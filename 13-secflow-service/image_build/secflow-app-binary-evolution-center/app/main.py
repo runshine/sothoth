@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api import router
 from app.config import get_config, load_config
 from app.model import get_engine, init_database
+from app.observability import get_observability
 from app.service.auth import get_auth_service
 from app.service.project import get_project_service
 from app.service.registry import get_registry_service
@@ -55,7 +56,14 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.middleware("http")(get_observability().http_middleware)
     app.include_router(router)
+
+    @app.get("/metrics")
+    @app.get("/api/app/binary-evolution/metrics", include_in_schema=False)
+    async def metrics():
+        return get_observability().metrics_response()
+
     return app
 
 

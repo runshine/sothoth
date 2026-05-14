@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -19,7 +20,12 @@ from app.api.tasks import router
 from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
 from app.model import get_engine, init_database
-from app.observability import observe_api_request, render_metrics
+from app.observability import (
+    observe_api_request,
+    observe_auth_token_validation,
+    observe_downstream_request,
+    render_metrics,
+)
 from app.service.http_client import close_all_async_clients
 from app.service.registry import get_registry_service
 from app.service.task_queue import close_task_queue
@@ -68,34 +74,98 @@ def verify_auth_service_or_exit() -> None:
 
     health_url = f"http://{cfg.host}:{cfg.port}/api/auth/health"
     try:
+        started = time.perf_counter()
         with urlopen(health_url, timeout=cfg.timeout) as response:
             if response.status != 200:
+                observe_downstream_request(
+                    service="auth_service",
+                    method="GET",
+                    operation="health",
+                    status=str(response.status),
+                    duration_seconds=time.perf_counter() - started,
+                )
                 logger.error("Auth 服务健康检查失败: status=%s", response.status)
                 sys.exit(1)
+            observe_downstream_request(
+                service="auth_service",
+                method="GET",
+                operation="health",
+                status=str(response.status),
+                duration_seconds=time.perf_counter() - started,
+            )
     except Exception as exc:
+        observe_downstream_request(
+            service="auth_service",
+            method="GET",
+            operation="health",
+            status="error",
+            duration_seconds=None,
+        )
         logger.error("Auth 服务不可达: %s", exc)
         sys.exit(1)
 
     try:
         request = Request(cfg.validate_url, method="POST")
         request.add_header("Authorization", f"Bearer {machine_token}")
+        started = time.perf_counter()
         with urlopen(request, timeout=cfg.timeout) as response:
             body = response.read().decode("utf-8", errors="ignore")
             if response.status != 200:
+                observe_auth_token_validation(result="failed", source="startup")
+                observe_downstream_request(
+                    service="auth_service",
+                    method="POST",
+                    operation="validate_machine_token",
+                    status=str(response.status),
+                    duration_seconds=time.perf_counter() - started,
+                )
                 logger.error("机机 Token 校验失败: status=%s body=%s", response.status, body)
                 sys.exit(1)
             payload = json.loads(body or "{}")
             if payload.get("token_type") != "machine":
+                observe_auth_token_validation(result="invalid_type", source="startup")
                 logger.error("机机 Token 类型异常: token_type=%s", payload.get("token_type"))
                 sys.exit(1)
+            observe_auth_token_validation(result="success", source="startup")
+            observe_downstream_request(
+                service="auth_service",
+                method="POST",
+                operation="validate_machine_token",
+                status=str(response.status),
+                duration_seconds=time.perf_counter() - started,
+            )
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="ignore") if hasattr(exc, "read") else ""
+        observe_auth_token_validation(result="failed", source="startup")
+        observe_downstream_request(
+            service="auth_service",
+            method="POST",
+            operation="validate_machine_token",
+            status=str(exc.code),
+            duration_seconds=None,
+        )
         logger.error("机机 Token 校验失败: status=%s body=%s", exc.code, body)
         sys.exit(1)
     except URLError as exc:
+        observe_auth_token_validation(result="connect_error", source="startup")
+        observe_downstream_request(
+            service="auth_service",
+            method="POST",
+            operation="validate_machine_token",
+            status="connect_error",
+            duration_seconds=None,
+        )
         logger.error("Auth 服务不可达，机机 Token 校验失败: %s", exc)
         sys.exit(1)
     except Exception as exc:
+        observe_auth_token_validation(result="error", source="startup")
+        observe_downstream_request(
+            service="auth_service",
+            method="POST",
+            operation="validate_machine_token",
+            status="error",
+            duration_seconds=None,
+        )
         logger.error("机机 Token 校验失败: %s", exc)
         sys.exit(1)
 
@@ -151,19 +221,24 @@ async def prometheus_http_middleware(request: FastAPIRequest, call_next):
     import time
 
     started = time.perf_counter()
-    response = await call_next(request)
-    route = request.scope.get("route")
-    path = getattr(route, "path", None) or request.url.path
-    observe_api_request(
-        method=request.method,
-        path=str(path),
-        status_code=response.status_code,
-        duration_seconds=time.perf_counter() - started,
-    )
-    return response
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        route = request.scope.get("route")
+        path = getattr(route, "path", None) or request.url.path
+        observe_api_request(
+            method=request.method,
+            path=str(path),
+            status_code=status_code,
+            duration_seconds=time.perf_counter() - started,
+        )
 
 
 @app.get("/metrics", include_in_schema=False)
+@app.get("/api/app/binary-security/metrics", include_in_schema=False)
 async def metrics_endpoint():
     payload, content_type = render_metrics()
     return Response(content=payload, media_type=content_type)

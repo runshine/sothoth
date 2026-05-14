@@ -42,9 +42,15 @@ from app.model import (
 )
 from app.observability import (
     observe_archive_action,
+    observe_archive_duration,
     observe_heartbeat_update,
     observe_queue_depths,
     observe_scheduler_loop,
+    observe_slot_usage,
+    observe_stage_duration,
+    observe_task_duration,
+    observe_task_error,
+    observe_task_lifecycle,
     observe_task_operation,
     observe_worker_counts,
 )
@@ -70,6 +76,7 @@ from app.schemas import (
     BinarySecurityTaskDetailResponse,
     BinarySecurityTaskEventResponse,
     BinarySecurityTaskListResponse,
+    BinarySecurityTaskPolicyUpdatePayload,
     BinarySecurityTaskResponse,
     BinarySecurityTimelineResponse,
     BinarySecurityUploadCompletePayload,
@@ -438,6 +445,20 @@ def _normalize_module_risk_levels(values: list[str] | None) -> list[str]:
     return ordered or ["高"]
 
 
+NO_CANDIDATE_MODULES_FAILURE_CODE = "no_candidate_modules"
+NO_CANDIDATE_MODULES_FAILURE_CATEGORY = "business"
+NO_CANDIDATE_MODULES_FAILURE_MESSAGE = "系统分析已完成，但未发现匹配所选风险等级的风险模块"
+
+
+def _no_candidate_modules_failure() -> dict[str, str]:
+    return {
+        "failure_code": NO_CANDIDATE_MODULES_FAILURE_CODE,
+        "failure_category": NO_CANDIDATE_MODULES_FAILURE_CATEGORY,
+        "failure_message": NO_CANDIDATE_MODULES_FAILURE_MESSAGE,
+        "error": NO_CANDIDATE_MODULES_FAILURE_MESSAGE,
+    }
+
+
 STAGE_RETRY_ALLOWED_STATUSES = {"success", "failed", "partial_success", "cancelled"}
 STAGE_RETRY_BLOCKED_TASK_STATUSES = {"pending", "dispatching", "running", "pending_upload", "uploading", "ready_to_start"}
 TASK_STATUS_PENDING_MODULE_CONFIRMATION = "pending_module_confirmation"
@@ -705,6 +726,7 @@ class TaskManager:
         await self._write_task_metadata_async(task, metadata_path, status="pending_upload")
         self._record_event(db, task, "task_created", f"创建任务 {task.id}", payload={"input_files": input_files})
         self._record_event(db, task, "task_upload_pending", "任务创建完成，等待上传文件")
+        observe_task_lifecycle("created", status=task.status, task_type=self._task_type(task))
         db.commit()
         return self.get_task_detail(db, project_id=project_id, task_id=task.id)
 
@@ -807,6 +829,7 @@ class TaskManager:
         }
         self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
         self._record_event(db, task, "task_start_requested", "任务已进入调度队列")
+        observe_task_lifecycle("queued", status=task.status, task_type=self._task_type(task))
         if self._task_type(task) == TASK_TYPE_BINARY:
             self._record_event(db, task, "firmware_items_initialized", f"已初始化 {len(input_files)} 个固件输入")
         else:
@@ -965,6 +988,99 @@ class TaskManager:
                 "task_concurrency_updated",
                 "任务阶段并发配置已更新",
                 payload={"before": before, "after": updated},
+            )
+            db.commit()
+            return self.get_task_detail(db, project_id=project_id, task_id=task_id)
+
+    def _task_policy_update_support(self, task: BinarySecurityTask) -> tuple[bool, str | None]:
+        blocked_statuses = {"dispatching", "running"} | TASK_PREPARING_STATUSES
+        if task.status in blocked_statuses:
+            return False, f"任务运行中，当前状态不允许修改任务策略: {task.status}"
+        return True, None
+
+    def update_task_policy(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        payload: BinarySecurityTaskPolicyUpdatePayload,
+    ) -> BinarySecurityTaskDetailResponse:
+        with self._task_operation_lock(db, task_id):
+            task = self._task_or_404(db, project_id, task_id)
+            supported, reason = self._task_policy_update_support(task)
+            if not supported:
+                raise ValidationError(reason or "当前任务不允许修改任务策略")
+
+            stage_sequence = self._stage_sequence_for_task(task)
+            allowed_stages = set(stage_sequence)
+            requested_parallelism = payload.stage_parallelism or {}
+            requested_stage_options = payload.stage_options or {}
+
+            invalid_parallelism_stage = next((stage for stage in requested_parallelism if stage not in allowed_stages), None)
+            if invalid_parallelism_stage:
+                raise ValidationError(f"阶段不属于当前任务流程: {invalid_parallelism_stage}")
+            invalid_stage_option = next((stage for stage in requested_stage_options if stage not in allowed_stages), None)
+            if invalid_stage_option:
+                raise ValidationError(f"阶段不属于当前任务流程: {invalid_stage_option}")
+
+            policy = dict(task.policy or {})
+            before = json.loads(json.dumps(policy))
+
+            current_parallelism = policy.get("stage_parallelism") if isinstance(policy.get("stage_parallelism"), dict) else {}
+            merged_parallelism = {
+                stage: max(1, int(current_parallelism.get(stage) or policy.get("max_stage_parallelism") or 1))
+                for stage in stage_sequence
+            }
+            for stage_name, raw_value in requested_parallelism.items():
+                try:
+                    value = int(raw_value)
+                except (TypeError, ValueError):
+                    raise ValidationError(f"阶段 {stage_name} 并发必须是 1 到 32 之间的整数") from None
+                if value < 1 or value > 32:
+                    raise ValidationError(f"阶段 {stage_name} 并发必须是 1 到 32 之间的整数")
+                merged_parallelism[stage_name] = value
+            policy["stage_parallelism"] = merged_parallelism
+            policy["max_stage_parallelism"] = max(merged_parallelism.values()) if merged_parallelism else 1
+
+            current_stage_options = policy.get("stage_options") if isinstance(policy.get("stage_options"), dict) else {}
+            merged_stage_options = {
+                stage: dict(current_stage_options.get(stage) or {})
+                for stage in stage_sequence
+                if stage in current_stage_options
+            }
+            for stage_name, option in requested_stage_options.items():
+                normalized_option = option.model_dump(mode="json") if hasattr(option, "model_dump") else dict(option or {})
+                merged_stage_options[stage_name] = {"enabled": bool(normalized_option.get("enabled", True))}
+            if merged_stage_options:
+                policy["stage_options"] = merged_stage_options
+
+            if payload.max_retries_per_item is not None:
+                policy["max_retries_per_item"] = int(payload.max_retries_per_item)
+            if payload.continue_on_item_failure is not None:
+                policy["continue_on_item_failure"] = bool(payload.continue_on_item_failure)
+            if payload.module_selection_mode is not None:
+                selection_mode = str(payload.module_selection_mode or MODULE_SELECTION_MODE_AUTO).strip()
+                if selection_mode not in {MODULE_SELECTION_MODE_AUTO, MODULE_SELECTION_MODE_MANUAL_CONFIRM}:
+                    selection_mode = MODULE_SELECTION_MODE_AUTO
+                policy["module_selection_mode"] = selection_mode
+            if payload.module_risk_levels is not None:
+                normalized_levels = _normalize_module_risk_levels(payload.module_risk_levels)
+                if not normalized_levels:
+                    raise ValidationError("至少选择一个模块风险等级")
+                policy["module_risk_levels"] = normalized_levels
+
+            task.policy = policy
+            self._record_event(
+                db,
+                task,
+                "task_policy_updated",
+                "任务策略已更新",
+                payload={
+                    "before": before,
+                    "after": policy,
+                    "effective_scope": "future_stages_only",
+                },
             )
             db.commit()
             return self.get_task_detail(db, project_id=project_id, task_id=task_id)
@@ -1151,6 +1267,8 @@ class TaskManager:
             self._invalidate_task_execution(task)
             task.finished_at = _now()
             self._record_event(db, task, "task_cancelled", "任务已取消")
+            observe_task_error("cancel", stage=str(task.current_stage or "none"), result="accepted")
+            observe_task_lifecycle("finished", status=task.status, task_type=self._task_type(task))
             running_items = db.query(BinarySecurityStageItem).filter(
                 BinarySecurityStageItem.task_id == task.id,
                 BinarySecurityStageItem.status.in_(["pending", "queued", "running"]),
@@ -1280,6 +1398,7 @@ class TaskManager:
             supported, reason, stage_name = self._task_retry_support(db, task)
             if not supported or not stage_name:
                 observe_task_operation("retry", "rejected")
+                observe_task_error("retry", stage=str(task.current_stage or "none"), result="rejected")
                 raise ValidationError(reason or "当前任务不支持安全重试")
             first_stage = self._stage_sequence_for_task(task)[0]
             self._accept_blocking_action(
@@ -1293,6 +1412,7 @@ class TaskManager:
                 event_payload={"target_stage": first_stage},
             )
             observe_task_operation("retry", "accepted")
+            observe_task_error("retry", stage=first_stage, result="accepted")
 
     async def _prepare_retry_task(self, db: Session, task: BinarySecurityTask) -> list[str]:
         stage_sequence = self._stage_sequence_for_task(task)
@@ -2060,7 +2180,7 @@ class TaskManager:
                                     )
                     else:
                         await self._reconcile_work_queues(db)
-                    self._observe_runtime_metrics(db)
+                    await self._observe_runtime_metrics(db)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -2088,7 +2208,7 @@ class TaskManager:
                                     )
                     else:
                         await self._reconcile_work_queues(db)
-                    self._observe_runtime_metrics(db)
+                    await self._observe_runtime_metrics(db)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -2157,6 +2277,15 @@ class TaskManager:
             )
         )
         if updated:
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
+            if task is not None:
+                wait_seconds = _elapsed_seconds_since(task.created_at)
+                observe_task_duration(
+                    phase="queue_wait",
+                    duration_seconds=wait_seconds,
+                    status="dispatching",
+                    task_type=self._task_type(task),
+                )
             db.commit()
             return task_id
         return None
@@ -2348,7 +2477,7 @@ class TaskManager:
                             db.commit()
                         except Exception:
                             db.rollback()
-                    self._observe_runtime_metrics(db, reconcile_candidates=len(task_refs))
+                    await self._observe_runtime_metrics(db, reconcile_candidates=len(task_refs))
             finally:
                 db.close()
             await asyncio.sleep(interval_seconds)
@@ -2540,6 +2669,11 @@ class TaskManager:
                 **dict(job.payload or {}),
                 "archive_copy_stats": copy_stats,
             }
+            observe_archive_duration(
+                action="copy",
+                result="archived",
+                duration_seconds=_elapsed_seconds_since(job.started_at),
+            )
             job.archive_status = "archived"
             job.archive_root = str(archived_dir)
             job.error_message = None
@@ -2555,6 +2689,11 @@ class TaskManager:
                     job.error_message = str(exc)
                     job.completed_at = _now()
                     job.updated_at = _now()
+                    observe_archive_duration(
+                        action="copy",
+                        result="failed",
+                        duration_seconds=_elapsed_seconds_since(job.started_at),
+                    )
                     db.commit()
             except Exception:
                 db.rollback()
@@ -2641,6 +2780,11 @@ class TaskManager:
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
             db.commit()
             observe_archive_action("apply", "success")
+            observe_archive_duration(
+                action="apply",
+                result="success",
+                duration_seconds=_elapsed_seconds_since(job.started_at),
+            )
         except Exception as exc:
             db.rollback()
             job = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.id == job_id).first()
@@ -2651,6 +2795,11 @@ class TaskManager:
                 job.updated_at = _now()
                 db.commit()
             observe_archive_action("apply", "failed")
+            observe_archive_duration(
+                action="apply",
+                result="failed",
+                duration_seconds=_elapsed_seconds_since(job.started_at) if job is not None else None,
+            )
         finally:
             db.close()
 
@@ -2718,6 +2867,7 @@ class TaskManager:
             execution_token = task.dispatch_started_at.isoformat() if task.dispatch_started_at else None
             task.status = "running"
             self._bind_execution_token(task)
+            observe_task_lifecycle("started", status=task.status, task_type=self._task_type(task))
             self._record_event(
                 db,
                 task,
@@ -2747,6 +2897,20 @@ class TaskManager:
                 task.dispatch_started_at = None
                 task.lease_expires_at = None
                 task.finished_at = _now()
+                observe_task_error("execution_error", stage=str(task.current_stage or "unknown"), result="failed")
+                observe_task_lifecycle("finished", status=task.status, task_type=self._task_type(task))
+                observe_task_duration(
+                    phase="execution",
+                    duration_seconds=_elapsed_seconds_since(task.started_at),
+                    status=task.status,
+                    task_type=self._task_type(task),
+                )
+                observe_task_duration(
+                    phase="total",
+                    duration_seconds=_elapsed_seconds_since(task.created_at),
+                    status=task.status,
+                    task_type=self._task_type(task),
+                )
                 self._record_event(db, task, "task_failed", f"任务执行失败: {exc}", level="error")
                 db.commit()
         finally:
@@ -2795,6 +2959,7 @@ class TaskManager:
                         },
                     }
                     self._record_event(db, task, "stage_completed", f"阶段未启用，按配置完成: {stage_name}", stage_name=stage_name)
+                    observe_stage_duration(stage=stage_name, result="success", duration_seconds=_elapsed_seconds_since(stage_run.started_at))
                     db.commit()
                     continue
                 task.current_stage = stage_name
@@ -2818,6 +2983,11 @@ class TaskManager:
                 status, summary = await handler(db, task, stage_run, token, retry_existing)
                 stage_run.status = "waiting_confirmation" if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION else status
                 stage_run.finished_at = _now()
+                observe_stage_duration(
+                    stage=stage_name,
+                    result=stage_run.status,
+                    duration_seconds=_elapsed_seconds_since(stage_run.started_at),
+                )
                 await self._persist_stage_run_output_summary_async(task, stage_run, summary)
                 stage_run.counts = self._stage_counts(db, stage_run)
                 if status in {"failed", "partial_success"}:
@@ -2828,6 +2998,15 @@ class TaskManager:
                         "status": stage_run.status,
                         "counts": stage_run.counts,
                         "finished_at": stage_run.finished_at.isoformat() if stage_run.finished_at else None,
+                        **(
+                            {
+                                "failure_code": summary.get("failure_code"),
+                                "failure_category": summary.get("failure_category"),
+                                "failure_message": summary.get("failure_message"),
+                            }
+                            if summary.get("failure_code")
+                            else {}
+                        ),
                     },
                 }
                 task.current_stage = stage_name
@@ -2863,6 +3042,20 @@ class TaskManager:
                     task.dispatch_started_at = None
                     task.lease_expires_at = None
                     task.finished_at = _now()
+                    observe_task_error("downstream_error", stage=stage_name, result="archive_blocked")
+                    observe_task_lifecycle("finished", status=task.status, task_type=self._task_type(task))
+                    observe_task_duration(
+                        phase="execution",
+                        duration_seconds=_elapsed_seconds_since(task.started_at),
+                        status=task.status,
+                        task_type=self._task_type(task),
+                    )
+                    observe_task_duration(
+                        phase="total",
+                        duration_seconds=_elapsed_seconds_since(task.created_at),
+                        status=task.status,
+                        task_type=self._task_type(task),
+                    )
                     self._record_event(
                         db,
                         task,
@@ -2884,8 +3077,27 @@ class TaskManager:
                         payload={"status": status},
                     )
                 if status == "failed":
-                    task.last_error = summary.get("error")
-                    self._record_event(db, task, "stage_failed", f"阶段失败，停止后续推进: {stage_name}", level="error", stage_name=stage_name)
+                    task.last_error = summary.get("failure_message") or summary.get("error")
+                    self._record_event(
+                        db,
+                        task,
+                        "stage_failed",
+                        f"阶段失败，停止后续推进: {stage_name}",
+                        level="error",
+                        stage_name=stage_name,
+                        payload={
+                            "error": task.last_error,
+                            **(
+                                {
+                                    "failure_code": summary.get("failure_code"),
+                                    "failure_category": summary.get("failure_category"),
+                                    "failure_message": summary.get("failure_message"),
+                                }
+                                if summary.get("failure_code")
+                                else {}
+                            ),
+                        },
+                    )
                     db.commit()
                     break
             if archive_blocked:
@@ -3171,7 +3383,8 @@ class TaskManager:
             archive_workers=len([task for task in self._archive_workers if not task.done()]),
         )
 
-    def _observe_runtime_metrics(self, db: Session, *, reconcile_candidates: int | None = None) -> None:
+    async def _observe_runtime_metrics(self, db: Session, *, reconcile_candidates: int | None = None) -> None:
+        queue_snapshot = await get_task_queue().snapshot()
         pending_tasks = int(
             db.query(func.count(BinarySecurityTask.id))
             .filter(BinarySecurityTask.status == "pending")
@@ -3208,6 +3421,18 @@ class TaskManager:
             .scalar()
             or 0
         )
+        leased_tasks = int(
+            db.query(func.count(BinarySecurityTask.id))
+            .filter(
+                BinarySecurityTask.dispatch_started_at.isnot(None),
+                BinarySecurityTask.lease_expires_at.isnot(None),
+            )
+            .scalar()
+            or 0
+        )
+        service_config = self._load_service_config(db)
+        task_workers = len([task for task in self._workers.values() if not task.done()])
+        action_workers = len([task for task in self._action_workers.values() if not task.done()])
         observe_queue_depths(
             pending_tasks=pending_tasks,
             running_tasks=running_tasks,
@@ -3216,6 +3441,17 @@ class TaskManager:
             archive_running_jobs=archive_running_jobs,
             archive_applying_jobs=archive_applying_jobs,
             reconcile_candidates=max(0, int(reconcile_candidates or 0)),
+            redis_task_queue=int((queue_snapshot.get("task_queue") or {}).get("length", 0)),
+            redis_action_queue=int((queue_snapshot.get("action_queue") or {}).get("length", 0)),
+            leased_tasks=leased_tasks,
+            task_queue_oldest_age_seconds=float((queue_snapshot.get("task_queue") or {}).get("oldest_age_seconds", 0.0) or 0.0),
+            action_queue_oldest_age_seconds=float((queue_snapshot.get("action_queue") or {}).get("oldest_age_seconds", 0.0) or 0.0),
+        )
+        observe_slot_usage(
+            task_active=task_workers,
+            task_capacity=int(service_config.max_concurrent_tasks),
+            action_active=action_workers,
+            action_capacity=max(1, int(self.cfg.scheduler.action_concurrency)),
         )
         self._observe_worker_counts()
 
@@ -3251,6 +3487,19 @@ class TaskManager:
         task.dispatch_started_at = None
         task.finished_at = _now()
         self._last_task_heartbeat_at.pop(task.id, None)
+        observe_task_lifecycle("finished", status=task.status, task_type=self._task_type(task))
+        observe_task_duration(
+            phase="execution",
+            duration_seconds=_elapsed_seconds_since(task.started_at),
+            status=task.status,
+            task_type=self._task_type(task),
+        )
+        observe_task_duration(
+            phase="total",
+            duration_seconds=_elapsed_seconds_since(task.created_at),
+            status=task.status,
+            task_type=self._task_type(task),
+        )
         self._record_event(db, task, "task_finished", f"任务结束: {task.status}")
 
     def _resolve_output_root(self, workspace_root: Path, custom_output_root: str | None) -> Path:
@@ -4217,6 +4466,9 @@ class TaskManager:
             "sync_status",
             "error",
             "reason",
+            "failure_code",
+            "failure_category",
+            "failure_message",
             "reclaimed",
             "archive_blocked",
             "waiting_manual_confirmation",
@@ -4654,8 +4906,9 @@ class TaskManager:
                     payload={"candidate_module_count": len(candidate_modules)},
                 )
         if status in {"success", "partial_success"} and not candidate_modules:
+            failure = _no_candidate_modules_failure()
             status = "failed"
-            failed = failed or [{"status": "failed", "error": "没有匹配所选风险等级的模块"}]
+            failed = failed or [{"status": "failed", **failure}]
         summary = dict(task.summary or {})
         summary.update(
             {
@@ -4665,6 +4918,7 @@ class TaskManager:
                 "candidate_modules": candidate_modules,
                 "selected_modules": selected_modules,
                 "high_risk_modules": selected_modules,
+                **(_no_candidate_modules_failure() if status == "failed" and not candidate_modules else {}),
             }
         )
         task.summary = summary
@@ -4677,6 +4931,17 @@ class TaskManager:
         stage_run.started_at = stage_run.started_at or _now()
         stage_run.counts = self._stage_counts(db, stage_run)
         stage_run.last_error = failed[0].get("error") if failed and status == "failed" else None
+        if status == "failed" and stage_run.last_error == NO_CANDIDATE_MODULES_FAILURE_MESSAGE:
+            task.last_error = stage_run.last_error
+            self._record_event(
+                db,
+                task,
+                "system_analysis_no_candidate_modules",
+                NO_CANDIDATE_MODULES_FAILURE_MESSAGE,
+                level="error",
+                stage_name="system_analysis",
+                payload=_no_candidate_modules_failure(),
+            )
         self._persist_stage_run_output_summary(
             task,
             stage_run,
@@ -4694,6 +4959,7 @@ class TaskManager:
                 "status_synced": True,
                 "sync_status": stage_run.status,
                 "error": stage_run.last_error,
+                **(_no_candidate_modules_failure() if status == "failed" and stage_run.last_error == NO_CANDIDATE_MODULES_FAILURE_MESSAGE else {}),
                 **stage_run.counts,
             },
         )
@@ -5703,6 +5969,7 @@ class TaskManager:
             all_modules.extend(result.get("modules", []))
         candidate_modules = self._filter_candidate_modules(all_modules, self._module_risk_levels(task))
         if not candidate_modules:
+            failure = _no_candidate_modules_failure()
             task.summary = {
                 **task.summary,
                 "system_analysis_results": self._lightweight_system_analysis_items(success),
@@ -5711,11 +5978,22 @@ class TaskManager:
                 "candidate_modules": [],
                 "selected_modules": [],
                 "high_risk_modules": [],
+                **failure,
             }
             task.metrics = {
                 **task.metrics,
                 **self._module_metrics(all_modules, [], []),
             }
+            task.last_error = failure["failure_message"]
+            self._record_event(
+                db,
+                task,
+                "system_analysis_no_candidate_modules",
+                failure["failure_message"],
+                level="error",
+                stage_name=stage_run.stage_name,
+                payload=failure,
+            )
             db.commit()
             return "failed", {
                 "items": self._lightweight_system_analysis_items(success),
@@ -5728,7 +6006,7 @@ class TaskManager:
                 "low_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "低"),
                 "candidate_module_count": 0,
                 "selected_module_count": 0,
-                "error": failed[0].get("error") if failed else "没有匹配所选风险等级的模块",
+                **failure,
             }
         selection_mode = self._module_selection_mode(task)
         selected_modules = self._mark_selected_modules(candidate_modules, selected_by=MODULE_SELECTION_MODE_AUTO) if selection_mode == MODULE_SELECTION_MODE_AUTO else []

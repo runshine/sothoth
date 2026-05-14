@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Optional
 
 from redis.asyncio import Redis
@@ -54,6 +55,7 @@ class TaskQueue:
         added = await client.sadd(dedupe_key, value)
         if added:
             await client.rpush(queue_key, value)
+            await client.zadd(f"{queue_key}:enqueued_at", {value: time.time()})
 
     async def _consume_result(self, client: Redis, queue_key: str, result) -> Optional[str]:
         if not result:
@@ -62,7 +64,35 @@ class TaskQueue:
         task_id = str(value or "").strip() or None
         if task_id:
             await client.srem(f"{queue_key}:dedupe", task_id)
+            await client.zrem(f"{queue_key}:enqueued_at", task_id)
         return task_id
+
+    async def queue_stats(self, queue_key: str) -> dict[str, float | int]:
+        client = await self._client_or_create()
+        length = int(await client.llen(queue_key) or 0)
+        oldest = await client.zrange(f"{queue_key}:enqueued_at", 0, 0, withscores=True)
+        oldest_age_seconds = 0.0
+        if oldest:
+            _, score = oldest[0]
+            try:
+                oldest_age_seconds = max(0.0, time.time() - float(score))
+            except (TypeError, ValueError):
+                oldest_age_seconds = 0.0
+        return {
+            "length": length,
+            "oldest_age_seconds": oldest_age_seconds,
+        }
+
+    async def snapshot(self) -> dict[str, dict[str, float | int]]:
+        client = await self._client_or_create()
+        task_queue, action_queue = await asyncio.gather(
+            self.queue_stats(self.config.task_queue_key),
+            self.queue_stats(self.config.action_queue_key),
+        )
+        return {
+            "task_queue": task_queue,
+            "action_queue": action_queue,
+        }
 
     async def close(self) -> None:
         async with self._lock:

@@ -6,7 +6,9 @@ import logging
 import sys
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+import time
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -16,6 +18,7 @@ from app.models.database import get_engine, init_database
 from app.pi_vuln_core.config.loader import ConfigValidationError
 from app.pi_vuln_core.runner import load_framework_config_from_path, run_framework_config
 from app.pi_vuln_core.utils.win_compat import ensure_event_loop_policy
+from app.observability import build_metrics_response, observe_http_request
 from app.services.auth import get_auth_service
 from app.services.llm_provider_sync import sync_providers_to_pi
 from app.services.project import get_project_service
@@ -65,13 +68,33 @@ def create_app() -> FastAPI:
             path = request.url.path
             allowed = (
                 path.startswith("/api/v1/jobs")
-                or path in {"/api/dataflow-vuln-scanner/health", "/api/dataflow-vuln-scanner/ready", "/openapi.json"}
+                or path in {
+                    "/api/dataflow-vuln-scanner/health",
+                    "/api/dataflow-vuln-scanner/ready",
+                    "/api/app/dataflow-vuln-scanner/metrics",
+                    "/metrics",
+                    "/openapi.json",
+                }
                 or path.startswith("/docs")
                 or path.startswith("/redoc")
             )
             if not allowed:
                 return JSONResponse(status_code=404, content={"detail": "not found"})
         return await call_next(request)
+
+    @app.middleware("http")
+    async def metrics_http_middleware(request: Request, call_next):
+        started = time.perf_counter()
+        response = None
+        try:
+            response = await call_next(request)
+            return response
+        finally:
+            duration_seconds = max(time.perf_counter() - started, 0.0)
+            route = request.scope.get("route")
+            route_path = getattr(route, "path", None) or request.url.path
+            status_code = response.status_code if response is not None else 500
+            observe_http_request(request.method, route_path, status_code, duration_seconds)
 
     app.add_middleware(
         CORSMiddleware,
@@ -81,6 +104,12 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(router)
+
+    @app.get("/metrics", include_in_schema=False)
+    @app.get("/api/app/dataflow-vuln-scanner/metrics", include_in_schema=False)
+    async def metrics():
+        return build_metrics_response()
+
     return app
 
 

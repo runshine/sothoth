@@ -76,6 +76,7 @@ MAX_LOG_RENDER_BYTES = 128 * 1024
 
 
 @router.get("/metrics", include_in_schema=False)
+@router.get("/api/app/firmware-unpacker/metrics", include_in_schema=False)
 async def metrics() -> Response:
     return Response(content=generate_metrics_payload(), media_type=metrics_content_type())
 

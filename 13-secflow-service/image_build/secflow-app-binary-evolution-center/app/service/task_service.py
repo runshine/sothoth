@@ -20,6 +20,7 @@ from app.model import (
     EvolutionTaskRound,
     EvolutionTaskSource,
 )
+from app.observability import get_observability
 from app.schemas import (
     EvolutionApplyResponse,
     EvolutionConfigPayload,
@@ -327,6 +328,7 @@ class TaskService:
         )
         db.commit()
         db.refresh(task)
+        get_observability().record_task_created(task, len(preview.sources))
 
         (task_root / "preview.json").write_text(
             json.dumps(preview.model_dump(mode="json"), ensure_ascii=False, indent=2),
@@ -727,6 +729,7 @@ class TaskService:
                 round_row.derived_tasks_json = derived_tasks
                 round_row.diff_summary_json = {"agent_count": len(_json_dict(task.agent_state_roots_json))}
                 round_row.finished_at = now_local()
+                get_observability().record_round_metrics(round_no, metrics, score, derived_tasks)
 
                 db.add(
                     EvolutionTaskArtifact(
@@ -758,6 +761,7 @@ class TaskService:
                     task.finished_at = now_local()
                     task.convergence_reason = "达到最小轮次后收敛"
                     task.message = f"已在第 {round_no} 轮收敛"
+                    get_observability().record_task_finished(task, task.status)
                     db.commit()
                     return
 
@@ -767,12 +771,18 @@ class TaskService:
             task.finished_at = now_local()
             task.convergence_reason = "达到最大轮次"
             task.message = "已执行到最大轮次"
+            get_observability().record_task_finished(task, task.status)
             db.commit()
         except Exception as exc:
             logger.exception("binary evolution task failed: %s", exc)
             task.status = "failed"
             task.finished_at = now_local()
             task.message = str(exc)
+            error_type = "timeout" if "timed out" in str(exc).lower() else type(exc).__name__
+            if "timed out" in str(exc).lower():
+                get_observability().record_timeout("task")
+            get_observability().record_error("task", error_type)
+            get_observability().record_task_finished(task, task.status)
             db.add(
                 EvolutionTaskEvent(
                     id=_new_id("evt"),
@@ -836,6 +846,7 @@ class TaskService:
                     deadline = asyncio.get_event_loop().time() + timeout_seconds
                     while True:
                         if asyncio.get_event_loop().time() > deadline:
+                            get_observability().record_timeout("derived_task")
                             raise RuntimeError(f"round {round_no} derived task {derived_task_id} timed out")
                         await asyncio.sleep(5)
                         detail = await dataflow_client.get_task(derived_task_id, token)
@@ -845,6 +856,7 @@ class TaskService:
                         if current_status in TERMINAL_DFVS_STATUSES:
                             break
                     if _trimmed(result.get("status")).lower() not in {"completed", "succeeded"}:
+                        get_observability().record_error("derived_task", str(result.get("status") or "upstream_error"))
                         raise RuntimeError(f"round {round_no} derived task {derived_task_id} finished with {result.get('status')}")
                 derived_results.append(result)
 

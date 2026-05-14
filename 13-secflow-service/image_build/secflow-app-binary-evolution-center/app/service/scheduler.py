@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_config
 from app.model import EvolutionTask, SchedulerWorker, get_db_session
+from app.observability import get_observability
 from app.service.task_service import get_task_service
 from app.time_utils import now_local
 
@@ -157,6 +158,9 @@ class SchedulerService:
                 db.rollback()
                 return None
             db.commit()
+            claimed = db.get(EvolutionTask, candidate.id)
+            if claimed is not None:
+                get_observability().record_task_started(claimed)
             return candidate.id
         finally:
             db.close()

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.config import get_config
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
 from app.model import B2STask, B2STaskItem
+from app.observability import get_observability
 from app.schemas import AdvancedBatch, AdvancedFile, AdvancedRun, B2SArtifact, B2SArtifactContentResponse, B2SOverallProgress, ReviewAnalyticsAttempt, ReviewAnalyticsDimension, ReviewAnalyticsFunction, ReviewAnalyticsFunctionAttempt, ReviewAnalyticsIssue, ReviewAnalyticsMeta, ReviewAnalyticsRadar, ReviewAnalyticsResponse, ReviewAnalyticsSummary, ReviewAnalyticsTrendInsight, ReviewAnalyticsTrendPoint, ReviewAnalyticsTrendSeries, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskItemResponse, TaskResponse
 from app.service.config_service import get_config_service, normalize_budget_exhausted_action
 from app.service.llm_provider import resolve_job_model
@@ -281,6 +282,9 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             item.status = map_pi_status(job.get("status"))
             item.phase = map_pi_phase(job.get("phase"), job.get("status"))
             item.progress = build_item_progress(item, job)
+            if item.status == "running" and item.started_at is None:
+                item.started_at = now_local()
+            get_observability().record_item_submit(item, worker_url)
         except Exception as exc:
             item.status = "failed"
             item.phase = "failed"
@@ -288,9 +292,11 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             item.failure_type = "pi-re-agent"
             item.error_reason = str(exc)
             item.finished_at = now_local()
+            get_observability().record_item_finished(item)
     recompute_task_status(db, task)
     db.commit()
     db.refresh(task)
+    get_observability().record_task_created(len(req.elf_tasks))
     return build_task_response(db, task)
 
 
@@ -339,10 +345,10 @@ async def sync_task(db: Session, task: B2STask) -> None:
         if item.progress != new_progress:
             item.progress = new_progress
             changed = True
+        started_now = False
         if new_status == "running" and item.started_at is None:
             item.started_at = now_local()
-        if new_status in TERMINAL and item.finished_at is None:
-            item.finished_at = now_local()
+            started_now = True
         if new_status == "success":
             output = job.get("output") or {}
             item.generated_files = build_generated_files(item, output)
@@ -353,6 +359,11 @@ async def sync_task(db: Session, task: B2STask) -> None:
         elif new_status == "success":
             item.failure_type = None
             item.error_reason = None
+        if started_now:
+            get_observability().record_item_submit(item, item_pi_worker_url(item) or "unknown")
+        if new_status in TERMINAL and item.finished_at is None:
+            item.finished_at = now_local()
+            get_observability().record_item_finished(item)
         changed = True
     if changed:
         recompute_task_status(db, task)
@@ -370,6 +381,7 @@ async def terminate_task(db: Session, task: B2STask) -> None:
         item.phase = "cancelled"
         item.progress = build_item_progress(item, {"status": "cancelled", "phase": "cancelled", "progress": item.progress})
         item.finished_at = now_local()
+        get_observability().record_item_finished(item)
     recompute_task_status(db, task)
     db.commit()
 
@@ -487,6 +499,9 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
             item.status = map_pi_status(job.get("status"))
             item.phase = map_pi_phase(job.get("phase"), job.get("status"))
             item.progress = build_item_progress(item, job)
+            if item.status == "running" and item.started_at is None:
+                item.started_at = now_local()
+            get_observability().record_item_submit(item, worker_url)
         except Exception as exc:
             item.pi_job_id = None
             item.status = "failed"
@@ -495,8 +510,10 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
             item.failure_type = "pi-re-agent"
             item.error_reason = str(exc)
             item.finished_at = now_local()
+            get_observability().record_item_finished(item)
     recompute_task_status(db, task)
     db.commit()
+    get_observability().record_retry("rerun", len(items))
 
 
 async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = None) -> None:
@@ -546,8 +563,12 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
         item.generated_files = []
         item.started_at = None
         item.finished_at = None
+        if item.status == "running":
+            item.started_at = now_local()
+        get_observability().record_item_submit(item, worker_url)
     recompute_task_status(db, task)
     db.commit()
+    get_observability().record_retry("retry", len(selected))
 
 
 def get_task_or_404(db: Session, project_id: str, task_id: str) -> B2STask:

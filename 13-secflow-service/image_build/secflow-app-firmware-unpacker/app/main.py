@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -18,12 +19,14 @@ for candidate in (_project_root, _app_dir):
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.requests import Request as FastAPIRequest
 
 from app.api.firmware import router as firmware_router
 from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
 from app.logging_utils import configure_container_logging
 from app.runtime import start_runtime, stop_runtime
+from app.services.observability import record_api_request
 
 
 configure_container_logging("secflow-app-firmware-unpacker")
@@ -110,6 +113,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def prometheus_http_middleware(request: FastAPIRequest, call_next):
+    started = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        route = request.scope.get("route")
+        path = getattr(route, "path", None) or request.url.path
+        record_api_request(
+            method=request.method,
+            path=str(path),
+            status_code=status_code,
+            duration_seconds=time.perf_counter() - started,
+        )
+
 
 setup_exception_handlers(app)
 app.include_router(firmware_router)

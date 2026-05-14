@@ -17,6 +17,7 @@ from app.api.tasks import router
 from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
 from app.model import get_engine, init_database
+from app.observability import get_observability
 from app.service.llm_provider import materialize_llm_provider
 from app.service.registry import get_registry_service
 
@@ -108,9 +109,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.middleware("http")(get_observability().http_middleware)
 
 setup_exception_handlers(app)
 app.include_router(router)
+
+
+@app.get("/metrics")
+@app.get("/api/app/binary-to-source/metrics", include_in_schema=False)
+async def metrics():
+    return get_observability().metrics_response()
 
 
 if __name__ == "__main__":

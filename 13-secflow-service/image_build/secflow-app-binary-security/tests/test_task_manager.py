@@ -17,7 +17,11 @@ from app.model import (
 )
 from app.exception import ValidationError
 from app.schemas import BinarySecurityServiceConfigPayload
-from app.schemas import BinarySecurityArchiveJobResponse, BinarySecurityTaskConcurrencyUpdatePayload
+from app.schemas import (
+    BinarySecurityArchiveJobResponse,
+    BinarySecurityTaskConcurrencyUpdatePayload,
+    BinarySecurityTaskPolicyUpdatePayload,
+)
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager, _now
 
@@ -1323,6 +1327,124 @@ class TaskManagerTests(unittest.TestCase):
                 payload=BinarySecurityTaskConcurrencyUpdatePayload(stage_parallelism={"system_analysis": 33}),
             )
 
+    def test_update_task_policy_merges_fields_and_records_event(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.policy = {
+            "max_stage_parallelism": 4,
+            "max_retries_per_item": 2,
+            "continue_on_item_failure": True,
+            "stage_parallelism": {
+                "firmware_unpack": 4,
+                "system_analysis": 4,
+                "binary_to_source": 4,
+                "entry_analysis": 4,
+                "dataflow_analysis": 4,
+                "vuln_scan": 4,
+            },
+            "stage_options": {
+                "binary_to_source": {"enabled": True},
+            },
+            "module_selection_mode": "auto",
+            "module_risk_levels": ["高"],
+        }
+        db = _ModelAwareDb(tasks=[task])
+
+        detail = self.manager.update_task_policy(
+            db,
+            project_id="p1",
+            task_id="t1",
+            payload=BinarySecurityTaskPolicyUpdatePayload(
+                stage_options={"binary_to_source": {"enabled": False}},
+                max_retries_per_item=5,
+                continue_on_item_failure=False,
+                stage_parallelism={"vuln_scan": 8},
+                module_selection_mode="manual_confirm",
+                module_risk_levels=["高", "中"],
+            ),
+        )
+
+        self.assertEqual(8, detail.policy["max_stage_parallelism"])
+        self.assertEqual(5, detail.policy["max_retries_per_item"])
+        self.assertFalse(detail.policy["continue_on_item_failure"])
+        self.assertEqual(8, detail.policy["stage_parallelism"]["vuln_scan"])
+        self.assertEqual(4, detail.policy["stage_parallelism"]["firmware_unpack"])
+        self.assertFalse(detail.policy["stage_options"]["binary_to_source"]["enabled"])
+        self.assertEqual("manual_confirm", detail.policy["module_selection_mode"])
+        self.assertEqual(["高", "中"], detail.policy["module_risk_levels"])
+        self.assertTrue(any(isinstance(obj, BinarySecurityEvent) and obj.event_type == "task_policy_updated" for obj in db.added))
+
+    def test_update_task_policy_rejects_stage_outside_source_flow(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.policy = {
+            "stage_parallelism": {
+                "system_analysis": 4,
+                "entry_analysis": 4,
+                "dataflow_analysis": 4,
+                "vuln_scan": 4,
+            }
+        }
+        db = _ModelAwareDb(tasks=[task])
+
+        with self.assertRaisesRegex(Exception, "阶段不属于当前任务流程"):
+            self.manager.update_task_policy(
+                db,
+                project_id="p1",
+                task_id="t1",
+                payload=BinarySecurityTaskPolicyUpdatePayload(stage_options={"firmware_unpack": {"enabled": False}}),
+            )
+
+    def test_update_task_policy_rejects_running_task(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.policy = {
+            "stage_parallelism": {
+                "firmware_unpack": 4,
+                "system_analysis": 4,
+                "binary_to_source": 4,
+                "entry_analysis": 4,
+                "dataflow_analysis": 4,
+                "vuln_scan": 4,
+            }
+        }
+        db = _ModelAwareDb(tasks=[task])
+
+        with self.assertRaisesRegex(Exception, "不允许修改任务策略"):
+            self.manager.update_task_policy(
+                db,
+                project_id="p1",
+                task_id="t1",
+                payload=BinarySecurityTaskPolicyUpdatePayload(stage_parallelism={"vuln_scan": 8}),
+            )
+
     def test_continue_task_deletes_archive_child_outputs_for_affected_stages(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -2299,6 +2421,136 @@ class TaskManagerTests(unittest.TestCase):
         rows = self.manager._filter_candidate_modules(modules, ["高", "中"])
 
         self.assertEqual(["h1", "m1"], [row["module_key"] for row in rows])
+
+    def test_stage_system_analysis_marks_no_candidate_modules_as_business_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="source-task",
+                status="running",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="system_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            task.policy = {}
+            stage_run = BinarySecurityStageRun(
+                id="sr1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="system_analysis",
+                sequence_no=1,
+                status="running",
+            )
+            (workspace / "input").mkdir(parents=True, exist_ok=True)
+            db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run])
+
+            original_prepare = self.manager._prepare_stage_items_for_execution
+            original_run_stage_pool = self.manager._run_stage_pool
+            self.manager._prepare_stage_items_for_execution = lambda *args, **kwargs: None
+
+            async def fake_run_stage_pool(current_task, items, concurrency, runner, retries=0, initial_retry=False):
+                del current_task, items, concurrency, runner, retries, initial_retry
+                return [
+                    {
+                        "status": "success",
+                        "item": {
+                            "firmware_key": "source_project",
+                            "firmware_name": "source-task",
+                            "filename": "source-project",
+                            "unpacked_root": str(workspace / "input"),
+                            "source_root": str(workspace / "input"),
+                            "task_type": TASK_TYPE_SOURCE,
+                        },
+                        "modules": [{"module_key": "m1", "module_name": "m1", "risk_level": "中", "risk_score": 50}],
+                    }
+                ]
+
+            self.manager._run_stage_pool = fake_run_stage_pool
+            try:
+                status, summary = asyncio.run(
+                    self.manager._stage_system_analysis(db, task, stage_run, token=None, retry_existing=False)
+                )
+            finally:
+                self.manager._prepare_stage_items_for_execution = original_prepare
+                self.manager._run_stage_pool = original_run_stage_pool
+
+            self.assertEqual("failed", status)
+            self.assertEqual("no_candidate_modules", summary["failure_code"])
+            self.assertEqual("business", summary["failure_category"])
+            self.assertIn("未发现匹配所选风险等级的风险模块", summary["failure_message"])
+            self.assertEqual(summary["failure_message"], task.last_error)
+            self.assertEqual("no_candidate_modules", task.summary["failure_code"])
+            event_types = [getattr(event, "event_type", "") for event in db.added if isinstance(event, BinarySecurityEvent)]
+            self.assertIn("system_analysis_no_candidate_modules", event_types)
+
+    def test_refresh_system_analysis_stage_from_synced_items_marks_no_candidate_modules_as_business_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            output_root = workspace / "output"
+            artifact_root = output_root / "system-analyse" / "source_project__sat1"
+            artifact_root.mkdir(parents=True, exist_ok=True)
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="source-task",
+                status="running",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="system_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(output_root),
+                workspace_root=str(workspace),
+            )
+            task.policy = {}
+            stage_run = BinarySecurityStageRun(
+                id="sr1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="system_analysis",
+                sequence_no=1,
+                status="running",
+            )
+            item = BinarySecurityStageItem(
+                id="si1",
+                task_id="t1",
+                project_id="p1",
+                stage_run_id="sr1",
+                stage_name="system_analysis",
+                item_key="source_project",
+                item_name="source-project",
+                status="success",
+                downstream_service="system_analyse",
+                downstream_task_id="sat1",
+            )
+            item.result = {
+                "firmware_key": "source_project",
+                "firmware_name": "source-task",
+                "filename": "source-project",
+                "unpacked_root": str(workspace / "input"),
+                "source_root": str(workspace / "input"),
+                "task_type": TASK_TYPE_SOURCE,
+                "artifact_root": str(artifact_root),
+                "archive_root": str(artifact_root),
+                "modules": [{"module_key": "m1", "module_name": "m1", "risk_level": "", "risk_score": 0}],
+            }
+            item.output_ref = {"archive_root": str(artifact_root)}
+            db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item])
+
+            self.manager._refresh_system_analysis_stage_from_synced_items(db, task)
+
+            self.assertEqual("failed", stage_run.status)
+            self.assertEqual("系统分析已完成，但未发现匹配所选风险等级的风险模块", stage_run.last_error)
+            self.assertEqual(stage_run.last_error, task.last_error)
+            self.assertEqual("no_candidate_modules", task.summary["failure_code"])
+            self.assertEqual("business", task.summary["failure_category"])
+            self.assertEqual("no_candidate_modules", stage_run.output_summary["failure_code"])
+            event_types = [getattr(event, "event_type", "") for event in db.added if isinstance(event, BinarySecurityEvent)]
+            self.assertIn("system_analysis_no_candidate_modules", event_types)
 
     def test_confirm_module_selection_updates_task(self):
         task = BinarySecurityTask(

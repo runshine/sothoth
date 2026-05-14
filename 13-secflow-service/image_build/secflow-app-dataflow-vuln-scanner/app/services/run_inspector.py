@@ -1539,6 +1539,7 @@ def inspect_sessions(workspace_root: str | Path) -> list[dict[str, Any]]:
                     "api_failures": response.get("api_failures", 0),
                     "pi_failures": response.get("pi_failures", 0),
                     "timeout_failures": response.get("timeout_failures", 0),
+                    "token_usage": response.get("token_usage", {}),
                     "timeout_max_retries": response.get("timeout_max_retries", 0),
                     "timeout_retry_fresh_session": response.get("timeout_retry_fresh_session", False),
                     "output_total_bytes": response.get("output_total_bytes", response.get("stdout_total_bytes", 0)),

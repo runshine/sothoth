@@ -28,6 +28,10 @@ from app.services.observability import (
     record_db_retry,
     record_dispatch_backpressure,
     record_orphan_recovery,
+    record_task_duration,
+    record_task_error,
+    record_task_lifecycle,
+    record_task_stage_transition,
 )
 from app.time_utils import isoformat_local, now_local
 from app.unpacker_engine_config import get_max_retries_reached_action
@@ -111,6 +115,20 @@ def _safe_positive(value: int, fallback: int) -> int:
     except Exception:
         return fallback
     return parsed if parsed > 0 else fallback
+
+
+def _task_origin(task: object) -> str:
+    return str(getattr(task, "task_origin_type", "") or "").strip() or "manual"
+
+
+def _elapsed_seconds(started_at: Optional[datetime], finished_at: Optional[datetime] = None) -> float | None:
+    if started_at is None:
+        return None
+    end = finished_at or now_local()
+    try:
+        return max(0.0, float((end - started_at).total_seconds()))
+    except Exception:
+        return None
 
 
 def _runtime_concurrency_mode() -> str:
@@ -717,6 +735,7 @@ def _update_task_progress_for_owner(
             task.current_stage = stage
         db.commit()
         if stage and stage != previous_stage:
+            record_task_stage_transition(stage=stage, task_origin=_task_origin(task))
             stage_label = STAGE_LABELS.get(stage, stage)
             _record_task_event_from_row(
                 task,
@@ -1417,6 +1436,11 @@ def submit_unpack_task(
             },
             created_by="task_manager",
         )
+        record_task_lifecycle(
+            event="created",
+            status=TaskStatus.PENDING.value,
+            task_origin=normalized_origin_type,
+        )
     finally:
         db.close()
 
@@ -1474,6 +1498,14 @@ def cancel_task(task_id: str) -> tuple[bool, str]:
                 status=task.status,
                 detail={"reason": "Task was cancelled before execution"},
                 created_by="task_manager",
+            )
+            record_task_error(category="cancel", status=task.status, task_origin=_task_origin(task))
+            record_task_lifecycle(event="finished", status=task.status, task_origin=_task_origin(task))
+            record_task_duration(
+                phase="total",
+                duration_seconds=_elapsed_seconds(task.created_at, task.completed_at),
+                status=task.status,
+                task_origin=_task_origin(task),
             )
             return True, "取消请求已提交"
         elif task.status in (TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value):
@@ -1550,6 +1582,7 @@ def retry_task(task_id: str) -> tuple[bool, Optional[str], str]:
         task.result_message = "正在后台重置任务目录并准备重试"
         task.error_message = None
         db.commit()
+        record_task_error(category="retry", status=task.status, task_origin=_task_origin(task))
         _record_task_event(
             task.id,
             project_id=task.project_id,
@@ -1776,6 +1809,7 @@ def recover_orphaned_tasks() -> None:
                     or cancel_timed_out
                     or progress_stale
                 ):
+                    record_task_error(category="timeout", status=task.status, task_origin=_task_origin(task))
                     _signal_task_runner(
                         task,
                         signal.SIGKILL,
@@ -1790,6 +1824,7 @@ def recover_orphaned_tasks() -> None:
                     _finalize_orphaned_task(task.id, reason="Task owner pod lost", owner_lost=True)
                     action_counts["orphaned_cancelled"] = int(action_counts.get("orphaned_cancelled", 0)) + 1
                 elif cancel_timed_out or progress_stale:
+                    record_task_error(category="timeout", status=task.status, task_origin=_task_origin(task))
                     _mark_task_cancelled(task.id, reason="Task cancelled after owner lost or timeout")
                     action_counts["cancel_timeout"] = int(action_counts.get("cancel_timeout", 0)) + 1
                 continue
@@ -1882,6 +1917,13 @@ def _claim_task(task_id: str) -> bool:
             db.commit()
             task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
             if task is not None:
+                record_task_lifecycle(event="queued", status=task.status, task_origin=_task_origin(task))
+                record_task_duration(
+                    phase="queue_wait",
+                    duration_seconds=_elapsed_seconds(task.created_at, task.dispatch_claimed_at),
+                    status=task.status,
+                    task_origin=_task_origin(task),
+                )
                 _record_task_event_from_row(
                     task,
                     event_type="task_claimed",
@@ -2026,6 +2068,13 @@ def _launch_task_runner(task_id: str) -> None:
             raise RuntimeError(f"任务状态已变化，已停止新 runner: {task_id}")
         task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
         if task is not None:
+            record_task_lifecycle(event="started", status=TaskStatus.RUNNING.value, task_origin=_task_origin(task))
+            record_task_duration(
+                phase="queue_wait",
+                duration_seconds=_elapsed_seconds(task.created_at, task.started_at),
+                status=TaskStatus.RUNNING.value,
+                task_origin=_task_origin(task),
+            )
             _record_task_event_from_row(
                 task,
                 event_type="runner_started",
@@ -3071,6 +3120,20 @@ def _mark_task_cancelled(task_id: str, reason: str = "Task was cancelled") -> No
             owner_id=previous_owner_id,
             created_by="task_manager",
         )
+        record_task_error(category="cancel", status=task.status, task_origin=_task_origin(task))
+        record_task_lifecycle(event="finished", status=task.status, task_origin=_task_origin(task))
+        record_task_duration(
+            phase="execution",
+            duration_seconds=_elapsed_seconds(task.started_at, task.completed_at),
+            status=task.status,
+            task_origin=_task_origin(task),
+        )
+        record_task_duration(
+            phase="total",
+            duration_seconds=_elapsed_seconds(task.created_at, task.completed_at),
+            status=task.status,
+            task_origin=_task_origin(task),
+        )
         _write_task_result_cache(task_id)
     finally:
         db.close()
@@ -3150,6 +3213,23 @@ def _update_task_result(task_id: str, result: dict, *, run_token: Optional[str] 
             owner_id=previous_owner_id,
             created_by="task_manager",
         )
+        if task.status == TaskStatus.CANCELLED.value:
+            record_task_error(category="cancel", status=task.status, task_origin=_task_origin(task))
+        elif task.status == TaskStatus.FAILED.value:
+            record_task_error(category="downstream_error", status=task.status, task_origin=_task_origin(task))
+        record_task_lifecycle(event="finished", status=task.status, task_origin=_task_origin(task))
+        record_task_duration(
+            phase="execution",
+            duration_seconds=_elapsed_seconds(task.started_at, task.completed_at),
+            status=task.status,
+            task_origin=_task_origin(task),
+        )
+        record_task_duration(
+            phase="total",
+            duration_seconds=_elapsed_seconds(task.created_at, task.completed_at),
+            status=task.status,
+            task_origin=_task_origin(task),
+        )
         _write_task_result_cache(task_id)
     finally:
         db.close()
@@ -3193,6 +3273,24 @@ def _update_task_error(task_id: str, error: str, *, run_token: Optional[str] = N
             detail={"reason": error},
             owner_id=previous_owner_id,
             created_by="task_manager",
+        )
+        record_task_error(
+            category="cancel" if task.status == TaskStatus.CANCELLED.value else "downstream_error",
+            status=task.status,
+            task_origin=_task_origin(task),
+        )
+        record_task_lifecycle(event="finished", status=task.status, task_origin=_task_origin(task))
+        record_task_duration(
+            phase="execution",
+            duration_seconds=_elapsed_seconds(task.started_at, task.completed_at),
+            status=task.status,
+            task_origin=_task_origin(task),
+        )
+        record_task_duration(
+            phase="total",
+            duration_seconds=_elapsed_seconds(task.created_at, task.completed_at),
+            status=task.status,
+            task_origin=_task_origin(task),
         )
         _write_task_result_cache(task_id)
     finally:

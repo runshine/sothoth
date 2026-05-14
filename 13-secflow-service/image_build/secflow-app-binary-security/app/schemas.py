@@ -56,6 +56,15 @@ class BinarySecurityTaskConcurrencyUpdatePayload(BaseModel):
     stage_parallelism: dict[str, int] = Field(default_factory=dict)
 
 
+class BinarySecurityTaskPolicyUpdatePayload(BaseModel):
+    stage_options: dict[str, StageOptions] = Field(default_factory=dict)
+    max_retries_per_item: Optional[int] = Field(default=None, ge=0, le=20)
+    continue_on_item_failure: Optional[bool] = None
+    stage_parallelism: dict[str, int] = Field(default_factory=dict)
+    module_selection_mode: Optional[str] = None
+    module_risk_levels: Optional[list[str]] = None
+
+
 class BinarySecurityTaskPrepareResponse(BaseModel):
     task_id: str
 

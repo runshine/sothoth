@@ -168,6 +168,7 @@ class DbExecutionRecorder(ExecutionRecorder):
                 "plugin_id": kwargs["plugin_id"],
                 "phase": kwargs["phase"],
                 "sequence": kwargs["sequence"],
+                "duration_ms": kwargs["result"].duration_ms,
                 "result_code": kwargs["result"].code.value,
                 "message": kwargs["result"].message,
                 "data": kwargs["result"].data,
