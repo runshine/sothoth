@@ -8,6 +8,7 @@ agent runtime to workflow-specific concepts.
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import time
 from typing import Any
 
@@ -51,6 +52,19 @@ def normalize_step_key(phase: str, step_key: str) -> str:
     if phase == "summary" and not step_key:
         return "summary"
     return step_key
+
+
+def node_id_for(*, cycle: int, phase: str, step_key: str) -> str:
+    """Return a stable identifier for a resumable workflow node.
+
+    A node is one business-level interaction with piagent.  The ID is stable
+    across process restarts so frontend traces and resume previews can point to
+    the same node even when the underlying runtime call directory changes.
+    """
+    normalized_phase = (phase or "").strip()
+    normalized_step = normalize_step_key(normalized_phase, step_key)
+    raw = f"cycle={int(cycle):03d}|phase={normalized_phase}|step={normalized_step}"
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:24]
 
 
 def node_kind_for(phase: str, step_key: str) -> str:
@@ -192,6 +206,7 @@ def record_step_checkpoint(
     """
     step_key = normalize_step_key(phase, step_key)
     node_kind = node_kind_for(phase, step_key)
+    node_id = node_id_for(cycle=cycle, phase=phase, step_key=step_key)
     now_iso = _now_iso()
     now_epoch = time.time()
     base = _checkpoint_dir(work_dir)
@@ -206,13 +221,16 @@ def record_step_checkpoint(
             existing = {}
 
     payload: dict[str, Any] = {
+        "schema_version": 1,
         "timestamp": now_iso,
         "cycle": cycle,
         "phase": phase,
         "step_key": step_key,
+        "node_id": node_id,
         "status": status,
         "node_kind": node_kind,
         "terminal_status": status in RESUME_TERMINAL_STATUSES,
+        "resume_policy": "rerun_current_node",
         "agent_id": agent_id,
         "session_id": session_id,
         "detail": detail,

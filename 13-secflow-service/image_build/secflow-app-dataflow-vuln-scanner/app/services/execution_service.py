@@ -874,6 +874,12 @@ class ExecutionService:
         cancel_poll_seconds = max(int(getattr(cfg.service, "execution_cancel_check_interval_seconds", 0) or 0) * 5, 0)
         return max(configured_seconds, scheduler_seconds, cancel_poll_seconds, 30)
 
+    def _process_start_grace_seconds(self) -> int:
+        cfg = get_config()
+        scheduler_seconds = max(int(getattr(cfg.scheduler, "poll_interval_seconds", 0) or 0) * 5, 0)
+        cancel_poll_seconds = max(int(getattr(cfg.service, "execution_cancel_check_interval_seconds", 0) or 0) * 5, 0)
+        return max(scheduler_seconds, cancel_poll_seconds, 30)
+
     def _parse_process_timestamp(self, value: Any) -> datetime | None:
         text = str(value or "").strip()
         if not text:
@@ -2990,6 +2996,31 @@ class ExecutionService:
                 )
                 return base
 
+        startup_grace = self._process_start_grace_seconds()
+        base["startup_grace_seconds"] = startup_grace
+        if run_status in _ACTIVE_RUN_INDEX_STATUSES or trigger_status in _ACTIVE_RUN_INDEX_STATUSES or execution_status in _ACTIVE_RUN_INDEX_STATUSES:
+            started_at = None
+            if execution is not None:
+                started_at = execution.process_started_at or execution.started_at or started_at
+            if started_at is None and trigger is not None:
+                started_at = trigger.started_at
+            if started_at is not None:
+                started_age = int(max((checked_at - started_at).total_seconds(), 0))
+                base["started_age_seconds"] = started_age
+                if started_age <= startup_grace:
+                    base.update(
+                        {
+                            "can_retry": False,
+                            "is_running": True,
+                            "display_status": "starting",
+                            "display_label": "启动中",
+                            "severity": "info",
+                            "reason": "Run 刚进入运行态，等待进程注册或心跳落盘",
+                            "source": "startup_grace",
+                        }
+                    )
+                    return base
+
         process_payload = self._read_run_process_file(run_index.run_root_path)
         if process_payload:
             heartbeat_at = self._parse_process_timestamp(
@@ -3278,6 +3309,7 @@ class ExecutionService:
                     "cycle": int((plan.resume_cursor or {}).get("cycle") or 0),
                     "phase": plan.resume_target_phase,
                     "step_key": plan.resume_target_step_key,
+                    "node_id": str((plan.resume_cursor or {}).get("node_id") or ""),
                     "node_kind": str((plan.resume_cursor or {}).get("node_kind") or ""),
                 } if plan.resume_target_phase else None,
                 node_resume_policy=plan.node_resume_policy,
@@ -3299,6 +3331,7 @@ class ExecutionService:
                     "cycle": int((plan.resume_cursor or {}).get("cycle") or 0),
                     "phase": plan.resume_target_phase,
                     "step_key": plan.resume_target_step_key,
+                    "node_id": str((plan.resume_cursor or {}).get("node_id") or ""),
                     "node_kind": str((plan.resume_cursor or {}).get("node_kind") or ""),
                 } if plan.resume_target_phase else None,
                 "node_resume_policy": plan.node_resume_policy,
@@ -3670,6 +3703,63 @@ class ExecutionService:
             )
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run is not managed by a cancellable execution")
 
+    def _resume_command_preview_payload(self, *, run_index, payload: RunRetryRequest) -> dict[str, Any]:
+        request = self._build_run_index_resume_request(run_index=run_index, payload=payload)
+        plan = self._build_dataflow_cli_resume_plan(
+            project_id=run_index.project_id,
+            request=request,
+        )
+        return self._resume_command_payload_from_plan(plan=plan, request=request)
+
+    def preview_run_retry(
+        self,
+        db: Session,
+        run_index_id: str,
+        principal: dict,
+        payload: RunRetryRequest,
+    ) -> dict[str, Any]:
+        run_index = self._run_index_or_404(db, run_index_id, principal)
+        run_index = get_run_index_service().refresh_run_index(db, run_index)
+        run_root = Path(run_index.run_root_path)
+        if not run_root.is_dir():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run directory not found")
+
+        trigger, latest_execution = self._linked_run_index_runtime(db, run_index)
+        process_state = self._run_process_state(db, run_index, trigger=trigger, execution=latest_execution)
+        can_retry = bool(process_state.get("can_retry"))
+        reason = str(process_state.get("reason") or "")
+        resume_preflight: dict[str, Any] = {}
+        if can_retry:
+            resume_preflight = self._preflight_run_resume(run_index=run_index, payload=payload)
+            try:
+                command_payload = self._resume_command_preview_payload(run_index=run_index, payload=payload)
+                resume_preflight.update(
+                    {
+                        "argv": command_payload.get("argv") or [],
+                        "command": command_payload.get("command") or [],
+                        "command_display": command_payload.get("command_display") or "",
+                    }
+                )
+            except Exception as exc:
+                resume_preflight["command_preview_error"] = str(exc)
+            resume_preflight.update(
+                {
+                    "can_retry": True,
+                    "reason": reason,
+                    "process_state": process_state,
+                }
+            )
+
+        return {
+            "success": True,
+            "run_id": run_index.id,
+            "project_id": run_index.project_id,
+            "can_retry": can_retry,
+            "reason": reason,
+            "process_state": process_state,
+            "resume_preflight": resume_preflight,
+        }
+
     def retry_run(
         self,
         db: Session,
@@ -3691,6 +3781,24 @@ class ExecutionService:
                 detail=str(process_state.get("reason") or "run_vuln_scan.py is still active; cannot retry"),
             )
         preflight = self._preflight_run_resume(run_index=run_index, payload=payload)
+        preflight.update(
+            {
+                "can_retry": True,
+                "reason": str(process_state.get("reason") or ""),
+                "process_state": process_state,
+            }
+        )
+        try:
+            command_payload = self._resume_command_preview_payload(run_index=run_index, payload=payload)
+            preflight.update(
+                {
+                    "argv": command_payload.get("argv") or [],
+                    "command": command_payload.get("command") or [],
+                    "command_display": command_payload.get("command_display") or "",
+                }
+            )
+        except Exception as exc:
+            preflight["command_preview_error"] = str(exc)
         self._mark_stale_runtime_exited(
             db,
             trigger=trigger,
@@ -3749,7 +3857,7 @@ class ExecutionService:
                 "resume_preflight": preflight,
             },
         )
-        return self._run_mutation_response(
+        response = self._run_mutation_response(
             run_id=run_index.id,
             project_id=run_index.project_id,
             status_text=run_index.status,
@@ -3757,6 +3865,8 @@ class ExecutionService:
             linked_task_id=trigger.id,
             linked_execution_id=execution.id,
         )
+        response["resume_preflight"] = preflight
+        return response
 
     def cancel_scan_task(self, db: Session, task_id: str, principal: dict, *, signal_process: bool = True) -> ScanTaskResponse:
         trigger = self._trigger_or_404(db, task_id)

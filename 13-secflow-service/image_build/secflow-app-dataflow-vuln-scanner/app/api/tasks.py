@@ -20,6 +20,7 @@ from app.schemas import (
     RunLogResponse,
     RunMutationResponse,
     RunResolveResponse,
+    RunResumePreviewResponse,
     RunRetryRequest,
     RunSessionResponse,
     RunSummaryResponse,
@@ -317,6 +318,17 @@ async def cancel_run(run_id: str, subject=Depends(get_current_subject), db: Sess
 async def adopt_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().adopt_run(db, run_id, principal)
+
+
+@router.post("/runs/{run_id}/retry/preview", response_model=RunResumePreviewResponse)
+async def preview_retry_run(
+    run_id: str,
+    payload: RunRetryRequest | None = Body(default=None),
+    subject=Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    principal, _ = subject
+    return get_execution_service().preview_run_retry(db, run_id, principal, payload or RunRetryRequest())
 
 
 @router.post(
