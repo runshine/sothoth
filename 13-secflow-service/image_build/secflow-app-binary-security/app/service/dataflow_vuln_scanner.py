@@ -30,7 +30,7 @@ class DataflowVulnScannerClient(JsonHttpClient):
             "filename": candidate.name or None,
         }
 
-    async def create_task(self, project_id: str, title: str, token: str, data_flow_path: str, source_dir: str, workspace_dir: str, output_dir: str, origin: dict[str, Any] | None = None) -> dict:
+    async def create_task(self, project_id: str, title: str, token: str, data_flow_path: str, source_dir: str, origin: dict[str, Any] | None = None) -> dict:
         # DFVS now owns its standard run/output layout under
         # /data/files/<project>/app/secflow-app-dataflow-vuln-scanner.  Do not
         # pass absolute workspace/output refs; send project-scoped input refs so

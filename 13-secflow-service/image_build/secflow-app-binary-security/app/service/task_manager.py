@@ -693,19 +693,19 @@ class TaskManager:
             current_stage=None,
             firmware_name=f"{len(input_files)} files",
             firmware_source="project_filesystem",
-            firmware_path=self._fileserver_task_path(task_id, "input"),
+            firmware_path=str(input_dir),
             output_root=str(output_root),
             workspace_root=str(workspace_root),
         )
         task.policy = policy
         task.summary = {
-            "fileserver_project_path": self._fileserver_task_path(task_id),
+            "fileserver_project_path": str(workspace_root),
             "task_root_path": str(workspace_root),
-            "input_dir": self._fileserver_task_path(task_id, "input"),
-            "output_dir": self._fileserver_task_path(task_id, "output"),
-            "run_dir": self._fileserver_task_path(task_id, "run"),
-            "temp_upload_dir": self._fileserver_task_path(task_id, "run/upload-tmp") if task_type == TASK_TYPE_SOURCE else None,
-            "input_manifest_path": f"{self._fileserver_task_path(task_id, 'input')}/task-metadata.json",
+            "input_dir": str(input_dir),
+            "output_dir": str(output_root),
+            "run_dir": str(run_dir),
+            "temp_upload_dir": str(run_dir / "upload-tmp") if task_type == TASK_TYPE_SOURCE else None,
+            "input_manifest_path": str(metadata_path),
             "input_files": input_files,
             "input_kind": "source_archives" if task_type == TASK_TYPE_SOURCE else "firmware_files",
             "downstream_task_ids": {},
@@ -4981,9 +4981,19 @@ class TaskManager:
         result = dict(item.result or {})
         firmware_key = str(item.item_key or input_ref.get("firmware_key") or result.get("firmware_key") or "")
         filename = str(input_ref.get("filename") or item.item_name or result.get("filename") or firmware_key)
-        runtime_output_path = str((item.output_ref or {}).get("runtime_output_path") or (item.output_ref or {}).get("output_path") or "")
-        fallback_root = runtime_output_path or str(Path(task.workspace_root) / "run" / "firmware-unpacker" / firmware_key)
-        unpacked_root = str(archived_dir) if archived_dir else str((item.output_ref or {}).get("archive_root") or result.get("archive_root") or result.get("unpacked_root") or fallback_root)
+        metadata_sources = self._resolve_downstream_output_sources(
+            downstream_payload or result.get("downstream") or {},
+            downstream_task_id=item.downstream_task_id,
+            task=task,
+            downstream_service=item.downstream_service,
+        )
+        runtime_output_path = str(metadata_sources[0]) if metadata_sources else ""
+        unpacked_root = str(archived_dir) if archived_dir else str(
+            (item.output_ref or {}).get("archive_root")
+            or result.get("archive_root")
+            or result.get("unpacked_root")
+            or runtime_output_path
+        )
         item.result = {
             **result,
             "firmware_key": firmware_key,
@@ -6163,7 +6173,7 @@ class TaskManager:
                 {"filename": input_file["filename"], "path": str(Path(task.workspace_root) / "input" / input_file["filename"])},
             ),
             output_ref=lambda input_file: {
-                "output_path": str(Path(task.workspace_root) / "run" / "firmware-unpacker" / input_file["firmware_key"]),
+                "downstream_service": "firmware_unpacker",
             },
         )
         results = await self._run_stage_pool(
@@ -6189,7 +6199,6 @@ class TaskManager:
         try:
             firmware_key = input_file["firmware_key"]
             input_path = Path(task.workspace_root) / "input" / input_file["filename"]
-            output_dir = ensure_dir(Path(task.workspace_root) / "run" / "firmware-unpacker" / firmware_key)
             item = self._upsert_stage_item(
                 session,
                 task=task,
@@ -6200,7 +6209,7 @@ class TaskManager:
                 parent_key=firmware_key,
                 downstream_service="firmware_unpacker",
                 input_ref={"filename": input_file["filename"], "path": str(input_path)},
-                output_ref={"output_path": str(output_dir)},
+                output_ref={"downstream_service": "firmware_unpacker"},
                 retrying=retrying,
                 running_status="queued",
             )
@@ -6211,7 +6220,6 @@ class TaskManager:
                 created = await get_firmware_unpacker_client().create_task(
                     task.project_id,
                     str(input_path),
-                    str(output_dir),
                     token or "",
                     _downstream_origin_payload(task, item),
                 )
@@ -6241,7 +6249,6 @@ class TaskManager:
                 payload=payload,
                 mapped_status=mapped_status,
                 before_status="running",
-                extra_paths=[output_dir],
             )
             if mapped_status != "success":
                 session.commit()
@@ -6260,7 +6267,6 @@ class TaskManager:
             item.result = {**(item.result or {}), **result}
             item.output_ref = {
                 **(item.output_ref or {}),
-                "runtime_output_path": str(output_dir),
                 "archive_root": str(archive_root),
                 "unpacked_root": result["unpacked_root"],
             }
@@ -6835,11 +6841,22 @@ class TaskManager:
             "workspace_root",
             "work_dir",
             "task_root",
+            "final_report_path",
+            "modules_list_path",
+            "result_file",
+            "result_file_path",
+            "run_result_path",
+            "run_report_path",
+            "functions_list_path",
+            "index_path",
+            "sessions_root",
         ):
             value = payload.get(key)
             if not value:
                 continue
             raw = Path(str(value))
+            if raw.suffix:
+                candidates.extend([raw.parent, raw.parent / "output"])
             if key in {"output_path", "output_root"} and downstream_task_id:
                 candidates.extend([raw / downstream_task_id / "output", raw / downstream_task_id])
             if key in {"workspace_root", "work_dir", "task_root"}:
@@ -7690,9 +7707,6 @@ class TaskManager:
                 retrying=retrying,
             )
             session.commit()
-            vuln_workspace = ensure_dir(Path(task.workspace_root) / "run" / "dataflow-vuln-scanner" / dataflow_result["entry_key"] / "workspace")
-            vuln_output = vuln_workspace / "output"
-            ensure_dir(vuln_output)
             if retrying and self._has_retryable_downstream_task(item):
                 created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=token)
             else:
@@ -7702,8 +7716,6 @@ class TaskManager:
                     token or "",
                     dataflow_result["data_flow_file"],
                     dataflow_result["source_dir"],
-                    str(vuln_workspace),
-                    str(vuln_output),
                     _downstream_origin_payload(task, item),
                 )
             item.downstream_task_id = created.get("task_id") or item.downstream_task_id
