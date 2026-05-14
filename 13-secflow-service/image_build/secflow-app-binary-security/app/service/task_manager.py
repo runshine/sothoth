@@ -1736,6 +1736,17 @@ class TaskManager:
                         before_status=before_status,
                         force=force,
                     )
+                    if job.archive_status == "success":
+                        # The archive job may already have finished in an earlier
+                        # reconcile pass while the item/stage/task state was not
+                        # fully applied back to the orchestrator. Re-apply the
+                        # persisted archive result idempotently so the main task
+                        # can leave the stale running state.
+                        db.commit()
+                        await self._apply_archive_job_status(job.id, job.archive_root)
+                        db.expire_all()
+                        synced_count += 1
+                        continue
                     if record_noop_events or force or mapped_status != before_status:
                         self._record_event(
                             db,
@@ -2745,7 +2756,7 @@ class TaskManager:
         db = session_factory()
         try:
             job = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.id == job_id).first()
-            if job is None or job.archive_status not in {"archived", "running", "applying"}:
+            if job is None or job.archive_status not in {"archived", "running", "applying", "success"}:
                 return
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == job.task_id).first()
             item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == job.item_id).first()
