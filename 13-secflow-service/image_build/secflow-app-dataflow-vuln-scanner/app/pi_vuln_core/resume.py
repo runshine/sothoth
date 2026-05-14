@@ -15,6 +15,7 @@ from app.pi_vuln_core.engine.checkpoint import (
     is_terminal_checkpoint,
     load_current_checkpoint,
     load_step_checkpoints,
+    node_id_for,
     node_kind_for,
 )
 from app.pi_vuln_core.engine.models import CompositeWorkflowResult
@@ -237,6 +238,7 @@ def _build_resume_cursor(
         "cycle": cycle,
         "phase": target_phase,
         "step_key": target_step_key,
+        "node_id": node_id_for(cycle=cycle, phase=target_phase, step_key=target_step_key),
         "status": source_status,
         "node_kind": node_kind_for(target_phase, target_step_key),
         "policy": _NODE_RESUME_POLICY,
@@ -244,6 +246,7 @@ def _build_resume_cursor(
             "cycle": cycle,
             "phase": source_phase,
             "step_key": source_step_key,
+            "node_id": str(checkpoint.get("node_id") or node_id_for(cycle=cycle, phase=source_phase, step_key=source_step_key)),
             "status": source_status,
             "node_kind": str(checkpoint.get("node_kind") or node_kind_for(source_phase, source_step_key)),
             "terminal_status": is_terminal_checkpoint(checkpoint),

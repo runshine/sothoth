@@ -1226,6 +1226,7 @@ def main(argv: list[str] | None = None):
                 "cycle": int((plan.resume_cursor or {}).get("cycle") or 0),
                 "phase": plan.resume_target_phase,
                 "step_key": plan.resume_target_step_key,
+                "node_id": str((plan.resume_cursor or {}).get("node_id") or ""),
                 "node_kind": str((plan.resume_cursor or {}).get("node_kind") or ""),
             } if plan.resume_target_phase else None,
             node_resume_policy=plan.node_resume_policy,

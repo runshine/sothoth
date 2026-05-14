@@ -26,6 +26,7 @@ from app.services.execution_service import get_execution_service
 from app.services.run_index_service import get_run_index_service
 from app.services.run_inspector import inspect_cycle_detail, inspect_run_detail
 from app.services.scheduler import get_scheduler_service
+from app.time_utils import now_local
 
 
 def _new_id(prefix: str) -> str:
@@ -955,6 +956,40 @@ def test_run_cancel_active_run_signals_bound_process(service_config_path):
         run_index = db.get(RunIndex, bound["run_id"])
         assert execution is not None and execution.status == "cancel_requested"
         assert run_index is not None and run_index.status == "cancel_requested"
+
+
+def test_run_process_state_uses_startup_grace_before_marking_stale(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_startup_grace_20260508_010203"
+    bound = _create_execution_bound_run(client, run_root)
+
+    with get_db_session() as db:
+        run_index = db.get(RunIndex, bound["run_id"])
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        trigger = db.get(TriggerTask, bound["task_id"])
+        assert run_index is not None and execution is not None and trigger is not None
+        now = now_local()
+        run_index.status = "running"
+        execution.status = "running"
+        execution.started_at = now
+        execution.process_status = None
+        trigger.status = "running"
+        trigger.started_at = now
+        db.add_all([run_index, execution, trigger])
+        db.commit()
+
+        service = get_execution_service()
+        process_state = service._run_process_state(db, run_index, trigger=trigger, execution=execution)
+        assert process_state["source"] == "startup_grace"
+        assert process_state["is_running"] is True
+        assert process_state["can_retry"] is False
+        assert process_state.get("stale") is not True
+        assert service._reconcile_stale_runtime(db, run_index=run_index, trigger=trigger, execution=execution) is False
+        db.refresh(execution)
+        db.refresh(trigger)
+        assert execution.status == "running"
+        assert trigger.status == "running"
 
 
 def test_run_delete_active_run_stops_process_and_removes_records(service_config_path, monkeypatch):

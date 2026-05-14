@@ -350,6 +350,16 @@ class RunRetryRequest(BaseModel):
     clean_workspace: bool = False
 
 
+class RunResumePreviewResponse(BaseModel):
+    success: bool = True
+    run_id: str
+    project_id: str
+    can_retry: bool = True
+    reason: str = ""
+    process_state: Dict[str, Any] = Field(default_factory=dict)
+    resume_preflight: Dict[str, Any] = Field(default_factory=dict)
+
+
 class RunVulnReportRequest(BaseModel):
     result_files: List[str] = Field(default_factory=list)
 
@@ -376,6 +386,7 @@ class RunMutationResponse(BaseModel):
     process_pid: Optional[int] = None
     process_host: Optional[str] = None
     process_signal: Optional[str] = None
+    resume_preflight: Dict[str, Any] = Field(default_factory=dict)
 
 
 class HealthResponse(BaseModel):
