@@ -3451,7 +3451,7 @@ class TaskManager:
             task_active=task_workers,
             task_capacity=int(service_config.max_concurrent_tasks),
             action_active=action_workers,
-            action_capacity=max(1, int(self.cfg.scheduler.action_concurrency)),
+            action_capacity=max(1, int(self.cfg.scheduler.downstream_action_concurrency)),
         )
         self._observe_worker_counts()
 
