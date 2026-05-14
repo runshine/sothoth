@@ -91,6 +91,12 @@ class BinarySecurityTask(Base, JsonMixin):
     target_stage_name = Column(String(64), nullable=True, index=True)
     pending_action = Column(String(32), nullable=True, index=True)
     last_error = Column(Text, nullable=True)
+    operation_lock_owner = Column(String(128), nullable=True, index=True)
+    operation_lock_token = Column(String(64), nullable=True, index=True)
+    operation_lock_type = Column(String(32), nullable=True, index=True)
+    operation_lock_acquired_at = Column(DateTime, nullable=True)
+    operation_lock_heartbeat_at = Column(DateTime, nullable=True)
+    operation_lock_expires_at = Column(DateTime, nullable=True, index=True)
     dispatcher_instance_id = Column(String(128), nullable=True, index=True)
     dispatch_started_at = Column(DateTime, nullable=True, index=True)
     lease_expires_at = Column(DateTime, nullable=True, index=True)
@@ -424,6 +430,30 @@ def _ensure_compat_columns(engine) -> None:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN pending_action VARCHAR(32) NULL"
             )
+        if "operation_lock_owner" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN operation_lock_owner VARCHAR(128) NULL"
+            )
+        if "operation_lock_token" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN operation_lock_token VARCHAR(64) NULL"
+            )
+        if "operation_lock_type" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN operation_lock_type VARCHAR(32) NULL"
+            )
+        if "operation_lock_acquired_at" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN operation_lock_acquired_at DATETIME NULL"
+            )
+        if "operation_lock_heartbeat_at" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN operation_lock_heartbeat_at DATETIME NULL"
+            )
+        if "operation_lock_expires_at" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN operation_lock_expires_at DATETIME NULL"
+            )
         with engine.begin() as conn:
             for statement in statements:
                 conn.execute(text(statement))
@@ -436,6 +466,10 @@ def _ensure_compat_columns(engine) -> None:
         if "ix_bst_project_status_created_id" not in indexes:
             index_statements.append(
                 f"CREATE INDEX ix_bst_project_status_created_id ON {task_table} (project_id, status, created_at, id)"
+            )
+        if "ix_bst_operation_lock_expires" not in indexes:
+            index_statements.append(
+                f"CREATE INDEX ix_bst_operation_lock_expires ON {task_table} (operation_lock_expires_at)"
             )
         with engine.begin() as conn:
             for statement in index_statements:

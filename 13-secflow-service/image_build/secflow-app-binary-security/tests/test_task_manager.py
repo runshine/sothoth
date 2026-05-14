@@ -133,6 +133,7 @@ class _FakeConnection:
     def __init__(self, lock_result=True):
         self.lock_result = lock_result
         self.calls = []
+        self.closed = False
 
     def execute(self, statement, params=None):
         self.calls.append((str(statement), dict(params or {})))
@@ -140,6 +141,9 @@ class _FakeConnection:
         if "GET_LOCK" in sql:
             return _ScalarResult(1 if self.lock_result else 0)
         return _ScalarResult(1)
+
+    def close(self):
+        self.closed = True
 
 
 class _LockingDb(_ModelAwareDb):
@@ -304,8 +308,7 @@ class TaskManagerTests(unittest.TestCase):
     def test_task_operation_lock_uses_bound_text_query_and_releases_lock(self):
         connection = _FakeConnection(lock_result=True)
         db = _LockingDb(connection)
-
-        with self.manager._task_operation_lock(db, "task-1"):
+        with self.manager._task_operation_lock(db, "task-1", operation="unit_test"):
             pass
 
         self.assertEqual(2, len(connection.calls))
@@ -316,9 +319,8 @@ class TaskManagerTests(unittest.TestCase):
     def test_task_operation_lock_rejects_when_named_lock_not_acquired(self):
         connection = _FakeConnection(lock_result=False)
         db = _LockingDb(connection)
-
         with self.assertRaises(ValidationError):
-            with self.manager._task_operation_lock(db, "task-1"):
+            with self.manager._task_operation_lock(db, "task-1", operation="unit_test"):
                 pass
 
     def test_runtime_status_reports_dispatch_loops(self):
@@ -1590,6 +1592,69 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(["t1"], cancelled)
         self.assertEqual("cancelled", task.status)
         self.assertEqual("cancelled", item.status)
+
+    def test_cancel_task_holds_lock_during_async_cleanup(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="i1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_key="m1",
+            status="running",
+            downstream_service="system_analyse",
+            downstream_task_id="sat_1",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item])
+        order: list[str] = []
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def fake_task_operation_lock(_db, _task_id, *, operation, ttl_seconds=1800):
+            del _db, _task_id, operation, ttl_seconds
+            order.append("lock_enter")
+            try:
+                yield
+            finally:
+                order.append("lock_exit")
+
+        async def fake_write_task_metadata_async(*args, **kwargs):
+            del args, kwargs
+            order.append("write_metadata")
+
+        async def fake_cancel_local_worker(task_id: str):
+            self.assertEqual("t1", task_id)
+            self.assertNotIn("lock_exit", order)
+            order.append("cancel_worker")
+
+        async def fake_cancel_downstream(downstream_item, token):
+            del token
+            self.assertEqual("sat_1", downstream_item.downstream_task_id)
+            self.assertNotIn("lock_exit", order)
+            order.append("cancel_downstream")
+
+        self.manager._task_operation_lock = fake_task_operation_lock
+        self.manager._write_task_metadata_async = fake_write_task_metadata_async
+        self.manager._cancel_local_worker = fake_cancel_local_worker
+        self.manager._cancel_downstream = fake_cancel_downstream
+
+        asyncio.run(self.manager.cancel_task(db, project_id="p1", task_id="t1"))
+
+        self.assertEqual(
+            ["lock_enter", "write_metadata", "cancel_worker", "cancel_downstream", "lock_exit"],
+            order,
+        )
 
     def test_retry_task_clears_archive_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
