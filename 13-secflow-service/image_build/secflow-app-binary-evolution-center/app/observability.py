@@ -8,7 +8,7 @@ from typing import Any, Callable, Iterable
 from fastapi import Request, Response
 from sqlalchemy.orm import Session
 
-from app.model import EvolutionTask, EvolutionTaskRound, SchedulerWorker, get_db_session
+from app.model import EvolutionTask, EvolutionTaskEvent, EvolutionTaskRound, SchedulerWorker, get_db_session
 
 
 def _labels_key(labels: dict[str, Any] | None) -> tuple[tuple[str, str], ...]:
@@ -170,14 +170,48 @@ def _snapshot_lines(db: Session) -> list[str]:
         lines.append(f"secflow_binary_evolution_best_score {latest_score}")
 
     round_fp = round_fn = round_derived = 0.0
+    retry_total = timeout_total = failure_total = 0.0
+    token_input_total = token_output_total = token_cache_read_total = token_cache_write_total = token_cost_total = 0.0
     for round_ in rounds:
         metrics = dict(round_.metrics_json or {}) if isinstance(round_.metrics_json, dict) else {}
         round_fp += _safe_float(metrics.get("false_positive_count"))
         round_fn += _safe_float(metrics.get("false_negative_count"))
         round_derived += len(round_.derived_tasks_json or []) if isinstance(round_.derived_tasks_json, list) else 0
+        retry_total += _safe_float(metrics.get("retry_count", metrics.get("retries")))
+        timeout_total += _safe_float(metrics.get("timeout_count", metrics.get("timeouts")))
+        failure_total += _safe_float(metrics.get("failure_count", metrics.get("errors")))
+        token_input_total += _safe_float(metrics.get("token_input", metrics.get("input_tokens")))
+        token_output_total += _safe_float(metrics.get("token_output", metrics.get("output_tokens")))
+        token_cache_read_total += _safe_float(metrics.get("token_cache_read", metrics.get("cache_read_tokens")))
+        token_cache_write_total += _safe_float(metrics.get("token_cache_write", metrics.get("cache_write_tokens")))
+        token_cost_total += _safe_float(metrics.get("token_cost", metrics.get("cost")))
     lines.append(f"secflow_binary_evolution_round_false_positive_total {round_fp}")
     lines.append(f"secflow_binary_evolution_round_false_negative_total {round_fn}")
     lines.append(f"secflow_binary_evolution_round_derived_task_total {round_derived}")
+    event_counts: dict[str, int] = defaultdict(int)
+    for event in db.query(EvolutionTaskEvent).all():
+        event_counts[str(event.event_type or "unknown")] += 1
+    retry_total += sum(count for name, count in event_counts.items() if "retry" in name)
+    timeout_total += sum(count for name, count in event_counts.items() if "timeout" in name)
+    failure_total += sum(count for name, count in event_counts.items() if "error" in name or "fail" in name)
+    total_tokens = token_input_total + token_output_total + token_cache_read_total + token_cache_write_total
+    lines.extend([
+        'secflow_binary_evolution_ai_role_count{role="agent"} 1',
+        f'secflow_binary_evolution_ai_role_count{{role="worker"}} {running_total}',
+        f'secflow_binary_evolution_ai_session_total{{role="agent"}} {len(rounds)}',
+        f'secflow_binary_evolution_ai_round_total{{kind="round"}} {len(rounds)}',
+        f'secflow_binary_evolution_ai_retry_total{{reason="retry"}} {retry_total}',
+        f'secflow_binary_evolution_ai_timeout_total{{scope="agent"}} {timeout_total}',
+        f'secflow_binary_evolution_ai_failure_total{{category="runtime"}} {failure_total}',
+        f'secflow_binary_evolution_ai_token_usage_total{{type="input"}} {token_input_total}',
+        f'secflow_binary_evolution_ai_token_usage_total{{type="output"}} {token_output_total}',
+        f'secflow_binary_evolution_ai_token_usage_total{{type="cache_read"}} {token_cache_read_total}',
+        f'secflow_binary_evolution_ai_token_usage_total{{type="cache_write"}} {token_cache_write_total}',
+        f'secflow_binary_evolution_ai_token_usage_total{{type="total"}} {total_tokens}',
+        f'secflow_binary_evolution_ai_token_cost_total {token_cost_total}',
+        f'secflow_binary_evolution_ai_review_total{{result="pass"}} {max(0, int(round_derived))}',
+        f'secflow_binary_evolution_ai_review_total{{result="partial"}} {len(rounds)}',
+    ])
     return lines
 
 

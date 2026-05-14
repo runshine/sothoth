@@ -231,6 +231,7 @@ def _collect_runtime_metrics(builder: MetricsBuilder) -> None:
         _collect_cycle_metrics(db, builder)
         _collect_plugin_metrics(db, builder)
         _collect_runtime_trace_metrics(db, builder)
+        _collect_ai_metrics(db, builder)
     finally:
         db.close()
 
@@ -529,3 +530,79 @@ def _collect_runtime_trace_metrics(db: Session, builder: MetricsBuilder) -> None
         builder.sample("secflow_dataflow_runtime_trace_total", value, {"mode": mode, "field": field})
     for token_type, value in sorted(token_totals.items()):
         builder.sample("secflow_dataflow_token_usage_total", value, {"token_type": token_type})
+
+
+def _collect_ai_metrics(db: Session, builder: MetricsBuilder) -> None:
+    builder.metric("secflow_dataflow_ai_role_count", "gauge", "Aggregated AI role counts for dataflow vuln scanner.")
+    builder.metric("secflow_dataflow_ai_session_total", "counter", "Aggregated AI session count by role.")
+    builder.metric("secflow_dataflow_ai_round_total", "counter", "Aggregated AI round counts by kind.")
+    builder.metric("secflow_dataflow_ai_retry_total", "counter", "Aggregated AI retry counts by reason.")
+    builder.metric("secflow_dataflow_ai_timeout_total", "counter", "Aggregated AI timeout counts by scope.")
+    builder.metric("secflow_dataflow_ai_failure_total", "counter", "Aggregated AI failure counts by category.")
+    builder.metric("secflow_dataflow_ai_token_usage_total", "counter", "Aggregated AI token usage by type.")
+    builder.metric("secflow_dataflow_ai_token_cost_total", "counter", "Aggregated AI token cost.")
+    builder.metric("secflow_dataflow_ai_review_total", "counter", "Aggregated AI review outcomes.")
+
+    cycle_total = db.query(func.count(RunIndexCycle.id)).scalar() or 0
+    session_total = db.query(func.count(RunIndexSession.id)).scalar() or 0
+    plugin_total = (
+        db.query(func.count(WorkflowExecutionEvent.id))
+        .filter(WorkflowExecutionEvent.event_type == "plugin_completed")
+        .scalar()
+        or 0
+    )
+    event_counts = dict(
+        db.query(WorkflowExecutionEvent.event_type, func.count(WorkflowExecutionEvent.id))
+        .group_by(WorkflowExecutionEvent.event_type)
+        .all()
+    )
+    timeout_total = sum(
+        int(event_counts.get(name, 0))
+        for name in event_counts
+        if "timeout" in str(name or "").lower()
+    )
+    retry_total = sum(
+        int(event_counts.get(name, 0))
+        for name in event_counts
+        if "retry" in str(name or "").lower() or "resume" in str(name or "").lower()
+    )
+    failure_total = sum(
+        int(event_counts.get(name, 0))
+        for name in event_counts
+        if "fail" in str(name or "").lower() or "error" in str(name or "").lower() or "abnormal" in str(name or "").lower()
+    )
+    token_totals: dict[str, float] = defaultdict(float)
+    session_rows = db.query(RunIndexSession, RunIndex.run_root_path).join(RunIndex, RunIndex.id == RunIndexSession.run_index_id).all()
+    for session_row, run_root in session_rows:
+        calls = _load_externalized_json_payload(run_root, session_row.calls_json)
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            token_usage = call.get("token_usage")
+            if isinstance(token_usage, dict):
+                token_totals["input"] += _to_float(token_usage.get("input", token_usage.get("prompt_tokens")))
+                token_totals["output"] += _to_float(token_usage.get("output", token_usage.get("completion_tokens")))
+                token_totals["cache_read"] += _to_float(token_usage.get("cache_read", token_usage.get("cacheRead")))
+                token_totals["cache_write"] += _to_float(token_usage.get("cache_write", token_usage.get("cacheWrite")))
+                token_totals["total"] += _to_float(token_usage.get("total")) or (
+                    _to_float(token_usage.get("input", token_usage.get("prompt_tokens")))
+                    + _to_float(token_usage.get("output", token_usage.get("completion_tokens")))
+                    + _to_float(token_usage.get("cache_read", token_usage.get("cacheRead")))
+                    + _to_float(token_usage.get("cache_write", token_usage.get("cacheWrite")))
+                )
+                token_totals["cost"] += _to_float(token_usage.get("cost"))
+
+    builder.sample("secflow_dataflow_ai_role_count", plugin_total, {"role": "plugin"})
+    builder.sample("secflow_dataflow_ai_role_count", max(session_total, 1), {"role": "agent"})
+    builder.sample("secflow_dataflow_ai_session_total", session_total, {"role": "agent"})
+    builder.sample("secflow_dataflow_ai_round_total", cycle_total, {"kind": "cycle"})
+    builder.sample("secflow_dataflow_ai_round_total", plugin_total, {"kind": "review"})
+    builder.sample("secflow_dataflow_ai_retry_total", retry_total, {"reason": "retry"})
+    builder.sample("secflow_dataflow_ai_timeout_total", timeout_total, {"scope": "plugin"})
+    builder.sample("secflow_dataflow_ai_failure_total", failure_total, {"category": "runtime"})
+    for token_type in ("input", "output", "cache_read", "cache_write", "total"):
+        builder.sample("secflow_dataflow_ai_token_usage_total", token_totals.get(token_type, 0.0), {"type": token_type})
+    builder.sample("secflow_dataflow_ai_token_cost_total", token_totals.get("cost", 0.0))
+    builder.sample("secflow_dataflow_ai_review_total", plugin_total, {"result": "partial"})

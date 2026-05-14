@@ -141,6 +141,45 @@ COST_USAGE_GAUGE = Gauge(
     "Aggregated LLM cost across task artifacts.",
     ("kind",),
 )
+AI_ROLE_COUNT = Gauge(
+    "firmware_unpacker_ai_role_count",
+    "Aggregated AI role counts for firmware unpacker.",
+    ("role",),
+)
+AI_SESSION_TOTAL = Gauge(
+    "firmware_unpacker_ai_session_total",
+    "Aggregated AI session counts for firmware unpacker.",
+    ("role",),
+)
+AI_ROUND_TOTAL = Gauge(
+    "firmware_unpacker_ai_round_total",
+    "Aggregated AI round counts for firmware unpacker.",
+    ("kind",),
+)
+AI_RETRY_TOTAL = Gauge(
+    "firmware_unpacker_ai_retry_total",
+    "Aggregated AI retry counts for firmware unpacker.",
+    ("reason",),
+)
+AI_TIMEOUT_TOTAL = Gauge(
+    "firmware_unpacker_ai_timeout_total",
+    "Aggregated AI timeout counts for firmware unpacker.",
+    ("scope",),
+)
+AI_FAILURE_TOTAL = Gauge(
+    "firmware_unpacker_ai_failure_total",
+    "Aggregated AI failure counts for firmware unpacker.",
+    ("category",),
+)
+AI_TOKEN_USAGE_TOTAL = Gauge(
+    "firmware_unpacker_ai_token_usage_total",
+    "Aggregated AI token usage for firmware unpacker.",
+    ("type",),
+)
+AI_TOKEN_COST_TOTAL = Gauge(
+    "firmware_unpacker_ai_token_cost_total",
+    "Aggregated AI token cost for firmware unpacker.",
+)
 
 
 @contextmanager
@@ -384,3 +423,50 @@ def refresh_cluster_state_metrics() -> None:
         COST_USAGE_GAUGE.labels(kind="total").set(aggregated["total_cost"])
     except Exception as exc:
         logger.debug("failed to refresh token/cost gauges: %s", exc)
+    failure_counts: dict[str, int] = {"timeout": 0, "cancel": 0, "runtime": 0, "business": 0, "unknown": 0}
+    ai_session_total = 0
+    ai_round_total = 0
+    for task in terminal_tasks:
+        if getattr(task, "fallback_to_llm", False) or str(getattr(task, "task_origin_type", "") or "") == "binary_security":
+            ai_session_total += 1
+            ai_round_total += max(1, _safe_int(getattr(task, "rounds", 0)))
+        failure_counts[_classify_ai_failure(task)] += 1
+
+    total_tokens = aggregated["total_tokens"] if "aggregated" in locals() else 0.0
+    AI_ROLE_COUNT.labels(role="worker").set(int(get_local_active_task_count()))
+    AI_ROLE_COUNT.labels(role="agent").set(int(task_counts.get(TaskStatus.RUNNING.value, 0)))
+    AI_SESSION_TOTAL.labels(role="agent").set(ai_session_total)
+    AI_ROUND_TOTAL.labels(kind="round").set(ai_round_total)
+    AI_RETRY_TOTAL.labels(reason="retry").set(int(task_counts.get(TaskStatus.RETRY_PREPARING.value, 0)))
+    AI_TIMEOUT_TOTAL.labels(scope="task").set(failure_counts["timeout"])
+    for category, count in failure_counts.items():
+        AI_FAILURE_TOTAL.labels(category=category).set(count)
+    AI_TOKEN_USAGE_TOTAL.labels(type="input").set(aggregated["input"] if "aggregated" in locals() else 0.0)
+    AI_TOKEN_USAGE_TOTAL.labels(type="output").set(aggregated["output"] if "aggregated" in locals() else 0.0)
+    AI_TOKEN_USAGE_TOTAL.labels(type="cache_read").set(aggregated["cache_read"] if "aggregated" in locals() else 0.0)
+    AI_TOKEN_USAGE_TOTAL.labels(type="cache_write").set(aggregated["cache_write"] if "aggregated" in locals() else 0.0)
+    AI_TOKEN_USAGE_TOTAL.labels(type="total").set(total_tokens)
+    AI_TOKEN_COST_TOTAL.set(aggregated["total_cost"] if "aggregated" in locals() else 0.0)
+
+
+def _classify_ai_failure(task: object) -> str:
+    text = " ".join(
+        str(value or "")
+        for value in (
+            getattr(task, "status", None),
+            getattr(task, "result_status", None),
+            getattr(task, "result_message", None),
+            getattr(task, "error_message", None),
+            getattr(task, "archive_error_message", None),
+            getattr(task, "skill_generation_error", None),
+        )
+    ).lower()
+    if "timeout" in text or "timed out" in text or "deadline" in text:
+        return "timeout"
+    if "cancel" in text:
+        return "cancel"
+    if "validation" in text or "invalid" in text or "business" in text:
+        return "business"
+    if "error" in text or "failed" in text or "exception" in text:
+        return "runtime"
+    return "unknown"
