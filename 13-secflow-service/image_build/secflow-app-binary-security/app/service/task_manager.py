@@ -26,6 +26,7 @@ from app.config import get_config
 from app.exception import ConflictError, NotFoundError, ValidationError
 from app.model import (
     STAGE_SEQUENCE,
+    TASK_TERMINAL_STATUSES,
     TASK_STAGE_SEQUENCES,
     TASK_TYPE_BINARY,
     TASK_TYPE_SOURCE,
