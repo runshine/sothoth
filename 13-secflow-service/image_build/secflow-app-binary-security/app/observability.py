@@ -219,6 +219,26 @@ STAGE_DURATION_SECONDS = Histogram(
     labelnames=("stage", "result"),
     buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 900, 1800, 3600),
 )
+AI_ROLE_COUNT = Gauge(
+    "secflow_binary_security_ai_role_count",
+    "Aggregated AI-oriented orchestration role counts.",
+    labelnames=("role",),
+)
+AI_ROUND_TOTAL = Counter(
+    "secflow_binary_security_ai_round_total",
+    "Aggregated AI-oriented orchestration rounds.",
+    labelnames=("kind",),
+)
+AI_RETRY_TOTAL = Counter(
+    "secflow_binary_security_ai_retry_total",
+    "Aggregated AI-oriented orchestration retries.",
+    labelnames=("reason",),
+)
+AI_FAILURE_TOTAL = Counter(
+    "secflow_binary_security_ai_failure_total",
+    "Aggregated AI-oriented orchestration failures.",
+    labelnames=("category",),
+)
 
 ARCHIVE_DURATION_SECONDS = Histogram(
     "secflow_binary_security_archive_duration_seconds",
@@ -253,6 +273,12 @@ def observe_scheduler_loop(loop_name: str) -> Iterator[None]:
 
 def observe_task_operation(action: str, result: str) -> None:
     TASK_OPERATIONS_TOTAL.labels(action=action, result=result).inc()
+    action_key = str(action or "unknown")
+    result_key = str(result or "unknown")
+    if result_key == "accepted" and action_key in {"continue", "retry"}:
+        AI_RETRY_TOTAL.labels(reason=action_key).inc()
+    if action_key in {"module_selection", "confirm_module_selection"} and result_key == "accepted":
+        AI_ROUND_TOTAL.labels(kind="selection").inc()
 
 
 def observe_task_lifecycle(event: str, *, status: str, task_type: str) -> None:
@@ -274,11 +300,13 @@ def observe_task_duration(*, phase: str, duration_seconds: float | None, status:
 
 
 def observe_task_error(category: str, *, stage: str | None = None, result: str | None = None) -> None:
+    category_value = str(category or "unknown")
     TASK_ERRORS_TOTAL.labels(
-        category=str(category or "unknown"),
+        category=category_value,
         stage=str(stage or "none"),
         result=str(result or "unknown"),
     ).inc()
+    AI_FAILURE_TOTAL.labels(category=_ai_failure_category(category_value, result)).inc()
 
 
 def observe_archive_action(action: str, result: str) -> None:
@@ -366,6 +394,9 @@ def observe_queue_depths(
     QUEUE_DEPTH.labels(queue="downstream_reconcile_candidates").set(max(0, int(reconcile_candidates)))
     QUEUE_AGE_SECONDS.labels(queue="task_queued").set(max(0.0, float(task_queue_oldest_age_seconds or 0.0)))
     QUEUE_AGE_SECONDS.labels(queue="action_queued").set(max(0.0, float(action_queue_oldest_age_seconds or 0.0)))
+    AI_ROLE_COUNT.labels(role="agent").set(max(0, int(running_tasks + preparing_tasks)))
+    AI_ROLE_COUNT.labels(role="worker").set(max(0, int(redis_action_queue)))
+    AI_ROLE_COUNT.labels(role="advisor").set(max(0, int(reconcile_candidates)))
 
 
 def observe_slot_usage(*, task_active: int, task_capacity: int, action_active: int, action_capacity: int) -> None:
@@ -382,3 +413,24 @@ def observe_stage_duration(*, stage: str, result: str, duration_seconds: float |
         stage=str(stage or "unknown"),
         result=str(result or "unknown"),
     ).observe(max(0.0, float(duration_seconds)))
+    if str(result or "unknown") in {"success", "partial_success", "completed"}:
+        AI_ROUND_TOTAL.labels(kind="selection" if str(stage or "") == "system_analysis" else "round").inc()
+
+
+def _ai_failure_category(category: str, result: str | None) -> str:
+    text = f"{category} {result or ''}".lower()
+    if "timeout" in text:
+        return "timeout"
+    if "cancel" in text:
+        return "cancel"
+    if "quota" in text:
+        return "quota"
+    if "validation" in text or "quality" in text:
+        return "quality"
+    if "model" in text:
+        return "model"
+    if "business" in text or "module" in text:
+        return "business"
+    if "runtime" in text or "error" in text or "failed" in text or "retry" in text:
+        return "runtime"
+    return "unknown"

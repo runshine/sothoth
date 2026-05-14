@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from fastapi import Request, Response
@@ -208,7 +210,114 @@ def _snapshot_lines(db: Session) -> list[str]:
     lines.append(f"secflow_binary_to_source_review_issue_resolved_total {review_resolved}")
     lines.append(f"secflow_binary_to_source_review_issue_remaining_total {review_remaining}")
     lines.append(f"secflow_binary_to_source_review_passed_items {review_passed}")
+    _append_ai_snapshot_lines(
+        lines,
+        items=items,
+        worker_loads=worker_loads,
+        failure_type_counts=failure_type_counts,
+        review_attempts=review_attempts,
+        review_passed=review_passed,
+    )
     return lines
+
+
+def _append_ai_snapshot_lines(
+    lines: list[str],
+    *,
+    items: list[B2STaskItem],
+    worker_loads: dict[str, int],
+    failure_type_counts: dict[str, int],
+    review_attempts: float,
+    review_passed: float,
+) -> None:
+    token_totals = defaultdict(float)
+    session_total = 0
+    timeout_total = 0
+    retry_total = 0
+    review_fail_total = 0
+    for item in items:
+        metadata = item.extra_metadata if isinstance(item.extra_metadata, dict) else {}
+        review_fail_total += 1 if str(item.status or "").lower() not in {"passed", "success", "completed"} else 0
+        if "timeout" in str(item.error_reason or "").lower():
+            timeout_total += 1
+        if metadata:
+            retry_total += max(0.0, _safe_float(metadata.get("retry_count", metadata.get("attempt_count", 0))) - 1)
+        output_dir = Path(str(item.output_dir or "")).expanduser()
+        summary = _load_token_summary(output_dir)
+        for key, value in summary.items():
+            token_totals[key] += value
+        session_total += _count_session_files(output_dir / "agent_sessions")
+
+    total_tokens = (
+        token_totals["input"]
+        + token_totals["output"]
+        + token_totals["cache_read"]
+        + token_totals["cache_write"]
+    )
+    lines.extend([
+        '# HELP secflow_binary_to_source_ai_role_count Aggregated AI role counts for this service.',
+        '# TYPE secflow_binary_to_source_ai_role_count gauge',
+        '# HELP secflow_binary_to_source_ai_session_total Aggregated AI session count by role.',
+        '# TYPE secflow_binary_to_source_ai_session_total counter',
+        '# HELP secflow_binary_to_source_ai_round_total Aggregated AI round counts by kind.',
+        '# TYPE secflow_binary_to_source_ai_round_total counter',
+        '# HELP secflow_binary_to_source_ai_retry_total Aggregated AI retry counts by reason.',
+        '# TYPE secflow_binary_to_source_ai_retry_total counter',
+        '# HELP secflow_binary_to_source_ai_timeout_total Aggregated AI timeout counts by scope.',
+        '# TYPE secflow_binary_to_source_ai_timeout_total counter',
+        '# HELP secflow_binary_to_source_ai_failure_total Aggregated AI failures by category.',
+        '# TYPE secflow_binary_to_source_ai_failure_total counter',
+        '# HELP secflow_binary_to_source_ai_token_usage_total Aggregated AI token usage by type.',
+        '# TYPE secflow_binary_to_source_ai_token_usage_total counter',
+        '# HELP secflow_binary_to_source_ai_token_cost_total Aggregated AI token cost.',
+        '# TYPE secflow_binary_to_source_ai_token_cost_total counter',
+        '# HELP secflow_binary_to_source_ai_review_total Aggregated AI review outcomes.',
+        '# TYPE secflow_binary_to_source_ai_review_total counter',
+    ])
+    lines.append(f'secflow_binary_to_source_ai_role_count{{role="worker"}} {sum(worker_loads.values())}')
+    lines.append(f'secflow_binary_to_source_ai_role_count{{role="judge"}} {int(review_attempts)}')
+    lines.append(f'secflow_binary_to_source_ai_role_count{{role="validator"}} {int(review_attempts)}')
+    lines.append(f'secflow_binary_to_source_ai_session_total{{role="agent"}} {session_total}')
+    lines.append(f'secflow_binary_to_source_ai_round_total{{kind="review"}} {int(review_attempts)}')
+    lines.append(f'secflow_binary_to_source_ai_retry_total{{reason="retry"}} {max(0, int(retry_total))}')
+    lines.append(f'secflow_binary_to_source_ai_timeout_total{{scope="worker"}} {timeout_total}')
+    for category, count in sorted(failure_type_counts.items()):
+        lines.append(f'secflow_binary_to_source_ai_failure_total{{category="{category}"}} {count}')
+    lines.append(f'secflow_binary_to_source_ai_failure_total{{category="timeout"}} {timeout_total}')
+    lines.append(f'secflow_binary_to_source_ai_token_usage_total{{type="input"}} {int(token_totals["input"])}')
+    lines.append(f'secflow_binary_to_source_ai_token_usage_total{{type="output"}} {int(token_totals["output"])}')
+    lines.append(f'secflow_binary_to_source_ai_token_usage_total{{type="cache_read"}} {int(token_totals["cache_read"])}')
+    lines.append(f'secflow_binary_to_source_ai_token_usage_total{{type="cache_write"}} {int(token_totals["cache_write"])}')
+    lines.append(f'secflow_binary_to_source_ai_token_usage_total{{type="total"}} {int(total_tokens)}')
+    lines.append(f'secflow_binary_to_source_ai_token_cost_total {token_totals["cost"]}')
+    lines.append(f'secflow_binary_to_source_ai_review_total{{result="pass"}} {int(review_passed)}')
+    lines.append(f'secflow_binary_to_source_ai_review_total{{result="fail"}} {max(0, int(review_fail_total))}')
+
+
+def _load_token_summary(output_dir: Path) -> dict[str, float]:
+    totals = defaultdict(float)
+    if not output_dir.exists():
+        return totals
+    for path in output_dir.rglob("tokens_summary.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        total = payload.get("total") if isinstance(payload, dict) else {}
+        if not isinstance(total, dict):
+            continue
+        totals["input"] += _safe_float(total.get("input", total.get("prompt_tokens")))
+        totals["output"] += _safe_float(total.get("output", total.get("completion_tokens")))
+        totals["cache_read"] += _safe_float(total.get("cache_read", total.get("cacheRead")))
+        totals["cache_write"] += _safe_float(total.get("cache_write", total.get("cacheWrite")))
+        totals["cost"] += _safe_float(total.get("cost"))
+    return totals
+
+
+def _count_session_files(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(1 for item in path.rglob("*") if item.is_file())
 
 
 _observability: B2SObservability | None = None
