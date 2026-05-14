@@ -125,6 +125,45 @@ resolve_target_image() {
   echo "$(image_repo "${current_image}"):${requested}"
 }
 
+image_exists() {
+  local image="${1:-}"
+  [[ -n "${image}" ]] || return 1
+
+  if command -v docker >/dev/null 2>&1; then
+    docker manifest inspect "${image}" >/dev/null 2>&1 && return 0
+  fi
+
+  if command -v crane >/dev/null 2>&1; then
+    crane manifest "${image}" >/dev/null 2>&1 && return 0
+  fi
+
+  if command -v skopeo >/dev/null 2>&1; then
+    skopeo inspect "docker://${image}" >/dev/null 2>&1 && return 0
+  fi
+
+  return 1
+}
+
+assert_image_exists() {
+  local image="${1:-}"
+  local source_label="${2:-image}"
+  [[ -n "${image}" ]] || return 0
+
+  if [[ -n "${VALIDATED_IMAGES[${image}]+x}" ]]; then
+    return 0
+  fi
+
+  echo "[INFO] Validating ${source_label}: ${image}"
+  if ! image_exists "${image}"; then
+    echo "[ERROR] Image not found or registry metadata is unreachable: ${image}"
+    echo "        Refusing to continue before mutating Kubernetes resources."
+    echo "        Hint: confirm the image tag exists in GHCR, or pass an explicit image/tag that has been built."
+    exit 1
+  fi
+
+  VALIDATED_IMAGES["${image}"]=1
+}
+
 update_deployment_container() {
   local deployment="${1:-}"
   local container="${2:-}"
@@ -136,6 +175,7 @@ update_deployment_container() {
     echo "[INFO] ${deployment}/${container} already uses ${current_image}"
     return 0
   fi
+  assert_image_exists "${target_image}" "${deployment}/${container}"
   echo "[INFO] Updating ${deployment}/${container}"
   echo "       ${current_image} -> ${target_image}"
   kubectl -n "${NAMESPACE}" set image deployment/"${deployment}" "${container}"="${target_image}" >/dev/null
@@ -244,6 +284,8 @@ FRONTEND_IMAGE="$(resolve_image "${FRONTEND_IMAGE_ARG}" "${FRONTEND_IMAGE_REPO}"
 RESOURCE_IMAGE="$(resolve_image "${RESOURCE_IMAGE_ARG}" "${RESOURCE_IMAGE_REPO}")"
 GATEWAY_WORKER_IMAGE="$(resolve_image "${GATEWAY_WORKER_IMAGE_ARG}" "${GATEWAY_WORKER_IMAGE_REPO}")"
 FW_UNPACKER_IMAGE="$(resolve_image "${FW_UNPACKER_IMAGE_ARG}" "${FW_UNPACKER_IMAGE_REPO}")"
+
+declare -A VALIDATED_IMAGES=()
 
 if [[ -f "${SCRIPT_DIR}/images.env" ]]; then
   # shellcheck disable=SC1091
