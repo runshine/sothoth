@@ -221,6 +221,7 @@ class BinarySecurityOverviewBusinessDetail(BaseModel):
     total_items: int = 0
     success_items: int = 0
     failed_items: int = 0
+    downstream_missing_items: int = 0
     skipped_items: int = 0
     running_items: int = 0
     cancelled_items: int = 0

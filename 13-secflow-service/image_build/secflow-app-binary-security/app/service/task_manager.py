@@ -1756,8 +1756,41 @@ class TaskManager:
                             },
                         )
                     continue
-                terminal_status = mapped_status in {"success", "partial_success", "failed", "cancelled"}
+                terminal_status = mapped_status in {"success", "partial_success", "failed", "cancelled", "downstream_missing"}
                 if terminal_status:
+                    if mapped_status == "downstream_missing":
+                        if mapped_status != before_status:
+                            item.status = mapped_status
+                            item.error_message = "下游子任务不存在"
+                            item.finished_at = item.finished_at or _now()
+                            item.started_at = item.started_at or _now()
+                            item.result = {
+                                **(item.result or {}),
+                                "downstream": self._lightweight_downstream_payload(payload),
+                                "downstream_status_synced_at": _now().isoformat(),
+                            }
+                            touched_stages.add(item.stage_name)
+                            synced_count += 1
+                        else:
+                            skipped_count += 1
+                        if force or mapped_status != before_status or record_noop_events:
+                            self._record_event(
+                                db,
+                                task,
+                                "downstream_status_synced" if (force or mapped_status != before_status) else "downstream_status_sync_skipped",
+                                "下游子任务不存在，已更新当前阶段子任务状态" if (force or mapped_status != before_status) else "下游子任务不存在，当前状态未变化",
+                                stage_name=item.stage_name,
+                                item=item,
+                                level="warning",
+                                payload={
+                                    "downstream_service": item.downstream_service,
+                                    "downstream_task_id": item.downstream_task_id,
+                                    "before_status": before_status,
+                                    "downstream_status": downstream_status,
+                                    "after_status": mapped_status,
+                                },
+                            )
+                        continue
                     job = self._ensure_downstream_archive_job(
                         db,
                         task,
@@ -3082,7 +3115,7 @@ class TaskManager:
                 )
                 await self._persist_stage_run_output_summary_async(task, stage_run, summary)
                 stage_run.counts = self._stage_counts(db, stage_run)
-                if status in {"failed", "partial_success"}:
+                if status in {"failed", "partial_success", "downstream_missing"}:
                     stage_run.last_error = summary.get("error")
                 task.stage_summary = {
                     **task.stage_summary,
@@ -3605,8 +3638,8 @@ class TaskManager:
         if statuses and all(status == "success" for status in statuses):
             task.status = "success"
         elif vuln_run and vuln_run.status in {"success", "partial_success"}:
-            task.status = "partial_success" if any(status in {"failed", "partial_success"} for status in statuses) else "success"
-        elif any(status in {"failed", "partial_success"} for status in statuses):
+            task.status = "partial_success" if any(status in {"failed", "partial_success", "downstream_missing"} for status in statuses) else "success"
+        elif any(status in {"failed", "partial_success", "downstream_missing"} for status in statuses):
             task.status = "partial_success" if any(status == "success" for status in statuses) else "failed"
         else:
             task.status = "success"
@@ -4342,6 +4375,7 @@ class TaskManager:
             "total_items": len(items),
             "success_items": 0,
             "failed_items": 0,
+            "downstream_missing_items": 0,
             "skipped_items": 0,
             "running_items": 0,
             "cancelled_items": 0,
@@ -4389,6 +4423,7 @@ class TaskManager:
             "skipped": "skipped",
             "partial_success": "partial_success",
             "failed": "failed",
+            "downstream_missing": "downstream_missing",
             "cancelled": "cancelled",
             "waiting_confirmation": "waiting_confirmation",
         }.get(status, status)
@@ -4419,6 +4454,7 @@ class TaskManager:
                 "total_items": len(stage_items),
                 "success_items": len([item for item in stage_items if (self._normalize_downstream_status(item.status) or item.status) == "success"]),
                 "failed_items": len([item for item in stage_items if (self._normalize_downstream_status(item.status) or item.status) == "failed"]),
+                "downstream_missing_items": len([item for item in stage_items if (self._normalize_downstream_status(item.status) or item.status) == "downstream_missing"]),
                 "skipped_items": 0,
                 "running_items": len(
                     [
@@ -4490,6 +4526,7 @@ class TaskManager:
                 total_items=summary.total_items,
                 success_items=summary.success_items,
                 failed_items=summary.failed_items,
+                downstream_missing_items=summary.downstream_missing_items,
                 skipped_items=summary.skipped_items,
                 running_items=summary.running_items,
                 cancelled_items=downstream_status_counts.get("cancelled", 0),
@@ -5202,6 +5239,8 @@ class TaskManager:
 
     def _map_downstream_status(self, status: str) -> str | None:
         normalized = (status or "").lower()
+        if normalized in {"downstream_missing", "not_found", "missing", "task_not_found"}:
+            return "downstream_missing"
         if normalized in {"pending", "queued", "created", "dispatching", "ready", "ready_to_start"}:
             return "queued"
         if normalized in {"running", "processing", "in_progress", "cancelling", "started"}:
@@ -5228,12 +5267,16 @@ class TaskManager:
             return "running"
         if all(status == "success" for status in statuses):
             return "success"
-        if any(status == "success" for status in statuses) and any(status in {"failed", "cancelled", "partial_success"} for status in statuses):
+        if any(status == "success" for status in statuses) and any(status in {"failed", "cancelled", "partial_success", "downstream_missing"} for status in statuses):
             return "partial_success"
         if all(status == "cancelled" for status in statuses):
             return "cancelled"
+        if all(status == "downstream_missing" for status in statuses):
+            return "downstream_missing"
         if any(status in {"failed", "partial_success"} for status in statuses):
             return "failed"
+        if any(status == "downstream_missing" for status in statuses):
+            return "downstream_missing"
         return statuses[0]
 
     def _refresh_stage_run_from_items(self, db: Session, task: BinarySecurityTask, stage_name: str) -> None:
@@ -5247,7 +5290,14 @@ class TaskManager:
         status = self._aggregate_item_statuses([item.status for item in items])
         stage_run.status = status
         stage_run.counts = self._stage_counts(db, stage_run)
-        stage_run.last_error = next((item.error_message for item in items if item.status == "failed" and item.error_message), None)
+        stage_run.last_error = next(
+            (
+                item.error_message
+                for item in items
+                if item.status in {"failed", "downstream_missing"} and item.error_message
+            ),
+            None,
+        )
         self._merge_stage_run_output_summary(
             task,
             stage_run,
@@ -5336,7 +5386,7 @@ class TaskManager:
                 "failed_items": [
                     self._lightweight_stage_failure({"item": dict(item.input_ref or item.result or {}), "error": item.error_message})
                     for item in self._stage_items(db, task.id, "entry_analysis")
-                    if item.status in {"failed", "cancelled"}
+                    if item.status in {"failed", "cancelled", "downstream_missing"}
                 ],
                 "success_count": len(rebuilt),
                 "failed_count": int((stage_run.counts or {}).get("failed_items") or 0),
@@ -5361,7 +5411,7 @@ class TaskManager:
         failed = [
             {"status": item.status, "error": item.error_message, "item_key": item.item_key}
             for item in items
-            if item.status in {"failed", "cancelled"}
+            if item.status in {"failed", "cancelled", "downstream_missing"}
         ]
         all_modules: list[dict[str, Any]] = []
         for item in items:
@@ -5727,7 +5777,9 @@ class TaskManager:
         raise ValidationError(f"阶段 {stage_name} 未配置安全重试接口")
 
     def _has_retryable_downstream_task(self, item: BinarySecurityStageItem) -> bool:
-        return bool(str(item.downstream_task_id or "").strip())
+        if not str(item.downstream_task_id or "").strip():
+            return False
+        return str(item.status or "").strip().lower() != "downstream_missing"
 
     async def _active_downstream_payload(
         self,
@@ -6256,7 +6308,10 @@ class TaskManager:
         while True:
             await self._ensure_task_execution_current_async(task)
             await self._touch_task_heartbeat_async(task.id)
-            payload = await fetcher()
+            try:
+                payload = await fetcher()
+            except NotFoundError:
+                return "downstream_missing", {"status": "downstream_missing", "error": "下游子任务不存在"}
             await self._ensure_task_execution_current_async(task)
             status = str(payload.get("status") or "").lower()
             if status in success_statuses:
@@ -6396,7 +6451,7 @@ class TaskManager:
                 task=task,
                 item=item,
             )
-            mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
+            mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "downstream_missing" if status == "downstream_missing" else "failed"
             item.status = mapped_status
             item.error_message = None if mapped_status in {"success", "partial_success"} else (
                 payload.get("error") or payload.get("error_message") or payload.get("message")
@@ -6662,7 +6717,7 @@ class TaskManager:
                 except Exception:
                     result_payload = {}
             archive_payload = {**payload, **({"result": result_payload} if result_payload else {})}
-            mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
+            mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "downstream_missing" if status == "downstream_missing" else "failed"
             item.status = mapped_status
             item.finished_at = _now()
             archive_root, archive_job = await self._queue_archive_and_wait(
@@ -7422,7 +7477,7 @@ class TaskManager:
                     src = Path(file_path)
                     if src.exists():
                         extra_paths.append(str(src.parent))
-            mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
+            mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "downstream_missing" if status == "downstream_missing" else "failed"
             item.status = mapped_status
             item.finished_at = _now()
             archived_dir, archive_job = await self._queue_archive_and_wait(
@@ -7545,7 +7600,7 @@ class TaskManager:
                 item=item,
             )
             entries = self._parse_entries(service_output, module)
-            mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
+            mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "downstream_missing" if status == "downstream_missing" else "failed"
             item.status = mapped_status
             item.finished_at = _now()
             archived_dir, archive_job = await self._queue_archive_and_wait(
@@ -7895,7 +7950,7 @@ class TaskManager:
                 "artifacts": artifacts,
                 "workspace_root": artifacts.get("workspace_root"),
             }
-            mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
+            mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "downstream_missing" if status == "downstream_missing" else "failed"
             item.status = mapped_status
             item.finished_at = _now()
             archived_dir, archive_job = await self._queue_archive_and_wait(
