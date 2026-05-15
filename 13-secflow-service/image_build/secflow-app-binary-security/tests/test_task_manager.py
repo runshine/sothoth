@@ -2572,6 +2572,86 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("下游子任务不存在", item.error_message)
         self.assertEqual(1, resp.synced_downstream_count)
 
+    def test_sync_downstream_status_keeps_all_missing_children_after_multiple_404s(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item1 = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="entry_analysis",
+            item_key="m1",
+            parent_key="source_project",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_missing_1",
+        )
+        item2 = BinarySecurityStageItem(
+            id="si2",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="entry_analysis",
+            item_key="m2",
+            parent_key="source_project",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_missing_2",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item1, item2])
+
+        original_fetch = self.manager._fetch_downstream_task_payload
+        original_write = self.manager._write_task_metadata_async
+        original_enqueue = self.manager._enqueue_task
+
+        async def _raise_missing(*_args, **_kwargs):
+            raise NotFoundError("Task not found")
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._fetch_downstream_task_payload = _raise_missing
+        self.manager._write_task_metadata_async = _noop_write
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        try:
+            resp = asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id="p1",
+                    task_id="s1",
+                    stage_name="entry_analysis",
+                )
+            )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+            self.manager._write_task_metadata_async = original_write
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual("downstream_missing", item1.status)
+        self.assertEqual("下游子任务不存在", item1.error_message)
+        self.assertEqual("downstream_missing", item2.status)
+        self.assertEqual("下游子任务不存在", item2.error_message)
+        self.assertEqual(2, resp.synced_downstream_count)
+
     def test_stage_retry_support_still_rejects_downstream_service_mismatch(self):
         task = BinarySecurityTask(
             id="s1",
