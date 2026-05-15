@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.exception import UnauthorizedError
 from app.model import get_db
-from app.runtime_health import collect_readiness
+from app.runtime_health import collect_liveness, collect_readiness
 from app.schemas import (
     BinarySecurityActionResponse,
     BinarySecurityArtifactsResponse,
@@ -65,7 +65,10 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> Token
 
 @router.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "secflow-app-binary-security"}
+    return {
+        "service": "secflow-app-binary-security",
+        **collect_liveness(),
+    }
 
 
 @router.get("/ready")

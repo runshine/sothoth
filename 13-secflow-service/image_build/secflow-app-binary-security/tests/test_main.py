@@ -58,10 +58,10 @@ class MainRoleTests(unittest.TestCase):
         async def fake_collect():
             return {
                 "status": "not_ready",
+                "role": "worker",
                 "checks": {
-                    "database": {"ok": False, "detail": "db down"},
-                    "data_mount": {"ok": True, "detail": "ok"},
-                    "auth_service": {"ok": True, "detail": "ok"},
+                    "process": {"ok": True, "detail": "alive"},
+                    "scheduler": {"ok": False, "detail": {"missing_loops": ["task_dispatch"]}},
                 },
             }
 
@@ -76,10 +76,10 @@ class MainRoleTests(unittest.TestCase):
         async def fake_collect():
             return {
                 "status": "ready",
+                "role": "worker",
                 "checks": {
-                    "database": {"ok": True, "detail": "ok"},
-                    "data_mount": {"ok": True, "detail": "ok"},
-                    "auth_service": {"ok": True, "detail": "ok"},
+                    "process": {"ok": True, "detail": "alive"},
+                    "scheduler": {"ok": True, "detail": {"missing_loops": []}},
                 },
             }
 
@@ -89,6 +89,15 @@ class MainRoleTests(unittest.TestCase):
             response = asyncio.run(task_routes.ready_check())
         self.assertEqual(200, response.status_code)
         self.assertIn("ready", response.body.decode("utf-8", errors="ignore"))
+
+    def test_health_route_returns_lightweight_payload(self):
+        from app.api import tasks as task_routes
+
+        with patch("app.api.tasks.collect_liveness", return_value={"status": "ok", "role": "worker", "checks": {"process": {"ok": True}}}):
+            payload = asyncio.run(task_routes.health_check())
+        self.assertEqual("ok", payload["status"])
+        self.assertEqual("worker", payload["role"])
+        self.assertEqual("secflow-app-binary-security", payload["service"])
 
 
 if __name__ == "__main__":
