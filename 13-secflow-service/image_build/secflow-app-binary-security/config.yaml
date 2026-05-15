@@ -68,7 +68,7 @@ services:
     base_url: "http://secflow-app-system-analyse/api/app/system-analyse"
     timeout: 60
   binary_to_source:
-    base_url: "http://secflow-app-binary-to-source/api/app/binary-to-source"
+    base_url: "http://secflow-app-binary-to-source-manager/api/app/binary-to-source"
     timeout: 60
   entry_analyse:
     base_url: "http://secflow-app-entry-analyse/api/app/entry-analyse"

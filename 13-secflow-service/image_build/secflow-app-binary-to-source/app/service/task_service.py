@@ -9,6 +9,7 @@ import shutil
 from datetime import datetime, timezone
 import re
 from pathlib import Path
+from statistics import mean
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
@@ -17,9 +18,48 @@ from app.config import get_config
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
 from app.model import B2STask, B2STaskItem
 from app.observability import get_observability
-from app.schemas import AdvancedBatch, AdvancedFile, AdvancedRun, B2SArtifact, B2SArtifactContentResponse, B2SOverallProgress, ReviewAnalyticsAttempt, ReviewAnalyticsDimension, ReviewAnalyticsFunction, ReviewAnalyticsFunctionAttempt, ReviewAnalyticsIssue, ReviewAnalyticsMeta, ReviewAnalyticsRadar, ReviewAnalyticsResponse, ReviewAnalyticsSummary, ReviewAnalyticsTrendInsight, ReviewAnalyticsTrendPoint, ReviewAnalyticsTrendSeries, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskItemResponse, TaskResponse
+from app.schemas import (
+    AdvancedBatch,
+    AdvancedFile,
+    AdvancedRun,
+    AgentRuntimeEntry,
+    AgentRuntimeSummary,
+    B2SArtifact,
+    B2SArtifactContentResponse,
+    B2SOverallProgress,
+    RelationshipEdge,
+    RelationshipNode,
+    ReviewAnalyticsAttempt,
+    ReviewAnalyticsDimension,
+    ReviewAnalyticsFunction,
+    ReviewAnalyticsFunctionAttempt,
+    ReviewAnalyticsIssue,
+    ReviewAnalyticsMeta,
+    ReviewAnalyticsRadar,
+    ReviewAnalyticsResponse,
+    ReviewAnalyticsSummary,
+    ReviewAnalyticsTrendInsight,
+    ReviewAnalyticsTrendPoint,
+    ReviewAnalyticsTrendSeries,
+    SessionFileResponse,
+    SessionIndexNode,
+    SessionIndexResponse,
+    TaskConfigInputItem,
+    TaskConfigSnapshot,
+    TaskCreate,
+    TaskDetailResponse,
+    TaskItemAdvancedResponse,
+    TaskItemArtifactsResponse,
+    TaskItemResponse,
+    TaskObservabilityItem,
+    TaskObservabilitySummary,
+    TaskRelationshipResponse,
+    TaskResponse,
+    TaskResultItemSummary,
+    TaskResultSummary,
+)
 from app.service.config_service import get_config_service, normalize_budget_exhausted_action
-from app.service.llm_provider import resolve_job_model
+from app.service.llm_provider import materialize_llm_provider
 from app.service.pi_re_agent import get_pi_client
 from app.service.security import app_task_item_root, app_task_root, ensure_path_in_project, project_root, safe_input_dir, safe_output_dir, validate_task_id
 from app.time_utils import isoformat_local, now_local
@@ -79,6 +119,26 @@ def _budget_exhausted_action_for_item(db: Session, item: B2STaskItem) -> str:
     if frozen:
         return normalize_budget_exhausted_action(str(frozen))
     return _budget_exhausted_action_for_project(db, item.project_id)
+
+
+def _normalize_llm_provider_key(value: object) -> str | None:
+    key = str(value or "").strip()
+    return key or None
+
+
+def _provider_model_name(provider: dict | None) -> str | None:
+    if not provider:
+        return None
+    provider_key = _normalize_llm_provider_key(provider.get("provider_key"))
+    model = _normalize_llm_provider_key(provider.get("model"))
+    if not provider_key or not model:
+        return None
+    return f"{provider_key}/{model}"
+
+
+def _project_default_llm_provider_key(db: Session, project_id: str) -> str | None:
+    cfg = get_config_service().get_config(db, project_id)
+    return _normalize_llm_provider_key(cfg.get("llm_provider_key"))
 
 
 def _is_budget_exhausted_failure(job: dict | None, error_reason: str | None = None) -> bool:
@@ -212,9 +272,15 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
     db.add(task)
     db.flush()
 
-    pi_cfg = get_config().pi_re_agent
-    llm_provider_key = (req.llm_provider_key or "").strip() or None
-    job_model = await resolve_job_model(llm_provider_key)
+    cfg = get_config()
+    pi_cfg = cfg.pi_re_agent
+    request_provider_key = _normalize_llm_provider_key(req.llm_provider_key)
+    project_provider_key = _project_default_llm_provider_key(db, project_id)
+    effective_provider_key = request_provider_key or project_provider_key
+    provider = await materialize_llm_provider(effective_provider_key) if cfg.configcenter_service.enabled else None
+    job_model = _provider_model_name(provider) or pi_cfg.model
+    frozen_provider_key = _normalize_llm_provider_key(provider.get("provider_key") if provider else effective_provider_key)
+    frozen_provider_model = _normalize_llm_provider_key(provider.get("model") if provider else job_model)
     job_concurrency = req.concurrency if req.concurrency and req.concurrency > 0 else pi_cfg.concurrency
     job_timeout_seconds = req.agent_run_timeout_seconds if req.agent_run_timeout_seconds is not None else pi_cfg.agent_run_timeout_seconds
     job_timeout_retry_enabled = req.agent_timeout_retry_enabled if req.agent_timeout_retry_enabled is not None else pi_cfg.agent_timeout_retry_enabled
@@ -248,7 +314,10 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             "parent_stage_item_key": req.parent_stage_item_key,
             "file_list": elf.file_list or [],
             "source_elf_path": str(source_elf_path),
-            "llm_provider_key": llm_provider_key,
+            "llm_provider_key": frozen_provider_key,
+            "llm_provider_model": frozen_provider_model,
+            "llm_provider_display_name": str(provider.get("display_name") or "").strip() if provider else None,
+            "llm_provider_type": str(provider.get("provider_type") or "").strip() if provider else None,
             "concurrency": job_concurrency,
             "agent_run_timeout_seconds": job_timeout_seconds,
             "agent_timeout_retry_enabled": job_timeout_retry_enabled,
@@ -440,23 +509,26 @@ async def delete_task(db: Session, task: B2STask) -> None:
 
 async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, cancel_running: bool = True) -> None:
     """Fully rerun all items of a task while keeping taskId and input files."""
+    if not clean_output:
+        raise ValidationError("rerun仅支持清空output后从头重跑")
+    if not cancel_running:
+        raise ValidationError("rerun仅支持先终止未完成job后再重跑")
     pi_cfg = get_config().pi_re_agent
     items = query_items(db, task.id)
     if not items:
         raise NotFoundError("任务没有可重跑的任务项")
-    selected_provider_keys = [
-        str((i.extra_metadata or {}).get("llm_provider_key") or "").strip()
-        for i in items
-        if str((i.extra_metadata or {}).get("llm_provider_key") or "").strip()
-    ]
-    job_model = await resolve_job_model(selected_provider_keys[0] if selected_provider_keys else None)
+    selected_provider_key = _normalize_llm_provider_key((items[0].extra_metadata or {}).get("llm_provider_key")) or _project_default_llm_provider_key(db, task.project_id)
+    provider = await materialize_llm_provider(selected_provider_key) if get_config().configcenter_service.enabled else None
+    job_model = _provider_model_name(provider) or get_config().pi_re_agent.model
 
     for item in items:
         if cancel_running and item.pi_job_id and item.status not in TERMINAL:
             try:
                 await get_pi_client(item_pi_worker_url(item)).cancel_job(item.pi_job_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                raise ValidationError(
+                    f"无法安全重跑：终止旧job失败，item={item.sequence_no} job_id={item.pi_job_id} error={exc}"
+                ) from exc
 
         if clean_output:
             item.output_dir = str(clean_item_output_dir(task.project_id, task.id, item.sequence_no, item.output_dir))
@@ -469,6 +541,11 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
         worker_url = await choose_pi_worker(db, task.id, item.sequence_no)
         metadata = item.extra_metadata or {}
         metadata["pi_worker_url"] = worker_url
+        if provider:
+            metadata["llm_provider_key"] = _normalize_llm_provider_key(provider.get("provider_key"))
+            metadata["llm_provider_model"] = _normalize_llm_provider_key(provider.get("model"))
+            metadata["llm_provider_display_name"] = str(provider.get("display_name") or "").strip() or None
+            metadata["llm_provider_type"] = str(provider.get("provider_type") or "").strip() or None
         item.extra_metadata = metadata
         item.status = "queued"
         item.phase = "queued"
@@ -520,14 +597,11 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
     pi_cfg = get_config().pi_re_agent
     items = query_items(db, task.id)
     selected = [i for i in items if item_ids is None or i.id in item_ids]
-    selected_provider_keys = [
-        str((i.extra_metadata or {}).get("llm_provider_key") or "").strip()
-        for i in selected
-        if str((i.extra_metadata or {}).get("llm_provider_key") or "").strip()
-    ]
-    job_model = await resolve_job_model(selected_provider_keys[0] if selected_provider_keys else None)
     if not selected:
         raise NotFoundError("未找到可重试的任务项")
+    selected_provider_key = _normalize_llm_provider_key((selected[0].extra_metadata or {}).get("llm_provider_key")) or _project_default_llm_provider_key(db, task.project_id)
+    provider = await materialize_llm_provider(selected_provider_key) if get_config().configcenter_service.enabled else None
+    job_model = _provider_model_name(provider) or get_config().pi_re_agent.model
     for item in selected:
         if item.status not in {"failed", "cancelled"}:
             continue
@@ -539,6 +613,11 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
         worker_url = await choose_pi_worker(db, task.id, item.sequence_no)
         metadata = item.extra_metadata or {}
         metadata["pi_worker_url"] = worker_url
+        if provider:
+            metadata["llm_provider_key"] = _normalize_llm_provider_key(provider.get("provider_key"))
+            metadata["llm_provider_model"] = _normalize_llm_provider_key(provider.get("model"))
+            metadata["llm_provider_display_name"] = str(provider.get("display_name") or "").strip() or None
+            metadata["llm_provider_type"] = str(provider.get("provider_type") or "").strip() or None
         item.extra_metadata = metadata
         job = await get_pi_client(worker_url).create_job({
             "target": item.elf_path,
@@ -779,6 +858,23 @@ def task_mode_summary(items: list[B2STaskItem]) -> tuple[str | None, str | None]
     return "mixed", "混合模式"
 
 
+def task_input_filenames(items: list[B2STaskItem]) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        metadata = item.extra_metadata or {}
+        filename = (
+            str(metadata.get("uploaded_filename") or "").strip()
+            or str(metadata.get("source_filename") or "").strip()
+            or Path(str(metadata.get("source_elf_path") or item.elf_path or "")).name
+        )
+        if not filename or filename in seen:
+            continue
+        seen.add(filename)
+        names.append(filename)
+    return names
+
+
 def build_task_response(db: Session, task: B2STask) -> TaskResponse:
     items = query_items(db, task.id)
     counts = count_status(items)
@@ -789,6 +885,7 @@ def build_task_response(db: Session, task: B2STask) -> TaskResponse:
         **_task_origin_payload(task),
         mode=mode,
         mode_label=mode_label,
+        input_filenames=task_input_filenames(items),
         name=task.name,
         status=task.status,
         total_items=len(items),
@@ -831,7 +928,91 @@ def build_task_detail(db: Session, task: B2STask) -> TaskDetailResponse:
         )
         for i in raw_items
     ]
-    return TaskDetailResponse(**base, overall_progress=build_overall_progress(raw_items), items=items)
+    return TaskDetailResponse(
+        **base,
+        overall_progress=build_overall_progress(raw_items),
+        items=items,
+        task_config_snapshot=build_task_config_snapshot(task, raw_items),
+        effective_llm_provider=build_effective_llm_provider(raw_items),
+        agent_runtime_summary=build_agent_runtime_summary(raw_items),
+        result_summary=build_task_result_summary(raw_items),
+        observability_summary=build_task_observability_summary(raw_items),
+    )
+
+
+def _item_metadata_value(item: B2STaskItem, key: str):
+    return (item.extra_metadata or {}).get(key)
+
+
+def _first_non_empty(items: list[B2STaskItem], key: str):
+    for item in items:
+        value = _item_metadata_value(item, key)
+        if value not in (None, "", []):
+            return value
+    return None
+
+
+def _item_output_subdir(item: B2STaskItem) -> str | None:
+    source = str((_item_metadata_value(item, "source_elf_path") or "")).strip()
+    try:
+        output_path = Path(item.output_dir)
+        source_name = Path(source).stem if source else ""
+        if source_name and output_path.name == source_name:
+            return source_name
+        return output_path.name or None
+    except Exception:
+        return None
+
+
+def build_task_config_snapshot(task: B2STask, items: list[B2STaskItem]) -> TaskConfigSnapshot:
+    mode, mode_label = task_mode_summary(items)
+    input_items = [
+        TaskConfigInputItem(
+            item_id=item.id,
+            sequence_no=item.sequence_no,
+            elf_path=item.elf_path,
+            source_elf_path=str(_item_metadata_value(item, "source_elf_path") or "").strip() or None,
+            output_dir=item.output_dir,
+            output_subdir=_item_output_subdir(item),
+            file_list=list(_item_metadata_value(item, "file_list") or []),
+        )
+        for item in items
+    ]
+    return TaskConfigSnapshot(
+        name=task.name,
+        description=task.description,
+        priority=task.priority,
+        tags=task.tags,
+        **_task_origin_payload(task),
+        mode=mode,
+        mode_label=mode_label,
+        engine=str(_first_non_empty(items, "engine") or "").strip() or None,
+        llm_provider_key=str(_first_non_empty(items, "llm_provider_key") or "").strip() or None,
+        llm_provider_display_name=str(_first_non_empty(items, "llm_provider_display_name") or "").strip() or None,
+        llm_provider_type=str(_first_non_empty(items, "llm_provider_type") or "").strip() or None,
+        llm_provider_model=str(_first_non_empty(items, "llm_provider_model") or "").strip() or None,
+        concurrency=int(_first_non_empty(items, "concurrency") or 0) or None,
+        agent_run_timeout_seconds=int(_first_non_empty(items, "agent_run_timeout_seconds") or 0) or None,
+        agent_timeout_retry_enabled=bool(_first_non_empty(items, "agent_timeout_retry_enabled")) if _first_non_empty(items, "agent_timeout_retry_enabled") is not None else None,
+        agent_timeout_max_retries=int(_first_non_empty(items, "agent_timeout_max_retries") or 0) or None,
+        budget_exhausted_action=str(_first_non_empty(items, "budget_exhausted_action") or "").strip() or None,
+        input_count=len(input_items),
+        input_items=input_items,
+    )
+
+
+def build_effective_llm_provider(items: list[B2STaskItem]) -> dict | None:
+    provider_key = str(_first_non_empty(items, "llm_provider_key") or "").strip()
+    if not provider_key:
+        return None
+    return {
+        "provider_key": provider_key,
+        "display_name": str(_first_non_empty(items, "llm_provider_display_name") or "").strip() or None,
+        "provider_type": str(_first_non_empty(items, "llm_provider_type") or "").strip() or None,
+        "enabled": True,
+        "is_default": False,
+        "model": str(_first_non_empty(items, "llm_provider_model") or "").strip() or None,
+    }
 
 
 ADVANCED_TEXT_EXTENSIONS = {".c", ".h", ".json", ".jsonl", ".md", ".txt", ".log", ".yaml", ".yml"}
@@ -1419,6 +1600,430 @@ def build_task_item_artifact_content(item: B2STaskItem, artifact_id: str, offset
         truncated=bool(next_offset),
         next_offset=next_offset,
     )
+
+
+def _safe_iso(dt: datetime | None) -> str | None:
+    return isoformat_local(dt) if dt else None
+
+
+def _session_relative_to_output(item: B2STaskItem, full_path: str) -> str:
+    try:
+        return str(Path(full_path).resolve().relative_to(Path(item.output_dir).resolve()))
+    except Exception:
+        return Path(full_path).name
+
+
+def build_task_session_index(items: list[B2STaskItem]) -> SessionIndexResponse:
+    nodes: list[SessionIndexNode] = []
+    warnings: list[str] = []
+    for item in items:
+        try:
+            advanced = build_task_item_advanced(item, include_content=False)
+            is_active = item.status not in TERMINAL
+            item_name = Path(item.elf_path).name
+            for run in advanced.runs:
+                for session in run.agent_sessions:
+                    nodes.append(SessionIndexNode(
+                        node_id=f"{item.id}:{hashlib.md5(session.path.encode('utf-8')).hexdigest()[:12]}",
+                        item_id=item.id,
+                        sequence_no=item.sequence_no,
+                        item_name=item_name,
+                        run_name=run.name,
+                        stage=session.stage or "Agent 会话",
+                        stage_order=int(session.stage_order or 0),
+                        section=session.section,
+                        round=session.round,
+                        round_order=session.round_order,
+                        agent=session.agent,
+                        role=session.role,
+                        batch_no=session.batch_no,
+                        attempt_no=session.attempt_no,
+                        relative_path=_session_relative_to_output(item, session.path),
+                        full_path=session.path,
+                        size=session.size,
+                        updated_at=_safe_iso(item.updated_at),
+                        is_active=is_active,
+                        kind=session.kind,
+                    ))
+        except Exception as exc:
+            warnings.append(f"item #{item.sequence_no} 会话索引构建失败: {exc}")
+    nodes.sort(key=lambda node: (node.sequence_no, node.stage_order, node.run_name, node.batch_no or 0, node.attempt_no or 0, node.relative_path))
+    return SessionIndexResponse(
+        task_id=items[0].task_id if items else "",
+        nodes=nodes,
+        warnings=warnings,
+        generated_at=isoformat_local(now_local()),
+    )
+
+
+def build_task_session_file(items: list[B2STaskItem], relative_path: str, offset: int = 0, limit: int = ADVANCED_MAX_BYTES) -> SessionFileResponse:
+    normalized = str(relative_path or "").replace("\\", "/").lstrip("/")
+    if not normalized:
+        raise NotFoundError("会话文件路径不能为空")
+    for item in items:
+        candidate = Path(item.output_dir).joinpath(normalized).resolve()
+        try:
+            candidate.relative_to(Path(item.output_dir).resolve())
+        except Exception:
+            continue
+        if not candidate.is_file():
+            continue
+        size = candidate.stat().st_size
+        safe_offset = max(0, int(offset or 0))
+        safe_limit = max(1, min(int(limit or ADVANCED_MAX_BYTES), ADVANCED_MAX_BYTES))
+        with candidate.open("rb") as fp:
+            fp.seek(safe_offset)
+            raw = fp.read(safe_limit + 1)
+        truncated = len(raw) > safe_limit
+        content = raw[:safe_limit].decode("utf-8", errors="replace")
+        next_offset = safe_offset + safe_limit if truncated or safe_offset + len(raw[:safe_limit]) < size else None
+        suffix = candidate.suffix.lower()
+        mime_type = "application/json" if suffix in {".json", ".jsonl"} else "text/markdown" if suffix == ".md" else "text/plain"
+        return SessionFileResponse(
+            task_id=item.task_id,
+            relative_path=normalized,
+            full_path=str(candidate),
+            size=size,
+            content=content,
+            truncated=bool(next_offset),
+            next_offset=next_offset,
+            offset=safe_offset,
+            limit=safe_limit,
+            mime_type=mime_type,
+        )
+    raise NotFoundError("会话文件不存在")
+
+
+def _count_item_sessions(advanced: TaskItemAdvancedResponse) -> int:
+    return sum(len(run.agent_sessions) for run in advanced.runs)
+
+
+def _count_item_reviews(advanced: TaskItemAdvancedResponse) -> int:
+    return sum(len(batch.reviews) for run in advanced.runs for batch in run.batches)
+
+
+def _count_item_batches(advanced: TaskItemAdvancedResponse) -> int:
+    return sum(len(run.batches) for run in advanced.runs)
+
+
+def _item_duration_ms(item: B2STaskItem) -> int | None:
+    if not item.started_at:
+        return None
+    end = item.finished_at or now_local()
+    delta = end - item.started_at
+    return max(0, int(delta.total_seconds() * 1000))
+
+
+def _empty_review_analytics(item: B2STaskItem) -> ReviewAnalyticsResponse:
+    return ReviewAnalyticsResponse(
+        task_id=item.task_id,
+        item_id=item.id,
+        status="empty",
+        meta=ReviewAnalyticsMeta(generated_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), mock=False, data_quality="empty"),
+        summary=ReviewAnalyticsSummary(
+            attempts=0,
+            attempt_count=0,
+            final_verdict="UNKNOWN",
+            final_verdict_label="未评审",
+            final_confidence=0,
+            final_quality_score=0,
+            final_quality_label="暂无",
+            initial_quality_score=0,
+            quality_delta=0,
+            quality_delta_percent=0,
+            issue_total=0,
+            issue_resolved=0,
+            issue_remaining=0,
+            issue_closure_rate=0,
+            residual_risk="unknown",
+            residual_risk_label="未知",
+            mock=False,
+        ),
+        attempts=[],
+        issues=[],
+        dimensions=[],
+        trend=None,
+        function_matrix=[],
+        radar=[],
+        trend_insight=None,
+    )
+
+
+def _task_level_review_analytics(item: B2STaskItem, advanced: TaskItemAdvancedResponse | None = None) -> ReviewAnalyticsResponse:
+    loaded = advanced or build_task_item_advanced(item, include_content=True)
+    has_reviews = any(batch.reviews for run in loaded.runs for batch in run.batches)
+    if not has_reviews:
+        return _empty_review_analytics(item)
+    return build_task_item_review_analytics(item, mock=False)
+
+
+def build_task_result_summary(items: list[B2STaskItem]) -> TaskResultSummary:
+    summaries: list[TaskResultItemSummary] = []
+    total_result_files = 0
+    total_sessions = 0
+    total_review_rounds = 0
+    success_items = partial_items = failed_items = cancelled_items = 0
+    for item in items:
+        advanced = build_task_item_advanced(item, include_content=False)
+        analytics = _task_level_review_analytics(item)
+        artifact_paths = normalize_generated_files(item)
+        result_file_count = len(artifact_paths)
+        total_result_files += result_file_count
+        session_count = _count_item_sessions(advanced)
+        total_sessions += session_count
+        review_round_count = int(analytics.summary.attempt_count or analytics.summary.attempts or 0)
+        total_review_rounds += review_round_count
+        if item.status == "success":
+            success_items += 1
+        elif item.status == "failed":
+            failed_items += 1
+        elif item.status == "cancelled":
+            cancelled_items += 1
+        elif item.status == "completed":
+            partial_items += 1
+        summaries.append(TaskResultItemSummary(
+            item_id=item.id,
+            sequence_no=item.sequence_no,
+            item_name=Path(item.elf_path).name,
+            elf_path=item.elf_path,
+            output_dir=item.output_dir,
+            status=item.status,
+            result_file_count=result_file_count,
+            key_result_files=artifact_paths[:6],
+            session_file_count=session_count,
+            review_round_count=review_round_count,
+            final_verdict=analytics.summary.final_verdict,
+            final_verdict_label=analytics.summary.final_verdict_label,
+        ))
+    return TaskResultSummary(
+        task_id=items[0].task_id if items else "",
+        success_items=success_items,
+        partial_items=partial_items,
+        failed_items=failed_items,
+        cancelled_items=cancelled_items,
+        result_file_count=total_result_files,
+        session_file_count=total_sessions,
+        review_round_count=total_review_rounds,
+        items=sorted(summaries, key=lambda entry: entry.sequence_no),
+    )
+
+
+def build_agent_runtime_summary(items: list[B2STaskItem]) -> AgentRuntimeSummary:
+    active_agents: list[AgentRuntimeEntry] = []
+    total_sessions = 0
+    for item in items:
+        if item.status in TERMINAL:
+            continue
+        advanced = build_task_item_advanced(item, include_content=False)
+        item_name = Path(item.elf_path).name
+        for run in advanced.runs:
+            for session in run.agent_sessions:
+                total_sessions += 1
+                active_agents.append(AgentRuntimeEntry(
+                    key=f"{item.id}:{session.path}",
+                    label=session.agent or session.role or session.name,
+                    item_id=item.id,
+                    sequence_no=item.sequence_no,
+                    item_name=item_name,
+                    run_name=run.name,
+                    stage=session.stage,
+                    agent=session.agent,
+                    role=session.role,
+                    batch_no=session.batch_no,
+                    attempt_no=session.attempt_no,
+                    relative_path=_session_relative_to_output(item, session.path),
+                    full_path=session.path,
+                    updated_at=_safe_iso(item.updated_at),
+                    is_active=True,
+                    size=session.size,
+                ))
+    def _count_by(keyword: str) -> int:
+        return sum(1 for entry in active_agents if keyword in str(entry.agent or "").lower())
+    return AgentRuntimeSummary(
+        total_sessions=total_sessions,
+        active_agent_count=len(active_agents),
+        header_agent_count=_count_by("header"),
+        executor_agent_count=_count_by("executor"),
+        validator_agent_count=_count_by("validator"),
+        active_agents=active_agents[:24],
+    )
+
+
+def build_task_observability_summary(items: list[B2STaskItem]) -> TaskObservabilitySummary:
+    rows: list[TaskObservabilityItem] = []
+    durations: list[int] = []
+    total_batches = total_sessions = total_attempts = 0
+    passed_items = issue_total = issue_resolved = issue_remaining = 0
+    confidence_scores: list[int] = []
+    quality_scores: list[int] = []
+    risk_distribution: dict[str, int] = {}
+    overall_progress = build_overall_progress(items)
+    for item in items:
+        advanced = build_task_item_advanced(item, include_content=False)
+        analytics = _task_level_review_analytics(item)
+        duration_ms = _item_duration_ms(item)
+        if duration_ms is not None:
+            durations.append(duration_ms)
+        batch_count = _count_item_batches(advanced)
+        session_count = _count_item_sessions(advanced)
+        attempt_count = int(analytics.summary.attempt_count or analytics.summary.attempts or 0)
+        total_batches += batch_count
+        total_sessions += session_count
+        total_attempts += attempt_count
+        if str(analytics.summary.final_verdict or "").upper() == "PASS":
+            passed_items += 1
+        issue_total += int(analytics.summary.issue_total or 0)
+        issue_resolved += int(analytics.summary.issue_resolved or 0)
+        issue_remaining += int(analytics.summary.issue_remaining or 0)
+        confidence_scores.append(int(analytics.summary.final_confidence or 0))
+        quality_scores.append(int(analytics.summary.final_quality_score or 0))
+        risk_key = str(analytics.summary.residual_risk or "unknown")
+        risk_distribution[risk_key] = risk_distribution.get(risk_key, 0) + 1
+        rows.append(TaskObservabilityItem(
+            item_id=item.id,
+            sequence_no=item.sequence_no,
+            item_name=Path(item.elf_path).name,
+            status=item.status,
+            duration_ms=duration_ms,
+            batch_count=batch_count,
+            session_count=session_count,
+            attempt_count=attempt_count,
+            final_verdict=analytics.summary.final_verdict,
+            final_confidence=int(analytics.summary.final_confidence or 0),
+            final_quality_score=int(analytics.summary.final_quality_score or 0),
+            issue_total=int(analytics.summary.issue_total or 0),
+            issue_resolved=int(analytics.summary.issue_resolved or 0),
+            issue_remaining=int(analytics.summary.issue_remaining or 0),
+        ))
+    total_duration_ms = sum(durations) if durations else None
+    return TaskObservabilitySummary(
+        task_id=items[0].task_id if items else "",
+        total_duration_ms=total_duration_ms,
+        avg_item_duration_ms=round(mean(durations)) if durations else None,
+        total_batches=total_batches,
+        avg_batches_per_item=round(total_batches / len(items), 2) if items else 0,
+        total_sessions=total_sessions,
+        active_agent_count=sum(1 for item in items if item.status not in TERMINAL),
+        total_review_attempts=total_attempts,
+        avg_review_attempts=round(total_attempts / len(items), 2) if items else 0,
+        passed_items=passed_items,
+        not_passed_items=max(0, len(items) - passed_items),
+        issue_total=issue_total,
+        issue_resolved=issue_resolved,
+        issue_remaining=issue_remaining,
+        issue_closure_rate=(issue_resolved / issue_total) if issue_total else 0,
+        completed_functions=int(overall_progress.completed_functions or 0),
+        total_functions=int(overall_progress.total_functions or 0),
+        completed_bytes=int(overall_progress.completed_bytes or 0),
+        total_bytes=int(overall_progress.total_bytes or 0),
+        avg_confidence=round(mean(confidence_scores), 1) if confidence_scores else 0,
+        avg_quality_score=round(mean(quality_scores), 1) if quality_scores else 0,
+        residual_risk_distribution=risk_distribution,
+        items=sorted(rows, key=lambda entry: entry.sequence_no),
+    )
+
+
+def build_task_relationship(items: list[B2STaskItem]) -> TaskRelationshipResponse:
+    nodes: list[RelationshipNode] = []
+    edges: list[RelationshipEdge] = []
+    warnings: list[str] = []
+    node_ids: set[str] = set()
+    edge_ids: set[str] = set()
+    def add_node(node: RelationshipNode):
+        if node.node_id in node_ids:
+            return
+        node_ids.add(node.node_id)
+        nodes.append(node)
+    def add_edge(source: str, target: str, kind: str, label: str | None = None):
+        edge_id = f"{source}->{target}:{kind}"
+        if edge_id in edge_ids:
+            return
+        edge_ids.add(edge_id)
+        edges.append(RelationshipEdge(edge_id=edge_id, source_node_id=source, target_node_id=target, kind=kind, label=label))
+    for item in items:
+        try:
+            advanced = build_task_item_advanced(item, include_content=False)
+            item_node_id = f"item:{item.id}"
+            add_node(RelationshipNode(
+                node_id=item_node_id,
+                node_type="item",
+                item_id=item.id,
+                sequence_no=item.sequence_no,
+                title=Path(item.elf_path).name,
+                subtitle=f"ELF #{item.sequence_no}",
+                status=item.status,
+                is_active=item.status not in TERMINAL,
+            ))
+            for run in advanced.runs:
+                run_node_id = f"{item_node_id}:run:{run.name}"
+                add_node(RelationshipNode(
+                    node_id=run_node_id,
+                    node_type="run",
+                    item_id=item.id,
+                    sequence_no=item.sequence_no,
+                    title=run.name,
+                    subtitle="执行 Run",
+                    status=item.status,
+                    is_active=item.status not in TERMINAL,
+                ))
+                add_edge(item_node_id, run_node_id, "run", "执行")
+                for batch in run.batches:
+                    batch_no = batch.batch_no or 0
+                    batch_node_id = f"{run_node_id}:batch:{batch_no}"
+                    add_node(RelationshipNode(
+                        node_id=batch_node_id,
+                        node_type="batch",
+                        item_id=item.id,
+                        sequence_no=item.sequence_no,
+                        title=_batch_label(batch_no),
+                        subtitle="函数批次",
+                        status=item.status,
+                        batch_no=batch_no or None,
+                        is_active=item.status not in TERMINAL,
+                    ))
+                    add_edge(run_node_id, batch_node_id, "batch", "批次")
+                    if batch.source:
+                        artifact_node_id = f"{batch_node_id}:artifact:{hashlib.md5(batch.source.path.encode('utf-8')).hexdigest()[:10]}"
+                        add_node(RelationshipNode(node_id=artifact_node_id, node_type="artifact", item_id=item.id, sequence_no=item.sequence_no, title=batch.source.name, subtitle="还原源码", status=item.status))
+                        add_edge(batch_node_id, artifact_node_id, "artifact", "输出")
+                    for review in batch.reviews:
+                        review_node_id = f"{batch_node_id}:review:{review.attempt_no or 0}"
+                        add_node(RelationshipNode(
+                            node_id=review_node_id,
+                            node_type="review",
+                            item_id=item.id,
+                            sequence_no=item.sequence_no,
+                            title=review.round or f"第 {review.attempt_no or 0} 轮评审",
+                            subtitle=review.name,
+                            status=item.status,
+                            batch_no=review.batch_no,
+                            attempt_no=review.attempt_no,
+                        ))
+                        add_edge(batch_node_id, review_node_id, "review", "评审")
+                    for session in run.agent_sessions:
+                        session_node_id = f"{run_node_id}:session:{hashlib.md5(session.path.encode('utf-8')).hexdigest()[:10]}"
+                        add_node(RelationshipNode(
+                            node_id=session_node_id,
+                            node_type="agent",
+                            item_id=item.id,
+                            sequence_no=item.sequence_no,
+                            title=session.agent or session.role or session.name,
+                            subtitle=session.round or session.section,
+                            status=item.status,
+                            relative_path=_session_relative_to_output(item, session.path),
+                            full_path=session.path,
+                            batch_no=session.batch_no,
+                            attempt_no=session.attempt_no,
+                            group_key=session.agent,
+                            is_active=item.status not in TERMINAL,
+                        ))
+                        if session.batch_no and batch_no and session.batch_no == batch_no:
+                            add_edge(batch_node_id, session_node_id, "session", session.role or "会话")
+                        else:
+                            add_edge(run_node_id, session_node_id, "session", session.role or "会话")
+        except Exception as exc:
+            warnings.append(f"item #{item.sequence_no} 关系图构建失败: {exc}")
+    return TaskRelationshipResponse(task_id=items[0].task_id if items else "", nodes=nodes, edges=edges, warnings=warnings)
 
 
 def build_overall_progress(items: list[B2STaskItem]) -> B2SOverallProgress:

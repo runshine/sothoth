@@ -43,6 +43,7 @@ from app.pi_vuln_core.review.state import (
 )
 from app.pi_vuln_core.utils.file_ops import read_file, read_json
 from app.pi_vuln_core.utils.result_docs import (
+    infer_result_lifecycle,
     list_result_report_files,
     list_supporting_markdown_files,
 )
@@ -126,6 +127,16 @@ class ResultReviewExecutor:
             return True, []
 
         current_fingerprints = calculate_result_fingerprints(results_dir)
+        all_result_files = self._filter_active_result_files(
+            all_result_files=all_result_files,
+            results_dir=results_dir,
+            cycle=cycle,
+            review_state=review_state,
+            current_fingerprints=current_fingerprints,
+        )
+        if not all_result_files:
+            logger.info("no_active_result_files", results_dir=results_dir)
+            return True, []
 
         # 过滤: 跳过已评审且文件内容未变化的结果 (R6g)
         advisors_dicts = [a.model_dump() for a in advisors_cfg]
@@ -137,6 +148,20 @@ class ResultReviewExecutor:
             cycle=cycle,
             result_files=all_result_files,
         )
+        current_cycle_framework_failed = {
+            name
+            for name, state in review_state.result_states.items()
+            if name in set(all_result_files)
+            and state.active
+            and not state.passed
+            and state.last_reviewed_cycle == cycle
+            and state.failure_reason
+        }
+        if current_cycle_framework_failed:
+            incomplete_current_cycle = [
+                name for name in incomplete_current_cycle
+                if name not in current_cycle_framework_failed
+            ]
         if incomplete_current_cycle:
             pending = sorted(set(pending) | set(incomplete_current_cycle))
             logger.info(
@@ -241,6 +266,20 @@ class ResultReviewExecutor:
                     ).failure_reason
                 ))
             else:
+                existing_state = review_state.result_states.get(result_file)
+                if (
+                    existing_state is not None
+                    and not existing_state.passed
+                    and existing_state.active
+                    and existing_state.last_reviewed_cycle == cycle
+                    and existing_state.failure_reason
+                ):
+                    failed_items.append(FailedResultItem(
+                        filename=result_file,
+                        reason=existing_state.failure_reason,
+                        cycle=cycle,
+                    ))
+                    continue
                 review_state.mark_result_passed(
                     result_file,
                     cycle,
@@ -256,6 +295,46 @@ class ResultReviewExecutor:
                      failed=len(failed_items))
 
         return all_passed, failed_items
+
+    @staticmethod
+    def _filter_active_result_files(
+        *,
+        all_result_files: list[str],
+        results_dir: str,
+        cycle: int,
+        review_state: ReviewState,
+        current_fingerprints: dict[str, str],
+    ) -> list[str]:
+        """Exclude withdrawn/false-positive/superseded result files from future FP repair loops."""
+        active_files: list[str] = []
+        inactive_files: list[str] = []
+        for result_file in all_result_files:
+            result_path = Path(results_dir) / result_file
+            lifecycle = infer_result_lifecycle(result_path)
+            if bool(lifecycle.get("active", True)):
+                active_files.append(result_file)
+                continue
+            existing_state = review_state.result_states.get(result_file)
+            if existing_state is None or existing_state.passed:
+                active_files.append(result_file)
+                continue
+            status = str(lifecycle.get("status") or "inactive")
+            review_state.mark_result_inactive(
+                result_file,
+                cycle,
+                lifecycle_status=status,
+                reason=f"result lifecycle marked {status}; skip repeated result repair",
+                fingerprint=current_fingerprints.get(result_file, ""),
+            )
+            inactive_files.append(result_file)
+
+        if inactive_files:
+            logger.info(
+                "result_review_skip_inactive_results",
+                cycle=cycle,
+                files=inactive_files,
+            )
+        return active_files
 
     def _results_with_incomplete_current_cycle(
         self,

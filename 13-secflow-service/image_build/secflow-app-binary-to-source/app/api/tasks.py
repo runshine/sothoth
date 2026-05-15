@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.exception import UnauthorizedError
 from app.model import B2STask, get_db
-from app.schemas import ActionResponse, B2SArtifactContentResponse, B2SServiceConfig, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskListResponse, TaskPrepareResponse, TaskResponse, TokenUser
+from app.schemas import ActionResponse, B2SArtifactContentResponse, B2SServiceConfig, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, SessionFileResponse, SessionIndexResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskListResponse, TaskObservabilitySummary, TaskPrepareResponse, TaskRelationshipResponse, TaskResponse, TaskResultSummary, TokenUser
 from app.service.auth import get_auth_service
 from app.service.configcenter import get_configcenter_client
 from app.service.config_service import get_config_service
@@ -22,11 +22,17 @@ from app.service.task_service import (
     build_task_item_artifact_content,
     build_task_item_artifacts,
     build_task_item_review_analytics,
+    build_task_observability_summary,
+    build_task_relationship,
+    build_task_result_summary,
+    build_task_session_file,
+    build_task_session_index,
     build_task_response,
     create_task,
     delete_task,
     get_task_item_or_404,
     get_task_or_404,
+    query_items,
     retry_task,
     rerun_task,
     sync_task,
@@ -39,6 +45,34 @@ router = APIRouter(prefix="/api/app/binary-to-source", tags=["binary-to-source"]
 
 class ConfigSaveRequest(BaseModel):
     config: dict
+
+
+def _provider_summary(payload: dict) -> dict:
+    return {
+        "provider_key": str(payload.get("provider_key") or "").strip(),
+        "display_name": str(payload.get("display_name") or "").strip() or None,
+        "provider_type": str(payload.get("provider_type") or "").strip() or None,
+        "enabled": bool(payload.get("enabled", False)),
+        "is_default": bool(payload.get("is_default", False)),
+        "model": str(payload.get("model") or "").strip() or None,
+    }
+
+
+async def _effective_llm_provider_summary(provider_key: str | None) -> dict | None:
+    try:
+        payload = await get_configcenter_client().list_llm_providers()
+    except Exception:
+        return None
+    items = [item for item in (payload.get("items") if isinstance(payload.get("items"), list) else []) if isinstance(item, dict) and item.get("enabled", True)]
+    if not items:
+        return None
+    normalized = str(provider_key or "").strip()
+    if normalized:
+        matched = next((item for item in items if str(item.get("provider_key") or "").strip() == normalized), None)
+        return _provider_summary(matched) if matched else None
+    default_key = str(payload.get("default_provider_key") or "").strip()
+    matched = next((item for item in items if str(item.get("provider_key") or "").strip() == default_key), None) if default_key else None
+    return _provider_summary(matched or items[0])
 
 
 @router.get("/health")
@@ -85,7 +119,9 @@ async def get_b2s_config(
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    return B2SServiceConfig(**get_config_service().get_config(db, project_id))
+    payload = get_config_service().get_config(db, project_id)
+    payload["effective_llm_provider"] = await _effective_llm_provider_summary(payload.get("llm_provider_key"))
+    return B2SServiceConfig(**payload)
 
 
 @router.put("/projects/{project_id}/config", response_model=B2SServiceConfig)
@@ -95,7 +131,12 @@ async def save_b2s_config(
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    return B2SServiceConfig(**get_config_service().save_config(db, project_id, payload.config))
+    provider_key = str(payload.config.get("llm_provider_key") or "").strip()
+    if provider_key:
+        await get_configcenter_client().get_llm_provider(provider_key)
+    saved = get_config_service().save_config(db, project_id, payload.config)
+    saved["effective_llm_provider"] = await _effective_llm_provider_summary(saved.get("llm_provider_key"))
+    return B2SServiceConfig(**saved)
 
 
 @router.get("/projects/{project_id}/tasks", response_model=TaskListResponse)
@@ -148,6 +189,73 @@ async def get_b2s_task(
     task = get_task_or_404(db, project_id, task_id)
     await sync_task(db, task)
     return build_task_detail(db, task)
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/sessions", response_model=SessionIndexResponse)
+async def get_b2s_task_sessions(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    await sync_task(db, task)
+    return build_task_session_index(query_items(db, task.id))
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/sessions/file", response_model=SessionFileResponse)
+async def get_b2s_task_session_file(
+    project_id: str,
+    task_id: str,
+    path: str = Query(...),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(512 * 1024, ge=1, le=512 * 1024),
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    await sync_task(db, task)
+    items = query_items(db, task.id)
+    return build_task_session_file(items, path, offset=offset, limit=limit)
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/relationships", response_model=TaskRelationshipResponse)
+async def get_b2s_task_relationships(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    await sync_task(db, task)
+    items = query_items(db, task.id)
+    return build_task_relationship(items)
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/result", response_model=TaskResultSummary)
+async def get_b2s_task_result(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    await sync_task(db, task)
+    items = query_items(db, task.id)
+    return build_task_result_summary(items)
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/observability", response_model=TaskObservabilitySummary)
+async def get_b2s_task_observability(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    await sync_task(db, task)
+    items = query_items(db, task.id)
+    return build_task_observability_summary(items)
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/items/{item_id}/advanced", response_model=TaskItemAdvancedResponse)
@@ -244,9 +352,12 @@ async def rerun_b2s_task(
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    req = payload or RerunRequest()
-    await rerun_task(db, task, clean_output=req.clean_output, cancel_running=req.cancel_running)
-    return ActionResponse(status="ok", task_id=task_id, message="任务已完整重新提交")
+    if payload and (payload.clean_output is not None or payload.cancel_running is not None):
+        # Keep the request body backward-compatible for older clients, but the
+        # backend no longer allows changing rerun semantics.
+        pass
+    await rerun_task(db, task, clean_output=True, cancel_running=True)
+    return ActionResponse(status="ok", task_id=task_id, message="任务已清空output并从头重跑")
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/retry", response_model=ActionResponse)

@@ -275,7 +275,7 @@ class ReviewState:
                 cycle=state.last_reviewed_cycle,
             )
             for name, state in self.result_states.items()
-            if not state.passed and (current_set is None or name in current_set)
+            if state.active and not state.passed and (current_set is None or name in current_set)
         ]
 
     def get_passed_result_filenames(
@@ -781,7 +781,7 @@ class ReviewState:
         current_set = set(current_results or []) if current_results is not None else None
         return [
             name for name, state in self.result_states.items()
-            if not state.passed and (current_set is None or name in current_set)
+            if state.active and not state.passed and (current_set is None or name in current_set)
         ]
 
     def mark_result_passed(self, filename: str, cycle: int, file_fingerprint: str = "") -> None:
@@ -796,7 +796,7 @@ class ReviewState:
 
     def is_result_failed(self, filename: str, current_fingerprint: str | None = None) -> bool:
         state = self.result_states.get(filename)
-        if state is None or state.passed:
+        if state is None or state.passed or not state.active:
             return False
         if current_fingerprint and state.fingerprint and current_fingerprint != state.fingerprint:
             return False
@@ -876,7 +876,8 @@ class ReviewState:
         return category not in non_worker_categories
 
     def is_result_review_stable(self) -> bool:
-        return bool(self.result_states) and all(s.passed for s in self.result_states.values())
+        active_states = [state for state in self.result_states.values() if state.active]
+        return bool(self.result_states) and all(state.passed for state in active_states)
 
     def get_pending_results(
         self,

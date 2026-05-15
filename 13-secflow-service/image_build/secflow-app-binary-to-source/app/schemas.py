@@ -47,6 +47,8 @@ class TaskCreate(BaseModel):
 class B2SServiceConfig(BaseModel):
     project_id: str
     budget_exhausted_action: Literal["treat_as_passed", "treat_as_failed"] = "treat_as_passed"
+    llm_provider_key: Optional[str] = None
+    effective_llm_provider: Optional["LlmProviderSummary"] = None
     updated_at: Optional[str] = None
 
 
@@ -55,8 +57,10 @@ class RetryRequest(BaseModel):
 
 
 class RerunRequest(BaseModel):
-    clean_output: bool = True
-    cancel_running: bool = True
+    """Deprecated request body kept only for compatibility."""
+
+    clean_output: Optional[bool] = None
+    cancel_running: Optional[bool] = None
 
 
 class B2SProgress(BaseModel):
@@ -108,6 +112,217 @@ class TaskItemResponse(BaseModel):
     finished_at: Optional[datetime] = None
 
 
+class TaskConfigInputItem(BaseModel):
+    item_id: str
+    sequence_no: int
+    elf_path: str
+    source_elf_path: Optional[str] = None
+    output_dir: str
+    output_subdir: Optional[str] = None
+    file_list: list[str] = Field(default_factory=list)
+
+
+class TaskConfigSnapshot(BaseModel):
+    name: str
+    description: Optional[str] = None
+    priority: int = 5
+    tags: list[str] = Field(default_factory=list)
+    task_origin_type: Optional[str] = None
+    origin_label: Optional[str] = None
+    parent_project_id: Optional[str] = None
+    parent_task_id: Optional[str] = None
+    parent_task_type: Optional[str] = None
+    parent_stage_name: Optional[str] = None
+    parent_stage_item_id: Optional[str] = None
+    parent_stage_item_key: Optional[str] = None
+    mode: Optional[str] = None
+    mode_label: Optional[str] = None
+    engine: Optional[str] = None
+    llm_provider_key: Optional[str] = None
+    llm_provider_display_name: Optional[str] = None
+    llm_provider_type: Optional[str] = None
+    llm_provider_model: Optional[str] = None
+    concurrency: Optional[int] = None
+    agent_run_timeout_seconds: Optional[int] = None
+    agent_timeout_retry_enabled: Optional[bool] = None
+    agent_timeout_max_retries: Optional[int] = None
+    budget_exhausted_action: Optional[str] = None
+    input_count: int = 0
+    input_items: list[TaskConfigInputItem] = Field(default_factory=list)
+
+
+class AgentRuntimeEntry(BaseModel):
+    key: str
+    label: str
+    item_id: Optional[str] = None
+    sequence_no: Optional[int] = None
+    item_name: Optional[str] = None
+    run_name: Optional[str] = None
+    stage: Optional[str] = None
+    agent: Optional[str] = None
+    role: Optional[str] = None
+    batch_no: Optional[int] = None
+    attempt_no: Optional[int] = None
+    relative_path: Optional[str] = None
+    full_path: Optional[str] = None
+    updated_at: Optional[str] = None
+    is_active: bool = False
+    size: int = 0
+
+
+class AgentRuntimeSummary(BaseModel):
+    total_sessions: int = 0
+    active_agent_count: int = 0
+    header_agent_count: int = 0
+    executor_agent_count: int = 0
+    validator_agent_count: int = 0
+    active_agents: list[AgentRuntimeEntry] = Field(default_factory=list)
+
+
+class TaskResultItemSummary(BaseModel):
+    item_id: str
+    sequence_no: int
+    item_name: str
+    elf_path: str
+    output_dir: str
+    status: str
+    result_file_count: int = 0
+    key_result_files: list[str] = Field(default_factory=list)
+    session_file_count: int = 0
+    review_round_count: int = 0
+    final_verdict: Optional[str] = None
+    final_verdict_label: Optional[str] = None
+
+
+class TaskResultSummary(BaseModel):
+    task_id: str
+    success_items: int = 0
+    partial_items: int = 0
+    failed_items: int = 0
+    cancelled_items: int = 0
+    result_file_count: int = 0
+    session_file_count: int = 0
+    review_round_count: int = 0
+    items: list[TaskResultItemSummary] = Field(default_factory=list)
+
+
+class TaskObservabilityItem(BaseModel):
+    item_id: str
+    sequence_no: int
+    item_name: str
+    status: str
+    duration_ms: Optional[int] = None
+    batch_count: int = 0
+    session_count: int = 0
+    attempt_count: int = 0
+    final_verdict: Optional[str] = None
+    final_confidence: int = 0
+    final_quality_score: int = 0
+    issue_total: int = 0
+    issue_resolved: int = 0
+    issue_remaining: int = 0
+
+
+class TaskObservabilitySummary(BaseModel):
+    task_id: str
+    total_duration_ms: Optional[int] = None
+    avg_item_duration_ms: Optional[int] = None
+    total_batches: int = 0
+    avg_batches_per_item: float = 0
+    total_sessions: int = 0
+    active_agent_count: int = 0
+    total_review_attempts: int = 0
+    avg_review_attempts: float = 0
+    passed_items: int = 0
+    not_passed_items: int = 0
+    issue_total: int = 0
+    issue_resolved: int = 0
+    issue_remaining: int = 0
+    issue_closure_rate: float = 0
+    completed_functions: int = 0
+    total_functions: int = 0
+    completed_bytes: int = 0
+    total_bytes: int = 0
+    avg_confidence: float = 0
+    avg_quality_score: float = 0
+    residual_risk_distribution: dict[str, int] = Field(default_factory=dict)
+    items: list[TaskObservabilityItem] = Field(default_factory=list)
+
+
+class SessionIndexNode(BaseModel):
+    node_id: str
+    item_id: str
+    sequence_no: int
+    item_name: str
+    run_name: str
+    stage: str
+    stage_order: int = 0
+    section: Optional[str] = None
+    round: Optional[str] = None
+    round_order: Optional[int] = None
+    agent: Optional[str] = None
+    role: Optional[str] = None
+    batch_no: Optional[int] = None
+    attempt_no: Optional[int] = None
+    relative_path: str
+    full_path: str
+    size: int = 0
+    updated_at: Optional[str] = None
+    is_active: bool = False
+    kind: str = "agent_session"
+
+
+class SessionIndexResponse(BaseModel):
+    task_id: str
+    nodes: list[SessionIndexNode] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    generated_at: Optional[str] = None
+
+
+class SessionFileResponse(BaseModel):
+    task_id: str
+    relative_path: str
+    full_path: str
+    size: int = 0
+    content: str = ""
+    truncated: bool = False
+    next_offset: Optional[int] = None
+    offset: int = 0
+    limit: int = 0
+    mime_type: str = "text/plain"
+
+
+class RelationshipNode(BaseModel):
+    node_id: str
+    node_type: str
+    item_id: Optional[str] = None
+    sequence_no: Optional[int] = None
+    title: str
+    subtitle: Optional[str] = None
+    status: Optional[str] = None
+    relative_path: Optional[str] = None
+    full_path: Optional[str] = None
+    batch_no: Optional[int] = None
+    attempt_no: Optional[int] = None
+    group_key: Optional[str] = None
+    is_active: bool = False
+
+
+class RelationshipEdge(BaseModel):
+    edge_id: str
+    source_node_id: str
+    target_node_id: str
+    kind: str
+    label: Optional[str] = None
+
+
+class TaskRelationshipResponse(BaseModel):
+    task_id: str
+    nodes: list[RelationshipNode] = Field(default_factory=list)
+    edges: list[RelationshipEdge] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class TaskResponse(BaseModel):
     id: str
     project_id: str
@@ -122,6 +337,7 @@ class TaskResponse(BaseModel):
     parent_task_display: Optional[str] = None
     mode: Optional[str] = None
     mode_label: Optional[str] = None
+    input_filenames: list[str] = Field(default_factory=list)
     name: str
     status: str
     total_items: int
@@ -139,6 +355,11 @@ class TaskResponse(BaseModel):
 class TaskDetailResponse(TaskResponse):
     overall_progress: Optional[B2SOverallProgress] = None
     items: list[TaskItemResponse] = Field(default_factory=list)
+    task_config_snapshot: Optional[TaskConfigSnapshot] = None
+    effective_llm_provider: Optional["LlmProviderSummary"] = None
+    agent_runtime_summary: Optional[AgentRuntimeSummary] = None
+    result_summary: Optional[TaskResultSummary] = None
+    observability_summary: Optional[TaskObservabilitySummary] = None
 
 
 class AdvancedFile(BaseModel):
@@ -400,3 +621,12 @@ class ActionResponse(BaseModel):
     status: str
     task_id: Optional[str] = None
     message: Optional[str] = None
+
+
+_SCHEMA_TYPES = {
+    "Optional": Optional,
+    "LlmProviderSummary": LlmProviderSummary,
+}
+
+B2SServiceConfig.model_rebuild(_types_namespace=_SCHEMA_TYPES)
+TaskDetailResponse.model_rebuild(_types_namespace=_SCHEMA_TYPES)
