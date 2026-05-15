@@ -159,6 +159,9 @@ class _LockingDb(_ModelAwareDb):
     def connection(self):
         return self._connection
 
+    def execute(self, statement, params=None):
+        return self._connection.execute(statement, params)
+
 
 class _AppendingModelAwareDb(_ModelAwareDb):
     def add(self, obj):
@@ -3538,6 +3541,83 @@ class TaskManagerTests(unittest.TestCase):
         self.assertNotIn("modules", downstream_payload)
         self.assertNotIn("modules", downstream_payload["result"])
         self.assertLess(len(job.payload_json or ""), 2048)
+
+    def test_ensure_downstream_archive_job_requeues_success_job_when_downstream_payload_changes(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="entry_analysis",
+            item_key="source_project-images",
+            item_name="images",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+            status="failed",
+        )
+        job = BinarySecurityArchiveJob(
+            id="aj1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_id="si1",
+            item_key="source_project-images",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+            job_dedupe_key="si1::eat_1",
+            archive_status="success",
+            archive_root="/old/archive",
+        )
+        job.payload = {
+            "mapped_status": "failed",
+            "before_status": "running",
+            "force": False,
+            "downstream_payload": {
+                "task_id": "eat_1",
+                "status": "failed",
+                "updated_at": "2026-05-15T20:05:39+08:00",
+                "error": "old failed",
+            },
+            "extra_paths": [],
+            "archive_copy_stats": {"copied_files": 10},
+        }
+        db = _LockingDb(_FakeConnection(lock_result=True))
+        db.tasks.append(task)
+        db.stage_items.append(item)
+        db.archive_jobs.append(job)
+
+        refreshed = self.manager._ensure_downstream_archive_job(
+            db,
+            task,
+            item,
+            payload={
+                "task_id": "eat_1",
+                "status": "passed",
+                "updated_at": "2026-05-15T21:18:53+08:00",
+                "finished_at": "2026-05-15T21:18:53+08:00",
+                "output_path": "/data/files/p1/app/secflow-app-entry-analyse",
+            },
+            mapped_status="success",
+            before_status="failed",
+        )
+
+        self.assertIs(job, refreshed)
+        self.assertEqual("pending", refreshed.archive_status)
+        self.assertIsNone(refreshed.archive_root)
+        self.assertEqual("success", refreshed.payload["mapped_status"])
+        self.assertEqual("passed", refreshed.payload["downstream_payload"]["status"])
+        self.assertNotIn("archive_copy_stats", refreshed.payload)
 
     def test_collect_downstream_refs_dedupes_same_service_and_task_id(self):
         task = BinarySecurityTask(

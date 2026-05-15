@@ -2056,6 +2056,13 @@ class TaskManager:
     ) -> BinarySecurityArchiveJob:
         downstream_task_id = str(item.downstream_task_id or "").strip()
         job_dedupe_key = build_archive_job_dedupe_key(item.id, downstream_task_id)
+        next_payload = self._build_archive_job_payload(
+            mapped_status=mapped_status,
+            before_status=before_status,
+            force=force,
+            payload=payload,
+            extra_paths=extra_paths,
+        )
         lock_digest = hashlib.sha1(f"{item.id}:{downstream_task_id}".encode("utf-8")).hexdigest()
         lock_name = f"bs_archive:{lock_digest}"
         locked = False
@@ -2081,6 +2088,27 @@ class TaskManager:
                 .first()
             )
             if existing is not None:
+                if existing.archive_status == "success" and self._archive_job_payload_requires_refresh(existing, next_payload=next_payload):
+                    existing.archive_status = "pending"
+                    existing.owner_id = None
+                    existing.error_message = None
+                    existing.archive_root = None
+                    existing.started_at = None
+                    existing.completed_at = None
+                    existing.updated_at = _now()
+                    existing.payload = self._build_archive_job_payload(
+                        mapped_status=mapped_status,
+                        before_status=before_status,
+                        force=force,
+                        payload=payload,
+                        extra_paths=extra_paths,
+                        previous_payload=existing.payload,
+                    )
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
                 return existing
             failed = (
                 db.query(BinarySecurityArchiveJob)
@@ -2118,13 +2146,14 @@ class TaskManager:
             job.started_at = None
             job.completed_at = None
             job.updated_at = _now()
-            job.payload = {
-                "mapped_status": mapped_status,
-                "before_status": before_status,
-                "force": force,
-                "downstream_payload": self._archive_job_downstream_payload(payload),
-                "extra_paths": [str(path) for path in (extra_paths or [])],
-            }
+            job.payload = self._build_archive_job_payload(
+                mapped_status=mapped_status,
+                before_status=before_status,
+                force=force,
+                payload=payload,
+                extra_paths=extra_paths,
+                previous_payload=job.payload,
+            )
             if failed is None:
                 db.add(job)
             try:
@@ -6984,6 +7013,44 @@ class TaskManager:
             if nested_compact:
                 compact[key] = nested_compact
         return compact
+
+    def _build_archive_job_payload(
+        self,
+        *,
+        mapped_status: str,
+        before_status: str | None,
+        force: bool,
+        payload: dict[str, Any] | None,
+        extra_paths: list[str | Path] | None = None,
+        previous_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        preserved = dict(previous_payload or {})
+        preserved.pop("archive_copy_stats", None)
+        return {
+            **preserved,
+            "mapped_status": mapped_status,
+            "before_status": before_status,
+            "force": force,
+            "downstream_payload": self._archive_job_downstream_payload(payload),
+            "extra_paths": [str(path) for path in (extra_paths or [])],
+        }
+
+    def _archive_job_payload_requires_refresh(
+        self,
+        job: BinarySecurityArchiveJob,
+        *,
+        next_payload: dict[str, Any],
+    ) -> bool:
+        current_payload = dict(job.payload or {})
+        current_downstream = dict(current_payload.get("downstream_payload") or {})
+        next_downstream = dict(next_payload.get("downstream_payload") or {})
+        current_extra_paths = [str(path) for path in (current_payload.get("extra_paths") or [])]
+        next_extra_paths = [str(path) for path in (next_payload.get("extra_paths") or [])]
+        return (
+            str(current_payload.get("mapped_status") or "").strip() != str(next_payload.get("mapped_status") or "").strip()
+            or current_downstream != next_downstream
+            or current_extra_paths != next_extra_paths
+        )
 
     def _lightweight_artifacts_payload(self, payload: dict[str, Any] | None) -> dict[str, Any]:
         payload = payload or {}
