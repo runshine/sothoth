@@ -1865,6 +1865,35 @@ class TaskManager:
                             "after_status": mapped_status,
                         },
                     )
+            except NotFoundError:
+                db.rollback()
+                item.status = "downstream_missing"
+                item.error_message = "下游子任务不存在"
+                item.finished_at = item.finished_at or _now()
+                item.started_at = item.started_at or _now()
+                item.result = {
+                    **(item.result or {}),
+                    "downstream": self._lightweight_downstream_payload({"status": "downstream_missing", "error": "下游子任务不存在"}),
+                    "downstream_status_synced_at": _now().isoformat(),
+                }
+                touched_stages.add(item.stage_name)
+                synced_count += 1
+                self._record_event(
+                    db,
+                    task,
+                    "downstream_status_synced",
+                    "下游子任务不存在，已更新当前阶段子任务状态",
+                    level="warning",
+                    stage_name=item_stage_name,
+                    item=item,
+                    payload={
+                        "downstream_service": item_downstream_service,
+                        "downstream_task_id": item_downstream_task_id,
+                        "before_status": before_status,
+                        "downstream_status": "downstream_missing",
+                        "after_status": "downstream_missing",
+                    },
+                )
             except Exception as exc:
                 db.rollback()
                 failed_count += 1
