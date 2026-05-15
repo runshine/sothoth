@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import tarfile
+import time
 import uuid
 import zipfile
 from contextlib import contextmanager
@@ -19,7 +20,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from sqlalchemy import func, or_, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, load_only
 
 from app.config import get_config
@@ -1426,12 +1427,9 @@ class TaskManager:
         downstream_refs = self._collect_downstream_refs(task, affected_items)
         if downstream_refs:
             await self._delete_downstream_refs(db, task, downstream_refs, self._service_token())
-        db.query(BinarySecurityStageItem).filter(
-            BinarySecurityStageItem.task_id == task.id,
-            BinarySecurityStageItem.stage_name.in_(affected_stages),
-        ).delete(synchronize_session=False)
         self._clear_stage_outputs_from(task, target_stage, mark_stale=False)
         self._delete_archive_children_for_stages(db, task, affected_stages)
+        self._delete_stage_items_for_stages(db, task.id, affected_stages)
         for stage_name in affected_stages:
             stage_run = stage_runs.get(stage_name)
             if stage_run:
@@ -1473,11 +1471,8 @@ class TaskManager:
         if downstream_refs:
             await self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token())
         self._clear_stage_outputs_from(task, first_stage, mark_stale=False)
-        db.query(BinarySecurityStageItem).filter(
-            BinarySecurityStageItem.task_id == task.id,
-            BinarySecurityStageItem.stage_name.in_(stage_sequence),
-        ).delete(synchronize_session=False)
         self._delete_archive_children_for_stages(db, task, stage_sequence)
+        self._delete_stage_items_for_stages(db, task.id, stage_sequence)
         for current_stage in stage_sequence:
             stage_run = db.query(BinarySecurityStageRun).filter(
                 BinarySecurityStageRun.task_id == task.id,
@@ -1517,10 +1512,7 @@ class TaskManager:
             self._clear_stage_outputs_from(task, stage_name, mark_stale=False)
             self._delete_archive_children_for_stages(db, task, affected_stages)
             if downstream_stages:
-                db.query(BinarySecurityStageItem).filter(
-                    BinarySecurityStageItem.task_id == task.id,
-                    BinarySecurityStageItem.stage_name.in_(downstream_stages),
-                ).delete(synchronize_session=False)
+                self._delete_stage_items_for_stages(db, task.id, downstream_stages)
             self._reset_stage_run_for_retry(task, stage_run, increment_retry=True)
             for downstream_stage in downstream_stages:
                 downstream_run = db.query(BinarySecurityStageRun).filter(
@@ -3648,6 +3640,17 @@ class TaskManager:
             task.lease_expires_at = None
             self._last_task_heartbeat_at.pop(task.id, None)
             return
+        pending_action = str(task.pending_action or "").strip()
+        if pending_action in TASK_PENDING_ACTIONS:
+            task.status = TASK_STATUS_CONTINUE_PREPARING if pending_action == "continue" else TASK_STATUS_RETRY_PREPARING
+            task.finished_at = None
+            task.last_error = None
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.lease_expires_at = None
+            self._enqueue_action(task.id)
+            self._last_task_heartbeat_at.pop(task.id, None)
+            return
         if task.status == "cancelled":
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
@@ -4297,6 +4300,63 @@ class TaskManager:
         except Exception:
             nested.rollback()
             raise
+
+    def _is_retryable_lock_error(self, exc: BaseException) -> bool:
+        current: BaseException | None = exc
+        while current is not None:
+            if isinstance(current, OperationalError):
+                args = getattr(getattr(current, "orig", None), "args", ()) or ()
+                code = args[0] if args else None
+                message = str(current).lower()
+                if code in {1205, 1213}:
+                    return True
+                if "lock wait timeout" in message or "deadlock found" in message:
+                    return True
+            current = getattr(current, "__cause__", None) or getattr(current, "orig", None)
+        return False
+
+    def _delete_stage_items_for_stages(
+        self,
+        db: Session,
+        task_id: str,
+        stage_names: list[str],
+        *,
+        batch_size: int = 100,
+        max_retries: int = 3,
+    ) -> int:
+        normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
+        if not normalized:
+            return 0
+        deleted = 0
+        while True:
+            item_ids = [
+                row[0]
+                for row in db.query(BinarySecurityStageItem.id)
+                .filter(
+                    BinarySecurityStageItem.task_id == task_id,
+                    BinarySecurityStageItem.stage_name.in_(normalized),
+                )
+                .order_by(BinarySecurityStageItem.created_at.asc(), BinarySecurityStageItem.id.asc())
+                .limit(max(1, int(batch_size)))
+                .all()
+            ]
+            if not item_ids:
+                return deleted
+            for attempt in range(max(1, int(max_retries))):
+                try:
+                    with self._savepoint(db):
+                        deleted += int(
+                            db.query(BinarySecurityStageItem)
+                            .filter(BinarySecurityStageItem.id.in_(item_ids))
+                            .delete(synchronize_session=False)
+                            or 0
+                        )
+                        db.flush()
+                    break
+                except OperationalError as exc:
+                    if not self._is_retryable_lock_error(exc) or attempt >= max(1, int(max_retries)) - 1:
+                        raise
+                    time.sleep(0.2 * (attempt + 1))
 
     def _stage_enabled(self, task: BinarySecurityTask, stage_name: str) -> bool:
         policy = task.policy or {}
@@ -5543,6 +5603,16 @@ class TaskManager:
             task.dispatch_started_at = None
             task.lease_expires_at = None
             task.finished_at = None
+            return
+        pending_action = str(task.pending_action or "").strip()
+        if pending_action in TASK_PENDING_ACTIONS:
+            task.status = TASK_STATUS_CONTINUE_PREPARING if pending_action == "continue" else TASK_STATUS_RETRY_PREPARING
+            task.finished_at = None
+            task.last_error = None
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.lease_expires_at = None
+            self._enqueue_action(task.id)
             return
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
         statuses = [run.status for run in stage_runs]

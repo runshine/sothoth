@@ -1038,6 +1038,29 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("partial_success", task.status)
         self.assertEqual("binary_to_source", task.current_stage)
 
+    def test_finalize_task_preserves_retry_preparing_when_pending_action_exists(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="n",
+            status="partial_success",
+            pending_action="retry",
+            current_stage="binary_to_source",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        db = _FakeDb()
+
+        self.manager._finalize_task(db, task)
+
+        self.assertEqual("retry_preparing", task.status)
+        self.assertEqual("retry", task.pending_action)
+        self.assertIsNone(task.finished_at)
+        self.assertIsNone(task.dispatcher_instance_id)
+
     def test_next_incomplete_stage_skips_disabled_stages(self):
         task = BinarySecurityTask(
             id="t1",
@@ -1277,6 +1300,28 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("partial_success", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertIsNotNone(task.finished_at)
+
+    def test_refresh_task_status_after_sync_preserves_retry_preparing_when_pending_action_exists(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="partial_success",
+            pending_action="retry",
+            current_stage="firmware_unpack",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        db = _ModelAwareDb(tasks=[task])
+
+        self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual("retry_preparing", task.status)
+        self.assertEqual("retry", task.pending_action)
+        self.assertIsNone(task.finished_at)
 
     def test_continue_task_starts_after_last_successful_stage(self):
         workspace = Path(tempfile.mkdtemp())
