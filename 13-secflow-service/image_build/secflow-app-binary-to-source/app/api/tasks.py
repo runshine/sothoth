@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.exception import UnauthorizedError
 from app.model import B2STask, get_db
-from app.schemas import ActionResponse, B2SArtifactContentResponse, B2SServiceConfig, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskListResponse, TaskPrepareResponse, TaskResponse, TokenUser
+from app.schemas import ActionResponse, B2SArtifactContentResponse, B2SServiceConfig, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, SessionFileResponse, SessionIndexResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskListResponse, TaskObservabilitySummary, TaskPrepareResponse, TaskRelationshipResponse, TaskResponse, TaskResultSummary, TokenUser
 from app.service.auth import get_auth_service
 from app.service.configcenter import get_configcenter_client
 from app.service.config_service import get_config_service
@@ -22,11 +22,17 @@ from app.service.task_service import (
     build_task_item_artifact_content,
     build_task_item_artifacts,
     build_task_item_review_analytics,
+    build_task_observability_summary,
+    build_task_relationship,
+    build_task_result_summary,
+    build_task_session_file,
+    build_task_session_index,
     build_task_response,
     create_task,
     delete_task,
     get_task_item_or_404,
     get_task_or_404,
+    query_items,
     retry_task,
     rerun_task,
     sync_task,
@@ -185,6 +191,73 @@ async def get_b2s_task(
     return build_task_detail(db, task)
 
 
+@router.get("/projects/{project_id}/tasks/{task_id}/sessions", response_model=SessionIndexResponse)
+async def get_b2s_task_sessions(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    await sync_task(db, task)
+    return build_task_session_index(query_items(db, task.id))
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/sessions/file", response_model=SessionFileResponse)
+async def get_b2s_task_session_file(
+    project_id: str,
+    task_id: str,
+    path: str = Query(...),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(512 * 1024, ge=1, le=512 * 1024),
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    await sync_task(db, task)
+    items = query_items(db, task.id)
+    return build_task_session_file(items, path, offset=offset, limit=limit)
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/relationships", response_model=TaskRelationshipResponse)
+async def get_b2s_task_relationships(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    await sync_task(db, task)
+    items = query_items(db, task.id)
+    return build_task_relationship(items)
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/result", response_model=TaskResultSummary)
+async def get_b2s_task_result(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    await sync_task(db, task)
+    items = query_items(db, task.id)
+    return build_task_result_summary(items)
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/observability", response_model=TaskObservabilitySummary)
+async def get_b2s_task_observability(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    await sync_task(db, task)
+    items = query_items(db, task.id)
+    return build_task_observability_summary(items)
+
+
 @router.get("/projects/{project_id}/tasks/{task_id}/items/{item_id}/advanced", response_model=TaskItemAdvancedResponse)
 async def get_b2s_task_item_advanced(
     project_id: str,
@@ -279,9 +352,12 @@ async def rerun_b2s_task(
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    req = payload or RerunRequest()
-    await rerun_task(db, task, clean_output=req.clean_output, cancel_running=req.cancel_running)
-    return ActionResponse(status="ok", task_id=task_id, message="任务已完整重新提交")
+    if payload and (payload.clean_output is not None or payload.cancel_running is not None):
+        # Keep the request body backward-compatible for older clients, but the
+        # backend no longer allows changing rerun semantics.
+        pass
+    await rerun_task(db, task, clean_output=True, cancel_running=True)
+    return ActionResponse(status="ok", task_id=task_id, message="任务已清空output并从头重跑")
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/retry", response_model=ActionResponse)
