@@ -997,6 +997,73 @@ class TaskManagerTests(unittest.TestCase):
         self.assertIsNotNone(task.finished_at)
         self.assertTrue(any(isinstance(obj, BinarySecurityEvent) for obj in db.added))
 
+    def test_finalize_task_does_not_mark_success_when_enabled_stage_missing(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.policy = {
+            "stage_options": {
+                "firmware_unpack": {"enabled": True},
+                "system_analysis": {"enabled": True},
+                "binary_to_source": {"enabled": True},
+                "entry_analysis": {"enabled": True},
+                "dataflow_analysis": {"enabled": True},
+                "vuln_scan": {"enabled": True},
+            }
+        }
+        db = _ModelAwareDb(
+            tasks=[task],
+            stage_runs=[
+                BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="firmware_unpack", sequence_no=1, status="success"),
+                BinarySecurityStageRun(id="sr2", task_id="t1", project_id="p1", stage_name="system_analysis", sequence_no=2, status="success"),
+            ],
+        )
+
+        self.manager._finalize_task(db, task)
+
+        self.assertEqual("partial_success", task.status)
+        self.assertEqual("binary_to_source", task.current_stage)
+
+    def test_next_incomplete_stage_skips_disabled_stages(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.policy = {
+            "stage_options": {
+                "firmware_unpack": {"enabled": True},
+                "system_analysis": {"enabled": True},
+                "binary_to_source": {"enabled": False},
+                "entry_analysis": {"enabled": False},
+                "dataflow_analysis": {"enabled": False},
+                "vuln_scan": {"enabled": False},
+            }
+        }
+        db = _ModelAwareDb(
+            stage_runs=[
+                BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="firmware_unpack", sequence_no=1, status="success"),
+                BinarySecurityStageRun(id="sr2", task_id="t1", project_id="p1", stage_name="system_analysis", sequence_no=2, status="success"),
+            ],
+        )
+
+        self.assertIsNone(self.manager._next_incomplete_stage(db, task))
+
     def test_refresh_task_status_after_sync_requeues_next_stage(self):
         task = BinarySecurityTask(
             id="s1",
@@ -2709,6 +2776,83 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual("no_candidate_modules", stage_run.output_summary["failure_code"])
             event_types = [getattr(event, "event_type", "") for event in db.added if isinstance(event, BinarySecurityEvent)]
             self.assertIn("system_analysis_no_candidate_modules", event_types)
+
+    def test_stage_system_analysis_success_clears_stale_failure_fields(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.policy = {"module_risk_levels": ["高"]}
+        task.summary = {
+            "failure_code": "no_candidate_modules",
+            "failure_category": "business",
+            "failure_message": "stale",
+            "error": "stale",
+            "firmware_unpack_results": [{
+                "firmware_key": "fw1",
+                "firmware_name": "fw1",
+                "filename": "fw1.bin",
+                "unpacked_root": "/tmp/fw1",
+                "source_root": "/tmp/fw1",
+                "task_type": TASK_TYPE_BINARY,
+            }],
+        }
+        task.last_error = "stale"
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run])
+
+        original_prepare = self.manager._prepare_stage_items_for_execution
+        original_run_stage_pool = self.manager._run_stage_pool
+        self.manager._prepare_stage_items_for_execution = lambda *args, **kwargs: None
+
+        async def fake_run_stage_pool(*args, **kwargs):
+            return [{
+                "status": "success",
+                "item": {
+                    "firmware_key": "fw1",
+                    "firmware_name": "fw1",
+                    "filename": "fw1.bin",
+                    "modules": [{
+                        "module_key": "m1",
+                        "module_name": "m1",
+                        "risk_level": "高",
+                        "risk_score": 90,
+                    }],
+                },
+            }]
+
+        self.manager._run_stage_pool = fake_run_stage_pool
+        try:
+            status, summary = asyncio.run(
+                self.manager._stage_system_analysis(db, task, stage_run, token=None, retry_existing=False)
+            )
+        finally:
+            self.manager._prepare_stage_items_for_execution = original_prepare
+            self.manager._run_stage_pool = original_run_stage_pool
+
+        self.assertEqual("success", status)
+        self.assertEqual(1, summary["candidate_module_count"])
+        self.assertEqual(1, len(task.summary["selected_modules"]))
+        self.assertNotIn("failure_code", task.summary)
+        self.assertNotIn("failure_category", task.summary)
+        self.assertNotIn("failure_message", task.summary)
+        self.assertNotIn("error", task.summary)
+        self.assertIsNone(task.last_error)
 
     def test_confirm_module_selection_updates_task(self):
         task = BinarySecurityTask(

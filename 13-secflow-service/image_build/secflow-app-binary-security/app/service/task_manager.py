@@ -3160,6 +3160,25 @@ class TaskManager:
                 summary = dict(task.summary or {})
                 summary.pop("stage_retry_context", None)
                 task.summary = summary
+            next_stage = self._next_incomplete_stage(db, task)
+            if task.status in {"running", "dispatching"} and next_stage:
+                task.status = "pending"
+                task.current_stage = next_stage
+                task.dispatcher_instance_id = None
+                task.dispatch_started_at = None
+                task.lease_expires_at = None
+                task.finished_at = None
+                task.last_error = None
+                self._record_event(
+                    db,
+                    task,
+                    "task_requeued_after_stage_completion",
+                    f"阶段完成后任务继续进入下一阶段: {next_stage}",
+                    stage_name=next_stage,
+                )
+                db.commit()
+                self._enqueue_task(task.id)
+                return
             self._finalize_task(db, task)
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
             db.commit()
@@ -3518,6 +3537,24 @@ class TaskManager:
             task.lease_expires_at = None
             task.finished_at = _now()
             self._last_task_heartbeat_at.pop(task.id, None)
+            return
+        next_stage = self._next_incomplete_stage(db, task)
+        if next_stage:
+            task.status = "partial_success"
+            task.current_stage = next_stage
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.lease_expires_at = None
+            task.finished_at = _now()
+            self._last_task_heartbeat_at.pop(task.id, None)
+            self._record_event(
+                db,
+                task,
+                "task_finalize_blocked_by_incomplete_stage",
+                f"任务仍有未完成阶段，拒绝收口为终态: {next_stage}",
+                level="warning",
+                stage_name=next_stage,
+            )
             return
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
         statuses = [run.status for run in stage_runs]
@@ -4889,11 +4926,21 @@ class TaskManager:
 
     def _next_incomplete_stage(self, db: Session, task: BinarySecurityTask) -> str | None:
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
-        completed = {run.stage_name for run in stage_runs if run.status == "success"}
+        runs_by_stage = {run.stage_name: run for run in stage_runs}
         for stage_name in self._stage_sequence_for_task(task):
-            if stage_name not in completed:
+            if not self._stage_enabled(task, stage_name):
+                continue
+            run = runs_by_stage.get(stage_name)
+            if run is None or run.status != "success":
                 return stage_name
         return None
+
+    @staticmethod
+    def _clear_failure_fields_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
+        cleaned = dict(summary or {})
+        for key in ("failure_code", "failure_category", "failure_message", "error"):
+            cleaned.pop(key, None)
+        return cleaned
 
     def _retry_snapshot_for_item(self, task: BinarySecurityTask, stage_name: str, item_key: str) -> dict[str, Any] | None:
         summary = task.summary or {}
@@ -6376,7 +6423,7 @@ class TaskManager:
         selection_mode = self._module_selection_mode(task)
         selected_modules = self._mark_selected_modules(candidate_modules, selected_by=MODULE_SELECTION_MODE_AUTO) if selection_mode == MODULE_SELECTION_MODE_AUTO else []
         task.summary = {
-            **task.summary,
+            **self._clear_failure_fields_from_summary(task.summary),
             "system_analysis_results": self._lightweight_system_analysis_items(success),
             "system_analysis_modules": self._lightweight_modules_for_storage(all_modules),
             "system_analysis_module_count": len(all_modules),
@@ -6388,6 +6435,7 @@ class TaskManager:
             **task.metrics,
             **self._module_metrics(all_modules, candidate_modules, selected_modules),
         }
+        task.last_error = None
         db.commit()
         status = "success"
         if failed and success:
