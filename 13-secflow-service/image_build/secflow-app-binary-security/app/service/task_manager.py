@@ -5242,7 +5242,7 @@ class TaskManager:
             project_id = (item.result or {}).get("project_id") or task.project_id
             return await get_binary_to_source_client().get_task(project_id, task_id, token or "")
         if item.downstream_service == "entry_analyse":
-            return await get_entry_analyse_client().get_task(task_id)
+            return await get_entry_analyse_client().get_task(task_id, token or "")
         if item.downstream_service == "dataflow_analyse":
             return await get_dataflow_analyse_client().get_task(task_id)
         if item.downstream_service == "dataflow_vuln_scanner":
@@ -5891,7 +5891,7 @@ class TaskManager:
                 cancel_running=True,
             )
         if stage_name == "entry_analysis":
-            return get_entry_analyse_client().restart_task(downstream_task_id)
+            return get_entry_analyse_client().restart_task(downstream_task_id, token or "")
         if stage_name == "dataflow_analysis":
             return get_dataflow_analyse_client().restart_task(downstream_task_id)
         if stage_name == "vuln_scan":
@@ -6210,7 +6210,7 @@ class TaskManager:
                 result = item.result
                 await get_binary_to_source_client().cancel_task(result.get("project_id") or item.project_id, item.downstream_task_id, token or "")
             elif item.downstream_service == "entry_analyse":
-                await get_entry_analyse_client().cancel_task(item.downstream_task_id)
+                await get_entry_analyse_client().cancel_task(item.downstream_task_id, token or "")
             elif item.downstream_service == "dataflow_analyse":
                 await get_dataflow_analyse_client().cancel_task(item.downstream_task_id)
             elif item.downstream_service == "dataflow_vuln_scanner":
@@ -6296,7 +6296,7 @@ class TaskManager:
                 elif ref["service"] == "binary_to_source":
                     await get_binary_to_source_client().cancel_task(ref["project_id"], ref["task_id"], token or "")
                 elif ref["service"] == "entry_analyse":
-                    await get_entry_analyse_client().cancel_task(ref["task_id"])
+                    await get_entry_analyse_client().cancel_task(ref["task_id"], token or "")
                 elif ref["service"] == "dataflow_analyse":
                     await get_dataflow_analyse_client().cancel_task(ref["task_id"])
                 elif ref["service"] == "dataflow_vuln_scanner":
@@ -6341,7 +6341,7 @@ class TaskManager:
         if service == "binary_to_source":
             return await get_binary_to_source_client().get_task(project_id, task_id, token or "")
         if service == "entry_analyse":
-            return await get_entry_analyse_client().get_task(task_id)
+            return await get_entry_analyse_client().get_task(task_id, token or "")
         if service == "dataflow_analyse":
             return await get_dataflow_analyse_client().get_task(task_id)
         if service == "dataflow_vuln_scanner":
@@ -6406,7 +6406,7 @@ class TaskManager:
                 elif ref["service"] == "binary_to_source":
                     await get_binary_to_source_client().delete_task(ref["project_id"], ref["task_id"], token or "")
                 elif ref["service"] == "entry_analyse":
-                    await get_entry_analyse_client().delete_task(ref["task_id"])
+                    await get_entry_analyse_client().delete_task(ref["task_id"], token or "")
                 elif ref["service"] == "dataflow_analyse":
                     await get_dataflow_analyse_client().delete_task(ref["task_id"])
                 elif ref["service"] == "dataflow_vuln_scanner":
@@ -7706,7 +7706,6 @@ class TaskManager:
         token: str | None,
         retrying: bool = False,
     ) -> dict[str, Any]:
-        del token
         session = get_session_factory()()
         try:
             item = self._upsert_stage_item(
@@ -7723,20 +7722,21 @@ class TaskManager:
             )
             session.commit()
             if retrying and self._has_retryable_downstream_task(item):
-                created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=None)
+                created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=token)
             else:
                 created = await get_entry_analyse_client().create_task(
                     task.project_id,
                     f"{task.name}-{module['module_name']}-entry",
                     module["source_dir"],
                     module["module_name"],
+                    token or "",
                     module.get("source_root") or module.get("unpacked_root") or module["source_dir"],
                     _downstream_origin_payload(task, item),
                 )
             item.downstream_task_id = created.get("task_id") or item.downstream_task_id
             session.commit()
             status, payload = await self._poll_until_terminal(
-                lambda: get_entry_analyse_client().get_task(item.downstream_task_id),
+                lambda: get_entry_analyse_client().get_task(item.downstream_task_id, token or ""),
                 success_statuses={"passed", "success"},
                 failure_statuses={"failed", "error", "cancelled"},
                 task=task,
