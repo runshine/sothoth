@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from app.model import (
     BinarySecurityArchiveJob,
     BinarySecurityEvent,
+    BinarySecurityProjectConfig,
     BinarySecurityStageItem,
     BinarySecurityStageRun,
     BinarySecurityTask,
@@ -18,6 +19,7 @@ from app.model import (
 from app.exception import ValidationError
 from app.schemas import BinarySecurityServiceConfigPayload
 from app.schemas import (
+    BinarySecurityProjectConfigPayload,
     BinarySecurityArchiveJobResponse,
     BinarySecurityTaskConcurrencyUpdatePayload,
     BinarySecurityTaskPolicyUpdatePayload,
@@ -1067,6 +1069,94 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertIsNone(self.manager._next_incomplete_stage(db, task))
 
+    def test_next_incomplete_stage_treats_partial_success_as_completed(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        db = _ModelAwareDb(
+            stage_runs=[
+                BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="firmware_unpack", sequence_no=1, status="success"),
+                BinarySecurityStageRun(id="sr2", task_id="t1", project_id="p1", stage_name="system_analysis", sequence_no=2, status="success"),
+                BinarySecurityStageRun(id="sr3", task_id="t1", project_id="p1", stage_name="binary_to_source", sequence_no=3, status="partial_success"),
+            ],
+        )
+
+        self.assertEqual("entry_analysis", self.manager._next_incomplete_stage(db, task))
+
+    def test_next_incomplete_stage_blocks_partial_success_when_stage_advancement_disabled(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.policy = {
+            "partial_success_stage_advancement": {
+                "binary_to_source": False,
+                "entry_analysis": True,
+                "dataflow_analysis": True,
+            }
+        }
+        db = _ModelAwareDb(
+            stage_runs=[
+                BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="firmware_unpack", sequence_no=1, status="success"),
+                BinarySecurityStageRun(id="sr2", task_id="t1", project_id="p1", stage_name="system_analysis", sequence_no=2, status="success"),
+                BinarySecurityStageRun(id="sr3", task_id="t1", project_id="p1", stage_name="binary_to_source", sequence_no=3, status="partial_success"),
+            ],
+        )
+
+        self.assertEqual("binary_to_source", self.manager._next_incomplete_stage(db, task))
+
+    def test_task_continue_support_targets_current_stage_when_partial_success_advancement_disabled(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="n",
+            status="partial_success",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="binary_to_source",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {
+            "selected_modules": [{"module_key": "m1", "module_name": "m1", "firmware_key": "fw1"}],
+        }
+        task.policy = {
+            "partial_success_stage_advancement": {
+                "binary_to_source": False,
+                "entry_analysis": True,
+                "dataflow_analysis": True,
+            }
+        }
+        db = _ModelAwareDb(
+            stage_runs=[
+                BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="firmware_unpack", sequence_no=1, status="success"),
+                BinarySecurityStageRun(id="sr2", task_id="t1", project_id="p1", stage_name="system_analysis", sequence_no=2, status="success"),
+                BinarySecurityStageRun(id="sr3", task_id="t1", project_id="p1", stage_name="binary_to_source", sequence_no=3, status="partial_success"),
+            ],
+        )
+
+        supported, reason, target_stage = self.manager._task_continue_support(db, task)
+
+        self.assertTrue(supported)
+        self.assertIsNone(reason)
+        self.assertEqual("binary_to_source", target_stage)
+
     def test_refresh_task_status_after_sync_requeues_next_stage(self):
         task = BinarySecurityTask(
             id="s1",
@@ -1459,6 +1549,11 @@ class TaskManagerTests(unittest.TestCase):
             "max_stage_parallelism": 4,
             "max_retries_per_item": 2,
             "continue_on_item_failure": True,
+            "partial_success_stage_advancement": {
+                "binary_to_source": True,
+                "entry_analysis": True,
+                "dataflow_analysis": True,
+            },
             "stage_parallelism": {
                 "firmware_unpack": 4,
                 "system_analysis": 4,
@@ -1483,6 +1578,7 @@ class TaskManagerTests(unittest.TestCase):
                 stage_options={"binary_to_source": {"enabled": False}},
                 max_retries_per_item=5,
                 continue_on_item_failure=False,
+                partial_success_stage_advancement={"binary_to_source": False, "entry_analysis": True},
                 stage_parallelism={"vuln_scan": 8},
                 module_selection_mode="manual_confirm",
                 module_risk_levels=["高", "中"],
@@ -1492,6 +1588,8 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(8, detail.policy["max_stage_parallelism"])
         self.assertEqual(5, detail.policy["max_retries_per_item"])
         self.assertFalse(detail.policy["continue_on_item_failure"])
+        self.assertFalse(detail.policy["partial_success_stage_advancement"]["binary_to_source"])
+        self.assertTrue(detail.policy["partial_success_stage_advancement"]["entry_analysis"])
         self.assertEqual(8, detail.policy["stage_parallelism"]["vuln_scan"])
         self.assertEqual(4, detail.policy["stage_parallelism"]["firmware_unpack"])
         self.assertFalse(detail.policy["stage_options"]["binary_to_source"]["enabled"])
@@ -1527,6 +1625,31 @@ class TaskManagerTests(unittest.TestCase):
                 project_id="p1",
                 task_id="t1",
                 payload=BinarySecurityTaskPolicyUpdatePayload(stage_options={"firmware_unpack": {"enabled": False}}),
+            )
+
+    def test_update_task_policy_rejects_partial_success_stage_outside_source_flow(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.policy = {}
+        db = _ModelAwareDb(tasks=[task])
+
+        with self.assertRaisesRegex(Exception, "阶段不属于当前任务流程: binary_to_source"):
+            self.manager.update_task_policy(
+                db,
+                project_id="p1",
+                task_id="t1",
+                payload=BinarySecurityTaskPolicyUpdatePayload(
+                    partial_success_stage_advancement={"binary_to_source": False}
+                ),
             )
 
     def test_update_task_policy_rejects_running_task(self):
@@ -3863,6 +3986,73 @@ class TaskManagerTests(unittest.TestCase):
     def test_service_config_includes_lease_timeout_default(self):
         payload = BinarySecurityServiceConfigPayload()
         self.assertEqual(90, payload.lease_timeout_seconds)
+
+    def test_project_config_includes_partial_success_stage_advancement_defaults(self):
+        payload = BinarySecurityProjectConfigPayload()
+        self.assertEqual(
+            {
+                "binary_to_source": True,
+                "entry_analysis": True,
+                "dataflow_analysis": True,
+            },
+            payload.partial_success_stage_advancement,
+        )
+
+    def test_merge_policy_merges_partial_success_stage_advancement(self):
+        row = BinarySecurityProjectConfig(project_id="p1")
+        row.config = {
+            "partial_success_stage_advancement": {
+                "binary_to_source": False,
+                "entry_analysis": True,
+                "dataflow_analysis": False,
+            }
+        }
+        policy = self.manager._merge_policy(
+            _FakeDb(rows=[row]),
+            "p1",
+            {
+                "task_type": TASK_TYPE_BINARY,
+                "partial_success_stage_advancement": {
+                    "entry_analysis": False,
+                },
+            },
+            {},
+        )
+
+        self.assertEqual(
+            {
+                "binary_to_source": False,
+                "entry_analysis": False,
+                "dataflow_analysis": False,
+            },
+            policy["partial_success_stage_advancement"],
+        )
+
+    def test_merge_policy_prunes_binary_to_source_partial_success_advancement_for_source_tasks(self):
+        row = BinarySecurityProjectConfig(project_id="p1")
+        row.config = {
+            "partial_success_stage_advancement": {
+                "binary_to_source": False,
+                "entry_analysis": True,
+                "dataflow_analysis": False,
+            }
+        }
+        policy = self.manager._merge_policy(
+            _FakeDb(rows=[row]),
+            "p1",
+            {
+                "task_type": TASK_TYPE_SOURCE,
+            },
+            {},
+        )
+
+        self.assertEqual(
+            {
+                "entry_analysis": True,
+                "dataflow_analysis": False,
+            },
+            policy["partial_success_stage_advancement"],
+        )
 
     def test_claim_pending_tasks_reclaims_expired_lease(self):
         task = BinarySecurityTask(

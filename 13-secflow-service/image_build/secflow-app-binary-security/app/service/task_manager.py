@@ -548,6 +548,14 @@ SOURCE_ARCHIVE_FORMATS = (
     ".tar.xz",
     ".txz",
 )
+PARTIAL_SUCCESS_ADVANCEMENT_STAGES = (
+    "binary_to_source",
+    "entry_analysis",
+    "dataflow_analysis",
+)
+DEFAULT_PARTIAL_SUCCESS_STAGE_ADVANCEMENT = {
+    stage_name: True for stage_name in PARTIAL_SUCCESS_ADVANCEMENT_STAGES
+}
 
 
 class StaleTaskExecution(RuntimeError):
@@ -672,6 +680,10 @@ class TaskManager:
             BinarySecurityTask.id == task_id,
         ).first():
             raise ValidationError("任务 ID 已存在")
+        self._validate_and_normalize_partial_success_stage_advancement_overrides(
+            payload.policy_overrides.partial_success_stage_advancement,
+            task_type=task_type,
+        )
         input_files = self._normalize_input_files(payload.input_files, task_type=task_type)
         workspace_root = app_task_root(project_id, task_id)
         output_root = self._resolve_output_root(workspace_root, payload.output_root)
@@ -680,7 +692,9 @@ class TaskManager:
         await self._init_workspace_async(workspace_root)
         await self._ensure_task_directories(project_id, task_id, authorization_token)
         metadata_path = input_dir / "task-metadata.json"
-        policy = self._merge_policy(db, project_id, payload.policy_overrides.model_dump(exclude_none=True), payload.stage_options)
+        policy_overrides = payload.policy_overrides.model_dump(exclude_none=True)
+        policy_overrides["task_type"] = task_type
+        policy = self._merge_policy(db, project_id, policy_overrides, payload.stage_options)
 
         task = BinarySecurityTask(
             id=task_id,
@@ -1031,6 +1045,10 @@ class TaskManager:
             invalid_stage_option = next((stage for stage in requested_stage_options if stage not in allowed_stages), None)
             if invalid_stage_option:
                 raise ValidationError(f"阶段不属于当前任务流程: {invalid_stage_option}")
+            normalized_partial_success_advancement = self._validate_and_normalize_partial_success_stage_advancement_overrides(
+                payload.partial_success_stage_advancement,
+                task_type=task,
+            )
 
             policy = dict(task.policy or {})
             before = json.loads(json.dumps(policy))
@@ -1067,6 +1085,19 @@ class TaskManager:
                 policy["max_retries_per_item"] = int(payload.max_retries_per_item)
             if payload.continue_on_item_failure is not None:
                 policy["continue_on_item_failure"] = bool(payload.continue_on_item_failure)
+            if normalized_partial_success_advancement:
+                current_partial_success_advancement = policy.get("partial_success_stage_advancement")
+                if not isinstance(current_partial_success_advancement, dict):
+                    current_partial_success_advancement = self._default_partial_success_stage_advancement_for_task(task)
+                policy["partial_success_stage_advancement"] = {
+                    **self._normalized_partial_success_stage_advancement_map(
+                        current_partial_success_advancement,
+                        allowed_stages=self._partial_success_advancement_stages_for_task(task),
+                        default_map=self._default_partial_success_stage_advancement_for_task(task),
+                        strict=False,
+                    ),
+                    **normalized_partial_success_advancement,
+                }
             if payload.module_selection_mode is not None:
                 selection_mode = str(payload.module_selection_mode or MODULE_SELECTION_MODE_AUTO).strip()
                 if selection_mode not in {MODULE_SELECTION_MODE_AUTO, MODULE_SELECTION_MODE_MANUAL_CONFIRM}:
@@ -2138,16 +2169,27 @@ class TaskManager:
     def get_project_config(self, db: Session, project_id: str) -> BinarySecurityProjectConfigResponse:
         row = db.query(BinarySecurityProjectConfig).filter(BinarySecurityProjectConfig.project_id == project_id).first()
         config = BinarySecurityProjectConfigPayload(**(row.config if row else {}))
+        config.partial_success_stage_advancement = self._normalized_partial_success_stage_advancement_map(
+            config.partial_success_stage_advancement,
+            allowed_stages=PARTIAL_SUCCESS_ADVANCEMENT_STAGES,
+            default_map=DEFAULT_PARTIAL_SUCCESS_STAGE_ADVANCEMENT,
+        )
         return BinarySecurityProjectConfigResponse(project_id=project_id, config=config)
 
     def save_project_config(self, db: Session, project_id: str, payload: BinarySecurityProjectConfigPayload) -> BinarySecurityProjectConfigResponse:
+        normalized_payload = payload.model_copy(deep=True)
+        normalized_payload.partial_success_stage_advancement = self._normalized_partial_success_stage_advancement_map(
+            payload.partial_success_stage_advancement,
+            allowed_stages=PARTIAL_SUCCESS_ADVANCEMENT_STAGES,
+            default_map=DEFAULT_PARTIAL_SUCCESS_STAGE_ADVANCEMENT,
+        )
         row = db.query(BinarySecurityProjectConfig).filter(BinarySecurityProjectConfig.project_id == project_id).first()
         if row is None:
             row = BinarySecurityProjectConfig(project_id=project_id)
             db.add(row)
-        row.config = payload.model_dump(mode="json")
+        row.config = normalized_payload.model_dump(mode="json")
         db.commit()
-        return BinarySecurityProjectConfigResponse(project_id=project_id, config=payload)
+        return BinarySecurityProjectConfigResponse(project_id=project_id, config=normalized_payload)
 
     def get_service_config(self, db: Session) -> BinarySecurityServiceConfigResponse:
         return BinarySecurityServiceConfigResponse(config=self._load_service_config(db))
@@ -3829,11 +3871,17 @@ class TaskManager:
             max_stage_parallelism=self.cfg.runtime_policy.max_stage_parallelism,
             max_retries_per_item=self.cfg.runtime_policy.max_retries_per_item,
             continue_on_item_failure=self.cfg.runtime_policy.continue_on_item_failure,
+            partial_success_stage_advancement=DEFAULT_PARTIAL_SUCCESS_STAGE_ADVANCEMENT,
             stage_parallelism=stage_parallelism,
         ).model_dump(mode="json")
         row = db.query(BinarySecurityProjectConfig).filter(BinarySecurityProjectConfig.project_id == project_id).first()
         if row:
             base.update(row.config)
+        base["partial_success_stage_advancement"] = self._normalized_partial_success_stage_advancement_map(
+            base.get("partial_success_stage_advancement"),
+            allowed_stages=PARTIAL_SUCCESS_ADVANCEMENT_STAGES,
+            default_map=DEFAULT_PARTIAL_SUCCESS_STAGE_ADVANCEMENT,
+        )
         if stage_options:
             base["stage_options"] = {
                 **base.get("stage_options", {}),
@@ -3853,12 +3901,83 @@ class TaskManager:
             base["max_retries_per_item"] = int(overrides["max_retries_per_item"])
         if overrides.get("continue_on_item_failure") is not None:
             base["continue_on_item_failure"] = bool(overrides["continue_on_item_failure"])
+        if overrides.get("partial_success_stage_advancement"):
+            base["partial_success_stage_advancement"] = {
+                **base.get("partial_success_stage_advancement", {}),
+                **self._validate_and_normalize_partial_success_stage_advancement_overrides(
+                    overrides.get("partial_success_stage_advancement"),
+                    task_type=overrides.get("task_type"),
+                ),
+            }
+        if overrides.get("task_type") is not None:
+            base["partial_success_stage_advancement"] = self._normalized_partial_success_stage_advancement_map(
+                base.get("partial_success_stage_advancement"),
+                allowed_stages=self._partial_success_advancement_stages_for_task(overrides.get("task_type")),
+                default_map=self._default_partial_success_stage_advancement_for_task(overrides.get("task_type")),
+                strict=False,
+            )
         selection_mode = str(overrides.get("module_selection_mode") or base.get("module_selection_mode") or MODULE_SELECTION_MODE_AUTO).strip()
         if selection_mode not in {MODULE_SELECTION_MODE_AUTO, MODULE_SELECTION_MODE_MANUAL_CONFIRM}:
             selection_mode = MODULE_SELECTION_MODE_AUTO
         base["module_selection_mode"] = selection_mode
         base["module_risk_levels"] = _normalize_module_risk_levels(overrides.get("module_risk_levels") or base.get("module_risk_levels"))
         return base
+
+    def _partial_success_advancement_stages_for_task(self, task: BinarySecurityTask | str | None) -> list[str]:
+        stage_sequence = set(self._stage_sequence_for_task(task))
+        return [stage_name for stage_name in PARTIAL_SUCCESS_ADVANCEMENT_STAGES if stage_name in stage_sequence]
+
+    def _default_partial_success_stage_advancement_for_task(self, task: BinarySecurityTask | str | None) -> dict[str, bool]:
+        return {
+            stage_name: DEFAULT_PARTIAL_SUCCESS_STAGE_ADVANCEMENT[stage_name]
+            for stage_name in self._partial_success_advancement_stages_for_task(task)
+        }
+
+    def _normalized_partial_success_stage_advancement_map(
+        self,
+        raw: Any,
+        *,
+        allowed_stages: list[str] | tuple[str, ...],
+        default_map: dict[str, bool],
+        strict: bool = True,
+    ) -> dict[str, bool]:
+        allowed = list(allowed_stages)
+        payload = dict(raw or {}) if isinstance(raw, dict) else {}
+        invalid_stage = next((stage for stage in payload if stage not in allowed), None)
+        if invalid_stage and strict:
+            raise ValidationError(f"阶段不支持配置部分成功推进: {invalid_stage}")
+        normalized = {stage_name: bool(default_map.get(stage_name, True)) for stage_name in allowed}
+        for stage_name, value in payload.items():
+            if stage_name not in allowed:
+                continue
+            normalized[stage_name] = bool(value)
+        return normalized
+
+    def _validate_and_normalize_partial_success_stage_advancement_overrides(
+        self,
+        raw: Any,
+        *,
+        task_type: BinarySecurityTask | str | None,
+    ) -> dict[str, bool]:
+        allowed_stages = self._partial_success_advancement_stages_for_task(task_type)
+        if not raw:
+            return {}
+        payload = dict(raw or {}) if isinstance(raw, dict) else {}
+        invalid_stage = next((stage for stage in payload if stage not in allowed_stages), None)
+        if invalid_stage:
+            raise ValidationError(f"阶段不属于当前任务流程: {invalid_stage}")
+        return {stage_name: bool(value) for stage_name, value in payload.items()}
+
+    def _partial_success_advancement_enabled(self, task: BinarySecurityTask, stage_name: str) -> bool:
+        if stage_name not in PARTIAL_SUCCESS_ADVANCEMENT_STAGES:
+            return True
+        stage_map = self._normalized_partial_success_stage_advancement_map(
+            (task.policy or {}).get("partial_success_stage_advancement"),
+            allowed_stages=self._partial_success_advancement_stages_for_task(task),
+            default_map=self._default_partial_success_stage_advancement_for_task(task),
+            strict=False,
+        )
+        return bool(stage_map.get(stage_name, True))
 
     def _service_token(self) -> str | None:
         return self.cfg.auth_service.service_machine_token
@@ -4932,7 +5051,13 @@ class TaskManager:
             if not self._stage_enabled(task, stage_name):
                 continue
             run = runs_by_stage.get(stage_name)
-            if run is None or run.status != "success":
+            if run is None:
+                return stage_name
+            if run.status == "partial_success":
+                if not self._partial_success_advancement_enabled(task, stage_name):
+                    return stage_name
+                continue
+            if run.status != "success":
                 return stage_name
         return None
 
@@ -5704,20 +5829,8 @@ class TaskManager:
         if not stage_sequence:
             return False, "当前任务没有可执行阶段", None
 
-        stage_runs = {
-            row.stage_name: row
-            for row in db.query(BinarySecurityStageRun).filter(
-                BinarySecurityStageRun.task_id == task.id,
-            ).all()
-        }
-        target_stage = stage_sequence[0]
-        for stage_name in stage_sequence:
-            run = stage_runs.get(stage_name)
-            if run and run.status == "success":
-                continue
-            target_stage = stage_name
-            break
-        else:
+        target_stage = self._next_incomplete_stage(db, task)
+        if target_stage is None:
             return False, "当前任务所有阶段都已成功，没有可继续的后续阶段", None
 
         reason = self._continue_stage_input_error(db, task, target_stage)

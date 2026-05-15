@@ -32,6 +32,7 @@ class TaskPolicyOverrides(BaseModel):
     max_stage_parallelism: Optional[int] = Field(default=None, ge=1, le=32)
     max_retries_per_item: Optional[int] = Field(default=None, ge=0, le=20)
     continue_on_item_failure: Optional[bool] = None
+    partial_success_stage_advancement: dict[str, bool] = Field(default_factory=dict)
     stage_parallelism: dict[str, int] = Field(default_factory=dict)
     module_selection_mode: Optional[str] = None
     module_risk_levels: Optional[list[str]] = None
@@ -60,6 +61,7 @@ class BinarySecurityTaskPolicyUpdatePayload(BaseModel):
     stage_options: dict[str, StageOptions] = Field(default_factory=dict)
     max_retries_per_item: Optional[int] = Field(default=None, ge=0, le=20)
     continue_on_item_failure: Optional[bool] = None
+    partial_success_stage_advancement: dict[str, bool] = Field(default_factory=dict)
     stage_parallelism: dict[str, int] = Field(default_factory=dict)
     module_selection_mode: Optional[str] = None
     module_risk_levels: Optional[list[str]] = None
@@ -347,6 +349,13 @@ class BinarySecurityProjectConfigPayload(BaseModel):
     max_stage_parallelism: int = Field(default=4, ge=1, le=32)
     max_retries_per_item: int = Field(default=2, ge=0, le=20)
     continue_on_item_failure: bool = True
+    partial_success_stage_advancement: dict[str, bool] = Field(
+        default_factory=lambda: {
+            "binary_to_source": True,
+            "entry_analysis": True,
+            "dataflow_analysis": True,
+        }
+    )
     stage_parallelism: dict[str, int] = Field(
         default_factory=lambda: {stage: 4 for stage in STAGE_SEQUENCE}
     )
