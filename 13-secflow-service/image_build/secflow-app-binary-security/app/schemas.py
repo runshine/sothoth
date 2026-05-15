@@ -351,9 +351,9 @@ class BinarySecurityProjectConfigPayload(BaseModel):
     continue_on_item_failure: bool = True
     partial_success_stage_advancement: dict[str, bool] = Field(
         default_factory=lambda: {
-            "binary_to_source": True,
-            "entry_analysis": True,
-            "dataflow_analysis": True,
+            "binary_to_source": False,
+            "entry_analysis": False,
+            "dataflow_analysis": False,
         }
     )
     stage_parallelism: dict[str, int] = Field(

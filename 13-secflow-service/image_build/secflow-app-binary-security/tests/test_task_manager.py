@@ -3991,9 +3991,9 @@ class TaskManagerTests(unittest.TestCase):
         payload = BinarySecurityProjectConfigPayload()
         self.assertEqual(
             {
-                "binary_to_source": True,
-                "entry_analysis": True,
-                "dataflow_analysis": True,
+                "binary_to_source": False,
+                "entry_analysis": False,
+                "dataflow_analysis": False,
             },
             payload.partial_success_stage_advancement,
         )
