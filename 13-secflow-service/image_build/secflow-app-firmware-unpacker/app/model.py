@@ -370,7 +370,9 @@ class FirmwareEvolutionJob(Base):
             "started_at": isoformat_local(self.started_at),
             "completed_at": isoformat_local(self.completed_at),
             "final_skill_path": self.final_skill_path,
+            "final_tool_path": self.final_skill_path,
             "replaced_skill_path": self.replaced_skill_path,
+            "replaced_tool_path": self.replaced_skill_path,
             "review_passed": bool(self.review_passed),
         }
 
@@ -399,6 +401,8 @@ class FirmwareEvolutionRound(Base):
             "status": self.status,
             "tool_skill_path_before": self.tool_skill_path_before,
             "tool_skill_path_after": self.tool_skill_path_after,
+            "tool_path_before": self.tool_skill_path_before,
+            "tool_path_after": self.tool_skill_path_after,
             "tool_changed": bool(self.tool_changed),
             "review_result": self.review_result,
             "summary_path": self.summary_path,

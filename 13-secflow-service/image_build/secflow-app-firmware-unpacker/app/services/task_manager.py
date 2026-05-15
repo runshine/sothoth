@@ -2300,6 +2300,37 @@ def _derive_evolution_job_root(output_path: str, job_id: str) -> Path:
     return _derive_evolution_root_from_output_path(output_path) / str(job_id).strip()
 
 
+def _resolve_evolution_source_tool_path(task: Any, latest_job: Any | None = None) -> str | None:
+    candidates: list[str] = []
+    if latest_job is not None and getattr(task, "output_path", None):
+        job_root = _derive_evolution_job_root(str(task.output_path or ""), str(latest_job.id or ""))
+        result_path = job_root / "evolution_result.json"
+        if result_path.exists():
+            try:
+                payload = json.loads(result_path.read_text(encoding="utf-8"))
+            except Exception:
+                payload = {}
+            if isinstance(payload, dict):
+                for key in ("working_tool_path", "final_tool_path", "working_skill_path", "final_skill_path"):
+                    value = str(payload.get(key) or "").strip()
+                    if value:
+                        candidates.append(value)
+                for item in reversed(list(payload.get("rounds") or [])):
+                    if not isinstance(item, dict):
+                        continue
+                    value = str(item.get("tool_path_after") or item.get("tool_skill_path_after") or "").strip()
+                    if value:
+                        candidates.append(value)
+                        break
+    base_tool = str(getattr(task, "matched_skill", "") or "").strip()
+    if base_tool:
+        candidates.append(base_tool)
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    return None
+
+
 def _enrich_evolution_job_payload(
     payload: dict[str, Any],
     *,
@@ -2309,9 +2340,15 @@ def _enrich_evolution_job_payload(
     enriched = dict(payload or {})
     source_skill_path = str(getattr(task, "matched_skill", "") or "").strip() or None
     enriched["source_skill_path"] = source_skill_path
+    enriched["source_tool_path"] = source_skill_path
     enriched["started_without_matched_skill"] = not bool(source_skill_path)
     enriched["working_skill_path"] = None
+    enriched["working_tool_path"] = None
     enriched["generated_new_skill"] = False
+    enriched["generated_new_tool"] = False
+    enriched["replacement_required"] = False
+    enriched["replacement_confirmed"] = True
+    enriched["effective_tool_path"] = None
     if job_root is None:
         return enriched
     result_path = job_root / "evolution_result.json"
@@ -2323,9 +2360,17 @@ def _enrich_evolution_job_payload(
         return enriched
     if isinstance(result_payload, dict):
         enriched["working_skill_path"] = str(result_payload.get("working_skill_path") or "").strip() or None
+        enriched["working_tool_path"] = str(result_payload.get("working_tool_path") or enriched["working_skill_path"] or "").strip() or None
         enriched["source_skill_path"] = str(result_payload.get("source_skill_path") or source_skill_path or "").strip() or None
+        enriched["source_tool_path"] = str(result_payload.get("source_tool_path") or enriched["source_skill_path"] or "").strip() or None
         enriched["started_without_matched_skill"] = bool(result_payload.get("started_without_matched_skill"))
         enriched["generated_new_skill"] = bool(result_payload.get("generated_new_skill"))
+        enriched["generated_new_tool"] = bool(result_payload.get("generated_new_tool", enriched["generated_new_skill"]))
+        enriched["final_tool_path"] = str(result_payload.get("final_tool_path") or result_payload.get("final_skill_path") or "").strip() or None
+        enriched["replaced_tool_path"] = str(result_payload.get("replaced_tool_path") or result_payload.get("replaced_skill_path") or "").strip() or None
+        enriched["replacement_required"] = bool(result_payload.get("replacement_required"))
+        enriched["replacement_confirmed"] = bool(result_payload.get("replacement_confirmed", not enriched["replacement_required"]))
+        enriched["effective_tool_path"] = str(result_payload.get("effective_tool_path") or "").strip() or None
         rounds = result_payload.get("rounds")
         if isinstance(rounds, list):
             enriched["round_count"] = len(rounds)
@@ -2341,13 +2386,17 @@ def _enrich_evolution_job_payload(
                         "status": str(item.get("status") or "failed"),
                         "tool_skill_path_before": str(item.get("tool_skill_path_before") or "").strip() or None,
                         "tool_skill_path_after": str(item.get("tool_skill_path_after") or "").strip() or None,
+                        "tool_path_before": str(item.get("tool_path_before") or item.get("tool_skill_path_before") or "").strip() or None,
+                        "tool_path_after": str(item.get("tool_path_after") or item.get("tool_skill_path_after") or "").strip() or None,
                         "tool_changed": bool(item.get("tool_changed")),
                         "review_result": str(item.get("review_result") or "").strip() or None,
                         "summary_path": str(item.get("summary_path") or "").strip() or None,
                         "reason_path": str(item.get("reason_path") or "").strip() or None,
                         "source_skill_path": str(item.get("source_skill_path") or enriched["source_skill_path"] or "").strip() or None,
+                        "source_tool_path": str(item.get("source_tool_path") or enriched["source_tool_path"] or "").strip() or None,
                         "started_without_matched_skill": bool(item.get("started_without_matched_skill")),
                         "generated_new_skill": bool(item.get("generated_new_skill")),
+                        "generated_new_tool": bool(item.get("generated_new_tool", item.get("generated_new_skill"))),
                         "executed_tool": bool(item.get("executed_tool")),
                         "tool_response_preview": str(item.get("tool_response_preview") or "").strip() or None,
                         "created_at": str(item.get("created_at") or "").strip() or None,
@@ -2581,6 +2630,13 @@ def submit_evolution_job(task_id: str, *, created_by: str = "task_manager") -> d
         )
         if existing is not None:
             raise ValueError("当前任务已有运行中的进化任务")
+        latest_job = (
+            db.query(FirmwareEvolutionJob)
+            .filter(FirmwareEvolutionJob.task_id == task.id)
+            .order_by(FirmwareEvolutionJob.created_at.desc())
+            .first()
+        )
+        source_tool_path = _resolve_evolution_source_tool_path(task, latest_job)
         job_id = generate_id()
         job = FirmwareEvolutionJob(
             id=job_id,
@@ -2589,7 +2645,7 @@ def submit_evolution_job(task_id: str, *, created_by: str = "task_manager") -> d
             status=EVOLUTION_PENDING,
             current_round=0,
             max_rounds=EVOLUTION_MAX_ROUNDS,
-            current_stage="tool_execute" if str(task.matched_skill or "").strip() else "evolve",
+            current_stage="tool_execute",
             created_by=created_by,
         )
         db.add(job)
@@ -2605,7 +2661,7 @@ def submit_evolution_job(task_id: str, *, created_by: str = "task_manager") -> d
             summary="手动进化任务已创建",
             stage_key="evolution",
             status=task.status,
-            detail={"job_id": job_id, "max_rounds": EVOLUTION_MAX_ROUNDS},
+            detail={"job_id": job_id, "max_rounds": EVOLUTION_MAX_ROUNDS, "source_tool_path": source_tool_path},
             created_by=created_by,
         )
         _write_task_result_cache(task.id)
@@ -2749,6 +2805,72 @@ def get_evolution_log(job_id: str, round_id: int, role: str) -> dict[str, Any] |
         db.close()
 
 
+def confirm_evolution_tool_replacement(job_id: str) -> dict[str, Any]:
+    from app.model import FirmwareEvolutionJob, UnpackTask, get_db_session
+
+    db = get_db_session()
+    try:
+        job = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
+        if job is None:
+            raise ValueError("进化任务不存在")
+        task = db.query(UnpackTask).filter(UnpackTask.id == job.task_id).first()
+        if task is None:
+            raise ValueError("进化任务对应主任务不存在")
+        if str(job.status or "").strip() != EVOLUTION_SUCCESS:
+            raise ValueError("仅 success 的进化任务允许确认替换")
+        job_root = _derive_evolution_job_root(task.output_path, job.id)
+        result_path = job_root / "evolution_result.json"
+        if not result_path.exists():
+            raise ValueError("进化结果不存在")
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("进化结果格式非法")
+
+        final_tool_path = Path(str(payload.get("final_tool_path") or payload.get("final_skill_path") or "").strip())
+        replaced_tool_path = Path(str(payload.get("replaced_tool_path") or payload.get("replaced_skill_path") or "").strip())
+        replacement_required = bool(payload.get("replacement_required"))
+        replacement_confirmed = bool(payload.get("replacement_confirmed", not replacement_required))
+
+        if not replacement_required:
+            raise ValueError("当前进化结果不需要确认替换")
+        if replacement_confirmed:
+            raise ValueError("当前进化结果已确认替换")
+        if not final_tool_path.exists():
+            raise ValueError("新工具文件不存在")
+        if not replaced_tool_path:
+            raise ValueError("原工具路径不存在")
+        replaced_tool_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(final_tool_path, replaced_tool_path)
+
+        payload["replacement_confirmed"] = True
+        payload["effective_tool_path"] = str(replaced_tool_path)
+        result_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        job.replaced_skill_path = str(replaced_tool_path)
+        task.latest_evolution_final_skill_path = str(replaced_tool_path)
+        db.commit()
+
+        _record_task_event_from_row(
+            task,
+            event_type="evolution_tool_replaced",
+            summary="已确认使用新工具替换原工具",
+            stage_key="evolution",
+            status=task.status,
+            detail={
+                "job_id": job.id,
+                "new_tool_path": str(final_tool_path),
+                "replaced_tool_path": str(replaced_tool_path),
+            },
+            created_by="task_manager",
+        )
+        return {
+            "message": "已确认替换原工具",
+            "task_id": task.id,
+        }
+    finally:
+        db.close()
+
+
 def process_evolution_jobs(limit: int = 1) -> int:
     from app.evolution_engine import run_evolution_job
     from app.model import FirmwareEvolutionJob, FirmwareEvolutionRound, UnpackTask, get_db_session, get_worker_id, generate_id
@@ -2811,7 +2933,13 @@ def process_evolution_jobs(limit: int = 1) -> int:
             project_id = task.project_id
             firmware_path = task.firmware_path
             output_path = task.output_path
-            active_skill_path = str(task.matched_skill or "").strip()
+            latest_job = (
+                db.query(FirmwareEvolutionJob)
+                .filter(FirmwareEvolutionJob.task_id == task.id)
+                .order_by(FirmwareEvolutionJob.created_at.desc())
+                .first()
+            )
+            active_skill_path = _resolve_evolution_source_tool_path(task, latest_job) or ""
             llm_binding_snapshot = _parse_llm_binding_snapshot(task.llm_binding_snapshot)
             max_rounds = int(job.max_rounds or EVOLUTION_MAX_ROUNDS)
         finally:
@@ -2881,7 +3009,7 @@ def process_evolution_jobs(limit: int = 1) -> int:
             current.lease_expires_at = None
             current.completed_at = completed_at
             current.current_round = int((result or {}).get("current_round") or current.current_round or 0)
-            current.current_stage = "review" if (result or {}).get("review_passed") else "evolve"
+            current.current_stage = "review"
             current.status = EVOLUTION_FAILED if error_message else str((result or {}).get("status") or EVOLUTION_FAILED)
             current.error_message = error_message
             current.final_skill_path = str((result or {}).get("final_skill_path") or "").strip() or None

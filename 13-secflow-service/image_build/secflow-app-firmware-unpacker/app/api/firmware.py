@@ -52,6 +52,7 @@ from app.services.observability import generate_metrics_payload, metrics_content
 from app.services.task_events import list_task_events
 from app.services.task_manager import (
     cancel_task,
+    confirm_evolution_tool_replacement,
     delete_tasks,
     get_evolution_job,
     get_evolution_log,
@@ -64,7 +65,8 @@ from app.services.task_manager import (
     submit_unpack_task,
 )
 from app.services.worker import get_cluster_snapshot, get_worker_id
-from app.skill_store import list_skills
+from app.tool_store import list_python_tools
+from app.time_utils import ensure_local, now_local
 from app.unpacker_engine_config import get_max_retries
 from app.unpacker_engine import TOOLS_DIR
 from app.unpacker_engine_logs import TASK_RESULT_CACHE_FILENAME, list_round_dirs as _list_round_dirs, read_text_tail
@@ -192,6 +194,7 @@ def _phase_payload(
     updated_at: Optional[str] = None,
     current_round: Optional[int] = None,
     total_rounds: Optional[int] = None,
+    duration_seconds: Optional[int] = None,
 ) -> dict:
     return {
         "key": key,
@@ -201,6 +204,7 @@ def _phase_payload(
         "updated_at": updated_at,
         "current_round": current_round,
         "total_rounds": total_rounds,
+        "duration_seconds": duration_seconds,
     }
 
 
@@ -230,6 +234,16 @@ def _mtime_iso_text(path: Path) -> Optional[str]:
         from datetime import datetime
 
         return datetime.fromtimestamp(timestamp).isoformat()
+    except Exception:
+        return None
+
+
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return ensure_local(datetime.fromisoformat(raw))
     except Exception:
         return None
 
@@ -274,6 +288,32 @@ def _read_final_round_result(run_dir: Path, final_round: int) -> dict | None:
 
 def _get_task_progress(task_id: str) -> dict:
     task = _get_task_or_404(task_id)
+    db = get_db_session()
+    try:
+        all_task_events = (
+            db.query(UnpackTaskEvent)
+            .filter(UnpackTaskEvent.task_id == task_id)
+            .order_by(UnpackTaskEvent.created_at.asc())
+            .all()
+        )
+    finally:
+        db.close()
+    run_window_start: Optional[datetime] = None
+    for event in reversed(all_task_events):
+        event_type = str(getattr(event, "event_type", "") or "").strip().lower()
+        if event_type in {"task_started", "task_retry_requested", "task_created"}:
+            candidate = ensure_local(getattr(event, "created_at", None))
+            if candidate is not None:
+                run_window_start = candidate
+                break
+    if run_window_start is not None:
+        task_events = [
+            event
+            for event in all_task_events
+            if (ensure_local(getattr(event, "created_at", None)) or run_window_start) >= run_window_start
+        ]
+    else:
+        task_events = all_task_events
     run_dir = _derive_run_path(task)
     stage1_path = _round_log_path(run_dir, 0, "preprocess.json")
     stage2_path = _round_log_path(run_dir, 0, "skill_match.json")
@@ -283,9 +323,11 @@ def _get_task_progress(task_id: str) -> dict:
     stage4_path = _round_log_path(run_dir, 0, "fallback.json")
     stage5_path = _round_log_path(run_dir, 0, "stage5_skill_generate.json")
     cleaner_path = _round_log_path(run_dir, 0, "cleaner_messages.json")
+    tool_reviewer_messages = _round_log_path(run_dir, 0, "reviewer_messages.json")
     round_dirs = _llm_round_dirs(run_dir)
     executor_logs = [path / "executor_messages.json" for path in round_dirs if (path / "executor_messages.json").exists()]
     verifier_logs = [path / "reviewer_messages.json" for path in round_dirs if (path / "reviewer_messages.json").exists()]
+    has_tool_review = tool_reviewer_messages.exists() or stage4_llm_review_log.exists()
 
     task_status = str(task.get("status") or "").lower()
     task_result = str(task.get("result_status") or "").lower()
@@ -293,12 +335,43 @@ def _get_task_progress(task_id: str) -> dict:
     result_message = str(task.get("result_message") or "")
     quick_preprocess_success = "quick pre-process" in result_message.lower()
     matched_skill = str(task.get("matched_skill") or "").strip()
+    matched_tool = matched_skill
+    matched_tool_score = task.get("matched_skill_score")
     fallback_to_llm = bool(task.get("fallback_to_llm"))
     generated_skill_path = str(task.get("generated_skill_path") or "").strip()
     final_round = int(task.get("rounds") or 0)
     total_llm_rounds = max(1, int(get_max_retries() or 1))
     final_round_result = _read_final_round_result(run_dir, final_round)
     final_round_result_status = str((final_round_result or {}).get("status") or "").strip().lower()
+    phase_start_times: dict[str, Optional[datetime]] = {
+        "preprocess": _parse_iso_datetime(task.get("started_at")),
+        "tool_match": None,
+        "llm_unpack": None,
+        "llm_review": None,
+        "llm_cleanup": None,
+    }
+
+    def _remember_phase_start(phase_key: str, created_at: Optional[datetime]) -> None:
+        if phase_key not in phase_start_times or phase_start_times[phase_key] is not None or created_at is None:
+            return
+        phase_start_times[phase_key] = ensure_local(created_at)
+
+    for event in task_events:
+        event_type = str(getattr(event, "event_type", "") or "").strip().lower()
+        stage_key = str(getattr(event, "stage_key", "") or "").strip().lower()
+        created_at = ensure_local(getattr(event, "created_at", None))
+        if event_type == "task_started":
+            _remember_phase_start("preprocess", created_at)
+        if stage_key == "preprocess":
+            _remember_phase_start("preprocess", created_at)
+        elif stage_key in {"feature_extract", "skill_match", "tool_match"}:
+            _remember_phase_start("tool_match", created_at)
+        elif stage_key == "llm_unpack":
+            _remember_phase_start("llm_unpack", created_at)
+        elif stage_key in {"review", "llm_review"}:
+            _remember_phase_start("llm_review", created_at)
+        elif stage_key in {"cleanup", "llm_cleanup"}:
+            _remember_phase_start("llm_cleanup", created_at)
 
     def _clamp_round(value: Optional[int]) -> Optional[int]:
         if value is None:
@@ -378,11 +451,21 @@ def _get_task_progress(task_id: str) -> dict:
     else:
         if stage2_path.exists():
             stage2_data = _read_json_file(stage2_path)
-            matched_path = matched_skill
-            matched_score = task.get("matched_skill_score")
+            matched_path = matched_tool
+            matched_score = matched_tool_score
             if isinstance(stage2_data, dict):
-                matched_path = str(stage2_data.get("matched_skill") or matched_path or "")
-                matched_score = stage2_data.get("matched_skill_score", matched_score)
+                matched_path = str(
+                    stage2_data.get("matched_tool")
+                    or stage2_data.get("matched_skill")
+                    or matched_path
+                    or ""
+                )
+                matched_score = stage2_data.get(
+                    "matched_tool_score",
+                    stage2_data.get("matched_skill_score", matched_score),
+                )
+            matched_tool = matched_path
+            matched_tool_score = matched_score
             if matched_path:
                 status = "success"
                 detail = f"命中工具：{Path(matched_path).name}"
@@ -410,7 +493,7 @@ def _get_task_progress(task_id: str) -> dict:
                     _mtime_iso_text(stage2_path),
                 )
 
-        if executor_logs or fallback_to_llm or (task_status == "running" and stage2_path.exists()):
+        if executor_logs or fallback_to_llm or task_current_stage == "llm_unpack":
             unpack_status = "running"
             unpack_detail = "LLM 正在执行解包"
             unpack_round = _running_unpack_round()
@@ -419,9 +502,19 @@ def _get_task_progress(task_id: str) -> dict:
                 unpack_detail = f"已执行 {len(executor_logs)} 轮解包"
                 if verifier_logs or task_result in {"success", "max_retries_reached", "failed"}:
                     unpack_status = "success"
-            if matched_skill and not fallback_to_llm and not executor_logs and task_status != "running":
+                elif task_current_stage in {"review", "cleanup"}:
+                    unpack_status = "success"
+                    unpack_detail = f"已执行 {len(executor_logs)} 轮解包"
+            elif task_current_stage != "llm_unpack":
+                unpack_status = "success" if task_current_stage in {"review", "cleanup"} else unpack_status
+                if unpack_status == "success":
+                    unpack_detail = "LLM 解包已完成，进入后续阶段"
+            if matched_tool and not fallback_to_llm and not executor_logs and task_status != "running":
                 unpack_status = "skipped"
-                unpack_detail = "工具执行成功，未进入 LLM 解包"
+                unpack_detail = "工具执行成功，跳过 LLM 解包"
+            elif matched_tool and not fallback_to_llm and not executor_logs:
+                unpack_status = "skipped"
+                unpack_detail = "工具执行成功，跳过 LLM 解包"
             if task_status == "failed" and not verifier_logs and executor_logs:
                 unpack_status = "failed"
                 unpack_detail = "LLM 解包阶段执行失败"
@@ -431,13 +524,13 @@ def _get_task_progress(task_id: str) -> dict:
                 unpack_status,
                 unpack_detail,
                 _mtime_iso_text(executor_logs[-1]) if executor_logs else (_mtime_iso_text(stage3_llm_unpack_log) or _mtime_iso_text(stage4_path)),
-                current_round=unpack_round if unpack_status != "skipped" else None,
-                total_rounds=total_llm_rounds if unpack_status != "skipped" else None,
+                current_round=unpack_round if unpack_status not in {"skipped", "not_executed"} else None,
+                total_rounds=total_llm_rounds if unpack_status not in {"skipped", "not_executed"} else None,
             )
-        elif matched_skill and not fallback_to_llm:
-            phases[2] = _phase_payload("llm_unpack", "LLM 解包", "skipped", "工具执行成功，未进入 LLM 解包")
+        elif matched_tool and not fallback_to_llm:
+            phases[2] = _phase_payload("llm_unpack", "LLM 解包", "skipped", "工具执行成功，跳过 LLM 解包")
 
-        if verifier_logs or task_result in {"success", "max_retries_reached", "failed"}:
+        if verifier_logs or has_tool_review or task_result in {"success", "max_retries_reached", "failed"} or task_current_stage in {"review", "cleanup"}:
             review_status = "running"
             review_detail = "LLM 正在评审当前解包结果"
             review_round = _running_review_round()
@@ -463,24 +556,34 @@ def _get_task_progress(task_id: str) -> dict:
                     review_detail = "最终轮评审已通过"
                 elif review_status == "failed":
                     review_detail = "最终轮评审未通过，任务失败"
+            elif has_tool_review:
+                if task_current_stage == "review":
+                    review_status = "running"
+                    review_detail = "LLM 正在评审当前解包结果"
+                elif task_result in {"success"} or task_status == "success" or task_current_stage == "cleanup":
+                    review_status = "success"
+                    review_detail = "工具执行后的评审已通过"
+                elif task_result in {"failed", "max_retries_reached"} or task_status == "failed":
+                    review_status = "failed"
+                    review_detail = "工具执行后的评审未通过"
             phases[3] = _phase_payload(
                 "llm_review",
                 "LLM 评审",
                 review_status,
                 review_detail,
-                _mtime_iso_text(verifier_logs[-1]) if verifier_logs else _mtime_iso_text(stage4_llm_review_log),
+                _mtime_iso_text(verifier_logs[-1]) if verifier_logs else (_mtime_iso_text(tool_reviewer_messages) or _mtime_iso_text(stage4_llm_review_log)),
                 current_round=review_round,
                 total_rounds=total_llm_rounds if review_round is not None else None,
             )
-        elif matched_skill and not fallback_to_llm:
-            phases[3] = _phase_payload("llm_review", "LLM 评审", "skipped", "工具执行成功后未进入 LLM 评审链路")
+        elif matched_tool and not fallback_to_llm:
+            phases[3] = _phase_payload("llm_review", "LLM 评审", "not_executed", "工具执行成功后，LLM 评审未执行")
 
         cleanup_status = "pending"
         cleanup_detail = None
         if cleaner_path.exists():
             cleanup_status = "success"
             cleanup_detail = "清理已完成"
-        elif task_status == "running" and (verifier_logs or (matched_skill and not fallback_to_llm and stage3_path.exists())):
+        elif task_current_stage == "cleanup":
             cleanup_status = "running"
             cleanup_detail = "正在清理中间产物和重复文件"
         elif task_status in {"failed", "cancelled"}:
@@ -506,8 +609,8 @@ def _get_task_progress(task_id: str) -> dict:
                 break
 
     summary_parts: list[str] = []
-    if matched_skill:
-        summary_parts.append(f"命中工具：{Path(matched_skill).name}")
+    if matched_tool:
+        summary_parts.append(f"命中工具：{Path(matched_tool).name}")
     if fallback_to_llm:
         summary_parts.append("已回退到 LLM 解包")
     if generated_skill_path:
@@ -527,6 +630,30 @@ def _get_task_progress(task_id: str) -> dict:
         if completed_round is not None:
             overall_current_round = completed_round
             overall_total_rounds = total_llm_rounds
+
+    task_completed_at = _parse_iso_datetime(task.get("completed_at"))
+    for index, phase in enumerate(phases):
+        phase_key = str(phase.get("key") or "")
+        phase_status = str(phase.get("status") or "")
+        phase_start = phase_start_times.get(phase_key)
+        if phase_start is None or phase_status in {"pending", "skipped", "not_executed"}:
+            continue
+        if phase_status == "running":
+            phase_end = now_local()
+        else:
+            phase_end = _parse_iso_datetime(phase.get("updated_at"))
+            if phase_end is None:
+                for next_phase in phases[index + 1:]:
+                    next_start = phase_start_times.get(str(next_phase.get("key") or ""))
+                    if next_start is not None:
+                        phase_end = next_start
+                        break
+            if phase_end is None:
+                phase_end = task_completed_at or phase_start
+        phase_start = ensure_local(phase_start)
+        phase_end = ensure_local(phase_end)
+        duration_seconds = max(0, int(round((phase_end - phase_start).total_seconds())))
+        phase["duration_seconds"] = duration_seconds
 
     return {
         "task_id": task_id,
@@ -1707,7 +1834,7 @@ def _batch_update_config_entries(items: list[ConfigBatchUpdateItem]) -> dict:
 
 def _list_tools() -> dict:
     items: list[dict] = []
-    for meta in list_skills(TOOLS_DIR):
+    for meta in list_python_tools(TOOLS_DIR):
         items.append(
             {
                 "filename": str(meta.get("filename") or ""),
@@ -1719,11 +1846,11 @@ def _list_tools() -> dict:
                 "magic_hex": str(meta.get("magic_hex") or ""),
                 "keywords": list(meta.get("keywords") or []),
                 "binwalk_sigs": list(meta.get("binwalk_sigs") or []),
-                "skill_status": str(meta.get("skill_status") or ""),
-                "skill_version": int(meta.get("skill_version") or 1),
-                "family_id": str(meta.get("family_id") or ""),
-                "promotion_success_count": int(meta.get("promotion_success_count") or 0),
-                "promotion_threshold": int(meta.get("promotion_threshold") or 5),
+                "skill_status": "python",
+                "skill_version": 1,
+                "family_id": str(meta.get("format_id") or meta.get("name") or ""),
+                "promotion_success_count": 0,
+                "promotion_threshold": 0,
             }
         )
     return {"total": len(items), "items": items}
@@ -2168,6 +2295,25 @@ async def get_evolution_logs_legacy(
     if payload is None:
         raise NotFoundError("进化任务日志", job_id)
     return payload
+
+
+@router.post(
+    "/api/app/firmware-unpacker/evolution-jobs/{job_id}/confirm-replacement",
+    response_model=ActionResponse,
+)
+async def confirm_evolution_tool_replacement_legacy(
+    job_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    job = get_evolution_job(job_id)
+    if job is None:
+        raise NotFoundError("进化任务", job_id)
+    await _get_task_with_access(str(job.get("task_id") or ""), token)
+    try:
+        return confirm_evolution_tool_replacement(job_id)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
 
 
 @router.get("/api/app/firmware-unpacker/tasks", response_model=TaskListResponse)

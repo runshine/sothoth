@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import shutil
 import subprocess
 import tempfile
@@ -15,13 +16,8 @@ from typing import Any, Callable, Optional
 
 from app.logging_utils import log_event
 from app.preprocess import detect_format, run_preprocess
-from app.skill_store import (
-    DEFAULT_PROMOTION_THRESHOLD,
-    compute_family_id,
-    match_skill,
-    register_skill_success,
-    save_candidate_skill,
-)
+from app.skill_store import DEFAULT_PROMOTION_THRESHOLD, save_candidate_skill
+from app.tool_store import compute_family_id, match_python_tool
 from app.unpacker_engine_config import (
     AUTHOR_AGENT_DEF,
     AUTHOR_PROMPT_TMPL,
@@ -375,6 +371,103 @@ def _run_skill_unpack(
             Path(skill_sp).unlink()
         except FileNotFoundError:
             pass
+
+
+def _tool_manifest_path(output_path: str) -> Path:
+    output_dir = Path(str(output_path or "").strip())
+    return output_dir.parent / "input" / "task.json"
+
+
+def _run_python_tool_unpack(
+    firmware_path: str,
+    output_path: str,
+    tool_meta: dict[str, Any],
+    log_dir: Path | None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    register_cancel_hook: Optional[Callable[[Callable[[], None] | None], None]] = None,
+) -> dict[str, Any]:
+    global_round_dir = _get_round_dir(log_dir, 0)
+    tool_path = Path(str(tool_meta.get("path") or "")).resolve()
+    manifest_path = _tool_manifest_path(output_path)
+    run_path = str(Path(output_path).parent / "run")
+    if not tool_path.is_file():
+        raise FileNotFoundError(f"tool not found: {tool_path}")
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"task manifest not found: {manifest_path}")
+
+    env = os.environ.copy()
+    env["SECFLOW_TOOL_INPUT_PATH"] = firmware_path
+    env["SECFLOW_TOOL_OUTPUT_PATH"] = output_path
+    env["SECFLOW_TOOL_LOG_PATH"] = run_path
+    env["SECFLOW_TOOL_MANIFEST_PATH"] = str(manifest_path)
+
+    _append_stage_log(
+        global_round_dir,
+        "skill_exec.log",
+        "starting python tool execution",
+        tool=str(tool_path),
+        firmware_path=firmware_path,
+        output_path=output_path,
+        manifest_path=str(manifest_path),
+    )
+    proc = subprocess.Popen(
+        [sys.executable, str(tool_path), str(manifest_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
+    if register_cancel_hook is not None:
+        register_cancel_hook(lambda: _kill_process_tree(proc))
+    output_lines: list[str] = []
+    try:
+        while True:
+            if cancel_check and cancel_check():
+                _kill_process_tree(proc)
+                raise RuntimeError("__CANCELLED__")
+            line = proc.stdout.readline() if proc.stdout is not None else ""
+            if line:
+                text = line.rstrip("\n")
+                output_lines.append(text)
+                _append_stage_log(
+                    global_round_dir,
+                    "skill_exec.log",
+                    text,
+                )
+                continue
+            if proc.poll() is not None:
+                break
+            time.sleep(0.2)
+        remaining = ""
+        if proc.stdout is not None:
+            remaining = proc.stdout.read() or ""
+        if remaining:
+            for line in remaining.splitlines():
+                output_lines.append(line)
+                _append_stage_log(global_round_dir, "skill_exec.log", line)
+        return_code = proc.wait()
+    finally:
+        if register_cancel_hook is not None:
+            register_cancel_hook(None)
+
+    result = {
+        "success": return_code == 0,
+        "method": f"python_tool:{tool_meta.get('filename')}",
+        "return_code": return_code,
+        "response": "\n".join(output_lines).strip(),
+    }
+    _write_json_log(
+        global_round_dir,
+        "skill_exec.json",
+        {
+            "tool": str(tool_path),
+            "success": result["success"],
+            "return_code": return_code,
+            "response_preview": _preview_text(result["response"]),
+        },
+    )
+    return result
 
 
 def _run_generic_unpack(
@@ -866,6 +959,13 @@ def _run_cleaner(
     event_callback: Optional[Callable[[str, str], None]] = None,
     activity_callback: Optional[Callable[[str], None]] = None,
 ) -> str:
+    session_log_dir = log_dir
+    if (
+        session_log_dir is not None
+        and session_log_dir.name.startswith("round_")
+        and session_log_dir.parent is not None
+    ):
+        session_log_dir = session_log_dir.parent
     _append_stage_log(
         log_dir,
         "cleaner.log",
@@ -876,11 +976,11 @@ def _run_cleaner(
     clean_sp = "/tmp/firmware-extract-cleanup.md"
     Path(clean_sp).write_text(clean_def["system_prompt"])
     session_artifacts = build_session_artifacts(
-        log_dir,
+        session_log_dir,
         role="cleaner",
         name="default",
         provider_role="cleaner",
-        phase="cleanup",
+        phase="llm_cleanup",
     )
     cleaner = PiRpcClient(
         system_prompt_file=clean_sp,
@@ -899,6 +999,7 @@ def _run_cleaner(
     )
     if bind_cancel_client:
         bind_cancel_client(cleaner)
+    result = ""
     try:
         clean_msg = render_prompt(CLEAN_PROMPT_TMPL, output_path, "")
         log_event(log, logging.INFO, "cleanup started", event="cleanup_start")
@@ -911,11 +1012,16 @@ def _run_cleaner(
                 detail={"output_path": output_path},
             )
         def _stream_cleanup_event(_event: dict[str, Any]) -> None:
+            _append_stream_delta(
+                log_dir,
+                "cleaner.log",
+                "cleaner",
+                _event,
+            )
             if activity_callback is not None:
                 activity_callback("cleanup")
 
         result = cleaner.prompt(clean_msg, stream_callback=_stream_cleanup_event)
-        _save_agent_log(cleaner, log, log_dir, "cleaner")
         log_event(
             log,
             logging.INFO,
@@ -939,6 +1045,15 @@ def _run_cleaner(
             )
         return result
     finally:
+        try:
+            _save_agent_log(cleaner, log, log_dir, "cleaner")
+        except Exception as exc:
+            _append_stage_log(
+                log_dir,
+                "cleaner.log",
+                "failed to persist cleaner session artifacts",
+                error=str(exc),
+            )
         if bind_cancel_client:
             bind_cancel_client(None)
         cleaner.close()
@@ -1045,13 +1160,13 @@ def run_unpack(
             register_cancel_hook=register_cancel_hook,
         )
         features["family_id"] = compute_family_id(features)
-        skill_meta, skill_score, skill_match = match_skill(features, TOOLS_DIR)
+        skill_meta, skill_score, skill_match = match_python_tool(features, TOOLS_DIR)
     except RuntimeError as exc:
         if str(exc) == "__CANCELLED__":
             raise
         skill_meta = None
         skill_score = 0
-        skill_match = {"matched_status": None, "reasons": []}
+        skill_match = {"reasons": []}
         log_event(
             log,
             logging.WARNING,
@@ -1062,7 +1177,7 @@ def run_unpack(
     except Exception as exc:
         skill_meta = None
         skill_score = 0
-        skill_match = {"matched_status": None, "reasons": []}
+        skill_match = {"reasons": []}
         log_event(
             log,
             logging.WARNING,
@@ -1073,11 +1188,10 @@ def run_unpack(
     _append_stage_log(
         global_round_dir,
         "skill_match.log",
-        "feature extraction and skill match completed",
+        "feature extraction and tool match completed",
         features=features,
-        matched_skill=skill_meta.get("path") if skill_meta else None,
-        matched_skill_score=skill_score,
-        matched_status=skill_match.get("matched_status"),
+        matched_tool=skill_meta.get("path") if skill_meta else None,
+        matched_tool_score=skill_score,
         reasons=skill_match.get("reasons"),
     )
 
@@ -1086,10 +1200,8 @@ def run_unpack(
         "skill_match.json",
         {
             "features": features,
-            "matched_skill": skill_meta.get("path") if skill_meta else None,
-            "matched_skill_version": skill_meta.get("skill_version") if skill_meta else None,
-            "matched_skill_score": skill_score,
-            "matched_status": skill_match.get("matched_status"),
+            "matched_tool": skill_meta.get("path") if skill_meta else None,
+            "matched_tool_score": skill_score,
             "reasons": skill_match.get("reasons"),
         },
     )
@@ -1128,9 +1240,8 @@ def run_unpack(
                     stage_key="tool_match",
                     status="running",
                     detail={
-                        "matched_skill": skill_meta.get("path"),
-                        "skill_version": skill_meta.get("skill_version"),
-                        "matched_skill_score": skill_score,
+                        "matched_tool": skill_meta.get("path"),
+                        "matched_tool_score": skill_score,
                     },
                 )
             _check_cancel()
@@ -1138,32 +1249,41 @@ def run_unpack(
             _append_stage_log(
                 global_round_dir,
                 "skill_match.log",
-                "matched skill selected for execution",
-                skill=skill_meta.get("path"),
-                skill_version=skill_meta.get("skill_version"),
-                family_id=skill_meta.get("family_id"),
+                "matched python tool selected for execution",
+                tool=skill_meta.get("path"),
             )
-            skill_result = _run_skill_unpack(
-                task_id,
-                skill_meta,
+            skill_result = _run_python_tool_unpack(
                 firmware_path,
                 output_path,
+                skill_meta,
                 log_dir,
-                val_def,
-                val_sp,
-                llm_binding_snapshot=llm_binding_snapshot,
-                bind_cancel_client=_bind_cancel_client,
-                activity_callback=_report_activity,
+                cancel_check=cancel_check,
+                register_cancel_hook=register_cancel_hook,
             )
+            review_result = ""
             if skill_result.get("success"):
-                passed = True
-                final_round = 0
-                updated_skill = register_skill_success(TOOLS_DIR, str(skill_meta.get("path")))
-                promotion_success_count = updated_skill.get("promotion_success_count")
-                matched_skill = updated_skill
+                passed, review_result, _review_meta = _run_reviewer(
+                    task_id,
+                    firmware_path,
+                    output_path,
+                    log_dir,
+                    global_round_dir,
+                    "tool",
+                    val_def,
+                    val_sp,
+                    llm_binding_snapshot=llm_binding_snapshot,
+                    bind_cancel_client=_bind_cancel_client,
+                    activity_callback=_report_activity,
+                )
+                final_round = 0 if passed else final_round
+                last_reason = review_result
             else:
                 fallback_to_llm = True
-                last_reason = str(skill_result.get("review") or skill_result.get("response") or "")
+                last_reason = str(skill_result.get("response") or "")
+            if not passed:
+                fallback_to_llm = True
+                if not last_reason:
+                    last_reason = str(review_result or "")
                 if event_callback:
                     event_callback(
                         "tool_fallback_to_llm",
@@ -1171,22 +1291,22 @@ def run_unpack(
                         stage_key="tool_match",
                         status="running",
                         detail={
-                            "matched_skill": skill_meta.get("path"),
+                            "matched_tool": skill_meta.get("path"),
                             "reason": _preview_text(last_reason, 400),
                         },
                     )
                 _append_stage_log(
                     global_round_dir,
                     "stage3_llm_unpack.log",
-                    "fallback to llm triggered after skill failure",
-                    matched_skill=skill_meta.get("path"),
+                    "fallback to llm triggered after python tool execution failure",
+                    matched_tool=skill_meta.get("path"),
                     reason_preview=_preview_text(last_reason, 400),
                 )
                 _write_json_log(
                     global_round_dir,
                     "fallback.json",
                     {
-                        "matched_skill": skill_meta.get("path"),
+                        "matched_tool": skill_meta.get("path"),
                         "reason": _preview_text(last_reason, 400),
                     },
                 )
@@ -1251,12 +1371,12 @@ def run_unpack(
         ),
         "rounds": final_round,
         "matched_skill": matched_skill.get("path") if matched_skill else None,
-        "matched_skill_version": matched_skill.get("skill_version") if matched_skill else None,
+        "matched_skill_version": None,
         "matched_skill_score": skill_score if matched_skill else None,
         "fallback_to_llm": fallback_to_llm,
         "generated_skill_path": None,
         "generated_skill_status": None,
-        "promotion_success_count": promotion_success_count,
+        "promotion_success_count": None,
     }
 
 

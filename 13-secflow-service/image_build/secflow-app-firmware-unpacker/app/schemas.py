@@ -154,6 +154,7 @@ class TaskProgressPhaseResponse(BaseModel):
     updated_at: Optional[str] = None
     current_round: Optional[int] = None
     total_rounds: Optional[int] = None
+    duration_seconds: Optional[int] = None
 
 
 class TaskProgressResponse(BaseModel):
@@ -365,13 +366,17 @@ class EvolutionRoundResponse(BaseModel):
     status: str
     tool_skill_path_before: Optional[str] = None
     tool_skill_path_after: Optional[str] = None
+    tool_path_before: Optional[str] = None
+    tool_path_after: Optional[str] = None
     tool_changed: bool = False
     review_result: Optional[str] = None
     summary_path: Optional[str] = None
     reason_path: Optional[str] = None
     source_skill_path: Optional[str] = None
+    source_tool_path: Optional[str] = None
     started_without_matched_skill: bool = False
     generated_new_skill: bool = False
+    generated_new_tool: bool = False
     executed_tool: bool = False
     tool_response_preview: Optional[str] = None
     created_at: Optional[str] = None
@@ -395,11 +400,19 @@ class EvolutionJobResponse(BaseModel):
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
     final_skill_path: Optional[str] = None
+    final_tool_path: Optional[str] = None
     replaced_skill_path: Optional[str] = None
+    replaced_tool_path: Optional[str] = None
     review_passed: bool = False
     source_skill_path: Optional[str] = None
+    source_tool_path: Optional[str] = None
     working_skill_path: Optional[str] = None
+    working_tool_path: Optional[str] = None
     generated_new_skill: bool = False
+    generated_new_tool: bool = False
+    replacement_required: bool = False
+    replacement_confirmed: bool = True
+    effective_tool_path: Optional[str] = None
     started_without_matched_skill: bool = False
     run_root: Optional[str] = None
     session_root: Optional[str] = None
