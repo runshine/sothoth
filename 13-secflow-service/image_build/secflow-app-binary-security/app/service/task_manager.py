@@ -1639,8 +1639,13 @@ class TaskManager:
         if not force and self._last_queue_reconcile_at and (now - self._last_queue_reconcile_at).total_seconds() < interval:
             return
         self._last_queue_reconcile_at = now
-        self._reclaim_stale_dispatching_locked(db)
-        self._reclaim_stale_running_locked(db)
+        stale_dispatching_reclaimed = self._reclaim_stale_dispatching_locked(db)
+        stale_running_reclaimed = self._reclaim_stale_running_locked(db)
+        if stale_dispatching_reclaimed or stale_running_reclaimed:
+            # Persist the reclaimed task state before seeding Redis queues.
+            # Otherwise the surrounding loop closes the session and rolls the
+            # reclaim back, leaving tasks permanently stuck on dead workers.
+            db.commit()
         seed_batch = max(1, int(self.cfg.queue.seed_batch_size or 20))
         pending_ids = [
             row[0]
