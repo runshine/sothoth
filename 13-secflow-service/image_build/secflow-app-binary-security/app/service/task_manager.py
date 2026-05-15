@@ -431,15 +431,29 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
     return unique
 
 
+def _stage_item_attr(item: Any, field: str) -> Any:
+    if item is None:
+        return None
+    if isinstance(item, dict):
+        return item.get(field)
+    state = getattr(item, "__dict__", None) or {}
+    if field in state:
+        return state.get(field)
+    try:
+        return getattr(item, field)
+    except Exception:
+        return None
+
+
 def _downstream_origin_payload(task: BinarySecurityTask, item: BinarySecurityStageItem) -> dict[str, Any]:
     return {
         "task_origin_type": "binary_security",
         "parent_project_id": task.project_id,
         "parent_task_id": task.id,
         "parent_task_type": task.task_type,
-        "parent_stage_name": item.stage_name,
-        "parent_stage_item_id": item.id,
-        "parent_stage_item_key": item.item_key,
+        "parent_stage_name": _stage_item_attr(item, "stage_name"),
+        "parent_stage_item_id": _stage_item_attr(item, "id"),
+        "parent_stage_item_key": _stage_item_attr(item, "item_key"),
     }
 
 
@@ -1423,8 +1437,7 @@ class TaskManager:
         affected_stages = stage_sequence[target_index:]
         self._invalidate_task_execution(task)
         db.flush()
-        affected_items = self._stage_items_for_stages(db, task.id, affected_stages)
-        downstream_refs = self._collect_downstream_refs(task, affected_items)
+        downstream_refs = self._downstream_refs_for_stages(db, task, affected_stages)
         if downstream_refs:
             await self._delete_downstream_refs(db, task, downstream_refs, self._service_token())
         self._clear_stage_outputs_from(task, target_stage, mark_stale=False)
@@ -1466,8 +1479,7 @@ class TaskManager:
         stage_sequence = self._stage_sequence_for_task(task)
         first_stage = stage_sequence[0]
         self._invalidate_task_execution(task)
-        all_items = self._stage_items_for_stages(db, task.id, stage_sequence)
-        downstream_refs = self._collect_downstream_refs(task, all_items)
+        downstream_refs = self._downstream_refs_for_stages(db, task, stage_sequence)
         if downstream_refs:
             await self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token())
         self._clear_stage_outputs_from(task, first_stage, mark_stale=False)
@@ -1505,8 +1517,7 @@ class TaskManager:
             affected_stages = stage_sequence[target_index:]
             downstream_stages = stage_sequence[target_index + 1 :]
             self._invalidate_task_execution(task)
-            downstream_items = self._stage_items_for_stages(db, task.id, downstream_stages)
-            downstream_refs = self._collect_downstream_refs(task, downstream_items)
+            downstream_refs = self._downstream_refs_for_stages(db, task, downstream_stages)
             if downstream_refs:
                 self._run_sync(self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token()))
             self._clear_stage_outputs_from(task, stage_name, mark_stale=False)
@@ -4461,8 +4472,8 @@ class TaskManager:
             task_id=task.id,
             project_id=task.project_id,
             stage_name=stage_name,
-            item_id=item.id if item else None,
-            item_key=item.item_key if item else None,
+            item_id=_stage_item_attr(item, "id"),
+            item_key=_stage_item_attr(item, "item_key"),
             level=level,
             event_type=event_type,
             message=message,
@@ -6213,21 +6224,50 @@ class TaskManager:
         refs: list[dict[str, str]] = []
         seen: set[tuple[str, str]] = set()
         for item in items:
-            if not item.downstream_service or not item.downstream_task_id:
+            downstream_service = str(_stage_item_attr(item, "downstream_service") or "").strip()
+            downstream_task_id = str(_stage_item_attr(item, "downstream_task_id") or "").strip()
+            if not downstream_service or not downstream_task_id:
                 continue
-            key = (item.downstream_service, item.downstream_task_id)
+            key = (downstream_service, downstream_task_id)
             if key in seen:
                 continue
             seen.add(key)
             refs.append(
                 {
-                    "service": item.downstream_service,
-                    "task_id": item.downstream_task_id,
+                    "service": downstream_service,
+                    "task_id": downstream_task_id,
                     "project_id": task.project_id,
-                    "stage_name": item.stage_name,
+                    "stage_name": _stage_item_attr(item, "stage_name"),
                 }
             )
         return refs
+
+    def _downstream_refs_for_stages(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_names: list[str],
+    ) -> list[dict[str, str]]:
+        normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
+        if not normalized:
+            return []
+        rows = db.query(
+            BinarySecurityStageItem.stage_name,
+            BinarySecurityStageItem.downstream_service,
+            BinarySecurityStageItem.downstream_task_id,
+        ).filter(
+            BinarySecurityStageItem.task_id == task.id,
+            BinarySecurityStageItem.stage_name.in_(normalized),
+        ).all()
+        snapshot_items = [
+            {
+                "stage_name": row[0],
+                "downstream_service": row[1],
+                "downstream_task_id": row[2],
+            }
+            for row in rows
+        ]
+        return self._collect_downstream_refs(task, snapshot_items)
 
     async def _cancel_local_worker(self, task_id: str) -> None:
         async with self._worker_lock:
