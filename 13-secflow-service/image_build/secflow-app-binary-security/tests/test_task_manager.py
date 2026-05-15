@@ -84,6 +84,9 @@ class _FakeDb:
     def commit(self):
         self.commits += 1
 
+    def flush(self):
+        pass
+
 
 class _ModelAwareDb:
     def __init__(self, *, tasks=None, stage_runs=None, stage_items=None, archive_jobs=None):
@@ -1091,6 +1094,50 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual("pending", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertIsNone(task.dispatch_started_at)
+
+    def test_refresh_task_status_after_sync_requeues_next_stage_for_task_retry_mode(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            execution_mode="task_retry",
+            target_stage_name="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        runs = [
+            BinarySecurityStageRun(
+                id="sr1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="firmware_unpack",
+                sequence_no=1,
+                status="success",
+            ),
+            BinarySecurityStageRun(
+                id="sr2",
+                task_id="t1",
+                project_id="p1",
+                stage_name="system_analysis",
+                sequence_no=2,
+                status="success",
+            ),
+        ]
+        db = _ModelAwareDb(tasks=[task], stage_runs=runs)
+
+        self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual("pending", task.status)
+        self.assertEqual("binary_to_source", task.current_stage)
+        self.assertIsNone(task.execution_mode)
+        self.assertIsNone(task.target_stage_name)
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertIsNone(task.dispatch_started_at)
 
@@ -3416,6 +3463,98 @@ class TaskManagerTests(unittest.TestCase):
         self.assertIsNone(task.last_error)
         self.assertTrue(db.closed)
 
+    def test_execute_task_failed_stage_does_not_requeue_same_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="running",
+                current_stage="binary_to_source",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(Path(tmp) / "output"),
+                workspace_root=tmp,
+                dispatcher_instance_id=self.manager.instance_id,
+            )
+            task.summary = {"selected_modules": [{"module_key": "m1", "module_name": "m1"}]}
+            stage_run = BinarySecurityStageRun(
+                id="sr1",
+                task_id="task1",
+                project_id="p1",
+                stage_name="binary_to_source",
+                sequence_no=3,
+                status="queued",
+            )
+            prev_runs = [
+                BinarySecurityStageRun(
+                    id="sr-fw",
+                    task_id="task1",
+                    project_id="p1",
+                    stage_name="firmware_unpack",
+                    sequence_no=1,
+                    status="success",
+                ),
+                BinarySecurityStageRun(
+                    id="sr-sa",
+                    task_id="task1",
+                    project_id="p1",
+                    stage_name="system_analysis",
+                    sequence_no=2,
+                    status="success",
+                ),
+            ]
+
+            class _ExecuteTaskDb(_ModelAwareDb):
+                def __init__(self, current_task, current_stage_run):
+                    super().__init__(tasks=[current_task], stage_runs=[*prev_runs, current_stage_run])
+                    self.closed = False
+
+                def refresh(self, obj):
+                    del obj
+
+                def close(self):
+                    self.closed = True
+
+            db = _ExecuteTaskDb(task, stage_run)
+            original_factory = task_manager_module.get_session_factory
+            original_handler = self.manager._stage_binary_to_source
+            original_counts = self.manager._stage_counts
+            original_persist = self.manager._persist_stage_run_output_summary_async
+            original_write_meta = self.manager._write_task_metadata_async
+
+            async def fake_stage_handler(db_arg, task_arg, stage_run_arg, token, retry_existing):
+                del db_arg, task_arg, stage_run_arg, token, retry_existing
+                return "failed", {"error": "无法连接下游服务: [Errno -2] Name or service not known"}
+
+            async def fake_persist(task_arg, stage_run_arg, payload):
+                del task_arg, stage_run_arg
+                return payload
+
+            async def fake_write_meta(task_arg, path, status=None):
+                del task_arg, path, status
+
+            task_manager_module.get_session_factory = lambda: (lambda: db)
+            self.manager._stage_binary_to_source = fake_stage_handler
+            self.manager._stage_counts = lambda db_arg, stage_run_arg: {}
+            self.manager._persist_stage_run_output_summary_async = fake_persist
+            self.manager._write_task_metadata_async = fake_write_meta
+            try:
+                asyncio.run(self.manager._execute_task("task1"))
+            finally:
+                task_manager_module.get_session_factory = original_factory
+                self.manager._stage_binary_to_source = original_handler
+                self.manager._stage_counts = original_counts
+                self.manager._persist_stage_run_output_summary_async = original_persist
+                self.manager._write_task_metadata_async = original_write_meta
+
+            event_types = [event.event_type for event in db.added if isinstance(event, BinarySecurityEvent)]
+            self.assertEqual("partial_success", task.status)
+            self.assertIn("stage_failed", event_types)
+            self.assertNotIn("task_requeued_after_stage_completion", event_types)
+            self.assertTrue(db.closed)
+
     def test_run_stage_pool_retries_existing_path_after_first_failure(self):
         calls: list[bool] = []
 
@@ -3740,7 +3879,18 @@ class TaskManagerTests(unittest.TestCase):
         task.dispatcher_instance_id = "other-worker"
         task.dispatch_started_at = _now() - timedelta(minutes=10)
         task.lease_expires_at = _now() - timedelta(seconds=1)
-        db = _FakeDb([task])
+
+        class _ClaimPendingDb(_ModelAwareDb):
+            def query(self, model, *args, **kwargs):
+                del args, kwargs
+                model_name = getattr(model, "__name__", "")
+                if model_name == "BinarySecurityTask":
+                    return _FakeQuery([task])
+                if getattr(model, "name", None) == "id":
+                    return _FakeQuery([("t1",)])
+                return _FakeQuery([])
+
+        db = _ClaimPendingDb(tasks=[task])
 
         claimed = self.manager._claim_pending_tasks(db, 1)
 

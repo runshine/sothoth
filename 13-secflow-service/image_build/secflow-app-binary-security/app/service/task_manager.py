@@ -3127,6 +3127,7 @@ class TaskManager:
                         payload={"status": status},
                     )
                 if status == "failed":
+                    task.status = "failed"
                     task.last_error = summary.get("failure_message") or summary.get("error")
                     self._record_event(
                         db,
@@ -5351,7 +5352,7 @@ class TaskManager:
         next_stage = self._next_incomplete_stage(db, task)
         next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
         next_stage_status = next_stage_run.status if next_stage_run else "pending"
-        if next_stage and next_stage_status in {"pending", "queued"} and not task_retry_mode:
+        if next_stage and next_stage_status in {"pending", "queued"}:
             task.status = "pending"
             task.current_stage = next_stage
             task.finished_at = None

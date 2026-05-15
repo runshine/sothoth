@@ -154,7 +154,7 @@ class ServicesConfig(BaseModel):
         default_factory=lambda: SimpleServiceConfig(base_url="http://secflow-app-system-analyse/api/app/system-analyse")
     )
     binary_to_source: SimpleServiceConfig = Field(
-        default_factory=lambda: SimpleServiceConfig(base_url="http://secflow-app-binary-to-source/api/app/binary-to-source")
+        default_factory=lambda: SimpleServiceConfig(base_url="http://secflow-app-binary-to-source-manager/api/app/binary-to-source")
     )
     entry_analyse: SimpleServiceConfig = Field(
         default_factory=lambda: SimpleServiceConfig(base_url="http://secflow-app-entry-analyse/api/app/entry-analyse")
