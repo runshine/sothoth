@@ -140,7 +140,10 @@ def _seconds_until(value: datetime | None) -> float | None:
     ]
     non_negative = [remaining for remaining in candidates if remaining >= 0]
     if non_negative:
-        return max(non_negative)
+        # Prefer the smallest non-negative interpretation so UTC+8 naive values
+        # do not incorrectly look fresh for ~8 extra hours when compared using
+        # datetime.utcnow().
+        return min(non_negative)
     return min(candidates)
 
 
