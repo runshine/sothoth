@@ -19,7 +19,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: secflow-app-binary-security-worker
-          image: ghcr.io/runshine/secflow-app-binary-security:20260515-1b8f404
+          image: ghcr.io/runshine/secflow-app-binary-security:20260515-14ce1fc
           imagePullPolicy: Always
           env:
             - name: TZ
