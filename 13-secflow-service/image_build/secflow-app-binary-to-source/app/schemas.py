@@ -47,6 +47,8 @@ class TaskCreate(BaseModel):
 class B2SServiceConfig(BaseModel):
     project_id: str
     budget_exhausted_action: Literal["treat_as_passed", "treat_as_failed"] = "treat_as_passed"
+    llm_provider_key: Optional[str] = None
+    effective_llm_provider: Optional["LlmProviderSummary"] = None
     updated_at: Optional[str] = None
 
 
@@ -400,3 +402,6 @@ class ActionResponse(BaseModel):
     status: str
     task_id: Optional[str] = None
     message: Optional[str] = None
+
+
+B2SServiceConfig.model_rebuild()

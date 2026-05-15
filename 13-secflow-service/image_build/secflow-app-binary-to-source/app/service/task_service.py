@@ -19,7 +19,7 @@ from app.model import B2STask, B2STaskItem
 from app.observability import get_observability
 from app.schemas import AdvancedBatch, AdvancedFile, AdvancedRun, B2SArtifact, B2SArtifactContentResponse, B2SOverallProgress, ReviewAnalyticsAttempt, ReviewAnalyticsDimension, ReviewAnalyticsFunction, ReviewAnalyticsFunctionAttempt, ReviewAnalyticsIssue, ReviewAnalyticsMeta, ReviewAnalyticsRadar, ReviewAnalyticsResponse, ReviewAnalyticsSummary, ReviewAnalyticsTrendInsight, ReviewAnalyticsTrendPoint, ReviewAnalyticsTrendSeries, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskItemResponse, TaskResponse
 from app.service.config_service import get_config_service, normalize_budget_exhausted_action
-from app.service.llm_provider import resolve_job_model
+from app.service.llm_provider import materialize_llm_provider
 from app.service.pi_re_agent import get_pi_client
 from app.service.security import app_task_item_root, app_task_root, ensure_path_in_project, project_root, safe_input_dir, safe_output_dir, validate_task_id
 from app.time_utils import isoformat_local, now_local
@@ -79,6 +79,26 @@ def _budget_exhausted_action_for_item(db: Session, item: B2STaskItem) -> str:
     if frozen:
         return normalize_budget_exhausted_action(str(frozen))
     return _budget_exhausted_action_for_project(db, item.project_id)
+
+
+def _normalize_llm_provider_key(value: object) -> str | None:
+    key = str(value or "").strip()
+    return key or None
+
+
+def _provider_model_name(provider: dict | None) -> str | None:
+    if not provider:
+        return None
+    provider_key = _normalize_llm_provider_key(provider.get("provider_key"))
+    model = _normalize_llm_provider_key(provider.get("model"))
+    if not provider_key or not model:
+        return None
+    return f"{provider_key}/{model}"
+
+
+def _project_default_llm_provider_key(db: Session, project_id: str) -> str | None:
+    cfg = get_config_service().get_config(db, project_id)
+    return _normalize_llm_provider_key(cfg.get("llm_provider_key"))
 
 
 def _is_budget_exhausted_failure(job: dict | None, error_reason: str | None = None) -> bool:
@@ -212,9 +232,15 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
     db.add(task)
     db.flush()
 
-    pi_cfg = get_config().pi_re_agent
-    llm_provider_key = (req.llm_provider_key or "").strip() or None
-    job_model = await resolve_job_model(llm_provider_key)
+    cfg = get_config()
+    pi_cfg = cfg.pi_re_agent
+    request_provider_key = _normalize_llm_provider_key(req.llm_provider_key)
+    project_provider_key = _project_default_llm_provider_key(db, project_id)
+    effective_provider_key = request_provider_key or project_provider_key
+    provider = await materialize_llm_provider(effective_provider_key) if cfg.configcenter_service.enabled else None
+    job_model = _provider_model_name(provider) or pi_cfg.model
+    frozen_provider_key = _normalize_llm_provider_key(provider.get("provider_key") if provider else effective_provider_key)
+    frozen_provider_model = _normalize_llm_provider_key(provider.get("model") if provider else job_model)
     job_concurrency = req.concurrency if req.concurrency and req.concurrency > 0 else pi_cfg.concurrency
     job_timeout_seconds = req.agent_run_timeout_seconds if req.agent_run_timeout_seconds is not None else pi_cfg.agent_run_timeout_seconds
     job_timeout_retry_enabled = req.agent_timeout_retry_enabled if req.agent_timeout_retry_enabled is not None else pi_cfg.agent_timeout_retry_enabled
@@ -248,7 +274,10 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             "parent_stage_item_key": req.parent_stage_item_key,
             "file_list": elf.file_list or [],
             "source_elf_path": str(source_elf_path),
-            "llm_provider_key": llm_provider_key,
+            "llm_provider_key": frozen_provider_key,
+            "llm_provider_model": frozen_provider_model,
+            "llm_provider_display_name": str(provider.get("display_name") or "").strip() if provider else None,
+            "llm_provider_type": str(provider.get("provider_type") or "").strip() if provider else None,
             "concurrency": job_concurrency,
             "agent_run_timeout_seconds": job_timeout_seconds,
             "agent_timeout_retry_enabled": job_timeout_retry_enabled,
@@ -444,12 +473,9 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
     items = query_items(db, task.id)
     if not items:
         raise NotFoundError("任务没有可重跑的任务项")
-    selected_provider_keys = [
-        str((i.extra_metadata or {}).get("llm_provider_key") or "").strip()
-        for i in items
-        if str((i.extra_metadata or {}).get("llm_provider_key") or "").strip()
-    ]
-    job_model = await resolve_job_model(selected_provider_keys[0] if selected_provider_keys else None)
+    selected_provider_key = _normalize_llm_provider_key((items[0].extra_metadata or {}).get("llm_provider_key")) or _project_default_llm_provider_key(db, task.project_id)
+    provider = await materialize_llm_provider(selected_provider_key) if get_config().configcenter_service.enabled else None
+    job_model = _provider_model_name(provider) or get_config().pi_re_agent.model
 
     for item in items:
         if cancel_running and item.pi_job_id and item.status not in TERMINAL:
@@ -469,6 +495,11 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
         worker_url = await choose_pi_worker(db, task.id, item.sequence_no)
         metadata = item.extra_metadata or {}
         metadata["pi_worker_url"] = worker_url
+        if provider:
+            metadata["llm_provider_key"] = _normalize_llm_provider_key(provider.get("provider_key"))
+            metadata["llm_provider_model"] = _normalize_llm_provider_key(provider.get("model"))
+            metadata["llm_provider_display_name"] = str(provider.get("display_name") or "").strip() or None
+            metadata["llm_provider_type"] = str(provider.get("provider_type") or "").strip() or None
         item.extra_metadata = metadata
         item.status = "queued"
         item.phase = "queued"
@@ -520,14 +551,11 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
     pi_cfg = get_config().pi_re_agent
     items = query_items(db, task.id)
     selected = [i for i in items if item_ids is None or i.id in item_ids]
-    selected_provider_keys = [
-        str((i.extra_metadata or {}).get("llm_provider_key") or "").strip()
-        for i in selected
-        if str((i.extra_metadata or {}).get("llm_provider_key") or "").strip()
-    ]
-    job_model = await resolve_job_model(selected_provider_keys[0] if selected_provider_keys else None)
     if not selected:
         raise NotFoundError("未找到可重试的任务项")
+    selected_provider_key = _normalize_llm_provider_key((selected[0].extra_metadata or {}).get("llm_provider_key")) or _project_default_llm_provider_key(db, task.project_id)
+    provider = await materialize_llm_provider(selected_provider_key) if get_config().configcenter_service.enabled else None
+    job_model = _provider_model_name(provider) or get_config().pi_re_agent.model
     for item in selected:
         if item.status not in {"failed", "cancelled"}:
             continue
@@ -539,6 +567,11 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
         worker_url = await choose_pi_worker(db, task.id, item.sequence_no)
         metadata = item.extra_metadata or {}
         metadata["pi_worker_url"] = worker_url
+        if provider:
+            metadata["llm_provider_key"] = _normalize_llm_provider_key(provider.get("provider_key"))
+            metadata["llm_provider_model"] = _normalize_llm_provider_key(provider.get("model"))
+            metadata["llm_provider_display_name"] = str(provider.get("display_name") or "").strip() or None
+            metadata["llm_provider_type"] = str(provider.get("provider_type") or "").strip() or None
         item.extra_metadata = metadata
         job = await get_pi_client(worker_url).create_job({
             "target": item.elf_path,

@@ -41,6 +41,34 @@ class ConfigSaveRequest(BaseModel):
     config: dict
 
 
+def _provider_summary(payload: dict) -> dict:
+    return {
+        "provider_key": str(payload.get("provider_key") or "").strip(),
+        "display_name": str(payload.get("display_name") or "").strip() or None,
+        "provider_type": str(payload.get("provider_type") or "").strip() or None,
+        "enabled": bool(payload.get("enabled", False)),
+        "is_default": bool(payload.get("is_default", False)),
+        "model": str(payload.get("model") or "").strip() or None,
+    }
+
+
+async def _effective_llm_provider_summary(provider_key: str | None) -> dict | None:
+    try:
+        payload = await get_configcenter_client().list_llm_providers()
+    except Exception:
+        return None
+    items = [item for item in (payload.get("items") if isinstance(payload.get("items"), list) else []) if isinstance(item, dict) and item.get("enabled", True)]
+    if not items:
+        return None
+    normalized = str(provider_key or "").strip()
+    if normalized:
+        matched = next((item for item in items if str(item.get("provider_key") or "").strip() == normalized), None)
+        return _provider_summary(matched) if matched else None
+    default_key = str(payload.get("default_provider_key") or "").strip()
+    matched = next((item for item in items if str(item.get("provider_key") or "").strip() == default_key), None) if default_key else None
+    return _provider_summary(matched or items[0])
+
+
 @router.get("/health")
 async def health_check():
     return {"status": "ok", "service": "secflow-app-binary-to-source"}
@@ -85,7 +113,9 @@ async def get_b2s_config(
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    return B2SServiceConfig(**get_config_service().get_config(db, project_id))
+    payload = get_config_service().get_config(db, project_id)
+    payload["effective_llm_provider"] = await _effective_llm_provider_summary(payload.get("llm_provider_key"))
+    return B2SServiceConfig(**payload)
 
 
 @router.put("/projects/{project_id}/config", response_model=B2SServiceConfig)
@@ -95,7 +125,12 @@ async def save_b2s_config(
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    return B2SServiceConfig(**get_config_service().save_config(db, project_id, payload.config))
+    provider_key = str(payload.config.get("llm_provider_key") or "").strip()
+    if provider_key:
+        await get_configcenter_client().get_llm_provider(provider_key)
+    saved = get_config_service().save_config(db, project_id, payload.config)
+    saved["effective_llm_provider"] = await _effective_llm_provider_summary(saved.get("llm_provider_key"))
+    return B2SServiceConfig(**saved)
 
 
 @router.get("/projects/{project_id}/tasks", response_model=TaskListResponse)
