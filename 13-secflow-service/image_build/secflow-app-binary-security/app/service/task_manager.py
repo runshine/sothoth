@@ -1865,6 +1865,35 @@ class TaskManager:
                             "after_status": mapped_status,
                         },
                     )
+            except NotFoundError:
+                db.rollback()
+                item.status = "downstream_missing"
+                item.error_message = "下游子任务不存在"
+                item.finished_at = item.finished_at or _now()
+                item.started_at = item.started_at or _now()
+                item.result = {
+                    **(item.result or {}),
+                    "downstream": self._lightweight_downstream_payload({"status": "downstream_missing", "error": "下游子任务不存在"}),
+                    "downstream_status_synced_at": _now().isoformat(),
+                }
+                touched_stages.add(item.stage_name)
+                synced_count += 1
+                self._record_event(
+                    db,
+                    task,
+                    "downstream_status_synced",
+                    "下游子任务不存在，已更新当前阶段子任务状态",
+                    level="warning",
+                    stage_name=item_stage_name,
+                    item=item,
+                    payload={
+                        "downstream_service": item_downstream_service,
+                        "downstream_task_id": item_downstream_task_id,
+                        "before_status": before_status,
+                        "downstream_status": "downstream_missing",
+                        "after_status": "downstream_missing",
+                    },
+                )
             except Exception as exc:
                 db.rollback()
                 failed_count += 1
@@ -2847,11 +2876,20 @@ class TaskManager:
                 job.completed_at = _now()
                 db.commit()
                 return
-            item.status = mapped_status
-            item.error_message = None if mapped_status in {"queued", "running", "success"} else (
+            normalized_mapped_status = self._map_downstream_status(mapped_status) or mapped_status
+            downstream_error_text = json.dumps(downstream_payload, ensure_ascii=False) if downstream_payload else ""
+            if normalized_mapped_status == "failed" and any(
+                marker in downstream_error_text.lower()
+                for marker in ("task not found", "not found", "不存在", "downstream_missing")
+            ):
+                normalized_mapped_status = "downstream_missing"
+            if str(item.status or "").strip().lower() == "downstream_missing" and normalized_mapped_status == "failed":
+                normalized_mapped_status = "downstream_missing"
+            item.status = normalized_mapped_status
+            item.error_message = None if normalized_mapped_status in {"queued", "running", "success"} else (
                 downstream_payload.get("error") or downstream_payload.get("error_message") or downstream_payload.get("message") or item.error_message
             )
-            item.finished_at = None if mapped_status in {"queued", "running"} else (item.finished_at or _now())
+            item.finished_at = None if normalized_mapped_status in {"queued", "running"} else (item.finished_at or _now())
             item.started_at = item.started_at or _now()
             item.result = {
                 **(item.result or {}),
@@ -2863,19 +2901,19 @@ class TaskManager:
                 **(item.output_ref or {}),
                 "archive_root": effective_archive_root,
             }
-            if item.stage_name == "firmware_unpack" and mapped_status == "success":
+            if item.stage_name == "firmware_unpack" and normalized_mapped_status == "success":
                 self._refresh_firmware_unpack_item_result(
                     task,
                     item,
                     archived_dir=Path(effective_archive_root) if effective_archive_root else None,
                     downstream_payload=downstream_payload,
                 )
-            if mapped_status in {"success", "partial_success"}:
+            if normalized_mapped_status in {"success", "partial_success"}:
                 await self._refresh_terminal_item_result_from_downstream(
                     task,
                     item,
                     downstream_payload,
-                    mapped_status=mapped_status,
+                    mapped_status=normalized_mapped_status,
                     archived_dir=Path(effective_archive_root) if effective_archive_root else None,
                 )
             if item.stage_name == "system_analysis":
