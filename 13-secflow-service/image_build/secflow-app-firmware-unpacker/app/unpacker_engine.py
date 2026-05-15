@@ -65,6 +65,8 @@ from app.unpacker_engine_session import build_session_artifacts, update_session_
 
 log = logging.getLogger("unpacker.engine")
 SKILL_GENERATION_CONTEXT_FILENAME = "stage5_skill_generation_context.json"
+LLM_CLEANUP_MAX_FILES = 5000
+LLM_CLEANUP_MAX_TOTAL_BYTES = 512 * 1024 * 1024
 
 
 def _reviewer_session_name(suffix: str) -> tuple[str, int | None]:
@@ -121,6 +123,45 @@ def _normalize_output_reports(output_path: str) -> None:
                 legacy_path.unlink(missing_ok=True)
             else:
                 shutil.move(str(legacy_path), str(canonical_path))
+
+
+def _collect_output_stats(
+    output_path: str,
+    *,
+    file_cap: int = LLM_CLEANUP_MAX_FILES + 1,
+    byte_cap: int = LLM_CLEANUP_MAX_TOTAL_BYTES + 1,
+) -> dict[str, int | bool]:
+    file_count = 0
+    total_bytes = 0
+    capped = False
+    for root, _dirs, files in os.walk(output_path):
+        for filename in files:
+            file_count += 1
+            try:
+                total_bytes += os.path.getsize(os.path.join(root, filename))
+            except OSError:
+                continue
+            if file_count >= file_cap or total_bytes >= byte_cap:
+                capped = True
+                return {
+                    "file_count": file_count,
+                    "total_bytes": total_bytes,
+                    "capped": capped,
+                }
+    return {
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+        "capped": capped,
+    }
+
+
+def _should_skip_llm_cleanup(output_path: str) -> tuple[bool, dict[str, int | bool]]:
+    stats = _collect_output_stats(output_path)
+    if int(stats["file_count"]) >= LLM_CLEANUP_MAX_FILES:
+        return True, stats
+    if int(stats["total_bytes"]) >= LLM_CLEANUP_MAX_TOTAL_BYTES:
+        return True, stats
+    return False, stats
 
 
 def extract_firmware_features(
@@ -972,6 +1013,42 @@ def _run_cleaner(
         "starting cleanup",
         output_path=output_path,
     )
+    skip_cleanup, cleanup_stats = _should_skip_llm_cleanup(output_path)
+    if skip_cleanup:
+        response = (
+            "Skipped LLM cleanup for large output tree "
+            f"(files={cleanup_stats['file_count']}, bytes={cleanup_stats['total_bytes']})"
+        )
+        log_event(
+            log,
+            logging.INFO,
+            "cleanup skipped for large output",
+            event="cleanup_skipped_large_output",
+            output_path=output_path,
+            file_count=cleanup_stats["file_count"],
+            total_bytes=cleanup_stats["total_bytes"],
+        )
+        _append_stage_log(
+            log_dir,
+            "cleaner.log",
+            "cleanup skipped for large output",
+            file_count=cleanup_stats["file_count"],
+            total_bytes=cleanup_stats["total_bytes"],
+        )
+        if event_callback:
+            event_callback(
+                "cleanup_completed",
+                "输出目录较大，跳过 LLM 清理以避免长时间阻塞",
+                stage_key="cleanup",
+                status="success",
+                detail={
+                    "output_path": output_path,
+                    "file_count": cleanup_stats["file_count"],
+                    "total_bytes": cleanup_stats["total_bytes"],
+                    "skipped": True,
+                },
+            )
+        return response
     clean_def = load_agent_def(CLEAN_AGENT_DEF)
     clean_sp = "/tmp/firmware-extract-cleanup.md"
     Path(clean_sp).write_text(clean_def["system_prompt"])
