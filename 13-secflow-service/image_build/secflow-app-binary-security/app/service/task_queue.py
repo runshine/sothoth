@@ -56,6 +56,21 @@ class TaskQueue:
         if added:
             await client.rpush(queue_key, value)
             await client.zadd(f"{queue_key}:enqueued_at", {value: time.time()})
+            return
+
+        # Heal stale dedupe entries left behind by interrupted consumers. If the
+        # list no longer contains the task ID, re-enqueue it so preparing/pending
+        # tasks cannot get stuck forever behind an orphaned dedupe marker.
+        present_in_queue = await client.lpos(queue_key, value)
+        if present_in_queue is not None:
+            await client.zadd(f"{queue_key}:enqueued_at", {value: time.time()})
+            return
+
+        await client.srem(dedupe_key, value)
+        restored = await client.sadd(dedupe_key, value)
+        if restored:
+            await client.rpush(queue_key, value)
+            await client.zadd(f"{queue_key}:enqueued_at", {value: time.time()})
 
     async def _consume_result(self, client: Redis, queue_key: str, result) -> Optional[str]:
         if not result:
