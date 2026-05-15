@@ -313,6 +313,93 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(1, summaries[0].success_items)
         self.assertEqual(1, summaries[0].failed_items)
 
+    def test_upstream_stage_retried_detects_previous_retry(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/in",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="failed",
+        )
+        stage_runs = [
+            BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="firmware_unpack", sequence_no=1, status="success", retry_count=1),
+            BinarySecurityStageRun(id="sr2", task_id="t1", project_id="p1", stage_name="system_analysis", sequence_no=2, status="failed", retry_count=0),
+        ]
+        stage_items = [
+            BinarySecurityStageItem(id="i1", task_id="t1", project_id="p1", stage_run_id="sr2", stage_name="system_analysis", item_key="fw1", parent_key="fw1", status="failed"),
+        ]
+
+        upstream_retried, upstream_stage = self.manager._upstream_stage_retried(
+            _ModelAwareDb(tasks=[task], stage_runs=stage_runs, stage_items=stage_items),
+            task,
+            "system_analysis",
+        )
+
+        self.assertTrue(upstream_retried)
+        self.assertEqual("firmware_unpack", upstream_stage)
+
+    def test_prepare_stage_items_for_execution_only_requeues_selected_failed_items(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/in",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="failed",
+        )
+        task.summary = {
+            "retry_plan": {
+                "target_stage": "firmware_unpack",
+                "mode": "retry_stage_failed_items",
+                "retry_item_keys": ["fw2::fw2"],
+            }
+        }
+        stage_run = BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="firmware_unpack", sequence_no=1, status="failed")
+        existing_success = BinarySecurityStageItem(
+            id="i1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="firmware_unpack",
+            item_key="fw1",
+            item_name="fw1.bin",
+            parent_key="fw1",
+            item_identity_key="fw1::fw1",
+            status="success",
+        )
+        db = _AppendingModelAwareDb(stage_runs=[stage_run], stage_items=[existing_success])
+
+        self.manager._prepare_stage_items_for_execution(
+            db,
+            task=task,
+            stage_run=stage_run,
+            inputs=[
+                {"firmware_key": "fw1", "filename": "fw1.bin"},
+                {"firmware_key": "fw2", "filename": "fw2.bin"},
+            ],
+            downstream_service="firmware_unpacker",
+            identity=lambda input_file: (
+                input_file["firmware_key"],
+                input_file["filename"],
+                input_file["firmware_key"],
+                {"filename": input_file["filename"]},
+            ),
+            output_ref=lambda _input_file: {"downstream_service": "firmware_unpacker"},
+        )
+
+        self.assertEqual("success", existing_success.status)
+        stage_item_keys = sorted(item.item_key for item in db.stage_items)
+        self.assertEqual(["fw1", "fw2"], stage_item_keys)
+        retried = next(item for item in db.stage_items if item.item_key == "fw2")
+        self.assertEqual("queued", retried.status)
+
     def test_task_operation_lock_uses_bound_text_query_and_releases_lock(self):
         connection = _FakeConnection(lock_result=True)
         db = _LockingDb(connection)
@@ -400,7 +487,7 @@ class TaskManagerTests(unittest.TestCase):
                 downstream_task_id="d1",
             )
         ]
-        nodes = self.manager._build_stage_overview_nodes(task, summaries, archive_jobs, stage_items)
+        nodes = self.manager._build_stage_overview_nodes(_ModelAwareDb(), task, summaries, archive_jobs, stage_items)
 
         self.assertEqual("business:firmware_unpack", nodes[0].node_id)
         self.assertEqual("archive:firmware_unpack", nodes[1].node_id)
@@ -468,7 +555,7 @@ class TaskManagerTests(unittest.TestCase):
             ),
         ]
 
-        nodes = self.manager._build_stage_overview_nodes(task, summaries, archive_jobs, stage_items)
+        nodes = self.manager._build_stage_overview_nodes(_ModelAwareDb(), task, summaries, archive_jobs, stage_items)
         by_node_id = {node.node_id: node for node in nodes}
 
         self.assertEqual("pending", by_node_id["archive:entry_analysis"].status)
@@ -2334,6 +2421,280 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual("success", item.status)
             event_types = [getattr(event, "event_type", "") for event in db.added]
             self.assertIn("task_archive_retry_requeued", event_types)
+            self.assertIn("archive_stage_retry_requested", event_types)
+
+    def test_retry_stage_archive_requeues_only_target_stage_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="binary",
+                status="failed",
+                task_type=TASK_TYPE_BINARY,
+                current_stage="entry_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+                finished_at=_now(),
+            )
+            entry_item = BinarySecurityStageItem(
+                id="i1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                item_key="m1",
+                status="failed",
+                downstream_service="entry_analyse",
+                downstream_task_id="eat1",
+            )
+            dataflow_item = BinarySecurityStageItem(
+                id="i2",
+                task_id="t1",
+                project_id="p1",
+                stage_name="dataflow_analysis",
+                item_key="m1-entry",
+                status="failed",
+                downstream_service="dataflow_analyse",
+                downstream_task_id="dat1",
+            )
+            entry_job = BinarySecurityArchiveJob(
+                id="aj1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                item_id="i1",
+                item_key="m1",
+                archive_status="failed",
+                archive_root=str(workspace / "entry-archive"),
+                error_message="copy failed",
+            )
+            entry_job.payload = {"mapped_status": "partial_success"}
+            dataflow_job = BinarySecurityArchiveJob(
+                id="aj2",
+                task_id="t1",
+                project_id="p1",
+                stage_name="dataflow_analysis",
+                item_id="i2",
+                item_key="m1-entry",
+                archive_status="failed",
+                archive_root=str(workspace / "dataflow-archive"),
+                error_message="copy failed",
+            )
+            dataflow_job.payload = {"mapped_status": "success"}
+            db = _ModelAwareDb(tasks=[task], stage_items=[entry_item, dataflow_item], archive_jobs=[entry_job, dataflow_job])
+
+            self.manager.retry_stage_archive(db, project_id="p1", task_id="t1", stage_name="entry_analysis")
+
+            self.assertEqual("pending", entry_job.archive_status)
+            self.assertEqual("failed", dataflow_job.archive_status)
+            self.assertEqual("running", task.status)
+            self.assertEqual("entry_analysis", task.current_stage)
+            self.assertIsNone(task.finished_at)
+            event_types = [getattr(event, "event_type", "") for event in db.added]
+            self.assertIn("archive_stage_retry_requested", event_types)
+            self.assertIn("task_archive_retry_requeued", event_types)
+
+    def test_retry_archive_job_requeues_single_failed_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="binary",
+                status="partial_success",
+                task_type=TASK_TYPE_BINARY,
+                current_stage="system_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+                finished_at=_now(),
+            )
+            item = BinarySecurityStageItem(
+                id="i1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="system_analysis",
+                item_key="fw1",
+                status="failed",
+                downstream_service="system_analyse",
+                downstream_task_id="sat1",
+            )
+            retryable_job = BinarySecurityArchiveJob(
+                id="aj1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="system_analysis",
+                item_id="i1",
+                item_key="fw1",
+                archive_status="failed",
+                archive_root=str(workspace / "old-archive"),
+                error_message="copy failed",
+                owner_id="worker1",
+            )
+            retryable_job.payload = {"mapped_status": "success", "downstream_payload": {"task_id": "sat1"}}
+            other_job = BinarySecurityArchiveJob(
+                id="aj2",
+                task_id="t1",
+                project_id="p1",
+                stage_name="system_analysis",
+                item_id="i1",
+                item_key="fw1",
+                archive_status="failed",
+                archive_root=str(workspace / "old-archive-2"),
+                error_message="copy failed",
+                owner_id="worker2",
+            )
+            other_job.payload = {"mapped_status": "failed", "downstream_payload": {"task_id": "sat1"}}
+            db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[retryable_job, other_job])
+
+            stage_name = self.manager.retry_archive_job(db, project_id="p1", task_id="t1", archive_job_id="aj1")
+
+            self.assertEqual("system_analysis", stage_name)
+            self.assertEqual("pending", retryable_job.archive_status)
+            self.assertIsNone(retryable_job.archive_root)
+            self.assertIsNone(retryable_job.error_message)
+            self.assertIsNone(retryable_job.owner_id)
+            self.assertEqual("failed", other_job.archive_status)
+            event_types = [getattr(event, "event_type", "") for event in db.added]
+            self.assertIn("archive_job_retry_requested", event_types)
+            self.assertIn("task_archive_retry_requeued", event_types)
+
+    def test_archive_job_retry_support_rejects_non_success_like_target_status(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        job = BinarySecurityArchiveJob(
+            id="aj1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_id="i1",
+            archive_status="failed",
+        )
+        job.payload = {"mapped_status": "failed"}
+
+        supported, reason = self.manager._archive_job_retry_support(_ModelAwareDb(), task, job)
+
+        self.assertFalse(supported)
+        self.assertIn("目标状态", reason or "")
+
+    def test_build_stage_overview_nodes_sets_archive_retry_support(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/in",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="failed",
+        )
+        item = BinarySecurityStageItem(
+            id="i1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            item_key="fw1",
+            status="failed",
+            downstream_service="firmware_unpacker",
+            downstream_task_id="d1",
+        )
+        summaries = [
+            BinarySecurityStageSummary(
+                stage_name="firmware_unpack",
+                sequence_no=1,
+                status="failed",
+                retry_supported=True,
+                failed_items=1,
+                total_items=1,
+            )
+        ]
+        archive_jobs = [
+            BinarySecurityArchiveJobResponse(
+                id="aj1",
+                stage_name="firmware_unpack",
+                item_id="i1",
+                item_key="fw1",
+                archive_status="failed",
+                retry_supported=True,
+            )
+        ]
+        db = _ModelAwareDb(
+            tasks=[task],
+            stage_items=[item],
+            archive_jobs=[
+                BinarySecurityArchiveJob(
+                    id="aj1",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_name="firmware_unpack",
+                    item_id="i1",
+                    item_key="fw1",
+                    archive_status="failed",
+                )
+            ],
+        )
+        db.archive_jobs[0].payload = {"mapped_status": "success"}
+
+        nodes = self.manager._build_stage_overview_nodes(db, task, summaries, archive_jobs, [item])
+        by_node_id = {node.node_id: node for node in nodes}
+
+        self.assertTrue(by_node_id["archive:firmware_unpack"].retry_supported)
+
+    def test_build_manual_operation_state_exposes_can_retry_archive(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/in",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="failed",
+        )
+        item = BinarySecurityStageItem(
+            id="i1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            item_key="fw1",
+            status="failed",
+        )
+        job = BinarySecurityArchiveJob(
+            id="aj1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            item_id="i1",
+            archive_status="failed",
+        )
+        job.payload = {"mapped_status": "success"}
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[job])
+
+        state = self.manager._build_manual_operation_state(
+            db,
+            task,
+            task_retry_supported=False,
+            task_retry_reason=None,
+            task_continue_supported=False,
+            task_continue_reason=None,
+            stage_summaries=[BinarySecurityStageSummary(stage_name="firmware_unpack", sequence_no=1, status="failed")],
+        )
+
+        self.assertTrue(state["can_retry_archive"])
 
     def test_retry_stage_clears_archive_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:

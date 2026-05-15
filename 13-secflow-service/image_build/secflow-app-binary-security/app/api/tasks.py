@@ -278,6 +278,23 @@ async def continue_task(
     )
 
 
+@router.post("/projects/{project_id}/tasks/{task_id}/retry-failed-items", response_model=BinarySecurityActionResponse)
+def retry_failed_items(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    target_stage = get_task_manager().retry_failed_items(db, project_id=project_id, task_id=task_id)
+    return BinarySecurityActionResponse(
+        task_id=task_id,
+        status="retry_preparing",
+        accepted=True,
+        action="retry_failed_items",
+        message=f"任务已受理，后台正在准备从阶段 {target_stage} 重试失败项",
+    )
+
+
 @router.post("/projects/{project_id}/tasks/{task_id}/stages/{stage_name}/retry", response_model=BinarySecurityActionResponse)
 def retry_stage(
     project_id: str,
@@ -286,8 +303,104 @@ def retry_stage(
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    get_task_manager().retry_stage(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
-    return BinarySecurityActionResponse(task_id=task_id, message=f"阶段 {stage_name} 的全部子任务已重新排队")
+    get_task_manager().retry_stage_full(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
+    return BinarySecurityActionResponse(task_id=task_id, accepted=True, action="retry_stage_full", status="retry_preparing", message=f"阶段 {stage_name} 的完全重试已受理")
+
+
+@router.post("/projects/{project_id}/tasks/{task_id}/stages/{stage_name}/retry-failed-items", response_model=BinarySecurityActionResponse)
+def retry_stage_failed_items(
+    project_id: str,
+    task_id: str,
+    stage_name: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    get_task_manager().retry_stage_failed_items(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
+    return BinarySecurityActionResponse(task_id=task_id, accepted=True, action="retry_stage_failed_items", status="retry_preparing", message=f"阶段 {stage_name} 的失败项重试已受理")
+
+
+@router.post("/projects/{project_id}/tasks/{task_id}/stages/{stage_name}/retry-full", response_model=BinarySecurityActionResponse)
+def retry_stage_full(
+    project_id: str,
+    task_id: str,
+    stage_name: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    get_task_manager().retry_stage_full(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
+    return BinarySecurityActionResponse(task_id=task_id, accepted=True, action="retry_stage_full", status="retry_preparing", message=f"阶段 {stage_name} 的完全重试已受理")
+
+
+@router.post("/projects/{project_id}/tasks/{task_id}/stages/{stage_name}/archive/retry", response_model=BinarySecurityActionResponse)
+def retry_stage_archive(
+    project_id: str,
+    task_id: str,
+    stage_name: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    get_task_manager().retry_stage_archive_failed_items(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
+    return BinarySecurityActionResponse(
+        task_id=task_id,
+        accepted=True,
+        action="retry_archive_failed_items",
+        status="running",
+        message=f"阶段 {stage_name} 的归档失败项已重新排队",
+    )
+
+
+@router.post("/projects/{project_id}/tasks/{task_id}/stages/{stage_name}/archive/retry-failed-items", response_model=BinarySecurityActionResponse)
+def retry_stage_archive_failed_items(
+    project_id: str,
+    task_id: str,
+    stage_name: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    get_task_manager().retry_stage_archive_failed_items(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
+    return BinarySecurityActionResponse(
+        task_id=task_id,
+        accepted=True,
+        action="retry_archive_failed_items",
+        status="running",
+        message=f"阶段 {stage_name} 的归档失败项已重新排队",
+    )
+
+
+@router.post("/projects/{project_id}/tasks/{task_id}/stages/{stage_name}/archive/retry-full", response_model=BinarySecurityActionResponse)
+def retry_stage_archive_full(
+    project_id: str,
+    task_id: str,
+    stage_name: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    get_task_manager().retry_stage_archive_full(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
+    return BinarySecurityActionResponse(
+        task_id=task_id,
+        accepted=True,
+        action="retry_archive_full",
+        status="running",
+        message=f"阶段 {stage_name} 的归档阶段已清空并重建",
+    )
+
+
+@router.post("/projects/{project_id}/tasks/{task_id}/archive-jobs/{archive_job_id}/retry", response_model=BinarySecurityActionResponse)
+def retry_archive_job(
+    project_id: str,
+    task_id: str,
+    archive_job_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    stage_name = get_task_manager().retry_archive_job(db, project_id=project_id, task_id=task_id, archive_job_id=archive_job_id)
+    return BinarySecurityActionResponse(
+        task_id=task_id,
+        accepted=True,
+        action="retry_archive_job",
+        status="running",
+        message=f"归档任务已重新排队，将在阶段 {stage_name} 完成后回写状态",
+    )
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/sync-downstream-status", response_model=BinarySecurityActionResponse)

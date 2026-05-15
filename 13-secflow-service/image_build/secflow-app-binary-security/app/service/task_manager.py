@@ -489,7 +489,22 @@ TASK_STATUS_PENDING_MODULE_CONFIRMATION = "pending_module_confirmation"
 TASK_STATUS_CONTINUE_PREPARING = "continue_preparing"
 TASK_STATUS_RETRY_PREPARING = "retry_preparing"
 TASK_PREPARING_STATUSES = {TASK_STATUS_CONTINUE_PREPARING, TASK_STATUS_RETRY_PREPARING}
-TASK_PENDING_ACTIONS = {"continue", "retry"}
+TASK_ACTION_CONTINUE = "continue"
+TASK_ACTION_RETRY = "retry"
+TASK_ACTION_RETRY_FAILED_ITEMS = "retry_failed_items"
+TASK_ACTION_RETRY_STAGE_FAILED_ITEMS = "retry_stage_failed_items"
+TASK_ACTION_RETRY_STAGE_FULL = "retry_stage_full"
+TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS = "retry_archive_failed_items"
+TASK_ACTION_RETRY_ARCHIVE_FULL = "retry_archive_full"
+TASK_PENDING_ACTIONS = {
+    TASK_ACTION_CONTINUE,
+    TASK_ACTION_RETRY,
+    TASK_ACTION_RETRY_FAILED_ITEMS,
+    TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
+    TASK_ACTION_RETRY_STAGE_FULL,
+    TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS,
+    TASK_ACTION_RETRY_ARCHIVE_FULL,
+}
 TASK_OPERATION_LOCK_TTL_SECONDS = 1800
 TASK_OPERATION_LOCK_HEARTBEAT_SECONDS = 20
 MODULE_SELECTION_MODE_AUTO = "auto"
@@ -523,6 +538,18 @@ STAGE_TITLES = {
     "dataflow_analysis": "数据流分析",
     "vuln_scan": "漏洞扫描",
 }
+
+FAILED_ITEM_RETRYABLE_STATUSES = {"failed", "cancelled", "downstream_missing", "pending", "queued", "running", "dispatching"}
+ARCHIVE_ACTIVE_STATUSES = {"pending", "running", "archived", "applying"}
+ARCHIVE_SUCCESS_MAPPED_STATUSES = {"success", "partial_success"}
+
+
+def _preparing_status_for_action(action: str) -> str:
+    return TASK_STATUS_CONTINUE_PREPARING if action == TASK_ACTION_CONTINUE else TASK_STATUS_RETRY_PREPARING
+
+
+def _retry_mode_needs_plan(mode: str | None) -> bool:
+    return bool(mode in {"task_retry_failed_items", "stage_retry_failed_items", "stage_retry_full"})
 STAGE_RETRY_ENDPOINTS = {
     "firmware_unpack": ("firmware_unpacker", "retry"),
     "system_analysis": ("system_analyse", "restart"),
@@ -946,26 +973,32 @@ class TaskManager:
         ).all()
         queue_info = self._build_queue_info(db, project_id=project_id)
         base = self._task_response(db, task, queue_info=queue_info).model_dump()
-        archive_job_responses = [
-            BinarySecurityArchiveJobResponse(
-                id=job.id,
-                stage_name=job.stage_name,
-                item_id=job.item_id,
-                item_key=job.item_key,
-                downstream_service=job.downstream_service,
-                downstream_task_id=job.downstream_task_id,
-                archive_status=job.archive_status,
-                archive_root=job.archive_root,
-                error_message=job.error_message,
-                attempts=job.attempts or 0,
-                created_at=job.created_at,
-                started_at=job.started_at,
-                completed_at=job.completed_at,
-                updated_at=job.updated_at,
-                copy_stats=dict((job.payload or {}).get("archive_copy_stats") or {}),
+        archive_job_responses: list[BinarySecurityArchiveJobResponse] = []
+        for job in archive_jobs:
+            retry_supported, retry_reason = self._archive_job_retry_support(db, task, job)
+            archive_job_responses.append(
+                BinarySecurityArchiveJobResponse(
+                    id=job.id,
+                    stage_name=job.stage_name,
+                    item_id=job.item_id,
+                    item_key=job.item_key,
+                    downstream_service=job.downstream_service,
+                    downstream_task_id=job.downstream_task_id,
+                    archive_status=job.archive_status,
+                    archive_root=job.archive_root,
+                    error_message=job.error_message,
+                    attempts=job.attempts or 0,
+                    created_at=job.created_at,
+                    started_at=job.started_at,
+                    completed_at=job.completed_at,
+                    updated_at=job.updated_at,
+                    retry_supported=retry_supported,
+                    retry_reason=retry_reason,
+                    retry_failed_supported=retry_supported,
+                    retry_failed_reason=retry_reason,
+                    copy_stats=dict((job.payload or {}).get("archive_copy_stats") or {}),
+                )
             )
-            for job in archive_jobs
-        ]
         return BinarySecurityTaskDetailResponse(
             **base,
             description=task.description,
@@ -979,6 +1012,7 @@ class TaskManager:
             stage_items=[self._stage_item_response(item) for item in items],
             archive_jobs=archive_job_responses,
             overview_nodes=self._build_stage_overview_nodes(
+                db,
                 task,
                 [BinarySecurityStageSummary(**summary) if isinstance(summary, dict) else summary for summary in base.get("stage_summaries", [])],
                 archive_job_responses,
@@ -1478,6 +1512,43 @@ class TaskManager:
             self._release_task_operation_lease(db, task_id, token=operation_token)
             raise
 
+    def retry_failed_items(self, db: Session, *, project_id: str, task_id: str) -> str:
+        operation_token = self._acquire_task_operation_lease(db, task_id, operation=TASK_ACTION_RETRY_FAILED_ITEMS)
+        try:
+            task = self._task_or_404(db, project_id, task_id)
+            supported, reason, stage_name, items = self._task_retry_failed_items_support(db, task)
+            if not supported or not stage_name:
+                observe_task_operation(TASK_ACTION_RETRY_FAILED_ITEMS, "rejected")
+                raise ValidationError(reason or "当前任务不支持重试失败项")
+            item_keys = sorted({self._stage_item_identity(item.item_key, item.parent_key) for item in items})
+            self._set_retry_plan(
+                task,
+                {
+                    "target_stage": stage_name,
+                    "mode": TASK_ACTION_RETRY_FAILED_ITEMS,
+                    "retry_item_keys": item_keys,
+                    "preserve_success_items": True,
+                    "archive_mode": "linked_failed_items",
+                    "cleared_business_stages": [],
+                    "cleared_archive_stages": [],
+                },
+            )
+            self._accept_blocking_action(
+                db,
+                task,
+                action=TASK_ACTION_RETRY_FAILED_ITEMS,
+                preparing_status=TASK_STATUS_RETRY_PREPARING,
+                target_stage=stage_name,
+                message=f"重试失败项已受理，后台正在准备从阶段 {stage_name} 重新排队",
+                event_type="task_retry_failed_items_accepted",
+                event_payload={"target_stage": stage_name, "retry_item_count": len(item_keys)},
+            )
+            observe_task_operation(TASK_ACTION_RETRY_FAILED_ITEMS, "accepted")
+            return stage_name
+        except Exception:
+            self._release_task_operation_lease(db, task_id, token=operation_token)
+            raise
+
     async def _prepare_retry_task(self, db: Session, task: BinarySecurityTask) -> list[str]:
         stage_sequence = self._stage_sequence_for_task(task)
         first_stage = stage_sequence[0]
@@ -1497,63 +1568,237 @@ class TaskManager:
                 self._reset_stage_run_for_retry(task, stage_run, increment_retry=True)
         return stage_sequence
 
-    def retry_stage(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
-        with self._task_operation_lock(db, task_id, operation="retry_stage"):
-            task = self._task_or_404(db, project_id, task_id)
-            stage_sequence = self._stage_sequence_for_task(task)
-            if stage_name not in stage_sequence:
-                raise ValidationError(f"无效阶段: {stage_name}")
-            if self._retry_failed_archive_jobs_for_stage(db, task, stage_name):
-                self._mark_task_waiting_for_archive_retry(db, task, stage_name)
-                db.commit()
-                return
-            supported, reason = self._stage_retry_support(db, task, stage_name)
-            if not supported:
-                raise ValidationError(reason or f"阶段 {stage_name} 不支持安全重试")
+    async def _prepare_retry_failed_items(self, db: Session, task: BinarySecurityTask, target_stage: str) -> list[str]:
+        stage_sequence = self._stage_sequence_for_task(task)
+        if target_stage not in stage_sequence:
+            raise ValidationError(f"无效阶段: {target_stage}")
+        plan = self._retry_plan(task)
+        retry_item_keys = set(plan.get("retry_item_keys") or [])
+        if not retry_item_keys:
+            raise ValidationError("失败项重试缺少目标子任务")
+        stage_items = self._stage_items(db, task.id, target_stage)
+        retry_items = [
+            item for item in stage_items
+            if self._stage_item_identity(item.item_key, item.parent_key) in retry_item_keys
+        ]
+        if not retry_items:
+            raise ValidationError("失败项重试未找到目标阶段子任务")
+        await self.sync_downstream_status(
+            db,
+            project_id=task.project_id,
+            task_id=task.id,
+            stage_name=target_stage,
+            force=True,
+            token=self._service_token(),
+            record_request_event=False,
+            record_noop_events=False,
+        )
+        target_index = stage_sequence.index(target_stage)
+        affected_stages = stage_sequence[target_index:]
+        downstream_stages = stage_sequence[target_index + 1:]
+        item_ids = [item.id for item in retry_items]
+        downstream_refs = self._collect_downstream_refs(task, retry_items)
+        all_downstream_refs = downstream_refs + self._downstream_refs_for_stages(db, task, downstream_stages)
+        self._invalidate_task_execution(task)
+        if all_downstream_refs:
+            await self._cleanup_downstream_refs(db, task, all_downstream_refs, self._service_token())
+        self._clear_single_stage_runtime_state(task, target_stage)
+        if downstream_stages:
+            self._clear_stage_outputs_from(task, downstream_stages[0], mark_stale=False)
+            self._delete_archive_children_for_stages(db, task, downstream_stages)
+            self._delete_stage_items_for_stages(db, task.id, downstream_stages)
+        self._clear_archive_jobs_for_stage_items(db, task.id, target_stage, item_ids)
+        self._delete_stage_items_by_ids(db, item_ids)
+        target_run = db.query(BinarySecurityStageRun).filter(
+            BinarySecurityStageRun.task_id == task.id,
+            BinarySecurityStageRun.stage_name == target_stage,
+        ).first()
+        if target_run:
+            self._reset_stage_run_for_retry(task, target_run, increment_retry=True)
+        for downstream_stage in downstream_stages:
+            downstream_run = db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == downstream_stage,
+            ).first()
+            if downstream_run:
+                self._reset_stage_run_for_retry(task, downstream_run, increment_retry=False)
+        self._set_retry_plan(
+            task,
+            {
+                **plan,
+                "cleared_business_stages": [target_stage, *downstream_stages],
+                "cleared_archive_stages": [target_stage, *downstream_stages],
+            },
+        )
+        return affected_stages
+
+    async def _prepare_retry_stage_full(self, db: Session, task: BinarySecurityTask, target_stage: str) -> list[str]:
+        stage_sequence = self._stage_sequence_for_task(task)
+        if target_stage not in stage_sequence:
+            raise ValidationError(f"无效阶段: {target_stage}")
+        target_index = stage_sequence.index(target_stage)
+        affected_stages = stage_sequence[target_index:]
+        self._invalidate_task_execution(task)
+        downstream_refs = self._downstream_refs_for_stages(db, task, affected_stages)
+        if downstream_refs:
+            await self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token())
+        self._clear_stage_outputs_from(task, target_stage, mark_stale=False)
+        self._delete_archive_children_for_stages(db, task, affected_stages)
+        self._delete_stage_items_for_stages(db, task.id, affected_stages)
+        for stage_name in affected_stages:
             stage_run = db.query(BinarySecurityStageRun).filter(
                 BinarySecurityStageRun.task_id == task.id,
                 BinarySecurityStageRun.stage_name == stage_name,
             ).first()
-            if not stage_run:
-                raise ValidationError("目标阶段尚未执行，不能重试")
-            target_index = stage_sequence.index(stage_name)
-            affected_stages = stage_sequence[target_index:]
-            downstream_stages = stage_sequence[target_index + 1 :]
-            self._invalidate_task_execution(task)
-            downstream_refs = self._downstream_refs_for_stages(db, task, downstream_stages)
-            if downstream_refs:
-                self._run_sync(self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token()))
-            self._clear_stage_outputs_from(task, stage_name, mark_stale=False)
-            self._delete_archive_children_for_stages(db, task, affected_stages)
-            if downstream_stages:
-                self._delete_stage_items_for_stages(db, task.id, downstream_stages)
-            self._reset_stage_run_for_retry(task, stage_run, increment_retry=True)
-            for downstream_stage in downstream_stages:
-                downstream_run = db.query(BinarySecurityStageRun).filter(
-                    BinarySecurityStageRun.task_id == task.id,
-                    BinarySecurityStageRun.stage_name == downstream_stage,
-                ).first()
-                if downstream_run:
-                    self._reset_stage_run_for_retry(task, downstream_run, increment_retry=False)
+            if stage_run:
+                self._reset_stage_run_for_retry(task, stage_run, increment_retry=(stage_name == target_stage))
+        plan = self._retry_plan(task)
+        self._set_retry_plan(
+            task,
+            {
+                **plan,
+                "cleared_business_stages": affected_stages,
+                "cleared_archive_stages": affected_stages,
+            },
+        )
+        return affected_stages
 
-            task.execution_mode = "stage_retry"
-            task.target_stage_name = stage_name
-            task.status = "pending"
-            task.current_stage = stage_name
-            task.last_error = None
-            self._invalidate_task_execution(task)
-            task.finished_at = None
-            self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
+    def retry_stage(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
+        self.retry_stage_full(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
+
+    def retry_stage_failed_items(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
+        with self._task_operation_lock(db, task_id, operation="retry_stage"):
+            task = self._task_or_404(db, project_id, task_id)
+            supported, reason, items = self._stage_retry_failed_items_support(db, task, stage_name)
+            if not supported:
+                raise ValidationError(reason or f"阶段 {stage_name} 不支持重试失败项")
+            item_keys = sorted({self._stage_item_identity(item.item_key, item.parent_key) for item in items})
+            self._set_retry_plan(
+                task,
+                {
+                    "target_stage": stage_name,
+                    "mode": TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
+                    "retry_item_keys": item_keys,
+                    "preserve_success_items": True,
+                    "archive_mode": "linked_failed_items",
+                    "cleared_business_stages": [],
+                    "cleared_archive_stages": [],
+                },
+            )
+            self._accept_blocking_action(
+                db,
+                task,
+                action=TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
+                preparing_status=TASK_STATUS_RETRY_PREPARING,
+                target_stage=stage_name,
+                message=f"阶段 {stage_name} 的失败项重试已受理，后台正在准备重新排队",
+                event_type="stage_retry_failed_items_accepted",
+                event_payload={"target_stage": stage_name, "retry_item_count": len(item_keys)},
+            )
+
+    def retry_stage_full(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
+        with self._task_operation_lock(db, task_id, operation="retry_stage_full"):
+            task = self._task_or_404(db, project_id, task_id)
+            supported, reason = self._stage_retry_support(db, task, stage_name)
+            if not supported:
+                raise ValidationError(reason or f"阶段 {stage_name} 不支持完全重试")
+            self._set_retry_plan(
+                task,
+                {
+                    "target_stage": stage_name,
+                    "mode": TASK_ACTION_RETRY_STAGE_FULL,
+                    "retry_item_keys": [],
+                    "preserve_success_items": False,
+                    "archive_mode": "linked_full",
+                    "cleared_business_stages": [],
+                    "cleared_archive_stages": [],
+                },
+            )
+            self._accept_blocking_action(
+                db,
+                task,
+                action=TASK_ACTION_RETRY_STAGE_FULL,
+                preparing_status=TASK_STATUS_RETRY_PREPARING,
+                target_stage=stage_name,
+                message=f"阶段 {stage_name} 的完全重试已受理，后台正在清理旧子任务并重建输入",
+                event_type="stage_retry_full_accepted",
+                event_payload={"target_stage": stage_name},
+            )
+
+    def retry_stage_archive(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
+        self.retry_stage_archive_failed_items(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
+
+    def retry_stage_archive_failed_items(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
+        with self._task_operation_lock(db, task_id, operation="retry_stage_archive"):
+            task = self._task_or_404(db, project_id, task_id)
+            stage_sequence = self._stage_sequence_for_task(task)
+            if stage_name not in stage_sequence:
+                observe_archive_action("retry_stage", "rejected")
+                raise ValidationError(f"无效阶段: {stage_name}")
+            supported, reason, jobs = self._archive_retry_support(db, task, stage_name)
+            if not supported:
+                observe_archive_action("retry_stage", "rejected")
+                raise ValidationError(reason or f"阶段 {stage_name} 暂无可重试的归档任务")
+            self._requeue_archive_jobs(
+                db,
+                task,
+                jobs,
+                stage_name=stage_name,
+                event_type="archive_stage_retry_requested",
+                event_message="阶段归档任务已重新排队",
+            )
+            self._mark_task_waiting_for_archive_retry(db, task, stage_name)
+            db.commit()
+            observe_archive_action("retry_stage", "accepted")
+
+    def retry_stage_archive_full(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
+        with self._task_operation_lock(db, task_id, operation="retry_stage_archive_full"):
+            task = self._task_or_404(db, project_id, task_id)
+            supported, reason, jobs, stage_items = self._archive_full_retry_support(db, task, stage_name)
+            if not supported:
+                observe_archive_action("retry_stage_full", "rejected")
+                raise ValidationError(reason or f"阶段 {stage_name} 暂无可完全重试的归档任务")
+            if jobs:
+                self._clear_archive_jobs_for_stages(db, task.id, [stage_name])
+            rebuilt = self._rebuild_archive_jobs_for_stage(db, task, stage_name, stage_items)
+            self._mark_task_waiting_for_archive_retry(db, task, stage_name)
             self._record_event(
                 db,
                 task,
-                "stage_retry_requested",
-                f"请求重试阶段: {stage_name}，并尽量复用该阶段旧下游任务",
+                "archive_stage_full_retry_requested",
+                "阶段归档任务已清空并重建",
                 stage_name=stage_name,
-                payload={"retry_semantics": "stage_retry_reuse_current_downstream", "cleared_stages": affected_stages},
+                payload={"stage_name": stage_name, "rebuild_count": rebuilt, "retry_semantics": "archive_full"},
             )
             db.commit()
-            self._enqueue_task(task.id)
+            observe_archive_action("retry_stage_full", "accepted")
+
+    def retry_archive_job(self, db: Session, *, project_id: str, task_id: str, archive_job_id: str) -> str:
+        with self._task_operation_lock(db, task_id, operation="retry_archive_job"):
+            task = self._task_or_404(db, project_id, task_id)
+            job = db.query(BinarySecurityArchiveJob).filter(
+                BinarySecurityArchiveJob.task_id == task.id,
+                BinarySecurityArchiveJob.id == archive_job_id,
+            ).first()
+            if job is None:
+                observe_archive_action("retry_job", "rejected")
+                raise NotFoundError("归档任务不存在")
+            supported, reason = self._archive_job_retry_support(db, task, job)
+            if not supported:
+                observe_archive_action("retry_job", "rejected")
+                raise ValidationError(reason or "当前归档任务不可重试")
+            self._requeue_archive_jobs(
+                db,
+                task,
+                [job],
+                stage_name=job.stage_name,
+                event_type="archive_job_retry_requested",
+                event_message="归档任务已重新排队",
+            )
+            self._mark_task_waiting_for_archive_retry(db, task, job.stage_name)
+            db.commit()
+            observe_archive_action("retry_job", "accepted")
+            return job.stage_name
 
     def _run_sync(self, coro):
         return asyncio.run(coro)
@@ -1802,6 +2047,40 @@ class TaskManager:
                                 },
                             )
                         continue
+                    if mapped_status not in ARCHIVE_SUCCESS_MAPPED_STATUSES:
+                        if mapped_status != before_status:
+                            item.status = mapped_status
+                            item.error_message = payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message
+                            item.finished_at = item.finished_at or _now()
+                            item.started_at = item.started_at or _now()
+                            item.result = {
+                                **(item.result or {}),
+                                "downstream": self._lightweight_downstream_payload(payload),
+                                "downstream_status_synced_at": _now().isoformat(),
+                            }
+                            touched_stages.add(item.stage_name)
+                            synced_count += 1
+                        else:
+                            skipped_count += 1
+                        if force or mapped_status != before_status or record_noop_events:
+                            self._record_event(
+                                db,
+                                task,
+                                "downstream_status_synced" if (force or mapped_status != before_status) else "downstream_status_sync_skipped",
+                                "下游终态已同步，当前子任务不再进入归档" if (force or mapped_status != before_status) else "下游终态未变化，当前子任务不进入归档",
+                                stage_name=item.stage_name,
+                                item=item,
+                                level="warning" if mapped_status in {"failed", "cancelled"} else "info",
+                                payload={
+                                    "downstream_service": item.downstream_service,
+                                    "downstream_task_id": item.downstream_task_id,
+                                    "before_status": before_status,
+                                    "downstream_status": downstream_status,
+                                    "after_status": mapped_status,
+                                    "archive_skipped": True,
+                                },
+                            )
+                        continue
                     job = self._ensure_downstream_archive_job(
                         db,
                         task,
@@ -1956,6 +2235,21 @@ class TaskManager:
             or 0
         )
 
+    def _clear_archive_jobs_for_stage_items(self, db: Session, task_id: str, stage_name: str, item_ids: list[str]) -> int:
+        normalized_item_ids = [str(item_id or "").strip() for item_id in item_ids if str(item_id or "").strip()]
+        if not normalized_item_ids:
+            return 0
+        return int(
+            db.query(BinarySecurityArchiveJob)
+            .filter(
+                BinarySecurityArchiveJob.task_id == task_id,
+                BinarySecurityArchiveJob.stage_name == stage_name,
+                BinarySecurityArchiveJob.item_id.in_(normalized_item_ids),
+            )
+            .delete(synchronize_session=False)
+            or 0
+        )
+
     def _delete_archive_children_for_stages(self, db: Session, task: BinarySecurityTask, stage_names: list[str]) -> int:
         normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
         if not normalized:
@@ -1963,28 +2257,108 @@ class TaskManager:
         self._clear_stage_output_artifacts(task, normalized)
         return self._clear_archive_jobs_for_stages(db, task.id, normalized)
 
-    def _retry_failed_archive_jobs_for_stage(self, db: Session, task: BinarySecurityTask, stage_name: str) -> bool:
-        if task.status in STAGE_RETRY_BLOCKED_TASK_STATUSES:
-            raise ValidationError(f"当前任务状态不允许重试: {task.status}")
+    def _archive_retry_blocked_reason(self, task: BinarySecurityTask) -> str | None:
+        now_value = _now()
+        if task.status in TASK_PREPARING_STATUSES:
+            return f"当前任务正在执行 {task.pending_action or task.status}，暂不可重试归档"
+        if task.status in {"dispatching", "running"}:
+            return f"当前任务正在执行中，当前状态 {task.status} 下不可手工重试归档"
+        if bool(task.operation_lock_expires_at and task.operation_lock_expires_at > now_value):
+            return f"当前任务正在执行 {task.operation_lock_type or task.pending_action or '未知'} 操作，请稍后重试"
+        if task.status in {"pending_upload", "uploading", "ready_to_start", "pending"}:
+            return f"当前任务状态不允许重试归档: {task.status}"
+        return None
+
+    def _archive_job_retry_support(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        job: BinarySecurityArchiveJob,
+    ) -> tuple[bool, str | None]:
+        del db
+        blocked_reason = self._archive_retry_blocked_reason(task)
+        if blocked_reason:
+            return False, blocked_reason
+        if job.task_id != task.id:
+            return False, "归档任务不属于当前任务"
+        if str(job.archive_status or "").strip() != "failed":
+            return False, f"当前归档任务状态不允许重试: {job.archive_status or '-'}"
+        mapped_status = str((job.payload or {}).get("mapped_status") or "").strip()
+        if mapped_status not in {"success", "partial_success"}:
+            return False, f"当前归档任务目标状态不允许重试: {mapped_status or '-'}"
+        return True, None
+
+    def _archive_retry_support(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> tuple[bool, str | None, list[BinarySecurityArchiveJob]]:
+        blocked_reason = self._archive_retry_blocked_reason(task)
+        if blocked_reason:
+            return False, blocked_reason, []
         jobs = (
             db.query(BinarySecurityArchiveJob)
             .filter(
                 BinarySecurityArchiveJob.task_id == task.id,
                 BinarySecurityArchiveJob.stage_name == stage_name,
-                BinarySecurityArchiveJob.archive_status == "failed",
             )
             .order_by(BinarySecurityArchiveJob.created_at.asc())
             .all()
         )
-        retryable_jobs = [
-            job
-            for job in jobs
-            if str((job.payload or {}).get("mapped_status") or "").strip() in {"success", "partial_success"}
-        ]
+        if not jobs:
+            return False, "当前阶段暂无归档任务", []
+        retryable_jobs: list[BinarySecurityArchiveJob] = []
+        for job in jobs:
+            supported, _ = self._archive_job_retry_support(db, task, job)
+            if supported:
+                retryable_jobs.append(job)
         if not retryable_jobs:
-            return False
+            return False, "当前阶段暂无可重试的失败归档任务", []
+        return True, None, retryable_jobs
+
+    def _archive_full_retry_support(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> tuple[bool, str | None, list[BinarySecurityArchiveJob], list[BinarySecurityStageItem]]:
+        blocked_reason = self._archive_retry_blocked_reason(task)
+        if blocked_reason:
+            return False, blocked_reason, [], []
+        jobs = (
+            db.query(BinarySecurityArchiveJob)
+            .filter(
+                BinarySecurityArchiveJob.task_id == task.id,
+                BinarySecurityArchiveJob.stage_name == stage_name,
+            )
+            .order_by(BinarySecurityArchiveJob.created_at.asc())
+            .all()
+        )
+        stage_items = [
+            item
+            for item in self._stage_items(db, task.id, stage_name)
+            if self._normalize_item_status(item.status) in ARCHIVE_SUCCESS_MAPPED_STATUSES
+        ]
+        if not jobs and not stage_items:
+            return False, "当前阶段暂无可重建的归档子任务", [], []
+        return True, None, jobs, stage_items
+
+    def _requeue_archive_jobs(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        jobs: list[BinarySecurityArchiveJob],
+        *,
+        stage_name: str,
+        event_type: str,
+        event_message: str,
+    ) -> None:
+        if not jobs:
+            return
         now = _now()
-        for job in retryable_jobs:
+        touched_stage_names: set[str] = set()
+        for job in jobs:
             item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == job.item_id).first()
             mapped_status = str((job.payload or {}).get("mapped_status") or "success").strip()
             if item is not None:
@@ -1994,6 +2368,7 @@ class TaskManager:
                 item.finished_at = item.finished_at or now
                 if item.stage_name == "firmware_unpack":
                     self._refresh_firmware_unpack_item_result(task, item, archived_dir=Path(job.archive_root) if job.archive_root else None)
+                touched_stage_names.add(item.stage_name)
             job.archive_status = "pending"
             job.owner_id = None
             job.error_message = None
@@ -2004,8 +2379,8 @@ class TaskManager:
             self._record_event(
                 db,
                 task,
-                "downstream_archive_retry_requested",
-                "产物归档已重新排队",
+                event_type,
+                event_message,
                 stage_name=stage_name,
                 item=item,
                 payload={
@@ -2015,12 +2390,58 @@ class TaskManager:
                     "mapped_status": mapped_status,
                 },
             )
-        if stage_name == "system_analysis":
-            self._refresh_system_analysis_stage_from_synced_items(db, task)
-        else:
-            self._refresh_stage_run_from_items(db, task, stage_name)
+        for current_stage in sorted(touched_stage_names):
+            if current_stage == "system_analysis":
+                self._refresh_system_analysis_stage_from_synced_items(db, task)
+            else:
+                self._refresh_stage_run_from_items(db, task, current_stage)
         self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+
+    def _retry_failed_archive_jobs_for_stage(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+        *,
+        event_type: str = "downstream_archive_retry_requested",
+    ) -> bool:
+        supported, _, jobs = self._archive_retry_support(db, task, stage_name)
+        if not supported:
+            return False
+        self._requeue_archive_jobs(
+            db,
+            task,
+            jobs,
+            stage_name=stage_name,
+            event_type=event_type,
+            event_message="产物归档已重新排队",
+        )
         return True
+
+    def _rebuild_archive_jobs_for_stage(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+        stage_items: list[BinarySecurityStageItem],
+    ) -> int:
+        rebuilt = 0
+        for item in stage_items:
+            mapped_status = self._normalize_item_status(item.status)
+            if mapped_status not in ARCHIVE_SUCCESS_MAPPED_STATUSES:
+                continue
+            payload = dict((item.result or {}).get("downstream") or {})
+            payload.setdefault("status", mapped_status)
+            job = self._queue_downstream_archive_job(
+                db,
+                task,
+                item,
+                payload=payload,
+                mapped_status=mapped_status,
+                before_status=mapped_status,
+            )
+            rebuilt += 1 if job else 0
+        return rebuilt
 
     def _mark_task_waiting_for_archive_retry(self, db: Session, task: BinarySecurityTask, stage_name: str) -> None:
         task.status = "running"
@@ -2202,6 +2623,8 @@ class TaskManager:
         before_status: str | None,
         extra_paths: list[str | Path] | None = None,
     ) -> BinarySecurityArchiveJob:
+        if mapped_status not in ARCHIVE_SUCCESS_MAPPED_STATUSES:
+            raise ValidationError(f"当前状态不生成归档任务: {mapped_status}")
         job = self._ensure_downstream_archive_job(
             db,
             task,
@@ -2240,6 +2663,8 @@ class TaskManager:
         before_status: str | None,
         extra_paths: list[str | Path] | None = None,
     ) -> tuple[Path | None, BinarySecurityArchiveJob | None]:
+        if mapped_status not in ARCHIVE_SUCCESS_MAPPED_STATUSES:
+            return None, None
         job = self._queue_downstream_archive_job(
             db,
             task,
@@ -2323,12 +2748,12 @@ class TaskManager:
         if action not in TASK_PENDING_ACTIONS:
             raise ValidationError(f"不支持的任务阻塞动作: {action}")
         self._invalidate_task_execution(task)
-        task.status = preparing_status
+        task.status = preparing_status or _preparing_status_for_action(action)
         task.pending_action = action
         task.current_stage = target_stage or task.current_stage
         task.last_error = None
         task.finished_at = None
-        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=preparing_status)
+        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
         self._record_event(
             db,
             task,
@@ -2498,10 +2923,10 @@ class TaskManager:
                 name=f"binary-security-operation-lock-{task.id}",
             )
             target_stage = str(task.current_stage or "").strip() or None
-            started_event = "task_continue_prepare_started" if action == "continue" else "task_retry_prepare_started"
-            finished_event = "task_continue_prepare_finished" if action == "continue" else "task_retry_prepare_finished"
-            failed_event = "task_continue_prepare_failed" if action == "continue" else "task_retry_prepare_failed"
-            requeued_event = "task_continue_requested" if action == "continue" else "task_retried"
+            started_event = "task_continue_prepare_started" if action == TASK_ACTION_CONTINUE else "task_retry_prepare_started"
+            finished_event = "task_continue_prepare_finished" if action == TASK_ACTION_CONTINUE else "task_retry_prepare_finished"
+            failed_event = "task_continue_prepare_failed" if action == TASK_ACTION_CONTINUE else "task_retry_prepare_failed"
+            requeued_event = "task_continue_requested" if action == TASK_ACTION_CONTINUE else "task_retried"
 
             self._record_event(
                 db,
@@ -2513,7 +2938,7 @@ class TaskManager:
             )
             db.commit()
 
-            if action == "continue":
+            if action == TASK_ACTION_CONTINUE:
                 if not target_stage:
                     raise ValidationError("继续任务缺少目标阶段")
                 affected_stages = await self._prepare_continue_task(db, task, target_stage)
@@ -2521,7 +2946,7 @@ class TaskManager:
                 task.target_stage_name = target_stage
                 requeued_message = f"任务已完成继续准备，将从阶段 {target_stage} 重新排队"
                 retry_semantics = "continue_with_existing_downstream"
-            else:
+            elif action == TASK_ACTION_RETRY:
                 stage_sequence = await self._prepare_retry_task(db, task)
                 target_stage = stage_sequence[0] if stage_sequence else None
                 affected_stages = stage_sequence
@@ -2529,6 +2954,24 @@ class TaskManager:
                 task.target_stage_name = None
                 requeued_message = f"任务已完成清理，将从第一阶段 {target_stage} 重新排队"
                 retry_semantics = "full_restart"
+            elif action in {TASK_ACTION_RETRY_FAILED_ITEMS, TASK_ACTION_RETRY_STAGE_FAILED_ITEMS}:
+                if not target_stage:
+                    raise ValidationError("失败项重试缺少目标阶段")
+                affected_stages = await self._prepare_retry_failed_items(db, task, target_stage)
+                task.execution_mode = "task_retry_failed_items" if action == TASK_ACTION_RETRY_FAILED_ITEMS else "stage_retry_failed_items"
+                task.target_stage_name = target_stage
+                requeued_message = f"任务已完成失败项清理，将从阶段 {target_stage} 重新排队"
+                retry_semantics = "retry_failed_items"
+            elif action == TASK_ACTION_RETRY_STAGE_FULL:
+                if not target_stage:
+                    raise ValidationError("阶段完全重试缺少目标阶段")
+                affected_stages = await self._prepare_retry_stage_full(db, task, target_stage)
+                task.execution_mode = "stage_retry_full"
+                task.target_stage_name = target_stage
+                requeued_message = f"阶段 {target_stage} 已完成全量清理，将重新排队"
+                retry_semantics = "stage_retry_full"
+            else:
+                raise ValidationError(f"未知 preparing action: {action}")
 
             task.status = "pending"
             task.pending_action = None
@@ -2577,7 +3020,7 @@ class TaskManager:
                 self._record_event(
                     db,
                     task,
-                    "task_continue_prepare_failed" if action == "continue" else "task_retry_prepare_failed",
+                    "task_continue_prepare_failed" if action == TASK_ACTION_CONTINUE else "task_retry_prepare_failed",
                     f"后台准备失败: {exc}",
                     level="error",
                     stage_name=target_stage,
@@ -3135,8 +3578,8 @@ class TaskManager:
             token = self._service_token()
             stage_sequence = self._stage_sequence_for_task(task)
             start_index = stage_sequence.index(task.current_stage) if task.current_stage in stage_sequence else 0
-            stage_retry_mode = task.execution_mode == "stage_retry" and bool(task.target_stage_name)
-            task_retry_mode = task.execution_mode == "task_retry" and bool(task.target_stage_name)
+            stage_retry_mode = task.execution_mode in {"stage_retry", "stage_retry_failed_items", "stage_retry_full"} and bool(task.target_stage_name)
+            task_retry_mode = task.execution_mode in {"task_retry", "task_retry_failed_items"} and bool(task.target_stage_name)
             target_stage_name = task.target_stage_name if (stage_retry_mode or task_retry_mode) else None
             target_stage_index = stage_sequence.index(target_stage_name) if target_stage_name in stage_sequence else start_index
             if stage_retry_mode:
@@ -3182,7 +3625,7 @@ class TaskManager:
                 self._record_event(db, task, "stage_started", f"阶段开始: {stage_name}", stage_name=stage_name)
                 db.commit()
                 retry_existing = False
-                if stage_retry_mode and stage_name == target_stage_name:
+                if task.execution_mode in {"stage_retry_failed_items", "task_retry_failed_items"} and stage_name == target_stage_name:
                     retry_existing = True
                 elif task_retry_mode and existing_stage_items:
                     retry_existing = True
@@ -3316,6 +3759,8 @@ class TaskManager:
                 task.target_stage_name = None
                 summary = dict(task.summary or {})
                 summary.pop("stage_retry_context", None)
+                summary.pop("task_retry_context", None)
+                summary.pop("retry_plan", None)
                 task.summary = summary
             next_stage = self._next_incomplete_stage(db, task)
             if task.status in {"running", "dispatching"} and next_stage:
@@ -3690,7 +4135,7 @@ class TaskManager:
             return
         pending_action = str(task.pending_action or "").strip()
         if pending_action in TASK_PENDING_ACTIONS:
-            task.status = TASK_STATUS_CONTINUE_PREPARING if pending_action == "continue" else TASK_STATUS_RETRY_PREPARING
+            task.status = _preparing_status_for_action(pending_action)
             task.finished_at = None
             task.last_error = None
             task.dispatcher_instance_id = None
@@ -4406,6 +4851,17 @@ class TaskManager:
                         raise
                     time.sleep(0.2 * (attempt + 1))
 
+    def _delete_stage_items_by_ids(self, db: Session, item_ids: list[str]) -> int:
+        normalized = [str(item_id or "").strip() for item_id in item_ids if str(item_id or "").strip()]
+        if not normalized:
+            return 0
+        return int(
+            db.query(BinarySecurityStageItem)
+            .filter(BinarySecurityStageItem.id.in_(normalized))
+            .delete(synchronize_session=False)
+            or 0
+        )
+
     def _stage_enabled(self, task: BinarySecurityTask, stage_name: str) -> bool:
         policy = task.policy or {}
         stage_options = policy.get("stage_options", {})
@@ -4595,6 +5051,11 @@ class TaskManager:
             for stage_name in stage_sequence
             if stage_name in runs_by_stage
         }
+        stage_retry_failed_support = {
+            stage_name: self._stage_retry_failed_items_support(db, task, stage_name)
+            for stage_name in stage_sequence
+            if stage_name in runs_by_stage
+        }
         summaries: list[BinarySecurityStageSummary] = []
         for index, stage_name in enumerate(stage_sequence, start=1):
             run = runs_by_stage.get(stage_name)
@@ -4620,6 +5081,10 @@ class TaskManager:
                     retry_count=int(run.retry_count or 0) if run else 0,
                     retry_supported=stage_retry_support.get(stage_name, (False, None))[0],
                     retry_reason=stage_retry_support.get(stage_name, (False, None))[1],
+                    retry_failed_supported=stage_retry_failed_support.get(stage_name, (False, None, []))[0],
+                    retry_failed_reason=stage_retry_failed_support.get(stage_name, (False, None, []))[1],
+                    retry_full_supported=stage_retry_support.get(stage_name, (False, None))[0],
+                    retry_full_reason=stage_retry_support.get(stage_name, (False, None))[1],
                     total_items=counts["total_items"],
                     success_items=counts["success_items"],
                     failed_items=counts["failed_items"],
@@ -4649,6 +5114,7 @@ class TaskManager:
 
     def _build_stage_overview_nodes(
         self,
+        db: Session,
         task: BinarySecurityTask,
         stage_summaries: list[BinarySecurityStageSummary],
         archive_jobs: list[BinarySecurityArchiveJobResponse],
@@ -4699,6 +5165,10 @@ class TaskManager:
                     last_error=summary.last_error,
                     retry_supported=summary.retry_supported,
                     retry_reason=summary.retry_reason,
+                    retry_failed_supported=summary.retry_failed_supported,
+                    retry_failed_reason=summary.retry_failed_reason,
+                    retry_full_supported=summary.retry_full_supported,
+                    retry_full_reason=summary.retry_full_reason,
                     detail=business_detail,
                 )
             )
@@ -4741,6 +5211,8 @@ class TaskManager:
                 archive_status = "pending"
             if stage_name == "system_analysis" and summary.status == "waiting_confirmation":
                 archive_status = "pending"
+            archive_retry_supported, archive_retry_reason, _ = self._archive_retry_support(db, task, stage_name)
+            archive_retry_full_supported, archive_retry_full_reason, _, _ = self._archive_full_retry_support(db, task, stage_name)
             nodes.append(
                 BinarySecurityOverviewNode(
                     node_id=f"archive:{stage_name}",
@@ -4754,8 +5226,12 @@ class TaskManager:
                     finished_at=last_updated_at if archive_status == "success" else None,
                     updated_at=last_updated_at,
                     last_error=archive_detail.latest_error,
-                    retry_supported=False,
-                    retry_reason=None,
+                    retry_supported=archive_retry_supported,
+                    retry_reason=archive_retry_reason,
+                    retry_failed_supported=archive_retry_supported,
+                    retry_failed_reason=archive_retry_reason,
+                    retry_full_supported=archive_retry_full_supported,
+                    retry_full_reason=archive_retry_full_reason,
                     detail=archive_detail,
                 )
             )
@@ -4878,6 +5354,7 @@ class TaskManager:
         stage_sequence = self._stage_sequence_for_task(task)
         task_retry_supported, task_retry_reason, _ = self._task_retry_support(db, task)
         task_continue_supported, task_continue_reason, _ = self._task_continue_support(db, task)
+        task_retry_failed_supported, task_retry_failed_reason, _, _ = self._task_retry_failed_items_support(db, task)
         stage_summaries = self._build_stage_summaries(db, task, stage_sequence, stage_runs, items)
         manual_operation_state = self._build_manual_operation_state(
             db,
@@ -4886,6 +5363,8 @@ class TaskManager:
             task_retry_reason=task_retry_reason,
             task_continue_supported=task_continue_supported,
             task_continue_reason=task_continue_reason,
+            task_retry_failed_supported=task_retry_failed_supported,
+            task_retry_failed_reason=task_retry_failed_reason,
             stage_summaries=stage_summaries,
         )
         return BinarySecurityTaskResponse(
@@ -4922,6 +5401,8 @@ class TaskManager:
             task_retry_reason=task_retry_reason,
             task_continue_supported=task_continue_supported,
             task_continue_reason=task_continue_reason,
+            task_retry_failed_items_supported=task_retry_failed_supported,
+            task_retry_failed_items_reason=task_retry_failed_reason,
             stage_summaries=stage_summaries,
             manual_operation_state=manual_operation_state,
         )
@@ -4935,21 +5416,29 @@ class TaskManager:
         task_retry_reason: str | None,
         task_continue_supported: bool,
         task_continue_reason: str | None,
+        task_retry_failed_supported: bool,
+        task_retry_failed_reason: str | None,
         stage_summaries: list[BinarySecurityStageSummary],
     ) -> dict[str, Any]:
         now_value = _now()
         lock_active = bool(task.operation_lock_expires_at and task.operation_lock_expires_at > now_value)
         operation_type = str(task.operation_lock_type or task.pending_action or "").strip() or None
         operation_owner = str(task.operation_lock_owner or "").strip() or None
-        has_stage_retry = any(bool(summary.retry_supported) for summary in stage_summaries)
+        has_stage_retry = any(bool(summary.retry_full_supported) for summary in stage_summaries)
+        has_stage_retry_failed = any(bool(summary.retry_failed_supported) for summary in stage_summaries)
         preparing = task.status in TASK_PREPARING_STATUSES
         running = task.status in {"dispatching", "running"}
         waiting_modules = task.status in {TASK_STATUS_PENDING_MODULE_CONFIRMATION, "waiting_confirmation"}
+        can_retry_archive = not preparing and not running and not lock_active and any(
+            self._archive_retry_support(db, task, summary.stage_name)[0] or self._archive_full_retry_support(db, task, summary.stage_name)[0]
+            for summary in stage_summaries
+        )
 
         can_cancel = task.status not in TASK_TERMINAL_STATUSES and not preparing and not lock_active
         can_continue = bool(task_continue_supported) and not lock_active
         can_retry = bool(task_retry_supported) and not lock_active
-        can_retry_stage = has_stage_retry and not lock_active and not running and not preparing
+        can_retry_failed_items = bool(task_retry_failed_supported) and not lock_active
+        can_retry_stage = (has_stage_retry or has_stage_retry_failed) and not lock_active and not running and not preparing
         can_delete = not lock_active
         can_edit_policy = task.status not in {"dispatching", "running"} | TASK_PREPARING_STATUSES and not lock_active
         can_confirm_modules = waiting_modules and not lock_active
@@ -4978,9 +5467,9 @@ class TaskManager:
             blocking_reason = f"当前任务正在执行中，当前状态 {task.status} 下仅支持取消或同步状态"
             overall = "blocked"
             summary = blocking_reason
-        elif not any([can_cancel, can_continue, can_retry, can_retry_stage, can_delete, can_edit_policy, can_confirm_modules]):
+        elif not any([can_cancel, can_continue, can_retry, can_retry_failed_items, can_retry_stage, can_retry_archive, can_delete, can_edit_policy, can_confirm_modules]):
             blocking_code = "no_manual_operation"
-            blocking_reason = task_continue_reason or task_retry_reason or "当前任务暂无可执行的手工操作"
+            blocking_reason = task_retry_failed_reason or task_continue_reason or task_retry_reason or "当前任务暂无可执行的手工操作"
             overall = "blocked"
             summary = blocking_reason
 
@@ -4997,7 +5486,13 @@ class TaskManager:
             "can_cancel": can_cancel,
             "can_continue": can_continue,
             "can_retry": can_retry,
+            "can_retry_failed_items": can_retry_failed_items,
             "can_retry_stage": can_retry_stage,
+            "can_retry_stage_failed_items": has_stage_retry_failed and not lock_active and not running and not preparing,
+            "can_retry_stage_full": has_stage_retry and not lock_active and not running and not preparing,
+            "can_retry_archive": can_retry_archive,
+            "can_retry_archive_failed_items": can_retry_archive,
+            "can_retry_archive_full": can_retry_archive,
             "can_delete": can_delete,
             "can_edit_policy": can_edit_policy,
             "can_confirm_modules": can_confirm_modules,
@@ -5246,6 +5741,59 @@ class TaskManager:
             if run.status != "success":
                 return stage_name
         return None
+
+    def _retry_plan(self, task: BinarySecurityTask) -> dict[str, Any]:
+        summary = dict(task.summary or {})
+        plan = summary.get("retry_plan") or {}
+        return dict(plan) if isinstance(plan, dict) else {}
+
+    def _set_retry_plan(self, task: BinarySecurityTask, plan: dict[str, Any] | None) -> None:
+        summary = dict(task.summary or {})
+        if plan:
+            summary["retry_plan"] = dict(plan)
+        else:
+            summary.pop("retry_plan", None)
+        task.summary = summary
+
+    def _normalize_item_status(self, status: str | None) -> str:
+        return (self._normalize_downstream_status(status) or str(status or "").strip().lower() or "unknown")
+
+    def _is_failed_retry_candidate_status(self, status: str | None) -> bool:
+        return self._normalize_item_status(status) in FAILED_ITEM_RETRYABLE_STATUSES
+
+    def _stage_retry_candidate_items(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> list[BinarySecurityStageItem]:
+        return [
+            item
+            for item in self._stage_items(db, task.id, stage_name)
+            if self._is_failed_retry_candidate_status(item.status)
+        ]
+
+    def _upstream_stage_retried(self, db: Session, task: BinarySecurityTask, stage_name: str) -> tuple[bool, str | None]:
+        stage_sequence = self._stage_sequence_for_task(task)
+        if stage_name not in stage_sequence:
+            return False, None
+        target_index = stage_sequence.index(stage_name)
+        stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+        runs_by_stage = {run.stage_name: run for run in stage_runs}
+        for upstream_stage in stage_sequence[:target_index]:
+            run = runs_by_stage.get(upstream_stage)
+            if run and int(run.retry_count or 0) > 0:
+                return True, upstream_stage
+        return False, None
+
+    def _first_failed_retry_stage(self, db: Session, task: BinarySecurityTask) -> tuple[str | None, list[BinarySecurityStageItem]]:
+        for stage_name in self._stage_sequence_for_task(task):
+            if not self._stage_enabled(task, stage_name):
+                continue
+            items = self._stage_retry_candidate_items(db, task, stage_name)
+            if items:
+                return stage_name, items
+        return None, []
 
     @staticmethod
     def _clear_failure_fields_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
@@ -5654,7 +6202,7 @@ class TaskManager:
             return
         pending_action = str(task.pending_action or "").strip()
         if pending_action in TASK_PENDING_ACTIONS:
-            task.status = TASK_STATUS_CONTINUE_PREPARING if pending_action == "continue" else TASK_STATUS_RETRY_PREPARING
+            task.status = _preparing_status_for_action(pending_action)
             task.finished_at = None
             task.last_error = None
             task.dispatcher_instance_id = None
@@ -5669,19 +6217,21 @@ class TaskManager:
             task.finished_at = None
             task.last_error = None
             return
-        stage_retry_mode = task.execution_mode == "stage_retry" and bool(task.target_stage_name)
-        task_retry_mode = task.execution_mode == "task_retry" and bool(task.target_stage_name)
+        stage_retry_mode = task.execution_mode in {"stage_retry", "stage_retry_failed_items", "stage_retry_full"} and bool(task.target_stage_name)
+        task_retry_mode = task.execution_mode in {"task_retry", "task_retry_failed_items"} and bool(task.target_stage_name)
         if stage_retry_mode:
             task.execution_mode = None
             task.target_stage_name = None
             summary = dict(task.summary or {})
             summary.pop("stage_retry_context", None)
+            summary.pop("retry_plan", None)
             task.summary = summary
         if task_retry_mode:
             task.execution_mode = None
             task.target_stage_name = None
             summary = dict(task.summary or {})
             summary.pop("task_retry_context", None)
+            summary.pop("retry_plan", None)
             task.summary = summary
         next_stage = self._next_incomplete_stage(db, task)
         next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
@@ -5849,12 +6399,22 @@ class TaskManager:
         output_ref,
     ) -> None:
         """Persist every intended stage item as queued before fan-out execution starts."""
+        retry_plan = self._retry_plan(task)
+        retry_item_keys = set(retry_plan.get("retry_item_keys") or [])
+        target_stage = str(retry_plan.get("target_stage") or "").strip()
+        retry_failed_only = (
+            stage_run.stage_name == target_stage
+            and str(retry_plan.get("mode") or "").strip() in {TASK_ACTION_RETRY_FAILED_ITEMS, TASK_ACTION_RETRY_STAGE_FAILED_ITEMS}
+            and bool(retry_item_keys)
+        )
         last_error: Exception | None = None
         for _ in range(2):
             try:
                 for input_item in inputs:
                     item_key, item_name, parent_key, input_ref = identity(input_item)
                     identity_key = build_stage_item_identity_key(item_key, parent_key)
+                    if retry_failed_only and identity_key not in retry_item_keys:
+                        continue
                     item = self._find_stage_item(
                         db,
                         task_id=task.id,
@@ -6026,6 +6586,50 @@ class TaskManager:
             return False, "当前任务没有可执行阶段", None
         return True, None, stage_sequence[0]
 
+    def _task_retry_failed_items_support(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> tuple[bool, str | None, str | None, list[BinarySecurityStageItem]]:
+        if task.status in {"pending_upload", "uploading", "ready_to_start"}:
+            return False, "当前任务尚未完成输入准备，不能重试失败项", None, []
+        if task.status in {"pending", "dispatching", "running"} | TASK_PREPARING_STATUSES:
+            return False, f"当前任务正在执行或排队中，不能重试失败项: {task.status}", None, []
+        if str(task.pending_action or "").strip():
+            return False, f"当前任务已有待处理操作: {task.pending_action}", None, []
+        if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
+            return False, "当前任务等待模块确认，请先确认模块后再重试失败项", None, []
+        stage_name, items = self._first_failed_retry_stage(db, task)
+        if not stage_name or not items:
+            return False, "当前任务没有可重试的失败项", None, []
+        upstream_retried, upstream_stage = self._upstream_stage_retried(db, task, stage_name)
+        if upstream_retried:
+            return False, f"阶段 {STAGE_TITLES.get(stage_name, stage_name)} 的上游阶段 {STAGE_TITLES.get(upstream_stage or '', upstream_stage or '')} 已发生重试，不能只重试失败项", None, []
+        reason = self._continue_stage_input_error(db, task, stage_name)
+        if reason:
+            return False, reason, stage_name, []
+        return True, None, stage_name, items
+
+    def _stage_retry_failed_items_support(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> tuple[bool, str | None, list[BinarySecurityStageItem]]:
+        supported, reason = self._stage_retry_support(db, task, stage_name)
+        if not supported:
+            return False, reason, []
+        items = self._stage_retry_candidate_items(db, task, stage_name)
+        if not items:
+            return False, "当前阶段没有可重试的失败项", []
+        upstream_retried, upstream_stage = self._upstream_stage_retried(db, task, stage_name)
+        if upstream_retried:
+            return False, f"上游阶段 {STAGE_TITLES.get(upstream_stage or '', upstream_stage or '')} 已发生重试，当前阶段不能只重试失败项", []
+        reason = self._continue_stage_input_error(db, task, stage_name)
+        if reason:
+            return False, reason, []
+        return True, None, items
+
     def _task_continue_support(self, db: Session, task: BinarySecurityTask) -> tuple[bool, str | None, str | None]:
         if task.status in {"pending_upload", "uploading", "ready_to_start"}:
             return False, f"当前任务状态不允许继续: {task.status}", None
@@ -6174,6 +6778,18 @@ class TaskManager:
         task.metrics = metrics
         task.stage_summary = stage_summary
         self._clear_stage_output_artifacts(task, [stage_name])
+
+    def _clear_single_stage_runtime_state(self, task: BinarySecurityTask, stage_name: str) -> None:
+        summary = dict(task.summary or {})
+        metrics = dict(task.metrics or {})
+        stage_summary = dict(task.stage_summary or {})
+        for summary_key in self._stage_result_keys(stage_name):
+            summary.pop(summary_key, None)
+        stage_summary.pop(stage_name, None)
+        metrics.update(STAGE_METRIC_RESETTERS.get(stage_name, {}))
+        task.summary = summary
+        task.metrics = metrics
+        task.stage_summary = stage_summary
 
     def _list_artifact_page(self, root: Path, *, limit: int, offset: int) -> dict[str, Any]:
         files: list[dict[str, Any]] = []

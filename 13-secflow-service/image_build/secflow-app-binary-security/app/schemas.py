@@ -78,6 +78,10 @@ class BinarySecurityStageSummary(BaseModel):
     retry_count: int = 0
     retry_supported: bool = False
     retry_reason: Optional[str] = None
+    retry_failed_supported: bool = False
+    retry_failed_reason: Optional[str] = None
+    retry_full_supported: bool = False
+    retry_full_reason: Optional[str] = None
     total_items: int = 0
     success_items: int = 0
     failed_items: int = 0
@@ -123,6 +127,8 @@ class BinarySecurityTaskResponse(BaseModel):
     task_retry_reason: Optional[str] = None
     task_continue_supported: bool = False
     task_continue_reason: Optional[str] = None
+    task_retry_failed_items_supported: bool = False
+    task_retry_failed_items_reason: Optional[str] = None
     stage_summaries: list[BinarySecurityStageSummary] = Field(default_factory=list)
     manual_operation_state: dict[str, Any] = Field(default_factory=dict)
 
@@ -215,6 +221,10 @@ class BinarySecurityArchiveJobResponse(BaseModel):
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    retry_supported: bool = False
+    retry_reason: Optional[str] = None
+    retry_failed_supported: bool = False
+    retry_failed_reason: Optional[str] = None
     copy_stats: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -260,6 +270,10 @@ class BinarySecurityOverviewNode(BaseModel):
     last_error: Optional[str] = None
     retry_supported: bool = False
     retry_reason: Optional[str] = None
+    retry_failed_supported: bool = False
+    retry_failed_reason: Optional[str] = None
+    retry_full_supported: bool = False
+    retry_full_reason: Optional[str] = None
     detail: BinarySecurityOverviewBusinessDetail | BinarySecurityOverviewArchiveDetail
 
 
