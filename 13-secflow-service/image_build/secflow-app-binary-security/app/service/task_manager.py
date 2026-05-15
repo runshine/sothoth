@@ -1866,7 +1866,9 @@ class TaskManager:
                         },
                     )
             except NotFoundError:
-                db.rollback()
+                # The exception is raised by downstream fetch only. Rolling the
+                # whole session back here would also discard already-synced
+                # sibling items from earlier loop iterations.
                 item.status = "downstream_missing"
                 item.error_message = "下游子任务不存在"
                 item.finished_at = item.finished_at or _now()
@@ -1895,7 +1897,8 @@ class TaskManager:
                     },
                 )
             except Exception as exc:
-                db.rollback()
+                # Keep previously synchronized item updates intact; this branch
+                # only records the current item's fetch failure.
                 failed_count += 1
                 self._record_event(
                     db,
