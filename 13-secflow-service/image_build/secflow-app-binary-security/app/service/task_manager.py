@@ -8140,6 +8140,7 @@ class TaskManager:
         mapping = STAGE_RETRY_ENDPOINTS.get(stage_name)
         if not mapping:
             return False, f"阶段 {stage_name} 未配置安全重试接口"
+        self._normalize_cancelled_task_active_children(db, task)
         if task.status in STAGE_RETRY_BLOCKED_TASK_STATUSES:
             return False, f"当前任务状态不允许重试: {task.status}"
         stage_run = db.query(BinarySecurityStageRun).filter(
@@ -8168,6 +8169,40 @@ class TaskManager:
                     f"阶段 {stage_name} 下游服务不匹配，期望 {expected_service}，实际 {item.downstream_service or '-'}"
                 )
         return True, None
+
+    def _normalize_cancelled_task_active_children(self, db: Session, task: BinarySecurityTask) -> None:
+        """Cancelled tasks must not keep stale active stage/item state that blocks retry."""
+        if task.status != "cancelled":
+            return
+        now_value = _now()
+        active_items = db.query(BinarySecurityStageItem).filter(
+            BinarySecurityStageItem.task_id == task.id,
+            BinarySecurityStageItem.status.in_(["pending", "queued", "dispatching", "running"]),
+        ).all()
+        active_stage_runs = db.query(BinarySecurityStageRun).filter(
+            BinarySecurityStageRun.task_id == task.id,
+            BinarySecurityStageRun.status.in_(["pending", "queued", "dispatching", "running"]),
+        ).all()
+        if not active_items and not active_stage_runs:
+            return
+        for item in active_items:
+            item.status = "cancelled"
+            item.finished_at = item.finished_at or now_value
+        for stage_run in active_stage_runs:
+            stage_run.status = "cancelled"
+            stage_run.finished_at = stage_run.finished_at or now_value
+        self._record_event(
+            db,
+            task,
+            "cancelled_task_children_normalized",
+            "已归一化取消任务中残留的活跃阶段与子任务",
+            level="warning",
+            stage_name=task.current_stage,
+            payload={
+                "cancelled_item_count": len(active_items),
+                "cancelled_stage_run_count": len(active_stage_runs),
+            },
+        )
 
     def _first_retry_stage_name(self, db: Session, task: BinarySecurityTask) -> str | None:
         stage_runs = {
