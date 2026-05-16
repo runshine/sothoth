@@ -531,7 +531,6 @@ class ReviewAnalyticsSummary(BaseModel):
     issue_closure_rate: float = 0
     residual_risk: str = "unknown"
     residual_risk_label: Optional[str] = None
-    mock: bool = False
 
 
 class ReviewAnalyticsMeta(BaseModel):
@@ -540,7 +539,6 @@ class ReviewAnalyticsMeta(BaseModel):
     source: str = "validator_verdict"
     data_quality: str = "estimated"
     generated_at: Optional[str] = None
-    mock: bool = False
 
 
 class ReviewAnalyticsTrendPoint(BaseModel):

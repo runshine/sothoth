@@ -309,14 +309,13 @@ async def get_b2s_task_item_review_analytics(
     project_id: str,
     task_id: str,
     item_id: str,
-    mock: bool = Query(False),
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
     await sync_task(db, task)
     item = get_task_item_or_404(db, task, item_id)
-    return build_task_item_review_analytics(item, mock=mock)
+    return build_task_item_review_analytics(item)
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/terminate", response_model=ActionResponse)

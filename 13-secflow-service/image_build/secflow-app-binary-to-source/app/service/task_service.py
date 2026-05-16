@@ -1278,7 +1278,7 @@ def _build_review_trend_insight(attempts: list[ReviewAnalyticsAttempt], dimensio
     return ReviewAnalyticsTrendInsight(title=title, conclusion=conclusion, tone=tone, primary_metric="质量分", first_score=first_score, final_score=final_score, delta=delta, series=series)
 
 
-def _finalize_review_analytics(task_id: str, item_id: str, attempts: list[ReviewAnalyticsAttempt], issues: list[ReviewAnalyticsIssue], matrix: list[ReviewAnalyticsFunction], radar: list[ReviewAnalyticsRadar], *, final_verdict: str, final_confidence: int, closure: float, residual: str, mock: bool) -> ReviewAnalyticsResponse:
+def _finalize_review_analytics(task_id: str, item_id: str, attempts: list[ReviewAnalyticsAttempt], issues: list[ReviewAnalyticsIssue], matrix: list[ReviewAnalyticsFunction], radar: list[ReviewAnalyticsRadar], *, final_verdict: str, final_confidence: int, closure: float, residual: str) -> ReviewAnalyticsResponse:
     for issue in issues:
         issue.display_label = issue.display_label or ISSUE_LABELS.get(issue.label, issue.label)
         issue.description = issue.description or ISSUE_DETAILS.get(issue.label, f"{issue.category} · {issue.severity}")
@@ -1314,14 +1314,14 @@ def _finalize_review_analytics(task_id: str, item_id: str, attempts: list[Review
         task_id=task_id,
         item_id=item_id,
         status="ready",
-        meta=ReviewAnalyticsMeta(generated_at=generated_at, mock=mock),
+        meta=ReviewAnalyticsMeta(generated_at=generated_at),
         summary=ReviewAnalyticsSummary(
             attempts=len(attempts), attempt_count=len(attempts), final_verdict=final_verdict,
             final_verdict_label=_verdict_label(final_verdict), final_confidence=final_confidence,
             final_quality_score=final_quality, final_quality_label=final_quality_label,
             initial_quality_score=initial_quality, quality_delta=quality_delta, quality_delta_percent=quality_delta_percent,
             issue_total=len(issues), issue_resolved=resolved_count, issue_remaining=remaining_count,
-            issue_closure_rate=closure, residual_risk=residual, residual_risk_label=RISK_LABELS.get(residual, residual), mock=mock,
+            issue_closure_rate=closure, residual_risk=residual, residual_risk_label=RISK_LABELS.get(residual, residual),
         ),
         attempts=attempts,
         issues=issues,
@@ -1331,27 +1331,6 @@ def _finalize_review_analytics(task_id: str, item_id: str, attempts: list[Review
         radar=radar,
         trend_insight=trend,
     )
-
-
-def _mock_review_analytics(task_id: str, item_id: str) -> ReviewAnalyticsResponse:
-    attempts = [
-        ReviewAnalyticsAttempt(attempt_no=1, verdict="FAIL", total_functions=10, verified_functions=8, blocking_issues=3, semantic_score=68, confidence=64),
-        ReviewAnalyticsAttempt(attempt_no=2, verdict="PASS", total_functions=10, verified_functions=10, blocking_issues=0, semantic_score=94, confidence=89),
-    ]
-    issues = [
-        ReviewAnalyticsIssue(id="I1", label="Length Logic", function="sub_880", category="Validation", severity="blocking", introduced_attempt=1, resolved_attempt=2, status="resolved"),
-        ReviewAnalyticsIssue(id="I2", label="Return Code", function="sub_880", category="Return", severity="blocking", introduced_attempt=1, resolved_attempt=2, status="resolved"),
-        ReviewAnalyticsIssue(id="I3", label="Extra Check", function="sub_880", category="Validation", severity="major", introduced_attempt=1, resolved_attempt=2, status="resolved"),
-    ]
-    names = [".init_proc", "sub_880", "start", "sub_E74", "sub_E90", "sub_EC0", "sub_F00", "sub_F50", "sub_F60", ".term_proc"]
-    matrix = [ReviewAnalyticsFunction(function=name, attempts=[ReviewAnalyticsFunctionAttempt(attempt_no=1, risk="critical" if name == "sub_880" else "passed", score=45 if name == "sub_880" else 86), ReviewAnalyticsFunctionAttempt(attempt_no=2, risk="warning" if name == "sub_E74" else "passed", score=80 if name == "sub_E74" else 95)]) for name in names]
-    radar = [
-        ReviewAnalyticsRadar(attempt_no=1, completeness=100, control_flow=70, return_semantics=55, input_validation=45, call_fidelity=94, type_struct_fidelity=88),
-        ReviewAnalyticsRadar(attempt_no=2, completeness=100, control_flow=95, return_semantics=96, input_validation=96, call_fidelity=95, type_struct_fidelity=95),
-    ]
-    return _finalize_review_analytics(task_id, item_id, attempts, issues, matrix, radar, final_verdict="PASS", final_confidence=89, closure=1.0, residual="low-medium", mock=True)
-
-
 def _parse_review_file(file: AdvancedFile) -> dict:
     try:
         data = json.loads(file.content or "{}")
@@ -1386,16 +1365,14 @@ def _review_issue_key(issue: str) -> tuple[str, str, str]:
     return function_name, category, label
 
 
-def build_task_item_review_analytics(item: B2STaskItem, mock: bool = False) -> ReviewAnalyticsResponse:
-    if mock:
-        return _mock_review_analytics(item.task_id, item.id)
+def build_task_item_review_analytics(item: B2STaskItem) -> ReviewAnalyticsResponse:
     advanced = build_task_item_advanced(item, include_content=True)
     review_files = [review for run in advanced.runs for batch in run.batches for review in batch.reviews]
     parsed = [_parse_review_file(file) for file in review_files]
     parsed = [entry for entry in parsed if entry["attempt_no"]]
     parsed.sort(key=lambda entry: entry["attempt_no"])
     if not parsed:
-        return _mock_review_analytics(item.task_id, item.id)
+        return _empty_review_analytics(item)
     attempts = [ReviewAnalyticsAttempt(attempt_no=entry["attempt_no"], verdict=entry["verdict"], total_functions=entry["total"], verified_functions=entry["verified"], blocking_issues=len(entry["issues"]), semantic_score=entry["score"], confidence=max(0, min(100, entry["score"] + (10 if entry["verdict"] == "PASS" else -4)))) for entry in parsed]
     final = parsed[-1]
     final_keys = {_review_issue_key(issue) for issue in final["issues"]}
@@ -1430,7 +1407,7 @@ def build_task_item_review_analytics(item: B2STaskItem, mock: bool = False) -> R
     closure = resolved / len(issues) if issues else (1.0 if final["verdict"] == "PASS" else 0.0)
     confidence = max(0, min(100, round(final["score"] * 0.42 + closure * 38 + (14 if final["verdict"] == "PASS" else 0) + min(len(parsed), 3) * 2)))
     residual = "high" if final["verdict"] != "PASS" or final["issues"] else ("low" if confidence >= 92 else "low-medium" if confidence >= 82 else "medium")
-    return _finalize_review_analytics(item.task_id, item.id, attempts, issues, matrix, radar, final_verdict=final["verdict"], final_confidence=confidence, closure=closure, residual=residual, mock=False)
+    return _finalize_review_analytics(item.task_id, item.id, attempts, issues, matrix, radar, final_verdict=final["verdict"], final_confidence=confidence, closure=closure, residual=residual)
 
 
 def build_task_item_advanced(item: B2STaskItem, include_content: bool = True) -> TaskItemAdvancedResponse:
@@ -1719,7 +1696,7 @@ def _empty_review_analytics(item: B2STaskItem) -> ReviewAnalyticsResponse:
         task_id=item.task_id,
         item_id=item.id,
         status="empty",
-        meta=ReviewAnalyticsMeta(generated_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), mock=False, data_quality="empty"),
+        meta=ReviewAnalyticsMeta(generated_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), data_quality="empty"),
         summary=ReviewAnalyticsSummary(
             attempts=0,
             attempt_count=0,
@@ -1737,7 +1714,6 @@ def _empty_review_analytics(item: B2STaskItem) -> ReviewAnalyticsResponse:
             issue_closure_rate=0,
             residual_risk="unknown",
             residual_risk_label="未知",
-            mock=False,
         ),
         attempts=[],
         issues=[],
@@ -1754,7 +1730,7 @@ def _task_level_review_analytics(item: B2STaskItem, advanced: TaskItemAdvancedRe
     has_reviews = any(batch.reviews for run in loaded.runs for batch in run.batches)
     if not has_reviews:
         return _empty_review_analytics(item)
-    return build_task_item_review_analytics(item, mock=False)
+    return build_task_item_review_analytics(item)
 
 
 def build_task_result_summary(items: list[B2STaskItem]) -> TaskResultSummary:

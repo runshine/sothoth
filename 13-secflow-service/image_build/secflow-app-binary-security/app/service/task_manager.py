@@ -2101,6 +2101,28 @@ class TaskManager:
                         db.expire_all()
                         synced_count += 1
                         continue
+                    if job.archive_status == "failed":
+                        if force or mapped_status != before_status or record_noop_events:
+                            self._record_event(
+                                db,
+                                task,
+                                "downstream_status_sync_skipped",
+                                "下游状态已获取，但当前阶段的归档失败需要人工处理；不会自动重新排队",
+                                stage_name=item.stage_name,
+                                item=item,
+                                level="warning",
+                                payload={
+                                    "archive_job_id": job.id,
+                                    "archive_status": job.archive_status,
+                                    "downstream_service": item.downstream_service,
+                                    "downstream_task_id": item.downstream_task_id,
+                                    "downstream_status": downstream_status,
+                                    "mapped_status": mapped_status,
+                                    "archive_retry_required": True,
+                                },
+                            )
+                        skipped_count += 1
+                        continue
                     if record_noop_events or force or mapped_status != before_status:
                         self._record_event(
                             db,
@@ -2509,22 +2531,6 @@ class TaskManager:
                 .first()
             )
             if existing is not None:
-                if existing.archive_status == "success" and self._archive_job_payload_requires_refresh(existing, next_payload=next_payload):
-                    existing.archive_status = "pending"
-                    existing.owner_id = None
-                    existing.error_message = None
-                    existing.archive_root = None
-                    existing.started_at = None
-                    existing.completed_at = None
-                    existing.updated_at = _now()
-                    existing.payload = self._build_archive_job_payload(
-                        mapped_status=mapped_status,
-                        before_status=before_status,
-                        force=force,
-                        payload=payload,
-                        extra_paths=extra_paths,
-                        previous_payload=existing.payload,
-                    )
                 try:
                     db.commit()
                 except Exception:
@@ -2542,7 +2548,14 @@ class TaskManager:
                 .order_by(BinarySecurityArchiveJob.created_at.desc())
                 .first()
             )
-            job = failed or BinarySecurityArchiveJob(
+            if failed is not None:
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
+                return failed
+            job = BinarySecurityArchiveJob(
                 id=f"aj_{uuid.uuid4().hex[:24]}",
                 task_id=task.id,
                 project_id=task.project_id,
@@ -2573,14 +2586,10 @@ class TaskManager:
                 force=force,
                 payload=payload,
                 extra_paths=extra_paths,
-                previous_payload=job.payload,
             )
-            if failed is None:
-                db.add(job)
+            db.add(job)
             try:
                 with self._savepoint(db):
-                    if failed is not None:
-                        db.add(job)
                     db.flush()
             except IntegrityError:
                 existing = (
@@ -5773,15 +5782,47 @@ class TaskManager:
             if self._is_failed_retry_candidate_status(item.status)
         ]
 
+    @staticmethod
+    def _comparable_datetime(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is not None:
+            return value.astimezone().replace(tzinfo=None)
+        return value
+
     def _upstream_stage_retried(self, db: Session, task: BinarySecurityTask, stage_name: str) -> tuple[bool, str | None]:
         stage_sequence = self._stage_sequence_for_task(task)
         if stage_name not in stage_sequence:
             return False, None
         target_index = stage_sequence.index(stage_name)
+        upstream_stages = stage_sequence[:target_index]
+        summary = dict(task.summary or {})
+        stale_stages = set(summary.get("stale_stages") or [])
+        stale_from_stage = str(summary.get("stale_from_stage") or "").strip()
+        if stage_name in stale_stages and stale_from_stage in upstream_stages:
+            return True, stale_from_stage
+
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
         runs_by_stage = {run.stage_name: run for run in stage_runs}
-        for upstream_stage in stage_sequence[:target_index]:
+        target_items = [
+            item
+            for item in self._stage_items(db, task.id, stage_name)
+            if item.stage_name == stage_name
+        ]
+        target_created_at = [
+            comparable
+            for comparable in (self._comparable_datetime(item.created_at) for item in target_items)
+            if comparable is not None
+        ]
+        earliest_target_created_at = min(target_created_at) if target_created_at else None
+
+        for upstream_stage in upstream_stages:
             run = runs_by_stage.get(upstream_stage)
+            if not run or int(run.retry_count or 0) <= 0:
+                continue
+            upstream_completed_at = self._comparable_datetime(run.finished_at or run.started_at)
+            if earliest_target_created_at and upstream_completed_at and earliest_target_created_at > upstream_completed_at:
+                continue
             if run and int(run.retry_count or 0) > 0:
                 return True, upstream_stage
         return False, None

@@ -135,9 +135,8 @@ class ReviewAnalyticsParserTests(unittest.TestCase):
     def test_build_review_analytics_from_real_verdicts_populates_frontend_contract(self) -> None:
         item = SimpleNamespace(task_id=TASK_ID, id=ITEM_ID)
         with mock.patch.object(task_service, "build_task_item_advanced", return_value=_advanced_response()):
-            response = task_service.build_task_item_review_analytics(item, mock=False)
+            response = task_service.build_task_item_review_analytics(item)
 
-        self.assertFalse(response.summary.mock)
         self.assertEqual(response.meta.schema_version, "review_analytics.v2")
         self.assertEqual(response.meta.source, "validator_verdict")
         self.assertEqual(response.summary.final_verdict, "PASS")
@@ -209,7 +208,7 @@ class ReviewAnalyticsApiTests(unittest.TestCase):
         ):
             client = TestClient(app)
             resp = client.get(
-                f"/api/app/binary-to-source/projects/{PROJECT_ID}/tasks/{TASK_ID}/items/{ITEM_ID}/review-analytics?mock=false",
+                f"/api/app/binary-to-source/projects/{PROJECT_ID}/tasks/{TASK_ID}/items/{ITEM_ID}/review-analytics",
                 headers={"Authorization": "Bearer test-token"},
             )
 
