@@ -536,6 +536,98 @@ class TaskManagerTests(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_stage_worker_terminal_event_does_not_resurrect_cancelled_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = create_engine("sqlite:///:memory:")
+            Base.metadata.create_all(engine)
+            SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+            db = SessionLocal()
+            try:
+                task = BinarySecurityTask(
+                    id="t1",
+                    project_id="p1",
+                    name="binary",
+                    status="cancelled",
+                    task_type=TASK_TYPE_BINARY,
+                    current_stage="binary_to_source",
+                    firmware_source="project_filesystem",
+                    firmware_path="/fw",
+                    output_root=str(Path(tmp) / "output"),
+                    workspace_root=tmp,
+                    finished_at=_now(),
+                )
+                db.add(task)
+                db.add(
+                    BinarySecurityStageRun(
+                        id="sr1",
+                        task_id="t1",
+                        project_id="p1",
+                        stage_name="binary_to_source",
+                        sequence_no=3,
+                        status="cancelled",
+                        finished_at=_now(),
+                    )
+                )
+                event = BinarySecurityStateEvent(
+                    id="sev-late-terminal",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_name="binary_to_source",
+                    event_type="stage_worker_terminal_observed",
+                    idempotency_key="sev-late-terminal",
+                    status="processing",
+                    available_at=_now(),
+                )
+                event.payload = {
+                    "stage_name": "binary_to_source",
+                    "status": "partial_success",
+                    "summary": {"success_count": 5, "failed_count": 1},
+                }
+                db.add(event)
+                db.commit()
+
+                asyncio.run(self.manager._apply_stage_worker_terminal_event_locked(db, event))
+                db.commit()
+
+                stage_run = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.id == "sr1").first()
+                self.assertEqual("cancelled", task.status)
+                self.assertEqual("cancelled", stage_run.status)
+                self.assertTrue(any(row.event_type == "stage_worker_terminal_ignored" for row in db.query(BinarySecurityEvent).all()))
+            finally:
+                db.close()
+
+    def test_refresh_task_status_after_sync_does_not_resurrect_cancelled_task(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="cancelled",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="binary_to_source",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="pod-a",
+            dispatch_started_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=1),
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            sequence_no=3,
+            status="running",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[run])
+
+        self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual("cancelled", task.status)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertIsNotNone(task.finished_at)
+
     def test_manual_delete_event_cleans_task_records_without_deleting_state_event(self):
         with tempfile.TemporaryDirectory() as tmp:
             engine = create_engine("sqlite:///:memory:")

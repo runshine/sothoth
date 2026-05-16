@@ -3818,6 +3818,18 @@ class TaskManager:
         task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == event.task_id).first()
         if task is None or not stage_name or not status:
             return
+        if task.status == "cancelled":
+            self._record_event(
+                db,
+                task,
+                "stage_worker_terminal_ignored",
+                "阶段终态事件晚于取消事件到达，已忽略以避免恢复已取消任务",
+                level="warning",
+                stage_name=stage_name,
+                payload={"state_event_id": event.id, "ignored_status": status},
+            )
+            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+            return
         stage_run = db.query(BinarySecurityStageRun).filter(
             BinarySecurityStageRun.task_id == task.id,
             BinarySecurityStageRun.stage_name == stage_name,
@@ -7687,6 +7699,10 @@ class TaskManager:
         )
 
     def _refresh_task_status_after_sync(self, db: Session, task: BinarySecurityTask) -> None:
+        if task.status == "cancelled":
+            self._invalidate_task_execution(task)
+            task.finished_at = task.finished_at or _now()
+            return
         if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
