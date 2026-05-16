@@ -8601,9 +8601,13 @@ class TaskManager:
         token: str | None,
     ) -> None:
         del db, task
-        # system-analyse rejects delete while running. Wait for it to actually
-        # leave queued/running before we rebuild the stage and create a new task.
-        if str(ref.get("service") or "").strip() != "system_analyse":
+        # Downstream services commonly reject deletion for active work. After a
+        # retry/cancel request, always wait until the old child is inactive
+        # before deleting local references and creating a replacement. Otherwise
+        # stale children can keep consuming downstream concurrency while the
+        # parent stage has already moved to a new retry attempt.
+        service = str(ref.get("service") or "").strip()
+        if not service:
             return
         timeout_seconds = max(
             int(self.cfg.scheduler.downstream_request_timeout_seconds or 120),
