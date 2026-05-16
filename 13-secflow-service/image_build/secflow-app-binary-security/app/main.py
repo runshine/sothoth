@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 def _service_role() -> str:
     raw_role = os.environ.get("SECFLOW_BINARY_SECURITY_ROLE") or ""
     normalized = str(raw_role).strip().lower()
-    return normalized if normalized in {"api", "worker"} else "all"
+    return normalized if normalized in {"api", "worker", "reducer"} else "all"
 
 
 def _scheduler_enabled() -> bool:
@@ -53,14 +53,14 @@ def _scheduler_enabled() -> bool:
     role = _service_role()
     if role == "api":
         return False
-    if role == "worker":
+    if role in {"worker", "reducer"}:
         return True
     return bool(get_config().scheduler.enabled)
 
 
 def _registry_enabled() -> bool:
     role = _service_role()
-    if role == "worker":
+    if role in {"worker", "reducer"}:
         return False
     return bool(get_config().registry.enabled)
 

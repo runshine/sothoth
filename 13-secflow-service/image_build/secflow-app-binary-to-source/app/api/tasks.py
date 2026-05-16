@@ -35,6 +35,7 @@ from app.service.task_service import (
     query_items,
     retry_task,
     rerun_task,
+    refresh_task_function_stats,
     sync_task,
     generate_task_id,
     terminate_task,
@@ -153,8 +154,15 @@ async def list_tasks(
         query = query.filter(B2STask.status == status)
     total = query.count()
     tasks = query.order_by(B2STask.created_at.desc()).offset(offset).limit(limit).all()
+    stats_changed = False
     for task in tasks:
         await sync_task(db, task)
+        if refresh_task_function_stats(db, task, inspect_files=True, only_missing=True, commit=False):
+            stats_changed = True
+    if stats_changed:
+        db.commit()
+        for task in tasks:
+            db.refresh(task)
     items = [build_task_response(db, task) for task in tasks]
     return TaskListResponse(total=total, items=items)
 
@@ -188,6 +196,7 @@ async def get_b2s_task(
 ):
     task = get_task_or_404(db, project_id, task_id)
     await sync_task(db, task)
+    refresh_task_function_stats(db, task, inspect_files=True, only_missing=True)
     return build_task_detail(db, task)
 
 

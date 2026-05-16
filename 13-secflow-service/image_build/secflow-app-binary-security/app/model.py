@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+import os
+import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, inspect, text
+from sqlalchemy import Column, DateTime, Integer, String, Text, UniqueConstraint, create_engine, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import get_config
+from app.observability import observe_state_file_write
 from app.time_utils import now_local
 
 
@@ -135,9 +139,21 @@ class BinarySecurityTask(Base, JsonMixin):
         self._summary_cache = dict(payload)
         path = self._summary_file_path()
         if path and path.parent.exists():
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(self._dump_json(payload), encoding="utf-8")
-            tmp.replace(path)
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+            started = time.perf_counter()
+            try:
+                tmp.write_text(self._dump_json(payload), encoding="utf-8")
+                tmp.replace(path)
+                observe_state_file_write(target=path.name, result="success", duration_seconds=time.perf_counter() - started)
+            except Exception:
+                observe_state_file_write(target=path.name, result="failed", duration_seconds=time.perf_counter() - started)
+                raise
+            finally:
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except Exception:
+                    pass
             self.summary_json = None
             return
         self.summary_json = self._dump_json(payload)
@@ -330,6 +346,53 @@ class BinarySecurityArchiveJob(Base, JsonMixin):
     @payload.setter
     def payload(self, value: dict[str, Any] | None) -> None:
         self.payload_json = self._dump_json(value or {})
+
+
+class BinarySecurityStateEvent(Base, JsonMixin):
+    __tablename__ = "secflow_binary_security_state_event"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_binary_security_state_event_idempotency"),
+    )
+
+    id = Column(String(48), primary_key=True)
+    task_id = Column(String(32), nullable=False, index=True)
+    project_id = Column(String(64), nullable=False, index=True)
+    stage_name = Column(String(64), nullable=True, index=True)
+    item_id = Column(String(40), nullable=True, index=True)
+    archive_job_id = Column(String(48), nullable=True, index=True)
+    event_type = Column(String(64), nullable=False, index=True)
+    idempotency_key = Column(String(255), nullable=False, index=True)
+    payload_json = Column(Text, nullable=True)
+    status = Column(String(32), nullable=False, default="pending", index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    available_at = Column(DateTime, default=now_local, nullable=False, index=True)
+    leased_by = Column(String(128), nullable=True, index=True)
+    lease_expires_at = Column(DateTime, nullable=True, index=True)
+    processed_at = Column(DateTime, nullable=True, index=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=now_local, nullable=False, index=True)
+    updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        return self._load_json(self.payload_json, {})
+
+    @payload.setter
+    def payload(self, value: dict[str, Any] | None) -> None:
+        self.payload_json = self._dump_json(value or {})
+
+
+class BinarySecurityTaskStateLease(Base):
+    __tablename__ = "secflow_binary_security_task_state_lease"
+
+    task_id = Column(String(32), primary_key=True)
+    owner_id = Column(String(128), nullable=False, index=True)
+    lease_token = Column(String(64), nullable=False, index=True)
+    lease_expires_at = Column(DateTime, nullable=False, index=True)
+    heartbeat_at = Column(DateTime, nullable=False)
+    operation = Column(String(64), nullable=False, default="state_reduce")
+    created_at = Column(DateTime, default=now_local, nullable=False)
+    updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
 
 
 class BinarySecurityProjectConfig(Base, JsonMixin):

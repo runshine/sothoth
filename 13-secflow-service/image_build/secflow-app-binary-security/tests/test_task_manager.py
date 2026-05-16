@@ -1,18 +1,26 @@
 import asyncio
+import json
 import tempfile
 import unittest
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
 from app.model import (
+    Base,
     BinarySecurityArchiveJob,
     BinarySecurityEvent,
     BinarySecurityProjectConfig,
     BinarySecurityStageItem,
     BinarySecurityStageRun,
+    BinarySecurityStateEvent,
     BinarySecurityTask,
+    BinarySecurityTaskStateLease,
     TASK_TYPE_BINARY,
     TASK_TYPE_SOURCE,
 )
@@ -21,6 +29,7 @@ from app.schemas import BinarySecurityServiceConfigPayload
 from app.schemas import (
     BinarySecurityProjectConfigPayload,
     BinarySecurityArchiveJobResponse,
+    BinarySecurityStageSummary,
     BinarySecurityTaskConcurrencyUpdatePayload,
     BinarySecurityTaskPolicyUpdatePayload,
 )
@@ -36,6 +45,9 @@ class _FakeQuery:
         return self
 
     def order_by(self, *args, **kwargs):
+        return self
+
+    def group_by(self, *args, **kwargs):
         return self
 
     def options(self, *args, **kwargs):
@@ -223,6 +235,374 @@ class TaskManagerTests(unittest.TestCase):
             self.assertTrue(summary_path.is_file())
             self.assertIsNone(task.summary_json)
             self.assertEqual({"selected_modules": [{"module_key": "m1"}]}, task.summary)
+
+    def test_task_summary_concurrent_file_writes_use_unique_temp_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks = [
+                BinarySecurityTask(
+                    id=f"t{index}",
+                    project_id="p1",
+                    name="n",
+                    status="pending",
+                    task_type=TASK_TYPE_BINARY,
+                    firmware_source="project_filesystem",
+                    firmware_path="/fw",
+                    output_root="/o",
+                    workspace_root=tmp,
+                )
+                for index in range(24)
+            ]
+
+            def write_summary(index: int) -> None:
+                tasks[index].summary = {"writer": index, "items": list(range(index))}
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                list(executor.map(write_summary, range(len(tasks))))
+
+            summary_path = Path(tmp) / BinarySecurityTask.SUMMARY_FILENAME
+            payload = json.loads(summary_path.read_text("utf-8"))
+            self.assertIn("writer", payload)
+            self.assertFalse(list(Path(tmp).glob(f".{BinarySecurityTask.SUMMARY_FILENAME}.*.tmp")))
+
+    def test_write_json_concurrent_writes_use_unique_temp_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "input" / "task-metadata.json"
+
+            def write_payload(index: int) -> None:
+                task_manager_module._write_json(target, {"writer": index, "items": list(range(index))})
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                list(executor.map(write_payload, range(24)))
+
+            payload = json.loads(target.read_text("utf-8"))
+            self.assertIn("writer", payload)
+            self.assertFalse(list(target.parent.glob(".task-metadata.json.*.tmp")))
+
+    def test_task_state_lease_blocks_other_owner_until_expired(self):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+        db = SessionLocal()
+        try:
+            first = TaskManager()
+            first.instance_id = "pod-a"
+            second = TaskManager()
+            second.instance_id = "pod-b"
+
+            first_token = first._acquire_task_state_lease(db, "t1")
+            db.commit()
+            self.assertIsNotNone(first_token)
+
+            second_token = second._acquire_task_state_lease(db, "t1")
+            db.commit()
+            self.assertIsNone(second_token)
+
+            lease = db.query(BinarySecurityTaskStateLease).filter(BinarySecurityTaskStateLease.task_id == "t1").first()
+            self.assertIsNotNone(lease)
+            lease.lease_expires_at = _now() - timedelta(seconds=1)
+            db.commit()
+
+            takeover_token = second._acquire_task_state_lease(db, "t1")
+            db.commit()
+            self.assertIsNotNone(takeover_token)
+            db.expire_all()
+            lease = db.query(BinarySecurityTaskStateLease).filter(BinarySecurityTaskStateLease.task_id == "t1").first()
+            self.assertEqual("pod-b", lease.owner_id)
+            self.assertEqual(takeover_token, lease.lease_token)
+        finally:
+            db.close()
+
+    def test_stage_worker_terminal_event_finalizes_task_in_reducer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = create_engine("sqlite:///:memory:")
+            Base.metadata.create_all(engine)
+            SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+            db = SessionLocal()
+            try:
+                task = BinarySecurityTask(
+                    id="t1",
+                    project_id="p1",
+                    name="source",
+                    status="running",
+                    task_type=TASK_TYPE_SOURCE,
+                    current_stage="vuln_scan",
+                    firmware_source="project_filesystem",
+                    firmware_path="/src",
+                    output_root=str(Path(tmp) / "output"),
+                    workspace_root=tmp,
+                    started_at=_now(),
+                )
+                task.summary = {"input_files": [{"filename": "src.zip"}]}
+                db.add(task)
+                for index, stage_name in enumerate(["system_analysis", "entry_analysis", "dataflow_analysis"], start=1):
+                    db.add(
+                        BinarySecurityStageRun(
+                            id=f"sr{index}",
+                            task_id="t1",
+                            project_id="p1",
+                            stage_name=stage_name,
+                            sequence_no=index,
+                            status="success",
+                            started_at=_now(),
+                            finished_at=_now(),
+                        )
+                    )
+                db.add(
+                    BinarySecurityStageRun(
+                        id="sr4",
+                        task_id="t1",
+                        project_id="p1",
+                        stage_name="vuln_scan",
+                        sequence_no=4,
+                        status="running",
+                        started_at=_now(),
+                    )
+                )
+                event = BinarySecurityStateEvent(
+                    id="sev1",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_name="vuln_scan",
+                    event_type="stage_worker_terminal_observed",
+                    idempotency_key="sev1",
+                    status="processing",
+                    available_at=_now(),
+                )
+                event.payload = {
+                    "stage_name": "vuln_scan",
+                    "status": "success",
+                    "summary": {"success_count": 1, "failed_count": 0, "vuln_result_count": 3},
+                }
+                db.add(event)
+                db.commit()
+
+                asyncio.run(self.manager._apply_stage_worker_terminal_event_locked(db, event))
+                db.commit()
+
+                self.assertEqual("success", task.status)
+                self.assertIsNone(task.dispatcher_instance_id)
+                self.assertIsNotNone(task.finished_at)
+                self.assertEqual("success", db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.id == "sr4").first().status)
+                metadata_path = Path(tmp) / "input" / "task-metadata.json"
+                self.assertTrue(metadata_path.is_file())
+            finally:
+                db.close()
+
+    def test_stage_worker_start_event_marks_stage_running_in_reducer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = create_engine("sqlite:///:memory:")
+            Base.metadata.create_all(engine)
+            SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+            db = SessionLocal()
+            try:
+                task = BinarySecurityTask(
+                    id="t1",
+                    project_id="p1",
+                    name="source",
+                    status="running",
+                    task_type=TASK_TYPE_SOURCE,
+                    current_stage="system_analysis",
+                    firmware_source="project_filesystem",
+                    firmware_path="/src",
+                    output_root=str(Path(tmp) / "output"),
+                    workspace_root=tmp,
+                    started_at=_now(),
+                )
+                db.add(task)
+                event = BinarySecurityStateEvent(
+                    id="sev-start",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_name="entry_analysis",
+                    event_type="stage_worker_start_requested",
+                    idempotency_key="sev-start",
+                    status="processing",
+                    available_at=_now(),
+                )
+                event.payload = {"stage_name": "entry_analysis", "task_retry_mode": False, "stage_retry_mode": False}
+                db.add(event)
+                db.commit()
+
+                self.manager._apply_stage_worker_start_requested_locked(db, event)
+                db.commit()
+
+                stage_run = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == "t1").first()
+                self.assertEqual("entry_analysis", task.current_stage)
+                self.assertEqual("running", stage_run.status)
+                self.assertIsNotNone(stage_run.started_at)
+                self.assertTrue(any(row.event_type == "stage_started" for row in db.query(BinarySecurityEvent).all()))
+            finally:
+                db.close()
+
+    def test_stage_worker_terminal_event_creates_missing_stage_run_in_reducer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = create_engine("sqlite:///:memory:")
+            Base.metadata.create_all(engine)
+            SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+            db = SessionLocal()
+            try:
+                task = BinarySecurityTask(
+                    id="t1",
+                    project_id="p1",
+                    name="source",
+                    status="running",
+                    task_type=TASK_TYPE_SOURCE,
+                    current_stage="entry_analysis",
+                    firmware_source="project_filesystem",
+                    firmware_path="/src",
+                    output_root=str(Path(tmp) / "output"),
+                    workspace_root=tmp,
+                    started_at=_now(),
+                )
+                task.summary = {"input_files": [{"filename": "src.zip"}]}
+                db.add(task)
+                event = BinarySecurityStateEvent(
+                    id="sev-terminal-missing-run",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_name="entry_analysis",
+                    event_type="stage_worker_terminal_observed",
+                    idempotency_key="sev-terminal-missing-run",
+                    status="processing",
+                    available_at=_now(),
+                )
+                event.payload = {
+                    "stage_name": "entry_analysis",
+                    "status": "success",
+                    "summary": {"success_count": 0, "failed_count": 0, "reason": "disabled_by_stage_options"},
+                }
+                db.add(event)
+                db.commit()
+
+                asyncio.run(self.manager._apply_stage_worker_terminal_event_locked(db, event))
+                db.commit()
+
+                stage_run = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == "t1").first()
+                self.assertIsNotNone(stage_run)
+                self.assertEqual("entry_analysis", stage_run.stage_name)
+                self.assertEqual("success", stage_run.status)
+            finally:
+                db.close()
+
+    def test_task_execution_failed_event_marks_task_failed_in_reducer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = create_engine("sqlite:///:memory:")
+            Base.metadata.create_all(engine)
+            SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+            db = SessionLocal()
+            try:
+                task = BinarySecurityTask(
+                    id="t1",
+                    project_id="p1",
+                    name="source",
+                    status="running",
+                    task_type=TASK_TYPE_SOURCE,
+                    current_stage="entry_analysis",
+                    firmware_source="project_filesystem",
+                    firmware_path="/src",
+                    output_root=str(Path(tmp) / "output"),
+                    workspace_root=tmp,
+                    dispatcher_instance_id="pod-a",
+                    started_at=_now(),
+                    dispatch_started_at=_now(),
+                )
+                db.add(task)
+                event = BinarySecurityStateEvent(
+                    id="sev-task-failed",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_name="entry_analysis",
+                    event_type="task_execution_failed",
+                    idempotency_key="sev-task-failed",
+                    status="processing",
+                    available_at=_now(),
+                )
+                event.payload = {
+                    "error": "boom",
+                    "dispatcher_instance_id": "pod-a",
+                    "execution_token": task.dispatch_started_at.isoformat(),
+                }
+                db.add(event)
+                db.commit()
+
+                asyncio.run(self.manager._apply_task_execution_failed_locked(db, event))
+                db.commit()
+
+                self.assertEqual("failed", task.status)
+                self.assertEqual("boom", task.last_error)
+                self.assertIsNone(task.dispatcher_instance_id)
+                self.assertIsNotNone(task.finished_at)
+                self.assertTrue((Path(tmp) / "input" / "task-metadata.json").is_file())
+            finally:
+                db.close()
+
+    def test_manual_delete_event_cleans_task_records_without_deleting_state_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = create_engine("sqlite:///:memory:")
+            Base.metadata.create_all(engine)
+            SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+            db = SessionLocal()
+            try:
+                task = BinarySecurityTask(
+                    id="t1",
+                    project_id="p1",
+                    name="source",
+                    status="partial_success",
+                    task_type=TASK_TYPE_SOURCE,
+                    current_stage="entry_analysis",
+                    firmware_source="project_filesystem",
+                    firmware_path="/src",
+                    output_root=str(Path(tmp) / "output"),
+                    workspace_root=tmp,
+                    started_at=_now(),
+                )
+                db.add(task)
+                db.add(BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="entry_analysis", sequence_no=1, status="failed"))
+                db.add(
+                    BinarySecurityStageItem(
+                        id="si1",
+                        task_id="t1",
+                        project_id="p1",
+                        stage_run_id="sr1",
+                        stage_name="entry_analysis",
+                        item_key="m1",
+                        status="failed",
+                    )
+                )
+                db.add(
+                    BinarySecurityArchiveJob(
+                        id="aj1",
+                        task_id="t1",
+                        project_id="p1",
+                        stage_name="entry_analysis",
+                        item_id="si1",
+                        item_key="m1",
+                        archive_status="failed",
+                    )
+                )
+                event = BinarySecurityStateEvent(
+                    id="sev-delete",
+                    task_id="t1",
+                    project_id="p1",
+                    event_type="manual_delete_requested",
+                    idempotency_key="sev-delete",
+                    status="processing",
+                    available_at=_now(),
+                )
+                event.payload = {}
+                db.add(event)
+                db.commit()
+
+                asyncio.run(self.manager._apply_manual_delete_request_locked(db, event))
+                db.commit()
+
+                self.assertEqual(0, db.query(BinarySecurityTask).filter(BinarySecurityTask.id == "t1").count())
+                self.assertEqual(0, db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == "t1").count())
+                self.assertEqual(0, db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == "t1").count())
+                self.assertEqual(0, db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == "t1").count())
+                self.assertEqual(1, db.query(BinarySecurityStateEvent).filter(BinarySecurityStateEvent.id == "sev-delete").count())
+            finally:
+                db.close()
 
     def test_task_summary_falls_back_to_db_before_workspace_is_available(self):
         task = BinarySecurityTask(
@@ -1898,6 +2278,10 @@ class TaskManagerTests(unittest.TestCase):
             ),
         )
 
+        self.assertIn("manual_policy_update_requested", [getattr(event, "event_type", "") for event in db.added])
+        self.manager._apply_manual_policy_update_requested_locked(db, db.added[-1])
+        detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
+
         self.assertEqual(8, detail.policy["max_stage_parallelism"])
         self.assertEqual(2, detail.policy["stage_parallelism"]["firmware_unpack"])
         self.assertEqual(8, detail.policy["stage_parallelism"]["vuln_scan"])
@@ -2002,6 +2386,10 @@ class TaskManagerTests(unittest.TestCase):
                 module_risk_levels=["高", "中"],
             ),
         )
+
+        self.assertIn("manual_policy_update_requested", [getattr(event, "event_type", "") for event in db.added])
+        self.manager._apply_manual_policy_update_requested_locked(db, db.added[-1])
+        detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
 
         self.assertEqual(8, detail.policy["max_stage_parallelism"])
         self.assertEqual(5, detail.policy["max_retries_per_item"])
@@ -2252,6 +2640,12 @@ class TaskManagerTests(unittest.TestCase):
 
         asyncio.run(self.manager.cancel_task(db, project_id="p1", task_id="t1"))
 
+        self.assertEqual([], cancelled)
+        self.assertEqual("running", task.status)
+        event_types = [getattr(event, "event_type", "") for event in db.added]
+        self.assertIn("manual_cancel_requested", event_types)
+        asyncio.run(self.manager._apply_manual_cancel_request_locked(db, db.added[-1]))
+
         self.assertEqual(["t1"], cancelled)
         self.assertEqual("cancelled", task.status)
         self.assertEqual("cancelled", stage_run.status)
@@ -2282,41 +2676,29 @@ class TaskManagerTests(unittest.TestCase):
         db = _ModelAwareDb(tasks=[task], stage_items=[item])
         order: list[str] = []
 
-        from contextlib import contextmanager
-
-        @contextmanager
-        def fake_task_operation_lock(_db, _task_id, *, operation, ttl_seconds=1800):
-            del _db, _task_id, operation, ttl_seconds
-            order.append("lock_enter")
-            try:
-                yield
-            finally:
-                order.append("lock_exit")
-
         async def fake_write_task_metadata_async(*args, **kwargs):
             del args, kwargs
             order.append("write_metadata")
 
         async def fake_cancel_local_worker(task_id: str):
             self.assertEqual("t1", task_id)
-            self.assertNotIn("lock_exit", order)
             order.append("cancel_worker")
 
         async def fake_cancel_downstream(downstream_item, token):
             del token
             self.assertEqual("sat_1", downstream_item.downstream_task_id)
-            self.assertNotIn("lock_exit", order)
             order.append("cancel_downstream")
 
-        self.manager._task_operation_lock = fake_task_operation_lock
         self.manager._write_task_metadata_async = fake_write_task_metadata_async
         self.manager._cancel_local_worker = fake_cancel_local_worker
         self.manager._cancel_downstream = fake_cancel_downstream
 
         asyncio.run(self.manager.cancel_task(db, project_id="p1", task_id="t1"))
+        self.assertEqual([], order)
+        asyncio.run(self.manager._apply_manual_cancel_request_locked(db, db.added[-1]))
 
         self.assertEqual(
-            ["lock_enter", "write_metadata", "cancel_worker", "cancel_downstream", "lock_exit"],
+            ["write_metadata", "cancel_worker", "cancel_downstream"],
             order,
         )
 
@@ -2348,6 +2730,10 @@ class TaskManagerTests(unittest.TestCase):
             db = _ModelAwareDb(tasks=[task], archive_jobs=archive_jobs)
 
             self.manager.retry_task(db, project_id="p1", task_id="t1")
+            self.assertEqual("failed", task.status)
+            self.assertIsNone(task.pending_action)
+            self.assertIn("manual_blocking_action_requested", [getattr(event, "event_type", "") for event in db.added])
+            self.manager._apply_blocking_action_request_locked(db, db.added[-1])
             self.assertEqual("retry_preparing", task.status)
             self.assertEqual("retry", task.pending_action)
             self._finish_retry_prepare(db, task)
@@ -2703,17 +3089,16 @@ class TaskManagerTests(unittest.TestCase):
 
             self.manager.retry_stage(db, project_id="p1", task_id="t1", stage_name="firmware_unpack")
 
-            self.assertEqual("running", task.status)
+            self.assertEqual("failed", task.status)
             self.assertEqual("firmware_unpack", task.current_stage)
-            self.assertIsNone(task.last_error)
-            self.assertIsNone(task.finished_at)
-            self.assertEqual("pending", job.archive_status)
-            self.assertIsNone(job.owner_id)
-            self.assertIsNone(job.archive_root)
-            self.assertEqual("success", item.status)
+            self.assertEqual("归档失败", task.last_error)
+            self.assertIsNotNone(task.finished_at)
+            self.assertEqual("failed", job.archive_status)
+            self.assertEqual("old-worker", job.owner_id)
+            self.assertEqual(str(workspace / "old-archive"), job.archive_root)
+            self.assertEqual("failed", item.status)
             event_types = [getattr(event, "event_type", "") for event in db.added]
-            self.assertIn("task_archive_retry_requeued", event_types)
-            self.assertIn("archive_stage_retry_requested", event_types)
+            self.assertIn("manual_blocking_action_requested", event_types)
 
     def test_retry_stage_archive_requeues_only_target_stage_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2778,6 +3163,9 @@ class TaskManagerTests(unittest.TestCase):
             db = _ModelAwareDb(tasks=[task], stage_items=[entry_item, dataflow_item], archive_jobs=[entry_job, dataflow_job])
 
             self.manager.retry_stage_archive(db, project_id="p1", task_id="t1", stage_name="entry_analysis")
+            event_types = [getattr(event, "event_type", "") for event in db.added]
+            self.assertIn("manual_archive_retry_requested", event_types)
+            self.manager._apply_manual_archive_retry_request_locked(db, db.added[-1])
 
             self.assertEqual("pending", entry_job.archive_status)
             self.assertEqual("failed", dataflow_job.archive_status)
@@ -2845,6 +3233,9 @@ class TaskManagerTests(unittest.TestCase):
             stage_name = self.manager.retry_archive_job(db, project_id="p1", task_id="t1", archive_job_id="aj1")
 
             self.assertEqual("system_analysis", stage_name)
+            event_types = [getattr(event, "event_type", "") for event in db.added]
+            self.assertIn("manual_archive_retry_requested", event_types)
+            self.manager._apply_manual_archive_retry_request_locked(db, db.added[-1])
             self.assertEqual("pending", retryable_job.archive_status)
             self.assertIsNone(retryable_job.archive_root)
             self.assertIsNone(retryable_job.error_message)
@@ -2981,6 +3372,8 @@ class TaskManagerTests(unittest.TestCase):
             task,
             task_retry_supported=False,
             task_retry_reason=None,
+            task_retry_failed_supported=False,
+            task_retry_failed_reason=None,
             task_continue_supported=False,
             task_continue_reason=None,
             stage_summaries=[BinarySecurityStageSummary(stage_name="firmware_unpack", sequence_no=1, status="failed")],
@@ -3036,8 +3429,9 @@ class TaskManagerTests(unittest.TestCase):
 
             self.manager.retry_stage(db, project_id="p1", task_id="s1", stage_name="entry_analysis")
 
-            self.assertEqual("pending", task.status)
-            self.assertEqual([], db.archive_jobs)
+            self.assertEqual("failed", task.status)
+            self.assertIn("manual_blocking_action_requested", [getattr(event, "event_type", "") for event in db.added])
+            self.assertEqual(1, len(db.archive_jobs))
 
     def test_retry_stage_deletes_affected_downstream_tasks_before_requeue(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3927,6 +4321,7 @@ class TaskManagerTests(unittest.TestCase):
                 return _Query([])
 
         db = _TaskDb(task)
+        self.manager._write_task_metadata = lambda *args, **kwargs: None
         detail = self.manager.confirm_module_selection(
             db,
             project_id="p1",
@@ -3934,11 +4329,15 @@ class TaskManagerTests(unittest.TestCase):
             selected_module_keys=["m2"],
         )
 
+        self.assertEqual("pending_module_confirmation", task.status)
+        self.assertIn("manual_module_selection_confirmed", [getattr(event, "event_type", "") for event in db.added])
+        self.manager._apply_manual_module_selection_confirmed_locked(db, db.added[-1])
+
         self.assertEqual("pending", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertEqual(1, task.metrics["selected_module_count"])
         self.assertEqual(["m2"], [item["module_key"] for item in task.summary["selected_modules"]])
-        self.assertEqual(1, detail.selected_module_count)
+        self.assertEqual(0, detail.selected_module_count)
 
     def test_normalize_source_input_files_rejects_duplicate_relative_paths(self):
         with self.assertRaisesRegex(Exception, "重复文件名"):

@@ -159,6 +159,16 @@ def get_task(
     return get_task_manager().get_task_detail(db, project_id=project_id, task_id=task_id)
 
 
+@router.get("/projects/{project_id}/tasks/{task_id}/orchestration-observability")
+def get_task_orchestration_observability(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().get_orchestration_observability(db, project_id=project_id, task_id=task_id)
+
+
 @router.put("/projects/{project_id}/tasks/{task_id}/concurrency", response_model=BinarySecurityTaskDetailResponse)
 def update_task_concurrency(
     project_id: str,

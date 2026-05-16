@@ -25,6 +25,7 @@ BIN_EVOLUTION_MANAGER_CONTAINER="secflow-app-binary-evolution-center-manager"
 BIN_EVOLUTION_WORKER_CONTAINER="secflow-app-binary-evolution-center-worker"
 BIN_SECURITY_API_DEPLOYMENT="secflow-app-binary-security"
 BIN_SECURITY_WORKER_DEPLOYMENT="secflow-app-binary-security-worker"
+BIN_SECURITY_REDUCER_DEPLOYMENT="secflow-app-binary-security-reducer"
 ENTRY_ANALYSE_DEPLOYMENTS=(
   "secflow-app-entry-analyse:secflow-app-entry-analyse"
   "secflow-app-entry-analyse-scheduler:secflow-app-entry-analyse-scheduler"
@@ -324,6 +325,7 @@ done
 
 maybe_set_explicit_image "${BIN_SECURITY_API_DEPLOYMENT}" "secflow-app-binary-security" "${BIN_SECURITY_IMAGE}"
 maybe_set_explicit_image "${BIN_SECURITY_WORKER_DEPLOYMENT}" "secflow-app-binary-security-worker" "${BIN_SECURITY_IMAGE}"
+maybe_set_explicit_image "${BIN_SECURITY_REDUCER_DEPLOYMENT}" "secflow-app-binary-security-reducer" "${BIN_SECURITY_IMAGE}"
 maybe_set_explicit_image "${FRONTEND_DEPLOYMENT}" "${FRONTEND_CONTAINER}" "${FRONTEND_IMAGE}"
 maybe_set_explicit_image "${B2S_MANAGER_DEPLOYMENT}" "${B2S_MANAGER_CONTAINER}" "${B2S_IMAGE}"
 maybe_set_explicit_image "${B2S_WORKER_DEPLOYMENT}" "${B2S_WORKER_CONTAINER}" "${B2S_IMAGE}"
@@ -354,7 +356,7 @@ while IFS=$'\t' read -r deployment containers; do
       "${BIN_EVOLUTION_MANAGER_DEPLOYMENT}:${BIN_EVOLUTION_MANAGER_CONTAINER}"|"${BIN_EVOLUTION_WORKER_DEPLOYMENT}:${BIN_EVOLUTION_WORKER_CONTAINER}")
         [[ -n "${BIN_EVOLUTION_IMAGE}" ]] && requested_tag="${BIN_EVOLUTION_IMAGE}"
         ;;
-      "${BIN_SECURITY_API_DEPLOYMENT}:secflow-app-binary-security"|"${BIN_SECURITY_WORKER_DEPLOYMENT}:secflow-app-binary-security-worker")
+      "${BIN_SECURITY_API_DEPLOYMENT}:secflow-app-binary-security"|"${BIN_SECURITY_WORKER_DEPLOYMENT}:secflow-app-binary-security-worker"|"${BIN_SECURITY_REDUCER_DEPLOYMENT}:secflow-app-binary-security-reducer")
         [[ -n "${BIN_SECURITY_IMAGE}" ]] && requested_tag="${BIN_SECURITY_IMAGE}"
         ;;
       "secflow-app-entry-analyse:secflow-app-entry-analyse"|"secflow-app-entry-analyse-scheduler:secflow-app-entry-analyse-scheduler"|"secflow-app-entry-analyse-worker:secflow-app-entry-analyse-worker")

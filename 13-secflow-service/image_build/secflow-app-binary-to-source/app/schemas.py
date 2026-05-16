@@ -348,6 +348,10 @@ class TaskResponse(BaseModel):
     partial_items: int
     failed_items: int
     cancelled_items: int
+    total_functions: Optional[int] = None
+    completed_functions: Optional[int] = None
+    failed_functions: Optional[int] = None
+    uncompleted_functions: Optional[int] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

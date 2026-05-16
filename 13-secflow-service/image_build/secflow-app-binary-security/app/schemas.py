@@ -289,6 +289,7 @@ class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
     stage_items: list[BinarySecurityStageItemResponse] = Field(default_factory=list)
     archive_jobs: list[BinarySecurityArchiveJobResponse] = Field(default_factory=list)
     overview_nodes: list[BinarySecurityOverviewNode] = Field(default_factory=list)
+    orchestration_observability: dict[str, Any] = Field(default_factory=dict)
 
 
 class BinarySecurityTaskEventResponse(BaseModel):

@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import re
 from pathlib import Path
 from statistics import mean
+from typing import Any
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
@@ -107,6 +108,8 @@ _BUDGET_EXHAUSTED_MARKERS = (
     "review budget exhausted",
     "max turns reached",
 )
+FUNCTION_STATS_METADATA_KEY = "function_stats"
+FUNCTION_STATS_FIELDS = ("total_functions", "completed_functions", "failed_functions", "uncompleted_functions")
 
 
 def _budget_exhausted_action_for_project(db: Session, project_id: str) -> str:
@@ -251,6 +254,20 @@ def _record_pi_metadata(item: B2STaskItem, **updates: object) -> None:
     item.extra_metadata = metadata
 
 
+def _merge_item_progress(item: B2STaskItem, **updates: object) -> bool:
+    progress = item.progress or {}
+    changed = False
+    for key, value in updates.items():
+        if value is None:
+            continue
+        if progress.get(key) != value:
+            progress[key] = value
+            changed = True
+    if changed:
+        item.progress = progress
+    return changed
+
+
 def _pi_job_payload(
     item: B2STaskItem,
     *,
@@ -314,10 +331,12 @@ def _apply_pi_job_to_item(db: Session, item: B2STaskItem, job: dict, *, worker_u
     item.status = map_pi_status(job.get("status"))
     item.phase = map_pi_phase(job.get("phase"), job.get("status"))
     item.progress = build_item_progress(item, job)
+    refresh_item_function_stats(item, inspect_files=False)
     if item.status == "running" and item.started_at is None:
         item.started_at = now_local()
     if item.status == "success":
         item.generated_files = build_generated_files(item, job.get("output") or {})
+        refresh_item_function_stats(item, inspect_files=True)
         item.failure_type = None
         item.error_reason = None
     elif item.status == "failed":
@@ -389,6 +408,7 @@ async def _recover_missing_pi_job(db: Session, item: B2STaskItem) -> dict | None
             "progress": item.progress or {},
             "error": item.error_reason,
         })
+        refresh_item_function_stats(item, inspect_files=True)
         get_observability().record_item_finished(item)
         return None
 
@@ -510,6 +530,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
         }
         item.phase = "queued"
         item.progress = build_item_progress(item, {"status": "queued", "phase": "queued", "progress": {}})
+        refresh_item_function_stats(item, inspect_files=False)
         db.add(item)
         db.flush()
 
@@ -537,6 +558,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             item.progress = build_item_progress(item, {"status": item.status, "phase": item.phase, "progress": {}, "error": str(exc)})
             item.failure_type = "upstream_conflict" if isinstance(exc, ConflictError) else _classify_pi_failure(str(exc))
             item.error_reason = str(exc)
+            refresh_item_function_stats(item, inspect_files=True)
             if item.status == "failed":
                 item.finished_at = now_local()
                 get_observability().record_item_finished(item)
@@ -613,6 +635,8 @@ async def sync_task(db: Session, task: B2STask) -> None:
         if item.progress != new_progress:
             item.progress = new_progress
             changed = True
+        if refresh_item_function_stats(item, inspect_files=False):
+            changed = True
         started_now = False
         if new_status == "running" and item.started_at is None:
             item.started_at = now_local()
@@ -620,10 +644,14 @@ async def sync_task(db: Session, task: B2STask) -> None:
         if new_status == "success":
             output = job.get("output") or {}
             item.generated_files = build_generated_files(item, output)
+            if refresh_item_function_stats(item, inspect_files=True):
+                changed = True
         if new_status == "failed":
             item.phase = "failed"
             item.failure_type = "pi-re-agent"
             item.error_reason = job.get("error")
+            if refresh_item_function_stats(item, inspect_files=True):
+                changed = True
         elif new_status == "success":
             item.failure_type = None
             item.error_reason = None
@@ -648,6 +676,7 @@ async def terminate_task(db: Session, task: B2STask) -> None:
         item.status = "cancelled"
         item.phase = "cancelled"
         item.progress = build_item_progress(item, {"status": "cancelled", "phase": "cancelled", "progress": item.progress})
+        refresh_item_function_stats(item, inspect_files=True)
         item.finished_at = now_local()
         get_observability().record_item_finished(item)
     recompute_task_status(db, task)
@@ -1085,10 +1114,233 @@ def task_input_filenames(items: list[B2STaskItem]) -> list[str]:
     return names
 
 
+def _safe_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _json_file(path: Path) -> dict[str, Any] | None:
+    try:
+        if path.is_file():
+            data = json.loads(path.read_text("utf-8") or "{}")
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        return None
+    return None
+
+
+def _latest_run_dir(item: B2STaskItem) -> Path | None:
+    output_dir = Path(item.output_dir)
+    work_dirs = sorted([p for p in output_dir.glob(".re_work_*") if p.is_dir()], key=lambda p: p.name)
+    work_dir = work_dirs[-1] if work_dirs else None
+    runs_root = work_dir / "runs" if work_dir else None
+    if not runs_root or not runs_root.exists():
+        return None
+    run_dirs = sorted([p for p in runs_root.iterdir() if p.is_dir()], key=lambda p: p.name)
+    return run_dirs[-1] if run_dirs else None
+
+
+def _normalize_function_stats(stats: dict[str, Any] | None) -> dict[str, int | None]:
+    stats = stats or {}
+    total = _safe_int(stats.get("total_functions"))
+    completed = _safe_int(stats.get("completed_functions"))
+    failed = _safe_int(stats.get("failed_functions"))
+    if total is not None and completed is not None:
+        completed = min(max(0, completed), max(0, total))
+    if total is not None and failed is not None:
+        failed = min(max(0, failed), max(0, total))
+    uncompleted = _safe_int(stats.get("uncompleted_functions"))
+    if total is not None and completed is not None:
+        uncompleted = max(0, total - completed)
+    return {
+        "total_functions": total,
+        "completed_functions": completed,
+        "failed_functions": failed,
+        "uncompleted_functions": uncompleted,
+    }
+
+
+def _cached_item_function_stats(item: B2STaskItem) -> dict[str, int | None] | None:
+    metadata = item.extra_metadata or {}
+    cached = metadata.get(FUNCTION_STATS_METADATA_KEY)
+    if not isinstance(cached, dict):
+        return None
+    stats = _normalize_function_stats(cached)
+    if any(stats[field] is not None for field in FUNCTION_STATS_FIELDS):
+        return stats
+    return None
+
+
+def _store_item_function_stats(item: B2STaskItem, stats: dict[str, int | None], *, source: str) -> bool:
+    normalized = _normalize_function_stats(stats)
+    metadata = item.extra_metadata or {}
+    existing = metadata.get(FUNCTION_STATS_METADATA_KEY) if isinstance(metadata.get(FUNCTION_STATS_METADATA_KEY), dict) else {}
+    comparable = {**normalized, "source": source}
+    existing_comparable = {key: existing.get(key) for key in (*FUNCTION_STATS_FIELDS, "source")} if isinstance(existing, dict) else {}
+    if existing_comparable == comparable:
+        return _merge_item_progress(
+            item,
+            total_functions=normalized["total_functions"],
+            completed_functions=normalized["completed_functions"],
+            failed_functions=normalized["failed_functions"],
+            uncompleted_functions=normalized["uncompleted_functions"],
+        )
+    payload = {
+        **(existing or {}),
+        **comparable,
+        "updated_at": isoformat_local(now_local()),
+    }
+    metadata[FUNCTION_STATS_METADATA_KEY] = payload
+    item.extra_metadata = metadata
+    _merge_item_progress(
+        item,
+        total_functions=normalized["total_functions"],
+        completed_functions=normalized["completed_functions"],
+        failed_functions=normalized["failed_functions"],
+        uncompleted_functions=normalized["uncompleted_functions"],
+    )
+    return True
+
+
+def _compute_item_function_stats(item: B2STaskItem, *, inspect_files: bool) -> tuple[dict[str, int | None], str]:
+    progress = item.progress or {}
+    run_dir = _latest_run_dir(item) if inspect_files else None
+    results = _json_file(run_dir / "results.json") if run_dir else None
+    manifest = _json_file(run_dir / "batch_manifest.json") if run_dir else None
+
+    total = _safe_int(progress.get("total_functions"))
+    completed = _safe_int(progress.get("completed_functions"))
+    failed: int | None = None
+    source = "progress"
+
+    result_rows = results.get("results") if isinstance(results, dict) else None
+    if isinstance(result_rows, list):
+        result_total = 0
+        result_completed = 0
+        result_failed = 0
+        has_result_functions = False
+        for row in result_rows:
+            if not isinstance(row, dict):
+                continue
+            count = _safe_int(row.get("func_count"))
+            if count is None:
+                continue
+            has_result_functions = True
+            result_total += count
+            verdict = str(row.get("verdict") or "").strip().upper()
+            if verdict == "PASS":
+                result_completed += count
+            elif verdict == "FAIL":
+                result_failed += count
+        if has_result_functions:
+            total = max(total or 0, result_total)
+            completed = max(completed or 0, result_completed)
+            failed = result_failed
+            source = "results"
+
+    manifest_total = _safe_int(manifest.get("function_count")) if isinstance(manifest, dict) else None
+    if manifest_total is not None:
+        total = max(total or 0, manifest_total)
+        if source == "progress":
+            source = "manifest"
+
+    file_list = (item.extra_metadata or {}).get("file_list")
+    if isinstance(file_list, list) and file_list:
+        total = max(total or 0, len(file_list))
+        if source == "progress":
+            source = "file_list"
+
+    if item.status == "success" and total is not None:
+        completed = total
+        failed = 0 if failed is None else failed
+    elif item.status in TERMINAL and total is not None and completed is None:
+        completed = 0
+
+    if total is not None and completed is not None:
+        completed = min(max(0, completed), max(0, total))
+
+    return {
+        "total_functions": total,
+        "completed_functions": completed,
+        "failed_functions": failed,
+        "uncompleted_functions": max(0, total - completed) if total is not None and completed is not None else None,
+    }, source
+
+
+def refresh_item_function_stats(item: B2STaskItem, *, inspect_files: bool = True, only_missing: bool = False) -> bool:
+    if only_missing and _cached_item_function_stats(item) is not None:
+        return False
+    stats, source = _compute_item_function_stats(item, inspect_files=inspect_files)
+    if not any(stats[field] is not None for field in FUNCTION_STATS_FIELDS):
+        return False
+    return _store_item_function_stats(item, stats, source=source)
+
+
+def refresh_task_function_stats(
+    db: Session,
+    task: B2STask,
+    *,
+    inspect_files: bool = True,
+    only_missing: bool = False,
+    commit: bool = True,
+) -> bool:
+    changed = False
+    for item in query_items(db, task.id):
+        if refresh_item_function_stats(item, inspect_files=inspect_files, only_missing=only_missing):
+            changed = True
+    if changed and commit:
+        db.commit()
+        db.refresh(task)
+    return changed
+
+
+def _item_function_stats(item: B2STaskItem) -> dict[str, int | None]:
+    cached = _cached_item_function_stats(item)
+    if cached is not None:
+        return cached
+    stats, _ = _compute_item_function_stats(item, inspect_files=False)
+    return _normalize_function_stats(stats)
+
+
+def build_task_function_stats(items: list[B2STaskItem]) -> dict[str, int | None]:
+    totals = completed = failed = 0
+    has_total = has_completed = has_failed = False
+    for item in items:
+        stats = _item_function_stats(item)
+        if stats["total_functions"] is not None:
+            has_total = True
+            totals += int(stats["total_functions"] or 0)
+        if stats["completed_functions"] is not None:
+            has_completed = True
+            completed += int(stats["completed_functions"] or 0)
+        if stats["failed_functions"] is not None:
+            has_failed = True
+            failed += int(stats["failed_functions"] or 0)
+
+    total_value = totals if has_total else None
+    completed_value = completed if has_completed else None
+    failed_value = failed if has_failed else None
+    uncompleted_value = None
+    if total_value is not None and completed_value is not None:
+        uncompleted_value = max(0, total_value - completed_value)
+    return {
+        "total_functions": total_value,
+        "completed_functions": completed_value,
+        "failed_functions": failed_value,
+        "uncompleted_functions": uncompleted_value,
+    }
+
+
 def build_task_response(db: Session, task: B2STask) -> TaskResponse:
     items = query_items(db, task.id)
     counts = count_status(items)
     mode, mode_label = task_mode_summary(items)
+    function_stats = build_task_function_stats(items)
     return TaskResponse(
         id=task.id,
         project_id=task.project_id,
@@ -1099,6 +1351,10 @@ def build_task_response(db: Session, task: B2STask) -> TaskResponse:
         name=task.name,
         status=task.status,
         total_items=len(items),
+        total_functions=function_stats["total_functions"],
+        completed_functions=function_stats["completed_functions"],
+        failed_functions=function_stats["failed_functions"],
+        uncompleted_functions=function_stats["uncompleted_functions"],
         created_at=task.created_at,
         updated_at=task.updated_at,
         **counts,

@@ -25,6 +25,11 @@ class DataflowAnalyseClient(JsonHttpClient):
         function_name: str | None = None,
         line_hint: str | None = None,
         taint_params: list[str] | None = None,
+        function_description: str | None = None,
+        entry_reason: str | None = None,
+        taint_details: list[dict[str, Any]] | None = None,
+        function_description_source: str | None = None,
+        entry_reason_source: str | None = None,
     ) -> dict:
         return await self.post(
             "/tasks",
@@ -38,6 +43,11 @@ class DataflowAnalyseClient(JsonHttpClient):
                 "function_name": function_name,
                 "line_hint": line_hint,
                 "taint_params": taint_params or [],
+                "function_description": function_description or "",
+                "function_description_source": function_description_source or "",
+                "entry_reason": entry_reason or "",
+                "entry_reason_source": entry_reason_source or "",
+                "taint_details": taint_details or [],
                 **(origin or {}),
             },
         )

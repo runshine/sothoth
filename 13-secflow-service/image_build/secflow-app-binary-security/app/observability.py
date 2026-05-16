@@ -247,6 +247,101 @@ ARCHIVE_DURATION_SECONDS = Histogram(
     buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 900),
 )
 
+STATE_EVENTS_TOTAL = Counter(
+    "secflow_binary_security_state_events_total",
+    "Total state reducer events by event type and enqueue result.",
+    labelnames=("event_type", "result"),
+)
+
+STATE_EVENT_QUEUE_DEPTH = Gauge(
+    "secflow_binary_security_state_event_queue_depth",
+    "Current state event queue depth by status.",
+    labelnames=("status",),
+)
+
+STATE_EVENT_OLDEST_AGE_SECONDS = Gauge(
+    "secflow_binary_security_state_event_oldest_age_seconds",
+    "Age in seconds of the oldest state event by status.",
+    labelnames=("status",),
+)
+
+STATE_EVENT_LAG_SECONDS = Histogram(
+    "secflow_binary_security_state_event_lag_seconds",
+    "State event lag from creation to reducer processing.",
+    labelnames=("event_type",),
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 900, 1800),
+)
+
+STATE_REDUCER_RUNS_TOTAL = Counter(
+    "secflow_binary_security_state_reducer_runs_total",
+    "Total state reducer runs by result and pod.",
+    labelnames=("result", "pod"),
+)
+
+STATE_REDUCER_EVENTS_TOTAL = Counter(
+    "secflow_binary_security_state_reducer_events_total",
+    "Total state reducer event applications.",
+    labelnames=("event_type", "result"),
+)
+
+STATE_REDUCER_DURATION_SECONDS = Histogram(
+    "secflow_binary_security_state_reducer_duration_seconds",
+    "State reducer run duration in seconds.",
+    labelnames=("result",),
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60),
+)
+
+TASK_STATE_LOCK_WAIT_SECONDS = Histogram(
+    "secflow_binary_security_task_state_lock_wait_seconds",
+    "Task state reducer lock wait duration in seconds.",
+    labelnames=("operation",),
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
+)
+
+TASK_STATE_LOCK_HELD_SECONDS = Histogram(
+    "secflow_binary_security_task_state_lock_held_seconds",
+    "Task state reducer lock held duration in seconds.",
+    labelnames=("operation",),
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60),
+)
+
+TASK_STATE_LOCK_ACTIVE = Gauge(
+    "secflow_binary_security_task_state_lock_active",
+    "Current active task state reducer locks.",
+    labelnames=("operation",),
+)
+
+STATE_DEAD_LETTERS_TOTAL = Counter(
+    "secflow_binary_security_state_dead_letters_total",
+    "Total state events moved to dead letter.",
+    labelnames=("event_type", "reason"),
+)
+
+STATE_FILE_WRITES_TOTAL = Counter(
+    "secflow_binary_security_state_file_writes_total",
+    "Total reducer-owned file writes.",
+    labelnames=("target", "result"),
+)
+
+STATE_FILE_WRITE_DURATION_SECONDS = Histogram(
+    "secflow_binary_security_state_file_write_duration_seconds",
+    "Reducer-owned file write duration in seconds.",
+    labelnames=("target", "result"),
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5),
+)
+
+ARCHIVE_JOBS_BY_STATUS = Gauge(
+    "secflow_binary_security_archive_jobs_by_status",
+    "Current archive jobs by stage and status.",
+    labelnames=("stage", "status"),
+)
+
+DOWNSTREAM_RECONCILE_OBSERVATIONS_TOTAL = Counter(
+    "secflow_binary_security_downstream_reconcile_observations_total",
+    "Total downstream reconcile observations.",
+    labelnames=("stage", "service", "result"),
+)
+
 
 def render_metrics() -> tuple[bytes, str]:
     return generate_latest(), CONTENT_TYPE_LATEST
@@ -415,6 +510,68 @@ def observe_stage_duration(*, stage: str, result: str, duration_seconds: float |
     ).observe(max(0.0, float(duration_seconds)))
     if str(result or "unknown") in {"success", "partial_success", "completed"}:
         AI_ROUND_TOTAL.labels(kind="selection" if str(stage or "") == "system_analysis" else "round").inc()
+
+
+def observe_state_event(event_type: str, result: str) -> None:
+    STATE_EVENTS_TOTAL.labels(event_type=str(event_type or "unknown"), result=str(result or "unknown")).inc()
+
+
+def observe_state_event_queues(*, status_counts: dict[str, int], oldest_ages: dict[str, float]) -> None:
+    statuses = set(status_counts) | set(oldest_ages) | {"pending", "processing", "retryable", "processed", "dead_letter"}
+    for status in statuses:
+        STATE_EVENT_QUEUE_DEPTH.labels(status=str(status)).set(max(0, int(status_counts.get(status, 0))))
+        STATE_EVENT_OLDEST_AGE_SECONDS.labels(status=str(status)).set(max(0.0, float(oldest_ages.get(status, 0.0))))
+
+
+def observe_state_event_lag(event_type: str, duration_seconds: float | None) -> None:
+    if duration_seconds is None:
+        return
+    STATE_EVENT_LAG_SECONDS.labels(event_type=str(event_type or "unknown")).observe(max(0.0, float(duration_seconds)))
+
+
+def observe_state_reducer_run(*, result: str, pod: str, duration_seconds: float | None) -> None:
+    STATE_REDUCER_RUNS_TOTAL.labels(result=str(result or "unknown"), pod=str(pod or "unknown")).inc()
+    if duration_seconds is not None:
+        STATE_REDUCER_DURATION_SECONDS.labels(result=str(result or "unknown")).observe(max(0.0, float(duration_seconds)))
+
+
+def observe_state_reducer_event(event_type: str, result: str) -> None:
+    STATE_REDUCER_EVENTS_TOTAL.labels(event_type=str(event_type or "unknown"), result=str(result or "unknown")).inc()
+
+
+def observe_task_state_lock(*, operation: str, wait_seconds: float | None = None, held_seconds: float | None = None, active: int | None = None) -> None:
+    operation_value = str(operation or "unknown")
+    if wait_seconds is not None:
+        TASK_STATE_LOCK_WAIT_SECONDS.labels(operation=operation_value).observe(max(0.0, float(wait_seconds)))
+    if held_seconds is not None:
+        TASK_STATE_LOCK_HELD_SECONDS.labels(operation=operation_value).observe(max(0.0, float(held_seconds)))
+    if active is not None:
+        TASK_STATE_LOCK_ACTIVE.labels(operation=operation_value).set(max(0, int(active)))
+
+
+def observe_state_dead_letter(event_type: str, reason: str) -> None:
+    STATE_DEAD_LETTERS_TOTAL.labels(event_type=str(event_type or "unknown"), reason=str(reason or "unknown")).inc()
+
+
+def observe_state_file_write(*, target: str, result: str, duration_seconds: float | None = None) -> None:
+    target_value = str(target or "unknown")
+    result_value = str(result or "unknown")
+    STATE_FILE_WRITES_TOTAL.labels(target=target_value, result=result_value).inc()
+    if duration_seconds is not None:
+        STATE_FILE_WRITE_DURATION_SECONDS.labels(target=target_value, result=result_value).observe(max(0.0, float(duration_seconds)))
+
+
+def observe_archive_job_statuses(status_counts: dict[tuple[str, str], int]) -> None:
+    for (stage, status), count in status_counts.items():
+        ARCHIVE_JOBS_BY_STATUS.labels(stage=str(stage or "unknown"), status=str(status or "unknown")).set(max(0, int(count)))
+
+
+def observe_downstream_reconcile_observation(*, stage: str | None, service: str | None, result: str) -> None:
+    DOWNSTREAM_RECONCILE_OBSERVATIONS_TOTAL.labels(
+        stage=str(stage or "none"),
+        service=str(service or "none"),
+        result=str(result or "unknown"),
+    ).inc()
 
 
 def _ai_failure_category(category: str, result: str | None) -> str:
