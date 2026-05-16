@@ -1674,7 +1674,8 @@ class TaskManager:
         self.retry_stage_full(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
 
     def retry_stage_failed_items(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
-        with self._task_operation_lock(db, task_id, operation="retry_stage"):
+        operation_token = self._acquire_task_operation_lease(db, task_id, operation=TASK_ACTION_RETRY_STAGE_FAILED_ITEMS)
+        try:
             task = self._task_or_404(db, project_id, task_id)
             supported, reason, items = self._stage_retry_failed_items_support(db, task, stage_name)
             if not supported:
@@ -1702,9 +1703,13 @@ class TaskManager:
                 event_type="stage_retry_failed_items_accepted",
                 event_payload={"target_stage": stage_name, "retry_item_count": len(item_keys)},
             )
+        except Exception:
+            self._release_task_operation_lease(db, task_id, token=operation_token)
+            raise
 
     def retry_stage_full(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
-        with self._task_operation_lock(db, task_id, operation="retry_stage_full"):
+        operation_token = self._acquire_task_operation_lease(db, task_id, operation=TASK_ACTION_RETRY_STAGE_FULL)
+        try:
             task = self._task_or_404(db, project_id, task_id)
             supported, reason = self._stage_retry_support(db, task, stage_name)
             if not supported:
@@ -1731,6 +1736,9 @@ class TaskManager:
                 event_type="stage_retry_full_accepted",
                 event_payload={"target_stage": stage_name},
             )
+        except Exception:
+            self._release_task_operation_lease(db, task_id, token=operation_token)
+            raise
 
     def retry_stage_archive(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
         self.retry_stage_archive_failed_items(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
