@@ -1590,6 +1590,8 @@ class TaskManager:
         ]
         if not retry_items:
             raise ValidationError("失败项重试未找到目标阶段子任务")
+        item_ids = [item.id for item in retry_items]
+        downstream_refs = self._collect_downstream_refs(task, retry_items)
         await self.sync_downstream_status(
             db,
             project_id=task.project_id,
@@ -1603,8 +1605,6 @@ class TaskManager:
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
         downstream_stages = stage_sequence[target_index + 1:]
-        item_ids = [item.id for item in retry_items]
-        downstream_refs = self._collect_downstream_refs(task, retry_items)
         all_downstream_refs = downstream_refs + self._downstream_refs_for_stages(db, task, downstream_stages)
         self._invalidate_task_execution(task)
         if all_downstream_refs:
@@ -6453,7 +6453,7 @@ class TaskManager:
         downstream_service: str,
         identity,
         output_ref,
-    ) -> None:
+    ) -> list[dict[str, Any]]:
         """Persist every intended stage item as queued before fan-out execution starts."""
         retry_plan = self._retry_plan(task)
         retry_item_keys = set(retry_plan.get("retry_item_keys") or [])
@@ -6463,6 +6463,7 @@ class TaskManager:
             and str(retry_plan.get("mode") or "").strip() in {TASK_ACTION_RETRY_FAILED_ITEMS, TASK_ACTION_RETRY_STAGE_FAILED_ITEMS}
             and bool(retry_item_keys)
         )
+        executable_inputs: list[dict[str, Any]] = []
         last_error: Exception | None = None
         for _ in range(2):
             try:
@@ -6471,6 +6472,7 @@ class TaskManager:
                     identity_key = build_stage_item_identity_key(item_key, parent_key)
                     if retry_failed_only and identity_key not in retry_item_keys:
                         continue
+                    executable_inputs.append(input_item)
                     item = self._find_stage_item(
                         db,
                         task_id=task.id,
@@ -6508,9 +6510,10 @@ class TaskManager:
                     item.input_ref = input_ref
                     item.output_ref = output_ref(input_item)
                 db.commit()
-                return
+                return executable_inputs
             except IntegrityError as exc:
                 db.rollback()
+                executable_inputs = []
                 last_error = exc
                 continue
         raise last_error or ValidationError(f"阶段 {stage_run.stage_name} 初始化阶段子任务失败")
@@ -7236,7 +7239,7 @@ class TaskManager:
         input_files = list(task.summary.get("input_files") or [])
         if not input_files:
             return "failed", {"error": "缺少输入文件"}
-        self._prepare_stage_items_for_execution(
+        executable_inputs = self._prepare_stage_items_for_execution(
             db,
             task=task,
             stage_run=stage_run,
@@ -7252,9 +7255,11 @@ class TaskManager:
                 "downstream_service": "firmware_unpacker",
             },
         )
+        if executable_inputs is None:
+            executable_inputs = input_files
         results = await self._run_stage_pool(
             task,
-            input_files,
+            executable_inputs,
             self._stage_parallelism(task, stage_run.stage_name),
             lambda input_file, retrying=False: self._run_firmware_item(task, stage_run, input_file, token, retrying),
             retries=int(task.policy.get("max_retries_per_item") or 0),
@@ -7373,7 +7378,7 @@ class TaskManager:
         system_inputs = self._system_analysis_inputs(task)
         if not system_inputs:
             return "failed", {"error": "缺少可用于系统分析的输入"}
-        self._prepare_stage_items_for_execution(
+        executable_inputs = self._prepare_stage_items_for_execution(
             db,
             task=task,
             stage_run=stage_run,
@@ -7387,9 +7392,11 @@ class TaskManager:
             ),
             output_ref=lambda _analysis_input: {},
         )
+        if executable_inputs is None:
+            executable_inputs = system_inputs
         results = await self._run_stage_pool(
             task,
-            system_inputs,
+            executable_inputs,
             self._stage_parallelism(task, stage_run.stage_name),
             lambda analysis_input, retrying=False: self._run_system_analysis_item(task, stage_run, analysis_input, retrying),
             retries=int(task.policy.get("max_retries_per_item") or 0),
@@ -8151,7 +8158,7 @@ class TaskManager:
         modules = list(task.summary.get("selected_modules") or [])
         if not modules:
             return "failed", {"error": "缺少已选模块列表"}
-        self._prepare_stage_items_for_execution(
+        executable_inputs = self._prepare_stage_items_for_execution(
             db,
             task=task,
             stage_run=stage_run,
@@ -8165,9 +8172,11 @@ class TaskManager:
             ),
             output_ref=lambda _module: {},
         )
+        if executable_inputs is None:
+            executable_inputs = modules
         results = await self._run_stage_pool(
             task,
-            modules,
+            executable_inputs,
             self._stage_parallelism(task, stage_run.stage_name),
             lambda module, retrying=False: self._run_b2s_item(task, stage_run, module, token, retrying),
             retries=int(task.policy.get("max_retries_per_item") or 0),
@@ -8186,7 +8195,7 @@ class TaskManager:
         b2s_success = self._entry_analysis_inputs(task)
         if not b2s_success:
             return "failed", {"error": "没有可用于入口分析的源码模块"}
-        self._prepare_stage_items_for_execution(
+        executable_inputs = self._prepare_stage_items_for_execution(
             db,
             task=task,
             stage_run=stage_run,
@@ -8200,9 +8209,11 @@ class TaskManager:
             ),
             output_ref=lambda _module: {},
         )
+        if executable_inputs is None:
+            executable_inputs = b2s_success
         results = await self._run_stage_pool(
             task,
-            b2s_success,
+            executable_inputs,
             self._stage_parallelism(task, stage_run.stage_name),
             lambda module, retrying=False: self._run_entry_item(task, stage_run, module, token, retrying),
             retries=int(task.policy.get("max_retries_per_item") or 0),
@@ -8233,7 +8244,7 @@ class TaskManager:
         entries = _deduplicate_entry_keys(entries)
         if not entries:
             return "failed", {"error": "没有可用于数据流分析的入口"}
-        self._prepare_stage_items_for_execution(
+        executable_inputs = self._prepare_stage_items_for_execution(
             db,
             task=task,
             stage_run=stage_run,
@@ -8247,9 +8258,11 @@ class TaskManager:
             ),
             output_ref=lambda _entry: {},
         )
+        if executable_inputs is None:
+            executable_inputs = entries
         results = await self._run_stage_pool(
             task,
-            entries,
+            executable_inputs,
             self._stage_parallelism(task, stage_run.stage_name),
             lambda entry, retrying=False: self._run_dataflow_item(task, stage_run, entry, token, retrying),
             retries=int(task.policy.get("max_retries_per_item") or 0),
@@ -8268,7 +8281,7 @@ class TaskManager:
         dataflow_results = list(task.summary.get("dataflow_results") or [])
         if not dataflow_results:
             return "failed", {"error": "没有可用于漏洞扫描的数据流结果"}
-        self._prepare_stage_items_for_execution(
+        executable_inputs = self._prepare_stage_items_for_execution(
             db,
             task=task,
             stage_run=stage_run,
@@ -8282,9 +8295,11 @@ class TaskManager:
             ),
             output_ref=lambda _result: {},
         )
+        if executable_inputs is None:
+            executable_inputs = dataflow_results
         results = await self._run_stage_pool(
             task,
-            dataflow_results,
+            executable_inputs,
             self._stage_parallelism(task, stage_run.stage_name),
             lambda result, retrying=False: self._run_vuln_item(task, stage_run, result, token, retrying),
             retries=int(task.policy.get("max_retries_per_item") or 0),

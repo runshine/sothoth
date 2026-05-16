@@ -605,7 +605,7 @@ class TaskManagerTests(unittest.TestCase):
         )
         db = _AppendingModelAwareDb(stage_runs=[stage_run], stage_items=[existing_success])
 
-        self.manager._prepare_stage_items_for_execution(
+        executable_inputs = self.manager._prepare_stage_items_for_execution(
             db,
             task=task,
             stage_run=stage_run,
@@ -628,6 +628,60 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(["fw1", "fw2"], stage_item_keys)
         retried = next(item for item in db.stage_items if item.item_key == "fw2")
         self.assertEqual("queued", retried.status)
+        self.assertEqual(["fw2"], [row["firmware_key"] for row in executable_inputs])
+
+    def test_stage_entry_analysis_only_runs_retry_plan_items(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="running",
+        )
+        task.policy = {}
+        task.summary = {
+            "selected_modules": [
+                {"firmware_key": "source_project", "module_key": "m1", "module_name": "m1", "source_dir": "/src/m1"},
+                {"firmware_key": "source_project", "module_key": "m2", "module_name": "m2", "source_dir": "/src/m2"},
+                {"firmware_key": "source_project", "module_key": "m3", "module_name": "m3", "source_dir": "/src/m3"},
+            ],
+            "retry_plan": {
+                "target_stage": "entry_analysis",
+                "mode": "retry_stage_failed_items",
+                "retry_item_keys": ["m2::source_project"],
+            },
+        }
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run])
+        captured = {}
+
+        async def fake_run_stage_pool(current_task, items, concurrency, runner, retries=0, initial_retry=False):
+            del current_task, concurrency, runner, retries, initial_retry
+            captured["items"] = items
+            return [{"status": "success", "item": items[0], "entries": [{"entry_key": "e1", "function_name": "main"}]}]
+
+        original_run_stage_pool = self.manager._run_stage_pool
+        self.manager._run_stage_pool = fake_run_stage_pool
+        try:
+            status, summary = asyncio.run(self.manager._stage_entry_analysis(db, task, stage_run, token=None, retry_existing=True))
+        finally:
+            self.manager._run_stage_pool = original_run_stage_pool
+
+        self.assertEqual("success", status)
+        self.assertEqual(["m2"], [row["module_key"] for row in captured["items"]])
+        self.assertEqual(["m2"], [item.item_key for item in db.stage_items])
+        self.assertEqual(1, summary["success_count"])
 
     def test_task_operation_lock_uses_bound_text_query_and_releases_lock(self):
         connection = _FakeConnection(lock_result=True)
