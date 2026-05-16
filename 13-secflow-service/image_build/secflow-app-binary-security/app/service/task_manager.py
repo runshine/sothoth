@@ -4077,13 +4077,31 @@ class TaskManager:
                     )
                     return
             if task.status == "cancelled":
+                running_items = db.query(BinarySecurityStageItem).filter(
+                    BinarySecurityStageItem.task_id == task.id,
+                    BinarySecurityStageItem.status.in_(["pending", "queued", "running"]),
+                ).all()
+                for item in running_items:
+                    item.status = "cancelled"
+                    item.finished_at = item.finished_at or _now()
+                active_stage_runs = db.query(BinarySecurityStageRun).filter(
+                    BinarySecurityStageRun.task_id == task.id,
+                    BinarySecurityStageRun.status.in_(["pending", "dispatching", "queued", "running"]),
+                ).all()
+                for stage_run in active_stage_runs:
+                    stage_run.status = "cancelled"
+                    stage_run.finished_at = stage_run.finished_at or _now()
                 self._record_event(
                     db,
                     task,
                     "manual_cancel_noop",
-                    "任务已经是取消状态，忽略重复取消事件",
+                    "任务已经是取消状态，已归一化仍活跃的阶段与子任务",
                     stage_name=task.current_stage,
-                    payload={"state_event_id": event.id},
+                    payload={
+                        "state_event_id": event.id,
+                        "cancelled_item_count": len(running_items),
+                        "cancelled_stage_run_count": len(active_stage_runs),
+                    },
                 )
                 return
             task.status = "cancelled"
