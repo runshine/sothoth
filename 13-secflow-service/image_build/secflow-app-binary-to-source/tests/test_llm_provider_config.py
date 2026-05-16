@@ -69,11 +69,14 @@ class _FakeDb:
 
 
 class _FakePiClient:
-    def __init__(self):
+    def __init__(self, response=None):
         self.payloads = []
+        self.response = response
 
     async def create_job(self, payload):
         self.payloads.append(payload)
+        if self.response is not None:
+            return self.response
         return {"id": "job-1", "status": "queued", "phase": "queued", "progress": {}}
 
 
@@ -173,6 +176,8 @@ class TaskProviderResolutionTests(unittest.TestCase):
 
         self.assertEqual("task1", response.id)
         self.assertEqual("team_codex/gpt-5.4", fake_pi.payloads[0]["model"])
+        self.assertTrue(fake_pi.payloads[0]["idempotency_key"].startswith("b2s:task1:"))
+        self.assertTrue(fake_pi.payloads[0]["idempotency_key"].endswith(":/tmp/input/demo.elf"))
         self.assertEqual("team_codex", db.task_items[0].extra_metadata["llm_provider_key"])
         self.assertEqual("gpt-5.4", db.task_items[0].extra_metadata["llm_provider_model"])
 
@@ -232,8 +237,59 @@ class TaskProviderResolutionTests(unittest.TestCase):
             asyncio.run(task_service.retry_task(db, task, ["item1"]))
 
         self.assertEqual("team_codex/gpt-5.4", fake_pi.payloads[0]["model"])
+        self.assertEqual("b2s:task1:item1:/tmp/demo.elf", fake_pi.payloads[0]["idempotency_key"])
         self.assertEqual("team_codex", item.extra_metadata["llm_provider_key"])
         self.assertEqual("gpt-5.4", item.extra_metadata["llm_provider_model"])
+
+    def test_create_task_reuses_existing_pi_job_conflict(self):
+        db = _FakeDb()
+        fake_pi = _FakePiClient(response={
+            "_conflict": True,
+            "existing_job": {
+                "id": "job-existing",
+                "target": "/tmp/input/demo.elf",
+                "status": "running",
+                "phase": "processing",
+                "progress": {},
+            },
+        })
+        req = TaskCreate(
+            task_id="task1",
+            name="demo",
+            elf_tasks=[ElfTaskInput(elf_path="/tmp/demo.elf")],
+        )
+
+        with (
+            mock.patch.object(task_service, "ensure_path_in_project", return_value=Path("/tmp/demo.elf")),
+            mock.patch.object(task_service, "prepare_input_file", return_value=Path("/tmp/input/demo.elf")),
+            mock.patch.object(task_service, "safe_output_dir", return_value=Path("/tmp/output")),
+            mock.patch.object(task_service, "choose_pi_worker", return_value="http://pi-worker"),
+            mock.patch.object(task_service, "get_pi_client", return_value=fake_pi),
+            mock.patch.object(task_service, "_project_default_llm_provider_key", return_value=None),
+            mock.patch.object(
+                task_service,
+                "get_config",
+                return_value=SimpleNamespace(
+                    pi_re_agent=SimpleNamespace(
+                        batch_size=8192,
+                        max_retries=3,
+                        concurrency=4,
+                        agent_run_timeout_seconds=3600,
+                        agent_timeout_retry_enabled=True,
+                        agent_timeout_max_retries=3,
+                        engine="hybrid",
+                        model=None,
+                    ),
+                    configcenter_service=SimpleNamespace(enabled=False),
+                ),
+            ),
+        ):
+            asyncio.run(task_service.create_task(db, "p1", req, "tester"))
+
+        item = db.task_items[0]
+        self.assertEqual("job-existing", item.pi_job_id)
+        self.assertEqual("running", item.status)
+        self.assertEqual("reuse_active_target_job", item.extra_metadata["pi_recover_reason"])
 
 
 if __name__ == "__main__":

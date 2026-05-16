@@ -29,6 +29,24 @@ spec:
           value: Asia/Shanghai
         - name: PI_RE_ALLOWED_DIRS
           value: "/data/files"
+        - name: PI_RE_DATABASE_URL
+          value: "mysql+pymysql://secflow:Huawei12%23%24@mysql.sothothv2-ns.svc.cluster.local:3306/secflow?charset=utf8mb4"
+        - name: PI_RE_WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: PI_RE_MAX_CONCURRENT_JOBS
+          value: "2"
+        - name: PI_RE_LEASE_SECONDS
+          value: "120"
+        - name: PI_RE_HEARTBEAT_SECONDS
+          value: "15"
+        - name: PI_RE_STUCK_SCAN_SECONDS
+          value: "30"
+        - name: PI_RE_MAX_JOB_ATTEMPTS
+          value: "3"
+        - name: PI_RE_QUEUE_LIMIT
+          value: "200"
         - name: PI_MODELS_JSON
           value: "/root/.pi/agent/models.json"
         - name: PI_CODING_AGENT_DIR

@@ -31,25 +31,38 @@ class PiReAgentClient:
         return headers
 
     async def create_job(self, payload: dict[str, Any]) -> dict:
+        headers = self._headers()
+        idempotency_key = str(payload.get("idempotency_key") or "").strip()
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
         try:
             async with httpx.AsyncClient(timeout=self.config.timeout) as client:
                 resp = await client.post(
                     f"{self.base_url.rstrip('/')}/api/v1/jobs",
-                    headers=self._headers(),
+                    headers=headers,
                     json=payload,
                 )
         except httpx.TimeoutException:
             raise UpstreamError("pi-re-agent创建任务超时")
         except httpx.ConnectError as exc:
             raise UpstreamError(f"无法连接pi-re-agent: {exc}")
+        if resp.status_code == 409:
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"error": resp.text or "pi-re-agent任务冲突"}
+            if isinstance(data, dict) and data.get("error") == "active_job_exists":
+                data["_conflict"] = True
+                return data
         return _handle(resp)
 
-    async def list_jobs(self) -> list[dict[str, Any]]:
+    async def list_jobs(self, **params: Any) -> list[dict[str, Any]]:
         try:
             async with httpx.AsyncClient(timeout=self.config.timeout) as client:
                 resp = await client.get(
                     f"{self.base_url.rstrip('/')}/api/v1/jobs",
                     headers=self._headers(),
+                    params={key: value for key, value in params.items() if value is not None},
                 )
         except httpx.TimeoutException:
             raise UpstreamError("pi-re-agent查询任务列表超时")
@@ -58,6 +71,22 @@ class PiReAgentClient:
         payload = _handle(resp)
         jobs = payload.get("jobs") if isinstance(payload, dict) else []
         return jobs if isinstance(jobs, list) else []
+
+    async def get_job_by_target(self, target: str, *, active: bool = True) -> Optional[dict]:
+        try:
+            async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+                resp = await client.get(
+                    f"{self.base_url.rstrip('/')}/api/v1/jobs/by-target",
+                    headers=self._headers(),
+                    params={"target": target, "active": str(active).lower()},
+                )
+        except httpx.TimeoutException:
+            raise UpstreamError("pi-re-agent按目标查询任务超时")
+        except httpx.ConnectError as exc:
+            raise UpstreamError(f"无法连接pi-re-agent: {exc}")
+        if resp.status_code == 404:
+            return None
+        return _handle(resp)
 
     async def get_job(self, job_id: str) -> Optional[dict]:
         try:

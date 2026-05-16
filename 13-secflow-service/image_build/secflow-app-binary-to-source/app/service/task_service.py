@@ -68,6 +68,7 @@ TERMINAL = {"success", "failed", "cancelled"}
 PI_STATUS_MAP = {
     "queued": "queued",
     "running": "running",
+    "cancelling": "running",
     "completed": "success",
     "failed": "failed",
     "cancelled": "cancelled",
@@ -196,8 +197,7 @@ def generate_task_id(db: Session, project_id: str) -> str:
 
 def configured_pi_workers() -> list[str]:
     cfg = get_config().pi_re_agent
-    workers = [url.rstrip("/") for url in (cfg.worker_urls or []) if url and url.strip()]
-    return workers or [cfg.base_url.rstrip("/")]
+    return [cfg.base_url.rstrip("/")]
 
 
 async def choose_pi_worker(db: Session, task_id: str, sequence_no: int) -> str:
@@ -232,6 +232,186 @@ async def choose_pi_worker(db: Session, task_id: str, sequence_no: int) -> str:
 def item_pi_worker_url(item: B2STaskItem) -> str | None:
     worker_url = str((item.extra_metadata or {}).get("pi_worker_url") or "").strip()
     return worker_url.rstrip("/") or None
+
+
+def _normalized_target(path: str | None) -> str:
+    try:
+        return str(Path(path or "").resolve())
+    except Exception:
+        return str(path or "")
+
+
+def _pi_idempotency_key(task_id: str, item: B2STaskItem) -> str:
+    return f"b2s:{task_id}:{item.id}:{_normalized_target(item.elf_path)}"
+
+
+def _record_pi_metadata(item: B2STaskItem, **updates: object) -> None:
+    metadata = item.extra_metadata or {}
+    metadata.update({key: value for key, value in updates.items() if value is not None})
+    item.extra_metadata = metadata
+
+
+def _pi_job_payload(
+    item: B2STaskItem,
+    *,
+    pi_cfg,
+    job_model: str | None,
+    timeout_seconds: int,
+    timeout_retry_enabled: bool,
+    timeout_max_retries: int,
+    engine: str,
+    concurrency: int,
+    clean: bool,
+) -> dict:
+    return {
+        "target": item.elf_path,
+        "output_dir": item.output_dir,
+        "idempotency_key": _pi_idempotency_key(item.task_id, item),
+        "batch_size": pi_cfg.batch_size,
+        "max_retries": pi_cfg.max_retries,
+        "timeout_seconds": timeout_seconds,
+        "timeout_retry_enabled": timeout_retry_enabled,
+        "timeout_max_retries": timeout_max_retries,
+        "model": job_model,
+        "functions": (item.extra_metadata or {}).get("file_list") or None,
+        "clean": clean,
+        "engine": engine,
+        "concurrency": concurrency,
+    }
+
+
+async def _submit_or_reuse_pi_job(item: B2STaskItem, worker_url: str, payload: dict) -> dict:
+    job = await get_pi_client(worker_url).create_job(payload)
+    if not isinstance(job, dict) or not job.get("_conflict"):
+        return job
+    existing = job.get("existing_job") if isinstance(job.get("existing_job"), dict) else None
+    if existing and _normalized_target(existing.get("target")) == _normalized_target(item.elf_path):
+        _record_pi_metadata(
+            item,
+            pi_conflict_job_id=existing.get("id"),
+            pi_recover_reason="reuse_active_target_job",
+        )
+        return existing
+    _record_pi_metadata(
+        item,
+        pi_conflict_job_id=(existing or {}).get("id") if existing else None,
+        pi_recover_reason="active_target_conflict",
+    )
+    raise ConflictError("pi-re-agent存在同名活跃任务，等待上游释放后重试")
+
+
+def _apply_pi_job_to_item(db: Session, item: B2STaskItem, job: dict, *, worker_url: str) -> None:
+    item.pi_job_id = job.get("id")
+    _record_pi_metadata(
+        item,
+        pi_worker_url=worker_url,
+        pi_job_id=item.pi_job_id,
+        pi_idempotency_key=_pi_idempotency_key(item.task_id, item),
+        pi_last_seen_status=job.get("status"),
+        pi_last_seen_at=isoformat_local(now_local()),
+        pi_recover_reason=(item.extra_metadata or {}).get("pi_recover_reason"),
+    )
+    item.status = map_pi_status(job.get("status"))
+    item.phase = map_pi_phase(job.get("phase"), job.get("status"))
+    item.progress = build_item_progress(item, job)
+    if item.status == "running" and item.started_at is None:
+        item.started_at = now_local()
+    if item.status == "success":
+        item.generated_files = build_generated_files(item, job.get("output") or {})
+        item.failure_type = None
+        item.error_reason = None
+    elif item.status == "failed":
+        item.phase = "failed"
+        item.failure_type = _classify_pi_failure(job.get("error"))
+        item.error_reason = job.get("error")
+    elif item.status in {"queued", "running"}:
+        item.failure_type = None
+        item.error_reason = None
+
+
+def _classify_pi_failure(error: str | None) -> str:
+    text = str(error or "").lower()
+    if "job not found" in text:
+        return "upstream_lost"
+    if "already running" in text or "active_job_exists" in text:
+        return "upstream_conflict"
+    if "timeout" in text:
+        return "upstream_timeout"
+    if "unauthorized" in text or "401" in text or "permission" in text:
+        return "provider_auth_error"
+    if "token" in text and ("context" in text or "length" in text or "quota" in text):
+        return "token_limit_error"
+    return "pi-re-agent"
+
+
+def _job_model_for_item(item: B2STaskItem) -> str | None:
+    metadata = item.extra_metadata or {}
+    key = _normalize_llm_provider_key(metadata.get("llm_provider_key"))
+    model = _normalize_llm_provider_key(metadata.get("llm_provider_model"))
+    if key and model and "/" not in model:
+        return f"{key}/{model}"
+    return model or get_config().pi_re_agent.model
+
+
+async def _recover_missing_pi_job(db: Session, item: B2STaskItem) -> dict | None:
+    worker_url = item_pi_worker_url(item) or get_config().pi_re_agent.base_url.rstrip("/")
+    client = get_pi_client(worker_url)
+    try:
+        found = await client.get_job_by_target(item.elf_path, active=True)
+    except Exception as exc:
+        _record_pi_metadata(
+            item,
+            pi_recover_reason="by_target_lookup_failed",
+            pi_last_recover_error=str(exc),
+        )
+        found = None
+    if found:
+        _record_pi_metadata(
+            item,
+            pi_worker_url=worker_url,
+            pi_job_id=found.get("id"),
+            pi_recover_reason="recovered_by_target",
+        )
+        item.pi_job_id = found.get("id")
+        return found
+
+    metadata = item.extra_metadata or {}
+    attempts = int(metadata.get("pi_recover_attempt") or 0)
+    if attempts >= 3:
+        item.status = "failed"
+        item.phase = "failed"
+        item.failure_type = "upstream_lost"
+        item.error_reason = "pi-re-agent job not found after recovery attempts"
+        item.finished_at = now_local()
+        item.progress = build_item_progress(item, {
+            "status": "failed",
+            "phase": "failed",
+            "progress": item.progress or {},
+            "error": item.error_reason,
+        })
+        get_observability().record_item_finished(item)
+        return None
+
+    pi_cfg = get_config().pi_re_agent
+    _record_pi_metadata(item, pi_recover_attempt=attempts + 1, pi_recover_reason="resubmit_missing_job")
+    payload = _pi_job_payload(
+        item,
+        pi_cfg=pi_cfg,
+        job_model=_job_model_for_item(item),
+        timeout_seconds=int(metadata.get("agent_run_timeout_seconds") or pi_cfg.agent_run_timeout_seconds),
+        timeout_retry_enabled=bool(metadata.get("agent_timeout_retry_enabled") if metadata.get("agent_timeout_retry_enabled") is not None else pi_cfg.agent_timeout_retry_enabled),
+        timeout_max_retries=int(metadata.get("agent_timeout_max_retries") if metadata.get("agent_timeout_max_retries") is not None else pi_cfg.agent_timeout_max_retries),
+        engine=str(metadata.get("engine") or pi_cfg.engine),
+        concurrency=int(metadata.get("concurrency") or pi_cfg.concurrency),
+        clean=False,
+    )
+    try:
+        job = await _submit_or_reuse_pi_job(item, worker_url, payload)
+    except Exception as exc:
+        _record_pi_metadata(item, pi_last_recover_error=str(exc))
+        return None
+    _apply_pi_job_to_item(db, item, job, worker_url=worker_url)
+    return job
 
 
 def prepare_input_file(project_id: str, task_id: str, sequence_no: int, source_path: Path) -> Path:
@@ -326,6 +506,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             "mode": job_mode,
             "engine": job_engine,
             "pi_worker_url": worker_url,
+            "pi_idempotency_key": _pi_idempotency_key(task.id, item),
         }
         item.phase = "queued"
         item.progress = build_item_progress(item, {"status": "queued", "phase": "queued", "progress": {}})
@@ -333,35 +514,32 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
         db.flush()
 
         try:
-            job = await get_pi_client(worker_url).create_job({
-                "target": item.elf_path,
-                "output_dir": item.output_dir,
-                "batch_size": pi_cfg.batch_size,
-                "max_retries": pi_cfg.max_retries,
-                "timeout_seconds": job_timeout_seconds,
-                "timeout_retry_enabled": job_timeout_retry_enabled,
-                "timeout_max_retries": job_timeout_max_retries,
-                "model": job_model,
-                "functions": elf.file_list or None,
-                "clean": False,
-                "engine": job_engine,
-                "concurrency": job_concurrency,
-            })
-            item.pi_job_id = job.get("id")
-            item.status = map_pi_status(job.get("status"))
-            item.phase = map_pi_phase(job.get("phase"), job.get("status"))
-            item.progress = build_item_progress(item, job)
-            if item.status == "running" and item.started_at is None:
-                item.started_at = now_local()
+            job = await _submit_or_reuse_pi_job(
+                item,
+                worker_url,
+                _pi_job_payload(
+                    item,
+                    pi_cfg=pi_cfg,
+                    job_model=job_model,
+                    timeout_seconds=job_timeout_seconds,
+                    timeout_retry_enabled=job_timeout_retry_enabled,
+                    timeout_max_retries=job_timeout_max_retries,
+                    engine=job_engine,
+                    concurrency=job_concurrency,
+                    clean=False,
+                ),
+            )
+            _apply_pi_job_to_item(db, item, job, worker_url=worker_url)
             get_observability().record_item_submit(item, worker_url)
         except Exception as exc:
-            item.status = "failed"
-            item.phase = "failed"
-            item.progress = build_item_progress(item, {"status": "failed", "phase": "failed", "progress": {}, "error": str(exc)})
-            item.failure_type = "pi-re-agent"
+            item.status = "queued" if isinstance(exc, ConflictError) else "failed"
+            item.phase = "queued" if isinstance(exc, ConflictError) else "failed"
+            item.progress = build_item_progress(item, {"status": item.status, "phase": item.phase, "progress": {}, "error": str(exc)})
+            item.failure_type = "upstream_conflict" if isinstance(exc, ConflictError) else _classify_pi_failure(str(exc))
             item.error_reason = str(exc)
-            item.finished_at = now_local()
-            get_observability().record_item_finished(item)
+            if item.status == "failed":
+                item.finished_at = now_local()
+                get_observability().record_item_finished(item)
     recompute_task_status(db, task)
     db.commit()
     db.refresh(task)
@@ -391,12 +569,33 @@ async def sync_task(db: Session, task: B2STask) -> None:
             changed = True
             continue
         if job is None:
-            item.status = "failed"
-            item.failure_type = "pi-re-agent"
-            item.error_reason = "pi-re-agent job not found"
-            item.finished_at = now_local()
+            recovered = await _recover_missing_pi_job(db, item)
+            if recovered is not None:
+                job = recovered
+            elif item.status == "failed":
+                changed = True
+                continue
+            else:
+                item.status = "queued"
+                item.phase = "queued"
+                item.failure_type = "upstream_lost"
+                item.error_reason = "pi-re-agent job not found; 已重新排队等待恢复"
+                item.progress = build_item_progress(item, {
+                    "status": "queued",
+                    "phase": "queued",
+                    "progress": item.progress or {},
+                    "error": item.error_reason,
+                })
+                item.pi_job_id = None
+                _record_pi_metadata(
+                    item,
+                    pi_recover_reason="job_not_found_waiting_resubmit",
+                    pi_last_seen_status="missing",
+                    pi_last_seen_at=isoformat_local(now_local()),
+                )
+                changed = True
+                continue
             changed = True
-            continue
         new_status = map_pi_status(job.get("status"))
         new_phase = map_pi_phase(job.get("phase"), job.get("status"))
         new_progress = build_item_progress(item, job)
@@ -541,6 +740,7 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
         worker_url = await choose_pi_worker(db, task.id, item.sequence_no)
         metadata = item.extra_metadata or {}
         metadata["pi_worker_url"] = worker_url
+        metadata["pi_idempotency_key"] = _pi_idempotency_key(task.id, item)
         if provider:
             metadata["llm_provider_key"] = _normalize_llm_provider_key(provider.get("provider_key"))
             metadata["llm_provider_model"] = _normalize_llm_provider_key(provider.get("model"))
@@ -558,36 +758,33 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
         db.flush()
 
         try:
-            job = await get_pi_client(worker_url).create_job({
-                "target": item.elf_path,
-                "output_dir": item.output_dir,
-                "batch_size": pi_cfg.batch_size,
-                "max_retries": pi_cfg.max_retries,
-                "timeout_seconds": item_timeout_seconds,
-                "timeout_retry_enabled": item_timeout_retry_enabled,
-                "timeout_max_retries": item_timeout_max_retries,
-                "model": job_model,
-                "functions": (item.extra_metadata or {}).get("file_list") or None,
-                "clean": True,
-                "engine": item_engine,
-                "concurrency": item_concurrency,
-            })
-            item.pi_job_id = job.get("id")
-            item.status = map_pi_status(job.get("status"))
-            item.phase = map_pi_phase(job.get("phase"), job.get("status"))
-            item.progress = build_item_progress(item, job)
-            if item.status == "running" and item.started_at is None:
-                item.started_at = now_local()
+            job = await _submit_or_reuse_pi_job(
+                item,
+                worker_url,
+                _pi_job_payload(
+                    item,
+                    pi_cfg=pi_cfg,
+                    job_model=job_model,
+                    timeout_seconds=item_timeout_seconds,
+                    timeout_retry_enabled=item_timeout_retry_enabled,
+                    timeout_max_retries=item_timeout_max_retries,
+                    engine=item_engine,
+                    concurrency=item_concurrency,
+                    clean=True,
+                ),
+            )
+            _apply_pi_job_to_item(db, item, job, worker_url=worker_url)
             get_observability().record_item_submit(item, worker_url)
         except Exception as exc:
             item.pi_job_id = None
-            item.status = "failed"
-            item.phase = "failed"
-            item.progress = build_item_progress(item, {"status": "failed", "phase": "failed", "progress": {}, "error": str(exc)})
-            item.failure_type = "pi-re-agent"
+            item.status = "queued" if isinstance(exc, ConflictError) else "failed"
+            item.phase = "queued" if isinstance(exc, ConflictError) else "failed"
+            item.progress = build_item_progress(item, {"status": item.status, "phase": item.phase, "progress": {}, "error": str(exc)})
+            item.failure_type = "upstream_conflict" if isinstance(exc, ConflictError) else _classify_pi_failure(str(exc))
             item.error_reason = str(exc)
-            item.finished_at = now_local()
-            get_observability().record_item_finished(item)
+            if item.status == "failed":
+                item.finished_at = now_local()
+                get_observability().record_item_finished(item)
     recompute_task_status(db, task)
     db.commit()
     get_observability().record_retry("rerun", len(items))
@@ -613,38 +810,51 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
         worker_url = await choose_pi_worker(db, task.id, item.sequence_no)
         metadata = item.extra_metadata or {}
         metadata["pi_worker_url"] = worker_url
+        metadata["pi_idempotency_key"] = _pi_idempotency_key(task.id, item)
         if provider:
             metadata["llm_provider_key"] = _normalize_llm_provider_key(provider.get("provider_key"))
             metadata["llm_provider_model"] = _normalize_llm_provider_key(provider.get("model"))
             metadata["llm_provider_display_name"] = str(provider.get("display_name") or "").strip() or None
             metadata["llm_provider_type"] = str(provider.get("provider_type") or "").strip() or None
         item.extra_metadata = metadata
-        job = await get_pi_client(worker_url).create_job({
-            "target": item.elf_path,
-            "output_dir": item.output_dir,
-            "batch_size": pi_cfg.batch_size,
-            "max_retries": pi_cfg.max_retries,
-            "timeout_seconds": item_timeout_seconds,
-            "timeout_retry_enabled": item_timeout_retry_enabled,
-            "timeout_max_retries": item_timeout_max_retries,
-            "model": job_model,
-            "functions": (item.extra_metadata or {}).get("file_list") or None,
-            "clean": True,
-            "engine": item_engine,
-            "concurrency": item_concurrency,
-        })
-        item.pi_job_id = job.get("id")
-        item.status = map_pi_status(job.get("status"))
-        item.phase = map_pi_phase(job.get("phase"), job.get("status"))
-        item.progress = build_item_progress(item, job)
+        item.status = "queued"
+        item.phase = "queued"
+        item.progress = build_item_progress(item, {"status": "queued", "phase": "queued", "progress": {}})
         item.failure_type = None
         item.error_reason = None
         item.generated_files = []
         item.started_at = None
         item.finished_at = None
-        if item.status == "running":
-            item.started_at = now_local()
-        get_observability().record_item_submit(item, worker_url)
+        try:
+            job = await _submit_or_reuse_pi_job(
+                item,
+                worker_url,
+                _pi_job_payload(
+                    item,
+                    pi_cfg=pi_cfg,
+                    job_model=job_model,
+                    timeout_seconds=item_timeout_seconds,
+                    timeout_retry_enabled=item_timeout_retry_enabled,
+                    timeout_max_retries=item_timeout_max_retries,
+                    engine=item_engine,
+                    concurrency=item_concurrency,
+                    clean=True,
+                ),
+            )
+            _apply_pi_job_to_item(db, item, job, worker_url=worker_url)
+            if item.status == "running":
+                item.started_at = now_local()
+            get_observability().record_item_submit(item, worker_url)
+        except Exception as exc:
+            item.pi_job_id = None
+            item.status = "queued" if isinstance(exc, ConflictError) else "failed"
+            item.phase = "queued" if isinstance(exc, ConflictError) else "failed"
+            item.progress = build_item_progress(item, {"status": item.status, "phase": item.phase, "progress": {}, "error": str(exc)})
+            item.failure_type = "upstream_conflict" if isinstance(exc, ConflictError) else _classify_pi_failure(str(exc))
+            item.error_reason = str(exc)
+            if item.status == "failed":
+                item.finished_at = now_local()
+                get_observability().record_item_finished(item)
     recompute_task_status(db, task)
     db.commit()
     get_observability().record_retry("retry", len(selected))
