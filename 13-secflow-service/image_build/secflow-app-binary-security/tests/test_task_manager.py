@@ -2176,7 +2176,15 @@ class TaskManagerTests(unittest.TestCase):
             item_key="m1",
             status="running",
         )
-        db = _ModelAwareDb(tasks=[task], stage_items=[item])
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="running",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item])
         cancelled: list[str] = []
 
         async def fake_write_task_metadata_async(*args, **kwargs):
@@ -2192,6 +2200,7 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual(["t1"], cancelled)
         self.assertEqual("cancelled", task.status)
+        self.assertEqual("cancelled", stage_run.status)
         self.assertEqual("cancelled", item.status)
 
     def test_cancel_task_holds_lock_during_async_cleanup(self):

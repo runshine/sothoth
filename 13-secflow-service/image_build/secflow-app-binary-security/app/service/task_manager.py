@@ -1367,6 +1367,13 @@ class TaskManager:
             for item in running_items:
                 item.status = "cancelled"
                 item.finished_at = _now()
+            active_stage_runs = db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.status.in_(["pending", "dispatching", "queued", "running"]),
+            ).all()
+            for stage_run in active_stage_runs:
+                stage_run.status = "cancelled"
+                stage_run.finished_at = stage_run.finished_at or _now()
             downstream_items = [item for item in running_items if item.downstream_task_id]
             metadata_path = Path(task.workspace_root) / "input" / "task-metadata.json"
             db.commit()
