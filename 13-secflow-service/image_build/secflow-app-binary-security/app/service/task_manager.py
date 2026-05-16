@@ -7132,7 +7132,87 @@ class TaskManager:
                 self._lightweight_stage_failure(item if isinstance(item, dict) else {"item": {}, "error": str(item)})
                 for item in cancelled_items[:10]
             ]
-        return compact
+        return self._fit_stage_output_summary_for_db(compact)
+
+    def _fit_stage_output_summary_for_db(self, compact: dict[str, Any], *, max_bytes: int = 32768) -> dict[str, Any]:
+        payload = dict(compact or {})
+
+        def encoded_size(value: dict[str, Any]) -> int:
+            return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
+
+        if encoded_size(payload) <= max_bytes:
+            return payload
+
+        items_preview = payload.get("items_preview")
+        if isinstance(items_preview, list):
+            shrunk_items: list[dict[str, Any]] = []
+            for item in items_preview:
+                if not isinstance(item, dict):
+                    continue
+                row = dict(item)
+                entries_preview = row.get("entries_preview")
+                if isinstance(entries_preview, list):
+                    row["entries_preview_count"] = len(entries_preview)
+                    row["entries_preview"] = entries_preview[:1]
+                shrunk_items.append(row)
+            payload["items_preview"] = shrunk_items[:5]
+            payload["items_preview_truncated_for_db"] = True
+        if encoded_size(payload) <= max_bytes:
+            return payload
+
+        for preview_key in ("failed_items_preview", "cancelled_items_preview"):
+            rows = payload.get(preview_key)
+            if isinstance(rows, list):
+                payload[f"{preview_key}_count"] = len(rows)
+                payload[preview_key] = rows[:3]
+        if encoded_size(payload) <= max_bytes:
+            return payload
+
+        scalar_allowlist = {
+            "summary_externalized",
+            "summary_file",
+            "status",
+            "sync_status",
+            "error",
+            "reason",
+            "failure_code",
+            "failure_category",
+            "failure_message",
+            "reclaimed",
+            "archive_blocked",
+            "waiting_manual_confirmation",
+            "success_count",
+            "failed_count",
+            "cancelled_count",
+            "entry_count",
+            "vuln_result_count",
+            "module_count",
+            "high_risk_module_count",
+            "medium_risk_module_count",
+            "low_risk_module_count",
+            "candidate_module_count",
+            "selected_module_count",
+            "total_items",
+            "success_items",
+            "failed_items_count",
+            "running_items",
+            "cancelled_items_count",
+            "skipped_items",
+            "item_count",
+            "items_truncated",
+            "failed_items_truncated",
+            "cancelled_items_truncated",
+            "status_synced",
+        }
+        fitted = {key: value for key, value in payload.items() if key in scalar_allowlist}
+        fitted["db_summary_truncated"] = True
+        if encoded_size(fitted) <= max_bytes:
+            return fitted
+
+        for verbose_key in ("error", "failure_message", "reason"):
+            if isinstance(fitted.get(verbose_key), str):
+                fitted[verbose_key] = str(fitted[verbose_key])[:1000]
+        return fitted
 
     def _persist_stage_run_output_summary(
         self,

@@ -628,6 +628,52 @@ class TaskManagerTests(unittest.TestCase):
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertIsNotNone(task.finished_at)
 
+    def test_stage_run_output_summary_db_payload_is_hard_capped(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/missing",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        huge_entries = [
+            {
+                "entry_key": f"e{i}",
+                "module_key": "m",
+                "module_name": "module",
+                "function_name": "func",
+                "function_description": "x" * 4000,
+                "entry_reason": "y" * 4000,
+                "taint_details": [{"name": "z" * 1000}],
+                "source_dir": "/data/source",
+            }
+            for i in range(20)
+        ]
+        summary = {
+            "status": "partial_success",
+            "items": [{"module_key": "m", "module_name": "module", "entries": huge_entries}],
+            "failed_items": [{"error": "boom" * 1000, "item": {"module_key": "m", "source_dir": "/data/source"}} for _ in range(20)],
+        }
+
+        compact = self.manager._compact_stage_output_summary_for_db(task, stage_run, summary, summary_file="/tmp/full.json")
+        encoded = json.dumps(compact, ensure_ascii=False, default=str).encode("utf-8")
+
+        self.assertLessEqual(len(encoded), 32768)
+        self.assertTrue(compact.get("items_preview_truncated_for_db") or compact.get("db_summary_truncated"))
+        self.assertEqual("/tmp/full.json", compact.get("summary_file"))
+
     def test_manual_delete_event_cleans_task_records_without_deleting_state_event(self):
         with tempfile.TemporaryDirectory() as tmp:
             engine = create_engine("sqlite:///:memory:")
