@@ -12,7 +12,7 @@ from app.service.task_manager import get_task_manager
 def _service_role() -> str:
     raw_role = os.environ.get("SECFLOW_BINARY_SECURITY_ROLE") or ""
     normalized = str(raw_role).strip().lower()
-    return normalized if normalized in {"api", "worker"} else "all"
+    return normalized if normalized in {"api", "worker", "reducer"} else "all"
 
 
 def collect_liveness() -> dict[str, Any]:
@@ -46,6 +46,23 @@ def _scheduler_readiness() -> tuple[bool, dict[str, Any]]:
     }
 
 
+def _reducer_readiness() -> tuple[bool, dict[str, Any]]:
+    scheduler_enabled = bool(get_config().scheduler.enabled)
+    runtime = get_task_manager().runtime_status()
+    loops = runtime.get("loops") if isinstance(runtime.get("loops"), dict) else {}
+    if not scheduler_enabled:
+        return True, {"enabled": False, "running": False, "loops": loops}
+
+    running = bool(runtime.get("running"))
+    reducer_alive = bool(loops.get("state_reducer"))
+    return running and reducer_alive, {
+        "enabled": True,
+        "running": running,
+        "loops": loops,
+        "missing_loops": [] if reducer_alive else ["state_reducer"],
+    }
+
+
 async def collect_readiness() -> dict[str, object]:
     role = _service_role()
     checks: dict[str, dict[str, Any]] = {
@@ -55,6 +72,9 @@ async def collect_readiness() -> dict[str, object]:
     if role in {"worker", "all"}:
         scheduler_ok, scheduler_detail = _scheduler_readiness()
         checks["scheduler"] = {"ok": scheduler_ok, "detail": scheduler_detail}
+    if role in {"reducer", "all"}:
+        reducer_ok, reducer_detail = _reducer_readiness()
+        checks["reducer"] = {"ok": reducer_ok, "detail": reducer_detail}
 
     status = "ready" if all(item.get("ok") for item in checks.values()) else "not_ready"
     return {

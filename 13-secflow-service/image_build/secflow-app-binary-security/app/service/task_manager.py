@@ -5134,6 +5134,7 @@ class TaskManager:
         action_loop_alive = bool(self._action_loop_task and not self._action_loop_task.done())
         archive_loop_alive = bool(self._archive_loop_task and not self._archive_loop_task.done())
         reconcile_loop_alive = bool(self._downstream_reconcile_task and not self._downstream_reconcile_task.done())
+        state_reducer_loop_alive = bool(self._state_reducer_loop_task and not self._state_reducer_loop_task.done())
         return {
             "running": self._running,
             "loops": {
@@ -5141,6 +5142,7 @@ class TaskManager:
                 "action_dispatch": action_loop_alive,
                 "archive_dispatch": archive_loop_alive,
                 "downstream_reconcile": reconcile_loop_alive,
+                "state_reducer": state_reducer_loop_alive,
             },
             "workers": {
                 "task_workers": len([task for task in self._workers.values() if not task.done()]),
