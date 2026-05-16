@@ -5210,9 +5210,16 @@ class TaskManager:
         return elapsed_seconds >= grace_seconds
 
     def _active_dispatch_count(self, db: Session) -> int:
+        now_value = _now()
         return int(
             db.query(func.count(BinarySecurityTask.id))
             .filter(BinarySecurityTask.status.in_(["dispatching", "running"]))
+            .filter(
+                or_(
+                    BinarySecurityTask.lease_expires_at.is_(None),
+                    BinarySecurityTask.lease_expires_at > now_value,
+                )
+            )
             .scalar()
             or 0
         )
@@ -5339,6 +5346,38 @@ class TaskManager:
                 BinarySecurityStageRun.task_id == task.id,
                 BinarySecurityStageRun.stage_name == stage_name,
             ).first()
+            active_items = db.query(BinarySecurityStageItem).filter(
+                BinarySecurityStageItem.task_id == task.id,
+                BinarySecurityStageItem.stage_name == stage_name,
+                BinarySecurityStageItem.status.in_(["pending", "queued", "running"]),
+            ).all()
+            has_downstream_refs = any(str(item.downstream_task_id or "").strip() for item in active_items)
+            queued_only = bool(active_items) and all(
+                str(item.status or "").strip().lower() in {"pending", "queued"}
+                for item in active_items
+            )
+            if queued_only or has_downstream_refs:
+                task.status = "pending" if queued_only else "running"
+                task.dispatcher_instance_id = None
+                task.dispatch_started_at = None
+                task.lease_expires_at = None
+                task.last_error = None
+                self._record_event(
+                    db,
+                    task,
+                    "running_execution_released",
+                    "运行实例心跳超时，已释放过期执行实例并保留阶段状态等待安全接管",
+                    level="warning",
+                    stage_name=stage_name,
+                    payload={
+                        "stage_name": stage_name,
+                        "queued_only": queued_only,
+                        "has_downstream_refs": has_downstream_refs,
+                        "active_item_count": len(active_items),
+                    },
+                )
+                reclaimed = True
+                continue
             if stage_run:
                 stage_run.status = "failed"
                 stage_run.finished_at = _now()
