@@ -46,10 +46,10 @@ class B2SDispatcher:
         cfg = get_config().pi_re_agent
         while not self._stopping.is_set():
             try:
+                if time.monotonic() - self._last_capacity_refresh >= max(1, cfg.capacity_refresh_seconds):
+                    await get_pi_cluster_monitor().refresh()
+                    self._last_capacity_refresh = time.monotonic()
                 if await self._acquire_lease():
-                    if time.monotonic() - self._last_capacity_refresh >= max(1, cfg.capacity_refresh_seconds):
-                        await get_pi_cluster_monitor().refresh()
-                        self._last_capacity_refresh = time.monotonic()
                     await self._dispatch_once()
             except Exception as exc:
                 logger.warning("B2S dispatcher tick failed: %s", exc, exc_info=True)
