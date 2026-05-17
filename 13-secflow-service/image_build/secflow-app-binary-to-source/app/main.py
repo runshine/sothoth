@@ -18,6 +18,7 @@ from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
 from app.model import get_engine, init_database
 from app.observability import get_observability
+from app.service.dispatcher import get_dispatcher
 from app.service.llm_provider import materialize_llm_provider
 from app.service.registry import get_registry_service
 
@@ -83,12 +84,14 @@ async def lifespan(_: FastAPI):
         verify_auth_service_or_exit()
         await materialize_llm_provider()
         await get_registry_service().start()
+        get_dispatcher().start()
     except Exception as exc:
         logger.exception("B2S服务启动失败: %s", exc)
         sys.exit(1)
     logger.info("SecFlow B2S后端适配服务启动成功")
     yield
     try:
+        await get_dispatcher().stop()
         await get_registry_service().stop()
     except Exception as exc:
         logger.warning("注销Menu注册中心失败: %s", exc)

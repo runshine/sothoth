@@ -118,6 +118,21 @@ class PiReAgentClient:
             return {"status": "already_terminal"}
         return _handle(resp)
 
+    async def capacity(self) -> dict:
+        try:
+            async with httpx.AsyncClient(timeout=self.config.worker_probe_timeout_seconds) as client:
+                resp = await client.get(
+                    f"{self.base_url.rstrip('/')}/capacity",
+                    headers=self._headers(),
+                )
+        except httpx.TimeoutException:
+            raise UpstreamError("pi-re-agent容量探测超时")
+        except httpx.ConnectError as exc:
+            raise UpstreamError(f"无法连接pi-re-agent容量接口: {exc}")
+        if resp.status_code == 404:
+            raise NotFoundError("pi-re-agent容量接口不存在")
+        return _handle(resp)
+
 
 def _handle(resp: httpx.Response) -> dict:
     if 200 <= resp.status_code < 300:

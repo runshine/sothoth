@@ -141,8 +141,6 @@ class TaskProviderResolutionTests(unittest.TestCase):
             mock.patch.object(task_service, "ensure_path_in_project", return_value=Path("/tmp/demo.elf")),
             mock.patch.object(task_service, "prepare_input_file", return_value=Path("/tmp/input/demo.elf")),
             mock.patch.object(task_service, "safe_output_dir", return_value=Path("/tmp/output")),
-            mock.patch.object(task_service, "choose_pi_worker", return_value="http://pi-worker"),
-            mock.patch.object(task_service, "get_pi_client", return_value=fake_pi),
             mock.patch.object(task_service, "_project_default_llm_provider_key", return_value="team_codex"),
             mock.patch.object(
                 task_service,
@@ -175,9 +173,11 @@ class TaskProviderResolutionTests(unittest.TestCase):
             response = asyncio.run(task_service.create_task(db, "p1", req, "tester"))
 
         self.assertEqual("task1", response.id)
-        self.assertEqual("team_codex/gpt-5.4", fake_pi.payloads[0]["model"])
-        self.assertTrue(fake_pi.payloads[0]["idempotency_key"].startswith("b2s:task1:"))
-        self.assertTrue(fake_pi.payloads[0]["idempotency_key"].endswith(":/tmp/input/demo.elf"))
+        self.assertEqual([], fake_pi.payloads)
+        self.assertEqual("pending", db.task_items[0].status)
+        self.assertEqual("pending", db.task_items[0].dispatch_status)
+        self.assertTrue(db.task_items[0].extra_metadata["pi_idempotency_key"].startswith("b2s:task1:"))
+        self.assertTrue(db.task_items[0].extra_metadata["pi_idempotency_key"].endswith(":/tmp/input/demo.elf"))
         self.assertEqual("team_codex", db.task_items[0].extra_metadata["llm_provider_key"])
         self.assertEqual("gpt-5.4", db.task_items[0].extra_metadata["llm_provider_model"])
 
@@ -203,8 +203,6 @@ class TaskProviderResolutionTests(unittest.TestCase):
         fake_pi = _FakePiClient()
 
         with (
-            mock.patch.object(task_service, "choose_pi_worker", return_value="http://pi-worker"),
-            mock.patch.object(task_service, "get_pi_client", return_value=fake_pi),
             mock.patch.object(task_service, "_project_default_llm_provider_key", return_value="team_codex"),
             mock.patch.object(
                 task_service,
@@ -236,12 +234,15 @@ class TaskProviderResolutionTests(unittest.TestCase):
         ):
             asyncio.run(task_service.retry_task(db, task, ["item1"]))
 
-        self.assertEqual("team_codex/gpt-5.4", fake_pi.payloads[0]["model"])
-        self.assertEqual("b2s:task1:item1:/tmp/demo.elf", fake_pi.payloads[0]["idempotency_key"])
+        self.assertEqual([], fake_pi.payloads)
+        self.assertEqual("pending", item.status)
+        self.assertEqual("pending", item.dispatch_status)
+        self.assertEqual("b2s:task1:item1:/tmp/demo.elf", item.extra_metadata["pi_idempotency_key"])
+        self.assertTrue(item.extra_metadata["dispatch_clean"])
         self.assertEqual("team_codex", item.extra_metadata["llm_provider_key"])
         self.assertEqual("gpt-5.4", item.extra_metadata["llm_provider_model"])
 
-    def test_create_task_reuses_existing_pi_job_conflict(self):
+    def test_dispatch_item_reuses_existing_pi_job_conflict(self):
         db = _FakeDb()
         fake_pi = _FakePiClient(response={
             "_conflict": True,
@@ -253,19 +254,21 @@ class TaskProviderResolutionTests(unittest.TestCase):
                 "progress": {},
             },
         })
-        req = TaskCreate(
+        item = B2STaskItem(
+            id="item1",
             task_id="task1",
-            name="demo",
-            elf_tasks=[ElfTaskInput(elf_path="/tmp/demo.elf")],
+            project_id="p1",
+            sequence_no=1,
+            elf_path="/tmp/input/demo.elf",
+            output_dir="/tmp/output",
+            status="pending",
         )
+        item.extra_metadata = {"concurrency": 4, "engine": "hybrid", "llm_provider_model": "team_codex/gpt-5.4"}
+        db.task_items.append(item)
 
         with (
-            mock.patch.object(task_service, "ensure_path_in_project", return_value=Path("/tmp/demo.elf")),
-            mock.patch.object(task_service, "prepare_input_file", return_value=Path("/tmp/input/demo.elf")),
-            mock.patch.object(task_service, "safe_output_dir", return_value=Path("/tmp/output")),
             mock.patch.object(task_service, "choose_pi_worker", return_value="http://pi-worker"),
             mock.patch.object(task_service, "get_pi_client", return_value=fake_pi),
-            mock.patch.object(task_service, "_project_default_llm_provider_key", return_value=None),
             mock.patch.object(
                 task_service,
                 "get_config",
@@ -284,12 +287,15 @@ class TaskProviderResolutionTests(unittest.TestCase):
                 ),
             ),
         ):
-            asyncio.run(task_service.create_task(db, "p1", req, "tester"))
+            asyncio.run(task_service.dispatch_item_to_pi(db, item, owner_id="test-owner"))
 
-        item = db.task_items[0]
         self.assertEqual("job-existing", item.pi_job_id)
         self.assertEqual("running", item.status)
         self.assertEqual("reuse_active_target_job", item.extra_metadata["pi_recover_reason"])
+        self.assertEqual("dispatched", item.dispatch_status)
+        self.assertEqual("team_codex/gpt-5.4", fake_pi.payloads[0]["model"])
+        self.assertEqual("b2s:task1:item1:/tmp/input/demo.elf", fake_pi.payloads[0]["idempotency_key"])
+        self.assertEqual(4, fake_pi.payloads[0]["concurrency"])
 
 
 if __name__ == "__main__":

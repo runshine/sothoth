@@ -17,7 +17,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-pi-re-agent
-        image: ghcr.io/skiyer/pi-re-agent:sha-94435df
+        image: ghcr.io/skiyer/pi-re-agent:sha-bb27573
         imagePullPolicy: Always
         command: ["pi-re-server"]
         args: ["--host", "0.0.0.0", "--port", "8000"]
@@ -36,7 +36,7 @@ spec:
             fieldRef:
               fieldPath: metadata.name
         - name: PI_RE_MAX_CONCURRENT_JOBS
-          value: "2"
+          value: "3"
         - name: PI_RE_LEASE_SECONDS
           value: "120"
         - name: PI_RE_HEARTBEAT_SECONDS

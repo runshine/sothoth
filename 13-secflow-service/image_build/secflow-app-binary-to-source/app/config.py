@@ -59,6 +59,17 @@ class PiReAgentConfig(BaseModel):
     worker_urls: list[str] = Field(default_factory=list)
     api_key: Optional[str] = None
     timeout: int = 30
+    discovery_mode: Literal["static", "k8s_headless"] = "k8s_headless"
+    discovery_service_name: str = "secflow-pi-re-agent-headless"
+    discovery_namespace: str = "secflow-ns"
+    discovery_port: int = 8000
+    capacity_refresh_seconds: int = 10
+    dispatch_interval_seconds: int = 2
+    queued_buffer_per_worker: int = 1
+    worker_probe_timeout_seconds: int = 5
+    max_dispatch_batch_size: int = 16
+    default_worker_max_concurrent_jobs: int = 3
+    dispatcher_lease_seconds: int = 15
     batch_size: int = 8192
     max_retries: int = 3
     agent_run_timeout_seconds: int = 3600

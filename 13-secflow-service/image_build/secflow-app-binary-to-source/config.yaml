@@ -32,6 +32,17 @@ pi_re_agent:
   worker_urls: []
   api_key: null
   timeout: 30
+  discovery_mode: "k8s_headless"
+  discovery_service_name: "secflow-pi-re-agent-headless"
+  discovery_namespace: "secflow-ns"
+  discovery_port: 8000
+  capacity_refresh_seconds: 10
+  dispatch_interval_seconds: 2
+  queued_buffer_per_worker: 1
+  worker_probe_timeout_seconds: 5
+  max_dispatch_batch_size: 16
+  default_worker_max_concurrent_jobs: 3
+  dispatcher_lease_seconds: 15
   batch_size: 8192
   max_retries: 3
   engine: "hybrid"

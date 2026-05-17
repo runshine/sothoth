@@ -127,6 +127,7 @@ def _build_snapshot_lines() -> list[str]:
 
 
 def _snapshot_lines(db: Session) -> list[str]:
+    from app.service.pi_cluster import get_pi_cluster_monitor
     from app.service.task_service import (
         build_overall_progress,
         build_task_item_review_analytics,
@@ -136,6 +137,7 @@ def _snapshot_lines(db: Session) -> list[str]:
     )
 
     lines: list[str] = []
+    cluster_snapshot = get_pi_cluster_monitor()._snapshot
     tasks = db.query(B2STask).all()
     items = db.query(B2STaskItem).all()
 
@@ -174,6 +176,16 @@ def _snapshot_lines(db: Session) -> list[str]:
         lines.append(f'secflow_binary_to_source_error_type{{error_type="{error_type}"}} {count}')
     for worker_url, count in sorted(worker_loads.items()):
         lines.append(f'secflow_binary_to_source_worker_load{{worker="{worker_url}"}} {count}')
+    lines.append(f"secflow_binary_to_source_pi_cluster_capacity {cluster_snapshot.total_capacity}")
+    lines.append(f"secflow_binary_to_source_pi_cluster_workers {cluster_snapshot.worker_count}")
+    lines.append(f"secflow_binary_to_source_pi_cluster_running_jobs {cluster_snapshot.running_jobs}")
+    lines.append(f"secflow_binary_to_source_pi_cluster_queued_jobs {cluster_snapshot.queued_jobs}")
+    lines.append(f"secflow_binary_to_source_pi_cluster_available_slots {cluster_snapshot.available_slots}")
+    for worker in cluster_snapshot.workers:
+        labels = f'worker="{worker.worker_id}",url="{worker.url}",source="{worker.source}"'
+        lines.append(f"secflow_binary_to_source_pi_worker_capacity{{{labels}}} {worker.max_concurrent_jobs}")
+        lines.append(f"secflow_binary_to_source_pi_worker_running_jobs{{{labels}}} {worker.running_jobs}")
+        lines.append(f"secflow_binary_to_source_pi_worker_queued_jobs{{{labels}}} {worker.queued_jobs}")
 
     overall = build_overall_progress(items)
     lines.append(f"secflow_binary_to_source_overall_progress_percent {_safe_float(overall.percent)}")

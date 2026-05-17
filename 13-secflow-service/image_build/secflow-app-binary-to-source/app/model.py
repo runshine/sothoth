@@ -57,6 +57,12 @@ class B2STaskItem(Base):
     output_dir = Column(Text, nullable=False)
     pi_job_id = Column(String(64), nullable=True, index=True)
     status = Column(String(32), nullable=False, default="pending", index=True)
+    dispatch_status = Column(String(32), nullable=True, index=True)
+    dispatch_attempts = Column(Integer, nullable=False, default=0)
+    last_dispatch_at = Column(DateTime, nullable=True)
+    next_dispatch_at = Column(DateTime, nullable=True)
+    scheduler_owner = Column(String(128), nullable=True, index=True)
+    scheduler_lease_until = Column(DateTime, nullable=True)
     phase = Column(String(32), nullable=True)
     progress_json = Column(Text, nullable=True)
     failure_type = Column(String(64), nullable=True)
@@ -91,6 +97,15 @@ class B2STaskItem(Base):
     @progress.setter
     def progress(self, value: dict[str, Any] | None) -> None:
         self.progress_json = json.dumps(value or {}, ensure_ascii=False)
+
+
+class B2SDispatchLease(Base):
+    __tablename__ = "secflow_b2s_dispatch_lease"
+
+    lease_name = Column(String(64), primary_key=True)
+    owner_id = Column(String(128), nullable=False)
+    lease_until = Column(DateTime, nullable=False, index=True)
+    renewed_at = Column(DateTime, default=now_local, nullable=False)
 
 
 class B2SProjectConfig(Base):
@@ -162,6 +177,18 @@ def _ensure_task_item_progress_columns(engine) -> None:
         statements.append(f"ALTER TABLE {table_name} ADD COLUMN phase VARCHAR(32) NULL")
     if "progress_json" not in columns:
         statements.append(f"ALTER TABLE {table_name} ADD COLUMN progress_json TEXT NULL")
+    if "dispatch_status" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN dispatch_status VARCHAR(32) NULL")
+    if "dispatch_attempts" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN dispatch_attempts INTEGER NOT NULL DEFAULT 0")
+    if "last_dispatch_at" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN last_dispatch_at DATETIME NULL")
+    if "next_dispatch_at" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN next_dispatch_at DATETIME NULL")
+    if "scheduler_owner" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN scheduler_owner VARCHAR(128) NULL")
+    if "scheduler_lease_until" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN scheduler_lease_until DATETIME NULL")
     with engine.begin() as conn:
         for statement in statements:
             conn.exec_driver_sql(statement)
