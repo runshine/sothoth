@@ -3703,7 +3703,7 @@ class TaskManager:
     async def _apply_state_event_locked(self, db: Session, event: BinarySecurityStateEvent) -> None:
         payload = dict(event.payload or {})
         if event.event_type == "archive_job_copied":
-            await self._apply_archive_job_status_locked(db, event.archive_job_id or "", payload.get("archive_root"))
+            await self._apply_archive_job_status_locked(db, event.archive_job_id or "", payload.get("archive_root"), state_event_id=event.id)
             return
         if event.event_type == "archive_job_copy_failed":
             self._apply_archive_job_copy_failed_locked(db, event)
@@ -3746,6 +3746,24 @@ class TaskManager:
         if task is None or item is None:
             return
         payload = dict(event.payload or {})
+        if task.status == "cancelled":
+            self._record_event(
+                db,
+                task,
+                "downstream_status_event_ignored",
+                "下游状态事件晚于取消事件到达，已忽略以避免恢复已取消任务",
+                level="warning",
+                stage_name=item.stage_name,
+                item=item,
+                payload={
+                    "state_event_id": event.id,
+                    "downstream_service": item.downstream_service,
+                    "downstream_task_id": item.downstream_task_id,
+                    "ignored_status": payload.get("mapped_status") or payload.get("downstream_status"),
+                },
+            )
+            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+            return
         mapped_status = str(payload.get("mapped_status") or "").strip()
         if not mapped_status:
             return
@@ -4610,6 +4628,13 @@ class TaskManager:
                 job.completed_at = _now()
                 db.commit()
                 return None, job.error_message
+            if task.status == "cancelled":
+                job.archive_status = "failed"
+                job.error_message = "任务已取消，跳过归档复制"
+                job.completed_at = _now()
+                job.updated_at = _now()
+                db.commit()
+                return None, job.error_message
             payload = dict(job.payload or {})
             archived_dir = self._archive_downstream_output(
                 db,
@@ -4671,13 +4696,41 @@ class TaskManager:
             payload={"archive_root": archived_root, "source": "compat_apply_request"},
         )
 
-    async def _apply_archive_job_status_locked(self, db: Session, job_id: str, archived_root: str | None) -> None:
+    async def _apply_archive_job_status_locked(
+        self,
+        db: Session,
+        job_id: str,
+        archived_root: str | None,
+        *,
+        state_event_id: str | None = None,
+    ) -> None:
         job = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.id == job_id).first()
         if job is None or job.archive_status not in {"archived", "running", "applying", "success"}:
             return
         task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == job.task_id).first()
         item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == job.item_id).first()
         if task is None or item is None:
+            return
+        if task.status == "cancelled":
+            job.archive_status = "success"
+            job.error_message = None
+            job.completed_at = job.completed_at or _now()
+            job.updated_at = _now()
+            self._record_event(
+                db,
+                task,
+                "downstream_archive_job_ignored",
+                "归档完成事件晚于取消事件到达，已忽略以避免恢复已取消任务",
+                level="warning",
+                stage_name=item.stage_name,
+                item=item,
+                payload={
+                    "archive_job_id": job.id,
+                    "state_event_id": state_event_id,
+                    "archive_root": archived_root or job.archive_root,
+                },
+            )
+            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
             return
         try:
             payload = dict(job.payload or {})

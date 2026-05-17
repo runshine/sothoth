@@ -628,6 +628,76 @@ class TaskManagerTests(unittest.TestCase):
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertIsNotNone(task.finished_at)
 
+    def test_downstream_status_event_does_not_resurrect_cancelled_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = create_engine("sqlite:///:memory:")
+            Base.metadata.create_all(engine)
+            SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+            db = SessionLocal()
+            try:
+                task = BinarySecurityTask(
+                    id="t1",
+                    project_id="p1",
+                    name="binary",
+                    status="cancelled",
+                    task_type=TASK_TYPE_BINARY,
+                    current_stage="entry_analysis",
+                    firmware_source="project_filesystem",
+                    firmware_path="/fw",
+                    output_root=str(Path(tmp) / "output"),
+                    workspace_root=tmp,
+                    finished_at=_now(),
+                )
+                stage_run = BinarySecurityStageRun(
+                    id="sr1",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_name="entry_analysis",
+                    sequence_no=4,
+                    status="cancelled",
+                    finished_at=_now(),
+                )
+                item = BinarySecurityStageItem(
+                    id="si1",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_run_id="sr1",
+                    stage_name="entry_analysis",
+                    item_key="module-a",
+                    status="cancelled",
+                    downstream_service="entry_analyse",
+                    downstream_task_id="eat1",
+                    finished_at=_now(),
+                )
+                event = BinarySecurityStateEvent(
+                    id="sev-late-downstream",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_name="entry_analysis",
+                    item_id="si1",
+                    event_type="downstream_status_observed",
+                    idempotency_key="sev-late-downstream",
+                    status="processing",
+                    available_at=_now(),
+                )
+                event.payload = {
+                    "mapped_status": "running",
+                    "downstream_status": "running",
+                    "downstream_payload": {"status": "running"},
+                }
+                db.add_all([task, stage_run, item, event])
+                db.commit()
+
+                asyncio.run(self.manager._apply_downstream_status_event_locked(db, event))
+                db.commit()
+
+                self.assertEqual("cancelled", task.status)
+                self.assertEqual("cancelled", stage_run.status)
+                self.assertEqual("cancelled", item.status)
+                self.assertTrue(any(row.event_type == "downstream_status_event_ignored" for row in db.query(BinarySecurityEvent).all()))
+            finally:
+                db.close()
+
     def test_stage_run_output_summary_db_payload_is_hard_capped(self):
         task = BinarySecurityTask(
             id="t1",
