@@ -3663,20 +3663,26 @@ class TaskManager:
             if event is None:
                 result = "missing_after_apply"
                 return
+            event_type = event.event_type
+            task_id = event.task_id
             event.status = "processed"
             event.processed_at = _now()
             event.leased_by = None
             event.lease_expires_at = None
             event.error_message = None
             event.updated_at = _now()
-            observe_state_event_lag(event.event_type, (_now() - event.created_at).total_seconds() if event.created_at else None)
-            observe_state_reducer_event(event.event_type, "processed")
+            observe_state_event_lag(event_type, (_now() - event.created_at).total_seconds() if event.created_at else None)
+            observe_state_reducer_event(event_type, "processed")
+            if event_type == "manual_delete_requested":
+                db.query(BinarySecurityStateEvent).filter(
+                    BinarySecurityStateEvent.task_id == task_id,
+                ).delete(synchronize_session=False)
             result = "success"
             db.commit()
-            if event.event_type == "manual_blocking_action_requested":
-                self._enqueue_action(event.task_id)
-            if event.event_type == "manual_module_selection_confirmed":
-                self._enqueue_task(event.task_id)
+            if event_type == "manual_blocking_action_requested":
+                self._enqueue_action(task_id)
+            if event_type == "manual_module_selection_confirmed":
+                self._enqueue_task(task_id)
         except Exception as exc:
             db.rollback()
             result = "failed"
@@ -4221,7 +4227,10 @@ class TaskManager:
                     BinarySecurityStageItem.created_at,
                 )
             ).filter(BinarySecurityStageItem.task_id == task.id).all()
-            downstream_refs = self._collect_downstream_refs(task, items)
+            downstream_refs = self._dedupe_downstream_refs(
+                self._collect_downstream_refs(task, items)
+                + self._discover_parent_linked_downstream_refs(db, task)
+            )
             for item in items:
                 if item.status in {"pending", "queued", "running"}:
                     item.status = "cancelled"
@@ -8639,6 +8648,92 @@ class TaskManager:
                     "stage_name": _stage_item_attr(item, "stage_name"),
                 }
             )
+        return refs
+
+    def _dedupe_downstream_refs(self, refs: list[dict[str, str]]) -> list[dict[str, str]]:
+        unique: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for ref in refs:
+            service = str(ref.get("service") or "").strip()
+            task_id = str(ref.get("task_id") or "").strip()
+            if not service or not task_id:
+                continue
+            key = (service, task_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append({**ref, "service": service, "task_id": task_id})
+        return unique
+
+    def _discover_parent_linked_downstream_refs(self, db: Session, task: BinarySecurityTask) -> list[dict[str, str]]:
+        """Find old child tasks that are no longer referenced by current stage items."""
+        candidates = [
+            ("firmware_unpacker", "secflow_app_firmware_unpacker_unpack_tasks", "id", "parent_task_id", "parent_stage_name"),
+            ("binary_to_source", "secflow_b2s_task", "id", "parent_task_id", "parent_stage_name"),
+            ("system_analyse", "secflow_app_sa_tasks", "task_id", "parent_task_id", "parent_stage_name"),
+            ("entry_analyse", "secflow_app_ea_tasks", "task_id", "parent_task_id", "parent_stage_name"),
+            ("dataflow_analyse", "secflow_app_dfa_tasks", "task_id", "parent_task_id", "parent_stage_name"),
+            ("dataflow_vuln_scanner", "secflow_dataflow_vuln_scanner_run_index", "id", "linked_task_id", None),
+        ]
+        refs: list[dict[str, str]] = []
+        for service, table_name, task_id_column, parent_column, stage_column in candidates:
+            try:
+                column_rows = db.execute(
+                    text(
+                        """
+                        SELECT column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = DATABASE()
+                          AND table_name = :table_name
+                          AND (
+                            column_name = :task_id_column
+                            OR column_name = :parent_column
+                            OR column_name = :stage_column
+                          )
+                        """
+                    ),
+                    {
+                        "table_name": table_name,
+                        "task_id_column": task_id_column,
+                        "parent_column": parent_column,
+                        "stage_column": stage_column or "",
+                    },
+                ).fetchall()
+                available_columns = {str(row[0]) for row in column_rows}
+                if task_id_column not in available_columns or parent_column not in available_columns:
+                    continue
+                select_stage = f"`{stage_column}`" if stage_column and stage_column in available_columns else "NULL"
+                rows = db.execute(
+                    text(
+                        f"""
+                        SELECT `{task_id_column}` AS task_id, {select_stage} AS stage_name
+                        FROM `{table_name}`
+                        WHERE `{parent_column}` = :parent_task_id
+                        """
+                    ),
+                    {"parent_task_id": task.id},
+                ).fetchall()
+            except Exception:
+                logger.debug(
+                    "failed to discover parent-linked downstream refs: service=%s table=%s task_id=%s",
+                    service,
+                    table_name,
+                    task.id,
+                    exc_info=True,
+                )
+                continue
+            for row in rows:
+                downstream_task_id = str(row[0] or "").strip()
+                if not downstream_task_id:
+                    continue
+                refs.append(
+                    {
+                        "service": service,
+                        "task_id": downstream_task_id,
+                        "project_id": task.project_id,
+                        "stage_name": str(row[1] or "") or None,
+                    }
+                )
         return refs
 
     def _downstream_refs_for_stages(

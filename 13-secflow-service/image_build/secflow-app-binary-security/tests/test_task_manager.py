@@ -812,6 +812,157 @@ class TaskManagerTests(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_manual_delete_reducer_cleans_state_events_after_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = create_engine("sqlite:///:memory:")
+            Base.metadata.create_all(engine)
+            SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+            db = SessionLocal()
+            try:
+                task = BinarySecurityTask(
+                    id="t1",
+                    project_id="p1",
+                    name="source",
+                    status="cancelled",
+                    task_type=TASK_TYPE_SOURCE,
+                    current_stage="entry_analysis",
+                    firmware_source="project_filesystem",
+                    firmware_path="/src",
+                    output_root=str(Path(tmp) / "output"),
+                    workspace_root=tmp,
+                    started_at=_now(),
+                )
+                delete_event = BinarySecurityStateEvent(
+                    id="sev-delete",
+                    task_id="t1",
+                    project_id="p1",
+                    event_type="manual_delete_requested",
+                    idempotency_key="sev-delete",
+                    status="processing",
+                    leased_by=self.manager.instance_id,
+                    available_at=_now(),
+                )
+                delete_event.payload = {}
+                old_event = BinarySecurityStateEvent(
+                    id="sev-old",
+                    task_id="t1",
+                    project_id="p1",
+                    event_type="archive_job_copied",
+                    idempotency_key="sev-old",
+                    status="processed",
+                    available_at=_now(),
+                )
+                old_event.payload = {}
+                db.add_all([task, delete_event, old_event])
+                db.commit()
+            finally:
+                db.close()
+
+            original_session_factory = task_manager_module.get_session_factory
+            task_manager_module.get_session_factory = lambda: SessionLocal
+            try:
+                asyncio.run(self.manager._reduce_state_event("sev-delete"))
+            finally:
+                task_manager_module.get_session_factory = original_session_factory
+
+            db = SessionLocal()
+            try:
+                self.assertEqual(0, db.query(BinarySecurityTask).filter(BinarySecurityTask.id == "t1").count())
+                self.assertEqual(0, db.query(BinarySecurityStateEvent).filter(BinarySecurityStateEvent.task_id == "t1").count())
+                self.assertEqual(0, db.query(BinarySecurityTaskStateLease).filter(BinarySecurityTaskStateLease.task_id == "t1").count())
+            finally:
+                db.close()
+
+    def test_manual_delete_cleans_parent_linked_downstream_refs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = create_engine("sqlite:///:memory:")
+            Base.metadata.create_all(engine)
+            SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+            db = SessionLocal()
+            cancelled_refs: list[dict[str, str]] = []
+            deleted_refs: list[dict[str, str]] = []
+            original_discover = self.manager._discover_parent_linked_downstream_refs
+            original_cancel = self.manager._cancel_downstream_refs
+            original_delete = self.manager._delete_downstream_refs
+            try:
+                task = BinarySecurityTask(
+                    id="t1",
+                    project_id="p1",
+                    name="binary",
+                    status="cancelled",
+                    task_type=TASK_TYPE_BINARY,
+                    current_stage="firmware_unpack",
+                    firmware_source="project_filesystem",
+                    firmware_path="/fw",
+                    output_root=str(Path(tmp) / "output"),
+                    workspace_root=tmp,
+                    started_at=_now(),
+                )
+                db.add(task)
+                db.add(
+                    BinarySecurityStageRun(
+                        id="sr-current",
+                        task_id="t1",
+                        project_id="p1",
+                        stage_name="firmware_unpack",
+                        sequence_no=1,
+                        status="success",
+                    )
+                )
+                db.add(
+                    BinarySecurityStageItem(
+                        id="si-current",
+                        task_id="t1",
+                        project_id="p1",
+                        stage_run_id="sr-current",
+                        stage_name="firmware_unpack",
+                        item_key="fw",
+                        downstream_service="firmware_unpacker",
+                        downstream_task_id="fw-current",
+                        status="success",
+                    )
+                )
+                event = BinarySecurityStateEvent(
+                    id="sev-delete",
+                    task_id="t1",
+                    project_id="p1",
+                    event_type="manual_delete_requested",
+                    idempotency_key="sev-delete",
+                    status="processing",
+                    available_at=_now(),
+                )
+                event.payload = {}
+                db.add(event)
+                db.commit()
+
+                self.manager._discover_parent_linked_downstream_refs = lambda _db, _task: [
+                    {"service": "firmware_unpacker", "task_id": "fw-current", "project_id": "p1", "stage_name": "firmware_unpack"},
+                    {"service": "firmware_unpacker", "task_id": "fw-orphan", "project_id": "p1", "stage_name": "firmware_unpack"},
+                ]
+
+                async def fake_cancel(_db, _task, refs, _token):
+                    cancelled_refs.extend(refs)
+                    return len(refs)
+
+                async def fake_delete(_db, _task, refs, _token):
+                    deleted_refs.extend(refs)
+                    return len(refs)
+
+                self.manager._cancel_downstream_refs = fake_cancel
+                self.manager._delete_downstream_refs = fake_delete
+
+                asyncio.run(self.manager._apply_manual_delete_request_locked(db, event))
+                db.commit()
+
+                self.assertEqual(["fw-current", "fw-orphan"], [ref["task_id"] for ref in cancelled_refs])
+                self.assertEqual(["fw-current", "fw-orphan"], [ref["task_id"] for ref in deleted_refs])
+                self.assertEqual(0, db.query(BinarySecurityTask).filter(BinarySecurityTask.id == "t1").count())
+            finally:
+                self.manager._discover_parent_linked_downstream_refs = original_discover
+                self.manager._cancel_downstream_refs = original_cancel
+                self.manager._delete_downstream_refs = original_delete
+                db.close()
+
     def test_task_summary_falls_back_to_db_before_workspace_is_available(self):
         task = BinarySecurityTask(
             id="t1",
