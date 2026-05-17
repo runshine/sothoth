@@ -107,6 +107,8 @@ class TaskItemResponse(BaseModel):
     progress: Optional[B2SProgress] = None
     failure_type: Optional[str] = None
     error_reason: Optional[str] = None
+    pi_job_id: Optional[str] = None
+    pi_worker_url: Optional[str] = None
     generated_files: list[str] = Field(default_factory=list)
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None

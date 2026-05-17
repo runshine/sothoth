@@ -1368,6 +1368,8 @@ def build_task_detail(db: Session, task: B2STask) -> TaskDetailResponse:
             progress=i.progress or None,
             failure_type=i.failure_type,
             error_reason=i.error_reason,
+            pi_job_id=i.pi_job_id,
+            pi_worker_url=str((i.extra_metadata or {}).get("pi_worker_url") or (i.extra_metadata or {}).get("pi_endpoint_url") or "") or None,
             generated_files=normalize_generated_files(i),
             started_at=i.started_at,
             finished_at=i.finished_at,
