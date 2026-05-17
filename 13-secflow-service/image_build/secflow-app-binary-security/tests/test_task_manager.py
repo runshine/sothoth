@@ -4499,6 +4499,66 @@ class TaskManagerTests(unittest.TestCase):
             event_types = [getattr(event, "event_type", "") for event in db.added if isinstance(event, BinarySecurityEvent)]
             self.assertIn("system_analysis_no_candidate_modules", event_types)
 
+    def test_stage_system_analysis_preserves_downstream_failure_when_no_modules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="binary-task",
+                status="running",
+                task_type=TASK_TYPE_BINARY,
+                current_stage="system_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            task.policy = {}
+            task.summary = {
+                "firmware_unpack_results": [
+                    {
+                        "firmware_key": "fw1",
+                        "firmware_name": "fw1",
+                        "filename": "fw1",
+                        "unpacked_root": str(workspace / "fw1"),
+                    }
+                ]
+            }
+            stage_run = BinarySecurityStageRun(
+                id="sr1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="system_analysis",
+                sequence_no=1,
+                status="running",
+            )
+            db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run])
+
+            original_prepare = self.manager._prepare_stage_items_for_execution
+            original_run_stage_pool = self.manager._run_stage_pool
+            self.manager._prepare_stage_items_for_execution = lambda *args, **kwargs: None
+
+            async def fake_run_stage_pool(current_task, items, concurrency, runner, retries=0, initial_retry=False):
+                del current_task, items, concurrency, runner, retries, initial_retry
+                return [{"status": "failed", "item": {"firmware_key": "fw1", "filename": "fw1"}, "error": "401 Authentication Error"}]
+
+            self.manager._run_stage_pool = fake_run_stage_pool
+            try:
+                status, summary = asyncio.run(
+                    self.manager._stage_system_analysis(db, task, stage_run, token=None, retry_existing=False)
+                )
+            finally:
+                self.manager._prepare_stage_items_for_execution = original_prepare
+                self.manager._run_stage_pool = original_run_stage_pool
+
+            self.assertEqual("failed", status)
+            self.assertEqual("401 Authentication Error", summary["error"])
+            self.assertNotIn("failure_code", summary)
+            self.assertNotEqual(task_manager_module.NO_CANDIDATE_MODULES_FAILURE_MESSAGE, task.last_error)
+            event_types = [getattr(event, "event_type", "") for event in db.added if isinstance(event, BinarySecurityEvent)]
+            self.assertNotIn("system_analysis_no_candidate_modules", event_types)
+
     def test_refresh_system_analysis_stage_from_synced_items_marks_no_candidate_modules_as_business_failed(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -4562,6 +4622,55 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual("no_candidate_modules", stage_run.output_summary["failure_code"])
             event_types = [getattr(event, "event_type", "") for event in db.added if isinstance(event, BinarySecurityEvent)]
             self.assertIn("system_analysis_no_candidate_modules", event_types)
+
+    def test_refresh_system_analysis_stage_preserves_failed_item_reason_when_no_modules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            output_root = workspace / "output"
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="binary-task",
+                status="running",
+                task_type=TASK_TYPE_BINARY,
+                current_stage="system_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(output_root),
+                workspace_root=str(workspace),
+            )
+            task.policy = {}
+            stage_run = BinarySecurityStageRun(
+                id="sr1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="system_analysis",
+                sequence_no=1,
+                status="running",
+            )
+            item = BinarySecurityStageItem(
+                id="si1",
+                task_id="t1",
+                project_id="p1",
+                stage_run_id="sr1",
+                stage_name="system_analysis",
+                item_key="fw1",
+                item_name="fw1",
+                status="failed",
+                downstream_service="system_analyse",
+                downstream_task_id="sat1",
+                error_message="401 Authentication Error",
+            )
+            db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item])
+
+            self.manager._refresh_system_analysis_stage_from_synced_items(db, task)
+
+            self.assertEqual("failed", stage_run.status)
+            self.assertEqual("401 Authentication Error", stage_run.last_error)
+            self.assertNotIn("failure_code", task.summary)
+            self.assertNotIn("failure_code", stage_run.output_summary)
+            event_types = [getattr(event, "event_type", "") for event in db.added if isinstance(event, BinarySecurityEvent)]
+            self.assertNotIn("system_analysis_no_candidate_modules", event_types)
 
     def test_stage_system_analysis_success_clears_stale_failure_fields(self):
         task = BinarySecurityTask(

@@ -7855,7 +7855,8 @@ class TaskManager:
                     stage_name="system_analysis",
                     payload={"candidate_module_count": len(candidate_modules)},
                 )
-        if status in {"success", "partial_success"} and not candidate_modules:
+        no_candidate_modules_failure = status == "success" and not failed and not candidate_modules
+        if no_candidate_modules_failure:
             failure = _no_candidate_modules_failure()
             status = "failed"
             failed = failed or [{"status": "failed", **failure}]
@@ -7868,7 +7869,7 @@ class TaskManager:
                 "candidate_modules": candidate_modules,
                 "selected_modules": selected_modules,
                 "high_risk_modules": selected_modules,
-                **(_no_candidate_modules_failure() if status == "failed" and not candidate_modules else {}),
+                **(_no_candidate_modules_failure() if no_candidate_modules_failure else {}),
             }
         )
         task.summary = summary
@@ -7881,7 +7882,7 @@ class TaskManager:
         stage_run.started_at = stage_run.started_at or _now()
         stage_run.counts = self._stage_counts(db, stage_run)
         stage_run.last_error = failed[0].get("error") if failed and status == "failed" else None
-        if status == "failed" and stage_run.last_error == NO_CANDIDATE_MODULES_FAILURE_MESSAGE:
+        if no_candidate_modules_failure and stage_run.last_error == NO_CANDIDATE_MODULES_FAILURE_MESSAGE:
             task.last_error = stage_run.last_error
             self._record_event(
                 db,
@@ -7909,7 +7910,7 @@ class TaskManager:
                 "status_synced": True,
                 "sync_status": stage_run.status,
                 "error": stage_run.last_error,
-                **(_no_candidate_modules_failure() if status == "failed" and stage_run.last_error == NO_CANDIDATE_MODULES_FAILURE_MESSAGE else {}),
+                **(_no_candidate_modules_failure() if no_candidate_modules_failure else {}),
                 **stage_run.counts,
             },
         )
@@ -9209,7 +9210,7 @@ class TaskManager:
         for result in success:
             all_modules.extend(result.get("modules", []))
         candidate_modules = self._filter_candidate_modules(all_modules, self._module_risk_levels(task))
-        if not candidate_modules:
+        if success and not failed and not candidate_modules:
             failure = _no_candidate_modules_failure()
             task.summary = {
                 **task.summary,
