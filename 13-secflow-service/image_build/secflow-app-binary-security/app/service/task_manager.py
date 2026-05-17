@@ -1533,9 +1533,18 @@ class TaskManager:
         try:
             task = self._task_or_404(db, project_id, task_id)
             if task.status == "cancelled":
-                observe_task_operation("cancel", "already_cancelled")
-                self._release_task_operation_lease(db, task_id, token=operation_token)
-                return BinarySecurityActionResponse(task_id=task_id, message="任务已取消")
+                active_item_count = db.query(BinarySecurityStageItem).filter(
+                    BinarySecurityStageItem.task_id == task.id,
+                    BinarySecurityStageItem.status.in_(["pending", "queued", "running", "dispatching"]),
+                ).count()
+                active_stage_count = db.query(BinarySecurityStageRun).filter(
+                    BinarySecurityStageRun.task_id == task.id,
+                    BinarySecurityStageRun.status.in_(["pending", "dispatching", "queued", "running"]),
+                ).count()
+                if active_item_count <= 0 and active_stage_count <= 0:
+                    observe_task_operation("cancel", "already_cancelled")
+                    self._release_task_operation_lease(db, task_id, token=operation_token)
+                    return BinarySecurityActionResponse(task_id=task_id, message="任务已取消")
             self._enqueue_state_event(
                 db,
                 task_id=task.id,
