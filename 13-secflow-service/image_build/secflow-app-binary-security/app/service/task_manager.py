@@ -8947,12 +8947,11 @@ class TaskManager:
         return success_count
 
     async def _cleanup_task_workspace(self, task: BinarySecurityTask, token: str | None) -> str:
-        relative_path = f"app/secflow-app-binary-security/{task.id}"
         workspace_root = Path(task.workspace_root)
         client = get_fileserver_client()
         cleanup_status = "deleted"
         try:
-            await client.delete_project_path(task.project_id, relative_path, token, recursive=True)
+            await client.delete_project_path(task.project_id, str(workspace_root), token, recursive=True)
         except Exception:
             cleanup_status = "fallback"
         try:
