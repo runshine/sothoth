@@ -2,7 +2,7 @@ import asyncio
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from app import main
 from app.observability import observe_api_request
@@ -53,6 +53,30 @@ class MainRoleTests(unittest.TestCase):
         self.assertIn("text/plain", response.media_type or "")
         body = response.body.decode("utf-8", errors="ignore")
         self.assertIn("secflow_binary_security_api_requests_total", body)
+
+    def test_reducer_metrics_endpoint_proxies_when_running_as_api(self):
+        fake_response = SimpleNamespace(
+            status_code=200,
+            content=b"# HELP demo metric\n",
+            headers={"content-type": "text/plain; version=0.0.4; charset=utf-8"},
+            text="# HELP demo metric\n",
+        )
+        fake_client = SimpleNamespace(get=AsyncMock(return_value=fake_response))
+        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "api"}, clear=True), patch(
+            "app.main.get_shared_async_client",
+            AsyncMock(return_value=fake_client),
+        ):
+            response = asyncio.run(main.reducer_metrics_endpoint())
+        self.assertEqual(200, response.status_code)
+        self.assertIn("text/plain", response.media_type or "")
+        self.assertIn("# HELP demo metric", response.body.decode("utf-8", errors="ignore"))
+
+    def test_reducer_metrics_endpoint_returns_local_payload_when_running_as_reducer(self):
+        observe_api_request("GET", "/health", 200, 0.01)
+        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "reducer"}, clear=True):
+            response = asyncio.run(main.reducer_metrics_endpoint())
+        self.assertEqual(200, response.status_code)
+        self.assertIn("text/plain", response.media_type or "")
 
     def test_ready_route_returns_503_when_checks_fail(self):
         async def fake_collect():

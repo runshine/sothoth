@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import sys
@@ -12,6 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from fastapi import FastAPI
+from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.requests import Request as FastAPIRequest
 from fastapi.responses import Response
@@ -26,6 +26,7 @@ from app.observability import (
     observe_downstream_request,
     render_metrics,
 )
+from app.service.http_client import get_shared_async_client
 from app.service.http_client import close_all_async_clients
 from app.service.registry import get_registry_service
 from app.service.task_queue import close_task_queue
@@ -63,6 +64,13 @@ def _registry_enabled() -> bool:
     if role in {"worker", "reducer"}:
         return False
     return bool(get_config().registry.enabled)
+
+
+def _reducer_metrics_url() -> str:
+    explicit = str(os.environ.get("SECFLOW_BINARY_SECURITY_REDUCER_METRICS_URL") or "").strip()
+    if explicit:
+        return explicit
+    return "http://secflow-app-binary-security-reducer/api/app/binary-security/metrics"
 
 
 def verify_auth_service_or_exit() -> None:
@@ -242,6 +250,38 @@ async def prometheus_http_middleware(request: FastAPIRequest, call_next):
 async def metrics_endpoint():
     payload, content_type = render_metrics()
     return Response(content=payload, media_type=content_type)
+
+
+@app.get("/api/app/binary-security/metrics/reducer", include_in_schema=False)
+async def reducer_metrics_endpoint():
+    if _service_role() == "reducer":
+        payload, content_type = render_metrics()
+        return Response(content=payload, media_type=content_type)
+    client = await get_shared_async_client("binary-security-reducer-metrics", timeout=5)
+    url = _reducer_metrics_url()
+    started = time.perf_counter()
+    try:
+        response = await client.get(url, headers={"Accept": "text/plain"})
+    except Exception as exc:
+        observe_downstream_request(
+            service="binary_security_reducer",
+            method="GET",
+            operation="metrics_proxy",
+            status="error",
+            duration_seconds=None,
+        )
+        raise HTTPException(status_code=502, detail=f"Reducer metrics proxy failed: {exc}") from exc
+    observe_downstream_request(
+        service="binary_security_reducer",
+        method="GET",
+        operation="metrics_proxy",
+        status=str(response.status_code),
+        duration_seconds=time.perf_counter() - started,
+    )
+    if response.status_code >= 400:
+        detail = response.text.strip() or f"upstream status {response.status_code}"
+        raise HTTPException(status_code=502, detail=f"Reducer metrics upstream failed: {detail}")
+    return Response(content=response.content, media_type=response.headers.get("content-type") or "text/plain; version=0.0.4; charset=utf-8")
 
 setup_exception_handlers(app)
 app.include_router(router)
