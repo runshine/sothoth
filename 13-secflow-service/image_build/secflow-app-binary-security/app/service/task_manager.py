@@ -5691,12 +5691,13 @@ class TaskManager:
 
     async def _ensure_task_directories(self, project_id: str, task_id: str, authorization_token: str) -> None:
         client = get_fileserver_client()
-        await client.ensure_project_directory(project_id, "app", authorization_token)
-        await client.ensure_project_directory(project_id, "app/secflow-app-binary-security", authorization_token)
-        await client.ensure_project_directory(project_id, f"app/secflow-app-binary-security/{task_id}", authorization_token)
+        task_root = client.project_files_root(project_id) / "app" / "secflow-app-binary-security" / task_id
+        await client.ensure_project_directory(project_id, task_root.parent.parent, authorization_token)
+        await client.ensure_project_directory(project_id, task_root.parent, authorization_token)
+        await client.ensure_project_directory(project_id, task_root, authorization_token)
         for name in ("input", "output", "run"):
-            await client.ensure_project_directory(project_id, f"app/secflow-app-binary-security/{task_id}/{name}", authorization_token)
-        await client.ensure_project_directory(project_id, f"app/secflow-app-binary-security/{task_id}/run/upload-tmp", authorization_token)
+            await client.ensure_project_directory(project_id, task_root / name, authorization_token)
+        await client.ensure_project_directory(project_id, task_root / "run" / "upload-tmp", authorization_token)
 
     def _write_task_metadata(self, task: BinarySecurityTask, metadata_path: Path, *, status: str) -> None:
         _write_json(
@@ -5898,7 +5899,7 @@ class TaskManager:
                     **file_info,
                     "size": stat.st_size,
                     "uploaded": True,
-                    "path": str(task.summary.get("input_dir") or self._fileserver_task_path(task.id, "input")),
+                    "path": str(task.summary.get("input_dir") or self._fileserver_task_path(task.project_id, task.id, "input")),
                     "temp_path": f"{task.summary.get('temp_upload_dir')}/{filename}" if task.summary.get("temp_upload_dir") else None,
                     "extracted": True,
                 }
@@ -10958,11 +10959,11 @@ class TaskManager:
             },
         }
 
-    def _fileserver_task_path(self, task_id: str, suffix: str | None = None) -> str:
-        base = f"/app/secflow-app-binary-security/{task_id}"
+    def _fileserver_task_path(self, project_id: str, task_id: str, suffix: str | None = None) -> str:
+        base = Path(self.cfg.storage.project_root_template.format(project_id=project_id)) / "app" / "secflow-app-binary-security" / task_id
         if suffix:
-            return f"{base}/{suffix.strip('/')}"
-        return base
+            return str(base / suffix.strip("/"))
+        return str(base)
 
 
 _task_manager: Optional[TaskManager] = None

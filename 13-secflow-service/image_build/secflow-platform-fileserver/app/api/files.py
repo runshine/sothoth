@@ -1188,8 +1188,20 @@ def project_files_root(project_id: str) -> str:
     return root
 
 
-def normalize_project_filesystem_path(path: str) -> tuple[str, str]:
+def normalize_project_filesystem_path(path: str, project_id: Optional[str] = None) -> tuple[str, str]:
     raw = (path or "").strip() or "/"
+    if project_id and raw.startswith("/"):
+        project_root = os.path.abspath(project_files_root(project_id))
+        files_root = os.path.abspath(os.path.join(get_config().storage.root_dir, "files"))
+        raw_abs = os.path.abspath(raw)
+        try:
+            if os.path.commonpath([raw_abs, project_root]) == project_root:
+                relative = os.path.relpath(raw_abs, project_root)
+                raw = "/" if relative == "." else "/" + relative.replace(os.sep, "/")
+            elif os.path.commonpath([raw_abs, files_root]) == files_root:
+                raise ValidationError("项目路径不能越权")
+        except ValueError:
+            pass
     normalized = posixpath.normpath(raw)
     if not normalized.startswith("/"):
         normalized = f"/{normalized}"
@@ -1201,7 +1213,7 @@ def normalize_project_filesystem_path(path: str) -> tuple[str, str]:
 
 
 def project_filesystem_target_path(project_id: str, path: str) -> tuple[str, str]:
-    relative_no_lead, normalized = normalize_project_filesystem_path(path)
+    relative_no_lead, normalized = normalize_project_filesystem_path(path, project_id)
     root = os.path.abspath(project_files_root(project_id))
     target_path = os.path.abspath(os.path.join(root, relative_no_lead))
     if os.path.commonpath([target_path, root]) != root:
@@ -1274,7 +1286,7 @@ def archive_workspace_root() -> str:
 def collect_project_fs_archive_entries(project_id: str, items: list[str]) -> tuple[list[dict[str, str]], list[str]]:
     normalized_items: list[str] = []
     for item in items:
-        _, normalized = normalize_project_filesystem_path(item)
+        _, normalized = normalize_project_filesystem_path(item, project_id)
         if normalized == "/":
             raise ValidationError("不允许打包项目根目录")
         normalized_items.append(normalized)
@@ -1452,7 +1464,7 @@ def list_project_filesystem_entries(project_id: str, path: str) -> tuple[str, st
 
 
 def build_project_filesystem_breadcrumbs(project_id: str, path: str) -> list[ProjectFilesystemBreadcrumbItem]:
-    _, normalized = normalize_project_filesystem_path(path)
+    _, normalized = normalize_project_filesystem_path(path, project_id)
     breadcrumbs = [ProjectFilesystemBreadcrumbItem(node_type="project", name=project_id, path="/")]
     if normalized == "/":
         return breadcrumbs
@@ -1725,7 +1737,7 @@ async def get_project_filesystem_children(
     await verify_project_access(project_id, authorization)
     project_files_root(project_id)
     _, current_name, directories, files = list_project_filesystem_entries(project_id, path)
-    _, normalized = normalize_project_filesystem_path(path)
+    _, normalized = normalize_project_filesystem_path(path, project_id)
     return ProjectFilesystemChildrenResponse(
         project_id=project_id,
         current_path=normalized,

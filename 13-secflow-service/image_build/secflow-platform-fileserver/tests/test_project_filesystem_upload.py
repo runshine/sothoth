@@ -130,6 +130,46 @@ def test_project_filesystem_upload_conflict_and_overwrite(tmp_path, monkeypatch)
         assert preview_resp.content == b"version-two"
 
 
+def test_project_filesystem_upload_accepts_project_absolute_path(tmp_path, monkeypatch):
+    with build_client(tmp_path, monkeypatch) as client:
+        headers = {"Authorization": "Bearer fake-token"}
+        project_root = tmp_path / "data" / "files" / "demo-project"
+        absolute_dir = project_root / "app" / "secflow-app-binary-security" / "task-1" / "run" / "upload-tmp"
+
+        current = project_root
+        for part in absolute_dir.relative_to(project_root).parts:
+            current = current / part
+            create_dir = client.post(
+                "/api/fileserver/project-filesystem/directories",
+                json={"project_id": "demo-project", "path": str(current)},
+                headers=headers,
+            )
+            assert create_dir.status_code in (200, 409)
+
+        upload_resp = client.post(
+            "/api/fileserver/project-filesystem/files/upload",
+            data={"project_id": "demo-project", "path": str(absolute_dir)},
+            files={"file": ("source.zip", io.BytesIO(b"zip"), "application/zip")},
+            headers=headers,
+        )
+        assert upload_resp.status_code == 200
+        assert upload_resp.json()["path"] == "/app/secflow-app-binary-security/task-1/run/upload-tmp/source.zip"
+        assert (absolute_dir / "source.zip").read_bytes() == b"zip"
+
+
+def test_project_filesystem_rejects_other_project_absolute_path(tmp_path, monkeypatch):
+    with build_client(tmp_path, monkeypatch) as client:
+        headers = {"Authorization": "Bearer fake-token"}
+        other_project_dir = tmp_path / "data" / "files" / "other-project" / "app"
+
+        create_dir = client.post(
+            "/api/fileserver/project-filesystem/directories",
+            json={"project_id": "demo-project", "path": str(other_project_dir)},
+            headers=headers,
+        )
+        assert create_dir.status_code == 400
+
+
 def test_project_filesystem_upload_rejects_directory_overwrite(tmp_path, monkeypatch):
     with build_client(tmp_path, monkeypatch) as client:
         headers = {"Authorization": "Bearer fake-token"}

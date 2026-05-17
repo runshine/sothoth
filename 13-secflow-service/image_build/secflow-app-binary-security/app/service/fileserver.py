@@ -40,6 +40,14 @@ class FileserverClient:
         cleaned = [str(part).strip("/").replace("\\", "/") for part in parts if str(part).strip("/")]
         return "/" + "/".join(cleaned)
 
+    def project_absolute_path(self, project_id: str, path: str) -> Path:
+        root = self.project_files_root(project_id).resolve()
+        raw = Path(str(path or "").strip())
+        target = raw.resolve() if raw.is_absolute() else (root / str(path or "").strip("/")).resolve()
+        if root not in (target, *target.parents):
+            raise UpstreamError(f"项目路径越权: {path}")
+        return target
+
     async def ensure_subproject(self, project_id: str, authorization_token: str | None, created_by: str) -> dict[str, Any]:
         headers = self._headers(authorization_token)
         try:
@@ -86,35 +94,35 @@ class FileserverClient:
         }
 
     async def ensure_project_directory(self, project_id: str, path: str, authorization_token: str | None) -> str:
-        normalized = self.project_relative_path(path)
-        if normalized == "/":
-            return normalized
-        local_path = self.project_files_root(project_id) / normalized.lstrip("/")
+        root = self.project_files_root(project_id).resolve()
+        local_path = self.project_absolute_path(project_id, path)
+        if local_path == root:
+            return str(local_path)
         if local_path.is_dir():
-            return normalized
+            return str(local_path)
         headers = self._headers(authorization_token)
-        current = ""
         try:
             client = await get_shared_async_client("fileserver-service", timeout=self.config.timeout)
-            for part in [item for item in normalized.strip("/").split("/") if item]:
-                current = self.project_relative_path(current, part)
+            current_path = root
+            for part in local_path.relative_to(root).parts:
+                current_path = current_path / part
                 resp = await client.post(
                     f"{self.config.base_url.rstrip('/')}/project-filesystem/directories",
-                    json={"project_id": project_id, "path": current},
+                    json={"project_id": project_id, "path": str(current_path)},
                     headers=headers,
                 )
                 if resp.status_code in (200, 201, 409):
                     continue
                 if resp.status_code == 404:
-                    raise UpstreamError(f"父目录不存在: {current}")
+                    raise UpstreamError(f"父目录不存在: {current_path}")
                 resp.raise_for_status()
         except Exception:
             ensure_dir(local_path)
-        return normalized
+        return str(local_path)
 
     async def delete_project_path(self, project_id: str, path: str, authorization_token: str | None, recursive: bool = True) -> None:
-        normalized = self.project_relative_path(path)
-        if normalized == "/":
+        target_path = self.project_absolute_path(project_id, path)
+        if target_path == self.project_files_root(project_id).resolve():
             return
         headers = self._headers(authorization_token)
         try:
@@ -123,7 +131,7 @@ class FileserverClient:
                 f"{self.config.base_url.rstrip('/')}/project-filesystem",
                 params={
                     "project_id": project_id,
-                    "path": normalized,
+                    "path": str(target_path),
                     "recursive": str(bool(recursive)).lower(),
                 },
                 headers=headers,
