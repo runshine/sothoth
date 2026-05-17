@@ -3665,6 +3665,17 @@ class TaskManager:
                 return
             event_type = event.event_type
             task_id = event.task_id
+            event_created_at = event.created_at
+            if event_type == "manual_delete_requested":
+                observe_state_event_lag(event_type, (_now() - event_created_at).total_seconds() if event_created_at else None)
+                observe_state_reducer_event(event_type, "processed")
+                db.expunge(event)
+                db.query(BinarySecurityStateEvent).filter(
+                    BinarySecurityStateEvent.task_id == task_id,
+                ).delete(synchronize_session=False)
+                result = "success"
+                db.commit()
+                return
             event.status = "processed"
             event.processed_at = _now()
             event.leased_by = None
@@ -3673,10 +3684,6 @@ class TaskManager:
             event.updated_at = _now()
             observe_state_event_lag(event_type, (_now() - event.created_at).total_seconds() if event.created_at else None)
             observe_state_reducer_event(event_type, "processed")
-            if event_type == "manual_delete_requested":
-                db.query(BinarySecurityStateEvent).filter(
-                    BinarySecurityStateEvent.task_id == task_id,
-                ).delete(synchronize_session=False)
             result = "success"
             db.commit()
             if event_type == "manual_blocking_action_requested":
