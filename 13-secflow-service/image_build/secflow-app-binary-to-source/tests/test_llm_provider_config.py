@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ from unittest import mock
 from app.api import tasks as tasks_api
 from app.model import B2SProjectConfig, B2STask, B2STaskItem
 from app.schemas import ElfTaskInput, TaskCreate
+from app.service import llm_provider
 from app.service import task_service
 from app.service.config_service import ConfigService
 
@@ -242,6 +244,126 @@ class TaskProviderResolutionTests(unittest.TestCase):
         self.assertEqual("team_codex", item.extra_metadata["llm_provider_key"])
         self.assertEqual("gpt-5.4", item.extra_metadata["llm_provider_model"])
 
+    def test_retry_stopped_task_uses_latest_project_provider_not_frozen_provider(self):
+        task = B2STask(
+            id="task1",
+            project_id="p1",
+            task_origin_type="manual",
+            name="demo",
+            status="failed",
+        )
+        item = B2STaskItem(
+            id="item1",
+            task_id="task1",
+            project_id="p1",
+            sequence_no=1,
+            elf_path="/tmp/demo.elf",
+            output_dir="/tmp/output",
+            status="failed",
+        )
+        item.extra_metadata = {
+            "concurrency": 2,
+            "llm_provider_key": "old_provider",
+            "llm_provider_model": "old-model",
+        }
+        db = _FakeDb(tasks=[task], task_items=[item])
+
+        with (
+            mock.patch.object(task_service, "_project_default_llm_provider_key", return_value="new_provider"),
+            mock.patch.object(
+                task_service,
+                "get_config",
+                return_value=SimpleNamespace(
+                    pi_re_agent=SimpleNamespace(
+                        batch_size=8192,
+                        max_retries=3,
+                        concurrency=4,
+                        agent_run_timeout_seconds=3600,
+                        agent_timeout_retry_enabled=True,
+                        agent_timeout_max_retries=3,
+                        engine="hybrid",
+                        model=None,
+                    ),
+                    configcenter_service=SimpleNamespace(enabled=True),
+                ),
+            ),
+            mock.patch.object(
+                task_service,
+                "materialize_llm_provider",
+                return_value={
+                    "provider_key": "new_provider",
+                    "display_name": "New Provider",
+                    "provider_type": "openai",
+                    "model": "new-model",
+                },
+            ) as mocked_materialize,
+        ):
+            asyncio.run(task_service.retry_task(db, task, ["item1"]))
+
+        mocked_materialize.assert_awaited_once_with("new_provider")
+        self.assertEqual("new_provider", item.extra_metadata["llm_provider_key"])
+        self.assertEqual("new-model", item.extra_metadata["llm_provider_model"])
+
+    def test_retry_running_task_keeps_frozen_provider(self):
+        task = B2STask(
+            id="task1",
+            project_id="p1",
+            task_origin_type="manual",
+            name="demo",
+            status="running",
+        )
+        item = B2STaskItem(
+            id="item1",
+            task_id="task1",
+            project_id="p1",
+            sequence_no=1,
+            elf_path="/tmp/demo.elf",
+            output_dir="/tmp/output",
+            status="failed",
+        )
+        item.extra_metadata = {
+            "concurrency": 2,
+            "llm_provider_key": "old_provider",
+            "llm_provider_model": "old-model",
+        }
+        db = _FakeDb(tasks=[task], task_items=[item])
+
+        with (
+            mock.patch.object(task_service, "_project_default_llm_provider_key", return_value="new_provider"),
+            mock.patch.object(
+                task_service,
+                "get_config",
+                return_value=SimpleNamespace(
+                    pi_re_agent=SimpleNamespace(
+                        batch_size=8192,
+                        max_retries=3,
+                        concurrency=4,
+                        agent_run_timeout_seconds=3600,
+                        agent_timeout_retry_enabled=True,
+                        agent_timeout_max_retries=3,
+                        engine="hybrid",
+                        model=None,
+                    ),
+                    configcenter_service=SimpleNamespace(enabled=True),
+                ),
+            ),
+            mock.patch.object(
+                task_service,
+                "materialize_llm_provider",
+                return_value={
+                    "provider_key": "old_provider",
+                    "display_name": "Old Provider",
+                    "provider_type": "openai",
+                    "model": "old-model",
+                },
+            ) as mocked_materialize,
+        ):
+            asyncio.run(task_service.retry_task(db, task, ["item1"]))
+
+        mocked_materialize.assert_awaited_once_with("old_provider")
+        self.assertEqual("old_provider", item.extra_metadata["llm_provider_key"])
+        self.assertEqual("old-model", item.extra_metadata["llm_provider_model"])
+
     def test_dispatch_item_reuses_existing_pi_job_conflict(self):
         db = _FakeDb()
         fake_pi = _FakePiClient(response={
@@ -296,6 +418,65 @@ class TaskProviderResolutionTests(unittest.TestCase):
         self.assertEqual("team_codex/gpt-5.4", fake_pi.payloads[0]["model"])
         self.assertEqual("b2s:task1:item1:/tmp/input/demo.elf", fake_pi.payloads[0]["idempotency_key"])
         self.assertEqual(4, fake_pi.payloads[0]["concurrency"])
+
+    def test_dispatch_item_always_qualifies_provider_model_with_slashes(self):
+        db = _FakeDb()
+        fake_pi = _FakePiClient()
+        item = B2STaskItem(
+            id="item1",
+            task_id="task1",
+            project_id="p1",
+            sequence_no=1,
+            elf_path="/tmp/input/demo.elf",
+            output_dir="/tmp/output",
+            status="pending",
+        )
+        item.extra_metadata = {
+            "concurrency": 4,
+            "engine": "hybrid",
+            "llm_provider_key": "local_minimax",
+            "llm_provider_model": "MiniMax/MiniMax-M2.5",
+        }
+        db.task_items.append(item)
+
+        with (
+            mock.patch.object(task_service, "choose_pi_worker", return_value="http://pi-worker"),
+            mock.patch.object(task_service, "get_pi_client", return_value=fake_pi),
+            mock.patch.object(
+                task_service,
+                "get_config",
+                return_value=SimpleNamespace(
+                    pi_re_agent=SimpleNamespace(
+                        batch_size=8192,
+                        max_retries=3,
+                        concurrency=4,
+                        agent_run_timeout_seconds=3600,
+                        agent_timeout_retry_enabled=True,
+                        agent_timeout_max_retries=3,
+                        engine="hybrid",
+                        model=None,
+                    ),
+                    configcenter_service=SimpleNamespace(enabled=False),
+                ),
+            ),
+        ):
+            asyncio.run(task_service.dispatch_item_to_pi(db, item, owner_id="test-owner"))
+
+        self.assertEqual("local_minimax/MiniMax/MiniMax-M2.5", fake_pi.payloads[0]["model"])
+
+
+class LlmProviderFileWriteTests(unittest.TestCase):
+    def test_write_json_uses_unique_temp_files_under_concurrent_writes(self):
+        target = Path(self._testMethodName).with_suffix(".json")
+        try:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                list(executor.map(lambda index: llm_provider._write_json(target, {"index": index}), range(40)))
+
+            self.assertTrue(target.exists())
+            self.assertIsInstance(target.read_text(encoding="utf-8"), str)
+            self.assertEqual([], list(target.parent.glob(f".{target.name}.*.tmp")))
+        finally:
+            target.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

@@ -138,12 +138,30 @@ def _provider_model_name(provider: dict | None) -> str | None:
     model = _normalize_llm_provider_key(provider.get("model"))
     if not provider_key or not model:
         return None
+    if model.startswith(f"{provider_key}/"):
+        return model
     return f"{provider_key}/{model}"
 
 
 def _project_default_llm_provider_key(db: Session, project_id: str) -> str | None:
     cfg = get_config_service().get_config(db, project_id)
     return _normalize_llm_provider_key(cfg.get("llm_provider_key"))
+
+
+def _frozen_item_llm_provider_key(items: list[B2STaskItem]) -> str | None:
+    for item in items:
+        key = _normalize_llm_provider_key((item.extra_metadata or {}).get("llm_provider_key"))
+        if key:
+            return key
+    return None
+
+
+def _restart_llm_provider_key(db: Session, task: B2STask, items: list[B2STaskItem]) -> str | None:
+    project_key = _project_default_llm_provider_key(db, task.project_id)
+    frozen_key = _frozen_item_llm_provider_key(items)
+    if task.status in TERMINAL:
+        return project_key or frozen_key
+    return frozen_key or project_key
 
 
 def _is_budget_exhausted_failure(job: dict | None, error_reason: str | None = None) -> bool:
@@ -451,7 +469,9 @@ def _job_model_for_item(item: B2STaskItem) -> str | None:
     metadata = item.extra_metadata or {}
     key = _normalize_llm_provider_key(metadata.get("llm_provider_key"))
     model = _normalize_llm_provider_key(metadata.get("llm_provider_model"))
-    if key and model and "/" not in model:
+    if key and model:
+        if model.startswith(f"{key}/"):
+            return model
         return f"{key}/{model}"
     return model or get_config().pi_re_agent.model
 
@@ -791,7 +811,7 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
     items = query_items(db, task.id)
     if not items:
         raise NotFoundError("任务没有可重跑的任务项")
-    selected_provider_key = _normalize_llm_provider_key((items[0].extra_metadata or {}).get("llm_provider_key")) or _project_default_llm_provider_key(db, task.project_id)
+    selected_provider_key = _restart_llm_provider_key(db, task, items)
     provider = await materialize_llm_provider(selected_provider_key) if get_config().configcenter_service.enabled else None
 
     for item in items:
@@ -828,7 +848,7 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
     selected = [i for i in items if item_ids is None or i.id in item_ids]
     if not selected:
         raise NotFoundError("未找到可重试的任务项")
-    selected_provider_key = _normalize_llm_provider_key((selected[0].extra_metadata or {}).get("llm_provider_key")) or _project_default_llm_provider_key(db, task.project_id)
+    selected_provider_key = _restart_llm_provider_key(db, task, selected)
     provider = await materialize_llm_provider(selected_provider_key) if get_config().configcenter_service.enabled else None
     for item in selected:
         if item.status not in {"failed", "cancelled"}:

@@ -7,6 +7,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, Optional
+from uuid import uuid4
 
 from app.exception import ValidationError
 from app.config import get_config
@@ -32,6 +33,8 @@ def _provider_model_name(provider: dict[str, Any]) -> str:
     model = str(provider.get("model") or "").strip()
     if not provider_key or not model:
         raise ValueError("LLM Provider缺少provider_key或model")
+    if model.startswith(f"{provider_key}/"):
+        return model
     return f"{provider_key}/{model}"
 
 
@@ -113,9 +116,15 @@ def _build_settings_json(provider: dict[str, Any] | None) -> dict[str, Any]:
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _write_file_bindings(config_dir: Path, provider: dict[str, Any]) -> None:
