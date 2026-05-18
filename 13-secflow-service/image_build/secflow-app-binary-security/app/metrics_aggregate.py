@@ -57,7 +57,7 @@ class PodTarget:
 
     @property
     def url(self) -> str:
-        return f"http://{self.ip}:{self.port}/metrics"
+        return f"http://{self.ip}:{self.port}/api/app/binary-security/metrics"
 
 
 @dataclass
@@ -315,6 +315,8 @@ async def _discover_binary_security_pods() -> list[PodTarget]:
         pod_name = str(metadata.get("name") or "").strip()
         ip = str(status.get("podIP") or "").strip()
         phase = str(status.get("phase") or "").strip()
+        if metadata.get("deletionTimestamp"):
+            continue
         if role not in _ROLE_LABELS or phase != "Running" or not ip or not pod_name:
             continue
         pods.append(PodTarget(pod_name=pod_name, role=role, ip=ip))
@@ -399,4 +401,3 @@ _aggregator = BinarySecurityMetricsAggregator()
 
 def get_metrics_aggregator() -> BinarySecurityMetricsAggregator:
     return _aggregator
-

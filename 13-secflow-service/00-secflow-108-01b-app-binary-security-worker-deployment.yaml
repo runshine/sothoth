@@ -15,11 +15,12 @@ spec:
         name: secflow-app-binary-security
         role: worker
     spec:
+      serviceAccountName: secflow-app-binary-security
       terminationGracePeriodSeconds: 120
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: secflow-app-binary-security-worker
-          image: ghcr.io/runshine/secflow-app-binary-security:20260516-6ba6a22
+          image: ghcr.io/runshine/secflow-app-binary-security:latest
           imagePullPolicy: Always
           env:
             - name: TZ
