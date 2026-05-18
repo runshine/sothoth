@@ -29,21 +29,36 @@ class RuntimeConfigService:
     def update_max_parallel_tasks(self, value: int, *, updated_by: str) -> RuntimeConfigResponse:
         normalized = max(int(value), 1)
         now = utc_now_z()
+        database = get_database()
         self._ensure_table()
-        with get_database().connect() as conn:
+        with database.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                """
-                insert into ipc_audit_runtime_config (
-                  config_key, config_value_json, updated_at, updated_by
-                ) values (?, ?, ?, ?)
-                on conflict(config_key) do update set
-                  config_value_json = excluded.config_value_json,
-                  updated_at = excluded.updated_at,
-                  updated_by = excluded.updated_by
-                """,
-                (MAX_PARALLEL_TASKS_KEY, json.dumps(normalized), now, updated_by or "anonymous"),
-            )
+            if database.backend == "mysql":
+                conn.execute(
+                    """
+                    insert into ipc_audit_runtime_config (
+                      config_key, config_value_json, updated_at, updated_by
+                    ) values (?, ?, ?, ?)
+                    on duplicate key update
+                      config_value_json = values(config_value_json),
+                      updated_at = values(updated_at),
+                      updated_by = values(updated_by)
+                    """,
+                    (MAX_PARALLEL_TASKS_KEY, json.dumps(normalized), now, updated_by or "anonymous"),
+                )
+            else:
+                conn.execute(
+                    """
+                    insert into ipc_audit_runtime_config (
+                      config_key, config_value_json, updated_at, updated_by
+                    ) values (?, ?, ?, ?)
+                    on conflict(config_key) do update set
+                      config_value_json = excluded.config_value_json,
+                      updated_at = excluded.updated_at,
+                      updated_by = excluded.updated_by
+                    """,
+                    (MAX_PARALLEL_TASKS_KEY, json.dumps(normalized), now, updated_by or "anonymous"),
+                )
             conn.commit()
         self._notify_scheduler_config_changed()
         return self.get_config()
@@ -73,17 +88,30 @@ class RuntimeConfigService:
 
     @staticmethod
     def _ensure_table() -> None:
-        with get_database().connect() as conn:
-            conn.execute(
-                """
-                create table if not exists ipc_audit_runtime_config (
-                  config_key text primary key,
-                  config_value_json text not null,
-                  updated_at text not null,
-                  updated_by text not null
+        database = get_database()
+        with database.connect() as conn:
+            if database.backend == "mysql":
+                conn.execute(
+                    """
+                    create table if not exists ipc_audit_runtime_config (
+                      config_key varchar(128) primary key,
+                      config_value_json longtext not null,
+                      updated_at varchar(64) not null,
+                      updated_by varchar(128) not null
+                    )
+                    """
                 )
-                """
-            )
+            else:
+                conn.execute(
+                    """
+                    create table if not exists ipc_audit_runtime_config (
+                      config_key text primary key,
+                      config_value_json text not null,
+                      updated_at text not null,
+                      updated_by text not null
+                    )
+                    """
+                )
 
     @staticmethod
     def _parse_positive_int(value: Any, fallback: int) -> int:

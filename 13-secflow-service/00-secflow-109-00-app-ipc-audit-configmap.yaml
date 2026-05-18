@@ -11,7 +11,13 @@ data:
     # The files/ subtree must contain the OpenHarmony source tree, hdc, and qcow2 cache.
     title: "SecFlow IPC Audit Service"
     api_prefix: "/api/app/ipc-audit"
-    database_url: "sqlite:////var/lib/secflow-app-ipc-audit/ipc-audit.db"
+    database:
+      type: "mysql"
+      host: "mysql.sothothv2-ns.svc.cluster.local"
+      port: 3306
+      username: "secflow"
+      password: "Huawei12#$"
+      name: "secflow"
     state_root: "/var/lib/secflow-app-ipc-audit"
     default_workspace_id: "shared-files-root"
 

@@ -3,3 +3,6 @@ httpx>=0.26.0
 uvicorn>=0.29,<1
 pydantic>=2.6,<3
 PyYAML>=6,<7
+PyMySQL>=1.1,<2
+jinja2>=3.1,<4
+typer>=0.16,<1

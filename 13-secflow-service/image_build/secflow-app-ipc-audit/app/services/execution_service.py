@@ -2,20 +2,20 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from app.core.config import get_config
 from app.core.time_utils import utc_now_z
-from app.db.database import get_database
+from app.db.database import DatabaseConnection, get_database
 from app.services.artifact_service import get_artifact_service
 from app.services.event_service import get_event_service
 from app.services.provider_client import ProviderClientError
 from app.services.provider_runtime import get_provider_runtime_service
 from app.services.workspace_service import get_workspace_service
 from app.workers.runner import StageArtifact, StageContext, StageExecutionResult, StageHooks, write_json_file
+from app.workers.stage_graph import GraphExecutionResult, run_graph
 from app.workers.stage_audit import run_audit_stage
 from app.workers.stage_poc import run_poc_stage
 
@@ -27,6 +27,31 @@ class ExecutionService:
         context = self._load_context(attempt_id)
         try:
             self._attach_provider_runtime(context)
+            if str(context["pipeline_mode"]) == "custom_graph":
+                graph_result = self._run_custom_graph(context)
+                if graph_result.overall_status == "cancelled":
+                    raise CancelledError("task cancelled")
+                if graph_result.overall_status == "timed_out":
+                    raise TimedOutError(graph_result.overall_message)
+                if graph_result.overall_status == "failed":
+                    raise StageFailedError("custom_graph", graph_result.overall_message)
+                if graph_result.overall_status == "partial_success":
+                    self._complete_attempt(
+                        str(context["task_id"]),
+                        attempt_id,
+                        task_status="partial_success",
+                        attempt_status="partial_success",
+                        message=graph_result.overall_message,
+                    )
+                    return
+                self._complete_attempt(
+                    str(context["task_id"]),
+                    attempt_id,
+                    task_status="succeeded",
+                    attempt_status="succeeded",
+                    message=graph_result.overall_message,
+                )
+                return
             audit_report_path: Path | None = None
             start_stage = str(context["effective_config"].get("start_stage") or "audit")
 
@@ -158,6 +183,36 @@ class ExecutionService:
             effective_config=dict(context["effective_config"]),
             provider_runtime=context.get("provider_runtime"),
         )
+
+    def _run_custom_graph(self, context: dict[str, object]) -> GraphExecutionResult:
+        task_id = str(context["task_id"])
+        attempt_id = str(context["attempt_id"])
+        stage_names = self._effective_stage_names(context)
+        if not stage_names:
+            raise RuntimeError("custom_graph has no declared stage names")
+        self._set_graph_running(task_id, attempt_id, stage_names, "custom graph execution started")
+        stage_context = self._build_stage_context(context, stage_names[0])
+        hooks = StageHooks(
+            heartbeat=lambda: self._heartbeat(attempt_id),
+            is_cancel_requested=lambda: self._is_cancel_requested(task_id, attempt_id),
+            graph_prepared=lambda payload: self._publish_materialized_graph_source(
+                task_id,
+                attempt_id,
+                payload,
+            ),
+            graph_progress=lambda snapshot: self._sync_custom_graph_progress(
+                task_id,
+                attempt_id,
+                snapshot,
+            ),
+        )
+        hooks.heartbeat()
+        result = run_graph(stage_context, hooks)
+        for stage_result in result.stage_results:
+            self._persist_stage_result(context, stage_result)
+        for artifact in result.attempt_artifacts:
+            self._persist_attempt_artifact(task_id, attempt_id, artifact)
+        return result
 
     def _attach_provider_runtime(self, context: dict[str, object]) -> None:
         effective_config = context["effective_config"] if isinstance(context.get("effective_config"), dict) else {}
@@ -292,6 +347,134 @@ class ExecutionService:
             )
             conn.commit()
 
+    def _persist_attempt_artifact(self, task_id: str, attempt_id: str, artifact: StageArtifact) -> None:
+        if not artifact.file_path.exists():
+            return
+        with get_database().connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                """
+                select artifact_id
+                from ipc_audit_artifacts
+                where attempt_id = ? and relative_path = ?
+                limit 1
+                """,
+                (
+                    attempt_id,
+                    self._relative_path_in_attempt(task_id, attempt_id, artifact.file_path),
+                ),
+            ).fetchone()
+            if existing is None:
+                get_artifact_service().record_artifact(
+                    conn,
+                    task_id=task_id,
+                    attempt_id=attempt_id,
+                    stage_name=None,
+                    artifact_kind=artifact.artifact_kind,
+                    file_path=artifact.file_path,
+                    display_name=artifact.display_name,
+                )
+            conn.commit()
+
+    def _publish_materialized_graph_source(self, task_id: str, attempt_id: str, payload: dict[str, Any]) -> None:
+        try:
+            with get_database().connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    """
+                    select effective_config_json
+                    from ipc_audit_task_attempts
+                    where task_id = ? and attempt_id = ?
+                    limit 1
+                    """,
+                    (task_id, attempt_id),
+                ).fetchone()
+                if row is None:
+                    conn.commit()
+                    return
+                effective_config = json.loads(row["effective_config_json"] or "{}")
+                if not isinstance(effective_config, dict):
+                    effective_config = {}
+                effective_config["materialized_graph_source"] = payload
+                conn.execute(
+                    """
+                    update ipc_audit_task_attempts
+                    set effective_config_json = ?, updated_at = ?
+                    where task_id = ? and attempt_id = ?
+                    """,
+                    (json.dumps(effective_config, ensure_ascii=False), utc_now_z(), task_id, attempt_id),
+                )
+                conn.commit()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("failed to publish materialized graph for %s/%s: %s", task_id, attempt_id, exc)
+
+    def _sync_custom_graph_progress(self, task_id: str, attempt_id: str, snapshot: dict[str, Any]) -> None:
+        nodes = snapshot.get("nodes") if isinstance(snapshot.get("nodes"), dict) else {}
+        if not nodes:
+            return
+        now = utc_now_z()
+        current_stage = str(snapshot.get("current_stage") or "").strip() or None
+        current_payload = nodes.get(current_stage) if current_stage and isinstance(nodes.get(current_stage), dict) else None
+        task_message = (
+            str(current_payload.get("message") or "").strip()
+            if current_payload
+            else "custom graph execution in progress"
+        )
+        try:
+            with get_database().connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    """
+                    update ipc_audit_tasks
+                    set current_stage = ?, updated_at = ?, started_at = coalesce(started_at, ?), message = ?
+                    where task_id = ?
+                    """,
+                    (current_stage, now, now, task_message, task_id),
+                )
+                conn.execute(
+                    """
+                    update ipc_audit_task_attempts
+                    set status = 'running', started_at = coalesce(started_at, ?), updated_at = ?
+                    where attempt_id = ?
+                    """,
+                    (now, now, attempt_id),
+                )
+                for stage_name, payload in nodes.items():
+                    if not isinstance(payload, dict):
+                        continue
+                    status = str(payload.get("status") or "").strip() or "pending"
+                    message = str(payload.get("message") or "").strip()
+                    if status == "running":
+                        conn.execute(
+                            """
+                            update ipc_audit_stage_runs
+                            set status = ?, started_at = coalesce(started_at, ?), updated_at = ?, message = ?
+                            where attempt_id = ? and stage_name = ?
+                            """,
+                            (status, now, now, message, attempt_id, stage_name),
+                        )
+                    elif status in {"succeeded", "failed", "cancelled", "skipped", "timed_out"}:
+                        conn.execute(
+                            """
+                            update ipc_audit_stage_runs
+                            set status = ?, started_at = coalesce(started_at, ?), finished_at = coalesce(finished_at, ?), updated_at = ?, message = ?
+                            where attempt_id = ? and stage_name = ?
+                            """,
+                            (status, now, now, now, message, attempt_id, stage_name),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            update ipc_audit_stage_runs
+                            set status = ?, updated_at = ?, message = ?
+                            where attempt_id = ? and stage_name = ?
+                            """,
+                            (status, now, message, attempt_id, stage_name),
+                        )
+                conn.commit()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("failed to sync custom graph progress for %s/%s: %s", task_id, attempt_id, exc)
+
     def _set_stage_running(self, task_id: str, attempt_id: str, stage_name: str, message: str) -> None:
         now = utc_now_z()
         with get_database().connect() as conn:
@@ -330,6 +513,58 @@ class ExecutionService:
                 message=message,
                 payload={},
             )
+            conn.commit()
+
+    def _set_graph_running(self, task_id: str, attempt_id: str, stage_names: list[str], message: str) -> None:
+        now = utc_now_z()
+        current_stage = stage_names[0]
+        with get_database().connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                update ipc_audit_tasks
+                set current_stage = ?, updated_at = ?, started_at = coalesce(started_at, ?), message = ?
+                where task_id = ?
+                """,
+                (stage_names[0], now, now, message, task_id),
+            )
+            conn.execute(
+                """
+                update ipc_audit_task_attempts
+                set status = 'running', started_at = coalesce(started_at, ?), updated_at = ?, failure_reason = null
+                where attempt_id = ?
+                """,
+                (now, now, attempt_id),
+            )
+            for stage_name in stage_names:
+                stage_status = "running" if stage_name == current_stage else "pending"
+                stage_started_at = now if stage_name == current_stage else None
+                conn.execute(
+                    """
+                    update ipc_audit_stage_runs
+                    set status = ?, started_at = coalesce(started_at, ?), updated_at = ?, message = ?
+                    where attempt_id = ? and stage_name = ?
+                    """,
+                    (
+                        stage_status,
+                        stage_started_at,
+                        now,
+                        message if stage_name == current_stage else "waiting for upstream graph dependencies",
+                        attempt_id,
+                        stage_name,
+                    ),
+                )
+                if stage_name == current_stage:
+                    get_event_service().append_event(
+                        conn,
+                        task_id=task_id,
+                        attempt_id=attempt_id,
+                        stage_name=stage_name,
+                        event_type="stage.started",
+                        level="info",
+                        message=message,
+                        payload={},
+                    )
             conn.commit()
 
     def _mark_stage_skipped(self, context: dict[str, object], stage_name: str, reason: str) -> None:
@@ -671,6 +906,18 @@ class ExecutionService:
             },
             "stages": [dict(row) for row in stage_rows],
             "artifacts": [dict(row) for row in artifact_rows],
+            "report_outputs": [
+                {
+                    **item,
+                    "exists": any(str(artifact["relative_path"]) == str(item.get("path") or "") for artifact in artifact_rows),
+                }
+                for item in (
+                    context["effective_config"].get("report_outputs")
+                    if isinstance(context["effective_config"], dict) and isinstance(context["effective_config"].get("report_outputs"), list)
+                    else []
+                )
+                if isinstance(item, dict)
+            ],
         }
         write_json_file(manifest_path, payload)
         now = utc_now_z()
@@ -711,7 +958,11 @@ class ExecutionService:
 
     @staticmethod
     def _log_artifact_kind(stage_name: str) -> str:
-        return "audit_log" if stage_name == "audit" else "poc_log"
+        if stage_name == "audit":
+            return "audit_log"
+        if stage_name == "poc":
+            return "poc_log"
+        return "stage_log"
 
     @staticmethod
     def _stage_level(status: str) -> str:
@@ -726,9 +977,15 @@ class ExecutionService:
         attempt_root = get_artifact_service().attempt_root(task_id, attempt_id).resolve()
         return path.resolve().relative_to(attempt_root).as_posix()
 
+    @staticmethod
+    def _effective_stage_names(context: dict[str, object]) -> list[str]:
+        effective_config = context["effective_config"] if isinstance(context.get("effective_config"), dict) else {}
+        stage_names = effective_config.get("stage_names") if isinstance(effective_config.get("stage_names"), list) else []
+        return [str(item).strip() for item in stage_names if str(item).strip()]
+
     def _append_session_summary_events(
         self,
-        conn: sqlite3.Connection,
+        conn: DatabaseConnection,
         *,
         task_id: str,
         attempt_id: str,

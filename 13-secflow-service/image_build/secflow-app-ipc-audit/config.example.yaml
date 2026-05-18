@@ -1,4 +1,6 @@
-database_url: sqlite:////var/lib/secflow-ipc-audit/ipc-audit.db
+database:
+  type: sqlite
+  path: /var/lib/secflow-ipc-audit/ipc-audit.db
 state_root: /var/lib/secflow-ipc-audit
 default_workspace_id: oh61-main
 
@@ -14,6 +16,7 @@ provider_source:
   api_prefix: /api/configcenter/service/llm
   timeout_seconds: 15
   machine_token: null
+  fallback_file_path: null
 
 execution:
   mode: mock
@@ -28,6 +31,9 @@ execution:
   poc_runtime_available: true
   codex_bin: codex
   opencode_bin: opencode
+  agentflow_root: /home/icsl/agentflow-alpha
+  agentflow_python_bin: python3
+  agentflow_agent: opencode
   codex_skip_git_repo_check: true
   codex_json_output: true
   codex_capture_last_message: true
@@ -51,5 +57,5 @@ workspaces:
       - foundation
     allow_custom_project_path: true
     supports_poc: true
-    default_pipeline_mode: audit_then_poc
+    default_pipeline_mode: custom_graph
     is_default: true

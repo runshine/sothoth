@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
 import threading
 from pathlib import Path
 
@@ -8,7 +7,7 @@ from fastapi import HTTPException, status
 
 from app.core.ids import new_refresh_job_id
 from app.core.time_utils import utc_now_z
-from app.db.database import get_database
+from app.db.database import DatabaseRow, get_database
 from app.schemas import CatalogRefreshJobResponse, PagedPresetProjectsResponse, PresetProjectResponse
 from app.services.workspace_service import get_workspace_service
 
@@ -218,7 +217,7 @@ class CatalogService:
                 )
 
     @staticmethod
-    def _row_to_model(row: sqlite3.Row) -> PresetProjectResponse:
+    def _row_to_model(row: DatabaseRow) -> PresetProjectResponse:
         return PresetProjectResponse(
             project_key=row["project_key"],
             project_path=row["project_path"],

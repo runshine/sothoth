@@ -19,11 +19,14 @@ services:
     environment:
       IPC_AUDIT_DATABASE_URL: "sqlite:////var/lib/secflow-ipc-audit/ipc-audit.db"
       IPC_AUDIT_STATE_ROOT: "/var/lib/secflow-ipc-audit"
-      IPC_AUDIT_EXECUTION_MODE: "${IPC_AUDIT_EXECUTION_MODE:-opencode_cli}"
+      IPC_AUDIT_EXECUTION_MODE: "${IPC_AUDIT_EXECUTION_MODE:-agentflow_cli}"
       IPC_AUDIT_MAX_PARALLEL_TASKS: "${IPC_AUDIT_MAX_PARALLEL_TASKS:-1}"
       IPC_AUDIT_DEFAULT_WORKSPACE_ID: "${IPC_AUDIT_DEFAULT_WORKSPACE_ID:-oh61-main}"
       IPC_AUDIT_CODEX_BIN: "/usr/local/bin/codex"
       IPC_AUDIT_OPENCODE_BIN: "/usr/local/bin/opencode"
+      IPC_AUDIT_AGENTFLOW_ROOT: "/home/icsl/agentflow-alpha"
+      IPC_AUDIT_AGENTFLOW_PYTHON_BIN: "/usr/local/bin/python3"
+      IPC_AUDIT_AGENTFLOW_AGENT: "${IPC_AUDIT_AGENTFLOW_AGENT:-opencode}"
       HDC_BIN: "/workspace/openharmony_6_1/vendor/edu/docker/src/hdc"
       LD_LIBRARY_PATH: "/workspace/openharmony_6_1/vendor/edu/docker/src"
       OHEMU_HELPER_BIN: "/usr/local/bin/ipc-audit-qemu"
@@ -38,11 +41,12 @@ services:
       OHEMU_HDC_READY_TIMEOUT: "${OHEMU_HDC_READY_TIMEOUT:-180}"
       IPC_AUDIT_POC_ENABLED: "${IPC_AUDIT_POC_ENABLED:-true}"
       IPC_AUDIT_POC_RUNTIME_AVAILABLE: "${IPC_AUDIT_POC_RUNTIME_AVAILABLE:-true}"
+      IPC_AUDIT_PROVIDER_FALLBACK_FILE: "/app/provider-files/providers.fallback.json"
       IPC_AUDIT_READY_CHECK_FILE_PATHS: "${IPC_AUDIT_READY_CHECK_FILE_PATHS:-/root/.codex/auth.json,/root/.codex/config.toml,/root/.config/opencode/opencode.json}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       OPENAI_BASE_URL: "${OPENAI_BASE_URL:-https://api.openai.com/v1}"
       IPC_AUDIT_WORKSPACES_JSON: >-
-        [{"workspace_id":"oh61-main","display_name":"OpenHarmony 6.1 Main Tree","repo_root":"/workspace/openharmony_6_1","entries_file":".audit/ipc_entries.txt","bundle_scan_roots":["base","foundation"],"allow_custom_project_path":true,"supports_poc":true,"default_pipeline_mode":"audit_then_poc","is_default":true}]
+        [{"workspace_id":"oh61-main","display_name":"OpenHarmony 6.1 Main Tree","repo_root":"/workspace/openharmony_6_1","entries_file":".audit/ipc_entries.txt","bundle_scan_roots":["base","foundation"],"allow_custom_project_path":true,"supports_poc":true,"default_pipeline_mode":"custom_graph","is_default":true}]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -52,6 +56,10 @@ services:
       - type: bind
         source: ${OH_WORKSPACE_HOST_PATH}
         target: /workspace/openharmony_6_1
+        read_only: true
+      - type: bind
+        source: ${IPC_AUDIT_AGENTFLOW_HOST_PATH:-/home/icsl/agentflow-alpha}
+        target: /home/icsl/agentflow-alpha
         read_only: true
       - type: bind
         source: ${CODEX_AUTH_FILE:-./provider-files/codex-auth.json.example}
@@ -64,6 +72,10 @@ services:
       - type: bind
         source: ${OPENCODE_CONFIG_FILE:-./provider-files/opencode.json.example}
         target: /root/.config/opencode/opencode.json
+        read_only: true
+      - type: bind
+        source: ${IPC_AUDIT_PROVIDER_FALLBACK_HOST_FILE:-./provider-files/providers.fallback.json.example}
+        target: /app/provider-files/providers.fallback.json
         read_only: true
     healthcheck:
       test: ["CMD", "python3", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/api/app/ipc-audit/health', timeout=5)"]

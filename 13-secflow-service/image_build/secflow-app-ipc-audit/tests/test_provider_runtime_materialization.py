@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,16 +28,21 @@ class ProviderRuntimeMaterializationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory(prefix="ipc-audit-provider-")
         self.runtime_root = Path(self.temp_dir.name) / "runtime"
+        import app.core.config as config_module
         import app.services.provider_client as provider_client_module
         import app.services.provider_runtime as provider_runtime_module
 
+        config_module._config = None
         provider_client_module._provider_client = None
         provider_runtime_module._provider_runtime_service = None
 
     def tearDown(self) -> None:
+        import app.core.config as config_module
         import app.services.provider_client as provider_client_module
         import app.services.provider_runtime as provider_runtime_module
 
+        os.environ.pop("IPC_AUDIT_AGENTFLOW_AGENT", None)
+        config_module._config = None
         provider_client_module._provider_client = None
         provider_runtime_module._provider_runtime_service = None
         self.temp_dir.cleanup()
@@ -295,6 +301,56 @@ class ProviderRuntimeMaterializationTest(unittest.TestCase):
         self.assertIn('"model": "local_minimax/MiniMax/MiniMax-M2.5"', config_text)
         self.assertIn('"provider"', config_text)
         self.assertNotIn('"provider":"bad-shape"', config_text)
+
+    def test_agentflow_cli_with_codex_agent_replaces_incompatible_codex_config(self) -> None:
+        import app.core.config as config_module
+        import app.services.provider_client as provider_client_module
+
+        os.environ["IPC_AUDIT_AGENTFLOW_AGENT"] = "codex"
+        config_module._config = None
+        provider_client_module._provider_client = FakeProviderClient(
+            {
+                "local-minimax": {
+                    "provider_key": "local-minimax",
+                    "display_name": "Local MiniMax",
+                    "provider_type": "openai-compatible",
+                    "enabled": True,
+                    "api_base": "http://provider.example.test/v1",
+                    "api_key": "sk-generated-codex",
+                    "model": "MiniMax/MiniMax-M2.5",
+                    "env_bindings": {},
+                    "file_bindings": [
+                        {
+                            "name": "config.toml",
+                            "path": "/root/.codex/config.toml",
+                            "content": "\n".join(
+                                [
+                                    'model_provider = "OpenAI"',
+                                    'model = "zai-org/GLM-5"',
+                                    '[model_providers.OpenAI]',
+                                    'wire_api = "chat"',
+                                ]
+                            )
+                            + "\n",
+                            "enabled": True,
+                        }
+                    ],
+                }
+            }
+        )
+
+        resolved = get_provider_runtime_service().resolve_runtime(
+            ["local-minimax"],
+            executor_mode="agentflow_cli",
+        )
+        materialized = get_provider_runtime_service().materialize_runtime(self.runtime_root, resolved)
+
+        config_path = materialized.home_dir / ".codex" / "config.toml"
+        config_text = config_path.read_text(encoding="utf-8")
+        self.assertEqual(resolved.executor_model, "MiniMax/MiniMax-M2.5")
+        self.assertIn('model = "MiniMax/MiniMax-M2.5"', config_text)
+        self.assertIn('wire_api = "responses"', config_text)
+        self.assertNotIn('wire_api = "chat"', config_text)
 
 
 if __name__ == "__main__":

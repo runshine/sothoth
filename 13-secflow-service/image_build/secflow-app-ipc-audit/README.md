@@ -161,21 +161,24 @@ QEMU_ARCH=arm64 ./ohemu-container.sh prepare
     - `/root/.codex`
     - `/root/.config/opencode`
     - `/root/.local/share/opencode`
+    - `/home/icsl/agentflow-alpha`
 - `docker-compose.platform.yml`
   - 用于平台模板部署
   - 不再依赖宿主机 bind mount 上述三个目录
   - 通过 ConfigCenter 维护 provider，再由 platform-agent 在部署时把 `env_bindings` / `file_bindings` 注入到容器
 
-第一轮只做 deployment-time 注入：
+当前默认真实执行链路已经切到 `agentflow_cli`：
 
-- 不新增 `opencode_cli` 执行器
-- 不把 `ipc-audit` 改造成 AI helper 服务
-- 不扩展 `file_bindings` 去支持目录树
-- `opencode` 仍然只是容器内置调试工具，当前真实执行链路还是 `codex_cli`
+- 服务端仍然自己生成阶段 prompt 和输出路径约束
+- 真实执行时不再直接 `subprocess` 拉 `codex exec`
+- 改为生成按阶段编排的临时 AgentFlow pipeline，然后通过挂载的 `/home/icsl/agentflow-alpha` 驱动节点执行
+- `audit_then_poc` 会在一次 AgentFlow run 里执行 `audit -> poc` 两个 stage node，后续扩阶段只需要继续加 node / dependency
+- 默认 stage node agent 已切到 `opencode`，后续如果要做多 agent 实验，也是在这个 stage pipeline 框架上扩展
 
 当前版本已经具备：
 
 - `sqlite` 初始化和 schema migration
+- `mysql` 初始化和 schema migration
 - `health` / `ready` / `capabilities`
 - workspace 浏览与输入校验
 - preset catalog 后台刷新与缓存
@@ -183,18 +186,203 @@ QEMU_ARCH=arm64 ./ohemu-container.sh prepare
 - 单进程内嵌 scheduler
 - `max_parallel_tasks` / `IPC_AUDIT_MAX_PARALLEL_TASKS` 控制 attempt 并发度，默认 1，部署时可调
 - 两阶段 `audit` / `poc` 执行流水线
-- `mock` / `codex_cli` 双执行模式
+- `mock` / `agentflow_cli` / `codex_cli` / `opencode_cli` 执行模式
 - `runtime manifest` 与 `session_file(prompt)` 归档
 
 当前执行器状态：
 
 - `mock` 模式会产出可供前端联调的日志、报告、JSON 产物
-- `codex_cli` 模式已经具备真正的命令编排能力，会按阶段生成 prompt、拉起 `codex exec`、收集日志并回填产物
-- `codex_cli` 模式会使用 `codex exec --add-dir <attempt_root>`，让模型直接把阶段输出写到 attempt 私有目录，而不是污染源码树
-- `codex_cli` 模式会额外归档 `prompt.txt`、`events.jsonl`、`last-message.md` 这类 session 文件，方便前端查看 agent 输出
+- `agentflow_cli` 模式会生成 stage pipeline，并通过 `agentflow.cli run` 驱动实际 agent
+- `audit_only` / `poc_only` 对应单节点 pipeline，`audit_then_poc` 对应 `audit -> poc` 双节点 pipeline
+- 默认 `agentflow_cli` stage node agent 为 `opencode`，并按节点透传 provider runtime；当节点显式指定 `agent: codex` 时仍会继续透传 `--add-dir <attempt_root>` 与 sandbox 配置
+- `agentflow_cli` 模式会把 AgentFlow 的 trace / result 回填成同样的 `prompt.txt`、`events.jsonl`、`last-message.md` session 文件，前端链路不需要改
+- `audit_then_poc` 的 `poc` 阶段不会再次重复拉起 AgentFlow，而是直接复用同一条 stage pipeline 里 `poc` node 的结果
+- `codex_cli` / `opencode_cli` 仍保留，便于对照调试或回退
 - 服务会把 `events.jsonl` 和 `last-message.md` 摘要回填到 `/tasks/{task_id}/events`，前端无需先下载原始 session 文件也能看到 agent 输出概览
 - 真实 prompt 目前已经贴近 `ipc_audit_pipeline_runner.py`，但仍可继续按你本地工作流细化
 - 如果某个 workspace 配置了 `allow_custom_project_path=false`，服务端会拒绝 `custom_project` 类型任务
+
+## Custom Graph Task
+
+现在 `agentflow_cli` 额外支持 `pipeline_mode=custom_graph`，用于把任务执行流完全交给请求体里的 AgentFlow graph：
+
+- 输入侧继续沿用现有 `workspace_id + input_ref`
+- 执行图通过 `graph_source` 提供
+- 报告输出通过 `report_outputs[]` 显式声明
+- attempt 详情接口会回填 `report_outputs[]`，前端可以直接按列表渲染，不需要再写死 `audit_report` / `poc_report`
+
+当前支持两种 graph source：
+
+- `inline_json`
+  - 直接传 AgentFlow JSON 模板
+  - JSON 字符串值支持 Jinja 占位符，例如 `{{ report_outputs.stage1_report.absolute_path }}`
+- `python_builder`
+  - 传 `entry` 或 `code`
+  - 服务端会先写 `runtime/graph/graph-context.json`
+  - 然后调用：
+    - `python <builder> --context <graph-context.json> --output <pipeline.json>`
+
+`report_outputs[]` 的 `path` 必须是 attempt root 下的相对路径，例如：
+
+```json
+[
+  {
+    "output_id": "stage1_report",
+    "node_id": "stage1",
+    "title": "阶段1报告",
+    "path": "exports/stage1-report.md",
+    "format": "markdown",
+    "required": true,
+    "order": 10
+  },
+  {
+    "output_id": "stage2_report",
+    "node_id": "stage2",
+    "title": "阶段2报告",
+    "path": "exports/stage2-report.md",
+    "format": "markdown",
+    "required": true,
+    "order": 20
+  }
+]
+```
+
+一个最小 `custom_graph` 请求示例：
+
+```json
+{
+  "title": "dynamic-graph-demo",
+  "workspace_id": "oh61-main",
+  "pipeline_mode": "custom_graph",
+  "input_ref": {
+    "kind": "custom_project",
+    "project_path": "foundation/demo/service"
+  },
+  "executor_mode": "agentflow_cli",
+  "graph_source": {
+    "type": "inline_json",
+    "content": {
+      "name": "dynamic-inline-graph",
+      "nodes": [
+        {
+          "id": "stage1",
+          "prompt": "Write report to {{ report_outputs.stage1_report.absolute_path }}",
+          "success_criteria": [
+            {
+              "kind": "file_nonempty",
+              "path": "{{ report_outputs.stage1_report.absolute_path }}"
+            }
+          ]
+        },
+        {
+          "id": "stage2",
+          "depends_on": ["stage1"],
+          "prompt": "Write report to {{ report_outputs.stage2_report.absolute_path }}",
+          "success_criteria": [
+            {
+              "kind": "file_nonempty",
+              "path": "{{ report_outputs.stage2_report.absolute_path }}"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "report_outputs": [
+    {
+      "output_id": "stage1_report",
+      "node_id": "stage1",
+      "title": "阶段1报告",
+      "path": "exports/stage1-report.md",
+      "format": "markdown",
+      "required": true,
+      "order": 10
+    },
+    {
+      "output_id": "stage2_report",
+      "node_id": "stage2",
+      "title": "阶段2报告",
+      "path": "exports/stage2-report.md",
+      "format": "markdown",
+      "required": true,
+      "order": 20
+    }
+  ]
+}
+```
+
+任务执行完成后：
+
+- 每个 node 的 prompt / events / last-message 仍然落到 `runtime/<node_id>/`
+- 每个 node 的 log 落到 `logs/<node_id>.codex.log`
+- 声明过的报告会以 `report_output` artifact 归档
+- `/tasks/{task_id}/attempts/{attempt_id}` 返回的 `report_outputs[]` 会包含 `exists`、`preview_url`、`download_url`
+
+## Template API
+
+现在服务端额外支持把任务图模板持久化到数据库，适合保存一组固定的：
+
+- `pipeline_mode`
+- `executor_mode`
+- `model`
+- `provider_keys`
+- `graph_source`
+- `report_outputs`
+
+当前接口：
+
+- `GET /api/app/ipc-audit/templates?workspace_id=oh61-main`
+- `GET /api/app/ipc-audit/templates/{template_id}`
+- `POST /api/app/ipc-audit/templates`
+- `PUT /api/app/ipc-audit/templates/{template_id}`
+- `DELETE /api/app/ipc-audit/templates/{template_id}`
+
+一个最小创建模板示例：
+
+```json
+{
+  "workspace_id": "oh61-main",
+  "name": "four-stage-ipc-audit",
+  "description": "四阶段审计图模板",
+  "config": {
+    "pipeline_mode": "custom_graph",
+    "executor_mode": "agentflow_cli",
+    "model": "gpt-5-codex",
+    "provider_keys": ["anthropic-prod"],
+    "graph_source": {
+      "type": "inline_json",
+      "content": {
+        "nodes": [
+          {"id": "audit", "prompt": "write {{ report_outputs.audit_report.absolute_path }}"},
+          {"id": "triage", "depends_on": ["audit"], "prompt": "write {{ report_outputs.triage_report.absolute_path }}"}
+        ]
+      }
+    },
+    "report_outputs": [
+      {
+        "output_id": "audit_report",
+        "node_id": "audit",
+        "title": "Audit Report",
+        "path": "exports/audit-report.md",
+        "format": "markdown",
+        "required": true,
+        "order": 10
+      },
+      {
+        "output_id": "triage_report",
+        "node_id": "triage",
+        "title": "Triage Report",
+        "path": "exports/triage-report.md",
+        "format": "markdown",
+        "required": true,
+        "order": 20
+      }
+    ]
+  }
+}
+```
+
+前端现在会优先读取这组服务端模板，而不是只保存在浏览器本地。
 
 ## Run Local
 
@@ -202,6 +390,26 @@ QEMU_ARCH=arm64 ./ohemu-container.sh prepare
 pip install -r requirements.txt
 cp config.example.yaml config.yaml
 python3 -m app.main
+```
+
+默认示例配置仍然使用本地 `sqlite`，方便单机开发。
+
+如果要切到 MySQL，可以在 `config.yaml` 里改成：
+
+```yaml
+database:
+  type: mysql
+  host: mysql.sothothv2-ns.svc.cluster.local
+  port: 3306
+  username: secflow
+  password: Huawei12#$
+  name: secflow
+```
+
+或者继续直接用环境变量 URL：
+
+```bash
+IPC_AUDIT_DATABASE_URL='mysql+pymysql://secflow:Huawei12%23%24@mysql.sothothv2-ns.svc.cluster.local:3306/secflow'
 ```
 
 或者直接用环境变量：
@@ -215,15 +423,27 @@ IPC_AUDIT_WORKSPACES_JSON='[{"workspace_id":"oh61-main","display_name":"OpenHarm
 python3 -m app.main
 ```
 
-如果要接真实 `codex`：
+如果要接真实 AgentFlow 引擎：
 
 ```bash
-IPC_AUDIT_EXECUTION_MODE=codex_cli \
+IPC_AUDIT_EXECUTION_MODE=agentflow_cli \
+IPC_AUDIT_AGENTFLOW_ROOT=/home/icsl/agentflow-alpha \
+IPC_AUDIT_AGENTFLOW_PYTHON_BIN=python3 \
+IPC_AUDIT_AGENTFLOW_AGENT=codex \
 IPC_AUDIT_CODEX_BIN=codex \
 IPC_AUDIT_AUDIT_SANDBOX_MODE=workspace-write \
 IPC_AUDIT_POC_SANDBOX_MODE=workspace-write \
 python3 -m app.main
 ```
+
+## K8s Database
+
+K8s 默认不再把任务元数据写到挂载的 NFS `sqlite` 文件里，而是改为：
+
+- 元数据表：MySQL
+- 任务产物、日志、runtime 文件：`state_root` 对应的 PVC / NFS
+
+这样可以避免 `sqlite + NFS` 下的锁竞争和 `database is locked` / `worker lease expired` 连带问题。
 
 ## Build Image
 
@@ -512,9 +732,12 @@ OH_WORKSPACE_HOST_PATH=/home/icsl/openharmony_6_1
 CODEX_AUTH_FILE=/home/icsl/.codex/auth.json
 CODEX_CONFIG_TOML_FILE=/home/icsl/.codex/config.toml
 OPENCODE_CONFIG_FILE=/home/icsl/.config/opencode/opencode.json
+IPC_AUDIT_PROVIDER_FALLBACK_HOST_FILE=/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-ipc-audit/provider-files/providers.fallback.json.example
 ```
 
-如果没有这些变量，compose 会退回到 `provider-files/*.example`，这些文件只用于 ready 链路占位，不能作为真实 `opencode_cli` 配置执行任务。
+如果没有这些变量，compose 会退回到 `provider-files/*.example`，这些文件只用于 ready 链路占位，不能作为真实执行配置。`agentflow_cli` 额外还要求宿主机存在并挂载 `/home/icsl/agentflow-alpha`。
+
+本地 Docker 联调时，后端还会额外挂载一份 `provider-files/providers.fallback.json.example` 到容器内，并设置 `IPC_AUDIT_PROVIDER_FALLBACK_FILE=/app/provider-files/providers.fallback.json`。如果容器里请求 ConfigCenter / provider API 失败，服务会自动改读这份 fallback 文件，让前端本地也能拿到 Provider 列表并继续测试。文件里的 `${OPENAI_API_KEY}`、`${OPENAI_BASE_URL}`、`${IPC_AUDIT_PROVIDER_FALLBACK_MODEL}` 会在容器内按环境变量展开；如果你要换成本地自己的 Provider 清单，只需要覆盖 `IPC_AUDIT_PROVIDER_FALLBACK_HOST_FILE` 指向另一份 JSON。
 
 OpenCode 运行时注意：
 
@@ -530,14 +753,15 @@ OpenCode 运行时注意：
 
 - `read_only: false`
 
-## About `codex_cli` In Container
+## About `agentflow_cli` In Container
 
 当前镜像已经支持：
 
 - `mock`
+- `agentflow_cli`
 - `codex_cli`
 
-但要注意，服务进程自身不直接执行 IPC PoC 逻辑，而是通过 `codex_cli` / `opencode_cli` 拉起 agent，并由 PoC prompt 约束 agent 使用容器内的 QEMU/HDC helper。
+但要注意，服务进程自身不直接执行 IPC PoC 逻辑，而是通过 `agentflow_cli` / `codex_cli` / `opencode_cli` 拉起 agent，并由 PoC prompt 约束 agent 使用容器内的 QEMU/HDC helper。
 
 `hdc` 也是类似状态：
 
@@ -546,8 +770,10 @@ OpenCode 运行时注意：
 - 后端 Python 服务不直接调用 `hdc`
 - PoC prompt 会要求 agent 在当前容器内通过 `ipc-audit-qemu` 启动/复用 QEMU，再用固定路径 `hdc` 连接
 
-原因是 `codex_cli` 模式除了 Python 服务本身，还依赖容器内存在：
+`agentflow_cli` 模式除了 Python 服务本身，还依赖容器内存在：
 
+- 可导入的 AgentFlow 源码目录 `/home/icsl/agentflow-alpha`
+- `python3`、`jinja2`、`typer` 等 AgentFlow 运行时依赖
 - `codex` 可执行文件
 - 挂载的 OpenHarmony 工作区内 `hdc` 运行时文件（如果 PoC 链路需要）
 - `ipc-audit-qemu` helper 和镜像内置 QEMU 运行时
@@ -584,7 +810,7 @@ OpenCode 运行时注意：
 如果你下一步要把真实执行也封进容器，建议继续拆两层：
 
 1. 保留当前 `Dockerfile` 作为基础 API 镜像
-2. 再做一个面向真实执行的派生镜像，把 `codex` 和所需运行时工具一起装进去
+2. 再做一个面向真实执行的派生镜像，把 `agentflow-alpha`、`codex` 和所需运行时工具一起装进去
 
 ## Key Endpoints
 

@@ -1,19 +1,18 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from typing import Any
 
 from app.core.ids import new_event_id
 from app.core.time_utils import utc_now_z
-from app.db.database import get_database
+from app.db.database import DatabaseConnection, DatabaseRow, get_database
 from app.schemas import EventPageResponse, EventResponse
 
 
 class EventService:
     def append_event(
         self,
-        conn: sqlite3.Connection,
+        conn: DatabaseConnection,
         *,
         task_id: str,
         attempt_id: str | None,
@@ -73,7 +72,7 @@ class EventService:
         return EventPageResponse(items=items, next_cursor=next_cursor)
 
     @staticmethod
-    def _row_to_model(row: sqlite3.Row) -> EventResponse:
+    def _row_to_model(row: DatabaseRow) -> EventResponse:
         return EventResponse(
             event_seq=row["event_seq"],
             event_id=row["event_id"],
@@ -96,4 +95,3 @@ def get_event_service() -> EventService:
     if _event_service is None:
         _event_service = EventService()
     return _event_service
-

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.core.config import get_config
 from app.services.provider_client import ProviderClientError, get_provider_client
 
 
@@ -312,7 +313,7 @@ class ProviderRuntimeService:
         provider_fields: dict[str, str],
         effective_model: str | None,
     ) -> None:
-        normalized_mode = str(executor_mode or "").strip().lower()
+        normalized_mode = cls._effective_executor_mode(executor_mode)
         if not cls._has_provider_source_fields(provider_fields):
             return
         if normalized_mode == "codex_cli":
@@ -344,7 +345,7 @@ class ProviderRuntimeService:
         executor_mode: str | None,
         provider_fields: dict[str, str],
     ) -> None:
-        normalized_mode = str(executor_mode or "").strip().lower()
+        normalized_mode = cls._effective_executor_mode(executor_mode)
         if normalized_mode == "codex_cli":
             for item in cls._build_codex_generated_files(provider_fields):
                 cls._add_generated_file_if_missing(merged_files_by_path, item)
@@ -471,7 +472,7 @@ class ProviderRuntimeService:
         model = str(effective_model or provider_fields.get("model") or "").strip()
         if not model:
             return None
-        if str(executor_mode or "").strip().lower() != "opencode_cli":
+        if cls._effective_executor_mode(executor_mode) != "opencode_cli":
             return model
         if has_executor_config or not cls._has_provider_source_fields(provider_fields):
             return model
@@ -483,6 +484,16 @@ class ProviderRuntimeService:
             return model
         candidate = f"{provider_alias}/{model_id}"
         return candidate or model
+
+    @classmethod
+    def _effective_executor_mode(cls, executor_mode: str | None) -> str:
+        normalized_mode = str(executor_mode or "").strip().lower()
+        if normalized_mode != "agentflow_cli":
+            return normalized_mode
+        agent = str(get_config().execution.agentflow_agent or "").strip().lower()
+        if agent == "opencode":
+            return "opencode_cli"
+        return "codex_cli"
 
     @classmethod
     def _build_codex_generated_files(cls, provider_fields: dict[str, str]) -> list[dict[str, Any]]:

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-ExecutorMode = Literal["mock", "codex_cli", "opencode_cli"]
+ExecutorMode = Literal["mock", "codex_cli", "opencode_cli", "agentflow_cli"]
 
 
 class HealthResponse(BaseModel):
@@ -146,22 +146,116 @@ class ProviderListResponse(BaseModel):
     items: list[ProviderSummaryResponse]
 
 
+class TaskReportOutputSpec(BaseModel):
+    output_id: str = Field(min_length=1, max_length=64)
+    node_id: str = Field(min_length=1, max_length=128)
+    title: str = Field(min_length=1, max_length=255)
+    path: str = Field(min_length=1, max_length=512)
+    format: Literal["markdown", "text", "json"] = "markdown"
+    required: bool = True
+    order: int = 0
+
+
+class InlineJsonGraphSource(BaseModel):
+    type: Literal["inline_json"]
+    content: dict[str, Any]
+    declared_nodes: list[str] = Field(default_factory=list)
+
+
+class PythonBuilderGraphSource(BaseModel):
+    type: Literal["python_builder"]
+    entry: str | None = None
+    code: str | None = None
+    declared_nodes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "PythonBuilderGraphSource":
+        if not str(self.entry or "").strip() and not str(self.code or "").strip():
+            raise ValueError("python_builder requires either entry or code")
+        return self
+
+
+TaskGraphSource = Annotated[InlineJsonGraphSource | PythonBuilderGraphSource, Field(discriminator="type")]
+
+
+class GraphValidateRequest(BaseModel):
+    workspace_id: str
+    executor_mode: ExecutorMode | None = "agentflow_cli"
+    model: str | None = None
+    provider_keys: list[str] = Field(default_factory=list)
+    graph_source: TaskGraphSource
+    report_outputs: list[TaskReportOutputSpec] = Field(default_factory=list)
+
+
+class GraphValidateResponse(BaseModel):
+    valid: bool = True
+    message: str
+    graph_source_type: Literal["inline_json", "python_builder"]
+    node_count: int
+    node_ids: list[str] = Field(default_factory=list)
+
+
 class TaskCreateRequest(BaseModel):
     project_id: str | None = None
     title: str
     workspace_id: str
-    pipeline_mode: Literal["audit_then_poc", "audit_only", "poc_only"] = "audit_then_poc"
+    pipeline_mode: Literal["audit_then_poc", "audit_only", "poc_only", "custom_graph"] = "custom_graph"
     input_ref: InputRef
     executor_mode: ExecutorMode | None = None
     model: str | None = None
     provider_keys: list[str] = Field(default_factory=list)
+    graph_source: TaskGraphSource | None = None
+    report_outputs: list[TaskReportOutputSpec] = Field(default_factory=list)
     notes: str | None = None
     idempotency_key: str | None = None
 
 
+class TaskTemplateConfig(BaseModel):
+    pipeline_mode: Literal["audit_then_poc", "audit_only", "poc_only", "custom_graph"] = "custom_graph"
+    executor_mode: ExecutorMode | None = None
+    model: str | None = None
+    provider_keys: list[str] = Field(default_factory=list)
+    graph_source: TaskGraphSource | None = None
+    report_outputs: list[TaskReportOutputSpec] = Field(default_factory=list)
+    notes: str | None = None
+
+    @model_validator(mode="after")
+    def validate_graph_source(self) -> "TaskTemplateConfig":
+        if self.pipeline_mode == "custom_graph" and self.graph_source is None:
+            raise ValueError("custom_graph requires graph_source")
+        if self.graph_source is not None and self.pipeline_mode != "custom_graph":
+            raise ValueError("graph_source is only supported with custom_graph")
+        return self
+
+
+class TaskTemplateCreateRequest(BaseModel):
+    workspace_id: str
+    name: str = Field(min_length=1, max_length=255)
+    description: str | None = None
+    config: TaskTemplateConfig
+
+
+class TaskTemplateUpdateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    description: str | None = None
+    config: TaskTemplateConfig
+
+
+class TaskTemplateResponse(BaseModel):
+    template_id: str
+    workspace_id: str
+    name: str
+    description: str | None = None
+    config: TaskTemplateConfig
+    created_by: str
+    created_at: str
+    updated_by: str | None = None
+    updated_at: str
+
+
 class TaskRetryRequest(BaseModel):
     retry_scope: Literal["task", "from_stage"] = "task"
-    stage: Literal["audit", "poc"] | None = None
+    stage: str | None = None
 
 
 class TaskSummaryResponse(BaseModel):
@@ -199,6 +293,24 @@ class StageRunResponse(BaseModel):
     message: str | None = None
 
 
+class TaskReportOutputResponse(BaseModel):
+    output_id: str
+    node_id: str
+    title: str
+    path: str
+    format: str
+    required: bool
+    order: int
+    exists: bool
+    artifact_id: str | None = None
+    preview_url: str | None = None
+    download_url: str | None = None
+    size: int | None = None
+    created_at: str | None = None
+    content_type: str | None = None
+    sha256: str | None = None
+
+
 class AttemptDetailResponse(BaseModel):
     attempt_id: str
     task_id: str
@@ -207,6 +319,7 @@ class AttemptDetailResponse(BaseModel):
     worker: AttemptWorkerResponse
     effective_config: dict[str, Any] = Field(default_factory=dict)
     stage_runs: list[StageRunResponse] = Field(default_factory=list)
+    report_outputs: list[TaskReportOutputResponse] = Field(default_factory=list)
     message: str | None = None
     created_at: str
     started_at: str | None = None

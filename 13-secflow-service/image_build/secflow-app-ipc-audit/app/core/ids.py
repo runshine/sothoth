@@ -26,3 +26,6 @@ def new_artifact_id() -> str:
 def new_refresh_job_id() -> str:
     return _new_id("catalog-refresh")
 
+
+def new_template_id() -> str:
+    return _new_id("ipc-audit-template")

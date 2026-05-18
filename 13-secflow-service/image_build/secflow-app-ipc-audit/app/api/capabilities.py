@@ -13,10 +13,8 @@ router = APIRouter()
 def get_capabilities() -> CapabilityResponse:
     cfg = get_config()
     default_workspace = next((item for item in cfg.workspaces if item.workspace_id == cfg.default_workspace_id), None)
-    pipeline_modes = ["audit_only"]
-    if cfg.execution.poc_enabled and cfg.execution.poc_runtime_available and default_workspace and default_workspace.supports_poc:
-        pipeline_modes.insert(0, "audit_then_poc")
-    executor_modes: list[str] = ["codex_cli", "opencode_cli"]
+    pipeline_modes = ["custom_graph"]
+    executor_modes: list[str] = ["agentflow_cli", "codex_cli", "opencode_cli"]
     if cfg.execution.mode == "mock":
         executor_modes.insert(0, "mock")
     elif cfg.execution.mode in executor_modes:
@@ -36,13 +34,16 @@ def get_capabilities() -> CapabilityResponse:
         supports_poc=cfg.execution.poc_enabled,
         poc_runtime_available=cfg.execution.poc_runtime_available,
         default_workspace_id=cfg.default_workspace_id,
-        default_pipeline_mode=default_workspace.default_pipeline_mode if default_workspace else None,
+        default_pipeline_mode="custom_graph",
         artifact_kinds=[
             "audit_report",
             "audit_log",
             "poc_report",
             "poc_log",
             "audited_result_json",
+            "report_output",
+            "stage_log",
+            "graph_manifest",
             "runtime_manifest",
             "session_file",
         ],

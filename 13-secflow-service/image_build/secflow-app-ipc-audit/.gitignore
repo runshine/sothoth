@@ -8,4 +8,5 @@ state/
 provider-files/codex-auth.json
 provider-files/config.toml
 provider-files/opencode.json
+provider-files/providers.fallback.json
 third_party/hdc/

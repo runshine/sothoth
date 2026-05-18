@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 from typing import Literal
+from urllib.parse import quote, unquote, urlparse
 
 import yaml
 from pydantic import BaseModel, Field
@@ -17,7 +18,7 @@ class WorkspaceConfig(BaseModel):
     bundle_scan_roots: list[str] = Field(default_factory=lambda: ["base", "foundation"])
     allow_custom_project_path: bool = True
     supports_poc: bool = True
-    default_pipeline_mode: Literal["audit_then_poc", "audit_only", "poc_only"] = "audit_then_poc"
+    default_pipeline_mode: Literal["audit_then_poc", "audit_only", "poc_only", "custom_graph"] = "custom_graph"
     is_default: bool = False
 
 
@@ -28,7 +29,7 @@ class AppConfig(BaseModel):
 
 
 class ExecutionConfig(BaseModel):
-    mode: Literal["mock", "codex_cli", "opencode_cli"] = "mock"
+    mode: Literal["mock", "codex_cli", "opencode_cli", "agentflow_cli"] = "mock"
     max_parallel_tasks: int = 1
     scheduler_tick_interval_seconds: float = 1.0
     heartbeat_interval_seconds: int = 5
@@ -40,6 +41,9 @@ class ExecutionConfig(BaseModel):
     poc_runtime_available: bool = True
     codex_bin: str = "codex"
     opencode_bin: str = "opencode"
+    agentflow_root: str = "/home/icsl/agentflow-alpha"
+    agentflow_python_bin: str = "python3"
+    agentflow_agent: Literal["codex", "opencode"] = "opencode"
     codex_skip_git_repo_check: bool = True
     codex_json_output: bool = True
     codex_capture_last_message: bool = True
@@ -62,12 +66,33 @@ class ProviderSourceConfig(BaseModel):
     api_prefix: str = "/api/configcenter/service/llm"
     timeout_seconds: int = 15
     machine_token: str | None = None
+    fallback_file_path: str | None = None
+
+
+class DatabaseConfig(BaseModel):
+    type: Literal["sqlite", "mysql"] = "sqlite"
+    path: str = "/var/lib/secflow-ipc-audit/ipc-audit.db"
+    host: str = "localhost"
+    port: int = 3306
+    username: str = "root"
+    password: str = ""
+    name: str = "secflow"
+
+    @property
+    def url(self) -> str:
+        if self.type == "sqlite":
+            return f"sqlite:///{self.path}"
+        username = quote(self.username, safe="")
+        password = quote(self.password, safe="")
+        name = quote(self.name, safe="")
+        return f"mysql+pymysql://{username}:{password}@{self.host}:{self.port}/{name}"
 
 
 class ServiceConfig(BaseModel):
     title: str = "SecFlow IPC Audit Service"
     api_prefix: str = "/api/app/ipc-audit"
     database_url: str = "sqlite:////var/lib/secflow-ipc-audit/ipc-audit.db"
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     state_root: str = "/var/lib/secflow-ipc-audit"
     default_workspace_id: str | None = None
     app: AppConfig = Field(default_factory=AppConfig)
@@ -89,7 +114,7 @@ def _default_workspace_payload() -> list[dict[str, object]]:
             "bundle_scan_roots": ["base", "foundation"],
             "allow_custom_project_path": True,
             "supports_poc": True,
-            "default_pipeline_mode": "audit_then_poc",
+            "default_pipeline_mode": "custom_graph",
             "is_default": True,
         }
     ]
@@ -126,12 +151,59 @@ def _as_bool(value: object) -> bool:
     return str(value).lower() in {"1", "true", "yes", "on"}
 
 
+def _database_payload_from_url(url: str | None) -> dict[str, object]:
+    value = str(url or "").strip()
+    if not value:
+        return {}
+    if value.startswith("sqlite:///"):
+        return {"type": "sqlite", "path": value[len("sqlite:///") :]}
+    parsed = urlparse(value)
+    if parsed.scheme not in {"mysql", "mysql+pymysql"}:
+        raise ValueError(f"unsupported database url: {value}")
+    return {
+        "type": "mysql",
+        "host": parsed.hostname or "localhost",
+        "port": int(parsed.port or 3306),
+        "username": unquote(parsed.username or "root"),
+        "password": unquote(parsed.password or ""),
+        "name": unquote(parsed.path.lstrip("/") or "secflow"),
+    }
+
+
+def _normalize_database_payload(payload: dict[str, object]) -> None:
+    raw_url = str(payload.get("database_url") or "").strip()
+    raw_db = dict(payload.get("database") or {})
+    env_url = str(os.environ.get("IPC_AUDIT_DATABASE_URL") or "").strip()
+    if env_url:
+        normalized = _database_payload_from_url(env_url)
+    elif raw_url:
+        normalized = _database_payload_from_url(raw_url)
+    else:
+        normalized = raw_db
+    if not env_url:
+        normalized["type"] = os.environ.get("IPC_AUDIT_DB_TYPE", normalized.get("type", "sqlite"))
+        normalized["path"] = os.environ.get(
+            "IPC_AUDIT_DB_PATH",
+            normalized.get("path", "/var/lib/secflow-ipc-audit/ipc-audit.db"),
+        )
+        normalized["host"] = os.environ.get("IPC_AUDIT_DB_HOST", normalized.get("host", "localhost"))
+        normalized["port"] = int(os.environ.get("IPC_AUDIT_DB_PORT", normalized.get("port", 3306)))
+        normalized["username"] = os.environ.get("IPC_AUDIT_DB_USERNAME", normalized.get("username", "root"))
+        normalized["password"] = os.environ.get("IPC_AUDIT_DB_PASSWORD", normalized.get("password", ""))
+        normalized["name"] = os.environ.get("IPC_AUDIT_DB_NAME", normalized.get("name", "secflow"))
+    database = DatabaseConfig(**normalized)
+    payload["database"] = database.model_dump()
+    payload["database_url"] = env_url or database.url
+
+
 def _merge_env_overrides(payload: dict[str, object]) -> dict[str, object]:
     app_payload = dict(payload.get("app") or {})
     execution_payload = dict(payload.get("execution") or {})
     provider_source_payload = dict(payload.get("provider_source") or {})
-    payload["database_url"] = os.environ.get("IPC_AUDIT_DATABASE_URL", payload.get("database_url"))
-    payload["state_root"] = os.environ.get("IPC_AUDIT_STATE_ROOT", payload.get("state_root"))
+    payload["state_root"] = os.environ.get(
+        "IPC_AUDIT_STATE_ROOT",
+        payload.get("state_root", "/var/lib/secflow-ipc-audit"),
+    )
     payload["default_workspace_id"] = os.environ.get(
         "IPC_AUDIT_DEFAULT_WORKSPACE_ID",
         payload.get("default_workspace_id"),
@@ -194,6 +266,18 @@ def _merge_env_overrides(payload: dict[str, object]) -> dict[str, object]:
     execution_payload["opencode_bin"] = os.environ.get(
         "IPC_AUDIT_OPENCODE_BIN",
         execution_payload.get("opencode_bin", "opencode"),
+    )
+    execution_payload["agentflow_root"] = os.environ.get(
+        "IPC_AUDIT_AGENTFLOW_ROOT",
+        execution_payload.get("agentflow_root", "/home/icsl/agentflow-alpha"),
+    )
+    execution_payload["agentflow_python_bin"] = os.environ.get(
+        "IPC_AUDIT_AGENTFLOW_PYTHON_BIN",
+        execution_payload.get("agentflow_python_bin", "python3"),
+    )
+    execution_payload["agentflow_agent"] = os.environ.get(
+        "IPC_AUDIT_AGENTFLOW_AGENT",
+        execution_payload.get("agentflow_agent", "opencode"),
     )
     execution_payload["codex_skip_git_repo_check"] = _as_bool(
         os.environ.get(
@@ -281,9 +365,14 @@ def _merge_env_overrides(payload: dict[str, object]) -> dict[str, object]:
         "IPC_AUDIT_PROVIDER_MACHINE_TOKEN",
         provider_source_payload.get("machine_token"),
     )
+    provider_source_payload["fallback_file_path"] = os.environ.get(
+        "IPC_AUDIT_PROVIDER_FALLBACK_FILE",
+        provider_source_payload.get("fallback_file_path"),
+    )
     payload["app"] = app_payload
     payload["execution"] = execution_payload
     payload["provider_source"] = provider_source_payload
+    _normalize_database_payload(payload)
     return payload
 
 
@@ -306,10 +395,9 @@ def get_config() -> ServiceConfig:
 
 
 def get_sqlite_db_path() -> Path:
-    url = get_config().database_url
-    if not url.startswith("sqlite:///"):
-        raise ValueError(f"only sqlite URLs are supported in V1: {url}")
-    raw_path = url[len("sqlite:///") :]
+    if get_config().database.type != "sqlite":
+        raise ValueError(f"database backend is not sqlite: {get_config().database.type}")
+    raw_path = get_config().database.path
     path = Path(raw_path)
     if not path.is_absolute():
         path = Path.cwd() / path

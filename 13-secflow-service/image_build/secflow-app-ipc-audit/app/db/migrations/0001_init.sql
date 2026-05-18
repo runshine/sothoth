@@ -5,7 +5,7 @@ create table if not exists ipc_audit_tasks (
   project_id text,
   workspace_id text not null,
   title text not null,
-  pipeline_mode text not null check (pipeline_mode in ('audit_then_poc', 'audit_only', 'poc_only')),
+  pipeline_mode text not null check (pipeline_mode in ('audit_then_poc', 'audit_only', 'poc_only', 'custom_graph')),
   input_kind text not null check (input_kind in ('preset_project', 'custom_project', 'existing_audit_report')),
   project_path text,
   report_path text,
@@ -13,7 +13,7 @@ create table if not exists ipc_audit_tasks (
     'queued', 'running', 'succeeded', 'partial_success', 'failed',
     'cancel_requested', 'cancelled', 'needs_attention'
   )),
-  current_stage text check (current_stage is null or current_stage in ('audit', 'poc')),
+  current_stage text,
   latest_attempt_id text,
   attempt_count integer not null default 0 check (attempt_count >= 0),
   notes text,
@@ -86,7 +86,7 @@ create index if not exists idx_ipc_audit_attempts_lease_expires_at
 create table if not exists ipc_audit_stage_runs (
   stage_run_id text primary key,
   attempt_id text not null,
-  stage_name text not null check (stage_name in ('audit', 'poc')),
+  stage_name text not null,
   status text not null check (status in (
     'pending', 'queued', 'running', 'succeeded', 'failed',
     'skipped', 'cancelled', 'timed_out'
@@ -111,7 +111,7 @@ create table if not exists ipc_audit_task_events (
   event_id text not null unique,
   task_id text not null,
   attempt_id text,
-  stage_name text check (stage_name is null or stage_name in ('audit', 'poc')),
+  stage_name text,
   event_type text not null,
   level text not null check (level in ('debug', 'info', 'warning', 'error')),
   message text not null,
@@ -131,10 +131,11 @@ create table if not exists ipc_audit_artifacts (
   artifact_id text primary key,
   task_id text not null,
   attempt_id text not null,
-  stage_name text check (stage_name is null or stage_name in ('audit', 'poc')),
+  stage_name text,
   artifact_kind text not null check (artifact_kind in (
     'audit_report', 'audit_log', 'poc_report', 'poc_log',
-    'audited_result_json', 'entries_snapshot', 'runtime_manifest', 'session_file'
+    'audited_result_json', 'entries_snapshot', 'runtime_manifest', 'session_file',
+    'stage_log', 'report_output', 'graph_manifest'
   )),
   display_name text not null,
   relative_path text not null,

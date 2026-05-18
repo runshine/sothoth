@@ -32,7 +32,7 @@ spec:
             - name: IPC_AUDIT_STATE_ROOT
               value: /var/lib/secflow-ipc-audit
             - name: IPC_AUDIT_EXECUTION_MODE
-              value: opencode_cli
+              value: agentflow_cli
             - name: IPC_AUDIT_MAX_PARALLEL_TASKS
               value: "1"
             - name: IPC_AUDIT_DEFAULT_WORKSPACE_ID
@@ -41,6 +41,12 @@ spec:
               value: /usr/local/bin/codex
             - name: IPC_AUDIT_OPENCODE_BIN
               value: /usr/local/bin/opencode
+            - name: IPC_AUDIT_AGENTFLOW_ROOT
+              value: /home/icsl/agentflow-alpha
+            - name: IPC_AUDIT_AGENTFLOW_PYTHON_BIN
+              value: /usr/local/bin/python3
+            - name: IPC_AUDIT_AGENTFLOW_AGENT
+              value: opencode
             - name: HDC_BIN
               value: /workspace/openharmony_6_1/vendor/edu/docker/src/hdc
             - name: LD_LIBRARY_PATH
@@ -67,12 +73,15 @@ spec:
               value: "180"
             - name: IPC_AUDIT_WORKSPACES_JSON
               value: >-
-                [{"workspace_id":"oh61-main","display_name":"OpenHarmony 6.1 Main Tree","repo_root":"/workspace/openharmony_6_1","entries_file":".audit/ipc_entries.txt","bundle_scan_roots":["base","foundation"],"allow_custom_project_path":true,"supports_poc":true,"default_pipeline_mode":"audit_then_poc","is_default":true}]
+                [{"workspace_id":"oh61-main","display_name":"OpenHarmony 6.1 Main Tree","repo_root":"/workspace/openharmony_6_1","entries_file":".audit/ipc_entries.txt","bundle_scan_roots":["base","foundation"],"allow_custom_project_path":true,"supports_poc":true,"default_pipeline_mode":"custom_graph","is_default":true}]
           volumeMounts:
             - name: ipc-audit-state
               mountPath: /var/lib/secflow-ipc-audit
             - name: oh-workspace
               mountPath: /workspace/openharmony_6_1
+              readOnly: true
+            - name: agentflow-root
+              mountPath: /home/icsl/agentflow-alpha
               readOnly: true
             - name: dev-net-tun
               mountPath: /dev/net/tun
@@ -95,6 +104,10 @@ spec:
         - name: oh-workspace
           persistentVolumeClaim:
             claimName: openharmony-workspace-pvc
+        - name: agentflow-root
+          hostPath:
+            path: /home/icsl/agentflow-alpha
+            type: Directory
         - name: dev-net-tun
           hostPath:
             path: /dev/net/tun

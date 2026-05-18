@@ -54,6 +54,15 @@ def _validate_opencode_config(opencode_bin: str) -> bool:
     return isinstance(payload, dict) and bool(payload)
 
 
+def _validate_agentflow_root(agentflow_root: str, agentflow_python_bin: str) -> bool:
+    root = Path(str(agentflow_root or "").strip())
+    if not root.exists() or not root.is_dir():
+        return False
+    if not (root / "agentflow" / "cli.py").exists():
+        return False
+    return shutil.which(agentflow_python_bin) is not None
+
+
 @router.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(status="ok", service="secflow-app-ipc-audit")
@@ -76,6 +85,11 @@ def ready() -> ReadyResponse:
         "workspace": workspace_ready,
         "scheduler": get_scheduler_service().is_running,
         "executor_binary": True,
+        "executor_binary:agentflow_cli": shutil.which(cfg.execution.agentflow_python_bin) is not None,
+        "executor_config:agentflow_cli": _validate_agentflow_root(
+            cfg.execution.agentflow_root,
+            cfg.execution.agentflow_python_bin,
+        ),
         "executor_binary:codex_cli": shutil.which(cfg.execution.codex_bin) is not None,
         "executor_binary:opencode_cli": shutil.which(cfg.execution.opencode_bin) is not None,
         "executor_config:opencode_cli": True,
@@ -95,7 +109,11 @@ def ready() -> ReadyResponse:
         checks["state_root"] = True
     except Exception:
         checks["state_root"] = False
-    if cfg.execution.mode == "codex_cli":
+    if cfg.execution.mode == "agentflow_cli":
+        checks["executor_binary"] = (
+            checks["executor_binary:agentflow_cli"] and checks["executor_config:agentflow_cli"]
+        )
+    elif cfg.execution.mode == "codex_cli":
         checks["executor_binary"] = checks["executor_binary:codex_cli"]
     elif cfg.execution.mode == "opencode_cli":
         checks["executor_binary"] = checks["executor_binary:opencode_cli"]

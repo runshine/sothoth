@@ -12,16 +12,26 @@ from app.workers.runner import (
     StageContext,
     StageExecutionResult,
     StageHooks,
+    append_file_to_log,
+    build_agentflow_exec_command,
+    build_agentflow_node,
+    build_agentflow_process_env_and_summary,
     build_codex_exec_command,
     build_opencode_exec_command,
     build_process_env_and_summary,
     command_line_string,
     copy_file,
+    discover_single_run_dir,
     extract_opencode_session_id,
     opencode_last_event_is_error,
+    read_json_file,
     resolve_executor_mode,
+    resolve_stage_primary_report_output_path,
     resolve_stage_executor_model,
     run_logged_command,
+    write_agentflow_events_from_trace,
+    write_json_file,
+    write_last_message_from_agentflow_result,
     write_last_message_from_jsonl,
     write_text_file,
 )
@@ -35,9 +45,28 @@ def run_poc_stage(context: StageContext, hooks: StageHooks, *, source_audit_repo
     prompt_path = context.stage_session_file("prompt.txt")
     events_path = context.stage_session_file("events.jsonl")
     last_message_path = context.stage_session_file("last-message.md")
-    final_report_path = context.stage_artifact_path("poc-report.md")
+    final_report_path = resolve_stage_primary_report_output_path(
+        context,
+        "poc",
+        default_path=context.stage_artifact_path("poc-report.md"),
+    )
     final_json_path = context.stage_artifact_path("audited-result.json")
     log_path = context.stage_log_path()
+
+    if executor_mode == "agentflow_cli":
+        combined_result = _reuse_agentflow_combined_stage_result(
+            context=context,
+            prompt_path=prompt_path,
+            events_path=events_path,
+            last_message_path=last_message_path,
+            final_report_path=final_report_path,
+            final_json_path=final_json_path,
+            log_path=log_path,
+            poc_skill=poc_skill,
+            executor_model=executor_model,
+        )
+        if combined_result is not None:
+            return combined_result
 
     if not source_audit_report.exists():
         write_text_file(prompt_path, "")
@@ -81,6 +110,21 @@ def run_poc_stage(context: StageContext, hooks: StageHooks, *, source_audit_repo
         )
     if executor_mode == "opencode_cli":
         return _run_opencode_stage(
+            context=context,
+            hooks=hooks,
+            prompt=prompt,
+            prompt_path=prompt_path,
+            events_path=events_path,
+            last_message_path=last_message_path,
+            source_report_path=stage_source_report,
+            final_report_path=final_report_path,
+            final_json_path=final_json_path,
+            log_path=log_path,
+            poc_skill=poc_skill,
+            executor_model=executor_model,
+        )
+    if executor_mode == "agentflow_cli":
+        return _run_agentflow_stage(
             context=context,
             hooks=hooks,
             prompt=prompt,
@@ -341,6 +385,332 @@ def _run_codex_stage(
         message="poc stage completed",
         return_code=result.return_code,
         log_path=log_path,
+        artifacts=[
+            StageArtifact("poc_report", final_report_path, display_name=final_report_path.name),
+            StageArtifact("audited_result_json", final_json_path, display_name=final_json_path.name),
+        ],
+        session_files=session_files,
+        output_path=final_report_path,
+        metadata=metadata,
+    )
+
+
+def _run_agentflow_stage(
+    *,
+    context: StageContext,
+    hooks: StageHooks,
+    prompt: str,
+    prompt_path: Path,
+    events_path: Path,
+    last_message_path: Path,
+    source_report_path: Path,
+    final_report_path: Path,
+    final_json_path: Path,
+    log_path: Path,
+    poc_skill: str,
+    executor_model: str | None,
+) -> StageExecutionResult:
+    return _run_agentflow_single_node_stage(
+        context=context,
+        hooks=hooks,
+        prompt=prompt,
+        prompt_path=prompt_path,
+        events_path=events_path,
+        last_message_path=last_message_path,
+        source_report_path=source_report_path,
+        final_report_path=final_report_path,
+        final_json_path=final_json_path,
+        log_path=log_path,
+        poc_skill=poc_skill,
+        executor_model=executor_model,
+    )
+
+
+def _run_agentflow_single_node_stage(
+    *,
+    context: StageContext,
+    hooks: StageHooks,
+    prompt: str,
+    prompt_path: Path,
+    events_path: Path,
+    last_message_path: Path,
+    source_report_path: Path,
+    final_report_path: Path,
+    final_json_path: Path,
+    log_path: Path,
+    poc_skill: str,
+    executor_model: str | None,
+) -> StageExecutionResult:
+    cfg = get_config().execution
+    workspace_output_report = _attempt_output_report(context)
+    workspace_output_json = _attempt_output_json(context)
+    sandbox_mode = str(context.effective_config.get("poc_sandbox_mode") or cfg.poc_sandbox_mode)
+    network_access = bool(context.effective_config.get("poc_network_access", cfg.poc_network_access))
+    pipeline_path = context.stage_session_dir() / "agentflow-pipeline.json"
+    runs_dir = context.stage_session_dir() / "agentflow-runs"
+    agent_name = cfg.agentflow_agent
+    pipeline_payload: dict[str, object] = {
+        "name": f"secflow-ipc-audit-{context.stage_name}",
+        "working_dir": str(context.repo_root),
+        "nodes": [
+            build_agentflow_node(
+                node_id=context.stage_name,
+                prompt=prompt,
+                repo_root=context.repo_root,
+                attempt_root=context.attempt_root,
+                model=executor_model,
+                sandbox_mode=sandbox_mode,
+                network_access=network_access,
+                success_criteria=[
+                    {
+                        "kind": "file_nonempty",
+                        "path": str(workspace_output_report),
+                    },
+                    {
+                        "kind": "file_nonempty",
+                        "path": str(workspace_output_json),
+                    },
+                    {
+                        "kind": "json_valid",
+                        "path": str(workspace_output_json),
+                    },
+                ],
+            )
+        ],
+    }
+    write_json_file(pipeline_path, pipeline_payload)
+    process_env, provider_summary, provider_metadata = build_agentflow_process_env_and_summary(context)
+    process_env["AGENTFLOW_RUNS_DIR"] = str(runs_dir)
+    cmd = build_agentflow_exec_command(pipeline_path, runs_dir=runs_dir)
+    log_header = "\n".join(
+        [
+            f"=== {poc_skill} ===",
+            f"Generated at (UTC): {utc_now_z()}",
+            f"Repo root: {context.repo_root}",
+            f"Source report: {source_report_path}",
+            f"Executor mode: agentflow_cli",
+            f"AgentFlow agent: {agent_name}",
+            f"Model: {executor_model or '(default)'}",
+            f"Output PoC report path: {workspace_output_report}",
+            f"Output audited result json path: {workspace_output_json}",
+            "=== provider runtime ===",
+            provider_summary,
+            "=== command ===",
+            command_line_string(cmd),
+            "=== prompt ===",
+            prompt,
+            "=== agentflow cli output ===",
+            "",
+        ]
+    )
+    result = run_logged_command(
+        cmd,
+        cwd=context.repo_root,
+        log_path=log_path,
+        log_header=log_header,
+        hooks=hooks,
+        timeout_seconds=int(cfg.task_timeout_seconds),
+        process_env=process_env,
+    )
+    session_files = [prompt_path]
+    run_dir = discover_single_run_dir(runs_dir)
+    trace_path = run_dir / "artifacts" / context.stage_name / "trace.jsonl" if run_dir else None
+    result_path = run_dir / "artifacts" / context.stage_name / "result.json" if run_dir else None
+    stdout_path = run_dir / "artifacts" / context.stage_name / "stdout.log" if run_dir else None
+    stderr_path = run_dir / "artifacts" / context.stage_name / "stderr.log" if run_dir else None
+    if stdout_path and stdout_path.exists():
+        append_file_to_log(log_path, stdout_path, "=== agentflow node stdout ===")
+    if stderr_path and stderr_path.exists() and stderr_path.stat().st_size > 0:
+        append_file_to_log(log_path, stderr_path, "=== agentflow node stderr ===")
+    if trace_path and trace_path.exists():
+        write_agentflow_events_from_trace(trace_path, events_path)
+    else:
+        write_text_file(events_path, "")
+    if events_path.exists():
+        session_files.append(events_path)
+    if result_path and result_path.exists():
+        write_last_message_from_agentflow_result(result_path, last_message_path, trace_path=trace_path)
+    if last_message_path.exists():
+        session_files.append(last_message_path)
+    metadata = {
+        "executor_mode": "agentflow_cli",
+        "agentflow_agent": agent_name,
+        "model": executor_model,
+        "poc_skill": poc_skill,
+        "source_report_path": str(source_report_path),
+        "output_report_path": str(workspace_output_report),
+        "output_json_path": str(workspace_output_json),
+        "duration_seconds": result.duration_seconds,
+        "agentflow_pipeline_path": str(pipeline_path),
+        "agentflow_run_dir": str(run_dir) if run_dir else None,
+        **provider_metadata,
+    }
+    if result.cancelled:
+        return StageExecutionResult(
+            stage_name="poc",
+            status="cancelled",
+            message="poc stage cancelled",
+            return_code=result.return_code,
+            log_path=log_path,
+            artifacts=[],
+            session_files=session_files,
+            metadata=metadata,
+        )
+    if result.timed_out:
+        return StageExecutionResult(
+            stage_name="poc",
+            status="timed_out",
+            message="poc stage timed out",
+            return_code=result.return_code,
+            log_path=log_path,
+            artifacts=[],
+            session_files=session_files,
+            metadata=metadata,
+        )
+    if result.return_code != 0:
+        return StageExecutionResult(
+            stage_name="poc",
+            status="failed",
+            message=f"poc stage failed with return code {result.return_code}",
+            return_code=result.return_code,
+            log_path=log_path,
+            artifacts=[],
+            session_files=session_files,
+            metadata=metadata,
+        )
+    if not workspace_output_report.exists() or workspace_output_report.stat().st_size == 0:
+        return StageExecutionResult(
+            stage_name="poc",
+            status="failed",
+            message=f"poc report not generated: {workspace_output_report}",
+            return_code=result.return_code,
+            log_path=log_path,
+            artifacts=[],
+            session_files=session_files,
+            metadata=metadata,
+        )
+    if not workspace_output_json.exists() or workspace_output_json.stat().st_size == 0:
+        return StageExecutionResult(
+            stage_name="poc",
+            status="failed",
+            message=f"audited result json not generated: {workspace_output_json}",
+            return_code=result.return_code,
+            log_path=log_path,
+            artifacts=[],
+            session_files=session_files,
+            metadata=metadata,
+        )
+    copy_file(workspace_output_report, final_report_path)
+    copy_file(workspace_output_json, final_json_path)
+    return StageExecutionResult(
+        stage_name="poc",
+        status="succeeded",
+        message="poc stage completed",
+        return_code=result.return_code,
+        log_path=log_path,
+        artifacts=[
+            StageArtifact("poc_report", final_report_path, display_name=final_report_path.name),
+            StageArtifact("audited_result_json", final_json_path, display_name=final_json_path.name),
+        ],
+        session_files=session_files,
+        output_path=final_report_path,
+        metadata=metadata,
+    )
+
+
+def _reuse_agentflow_combined_stage_result(
+    *,
+    context: StageContext,
+    prompt_path: Path,
+    events_path: Path,
+    last_message_path: Path,
+    final_report_path: Path,
+    final_json_path: Path,
+    log_path: Path,
+    poc_skill: str,
+    executor_model: str | None,
+) -> StageExecutionResult | None:
+    if context.pipeline_mode != "audit_then_poc":
+        return None
+    manifest_path = _agentflow_manifest_path(context)
+    manifest = read_json_file(manifest_path)
+    if not isinstance(manifest, dict) or str(manifest.get("kind") or "") != "combined_stage_pipeline":
+        return None
+    stages = manifest.get("stages")
+    if not isinstance(stages, dict):
+        return None
+    stage_data = stages.get("poc")
+    if not isinstance(stage_data, dict):
+        return None
+
+    stage_log_path_value = str(stage_data.get("log_path") or "").strip()
+    stage_log_path = Path(stage_log_path_value) if stage_log_path_value else log_path
+    session_files = [path for path in (prompt_path, events_path, last_message_path) if path.exists()]
+    output_paths_value = stage_data.get("output_paths")
+    output_paths = (
+        [Path(str(item)) for item in output_paths_value if str(item).strip()]
+        if isinstance(output_paths_value, list)
+        else []
+    )
+    workspace_output_report = output_paths[0] if len(output_paths) > 0 else _attempt_output_report(context)
+    workspace_output_json = output_paths[1] if len(output_paths) > 1 else _attempt_output_json(context)
+    status = str(stage_data.get("status") or "failed")
+    message = str(stage_data.get("message") or "poc stage failed")
+    return_code = stage_data.get("return_code")
+    process_data = manifest.get("process") if isinstance(manifest.get("process"), dict) else {}
+    metadata = {
+        "executor_mode": "agentflow_cli",
+        "reused_combined_pipeline": True,
+        "model": executor_model,
+        "poc_skill": poc_skill,
+        "output_report_path": str(workspace_output_report),
+        "output_json_path": str(workspace_output_json),
+        "duration_seconds": process_data.get("duration_seconds"),
+        "agentflow_pipeline_path": manifest.get("pipeline_path"),
+        "agentflow_run_dir": manifest.get("run_dir"),
+        "agentflow_manifest_path": str(manifest_path),
+    }
+    if status != "succeeded":
+        return StageExecutionResult(
+            stage_name="poc",
+            status=status,
+            message=message,
+            return_code=return_code,
+            log_path=stage_log_path,
+            artifacts=[],
+            session_files=session_files,
+            metadata=metadata,
+        )
+    if _missing_output(workspace_output_report):
+        return StageExecutionResult(
+            stage_name="poc",
+            status="failed",
+            message=f"poc report not generated: {workspace_output_report}",
+            return_code=return_code,
+            log_path=stage_log_path,
+            artifacts=[],
+            session_files=session_files,
+            metadata=metadata,
+        )
+    if _missing_output(workspace_output_json):
+        return StageExecutionResult(
+            stage_name="poc",
+            status="failed",
+            message=f"audited result json not generated: {workspace_output_json}",
+            return_code=return_code,
+            log_path=stage_log_path,
+            artifacts=[],
+            session_files=session_files,
+            metadata=metadata,
+        )
+    copy_file(workspace_output_report, final_report_path)
+    copy_file(workspace_output_json, final_json_path)
+    return StageExecutionResult(
+        stage_name="poc",
+        status="succeeded",
+        message="poc stage completed",
+        return_code=return_code,
+        log_path=stage_log_path,
         artifacts=[
             StageArtifact("poc_report", final_report_path, display_name=final_report_path.name),
             StageArtifact("audited_result_json", final_json_path, display_name=final_json_path.name),
@@ -704,6 +1074,10 @@ def _attempt_output_report(context: StageContext) -> Path:
 
 def _attempt_output_json(context: StageContext) -> Path:
     return context.stage_session_dir() / "outputs" / "audited-result.json"
+
+
+def _agentflow_manifest_path(context: StageContext) -> Path:
+    return context.runtime_root / "agentflow-stage-pipeline-manifest.json"
 
 
 def _missing_output(path: Path) -> bool:

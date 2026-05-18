@@ -3,16 +3,17 @@ from __future__ import annotations
 import json
 import os
 import selectors
+import signal
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from app.core.config import ExecutionConfig, get_config
 
-SUPPORTED_EXECUTOR_MODES = ("mock", "codex_cli", "opencode_cli")
+SUPPORTED_EXECUTOR_MODES = ("mock", "codex_cli", "opencode_cli", "agentflow_cli")
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,8 @@ class LoggedCommandResult:
 class StageHooks:
     heartbeat: Callable[[], None]
     is_cancel_requested: Callable[[], bool]
+    graph_prepared: Callable[[dict[str, Any]], None] | None = None
+    graph_progress: Callable[[dict[str, Any]], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +92,23 @@ class StageContext:
 
 def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def normalize_attempt_relative_path(raw_path: str) -> PurePosixPath:
+    normalized = PurePosixPath(str(raw_path or "").strip())
+    if not normalized.parts or normalized.is_absolute() or ".." in normalized.parts:
+        raise ValueError(f"invalid relative path: {raw_path}")
+    return normalized
+
+
+def resolve_attempt_relative_path(attempt_root: Path, relative_path: str) -> Path:
+    normalized = normalize_attempt_relative_path(relative_path)
+    candidate = (attempt_root.resolve() / normalized.as_posix()).resolve()
+    try:
+        candidate.relative_to(attempt_root.resolve())
+    except ValueError as exc:
+        raise ValueError(f"path escapes attempt root: {relative_path}") from exc
+    return candidate
 
 
 def write_text_file(path: Path, content: str) -> Path:
@@ -144,6 +164,66 @@ def resolve_stage_executor_model(context: StageContext) -> str | None:
     return resolve_executor_model(context.effective_config)
 
 
+def load_declared_report_outputs(effective_config: dict[str, Any]) -> list[dict[str, Any]]:
+    outputs = effective_config.get("report_outputs")
+    if not isinstance(outputs, list):
+        return []
+    normalized_outputs: list[dict[str, Any]] = []
+    for item in outputs:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        node_id = str(item.get("node_id") or "").strip()
+        output_id = str(item.get("output_id") or "").strip()
+        title = str(item.get("title") or output_id or node_id).strip()
+        if not path or not node_id or not output_id:
+            continue
+        normalized_outputs.append(
+            {
+                "output_id": output_id,
+                "node_id": node_id,
+                "title": title or output_id,
+                "path": path,
+                "format": str(item.get("format") or "markdown"),
+                "required": bool(item.get("required", True)),
+                "order": int(item.get("order") or 0),
+            }
+        )
+    return normalized_outputs
+
+
+def resolve_report_outputs_for_attempt(attempt_root: Path, effective_config: dict[str, Any]) -> list[dict[str, Any]]:
+    resolved_outputs: list[dict[str, Any]] = []
+    for item in load_declared_report_outputs(effective_config):
+        relative_path = normalize_attempt_relative_path(str(item["path"])).as_posix()
+        absolute_path = resolve_attempt_relative_path(attempt_root, relative_path)
+        resolved_outputs.append(
+            {
+                **item,
+                "path": relative_path,
+                "absolute_path": absolute_path,
+            }
+        )
+    return resolved_outputs
+
+
+def resolve_stage_primary_report_output_path(
+    context: StageContext,
+    stage_name: str,
+    *,
+    default_path: Path,
+) -> Path:
+    matches = [
+        item
+        for item in resolve_report_outputs_for_attempt(context.attempt_root, context.effective_config)
+        if str(item.get("node_id") or "").strip() == stage_name
+    ]
+    if not matches:
+        return default_path
+    matches.sort(key=lambda item: (int(item.get("order") or 0), str(item.get("output_id") or "")))
+    return Path(matches[0]["absolute_path"])
+
+
 def build_codex_exec_command(
     prompt: str,
     *,
@@ -196,6 +276,71 @@ def build_opencode_exec_command(
     return cmd
 
 
+def build_agentflow_exec_command(
+    pipeline_path: Path,
+    *,
+    runs_dir: Path,
+) -> list[str]:
+    cfg = get_config().execution
+    return [
+        cfg.agentflow_python_bin,
+        "-m",
+        "agentflow.cli",
+        "run",
+        str(pipeline_path),
+        "--output",
+        "json-summary",
+        "--preflight",
+        "never",
+        "--runs-dir",
+        str(runs_dir),
+    ]
+
+
+def build_agentflow_node(
+    *,
+    node_id: str,
+    prompt: str,
+    repo_root: Path,
+    attempt_root: Path,
+    model: str | None = None,
+    sandbox_mode: str | None = None,
+    network_access: bool = False,
+    depends_on: list[str] | None = None,
+    success_criteria: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    cfg = get_config().execution
+    agent_name = cfg.agentflow_agent
+    executable = cfg.codex_bin if agent_name == "codex" else cfg.opencode_bin
+    extra_args: list[str] = []
+    node_env: dict[str, str] = {}
+    if agent_name == "codex":
+        extra_args += ["--add-dir", str(attempt_root)]
+        if sandbox_mode:
+            node_env["AGENTFLOW_CODEX_SANDBOX_MODE"] = sandbox_mode
+            if sandbox_mode == "workspace-write" and network_access:
+                extra_args += ["-c", "sandbox_workspace_write.network_access=true"]
+    node: dict[str, Any] = {
+        "id": node_id,
+        "agent": agent_name,
+        "prompt": prompt,
+        "model": model,
+        "tools": "read_write",
+        "target": {
+            "kind": "local",
+            "cwd": str(repo_root),
+        },
+        "timeout_seconds": int(cfg.task_timeout_seconds),
+        "executable": executable,
+        "extra_args": extra_args,
+        "env": node_env,
+        "success_criteria": success_criteria or [],
+    }
+    if depends_on:
+        node["depends_on"] = depends_on
+    return node
+
+
 def build_process_env(context: StageContext) -> dict[str, str]:
     process_env, _, _ = build_process_env_and_summary(context)
     return process_env
@@ -235,6 +380,41 @@ def build_process_env_and_summary(context: StageContext) -> tuple[dict[str, str]
 
 def build_opencode_process_env(context: StageContext) -> dict[str, str]:
     return build_process_env(context)
+
+
+def build_agentflow_process_env_and_summary(context: StageContext) -> tuple[dict[str, str], str, dict[str, Any]]:
+    cfg = get_config().execution
+    process_env, provider_summary, provider_metadata = build_process_env_and_summary(context)
+    merged_pythonpath = str(cfg.agentflow_root)
+    current_pythonpath = str(process_env.get("PYTHONPATH") or "").strip()
+    if current_pythonpath:
+        merged_pythonpath = f"{cfg.agentflow_root}:{current_pythonpath}"
+    process_env["PYTHONPATH"] = merged_pythonpath
+    metadata = {
+        "agentflow_root": cfg.agentflow_root,
+        "agentflow_python_bin": cfg.agentflow_python_bin,
+        "agentflow_agent": cfg.agentflow_agent,
+        **provider_metadata,
+    }
+    summary = "\n".join(
+        [
+            provider_summary,
+            f"AgentFlow root: {cfg.agentflow_root}",
+            f"AgentFlow python: {cfg.agentflow_python_bin}",
+            f"AgentFlow agent: {cfg.agentflow_agent}",
+            f"PYTHONPATH: {process_env.get('PYTHONPATH', '')}",
+        ]
+    )
+    return process_env, summary, metadata
+
+
+def read_json_file(path: Path) -> Any | None:
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def opencode_env_summary(env: dict[str, str]) -> str:
@@ -308,6 +488,85 @@ def write_last_message_from_jsonl(events_path: Path, output_path: Path) -> Path 
     return write_text_file(output_path, last_message.rstrip() + "\n")
 
 
+def write_agentflow_events_from_trace(trace_path: Path, output_path: Path) -> Path | None:
+    if not trace_path.exists():
+        return None
+    normalized_lines: list[str] = []
+    for raw_line in trace_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        try:
+            item = json.loads(stripped)
+        except json.JSONDecodeError:
+            normalized_lines.append(stripped)
+            continue
+        normalized = {
+            "type": item.get("kind") or "event",
+            "title": item.get("title"),
+            "content": item.get("content"),
+            "timestamp": item.get("timestamp"),
+            "agent": item.get("agent"),
+            "attempt": item.get("attempt"),
+            "source": item.get("source"),
+            "raw": item.get("raw"),
+        }
+        normalized_lines.append(json.dumps(normalized, ensure_ascii=False))
+    return write_text_file(output_path, "\n".join(normalized_lines) + ("\n" if normalized_lines else ""))
+
+
+def write_last_message_from_agentflow_result(
+    result_path: Path,
+    output_path: Path,
+    *,
+    trace_path: Path | None = None,
+) -> Path | None:
+    final_message: str | None = None
+    if result_path.exists():
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            final_message = str(payload.get("final_response") or payload.get("output") or "").strip() or None
+    if not final_message and trace_path is not None and trace_path.exists():
+        for raw_line in trace_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            try:
+                item = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            message = str(item.get("content") or "").strip()
+            if message and str(item.get("kind") or "").strip() in {"assistant_message", "completed", "result"}:
+                final_message = message
+    if not final_message:
+        return None
+    return write_text_file(output_path, final_message.rstrip() + "\n")
+
+
+def discover_single_run_dir(runs_dir: Path) -> Path | None:
+    if not runs_dir.exists():
+        return None
+    run_dirs = [path for path in sorted(runs_dir.iterdir()) if path.is_dir()]
+    if len(run_dirs) != 1:
+        return None
+    return run_dirs[0]
+
+
+def append_file_to_log(log_path: Path, source_path: Path, header: str) -> None:
+    if not source_path.exists():
+        return
+    content = source_path.read_bytes()
+    _ensure_trailing_newline(log_path)
+    with log_path.open("ab") as handle:
+        handle.write((header + "\n").encode("utf-8"))
+        handle.write(content)
+        if not content.endswith(b"\n"):
+            handle.write(b"\n")
+
+
 def command_line_string(cmd: list[str]) -> str:
     def quote(value: str) -> str:
         if not value or any(ch.isspace() or ch in "\"'\\$`" for ch in value):
@@ -329,6 +588,7 @@ def run_logged_command(
     mirror_output_paths: list[Path] | None = None,
     append: bool = False,
     process_env: dict[str, str] | None = None,
+    progress_tick: Callable[[], None] | None = None,
 ) -> LoggedCommandResult:
     cfg: ExecutionConfig = get_config().execution
     heartbeat_interval = max(float(cfg.heartbeat_interval_seconds), 1.0)
@@ -357,6 +617,7 @@ def run_logged_command(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=process_env,
+        start_new_session=True,
     )
     selector = selectors.DefaultSelector()
     if process.stdout is not None:
@@ -366,6 +627,7 @@ def run_logged_command(
     timed_out = False
     started = time.monotonic()
     last_heartbeat = 0.0
+    last_progress_tick = 0.0
 
     with log_path.open("ab") as handle:
         try:
@@ -374,6 +636,12 @@ def run_logged_command(
                 if now - last_heartbeat >= heartbeat_interval:
                     hooks.heartbeat()
                     last_heartbeat = now
+                if progress_tick is not None and now - last_progress_tick >= poll_interval:
+                    try:
+                        progress_tick()
+                    except Exception:
+                        pass
+                    last_progress_tick = now
                 if hooks.is_cancel_requested():
                     cancelled = True
                     _terminate_process(process)
@@ -421,12 +689,18 @@ def _read_chunk(fd: int) -> bytes:
 def _terminate_process(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is not None:
         return
-    process.terminate()
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
     grace_seconds = max(float(get_config().execution.process_terminate_grace_seconds), 0.5)
     try:
         process.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
-        process.kill()
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         process.wait()
 
 

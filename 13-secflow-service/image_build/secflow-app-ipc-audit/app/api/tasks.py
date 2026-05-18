@@ -11,6 +11,8 @@ from app.schemas import (
     ArtifactListResponse,
     AttemptDetailResponse,
     EventPageResponse,
+    GraphValidateRequest,
+    GraphValidateResponse,
     PagedTaskResponse,
     StageLogResponse,
     SuccessResponse,
@@ -19,9 +21,18 @@ from app.schemas import (
     TaskRetryRequest,
     TaskSummaryResponse,
 )
-from app.services.task_service import get_task_service
+from app.services.task_service import (
+    extract_complete_jsonl_byte_chunks,
+    get_task_service,
+    normalize_agentflow_trace_jsonl_line,
+)
 
 router = APIRouter()
+
+
+@router.post("/graphs/validate", response_model=GraphValidateResponse)
+def validate_graph(payload: GraphValidateRequest) -> GraphValidateResponse:
+    return get_task_service().validate_graph(payload)
 
 
 @router.post("/tasks", response_model=TaskSummaryResponse, status_code=201)
@@ -108,7 +119,9 @@ async def stream_stage_session_file(
     cursor: int = Query(default=0, ge=0),
     poll_ms: int = Query(default=1000, ge=200, le=5000),
 ) -> StreamingResponse:
-    normalized, candidate = get_task_service().resolve_stage_session_file_path(task_id, attempt_id, stage_name, path)
+    source = get_task_service().resolve_stage_session_source(task_id, attempt_id, stage_name, path)
+    normalized = source.normalized_path
+    candidate = source.source_path
     interval = poll_ms / 1000.0
 
     async def event_stream():
@@ -140,7 +153,11 @@ async def stream_stage_session_file(
                     position += len(chunk)
                     if normalized.name.endswith(".jsonl"):
                         pending += chunk
-                        lines, pending = _extract_complete_lines(pending)
+                        if source.mode == "agentflow_trace":
+                            raw_lines, pending = extract_complete_jsonl_byte_chunks(pending)
+                            lines = [line for raw in raw_lines if (line := normalize_agentflow_trace_jsonl_line(raw))]
+                        else:
+                            lines, pending = _extract_complete_lines(pending)
                         if lines:
                             yield _sse(
                                 "delta",
