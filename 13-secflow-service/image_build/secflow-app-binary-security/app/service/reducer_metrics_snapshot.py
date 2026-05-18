@@ -13,7 +13,7 @@ from app.config import get_config
 from app.observability import CONTENT_TYPE_LATEST
 
 
-_SNAPSHOT_TTL_SECONDS = 180
+_SNAPSHOT_TTL_SECONDS = 1800
 _SNAPSHOT_STALE_AFTER_SECONDS = 30.0
 _SNAPSHOT_KEY = "secflow:binary-security:reducer:metrics-snapshot:v1"
 
