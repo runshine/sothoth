@@ -54,29 +54,37 @@ class MainRoleTests(unittest.TestCase):
         body = response.body.decode("utf-8", errors="ignore")
         self.assertIn("secflow_binary_security_api_requests_total", body)
 
-    def test_reducer_metrics_endpoint_proxies_when_running_as_api(self):
-        fake_response = SimpleNamespace(
-            status_code=200,
-            content=b"# HELP demo metric\n",
-            headers={"content-type": "text/plain; version=0.0.4; charset=utf-8"},
-            text="# HELP demo metric\n",
+    def test_reducer_metrics_endpoint_reads_snapshot_when_running_as_api(self):
+        fake_store = SimpleNamespace(
+            render_metrics=AsyncMock(
+                return_value=(b"# HELP demo metric\n# TYPE demo gauge\ndemo 1\n", "text/plain; version=0.0.4; charset=utf-8")
+            )
         )
-        fake_client = SimpleNamespace(get=AsyncMock(return_value=fake_response))
         with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "api"}, clear=True), patch(
-            "app.main.get_shared_async_client",
-            AsyncMock(return_value=fake_client),
+            "app.main.get_reducer_metrics_snapshot_store",
+            return_value=fake_store,
         ):
             response = asyncio.run(main.reducer_metrics_endpoint())
         self.assertEqual(200, response.status_code)
         self.assertIn("text/plain", response.media_type or "")
-        self.assertIn("# HELP demo metric", response.body.decode("utf-8", errors="ignore"))
+        body = response.body.decode("utf-8", errors="ignore")
+        self.assertIn("# HELP demo metric", body)
+        fake_store.render_metrics.assert_awaited_once_with(fallback_payload=None)
 
-    def test_reducer_metrics_endpoint_returns_local_payload_when_running_as_reducer(self):
-        observe_api_request("GET", "/health", 200, 0.01)
-        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "reducer"}, clear=True):
+    def test_reducer_metrics_endpoint_passes_local_fallback_when_running_as_reducer(self):
+        fake_store = SimpleNamespace(
+            render_metrics=AsyncMock(return_value=(b"demo 1\n", "text/plain; version=0.0.4; charset=utf-8"))
+        )
+        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "reducer"}, clear=True), patch(
+            "app.main.get_reducer_metrics_snapshot_store",
+            return_value=fake_store,
+        ):
             response = asyncio.run(main.reducer_metrics_endpoint())
         self.assertEqual(200, response.status_code)
         self.assertIn("text/plain", response.media_type or "")
+        fallback_payload = fake_store.render_metrics.await_args.kwargs.get("fallback_payload")
+        self.assertIsInstance(fallback_payload, str)
+        self.assertIn("secflow_binary_security_api_requests_total", fallback_payload)
 
     def test_ready_route_returns_503_when_checks_fail(self):
         async def fake_collect():

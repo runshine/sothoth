@@ -68,6 +68,7 @@ from app.observability import (
     observe_task_lifecycle,
     observe_task_operation,
     observe_worker_counts,
+    render_metrics,
 )
 from app.schemas import (
     BinarySecurityActionResponse,
@@ -104,6 +105,7 @@ from app.service.fileserver import get_fileserver_client
 from app.service.firmware_unpacker import get_firmware_unpacker_client
 from app.service.security import app_task_root, ensure_dir, validate_task_id
 from app.service.system_analyse import get_system_analyse_client
+from app.service.reducer_metrics_snapshot import get_reducer_metrics_snapshot_store
 from app.service.task_queue import get_task_queue
 from app.time_utils import now_local
 
@@ -3482,11 +3484,22 @@ class TaskManager:
                         processed += 1
                         await self._reduce_state_event(event_id)
                     await self._observe_runtime_metrics(db)
+                    await self._publish_reducer_metrics_snapshot()
                     if processed:
                         continue
             finally:
                 db.close()
             await asyncio.sleep(interval_seconds)
+
+    async def _publish_reducer_metrics_snapshot(self) -> None:
+        try:
+            payload, _ = await asyncio.to_thread(render_metrics)
+            await get_reducer_metrics_snapshot_store().write_snapshot(
+                metrics_payload=payload.decode("utf-8", errors="ignore"),
+                source_pod=self.instance_id,
+            )
+        except Exception:
+            logger.exception("binary-security failed to publish reducer metrics snapshot")
 
     def _observe_state_runtime_metrics(self, db: Session) -> None:
         rows = (
