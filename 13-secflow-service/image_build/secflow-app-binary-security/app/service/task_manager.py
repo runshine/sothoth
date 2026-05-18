@@ -3319,8 +3319,7 @@ class TaskManager:
                                         self._run_task(claimed_id),
                                         name=f"binary-security-{claimed_id}",
                                     )
-                    else:
-                        await self._reconcile_work_queues(db)
+                    await self._reconcile_work_queues(db)
                     await self._observe_runtime_metrics(db)
             except asyncio.CancelledError:
                 raise

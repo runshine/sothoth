@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from app.service.task_manager import TaskManager
 
@@ -38,6 +39,47 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
             },
             status["loops"],
         )
+
+
+class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dispatch_loop_reconciles_queues_even_when_task_queue_is_busy(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.cfg.queue.enabled = True
+        manager.cfg.queue.block_timeout_seconds = 1
+        popped = False
+        reconcile_calls = []
+
+        class _Queue:
+            async def pop_task(self, _timeout_seconds):
+                nonlocal popped
+                if not popped:
+                    popped = True
+                    return "task-1"
+                manager._running = False
+                return None
+
+        def _dispatch_task_by_id(_db, task_id):
+            return task_id
+
+        async def _run_task(_task_id):
+            return None
+
+        async def _reconcile(_db):
+            reconcile_calls.append("called")
+
+        async def _observe(_db):
+            return None
+
+        manager._dispatch_task_by_id = _dispatch_task_by_id
+        manager._run_task = _run_task
+        manager._reconcile_work_queues = _reconcile
+        manager._observe_runtime_metrics = _observe
+
+        with patch("app.service.task_manager.get_task_queue", return_value=_Queue()):
+            await manager._dispatch_loop()
+
+        self.assertEqual(["called", "called"], reconcile_calls)
 
 
 if __name__ == "__main__":
