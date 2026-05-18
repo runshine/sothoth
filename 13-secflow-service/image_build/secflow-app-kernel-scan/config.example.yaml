@@ -1,0 +1,32 @@
+# SecFlow Kernel Scan Service Configuration
+# Copy to config.yaml and adjust values as needed.
+
+database_url: "sqlite:////var/lib/secflow-kernel-scan/kernel-scan.db"
+state_root: "/var/lib/secflow-kernel-scan"
+kernel_dir: "/workspace/kernel"
+
+app:
+  host: "0.0.0.0"
+  port: 8080
+  debug: false
+
+execution:
+  mode: "claude_cli"
+  claude_bin: "claude"
+  claude_model: "zai-org/GLM-5"
+  # Per-stage model overrides (empty = use claude_model)
+  entry_model: ""
+  audit_model: ""
+  poc_model: ""
+  max_parallel_tasks: 1
+  # Default thread counts (can be overridden per-task via API)
+  entry_threads: 4
+  audit_threads: 4
+  poc_threads: 2
+  scheduler_tick_interval_seconds: 1.0
+  heartbeat_interval_seconds: 5
+  lease_duration_seconds: 30
+  task_timeout_seconds: 14400
+  cancel_check_interval_seconds: 1.0
+  process_terminate_grace_seconds: 5.0
+  mock_stage_delay_seconds: 0.0

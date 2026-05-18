@@ -1,0 +1,49 @@
+services:
+  secflow-app-kernel-scan:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NODE_BASE_IMAGE: ${NODE_BASE_IMAGE:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/node:22-bookworm-slim}
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/python:3.11-slim}
+        ANDROID_PLATFORM_TOOLS_URL: ${ANDROID_PLATFORM_TOOLS_URL:-https://dl.google.com/android/repository/platform-tools-latest-linux.zip}
+        ANDROID_NDK_URL: ${ANDROID_NDK_URL:-https://dl.google.com/android/repository/android-ndk-r29-linux.zip}
+        ANDROID_NDK_SHA1: ${ANDROID_NDK_SHA1:-87e2bb7e9be5d6a1c6cdf5ec40dd4e0c6d07c30b}
+      platforms:
+        - linux/amd64
+    platform: linux/amd64
+    image: secflow-app-kernel-scan:local
+    container_name: secflow-app-kernel-scan
+    restart: unless-stopped
+    user: "1000:1000"
+    ports:
+      - "${KERNEL_SCAN_PORT:-18081}:8080"
+    environment:
+      KERNEL_SCAN_DATABASE_URL: "sqlite:////var/lib/secflow-kernel-scan/kernel-scan.db"
+      KERNEL_SCAN_STATE_ROOT: "/var/lib/secflow-kernel-scan"
+      KERNEL_SCAN_KERNEL_DIR: "/workspace/kernel"
+      KERNEL_SCAN_EXECUTION_MODE: "${KERNEL_SCAN_EXECUTION_MODE:-claude_cli}"
+      KERNEL_SCAN_CLAUDE_MODEL: "${KERNEL_SCAN_CLAUDE_MODEL:-zai-org/GLM-5}"
+      KERNEL_SCAN_MAX_PARALLEL_TASKS: "${KERNEL_SCAN_MAX_PARALLEL_TASKS:-1}"
+      KERNEL_SCAN_ENTRY_THREADS: "${KERNEL_SCAN_ENTRY_THREADS:-4}"
+      KERNEL_SCAN_AUDIT_THREADS: "${KERNEL_SCAN_AUDIT_THREADS:-4}"
+      KERNEL_SCAN_POC_THREADS: "${KERNEL_SCAN_POC_THREADS:-2}"
+      KERNEL_SCAN_ENTRY_MODEL: "${KERNEL_SCAN_ENTRY_MODEL:-}"
+      KERNEL_SCAN_AUDIT_MODEL: "${KERNEL_SCAN_AUDIT_MODEL:-}"
+      KERNEL_SCAN_POC_MODEL: "${KERNEL_SCAN_POC_MODEL:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      ANTHROPIC_BASE_URL: "${ANTHROPIC_BASE_URL:-}"
+    volumes:
+      - type: bind
+        source: ${KERNEL_SCAN_STATE_HOST_PATH:-./state}
+        target: /var/lib/secflow-kernel-scan
+      - type: bind
+        source: ${KERNEL_HOST_PATH}
+        target: /workspace/kernel
+        read_only: true
+    healthcheck:
+      test: ["CMD", "python3", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/api/app/kernel-scan/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

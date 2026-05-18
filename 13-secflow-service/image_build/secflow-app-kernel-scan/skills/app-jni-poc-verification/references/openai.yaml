@@ -1,0 +1,4 @@
+interface:
+  display_name: "App JNI PoC"
+  short_description: "把 PoC 写进 App 的 JNI 并取应用私有日志"
+  default_prompt: "使用 $app-jni-poc-verification 把 PoC 写进 Android Studio 工程的 JNI 函数，通过 am start 拉起应用，并用 run-as 读取应用私有日志完成验证。"

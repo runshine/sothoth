@@ -1,0 +1,4 @@
+interface:
+  display_name: "PoC 验证"
+  short_description: "根据报告生成并验证 Android 内核 PoC"
+  default_prompt: "使用 $poc-verification 根据漏洞报告生成可运行的 Android PoC，推送到设备并完成验证。"
