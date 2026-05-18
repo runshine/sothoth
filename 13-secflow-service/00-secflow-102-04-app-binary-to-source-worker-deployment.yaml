@@ -29,7 +29,7 @@ spec:
             name: secflow-app-binary-to-source-worker
       containers:
       - name: secflow-app-binary-to-source-worker
-        image: ghcr.io/runshine/secflow-app-binary-to-source:latest
+        image: ghcr.io/runshine/secflow-app-binary-to-source:20260518-1177f4e
         imagePullPolicy: Always
         env:
           - name: TZ
