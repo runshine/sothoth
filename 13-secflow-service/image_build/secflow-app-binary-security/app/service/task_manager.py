@@ -2465,34 +2465,79 @@ class TaskManager:
             failed_downstream_count=failed_count,
         )
 
-    def _clear_archive_jobs_for_stages(self, db: Session, task_id: str, stage_names: list[str]) -> int:
-        normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
-        if not normalized:
-            return 0
-        return int(
-            db.query(BinarySecurityArchiveJob)
-            .filter(
-                BinarySecurityArchiveJob.task_id == task_id,
-                BinarySecurityArchiveJob.stage_name.in_(normalized),
-            )
-            .delete(synchronize_session=False)
-            or 0
-        )
-
     def _clear_archive_jobs_for_stage_items(self, db: Session, task_id: str, stage_name: str, item_ids: list[str]) -> int:
         normalized_item_ids = [str(item_id or "").strip() for item_id in item_ids if str(item_id or "").strip()]
         if not normalized_item_ids:
             return 0
-        return int(
-            db.query(BinarySecurityArchiveJob)
-            .filter(
-                BinarySecurityArchiveJob.task_id == task_id,
-                BinarySecurityArchiveJob.stage_name == stage_name,
-                BinarySecurityArchiveJob.item_id.in_(normalized_item_ids),
-            )
-            .delete(synchronize_session=False)
-            or 0
-        )
+        deleted = 0
+        remaining_ids = list(normalized_item_ids)
+        while remaining_ids:
+            current_ids = remaining_ids[:100]
+            remaining_ids = remaining_ids[100:]
+            for attempt in range(3):
+                try:
+                    with self._savepoint(db):
+                        deleted += int(
+                            db.query(BinarySecurityArchiveJob)
+                            .filter(
+                                BinarySecurityArchiveJob.task_id == task_id,
+                                BinarySecurityArchiveJob.stage_name == stage_name,
+                                BinarySecurityArchiveJob.item_id.in_(current_ids),
+                            )
+                            .delete(synchronize_session=False)
+                            or 0
+                        )
+                    break
+                except Exception as exc:
+                    if attempt >= 2 or not self._is_retryable_lock_error(exc):
+                        raise
+                    db.rollback()
+        return deleted
+
+    def _clear_archive_jobs_for_stages(
+        self,
+        db: Session,
+        task_id: str,
+        stage_names: list[str],
+        *,
+        batch_size: int = 100,
+        max_retries: int = 3,
+    ) -> int:
+        normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
+        if not normalized:
+            return 0
+        deleted = 0
+        while True:
+            job_ids = [
+                row[0]
+                for row in db.query(BinarySecurityArchiveJob.id)
+                .filter(
+                    BinarySecurityArchiveJob.task_id == task_id,
+                    BinarySecurityArchiveJob.stage_name.in_(normalized),
+                )
+                .order_by(BinarySecurityArchiveJob.created_at.asc(), BinarySecurityArchiveJob.id.asc())
+                .limit(max(1, int(batch_size)))
+                .all()
+            ]
+            if not job_ids:
+                return deleted
+            for attempt in range(max(1, int(max_retries))):
+                try:
+                    with self._savepoint(db):
+                        deleted += int(
+                            db.query(BinarySecurityArchiveJob)
+                            .filter(
+                                BinarySecurityArchiveJob.task_id == task_id,
+                                BinarySecurityArchiveJob.id.in_(job_ids),
+                            )
+                            .delete(synchronize_session=False)
+                            or 0
+                        )
+                    break
+                except Exception as exc:
+                    if attempt >= max(1, int(max_retries)) - 1 or not self._is_retryable_lock_error(exc):
+                        raise
+                    db.rollback()
 
     def _delete_archive_children_for_stages(self, db: Session, task: BinarySecurityTask, stage_names: list[str]) -> int:
         normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
@@ -3174,7 +3219,6 @@ class TaskManager:
             stage_name=target_stage,
             payload={"action": action, "target_stage": target_stage, "state_event_id": event.id, **event_payload},
         )
-        self._enqueue_action(task.id)
 
     async def _blocking_action_dispatch_loop(self) -> None:
         session_factory = get_session_factory()
@@ -3274,23 +3318,30 @@ class TaskManager:
     def _claim_preparing_task_by_id(self, db: Session, task_id: str) -> str | None:
         started_at = _now()
         lease_expires_at = self._next_lease_expiry(db, now_value=started_at)
-        updated = (
-            db.query(BinarySecurityTask)
-            .filter(
-                BinarySecurityTask.id == task_id,
-                BinarySecurityTask.status.in_(list(TASK_PREPARING_STATUSES)),
-                self._lease_filter_available(),
+        try:
+            updated = (
+                db.query(BinarySecurityTask)
+                .filter(
+                    BinarySecurityTask.id == task_id,
+                    BinarySecurityTask.status.in_(list(TASK_PREPARING_STATUSES)),
+                    self._lease_filter_available(),
+                )
+                .update(
+                    {
+                        BinarySecurityTask.dispatcher_instance_id: self.instance_id,
+                        BinarySecurityTask.dispatch_started_at: started_at,
+                        BinarySecurityTask.lease_expires_at: lease_expires_at,
+                        BinarySecurityTask.updated_at: started_at,
+                    },
+                    synchronize_session=False,
+                )
             )
-            .update(
-                {
-                    BinarySecurityTask.dispatcher_instance_id: self.instance_id,
-                    BinarySecurityTask.dispatch_started_at: started_at,
-                    BinarySecurityTask.lease_expires_at: lease_expires_at,
-                    BinarySecurityTask.updated_at: started_at,
-                },
-                synchronize_session=False,
-            )
-        )
+        except Exception as exc:
+            if not self._is_retryable_lock_error(exc):
+                raise
+            db.rollback()
+            logger.warning("binary-security preparing task claim hit retryable lock conflict: task=%s", task_id)
+            return None
         if updated:
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
             if task is not None:
@@ -8319,6 +8370,8 @@ class TaskManager:
         if not mapping:
             return False, f"阶段 {stage_name} 未配置安全重试接口"
         self._normalize_cancelled_task_active_children(db, task)
+        if task.status == "cancelled":
+            return False, "当前任务已取消，暂不支持阶段重试；请使用任务重试/重头开始重新排队"
         if task.status in STAGE_RETRY_BLOCKED_TASK_STATUSES:
             return False, f"当前任务状态不允许重试: {task.status}"
         stage_run = db.query(BinarySecurityStageRun).filter(

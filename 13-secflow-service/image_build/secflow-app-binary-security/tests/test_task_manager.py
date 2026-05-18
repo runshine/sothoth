@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -3228,6 +3229,95 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("pending", task.status)
             self.assertEqual([], db.archive_jobs)
 
+    def test_apply_blocking_action_request_does_not_enqueue_action_directly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="binary",
+                status="failed",
+                task_type=TASK_TYPE_BINARY,
+                current_stage="binary_to_source",
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+                operation_lock_token="op-1",
+            )
+            event = BinarySecurityStateEvent(
+                id="evt1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="binary_to_source",
+                event_type="manual_blocking_action_requested",
+                status="leased",
+                payload={
+                    "action": "retry_stage_full",
+                    "preparing_status": "retry_preparing",
+                    "target_stage": "binary_to_source",
+                    "message": "accepted",
+                    "operation_token": "op-1",
+                },
+            )
+            db = _ModelAwareDb(tasks=[task])
+
+            with patch.object(self.manager, "_enqueue_action") as enqueue_action:
+                self.manager._apply_blocking_action_request_locked(db, event)
+
+            self.assertEqual("retry_preparing", task.status)
+            self.assertEqual("retry_stage_full", task.pending_action)
+            enqueue_action.assert_not_called()
+
+    def test_clear_archive_jobs_for_stages_deletes_in_batches(self):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        SessionLocal = sessionmaker(bind=engine)
+        db = SessionLocal()
+        try:
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="binary",
+                status="failed",
+                task_type=TASK_TYPE_BINARY,
+                current_stage="binary_to_source",
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root="/tmp/output",
+                workspace_root="/tmp/workspace",
+            )
+            db.add(task)
+            for idx in range(7):
+                db.add(
+                    BinarySecurityArchiveJob(
+                        id=f"aj{idx}",
+                        task_id="t1",
+                        project_id="p1",
+                        stage_name="binary_to_source",
+                        item_id=f"i{idx}",
+                        archive_status="success",
+                    )
+                )
+            db.commit()
+
+            deleted = self.manager._clear_archive_jobs_for_stages(
+                db,
+                "t1",
+                ["binary_to_source"],
+                batch_size=3,
+            )
+            db.commit()
+
+            self.assertEqual(7, deleted)
+            remaining = db.query(BinarySecurityArchiveJob).filter(
+                BinarySecurityArchiveJob.task_id == "t1",
+                BinarySecurityArchiveJob.stage_name == "binary_to_source",
+            ).count()
+            self.assertEqual(0, remaining)
+        finally:
+            db.close()
+
     def test_retry_task_clears_stage_output_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -5505,6 +5595,88 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(supported)
         self.assertIn("重复历史 item", reason or "")
+
+    def test_stage_retry_support_rejects_cancelled_task(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="cancelled",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            sequence_no=1,
+            status="cancelled",
+            finished_at=None,
+        )
+        stage_item = BinarySecurityStageItem(
+            id="si1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            item_key="fw1",
+            parent_key="fw1",
+            downstream_service="firmware_unpacker",
+            downstream_task_id="down-1",
+            status="cancelled",
+            created_at=_now(),
+            finished_at=None,
+        )
+
+        supported, reason = self.manager._stage_retry_support(
+            _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[stage_item]),
+            task,
+            "firmware_unpack",
+        )
+
+        self.assertFalse(supported)
+        self.assertIn("已取消", reason or "")
+
+    def test_retry_stage_rejects_cancelled_task(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="cancelled",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            sequence_no=1,
+            status="cancelled",
+        )
+        stage_item = BinarySecurityStageItem(
+            id="si1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            item_key="fw1",
+            parent_key="fw1",
+            downstream_service="firmware_unpacker",
+            downstream_task_id="down-1",
+            status="cancelled",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[stage_item])
+
+        with self.assertRaises(ValidationError) as ctx:
+            self.manager.retry_stage(db, project_id="p1", task_id="task1", stage_name="firmware_unpack")
+
+        self.assertIn("已取消", str(ctx.exception))
 
     def test_task_retry_support_targets_first_stage_for_full_restart(self):
         task = BinarySecurityTask(
