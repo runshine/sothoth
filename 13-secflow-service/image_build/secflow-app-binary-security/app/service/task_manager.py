@@ -8601,9 +8601,9 @@ class TaskManager:
         mapped = self._map_downstream_status(status)
         if mapped == "running":
             priority = 0
-        elif mapped == "queued":
-            priority = 1
         elif mapped == "success":
+            priority = 1
+        elif mapped == "queued":
             priority = 2
         elif mapped in {"failed", "cancelled"}:
             priority = 3

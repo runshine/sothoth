@@ -6920,6 +6920,34 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("dfa-running", payload["task_id"])
         self.assertEqual("dfa-running", item.downstream_task_id)
 
+    def test_find_reusable_dataflow_payload_prefers_success_over_newer_pending_duplicate(self):
+        task = BinarySecurityTask(id="t1", project_id="p1")
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            item_key="entry-1",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa-old",
+            status="queued",
+        )
+        client = _AsyncDataflowClientStub(
+            listed={
+                "items": [
+                    {"task_id": "dfa-pending", "status": "pending", "updated_at": "2026-05-18T23:27:54"},
+                    {"task_id": "dfa-passed", "status": "passed", "updated_at": "2026-05-18T23:20:00"},
+                ]
+            }
+        )
+
+        with patch.object(task_manager_module, "get_dataflow_analyse_client", return_value=client):
+            payload = asyncio.run(self.manager._find_reusable_dataflow_payload(task, item))
+
+        self.assertIsNotNone(payload)
+        self.assertEqual("dfa-passed", payload["task_id"])
+        self.assertEqual("dfa-passed", item.downstream_task_id)
+
 
 if __name__ == "__main__":
     unittest.main()
