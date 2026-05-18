@@ -171,7 +171,7 @@ metadata:
   name: secflow-app-entry-analyse-worker
   namespace: secflow-ns
 spec:
-  replicas: 2
+  replicas: 4
   revisionHistoryLimit: 3
   strategy:
     type: RollingUpdate

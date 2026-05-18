@@ -13,7 +13,14 @@ class BinaryToSourceClient(JsonHttpClient):
         cfg = get_config().services.binary_to_source
         super().__init__(base_url=cfg.base_url, timeout=cfg.timeout)
 
-    async def create_task(self, project_id: str, name: str, elf_path: str, token: str, metadata: dict[str, Any] | None = None, origin: dict[str, Any] | None = None) -> dict:
+    async def create_task(
+        self,
+        project_id: str,
+        name: str,
+        elf_tasks: list[dict[str, Any]],
+        token: str,
+        origin: dict[str, Any] | None = None,
+    ) -> dict:
         return await self.post(
             f"/projects/{project_id}/tasks",
             token=token,
@@ -23,13 +30,7 @@ class BinaryToSourceClient(JsonHttpClient):
                 "priority": 5,
                 "tags": ["binary-security", "b2s"],
                 **(origin or {}),
-                "elf_tasks": [
-                    {
-                        "elf_path": elf_path,
-                        "file_list": [],
-                        "metadata": metadata or {},
-                    }
-                ],
+                "elf_tasks": elf_tasks,
             },
         )
 

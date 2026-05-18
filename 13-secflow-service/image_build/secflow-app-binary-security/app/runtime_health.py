@@ -54,12 +54,13 @@ def _reducer_readiness() -> tuple[bool, dict[str, Any]]:
         return True, {"enabled": False, "running": False, "loops": loops}
 
     running = bool(runtime.get("running"))
-    reducer_alive = bool(loops.get("state_reducer"))
-    return running and reducer_alive, {
+    required_loops = ("state_reducer", "reducer_metrics_snapshot")
+    missing = [loop_name for loop_name in required_loops if not bool(loops.get(loop_name))]
+    return running and not missing, {
         "enabled": True,
         "running": running,
         "loops": loops,
-        "missing_loops": [] if reducer_alive else ["state_reducer"],
+        "missing_loops": missing,
     }
 
 

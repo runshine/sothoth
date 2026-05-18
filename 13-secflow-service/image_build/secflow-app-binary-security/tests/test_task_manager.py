@@ -1604,6 +1604,100 @@ class TaskManagerTests(unittest.TestCase):
 
             self.assertEqual(str(target.resolve()), path)
 
+    def test_resolve_module_binary_paths_returns_all_module_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            unpacked = root / "unpacked"
+            module_dir = unpacked / "modules" / "ipsec"
+            module_dir.mkdir(parents=True)
+            first = unpacked / "lib" / "libipsecluaext-ppc_rtos.so"
+            second = unpacked / "module" / "libipsec-ppc_rtos.so"
+            first.parent.mkdir(parents=True)
+            second.parent.mkdir(parents=True)
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            (module_dir / "files.list").write_text(
+                "lib/libipsecluaext-ppc_rtos.so\nmodule/libipsec-ppc_rtos.so\n",
+                encoding="utf-8",
+            )
+
+            paths = self.manager._resolve_module_binary_paths(
+                {
+                    "module_name": "ipsec",
+                    "module_dir": str(module_dir),
+                    "files_list": str(module_dir / "files.list"),
+                    "unpacked_root": str(unpacked),
+                }
+            )
+
+            self.assertEqual([str(first.resolve()), str(second.resolve())], paths)
+
+    def test_build_module_elf_tasks_creates_one_task_per_module_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            unpacked = root / "unpacked"
+            module_dir = unpacked / "modules" / "ipsec"
+            module_dir.mkdir(parents=True)
+            first = unpacked / "lib" / "libipsecluaext-ppc_rtos.so"
+            second = unpacked / "module" / "libipsec-ppc_rtos.so"
+            first.parent.mkdir(parents=True)
+            second.parent.mkdir(parents=True)
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            (module_dir / "files.list").write_text(
+                "lib/libipsecluaext-ppc_rtos.so\nmodule/libipsec-ppc_rtos.so\n",
+                encoding="utf-8",
+            )
+
+            elf_tasks = self.manager._build_module_elf_tasks(
+                {
+                    "module_key": "fw-ipsec",
+                    "module_name": "ipsec",
+                    "module_dir": str(module_dir),
+                    "files_list": str(module_dir / "files.list"),
+                    "unpacked_root": str(unpacked),
+                    "risk_level": "高",
+                }
+            )
+
+            self.assertEqual(2, len(elf_tasks))
+            self.assertEqual(str(first.resolve()), elf_tasks[0]["elf_path"])
+            self.assertEqual(str(second.resolve()), elf_tasks[1]["elf_path"])
+            self.assertEqual(1, elf_tasks[0]["metadata"]["module_file_index"])
+            self.assertEqual(2, elf_tasks[1]["metadata"]["module_file_count"])
+            self.assertEqual(
+                [str(first.resolve()), str(second.resolve())],
+                elf_tasks[0]["metadata"]["module_all_elf_paths"],
+            )
+
+
+class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_create_task_preserves_multiple_elf_tasks(self):
+        from app.service.binary_to_source import BinaryToSourceClient
+
+        client = BinaryToSourceClient()
+        recorded = {}
+
+        async def fake_post(path, *, token=None, json_body=None):
+            recorded["path"] = path
+            recorded["token"] = token
+            recorded["json_body"] = json_body
+            return {"id": "task1"}
+
+        client.post = fake_post
+
+        elf_tasks = [
+            {"elf_path": "/tmp/first.so", "file_list": [], "metadata": {"module_file_index": 1}},
+            {"elf_path": "/tmp/second.so", "file_list": [], "metadata": {"module_file_index": 2}},
+        ]
+        result = await client.create_task("p1", "ipsec", elf_tasks, "token123", {"parent_task_id": "bs1"})
+
+        self.assertEqual({"id": "task1"}, result)
+        self.assertEqual("/projects/p1/tasks", recorded["path"])
+        self.assertEqual("token123", recorded["token"])
+        self.assertEqual(elf_tasks, recorded["json_body"]["elf_tasks"])
+        self.assertEqual("bs1", recorded["json_body"]["parent_task_id"])
+
     def test_build_project_stats_aggregates_task_metrics(self):
         success = BinarySecurityTask(
             id="t1",

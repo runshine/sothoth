@@ -716,6 +716,7 @@ class TaskManager:
         self._downstream_reconcile_task: Optional[asyncio.Task] = None
         self._action_loop_task: Optional[asyncio.Task] = None
         self._state_reducer_loop_task: Optional[asyncio.Task] = None
+        self._reducer_metrics_snapshot_loop_task: Optional[asyncio.Task] = None
         self._workers: dict[str, asyncio.Task] = {}
         self._action_workers: dict[str, asyncio.Task] = {}
         self._archive_workers: set[asyncio.Task] = set()
@@ -748,6 +749,10 @@ class TaskManager:
             self._state_reducer_loop_task = asyncio.create_task(
                 self._state_reducer_loop(),
                 name="binary-security-state-reducer",
+            )
+            self._reducer_metrics_snapshot_loop_task = asyncio.create_task(
+                self._reducer_metrics_snapshot_loop(),
+                name="binary-security-reducer-metrics-snapshot",
             )
         if run_worker_loops:
             await self._seed_work_queues()
@@ -782,6 +787,12 @@ class TaskManager:
             self._state_reducer_loop_task.cancel()
             try:
                 await self._state_reducer_loop_task
+            except asyncio.CancelledError:
+                pass
+        if self._reducer_metrics_snapshot_loop_task:
+            self._reducer_metrics_snapshot_loop_task.cancel()
+            try:
+                await self._reducer_metrics_snapshot_loop_task
             except asyncio.CancelledError:
                 pass
         archive_active = list(self._archive_workers)
@@ -3484,12 +3495,20 @@ class TaskManager:
                         processed += 1
                         await self._reduce_state_event(event_id)
                     await self._observe_runtime_metrics(db)
-                    await self._publish_reducer_metrics_snapshot()
                     if processed:
                         continue
             finally:
                 db.close()
             await asyncio.sleep(interval_seconds)
+
+    async def _reducer_metrics_snapshot_loop(self) -> None:
+        interval_seconds = max(5, int(self.cfg.scheduler.poll_interval_seconds or 5))
+        # Publish one snapshot immediately on startup so the dashboard has a
+        # current baseline even before the reducer processes the first event.
+        await self._publish_reducer_metrics_snapshot()
+        while self._running:
+            await asyncio.sleep(interval_seconds)
+            await self._publish_reducer_metrics_snapshot()
 
     async def _publish_reducer_metrics_snapshot(self) -> None:
         try:
@@ -5256,6 +5275,9 @@ class TaskManager:
         archive_loop_alive = bool(self._archive_loop_task and not self._archive_loop_task.done())
         reconcile_loop_alive = bool(self._downstream_reconcile_task and not self._downstream_reconcile_task.done())
         state_reducer_loop_alive = bool(self._state_reducer_loop_task and not self._state_reducer_loop_task.done())
+        reducer_metrics_snapshot_loop_alive = bool(
+            self._reducer_metrics_snapshot_loop_task and not self._reducer_metrics_snapshot_loop_task.done()
+        )
         return {
             "running": self._running,
             "loops": {
@@ -5264,6 +5286,7 @@ class TaskManager:
                 "archive_dispatch": archive_loop_alive,
                 "downstream_reconcile": reconcile_loop_alive,
                 "state_reducer": state_reducer_loop_alive,
+                "reducer_metrics_snapshot": reducer_metrics_snapshot_loop_alive,
             },
             "workers": {
                 "task_workers": len([task for task in self._workers.values() if not task.done()]),
@@ -10167,16 +10190,15 @@ class TaskManager:
                 retrying=retrying,
             )
             session.commit()
-            elf_path = self._choose_module_binary(module)
+            elf_tasks = self._build_module_elf_tasks(module)
             if retrying and self._has_retryable_downstream_task(item):
                 created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=token)
             else:
                 created = await get_binary_to_source_client().create_task(
                     task.project_id,
                     f"{task.name}-{module['module_name']}",
-                    elf_path,
+                    elf_tasks,
                     token or "",
-                    module,
                     _downstream_origin_payload(task, item),
                 )
             item.downstream_task_id = created.get("id") or item.downstream_task_id
@@ -10245,10 +10267,12 @@ class TaskManager:
         finally:
             session.close()
 
-    def _choose_module_binary(self, module: dict[str, Any]) -> str:
+    def _resolve_module_binary_paths(self, module: dict[str, Any]) -> list[str]:
         files = [line.strip() for line in _read_text(Path(module["files_list"])).splitlines() if line.strip()]
         module_dir = Path(module["module_dir"])
         unpacked_root = Path(str(module["unpacked_root"]))
+        resolved_paths: list[str] = []
+        seen: set[str] = set()
         for rel in files:
             candidate = Path(rel)
             candidates = []
@@ -10260,12 +10284,45 @@ class TaskManager:
                 candidates.append(module_dir.parent / rel)
             for resolved in candidates:
                 if resolved.exists() and resolved.is_file():
-                    return str(resolved.resolve())
+                    normalized = str(resolved.resolve())
+                    if normalized not in seen:
+                        seen.add(normalized)
+                        resolved_paths.append(normalized)
+                    break
                 if resolved.parent.exists():
                     matches = sorted(p for p in resolved.parent.rglob(candidate.name) if p.is_file())
                     if matches:
-                        return str(matches[0].resolve())
+                        normalized = str(matches[0].resolve())
+                        if normalized not in seen:
+                            seen.add(normalized)
+                            resolved_paths.append(normalized)
+                        break
+        return resolved_paths
+
+    def _choose_module_binary(self, module: dict[str, Any]) -> str:
+        paths = self._resolve_module_binary_paths(module)
+        if paths:
+            return paths[0]
         raise ValidationError(f"模块 {module['module_name']} 未找到可反编译文件")
+
+    def _build_module_elf_tasks(self, module: dict[str, Any]) -> list[dict[str, Any]]:
+        paths = self._resolve_module_binary_paths(module)
+        if not paths:
+            raise ValidationError(f"模块 {module['module_name']} 未找到可反编译文件")
+        return [
+            {
+                "elf_path": path,
+                "file_list": [],
+                "metadata": {
+                    **module,
+                    "module_file_index": index,
+                    "module_file_count": len(paths),
+                    "module_file_name": Path(path).name,
+                    "module_all_elf_paths": paths,
+                },
+            }
+            for index, path in enumerate(paths, start=1)
+        ]
 
     async def _run_entry_item(
         self,

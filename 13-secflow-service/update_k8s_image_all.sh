@@ -13,6 +13,7 @@ FRONTEND_IMAGE_REPO="${FRONTEND_IMAGE_REPO:-ghcr.io/runshine/secflow-frontend}"
 RESOURCE_IMAGE_REPO="${RESOURCE_IMAGE_REPO:-ghcr.io/runshine/secflow-platform-resource}"
 GATEWAY_WORKER_IMAGE_REPO="${GATEWAY_WORKER_IMAGE_REPO:-ghcr.io/runshine/secflow-platform-resource-file-gateway-worker}"
 FW_UNPACKER_IMAGE_REPO="${FW_UNPACKER_IMAGE_REPO:-ghcr.io/runshine/secflow-app-firmware-unpacker}"
+ENTRY_ANALYSE_WORKER_REPLICAS="${ENTRY_ANALYSE_WORKER_REPLICAS:-4}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 B2S_MANAGER_DEPLOYMENT="secflow-app-binary-to-source-manager"
@@ -78,6 +79,7 @@ Behavior:
   - resource image: override secflow-platform-resource image.
   - gateway-worker image: update file_gateway.worker_image in resource ConfigMap template vars.
   - firmware-unpacker image: override secflow-app-firmware-unpacker image.
+  - ENTRY_ANALYSE_WORKER_REPLICAS env: desired entry-analyse worker replicas, default 4.
   - Non-secflow deployments and third-party sidecars are skipped.
 HELP
 }
@@ -199,6 +201,15 @@ maybe_set_explicit_image() {
   update_deployment_container "${deployment}" "${container}" "${current_image}" "${target_image}"
 }
 
+scale_deployment_if_exists() {
+  local deployment="${1:-}"
+  local replicas="${2:-}"
+  [[ -n "${deployment}" && -n "${replicas}" ]] || return 0
+  deployment_exists "${deployment}" || return 0
+  echo "[INFO] Scaling ${deployment} to ${replicas} replicas"
+  kubectl -n "${NAMESPACE}" scale deployment "${deployment}" --replicas="${replicas}" >/dev/null
+}
+
 B2S_IMAGE_ARG=""
 BIN_EVOLUTION_IMAGE_ARG=""
 BIN_SECURITY_IMAGE_ARG=""
@@ -314,6 +325,7 @@ fi
 for pair in "${ENTRY_ANALYSE_DEPLOYMENTS[@]}"; do
   maybe_set_explicit_image "${pair%%:*}" "${pair##*:}" "${ENTRY_ANALYSE_IMAGE}"
 done
+scale_deployment_if_exists "secflow-app-entry-analyse-worker" "${ENTRY_ANALYSE_WORKER_REPLICAS}"
 
 for pair in "${DATAFLOW_ANALYSE_DEPLOYMENTS[@]}"; do
   maybe_set_explicit_image "${pair%%:*}" "${pair##*:}" "${DATAFLOW_ANALYSE_IMAGE}"
