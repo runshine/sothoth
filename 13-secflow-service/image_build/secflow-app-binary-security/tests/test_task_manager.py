@@ -4324,6 +4324,157 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("下游子任务不存在", item2.error_message)
         self.assertEqual(2, resp.synced_downstream_count)
 
+    def test_sync_downstream_status_processes_items_in_batches(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        items = [
+            BinarySecurityStageItem(
+                id=f"si{index}",
+                task_id="s1",
+                project_id="p1",
+                stage_run_id="sr1",
+                stage_name="entry_analysis",
+                item_key=f"m{index}",
+                parent_key="source_project",
+                status="queued",
+                downstream_service="entry_analyse",
+                downstream_task_id=f"eat_{index}",
+            )
+            for index in range(3)
+        ]
+        db = _ModelAwareDb(tasks=[task], stage_runs=[run], stage_items=items)
+        self.manager.cfg.scheduler.downstream_sync_batch_size = 2
+
+        fetched_ids = []
+        original_fetch = self.manager._fetch_downstream_task_payload
+        original_write = self.manager._write_task_metadata_async
+        original_enqueue = self.manager._enqueue_task
+
+        async def _fetch(_task, item, _token):
+            fetched_ids.append(item.id)
+            return {"status": "running"}
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._fetch_downstream_task_payload = _fetch
+        self.manager._write_task_metadata_async = _noop_write
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        try:
+            resp = asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id="p1",
+                    task_id="s1",
+                    stage_name="entry_analysis",
+                )
+            )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+            self.manager._write_task_metadata_async = original_write
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual(["si0", "si1"], fetched_ids)
+        self.assertEqual(2, resp.synced_downstream_count)
+
+    def test_sync_downstream_status_refreshes_parent_state_when_item_status_changes(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="entry_analysis",
+            item_key="m1",
+            parent_key="source_project",
+            status="queued",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item])
+
+        original_fetch = self.manager._fetch_downstream_task_payload
+        original_write = self.manager._write_task_metadata_async
+        original_enqueue = self.manager._enqueue_task
+        original_refresh_stage = self.manager._refresh_stage_run_from_items
+        original_refresh_task = self.manager._refresh_task_status_after_sync
+
+        refreshed_stages = []
+        refreshed_tasks = []
+
+        async def _fetch(_task, _item, _token):
+            return {"status": "running"}
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        def _capture_stage(_db, _task, current_stage):
+            refreshed_stages.append(current_stage)
+
+        def _capture_task(_db, current_task):
+            refreshed_tasks.append(current_task.id)
+
+        self.manager._fetch_downstream_task_payload = _fetch
+        self.manager._write_task_metadata_async = _noop_write
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        self.manager._refresh_stage_run_from_items = _capture_stage
+        self.manager._refresh_task_status_after_sync = _capture_task
+        try:
+            asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id="p1",
+                    task_id="s1",
+                    stage_name="entry_analysis",
+                )
+            )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+            self.manager._write_task_metadata_async = original_write
+            self.manager._enqueue_task = original_enqueue
+            self.manager._refresh_stage_run_from_items = original_refresh_stage
+            self.manager._refresh_task_status_after_sync = original_refresh_task
+
+        self.assertEqual(["entry_analysis"], refreshed_stages)
+        self.assertEqual(["s1"], refreshed_tasks)
+
     def test_stage_retry_support_still_rejects_downstream_service_mismatch(self):
         task = BinarySecurityTask(
             id="s1",

@@ -98,6 +98,7 @@ class SchedulerConfig(BaseModel):
     shutdown_grace_seconds: int = 10
     archive_job_concurrency: int = 4
     downstream_sync_concurrency: int = 8
+    downstream_sync_batch_size: int = 50
     downstream_action_concurrency: int = 8
     downstream_request_timeout_seconds: int = 120
 

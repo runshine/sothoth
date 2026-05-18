@@ -2153,9 +2153,31 @@ class TaskManager:
             query = query.filter(BinarySecurityStageItem.stage_name == stage_name)
         if item_id:
             query = query.filter(BinarySecurityStageItem.id == item_id)
-        items = query.order_by(BinarySecurityStageItem.created_at.asc()).all()
+        batch_size = max(1, int(getattr(self.cfg.scheduler, "downstream_sync_batch_size", 50) or 50))
+        items = query.order_by(
+            BinarySecurityStageItem.updated_at.asc(),
+            BinarySecurityStageItem.created_at.asc(),
+            BinarySecurityStageItem.id.asc(),
+        ).all()
         if item_id and not items:
             raise NotFoundError("阶段子任务不存在")
+        if not item_id and items:
+            status_priority = {
+                "running": 0,
+                "dispatching": 1,
+                "queued": 2,
+                "pending": 3,
+            }
+            items = sorted(
+                items,
+                key=lambda current_item: (
+                    status_priority.get(str(current_item.status or "").strip().lower(), 99),
+                    self._comparable_datetime(current_item.updated_at)
+                    or self._comparable_datetime(current_item.created_at)
+                    or datetime.min,
+                    str(current_item.id or ""),
+                ),
+            )[:batch_size]
 
         if record_request_event:
             self._record_event(
@@ -2164,7 +2186,13 @@ class TaskManager:
                 "downstream_status_sync_requested",
                 "请求同步下游子任务状态",
                 stage_name=stage_name,
-                payload={"stage_name": stage_name, "item_id": item_id, "force": force},
+                payload={
+                    "stage_name": stage_name,
+                    "item_id": item_id,
+                    "force": force,
+                    "batch_size": batch_size,
+                    "selected_items": len(items),
+                },
             )
             db.commit()
 
@@ -2248,6 +2276,13 @@ class TaskManager:
                                 error_message="下游子任务不存在",
                                 force=force,
                             )
+                            self._apply_downstream_status_inline(
+                                item,
+                                mapped_status=mapped_status,
+                                downstream_payload=payload,
+                                error_message="下游子任务不存在",
+                            )
+                            touched_stages.add(item.stage_name)
                             synced_count += 1
                         else:
                             skipped_count += 1
@@ -2271,6 +2306,7 @@ class TaskManager:
                         continue
                     if mapped_status not in ARCHIVE_SUCCESS_MAPPED_STATUSES:
                         if mapped_status != before_status or force:
+                            error_message = payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message
                             self._enqueue_downstream_terminal_event(
                                 db,
                                 task=task,
@@ -2279,9 +2315,16 @@ class TaskManager:
                                 before_status=before_status,
                                 downstream_status=downstream_status,
                                 payload=payload,
-                                error_message=payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message,
+                                error_message=error_message,
                                 force=force,
                             )
+                            self._apply_downstream_status_inline(
+                                item,
+                                mapped_status=mapped_status,
+                                downstream_payload=payload,
+                                error_message=error_message,
+                            )
+                            touched_stages.add(item.stage_name)
                             synced_count += 1
                         else:
                             skipped_count += 1
@@ -2322,6 +2365,7 @@ class TaskManager:
                         db.commit()
                         await self._apply_archive_job_status(job.id, job.archive_root)
                         db.expire_all()
+                        touched_stages.add(item.stage_name)
                         synced_count += 1
                         continue
                     if job.archive_status == "failed":
@@ -2363,6 +2407,7 @@ class TaskManager:
                                 "mapped_status": mapped_status,
                             },
                         )
+                    touched_stages.add(item.stage_name)
                     skipped_count += 1
                     continue
                 if mapped_status != before_status:
@@ -2379,6 +2424,7 @@ class TaskManager:
                         ),
                         force=force,
                     )
+                    touched_stages.add(item.stage_name)
                     synced_count += 1
                 else:
                     skipped_count += 1
@@ -2413,6 +2459,13 @@ class TaskManager:
                     error_message="下游子任务不存在",
                     force=True,
                 )
+                self._apply_downstream_status_inline(
+                    item,
+                    mapped_status="downstream_missing",
+                    downstream_payload={"status": "downstream_missing", "error": "下游子任务不存在"},
+                    error_message="下游子任务不存在",
+                )
+                touched_stages.add(item.stage_name)
                 synced_count += 1
                 self._record_event(
                     db,
@@ -2446,6 +2499,7 @@ class TaskManager:
                         "downstream_service": item_downstream_service,
                         "downstream_task_id": item_downstream_task_id,
                         "error": str(exc),
+                        "error_type": exc.__class__.__name__,
                     },
                 )
         for current_stage in touched_stages:
@@ -3936,6 +3990,25 @@ class TaskManager:
         )
         await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
 
+    def _apply_downstream_status_inline(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        mapped_status: str,
+        downstream_payload: dict[str, Any] | None,
+        error_message: str | None,
+    ) -> None:
+        normalized_status = self._map_downstream_status(mapped_status) or mapped_status
+        item.status = normalized_status
+        item.error_message = None if normalized_status in {"queued", "running", "success"} else error_message
+        item.started_at = item.started_at or _now()
+        item.finished_at = None if normalized_status in {"queued", "running"} else (item.finished_at or _now())
+        item.result = {
+            **(item.result or {}),
+            "downstream": self._lightweight_downstream_payload(downstream_payload or {}),
+            "downstream_status_synced_at": _now().isoformat(),
+        }
+
     def _apply_stage_worker_start_requested_locked(self, db: Session, event: BinarySecurityStateEvent) -> None:
         payload = dict(event.payload or {})
         stage_name = str(event.stage_name or payload.get("stage_name") or "").strip()
@@ -4572,7 +4645,15 @@ class TaskManager:
                                 "downstream_status_reconcile_failed",
                                 f"后台同步下游状态失败: {exc}",
                                 level="warning",
-                                payload={"task_id": ref["task_id"], "project_id": ref["project_id"], "error": str(exc)},
+                                payload={
+                                    "task_id": ref["task_id"],
+                                    "project_id": ref["project_id"],
+                                    "error": str(exc),
+                                    "error_type": exc.__class__.__name__,
+                                    "downstream_sync_batch_size": int(
+                                        getattr(self.cfg.scheduler, "downstream_sync_batch_size", 50) or 50
+                                    ),
+                                },
                             )
                             db.commit()
                         except Exception:
