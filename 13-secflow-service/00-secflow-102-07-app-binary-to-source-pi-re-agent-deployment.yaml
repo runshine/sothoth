@@ -5,7 +5,7 @@ metadata:
   namespace: secflow-ns
 spec:
   serviceName: secflow-pi-re-agent-headless
-  replicas: 3
+  replicas: 5
   selector:
     matchLabels:
       name: secflow-pi-re-agent
@@ -17,7 +17,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-pi-re-agent
-        image: ghcr.io/skiyer/pi-re-agent:sha-db025de
+        image: ghcr.io/skiyer/pi-re-agent:sha-ad9ac8c
         imagePullPolicy: Always
         command: ["pi-re-server"]
         args: ["--host", "0.0.0.0", "--port", "8000"]

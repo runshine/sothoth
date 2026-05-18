@@ -40,6 +40,8 @@ data:
         - "http://secflow-pi-re-agent-0.secflow-pi-re-agent-headless.secflow-ns.svc.cluster.local:8000"
         - "http://secflow-pi-re-agent-1.secflow-pi-re-agent-headless.secflow-ns.svc.cluster.local:8000"
         - "http://secflow-pi-re-agent-2.secflow-pi-re-agent-headless.secflow-ns.svc.cluster.local:8000"
+        - "http://secflow-pi-re-agent-3.secflow-pi-re-agent-headless.secflow-ns.svc.cluster.local:8000"
+        - "http://secflow-pi-re-agent-4.secflow-pi-re-agent-headless.secflow-ns.svc.cluster.local:8000"
       api_key: null
       timeout: 30
       discovery_mode: "k8s_headless"

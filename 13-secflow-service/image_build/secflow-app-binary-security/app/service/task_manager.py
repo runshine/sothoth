@@ -30,6 +30,7 @@ from app.model import (
     TASK_TERMINAL_STATUSES,
     TASK_STAGE_SEQUENCES,
     TASK_TYPE_BINARY,
+    TASK_TYPE_BINARY_MODULE,
     TASK_TYPE_SOURCE,
     BinarySecurityEvent,
     BinarySecurityArchiveJob,
@@ -115,6 +116,7 @@ DB_SUMMARY_ITEM_LIMIT = 50
 DB_FAILURE_ITEM_LIMIT = 20
 DB_ENTRY_PREVIEW_LIMIT = 50
 DB_ARTIFACT_PREVIEW_LIMIT = 50
+MODULE_TASK_INPUT_KEY = "module-input"
 
 
 def _now() -> datetime:
@@ -164,6 +166,14 @@ def _seconds_until(value: datetime | None) -> float | None:
 def _slug(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", value or "").strip("-")
     return cleaned[:120] or uuid.uuid4().hex[:12]
+
+
+def _display_task_type(task_type: str) -> str:
+    if task_type == TASK_TYPE_SOURCE:
+        return "源码扫描"
+    if task_type == TASK_TYPE_BINARY_MODULE:
+        return "二进制模块扫描"
+    return "二进制安全"
 
 
 def _normalize_entry_function_name(value: Any) -> str:
@@ -879,6 +889,9 @@ class TaskManager:
             payload.policy_overrides.partial_success_stage_advancement,
             task_type=task_type,
         )
+        module_name = str(payload.module_name or "").strip()
+        if task_type == TASK_TYPE_BINARY_MODULE and not module_name:
+            raise ValidationError("二进制模块任务必须填写模块名")
         input_files = self._normalize_input_files(payload.input_files, task_type=task_type)
         workspace_root = app_task_root(project_id, task_id)
         output_root = self._resolve_output_root(workspace_root, payload.output_root)
@@ -916,7 +929,18 @@ class TaskManager:
             "temp_upload_dir": str(run_dir / "upload-tmp") if task_type == TASK_TYPE_SOURCE else None,
             "input_manifest_path": str(metadata_path),
             "input_files": input_files,
-            "input_kind": "source_archives" if task_type == TASK_TYPE_SOURCE else "firmware_files",
+            "input_kind": (
+                "source_archives"
+                if task_type == TASK_TYPE_SOURCE
+                else "module_elf_files"
+                if task_type == TASK_TYPE_BINARY_MODULE
+                else "firmware_files"
+            ),
+            "module_input": {
+                "module_name": module_name,
+                "file_count": len(input_files),
+            } if task_type == TASK_TYPE_BINARY_MODULE else None,
+            "system_analysis_bypassed": task_type == TASK_TYPE_BINARY_MODULE,
             "downstream_task_ids": {},
             "system_analysis_modules": [],
             "candidate_modules": [],
@@ -975,7 +999,28 @@ class TaskManager:
                 "source_archives_extracted",
                 "源码压缩包已解压到任务输入目录",
                 payload={"archive_count": len(actual_files), "extracted_file_count": extracted_count},
-            )
+                )
+        elif self._task_type(task) == TASK_TYPE_BINARY_MODULE:
+            actual_files = []
+            total_bytes = 0
+            for file_info in declared:
+                filename = str(file_info["filename"])
+                relative_path = str(file_info.get("relative_path") or filename).strip().replace("\\", "/")
+                local_path = input_dir / relative_path
+                if not await asyncio.to_thread(local_path.is_file):
+                    raise ValidationError(f"上传文件缺失: {relative_path}")
+                stat = await asyncio.to_thread(local_path.stat)
+                self._validate_uploaded_archive_size(filename, stat.st_size, source_task=False)
+                self._check_storage_free_space(required_bytes=stat.st_size)
+                total_bytes += stat.st_size
+                actual_files.append(
+                    {
+                        **file_info,
+                        "size": stat.st_size,
+                        "uploaded": True,
+                        "path": f"{task.summary.get('input_dir')}/{relative_path}",
+                    }
+                )
         else:
             actual_files = []
             total_bytes = 0
@@ -1004,6 +1049,7 @@ class TaskManager:
         task.summary = {
             **task.summary,
             "input_files": actual_files,
+            **(self._build_binary_module_summary(task, actual_files) if self._task_type(task) == TASK_TYPE_BINARY_MODULE else {}),
         }
         task.metrics = {
             **task.metrics,
@@ -1011,6 +1057,17 @@ class TaskManager:
             "uploaded_file_count": len(actual_files),
             "input_total_bytes": total_bytes,
             "firmware_item_count": len(actual_files),
+            **(
+                {
+                    "selected_module_count": 1,
+                    "candidate_module_count": 1,
+                    "high_risk_module_count": 0,
+                    "medium_risk_module_count": 0,
+                    "low_risk_module_count": 0,
+                }
+                if self._task_type(task) == TASK_TYPE_BINARY_MODULE
+                else {}
+            ),
         }
         await self._write_task_metadata_async(task, input_dir / "task-metadata.json", status="ready_to_start")
         self._record_event(db, task, "task_upload_completed", "输入文件上传完成", payload={"uploaded_files": len(actual_files)})
@@ -5948,7 +6005,11 @@ class TaskManager:
                 if not self._is_supported_source_archive(filename):
                     raise ValidationError(f"源码扫描仅支持常见压缩文件: {filename}")
             else:
-                if filename in seen_names:
+                dedupe_key = effective_path if task_type == TASK_TYPE_BINARY_MODULE else filename
+                if dedupe_key in seen_paths:
+                    raise ValidationError(f"存在重复{'路径' if task_type == TASK_TYPE_BINARY_MODULE else '文件名'}: {dedupe_key}")
+                seen_paths.add(dedupe_key)
+                if filename in seen_names and task_type != TASK_TYPE_BINARY_MODULE:
                     raise ValidationError(f"存在重复文件名: {filename}")
                 seen_names.add(filename)
             firmware_key = _slug(filename)
@@ -5969,6 +6030,42 @@ class TaskManager:
         if not rows:
             raise ValidationError("至少需要上传一个输入文件")
         return rows
+
+    def _build_binary_module_summary(self, task: BinarySecurityTask, input_files: list[dict[str, Any]]) -> dict[str, Any]:
+        input_dir = Path(str(task.summary.get("input_dir") or Path(task.workspace_root) / "input"))
+        module_input = dict(task.summary.get("module_input") or {})
+        module_name = str(module_input.get("module_name") or task.name or "module").strip() or "module"
+        module_key = _slug(module_name)
+        firmware_key = MODULE_TASK_INPUT_KEY
+        files_list_path = input_dir / "module-files.list"
+        rel_paths = [str(item.get("relative_path") or item.get("filename") or "").strip().replace("\\", "/") for item in input_files]
+        files_list_path.write_text("\n".join(path for path in rel_paths if path) + ("\n" if rel_paths else ""), encoding="utf-8")
+        module = {
+            "module_key": module_key,
+            "module_name": module_name,
+            "task_type": TASK_TYPE_BINARY_MODULE,
+            "firmware_key": firmware_key,
+            "firmware_name": module_name,
+            "source_dir": str(input_dir),
+            "module_dir": str(input_dir),
+            "files_list": str(files_list_path),
+            "unpacked_root": str(input_dir),
+            "source_root": str(input_dir),
+            "file_count": len(input_files),
+        }
+        return {
+            "module_input": {
+                **module_input,
+                "module_name": module_name,
+                "module_key": module_key,
+                "file_count": len(input_files),
+            },
+            "selected_modules": [module],
+            "candidate_modules": [module],
+            "system_analysis_modules": [module],
+            "high_risk_modules": [],
+            "system_analysis_bypassed": True,
+        }
 
     def _is_supported_source_archive(self, filename: str) -> bool:
         lowered = str(filename or "").strip().lower()

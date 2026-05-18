@@ -4,7 +4,7 @@ metadata:
   name: secflow-app-dataflow-analyse-worker
   namespace: secflow-ns
 spec:
-  replicas: 2
+  replicas: 6
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -51,7 +51,7 @@ spec:
           - name: DFA_HEARTBEAT_INTERVAL_SECONDS
             value: "15"
           - name: DFA_MAX_LOCAL_RUNNING_TASKS
-            value: "2"
+            value: "4"
           - name: DFA_DISPATCH_POLL_INTERVAL_SECONDS
             value: "3"
         ports:

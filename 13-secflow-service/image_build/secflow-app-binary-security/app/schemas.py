@@ -43,6 +43,7 @@ class BinarySecurityTaskCreate(BaseModel):
     task_type: str = Field(default=TASK_TYPE_BINARY)
     name: str = Field(..., min_length=1)
     description: Optional[str] = None
+    module_name: Optional[str] = None
     input_files: list[BinarySecurityInputFile] = Field(default_factory=list)
     output_root: Optional[str] = None
     stage_options: dict[str, StageOptions] = Field(default_factory=dict)

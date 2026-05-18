@@ -23,16 +23,20 @@ from app.model import (
     BinarySecurityTask,
     BinarySecurityTaskStateLease,
     TASK_TYPE_BINARY,
+    TASK_TYPE_BINARY_MODULE,
     TASK_TYPE_SOURCE,
 )
 from app.exception import NotFoundError, ValidationError
 from app.schemas import BinarySecurityServiceConfigPayload
 from app.schemas import (
+    BinarySecurityInputFile,
     BinarySecurityProjectConfigPayload,
     BinarySecurityArchiveJobResponse,
     BinarySecurityStageSummary,
+    BinarySecurityTaskCreate,
     BinarySecurityTaskConcurrencyUpdatePayload,
     BinarySecurityTaskPolicyUpdatePayload,
+    BinarySecurityUploadCompletePayload,
 )
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager, _deduplicate_entry_keys, _now
@@ -1732,6 +1736,88 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("token123", recorded["token"])
         self.assertEqual(elf_tasks, recorded["json_body"]["elf_tasks"])
         self.assertEqual("bs1", recorded["json_body"]["parent_task_id"])
+
+    async def test_create_task_rejects_binary_module_without_module_name(self):
+        payload = BinarySecurityTaskCreate(
+            task_id="bm1",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            name="binary-module-task",
+            input_files=[BinarySecurityInputFile(filename="libipsec.so", size=12)],
+        )
+
+        with self.assertRaisesRegex(ValidationError, "必须填写模块名"):
+            await self.manager.create_task(
+                _FakeDb(),
+                project_id="p1",
+                payload=payload,
+                created_by="tester",
+                authorization_token="token",
+            )
+
+    async def test_complete_uploads_populates_binary_module_summary_and_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            input_dir = workspace / "input"
+            input_dir.mkdir(parents=True)
+            elf_rel = "mod/libipsec.so"
+            elf_path = input_dir / elf_rel
+            elf_path.parent.mkdir(parents=True, exist_ok=True)
+            elf_path.write_bytes(b"\x7fELFdemo")
+
+            task = BinarySecurityTask(
+                id="bm1",
+                project_id="p1",
+                name="binary-module-task",
+                task_type=TASK_TYPE_BINARY_MODULE,
+                status="pending_upload",
+                firmware_source="project_filesystem",
+                firmware_path=str(input_dir),
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            task.summary = {
+                "input_dir": str(input_dir),
+                "input_kind": "module_elf_files",
+                "module_input": {"module_name": "ipsec"},
+                "input_files": [{"filename": "libipsec.so", "relative_path": elf_rel}],
+            }
+            task.metrics = {}
+            db = _ModelAwareDb(tasks=[task], stage_runs=[], stage_items=[], archive_jobs=[])
+
+            def _fake_start_task(_db, *, project_id, task_id):
+                self.assertEqual("p1", project_id)
+                self.assertEqual("bm1", task_id)
+                return self.manager.get_task_detail(_db, project_id=project_id, task_id=task_id)
+
+            original_start_task = self.manager.start_task
+            original_build_queue_info = self.manager._build_queue_info
+            self.manager.start_task = _fake_start_task
+            self.manager._build_queue_info = lambda *_args, **_kwargs: {"pending_positions": {}, "running_count": 0, "queued_count": 0, "max_concurrent_tasks": 0}
+            try:
+                detail = await self.manager.complete_uploads(
+                    db,
+                    project_id="p1",
+                    task_id="bm1",
+                    payload=BinarySecurityUploadCompletePayload(
+                        files=[BinarySecurityInputFile(filename="libipsec.so", relative_path=elf_rel)]
+                    ),
+                    updated_by="tester",
+                    authorization_token="token",
+                )
+            finally:
+                self.manager.start_task = original_start_task
+                self.manager._build_queue_info = original_build_queue_info
+
+            self.assertEqual("ready_to_start", task.status)
+            self.assertTrue(task.summary["system_analysis_bypassed"])
+            self.assertEqual("module_elf_files", task.summary["input_kind"])
+            self.assertEqual("ipsec", task.summary["module_input"]["module_name"])
+            self.assertEqual(1, len(task.summary["selected_modules"]))
+            self.assertEqual(TASK_TYPE_BINARY_MODULE, task.summary["selected_modules"][0]["task_type"])
+            self.assertEqual(1, task.metrics["selected_module_count"])
+            self.assertEqual(1, task.metrics["candidate_module_count"])
+            self.assertEqual(1, task.metrics["uploaded_file_count"])
+            self.assertEqual("ready_to_start", detail.status)
 
     def test_build_project_stats_aggregates_task_metrics(self):
         success = BinarySecurityTask(
@@ -4700,6 +4786,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
     def test_stage_sequence_uses_task_type(self):
         binary_task = BinarySecurityTask(id="b1", project_id="p1", name="binary", task_type=TASK_TYPE_BINARY, status="pending", firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
         source_task = BinarySecurityTask(id="s1", project_id="p1", name="source", task_type=TASK_TYPE_SOURCE, status="pending", firmware_source="project_filesystem", firmware_path="/src", output_root="/o", workspace_root="/w")
+        module_task = BinarySecurityTask(id="m1", project_id="p1", name="module", task_type=TASK_TYPE_BINARY_MODULE, status="pending", firmware_source="project_filesystem", firmware_path="/input", output_root="/o", workspace_root="/w")
 
         self.assertEqual(
             ["firmware_unpack", "system_analysis", "binary_to_source", "entry_analysis", "dataflow_analysis", "vuln_scan"],
@@ -4709,6 +4796,60 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ["system_analysis", "entry_analysis", "dataflow_analysis", "vuln_scan"],
             self.manager._stage_sequence_for_task(source_task),
         )
+        self.assertEqual(
+            ["binary_to_source", "entry_analysis", "dataflow_analysis", "vuln_scan"],
+            self.manager._stage_sequence_for_task(module_task),
+        )
+
+    def test_normalize_binary_module_input_files_allows_same_filename_under_different_relative_paths(self):
+        rows = self.manager._normalize_input_files(
+            [
+                {"filename": "libcrypto.so", "relative_path": "a/libcrypto.so"},
+                {"filename": "libcrypto.so", "relative_path": "b/libcrypto.so"},
+            ],
+            task_type=TASK_TYPE_BINARY_MODULE,
+        )
+
+        self.assertEqual(["a/libcrypto.so", "b/libcrypto.so"], [row["relative_path"] for row in rows])
+
+    def test_build_binary_module_summary_preloads_single_selected_module(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            input_dir = workspace / "input"
+            input_dir.mkdir(parents=True)
+            task = BinarySecurityTask(
+                id="m1",
+                project_id="p1",
+                name="module-task",
+                task_type=TASK_TYPE_BINARY_MODULE,
+                status="pending_upload",
+                firmware_source="project_filesystem",
+                firmware_path=str(input_dir),
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            task.summary = {
+                "input_dir": str(input_dir),
+                "module_input": {
+                    "module_name": "ipsec",
+                },
+            }
+
+            summary = self.manager._build_binary_module_summary(
+                task,
+                [
+                    {"filename": "ipsec_main.so", "relative_path": "core/ipsec_main.so"},
+                    {"filename": "ipsec_helper.so", "relative_path": "plugins/ipsec_helper.so"},
+                ],
+            )
+
+            selected = summary["selected_modules"]
+            self.assertEqual(1, len(selected))
+            self.assertEqual(TASK_TYPE_BINARY_MODULE, selected[0]["task_type"])
+            self.assertEqual("ipsec", selected[0]["module_name"])
+            self.assertEqual(str(input_dir / "module-files.list"), selected[0]["files_list"])
+            self.assertEqual(["core/ipsec_main.so", "plugins/ipsec_helper.so"], (input_dir / "module-files.list").read_text(encoding="utf-8").splitlines())
+            self.assertTrue(summary["system_analysis_bypassed"])
 
     def test_source_system_analysis_inputs_use_workspace_input(self):
         with tempfile.TemporaryDirectory() as tmp:

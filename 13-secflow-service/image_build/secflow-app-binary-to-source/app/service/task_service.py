@@ -324,6 +324,19 @@ def _record_pi_metadata(item: B2STaskItem, **updates: object) -> None:
     item.extra_metadata = metadata
 
 
+def _record_pi_runtime_metrics(item: B2STaskItem, job: dict) -> bool:
+    progress = job.get("progress") if isinstance(job, dict) else None
+    metrics = progress.get("runtime_metrics") if isinstance(progress, dict) else None
+    if not isinstance(metrics, dict):
+        return False
+    metadata = dict(item.extra_metadata or {})
+    if metadata.get("pi_runtime_metrics") == metrics:
+        return False
+    metadata["pi_runtime_metrics"] = metrics
+    item.extra_metadata = metadata
+    return True
+
+
 def _merge_item_progress(item: B2STaskItem, **updates: object) -> bool:
     progress = item.progress or {}
     changed = False
@@ -401,6 +414,7 @@ def _apply_pi_job_to_item(db: Session, item: B2STaskItem, job: dict, *, worker_u
     item.status = map_pi_status(job.get("status"))
     item.phase = map_pi_phase(job.get("phase"), job.get("status"))
     item.progress = build_item_progress(item, job)
+    _record_pi_runtime_metrics(item, job)
     refresh_item_function_stats(item, inspect_files=False)
     if item.status == "running" and item.started_at is None:
         item.started_at = now_local()
@@ -816,6 +830,8 @@ async def sync_task(db: Session, task: B2STask) -> None:
         new_status = map_pi_status(job.get("status"))
         new_phase = map_pi_phase(job.get("phase"), job.get("status"))
         new_progress = build_item_progress(item, job)
+        if _record_pi_runtime_metrics(item, job):
+            changed = True
         if new_status == "failed" and _is_budget_exhausted_failure(job, item.error_reason):
             action = _budget_exhausted_action_for_item(db, item)
             if action == "treat_as_passed":
@@ -1448,11 +1464,32 @@ def build_task_function_stats(items: list[B2STaskItem]) -> dict[str, int | None]
     }
 
 
+def build_task_timing_summary(items: list[B2STaskItem]) -> dict[str, datetime | int | None]:
+    started_values = [item.started_at for item in items if item.started_at is not None]
+    if not started_values:
+        return {"started_at": None, "finished_at": None, "run_duration_ms": None}
+
+    started_at = min(started_values)
+    open_items = [item for item in items if item.started_at is not None and item.status not in TERMINAL]
+    finished_values = [item.finished_at for item in items if item.finished_at is not None]
+    finished_at = max(finished_values) if finished_values else None
+    duration_end = now_local() if open_items else finished_at
+    run_duration_ms = None
+    if duration_end is not None:
+        run_duration_ms = max(0, int((duration_end - started_at).total_seconds() * 1000))
+    return {
+        "started_at": started_at,
+        "finished_at": None if open_items else finished_at,
+        "run_duration_ms": run_duration_ms,
+    }
+
+
 def build_task_response(db: Session, task: B2STask) -> TaskResponse:
     items = query_items(db, task.id)
     counts = count_status(items)
     mode, mode_label = task_mode_summary(items)
     function_stats = build_task_function_stats(items)
+    timing_summary = build_task_timing_summary(items)
     return TaskResponse(
         id=task.id,
         project_id=task.project_id,
@@ -1467,6 +1504,9 @@ def build_task_response(db: Session, task: B2STask) -> TaskResponse:
         completed_functions=function_stats["completed_functions"],
         failed_functions=function_stats["failed_functions"],
         uncompleted_functions=function_stats["uncompleted_functions"],
+        started_at=timing_summary["started_at"],
+        finished_at=timing_summary["finished_at"],
+        run_duration_ms=timing_summary["run_duration_ms"],
         created_at=task.created_at,
         updated_at=task.updated_at,
         **counts,
@@ -2405,6 +2445,98 @@ def build_agent_runtime_summary(items: list[B2STaskItem]) -> AgentRuntimeSummary
     )
 
 
+def build_business_runtime_metrics_summary(items: list[B2STaskItem]) -> dict[str, Any]:
+    available = 0
+    missing = 0
+    phase_totals: dict[str, float] = {}
+    phase_counts: dict[str, int] = {}
+    artifact_totals: dict[str, float] = {}
+    engines: dict[str, int] = {}
+    batch_count = passed_batches = failed_batches = 0
+    total_attempts = 0
+    total_functions = completed_functions = failed_functions = 0
+    throughput_values: list[float] = []
+    token_totals: dict[str, float] = {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0, "cost": 0.0}
+
+    for item in items:
+        metadata = item.extra_metadata if isinstance(item.extra_metadata, dict) else {}
+        metrics = metadata.get("pi_runtime_metrics")
+        if not isinstance(metrics, dict):
+            missing += 1
+            continue
+        available += 1
+        engine = str(metrics.get("engine") or "unknown")
+        engines[engine] = engines.get(engine, 0) + 1
+        phases = metrics.get("phase_durations_seconds") if isinstance(metrics.get("phase_durations_seconds"), dict) else {}
+        for phase, value in phases.items():
+            try:
+                duration = float(value or 0)
+            except Exception:
+                duration = 0.0
+            phase_totals[str(phase)] = phase_totals.get(str(phase), 0.0) + duration
+            phase_counts[str(phase)] = phase_counts.get(str(phase), 0) + 1
+
+        batch_summary = metrics.get("batch_summary") if isinstance(metrics.get("batch_summary"), dict) else {}
+        batch_count += int(batch_summary.get("batch_count") or 0)
+        passed_batches += int(batch_summary.get("passed_batches") or 0)
+        failed_batches += int(batch_summary.get("failed_batches") or 0)
+        total_attempts += int(batch_summary.get("total_attempts") or 0)
+
+        function_summary = metrics.get("function_summary") if isinstance(metrics.get("function_summary"), dict) else {}
+        total_functions += int(function_summary.get("total_functions") or 0)
+        completed_functions += int(function_summary.get("completed_functions") or 0)
+        failed_functions += int(function_summary.get("failed_functions") or 0)
+        try:
+            throughput = float(function_summary.get("functions_per_second") or 0)
+        except Exception:
+            throughput = 0.0
+        if throughput > 0:
+            throughput_values.append(throughput)
+
+        artifact_summary = metrics.get("artifact_summary") if isinstance(metrics.get("artifact_summary"), dict) else {}
+        for kind, value in artifact_summary.items():
+            try:
+                artifact_totals[str(kind)] = artifact_totals.get(str(kind), 0.0) + float(value or 0)
+            except Exception:
+                artifact_totals[str(kind)] = artifact_totals.get(str(kind), 0.0)
+
+        llm_summary = metrics.get("llm_summary") if isinstance(metrics.get("llm_summary"), dict) else {}
+        for key in token_totals:
+            try:
+                token_totals[key] += float(llm_summary.get(key) or 0)
+            except Exception:
+                pass
+
+    phase_averages = {
+        phase: round(total / max(1, phase_counts.get(phase, 0)), 6)
+        for phase, total in sorted(phase_totals.items())
+    }
+    return {
+        "available_items": available,
+        "missing_items": missing,
+        "engines": engines,
+        "phase_average_seconds": phase_averages,
+        "header_recovery_avg_seconds": phase_averages.get("header_synthesis", 0),
+        "body_recovery_avg_seconds": phase_averages.get("body_generation", 0),
+        "batch_summary": {
+            "batch_count": batch_count,
+            "passed_batches": passed_batches,
+            "failed_batches": failed_batches,
+            "total_attempts": total_attempts,
+            "retry_rate": round(max(0, total_attempts - batch_count) / total_attempts, 6) if total_attempts else 0,
+            "validation_pass_rate": round(passed_batches / batch_count, 6) if batch_count else 0,
+        },
+        "function_summary": {
+            "total_functions": total_functions,
+            "completed_functions": completed_functions,
+            "failed_functions": failed_functions,
+            "avg_functions_per_second": round(mean(throughput_values), 6) if throughput_values else 0,
+        },
+        "llm_summary": token_totals,
+        "artifact_summary": artifact_totals,
+    }
+
+
 def build_task_observability_summary(items: list[B2STaskItem]) -> TaskObservabilitySummary:
     rows: list[TaskObservabilityItem] = []
     durations: list[int] = []
@@ -2475,6 +2607,7 @@ def build_task_observability_summary(items: list[B2STaskItem]) -> TaskObservabil
         avg_confidence=round(mean(confidence_scores), 1) if confidence_scores else 0,
         avg_quality_score=round(mean(quality_scores), 1) if quality_scores else 0,
         residual_risk_distribution=risk_distribution,
+        business_runtime_metrics=build_business_runtime_metrics_summary(items),
         items=sorted(rows, key=lambda entry: entry.sequence_no),
     )
 

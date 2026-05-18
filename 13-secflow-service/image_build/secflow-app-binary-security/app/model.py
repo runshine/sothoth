@@ -32,10 +32,17 @@ STAGE_SEQUENCE = [
 ]
 TASK_TYPE_BINARY = "binary"
 TASK_TYPE_SOURCE = "source"
+TASK_TYPE_BINARY_MODULE = "binary_module"
 TASK_STAGE_SEQUENCES = {
     TASK_TYPE_BINARY: STAGE_SEQUENCE,
     TASK_TYPE_SOURCE: [
         "system_analysis",
+        "entry_analysis",
+        "dataflow_analysis",
+        "vuln_scan",
+    ],
+    TASK_TYPE_BINARY_MODULE: [
+        "binary_to_source",
         "entry_analysis",
         "dataflow_analysis",
         "vuln_scan",

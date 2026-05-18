@@ -230,7 +230,117 @@ def _snapshot_lines(db: Session) -> list[str]:
         review_attempts=review_attempts,
         review_passed=review_passed,
     )
+    _append_business_runtime_snapshot_lines(lines, items)
     return lines
+
+
+def _metric_labels(**labels: Any) -> str:
+    return _format_labels(_labels_key(labels))
+
+
+def _append_histogram_samples(lines: list[str], name: str, samples: dict[tuple[tuple[str, str], ...], list[float]]) -> None:
+    if not samples:
+        return
+    lines.append(f"# TYPE {name} histogram")
+    for labels, (total, count) in sorted(samples.items()):
+        lines.append(f"{name}_sum{_format_labels(labels)} {total}")
+        lines.append(f"{name}_count{_format_labels(labels)} {count}")
+
+
+def _observe_histogram_sample(samples: dict[tuple[tuple[str, str], ...], list[float]], value: Any, **labels: Any) -> None:
+    key = _labels_key(labels)
+    slot = samples.setdefault(key, [0.0, 0.0])
+    slot[0] += _safe_float(value)
+    slot[1] += 1.0
+
+
+def _append_business_runtime_snapshot_lines(lines: list[str], items: list[B2STaskItem]) -> None:
+    phase_samples: dict[tuple[tuple[str, str], ...], list[float]] = {}
+    header_samples: dict[tuple[tuple[str, str], ...], list[float]] = {}
+    body_samples: dict[tuple[tuple[str, str], ...], list[float]] = {}
+    batch_samples: dict[tuple[tuple[str, str], ...], list[float]] = {}
+    batch_attempts: dict[tuple[str, str], float] = defaultdict(float)
+    batch_validation: dict[tuple[str, str], float] = defaultdict(float)
+    artifact_bytes: dict[str, float] = defaultdict(float)
+    token_usage: dict[str, float] = defaultdict(float)
+    token_cost = 0.0
+    throughput_total: dict[str, float] = defaultdict(float)
+    throughput_count: dict[str, float] = defaultdict(float)
+    available = 0
+    missing = 0
+
+    for item in items:
+        metadata = item.extra_metadata if isinstance(item.extra_metadata, dict) else {}
+        metrics = metadata.get("pi_runtime_metrics")
+        if not isinstance(metrics, dict):
+            missing += 1
+            continue
+        available += 1
+        engine = str(metrics.get("engine") or "unknown")
+        status = str(metrics.get("status") or item.status or "unknown")
+        phases = metrics.get("phase_durations_seconds") if isinstance(metrics.get("phase_durations_seconds"), dict) else {}
+        for phase, value in phases.items():
+            phase_name = str(phase)
+            _observe_histogram_sample(phase_samples, value, phase=phase_name, engine=engine, status=status)
+            if phase_name == "header_synthesis":
+                _observe_histogram_sample(header_samples, value, engine=engine, status=status)
+            elif phase_name == "body_generation":
+                _observe_histogram_sample(body_samples, value, engine=engine, status=status)
+
+        batch_summary = metrics.get("batch_summary") if isinstance(metrics.get("batch_summary"), dict) else {}
+        for batch in batch_summary.get("batches") or []:
+            if not isinstance(batch, dict):
+                continue
+            verdict = str(batch.get("status") or "unknown").lower()
+            result = "success" if verdict in {"pass", "passed", "success"} else "failed"
+            _observe_histogram_sample(batch_samples, batch.get("duration_seconds"), engine=engine, status=result)
+            batch_attempts[(engine, result)] += _safe_float(batch.get("attempts"))
+            batch_validation[(engine, result)] += 1.0
+
+        function_summary = metrics.get("function_summary") if isinstance(metrics.get("function_summary"), dict) else {}
+        throughput = _safe_float(function_summary.get("functions_per_second"))
+        if throughput > 0:
+            throughput_total[engine] += throughput
+            throughput_count[engine] += 1.0
+
+        artifact_summary = metrics.get("artifact_summary") if isinstance(metrics.get("artifact_summary"), dict) else {}
+        for kind, value in artifact_summary.items():
+            artifact_bytes[str(kind)] += _safe_float(value)
+        llm_summary = metrics.get("llm_summary") if isinstance(metrics.get("llm_summary"), dict) else {}
+        for token_type in ("input", "output", "cache_read", "cache_write"):
+            token_usage[token_type] += _safe_float(llm_summary.get(token_type))
+        token_cost += _safe_float(llm_summary.get("cost"))
+
+    lines.extend([
+        "# HELP secflow_binary_to_source_business_metric_available_items Items with pi runtime metrics.",
+        "# TYPE secflow_binary_to_source_business_metric_available_items gauge",
+        f"secflow_binary_to_source_business_metric_available_items {available}",
+        "# HELP secflow_binary_to_source_business_metric_missing_items Items without pi runtime metrics.",
+        "# TYPE secflow_binary_to_source_business_metric_missing_items gauge",
+        f"secflow_binary_to_source_business_metric_missing_items {missing}",
+    ])
+    _append_histogram_samples(lines, "secflow_binary_to_source_business_phase_duration_seconds", phase_samples)
+    _append_histogram_samples(lines, "secflow_binary_to_source_header_recovery_duration_seconds", header_samples)
+    _append_histogram_samples(lines, "secflow_binary_to_source_body_recovery_duration_seconds", body_samples)
+    _append_histogram_samples(lines, "secflow_binary_to_source_batch_recovery_duration_seconds", batch_samples)
+    lines.append("# TYPE secflow_binary_to_source_function_throughput gauge")
+    for engine, total in sorted(throughput_total.items()):
+        count = max(1.0, throughput_count.get(engine, 0.0))
+        lines.append(f"secflow_binary_to_source_function_throughput{_metric_labels(engine=engine)} {total / count}")
+    lines.append("# TYPE secflow_binary_to_source_batch_attempts_total counter")
+    for (engine, result), value in sorted(batch_attempts.items()):
+        lines.append(f"secflow_binary_to_source_batch_attempts_total{_metric_labels(engine=engine, result=result)} {value}")
+    lines.append("# TYPE secflow_binary_to_source_batch_validation_total counter")
+    for (engine, verdict), value in sorted(batch_validation.items()):
+        lines.append(f"secflow_binary_to_source_batch_validation_total{_metric_labels(engine=engine, verdict=verdict)} {value}")
+    lines.append("# TYPE secflow_binary_to_source_artifact_bytes gauge")
+    for kind, value in sorted(artifact_bytes.items()):
+        lines.append(f"secflow_binary_to_source_artifact_bytes{_metric_labels(kind=kind)} {value}")
+    lines.append("# TYPE secflow_binary_to_source_llm_token_usage_total counter")
+    for token_type, value in sorted(token_usage.items()):
+        lines.append(f"secflow_binary_to_source_llm_token_usage_total{_metric_labels(phase='total', type=token_type)} {value}")
+    lines.append("# TYPE secflow_binary_to_source_llm_token_cost_total counter")
+    lines.append(f"secflow_binary_to_source_llm_token_cost_total{_metric_labels(phase='total')} {token_cost}")
 
 
 def _append_ai_snapshot_lines(

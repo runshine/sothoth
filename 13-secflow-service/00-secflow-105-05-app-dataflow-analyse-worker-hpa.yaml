@@ -8,7 +8,7 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: secflow-app-dataflow-analyse-worker
-  minReplicas: 2
+  minReplicas: 6
   maxReplicas: 6
   metrics:
   - type: Resource

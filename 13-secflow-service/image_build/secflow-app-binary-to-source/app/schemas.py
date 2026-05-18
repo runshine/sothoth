@@ -248,6 +248,7 @@ class TaskObservabilitySummary(BaseModel):
     avg_confidence: float = 0
     avg_quality_score: float = 0
     residual_risk_distribution: dict[str, int] = Field(default_factory=dict)
+    business_runtime_metrics: Optional[dict[str, Any]] = None
     items: list[TaskObservabilityItem] = Field(default_factory=list)
 
 
@@ -354,6 +355,9 @@ class TaskResponse(BaseModel):
     completed_functions: Optional[int] = None
     failed_functions: Optional[int] = None
     uncompleted_functions: Optional[int] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    run_duration_ms: Optional[int] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
