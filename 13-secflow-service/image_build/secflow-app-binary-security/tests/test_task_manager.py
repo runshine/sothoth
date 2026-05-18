@@ -200,6 +200,28 @@ class _StageRun:
         self.status = status
 
 
+class _AsyncDataflowClientStub:
+    def __init__(self, *, listed=None, fetched=None, fail_on_create=False):
+        self.listed = listed or {"items": []}
+        self.fetched = fetched or {}
+        self.fail_on_create = fail_on_create
+        self.created = 0
+
+    async def list_tasks(self, *args, **kwargs):
+        del args, kwargs
+        return self.listed
+
+    async def get_task(self, task_id):
+        return dict(self.fetched.get(task_id) or {"task_id": task_id, "status": "passed"})
+
+    async def create_task(self, *args, **kwargs):
+        del args, kwargs
+        self.created += 1
+        if self.fail_on_create:
+            raise AssertionError("create_task should not be called")
+        return {"task_id": "dfa-created"}
+
+
 class TaskManagerTests(unittest.TestCase):
     def setUp(self):
         self.manager = TaskManager()
@@ -6868,6 +6890,35 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["t1"], claimed)
         self.assertEqual(self.manager.instance_id, task.dispatcher_instance_id)
         self.assertIsNotNone(task.lease_expires_at)
+
+    def test_find_reusable_dataflow_payload_prefers_active_duplicate_task(self):
+        task = BinarySecurityTask(id="t1", project_id="p1")
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            item_key="entry-1",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa-old",
+            status="queued",
+        )
+        client = _AsyncDataflowClientStub(
+            listed={
+                "items": [
+                    {"task_id": "dfa-passed", "status": "passed", "updated_at": "2026-05-18T23:32:56"},
+                    {"task_id": "dfa-pending", "status": "pending", "updated_at": "2026-05-18T23:27:54"},
+                    {"task_id": "dfa-running", "status": "running", "updated_at": "2026-05-18T23:34:41"},
+                ]
+            }
+        )
+
+        with patch.object(task_manager_module, "get_dataflow_analyse_client", return_value=client):
+            payload = asyncio.run(self.manager._find_reusable_dataflow_payload(task, item))
+
+        self.assertIsNotNone(payload)
+        self.assertEqual("dfa-running", payload["task_id"])
+        self.assertEqual("dfa-running", item.downstream_task_id)
 
 
 if __name__ == "__main__":

@@ -7805,6 +7805,21 @@ class TaskManager:
             return value.astimezone().replace(tzinfo=None)
         return value
 
+    @classmethod
+    def _parse_comparable_datetime(cls, value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            return cls._comparable_datetime(value)
+        if not value:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        normalized = text.replace("Z", "+00:00")
+        try:
+            return cls._comparable_datetime(datetime.fromisoformat(normalized))
+        except ValueError:
+            return None
+
     def _upstream_stage_retried(self, db: Session, task: BinarySecurityTask, stage_name: str) -> tuple[bool, str | None]:
         stage_sequence = self._stage_sequence_for_task(task)
         if stage_name not in stage_sequence:
@@ -8580,6 +8595,61 @@ class TaskManager:
         if mapped_status in {"queued", "running"}:
             return payload
         return None
+
+    def _sort_downstream_payload_priority(self, payload: dict[str, Any]) -> tuple[int, datetime, str]:
+        status = str(payload.get("status") or "").strip().lower()
+        mapped = self._map_downstream_status(status)
+        if mapped == "running":
+            priority = 0
+        elif mapped == "queued":
+            priority = 1
+        elif mapped == "success":
+            priority = 2
+        elif mapped in {"failed", "cancelled"}:
+            priority = 3
+        else:
+            priority = 4
+        comparable = (
+            self._parse_comparable_datetime(payload.get("updated_at"))
+            or self._parse_comparable_datetime(payload.get("finished_at"))
+            or self._parse_comparable_datetime(payload.get("started_at"))
+            or self._parse_comparable_datetime(payload.get("created_at"))
+            or datetime.min
+        )
+        return (priority, comparable, str(payload.get("task_id") or payload.get("id") or ""))
+
+    async def _find_reusable_dataflow_payload(
+        self,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+    ) -> dict[str, Any] | None:
+        item_id = str(item.id or "").strip()
+        if not item_id:
+            return None
+        try:
+            listed = await get_dataflow_analyse_client().list_tasks(
+                task.project_id,
+                parent_task_id=task.id,
+                parent_stage_item_id=item_id,
+                per_page=100,
+                sort_by="updated_at",
+                sort_order="desc",
+            )
+        except Exception:
+            return None
+        rows = listed.get("items") if isinstance(listed, dict) else None
+        if not isinstance(rows, list):
+            return None
+        candidates = [row for row in rows if isinstance(row, dict)]
+        if not candidates:
+            return None
+        candidates.sort(key=self._sort_downstream_payload_priority)
+        selected = candidates[0]
+        selected_task_id = str(selected.get("task_id") or selected.get("id") or "").strip()
+        current_task_id = str(item.downstream_task_id or "").strip()
+        if selected_task_id and selected_task_id != current_task_id:
+            item.downstream_task_id = selected_task_id
+        return selected
 
     def _stage_retry_support(
         self,
@@ -10915,7 +10985,33 @@ class TaskManager:
             line_hint = ""
             if definition_line:
                 line_hint = definition_line if definition_line.upper().startswith("L") else f"L{definition_line}"
-            if retrying and self._has_retryable_downstream_task(item):
+            reusable_payload = None if retrying else await self._find_reusable_dataflow_payload(task, item)
+            if reusable_payload is not None:
+                downstream_status = str(reusable_payload.get("status") or "").lower()
+                mapped_reusable_status = self._map_downstream_status(downstream_status)
+                if mapped_reusable_status in {"queued", "running"}:
+                    item.status = mapped_reusable_status
+                    session.commit()
+                    status, payload = await self._poll_until_terminal(
+                        lambda: get_dataflow_analyse_client().get_task(item.downstream_task_id),
+                        success_statuses={"passed", "success"},
+                        failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
+                        task=task,
+                        item=item,
+                    )
+                else:
+                    session.commit()
+                    payload = await get_dataflow_analyse_client().get_task(item.downstream_task_id)
+                    downstream_status = str(payload.get("status") or "").lower()
+                    if downstream_status in {"passed", "success"}:
+                        status = "success"
+                    elif downstream_status == "cancelled":
+                        status = "cancelled"
+                    elif downstream_status == "downstream_missing":
+                        status = "downstream_missing"
+                    else:
+                        status = "failed"
+            elif retrying and self._has_retryable_downstream_task(item):
                 created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=None)
             else:
                 created = await get_dataflow_analyse_client().create_task(
@@ -10934,15 +11030,15 @@ class TaskManager:
                     entry_reason_source=str(entry.get("entry_reason_source") or ""),
                     taint_details=[dict(detail) for detail in (entry.get("taint_details") or []) if isinstance(detail, dict)],
                 )
-            item.downstream_task_id = created.get("task_id") or item.downstream_task_id
-            session.commit()
-            status, payload = await self._poll_until_terminal(
-                lambda: get_dataflow_analyse_client().get_task(item.downstream_task_id),
-                success_statuses={"passed", "success"},
-                failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
-                task=task,
-                item=item,
-            )
+                item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+                session.commit()
+                status, payload = await self._poll_until_terminal(
+                    lambda: get_dataflow_analyse_client().get_task(item.downstream_task_id),
+                    success_statuses={"passed", "success"},
+                    failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
+                    task=task,
+                    item=item,
+                )
             artifact_root = self._service_output_dir(task, item.downstream_service or stage_run.stage_name, entry["entry_key"], item.downstream_task_id)
             materialized = self._materialize_stage_artifact(
                 artifact_root,
