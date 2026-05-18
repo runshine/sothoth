@@ -6,7 +6,7 @@ import json
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, inspect
+from sqlalchemy import BigInteger, Column, DateTime, Integer, String, Text, create_engine, inspect
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import get_config
@@ -122,6 +122,33 @@ class B2SProjectConfig(Base):
     @config.setter
     def config(self, value: dict[str, Any] | None) -> None:
         self.config_json = json.dumps(value or {}, ensure_ascii=False)
+
+
+class B2SAnalysisCache(Base):
+    __tablename__ = "secflow_b2s_analysis_cache"
+
+    id = Column(String(32), primary_key=True)
+    cache_key = Column(String(64), nullable=False, unique=True, index=True)
+    file_sha256 = Column(String(64), nullable=False, index=True)
+    file_size = Column(BigInteger, nullable=False, default=0)
+    elf_basename = Column(String(255), nullable=True)
+    analysis_signature = Column(String(64), nullable=False, index=True)
+    analysis_signature_json = Column(Text, nullable=True)
+    status = Column(String(32), nullable=False, default="creating", index=True)
+    source_project_id = Column(String(64), nullable=True, index=True)
+    source_task_id = Column(String(64), nullable=True, index=True)
+    source_item_id = Column(String(64), nullable=True, index=True)
+    canonical_output_dir = Column(Text, nullable=False)
+    canonical_input_path = Column(Text, nullable=True)
+    generated_files_json = Column(Text, nullable=True)
+    function_stats_json = Column(Text, nullable=True)
+    progress_json = Column(Text, nullable=True)
+    metadata_json = Column(Text, nullable=True)
+    hit_count = Column(Integer, nullable=False, default=0)
+    last_hit_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=now_local, nullable=False)
+    updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
+    expires_at = Column(DateTime, nullable=True, index=True)
 
 
 def _loads(raw: Optional[str], default: Any) -> Any:

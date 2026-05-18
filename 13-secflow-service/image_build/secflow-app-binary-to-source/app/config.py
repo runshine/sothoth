@@ -89,6 +89,16 @@ class StorageConfig(BaseModel):
     require_input_exists: bool = True
 
 
+class CacheConfig(BaseModel):
+    enabled: bool = True
+    scope: Literal["project", "global"] = "project"
+    root_dir: str = "/data/files/.secflow-cache/binary-to-source"
+    materialize_mode: Literal["copy", "hardlink", "symlink"] = "copy"
+    ttl_days: int = 90
+    max_size_gb: Optional[int] = 500
+    cache_success_only: bool = True
+
+
 class RegistryMenuLevelConfig(BaseModel):
     name: Optional[str] = None
     name_en: Optional[str] = None
@@ -134,6 +144,7 @@ class Config(BaseModel):
     configcenter_service: ConfigCenterServiceConfig = Field(default_factory=ConfigCenterServiceConfig)
     pi_re_agent: PiReAgentConfig = Field(default_factory=PiReAgentConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    cache: CacheConfig = Field(default_factory=CacheConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
     app: AppConfig = Field(default_factory=AppConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)

@@ -59,6 +59,7 @@ from app.schemas import (
     TaskResultItemSummary,
     TaskResultSummary,
 )
+from app.service.cache_service import get_cache_service
 from app.service.config_service import get_config_service, normalize_budget_exhausted_action
 from app.service.llm_provider import materialize_llm_provider
 from app.service.pi_cluster import get_pi_cluster_monitor
@@ -434,6 +435,8 @@ async def dispatch_item_to_pi(db: Session, item: B2STaskItem, *, owner_id: str) 
         )
         item.dispatch_status = "dispatched"
         _apply_pi_job_to_item(db, item, job, worker_url=worker_url)
+        if item.status == "success":
+            get_cache_service().store_success_cache(db, item)
         get_observability().record_item_submit(item, worker_url)
         return True
     except Exception as exc:
@@ -616,8 +619,10 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             "pi_idempotency_key": _pi_idempotency_key(task.id, item),
             "dispatch_clean": False,
         }
-        _queue_item_for_dispatch(item, clean=False)
-        refresh_item_function_stats(item, inspect_files=False)
+        cache_result = get_cache_service().try_apply_cache_hit(db, project_id, item, input_elf_path)
+        if not cache_result.hit:
+            _queue_item_for_dispatch(item, clean=False)
+        refresh_item_function_stats(item, inspect_files=cache_result.hit)
         db.add(item)
         db.flush()
     recompute_task_status(db, task)
@@ -713,6 +718,8 @@ async def sync_task(db: Session, task: B2STask) -> None:
             item.generated_files = build_generated_files(item, output)
             if refresh_item_function_stats(item, inspect_files=True):
                 changed = True
+            if get_cache_service().store_success_cache(db, item):
+                changed = True
         if new_status == "failed":
             item.phase = "failed"
             item.failure_type = "pi-re-agent"
@@ -786,6 +793,8 @@ async def delete_task(db: Session, task: B2STask) -> None:
                 # Deletion should not be blocked by a stale/unreachable upstream
                 # job.  DB rows and the task workspace are still removed below.
                 pass
+
+    get_cache_service().delete_caches_for_source_task(db, task.project_id, task.id)
 
     task_dir = app_task_root(task.project_id, task.id)
     root = project_root(task.project_id)
