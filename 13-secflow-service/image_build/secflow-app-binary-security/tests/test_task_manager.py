@@ -6139,11 +6139,56 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._workers.clear()
 
         self.assertTrue(reclaimed)
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertIsNone(task.dispatch_started_at)
         self.assertIsNone(task.lease_expires_at)
         self.assertIsNone(task.last_error)
+
+    def test_requeue_released_running_task_marks_task_pending(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            current_stage="binary_to_source",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw.bin",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.updated_at = _now() - timedelta(seconds=120)
+        active_item = BinarySecurityStageItem(
+            id="si1",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="binary_to_source",
+            item_key="k1",
+            status="running",
+            downstream_task_id="b2s-1",
+        )
+
+        class _RequeueDb(_FakeDb):
+            def query(self, model, *args, **kwargs):
+                model_name = getattr(model, "__name__", "")
+                if model_name == "BinarySecurityTask":
+                    return _FakeQuery([task])
+                if model_name == "BinarySecurityStageItem":
+                    return _FakeQuery([active_item])
+                return _FakeQuery([])
+
+            def flush(self):
+                pass
+
+        requeued = self.manager._requeue_released_running_locked(_RequeueDb())
+
+        self.assertTrue(requeued)
+        self.assertEqual("pending", task.status)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertIsNone(task.dispatch_started_at)
+        self.assertIsNone(task.lease_expires_at)
 
     def test_run_task_ignores_stale_worker_failure_after_retry(self):
         task = BinarySecurityTask(

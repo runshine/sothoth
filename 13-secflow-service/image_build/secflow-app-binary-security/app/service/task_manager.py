@@ -2160,7 +2160,8 @@ class TaskManager:
         self._last_queue_reconcile_at = now
         stale_dispatching_reclaimed = self._reclaim_stale_dispatching_locked(db)
         stale_running_reclaimed = self._reclaim_stale_running_locked(db)
-        if stale_dispatching_reclaimed or stale_running_reclaimed:
+        released_running_requeued = self._requeue_released_running_locked(db)
+        if stale_dispatching_reclaimed or stale_running_reclaimed or released_running_requeued:
             # Persist the reclaimed task state before seeding Redis queues.
             # Otherwise the surrounding loop closes the session and rolls the
             # reclaim back, leaving tasks permanently stuck on dead workers.
@@ -5096,17 +5097,19 @@ class TaskManager:
     def _dispatch_once(self, db: Session) -> list[str]:
         stale_reclaimed = self._reclaim_stale_dispatching_locked(db)
         stale_running_reclaimed = self._reclaim_stale_running_locked(db)
+        released_running_requeued = self._requeue_released_running_locked(db)
         service_config = self._load_service_config(db)
         active_count = self._active_dispatch_count(db)
         slots = max(0, service_config.max_concurrent_tasks - active_count)
         claimed_ids = self._claim_pending_tasks(db, slots)
-        if stale_reclaimed or stale_running_reclaimed or claimed_ids:
+        if stale_reclaimed or stale_running_reclaimed or released_running_requeued or claimed_ids:
             db.commit()
         return claimed_ids
 
     def _dispatch_task_by_id(self, db: Session, task_id: str) -> str | None:
         self._reclaim_stale_dispatching_locked(db)
         self._reclaim_stale_running_locked(db)
+        self._requeue_released_running_locked(db)
         service_config = self._load_service_config(db)
         active_count = self._active_dispatch_count(db)
         if active_count >= service_config.max_concurrent_tasks:
@@ -5680,7 +5683,7 @@ class TaskManager:
                 for item in active_items
             )
             if queued_only or has_downstream_refs:
-                task.status = "pending" if queued_only else "running"
+                task.status = "pending"
                 task.dispatcher_instance_id = None
                 task.dispatch_started_at = None
                 task.lease_expires_at = None
@@ -5742,6 +5745,52 @@ class TaskManager:
         if reclaimed:
             db.flush()
         return reclaimed
+
+    def _requeue_released_running_locked(self, db: Session) -> bool:
+        released_rows = (
+            db.query(BinarySecurityTask)
+            .filter(
+                BinarySecurityTask.status == "running",
+                or_(
+                    BinarySecurityTask.dispatcher_instance_id.is_(None),
+                    BinarySecurityTask.dispatcher_instance_id == "",
+                ),
+                BinarySecurityTask.dispatch_started_at.is_(None),
+                BinarySecurityTask.lease_expires_at.is_(None),
+            )
+            .all()
+        )
+        if not released_rows:
+            return False
+        requeued = False
+        for task in released_rows:
+            stage_name = task.current_stage or self._stage_sequence_for_task(task)[0]
+            active_items = db.query(BinarySecurityStageItem).filter(
+                BinarySecurityStageItem.task_id == task.id,
+                BinarySecurityStageItem.stage_name == stage_name,
+                BinarySecurityStageItem.status.in_(["pending", "queued", "running"]),
+            ).all()
+            if not active_items:
+                continue
+            task.status = "pending"
+            task.updated_at = _now()
+            task.last_error = None
+            self._record_event(
+                db,
+                task,
+                "running_execution_requeued",
+                "已将释放后的运行任务重新纳入待调度队列，等待新的 worker 安全接管",
+                level="warning",
+                stage_name=stage_name,
+                payload={
+                    "stage_name": stage_name,
+                    "active_item_count": len(active_items),
+                },
+            )
+            requeued = True
+        if requeued:
+            db.flush()
+        return requeued
 
     def _build_queue_info(self, db: Session, *, project_id: str) -> dict[str, Any]:
         running_count = int(
