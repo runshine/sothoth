@@ -32,6 +32,7 @@ execution:
   codex_bin: codex
   opencode_bin: opencode
   agentflow_root: /home/icsl/agentflow-alpha
+  agentflow_root_candidates: []
   agentflow_python_bin: python3
   agentflow_agent: opencode
   codex_skip_git_repo_check: true

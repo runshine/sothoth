@@ -70,6 +70,7 @@ class AgentFlowCliModeTest(unittest.TestCase):
             "IPC_AUDIT_STATE_ROOT",
             "IPC_AUDIT_EXECUTION_MODE",
             "IPC_AUDIT_AGENTFLOW_ROOT",
+            "IPC_AUDIT_AGENTFLOW_ROOT_CANDIDATES",
             "IPC_AUDIT_AGENTFLOW_PYTHON_BIN",
             "IPC_AUDIT_AGENTFLOW_AGENT",
             "IPC_AUDIT_CODEX_BIN",
@@ -173,6 +174,47 @@ class AgentFlowCliModeTest(unittest.TestCase):
         invocations = [json.loads(line) for line in invocations_path.read_text(encoding="utf-8").splitlines() if line.strip()]
         self.assertEqual(len(invocations), 1)
         self.assertEqual(invocations[0]["node_ids"], ["audit", "poc"])
+
+    def test_agentflow_root_resolves_nested_directory_for_k8s_style_mount(self) -> None:
+        from app.core.config import load_config, resolve_agentflow_root
+        from app.workers.runner import StageContext, build_agentflow_process_env_and_summary
+
+        nested_parent = self.state_root / "agentflow-volume"
+        nested_root = nested_parent / "agentflow-alpha"
+        (nested_root / "agentflow").mkdir(parents=True, exist_ok=True)
+        (nested_root / "agentflow" / "__init__.py").write_text("", encoding="utf-8")
+        (nested_root / "agentflow" / "cli.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+
+        self._set_env("IPC_AUDIT_AGENTFLOW_ROOT", str(nested_parent))
+        self._reset_singletons()
+        load_config()
+
+        resolved_root = resolve_agentflow_root()
+        self.assertEqual(resolved_root, nested_root.resolve())
+
+        attempt_root = self.state_root / "attempt-nested-root"
+        context = StageContext(
+            task_id="task-nested-root",
+            attempt_id="attempt-nested-root",
+            workspace_id="oh61-main",
+            stage_name="audit",
+            input_kind="custom_project",
+            pipeline_mode="custom_graph",
+            project_path="foundation/demo/service",
+            report_path=None,
+            repo_root=self.repo_root,
+            attempt_root=attempt_root,
+            runtime_root=attempt_root / "runtime",
+            logs_dir=attempt_root / "logs",
+            artifacts_dir=attempt_root / "artifacts",
+            scratch_dir=attempt_root / "scratch",
+            effective_config={"executor_mode": "agentflow_cli"},
+            provider_runtime=None,
+        )
+        process_env, summary, metadata = build_agentflow_process_env_and_summary(context)
+        self.assertTrue(process_env["PYTHONPATH"].startswith(str(nested_root.resolve())))
+        self.assertEqual(metadata["agentflow_root"], str(nested_root.resolve()))
+        self.assertIn(str(nested_root.resolve()), summary)
 
     def test_custom_graph_progress_snapshot_reflects_completed_and_running_nodes(self) -> None:
         from app.workers.stage_graph import _build_graph_progress_snapshot

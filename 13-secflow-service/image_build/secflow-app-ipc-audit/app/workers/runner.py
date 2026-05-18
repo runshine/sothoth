@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
-from app.core.config import ExecutionConfig, get_config
+from app.core.config import ExecutionConfig, get_config, resolve_agentflow_root
 
 SUPPORTED_EXECUTOR_MODES = ("mock", "codex_cli", "opencode_cli", "agentflow_cli")
 
@@ -385,13 +385,17 @@ def build_opencode_process_env(context: StageContext) -> dict[str, str]:
 def build_agentflow_process_env_and_summary(context: StageContext) -> tuple[dict[str, str], str, dict[str, Any]]:
     cfg = get_config().execution
     process_env, provider_summary, provider_metadata = build_process_env_and_summary(context)
-    merged_pythonpath = str(cfg.agentflow_root)
+    resolved_root = resolve_agentflow_root(cfg)
+    effective_root = str(resolved_root or cfg.agentflow_root).strip()
     current_pythonpath = str(process_env.get("PYTHONPATH") or "").strip()
-    if current_pythonpath:
-        merged_pythonpath = f"{cfg.agentflow_root}:{current_pythonpath}"
-    process_env["PYTHONPATH"] = merged_pythonpath
+    merged_pythonpath = current_pythonpath
+    if effective_root:
+        merged_pythonpath = effective_root if not current_pythonpath else f"{effective_root}:{current_pythonpath}"
+        process_env["PYTHONPATH"] = merged_pythonpath
     metadata = {
-        "agentflow_root": cfg.agentflow_root,
+        "agentflow_root": effective_root,
+        "agentflow_configured_root": cfg.agentflow_root,
+        "agentflow_root_resolved": resolved_root is not None,
         "agentflow_python_bin": cfg.agentflow_python_bin,
         "agentflow_agent": cfg.agentflow_agent,
         **provider_metadata,
@@ -399,7 +403,8 @@ def build_agentflow_process_env_and_summary(context: StageContext) -> tuple[dict
     summary = "\n".join(
         [
             provider_summary,
-            f"AgentFlow root: {cfg.agentflow_root}",
+            f"AgentFlow configured root: {cfg.agentflow_root}",
+            f"AgentFlow resolved root: {effective_root or '(not found)'}",
             f"AgentFlow python: {cfg.agentflow_python_bin}",
             f"AgentFlow agent: {cfg.agentflow_agent}",
             f"PYTHONPATH: {process_env.get('PYTHONPATH', '')}",

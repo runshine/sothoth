@@ -9,6 +9,12 @@ from urllib.parse import quote, unquote, urlparse
 import yaml
 from pydantic import BaseModel, Field
 
+DEFAULT_AGENTFLOW_ROOT = "/home/icsl/agentflow-alpha"
+K8S_AGENTFLOW_ROOT_CANDIDATES = (
+    "/var/lib/secflow-app-ipc-audit/agentflow-alpha",
+    "/var/lib/secflow-ipc-audit/agentflow-alpha",
+)
+
 
 class WorkspaceConfig(BaseModel):
     workspace_id: str
@@ -41,7 +47,8 @@ class ExecutionConfig(BaseModel):
     poc_runtime_available: bool = True
     codex_bin: str = "codex"
     opencode_bin: str = "opencode"
-    agentflow_root: str = "/home/icsl/agentflow-alpha"
+    agentflow_root: str = DEFAULT_AGENTFLOW_ROOT
+    agentflow_root_candidates: list[str] = Field(default_factory=list)
     agentflow_python_bin: str = "python3"
     agentflow_agent: Literal["codex", "opencode"] = "opencode"
     codex_skip_git_repo_check: bool = True
@@ -149,6 +156,32 @@ def _resolve_candidates(config_path: str | None) -> str | None:
 
 def _as_bool(value: object) -> bool:
     return str(value).lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_string_list(value: object) -> list[str]:
+    if isinstance(value, list):
+        items = value
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            items = parsed
+        else:
+            items = [part.strip() for part in raw.replace("\r", "\n").replace(",", "\n").split("\n")]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        candidate = str(item or "").strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        normalized.append(candidate)
+    return normalized
 
 
 def _database_payload_from_url(url: str | None) -> dict[str, object]:
@@ -269,7 +302,13 @@ def _merge_env_overrides(payload: dict[str, object]) -> dict[str, object]:
     )
     execution_payload["agentflow_root"] = os.environ.get(
         "IPC_AUDIT_AGENTFLOW_ROOT",
-        execution_payload.get("agentflow_root", "/home/icsl/agentflow-alpha"),
+        execution_payload.get("agentflow_root", DEFAULT_AGENTFLOW_ROOT),
+    )
+    execution_payload["agentflow_root_candidates"] = _parse_string_list(
+        os.environ.get(
+            "IPC_AUDIT_AGENTFLOW_ROOT_CANDIDATES",
+            execution_payload.get("agentflow_root_candidates", []),
+        )
     )
     execution_payload["agentflow_python_bin"] = os.environ.get(
         "IPC_AUDIT_AGENTFLOW_PYTHON_BIN",
@@ -374,6 +413,49 @@ def _merge_env_overrides(payload: dict[str, object]) -> dict[str, object]:
     payload["provider_source"] = provider_source_payload
     _normalize_database_payload(payload)
     return payload
+
+
+def is_running_in_kubernetes() -> bool:
+    return bool(os.environ.get("KUBERNETES_SERVICE_HOST")) or Path(
+        "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    ).exists()
+
+
+def _iter_agentflow_root_candidates(config: ExecutionConfig | None = None) -> list[Path]:
+    execution = config or get_config().execution
+    raw_candidates = [
+        execution.agentflow_root,
+        *execution.agentflow_root_candidates,
+    ]
+    if is_running_in_kubernetes():
+        raw_candidates.extend(K8S_AGENTFLOW_ROOT_CANDIDATES)
+        raw_candidates.append(DEFAULT_AGENTFLOW_ROOT)
+    else:
+        raw_candidates.append(DEFAULT_AGENTFLOW_ROOT)
+        raw_candidates.extend(K8S_AGENTFLOW_ROOT_CANDIDATES)
+
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for raw_candidate in raw_candidates:
+        candidate_text = str(raw_candidate or "").strip()
+        if not candidate_text:
+            continue
+        base_path = Path(candidate_text)
+        expanded_paths = [base_path, base_path / "agentflow-alpha"]
+        for path in expanded_paths:
+            key = path.as_posix()
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(path)
+    return candidates
+
+
+def resolve_agentflow_root(config: ExecutionConfig | None = None) -> Path | None:
+    for candidate in _iter_agentflow_root_candidates(config):
+        if candidate.exists() and candidate.is_dir() and (candidate / "agentflow" / "cli.py").exists():
+            return candidate.resolve()
+    return None
 
 
 def load_config(config_path: str | None = None) -> ServiceConfig:

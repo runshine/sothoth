@@ -7,7 +7,7 @@ from pathlib import Path
 
 from fastapi import APIRouter
 
-from app.core.config import get_config
+from app.core.config import get_config, resolve_agentflow_root
 from app.db.database import get_database
 from app.schemas import HealthResponse, ReadyResponse
 from app.workers.scheduler import get_scheduler_service
@@ -54,13 +54,8 @@ def _validate_opencode_config(opencode_bin: str) -> bool:
     return isinstance(payload, dict) and bool(payload)
 
 
-def _validate_agentflow_root(agentflow_root: str, agentflow_python_bin: str) -> bool:
-    root = Path(str(agentflow_root or "").strip())
-    if not root.exists() or not root.is_dir():
-        return False
-    if not (root / "agentflow" / "cli.py").exists():
-        return False
-    return shutil.which(agentflow_python_bin) is not None
+def _validate_agentflow_root(agentflow_python_bin: str) -> bool:
+    return resolve_agentflow_root() is not None and shutil.which(agentflow_python_bin) is not None
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -86,10 +81,7 @@ def ready() -> ReadyResponse:
         "scheduler": get_scheduler_service().is_running,
         "executor_binary": True,
         "executor_binary:agentflow_cli": shutil.which(cfg.execution.agentflow_python_bin) is not None,
-        "executor_config:agentflow_cli": _validate_agentflow_root(
-            cfg.execution.agentflow_root,
-            cfg.execution.agentflow_python_bin,
-        ),
+        "executor_config:agentflow_cli": _validate_agentflow_root(cfg.execution.agentflow_python_bin),
         "executor_binary:codex_cli": shutil.which(cfg.execution.codex_bin) is not None,
         "executor_binary:opencode_cli": shutil.which(cfg.execution.opencode_bin) is not None,
         "executor_config:opencode_cli": True,
