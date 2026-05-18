@@ -1,0 +1,114 @@
+import asyncio
+import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+from app.metrics_aggregate import (
+    AggregateMetadata,
+    AggregatedMetricsPayload,
+    PodTarget,
+    ScrapeResult,
+    aggregate_prometheus_samples,
+    render_aggregated_metrics,
+)
+
+
+class MetricsAggregateTests(unittest.TestCase):
+    def test_counter_and_local_gauges_are_summed(self):
+        api_1 = ScrapeResult(
+            target=PodTarget(pod_name="api-1", role="api", ip="10.0.0.1"),
+            raw_text=(
+                "# TYPE secflow_binary_security_api_requests_total counter\n"
+                "secflow_binary_security_api_requests_total{method=\"GET\",path=\"/x\",status=\"200\"} 5\n"
+                "# TYPE secflow_binary_security_active_workers gauge\n"
+                "secflow_binary_security_active_workers{kind=\"task\"} 2\n"
+            ),
+        )
+        api_2 = ScrapeResult(
+            target=PodTarget(pod_name="api-2", role="api", ip="10.0.0.2"),
+            raw_text=(
+                "# TYPE secflow_binary_security_api_requests_total counter\n"
+                "secflow_binary_security_api_requests_total{method=\"GET\",path=\"/x\",status=\"200\"} 7\n"
+                "# TYPE secflow_binary_security_active_workers gauge\n"
+                "secflow_binary_security_active_workers{kind=\"task\"} 3\n"
+            ),
+        )
+
+        aggregated = aggregate_prometheus_samples([api_1, api_2])
+        request_series = aggregated["secflow_binary_security_api_requests_total"]
+        worker_series = aggregated["secflow_binary_security_active_workers"]
+
+        self.assertEqual(
+            12.0,
+            request_series.samples[((("method", "GET"), ("path", "/x"), ("status", "200")))],
+        )
+        self.assertEqual(5.0, worker_series.samples[((("kind", "task"),))])
+
+    def test_authoritative_reducer_metrics_prefer_reducer_max(self):
+        worker = ScrapeResult(
+            target=PodTarget(pod_name="worker-1", role="worker", ip="10.0.0.3"),
+            raw_text=(
+                "# TYPE secflow_binary_security_queue_depth gauge\n"
+                "secflow_binary_security_queue_depth{queue=\"pending_tasks\"} 9\n"
+            ),
+        )
+        reducer_1 = ScrapeResult(
+            target=PodTarget(pod_name="reducer-1", role="reducer", ip="10.0.0.4"),
+            raw_text=(
+                "# TYPE secflow_binary_security_queue_depth gauge\n"
+                "secflow_binary_security_queue_depth{queue=\"pending_tasks\"} 4\n"
+            ),
+        )
+        reducer_2 = ScrapeResult(
+            target=PodTarget(pod_name="reducer-2", role="reducer", ip="10.0.0.5"),
+            raw_text=(
+                "# TYPE secflow_binary_security_queue_depth gauge\n"
+                "secflow_binary_security_queue_depth{queue=\"pending_tasks\"} 6\n"
+            ),
+        )
+
+        aggregated = aggregate_prometheus_samples([worker, reducer_1, reducer_2])
+        queue_series = aggregated["secflow_binary_security_queue_depth"]
+        self.assertEqual(6.0, queue_series.samples[((("queue", "pending_tasks"),))])
+
+    def test_render_aggregated_metrics_includes_metadata(self):
+        payload = render_aggregated_metrics(
+            {
+                "secflow_binary_security_active_workers": SimpleNamespace(
+                    metric_type="gauge",
+                    help_text="Current workers",
+                    samples={((("kind", "task"),)): 3.0},
+                )
+            },
+            metadata=AggregateMetadata(
+                attempted_by_role={"api": 4, "worker": 3, "reducer": 2},
+                successful_by_role={"api": 4, "worker": 2, "reducer": 2},
+                partial=True,
+                generated_at=1234.5,
+            ),
+        ).decode("utf-8", errors="ignore")
+        self.assertIn("secflow_binary_security_metrics_aggregate_scrape_targets", payload)
+        self.assertIn("secflow_binary_security_metrics_aggregate_partial 1.0", payload)
+
+    def test_aggregate_endpoint_returns_partial_result_when_some_scrapes_fail(self):
+        from app import main
+
+        fake_payload = AggregatedMetricsPayload(
+            payload=b"# TYPE demo gauge\ndemo 1\n",
+            content_type="text/plain; version=0.0.4; charset=utf-8",
+            metadata=AggregateMetadata(
+                attempted_by_role={"api": 2, "worker": 1, "reducer": 1},
+                successful_by_role={"api": 1, "worker": 1, "reducer": 1},
+                partial=True,
+                generated_at=1234.5,
+            ),
+        )
+        fake_aggregator = SimpleNamespace(aggregate=AsyncMock(return_value=fake_payload))
+        with patch("app.main.get_metrics_aggregator", return_value=fake_aggregator):
+            response = asyncio.run(main.aggregate_metrics_endpoint())
+        self.assertEqual(200, response.status_code)
+        self.assertIn("demo 1", response.body.decode("utf-8", errors="ignore"))
+
+
+if __name__ == "__main__":
+    unittest.main()

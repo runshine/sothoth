@@ -20,6 +20,7 @@ from fastapi.responses import Response
 from app.api.tasks import router
 from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
+from app.metrics_aggregate import get_metrics_aggregator
 from app.model import get_engine, init_database
 from app.observability import (
     observe_api_request,
@@ -251,6 +252,30 @@ async def prometheus_http_middleware(request: FastAPIRequest, call_next):
 async def metrics_endpoint():
     payload, content_type = render_metrics()
     return Response(content=payload, media_type=content_type)
+
+
+@app.get("/api/app/binary-security/metrics/aggregate", include_in_schema=False)
+async def aggregate_metrics_endpoint():
+    started = time.perf_counter()
+    try:
+        aggregated = await get_metrics_aggregator().aggregate()
+    except Exception as exc:
+        observe_downstream_request(
+            service="binary_security_metrics",
+            method="GET",
+            operation="aggregate",
+            status="error",
+            duration_seconds=None,
+        )
+        raise HTTPException(status_code=502, detail=f"Aggregate metrics generation failed: {exc}") from exc
+    observe_downstream_request(
+        service="binary_security_metrics",
+        method="GET",
+        operation="aggregate",
+        status="200",
+        duration_seconds=time.perf_counter() - started,
+    )
+    return Response(content=aggregated.payload, media_type=aggregated.content_type)
 
 
 @app.get("/api/app/binary-security/metrics/reducer", include_in_schema=False)
