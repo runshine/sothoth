@@ -530,6 +530,27 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
     return unique
 
 
+def _path_matches_task_id(path: Path, task_id: str | None) -> bool:
+    if not task_id:
+        return False
+    return any(part == task_id for part in path.parts)
+
+
+def _prefer_specific_paths(paths: list[Path], *, downstream_task_id: str | None = None) -> list[Path]:
+    if not paths:
+        return []
+    preferred = list(paths)
+    task_scoped = [path for path in preferred if _path_matches_task_id(path, downstream_task_id)]
+    if task_scoped:
+        preferred = task_scoped
+    pruned: list[Path] = []
+    for candidate in preferred:
+        if any(candidate != other and _is_within_path(candidate, other) for other in preferred):
+            continue
+        pruned.append(candidate)
+    return _dedupe_paths(pruned or preferred)
+
+
 def _stage_item_attr(item: Any, field: str) -> Any:
     if item is None:
         return None
@@ -9878,6 +9899,7 @@ class TaskManager:
             and source.resolve() != target_dir.resolve()
             and not _is_within_path(target_dir, source)
         ]
+        existing_sources = _prefer_specific_paths(existing_sources, downstream_task_id=item.downstream_task_id)
         if not existing_sources:
             self._record_event(
                 db,

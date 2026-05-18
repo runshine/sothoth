@@ -1672,6 +1672,9 @@ class TaskManagerTests(unittest.TestCase):
 
 
 class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.manager = TaskManager()
+
     async def test_create_task_preserves_multiple_elf_tasks(self):
         from app.service.binary_to_source import BinaryToSourceClient
 
@@ -5033,6 +5036,25 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(output_dir, rows[0])
 
+    def test_resolve_downstream_output_sources_prefers_task_scoped_output_over_service_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service_root = root / "service"
+            other_output = service_root / "other-task" / "output"
+            task_output = service_root / "down1" / "output"
+            other_output.mkdir(parents=True)
+            task_output.mkdir(parents=True)
+            (other_output / "other.md").write_text("other", encoding="utf-8")
+            (task_output / "report.md").write_text("ok", encoding="utf-8")
+
+            rows = self.manager._resolve_downstream_output_sources(
+                {"output_path": str(service_root)},
+                downstream_task_id="down1",
+            )
+
+            self.assertEqual(task_output, rows[0])
+            self.assertIn(service_root, rows)
+
     def test_archive_downstream_output_uses_standard_service_output_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -5071,6 +5093,49 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             assert target is not None
             self.assertTrue((target / "summary.md").is_file())
             self.assertEqual("firmware-unpacker", target.parent.name)
+
+    def test_archive_downstream_output_does_not_copy_other_downstream_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service_root = root / "secflow-app-entry-analyse"
+            current_output = service_root / "eat_current" / "output"
+            other_output = service_root / "eat_other" / "output"
+            current_output.mkdir(parents=True)
+            other_output.mkdir(parents=True)
+            (current_output / "entry-details.json").write_text("[]", encoding="utf-8")
+            (other_output / "foreign.txt").write_text("x", encoding="utf-8")
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="running",
+                task_type=TASK_TYPE_SOURCE,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(root / "task-output"),
+                workspace_root=str(root / "workspace-root"),
+            )
+            item = type("Item", (), {
+                "downstream_service": "entry_analyse",
+                "stage_name": "entry_analysis",
+                "downstream_task_id": "eat_current",
+                "item_key": "source_project-image",
+                "id": "si1",
+            })()
+
+            target = self.manager._archive_downstream_output(
+                _FakeDb(),
+                task,
+                item,
+                semantic_key="source_project-image",
+                payload={"output_path": str(service_root)},
+            )
+
+            self.assertIsNotNone(target)
+            assert target is not None
+            self.assertTrue((target / "entry-details.json").is_file())
+            self.assertFalse((target / "eat_other").exists())
+            self.assertFalse((target / "foreign.txt").exists())
 
     def test_archive_downstream_output_skips_empty_sources_without_creating_target(self):
         with tempfile.TemporaryDirectory() as tmp:
