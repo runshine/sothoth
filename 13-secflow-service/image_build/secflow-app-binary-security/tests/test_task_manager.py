@@ -6948,6 +6948,69 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("dfa-passed", payload["task_id"])
         self.assertEqual("dfa-passed", item.downstream_task_id)
 
+    def test_run_dataflow_item_retry_path_polls_after_restart(self):
+        task = BinarySecurityTask(id="t1", name="source-task", project_id="p1", workspace_root="/tmp/ws")
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            sequence_no=3,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            item_key="entry-1",
+            item_name="entry-1",
+            parent_key="module-1",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa-old",
+            status="failed",
+            output_ref={},
+        )
+        entry = {
+            "entry_key": "entry-1",
+            "function_name": "main",
+            "source_dir": "/tmp/src",
+            "source_file": "main.c",
+            "file_name": "main.c",
+            "module_key": "module-1",
+            "is_definition_found": True,
+            "definition_file": "main.c",
+            "definition_line": "10",
+            "taint_params": ["argv"],
+        }
+        fake_session = _ModelAwareDb()
+
+        async def fake_retry(*args, **kwargs):
+            del args, kwargs
+            return {"task_id": "dfa-retried"}
+
+        async def fake_poll(*args, **kwargs):
+            del args, kwargs
+            return "failed", {"task_id": "dfa-retried", "status": "error", "error": "boom"}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_find_reusable_dataflow_payload", return_value=None),
+            patch.object(self.manager, "_invoke_existing_downstream_retry", side_effect=fake_retry),
+            patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
+            patch.object(self.manager, "_service_output_dir", return_value=Path("/tmp")),
+            patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
+            patch.object(self.manager, "_find_first", return_value=None),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+            patch.object(self.manager, "_lightweight_downstream_payload", side_effect=lambda payload: {"status": payload.get("status")}),
+        ):
+            result = asyncio.run(self.manager._run_dataflow_item(task, stage_run, entry, token=None, retrying=True))
+
+        self.assertEqual("dfa-retried", item.downstream_task_id)
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("boom", result["error"])
+
 
 if __name__ == "__main__":
     unittest.main()
