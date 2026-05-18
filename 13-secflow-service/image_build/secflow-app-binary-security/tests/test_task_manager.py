@@ -6190,6 +6190,50 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(task.dispatch_started_at)
         self.assertIsNone(task.lease_expires_at)
 
+    def test_list_tasks_needing_downstream_sync_includes_failed_items_with_downstream_refs(self):
+        engine = create_engine("sqlite:///:memory:")
+        TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base.metadata.create_all(bind=engine)
+        db = TestingSessionLocal()
+        try:
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="running",
+                current_stage="binary_to_source",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw.bin",
+                output_root="/o",
+                workspace_root="/w",
+            )
+            item = BinarySecurityStageItem(
+                id="si1",
+                task_id="task1",
+                project_id="p1",
+                stage_run_id="sr1",
+                stage_name="binary_to_source",
+                item_key="k1",
+                status="failed",
+                downstream_service="binary_to_source",
+                downstream_task_id="b2s-1",
+            )
+            db.add(task)
+            db.add(item)
+            db.commit()
+
+            original_needs_reconcile = self.manager._task_needs_downstream_reconcile
+            self.manager._task_needs_downstream_reconcile = lambda current_task: current_task.id == "task1"
+            try:
+                refs = self.manager._list_tasks_needing_downstream_sync(db)
+            finally:
+                self.manager._task_needs_downstream_reconcile = original_needs_reconcile
+        finally:
+            db.close()
+
+        self.assertEqual([{"project_id": "p1", "task_id": "task1"}], refs)
+
     def test_run_task_ignores_stale_worker_failure_after_retry(self):
         task = BinarySecurityTask(
             id="task1",

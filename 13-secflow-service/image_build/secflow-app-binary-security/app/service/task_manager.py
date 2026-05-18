@@ -2223,6 +2223,7 @@ class TaskManager:
                 "dispatching": 1,
                 "queued": 2,
                 "pending": 3,
+                "failed": 4,
             }
             items = sorted(
                 items,
@@ -4777,7 +4778,7 @@ class TaskManager:
                 BinarySecurityTask.status.in_(["pending", "dispatching", "running"]),
                 BinarySecurityStageItem.downstream_service.isnot(None),
                 BinarySecurityStageItem.downstream_task_id.isnot(None),
-                BinarySecurityStageItem.status.in_(["pending", "queued", "running", "dispatching"]),
+                BinarySecurityStageItem.status.in_(["pending", "queued", "running", "dispatching", "failed"]),
             )
             .distinct()
             .all()
