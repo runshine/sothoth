@@ -5,11 +5,9 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-import socket
 import time
 from dataclasses import dataclass, field
 from typing import Iterable
-from urllib.parse import quote
 
 import httpx
 
@@ -18,6 +16,11 @@ from app.service.http_client import get_shared_async_client
 
 
 _ROLE_LABELS = {"api", "worker", "reducer"}
+_AGGREGATED_ROLE_LABELS = ("api", "reducer")
+_ROLE_SERVICE_NAMES = {
+    "api": "secflow-app-binary-security",
+    "reducer": "secflow-app-binary-security-reducer",
+}
 _POD_DISCOVERY_CACHE_TTL_SECONDS = 30.0
 _AGGREGATED_METRICS_CACHE_TTL_SECONDS = 5.0
 _SCRAPE_TIMEOUT_SECONDS = 1.5
@@ -275,58 +278,65 @@ def render_aggregated_metrics(
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-async def _discover_binary_security_pods() -> list[PodTarget]:
+async def _fetch_k8s_resource(path: str) -> dict:
     token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
     ca_path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
     if not os.path.exists(token_path):
-        return []
+        return {}
     try:
         with open(token_path, "r", encoding="utf-8") as token_file:
             token = token_file.read().strip()
     except OSError:
-        return []
+        return {}
     host = os.environ.get("KUBERNETES_SERVICE_HOST")
     port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
-    namespace = (
-        str(os.environ.get("POD_NAMESPACE") or "").strip()
-        or str(os.environ.get("NAMESPACE") or "").strip()
-        or "secflow-ns"
-    )
     if not host:
-        return []
-    selector = quote("name=secflow-app-binary-security")
-    url = f"https://{host}:{port}/api/v1/namespaces/{namespace}/pods?labelSelector={selector}"
+        return {}
+    url = f"https://{host}:{port}{path}"
     headers = {"Authorization": f"Bearer {token}"}
     verify = ca_path if os.path.exists(ca_path) else True
     try:
         async with httpx.AsyncClient(timeout=_DISCOVERY_TIMEOUT_SECONDS, verify=verify) as client:
             response = await client.get(url, headers=headers)
     except Exception:
-        return []
+        return {}
     if response.status_code >= 400:
-        return []
-    payload = response.json()
+        return {}
+    return response.json()
+
+
+async def _discover_binary_security_pods() -> list[PodTarget]:
+    namespace = (
+        str(os.environ.get("POD_NAMESPACE") or "").strip()
+        or str(os.environ.get("NAMESPACE") or "").strip()
+        or "secflow-ns"
+    )
     pods: list[PodTarget] = []
-    for item in payload.get("items") or []:
-        metadata = item.get("metadata") or {}
-        status = item.get("status") or {}
-        labels = metadata.get("labels") or {}
-        role = str(labels.get("role") or "").strip().lower()
-        pod_name = str(metadata.get("name") or "").strip()
-        ip = str(status.get("podIP") or "").strip()
-        phase = str(status.get("phase") or "").strip()
-        if metadata.get("deletionTimestamp"):
-            continue
-        if role not in _ROLE_LABELS or phase != "Running" or not ip or not pod_name:
-            continue
-        pods.append(PodTarget(pod_name=pod_name, role=role, ip=ip))
+    seen: set[tuple[str, str]] = set()
+    for role in _AGGREGATED_ROLE_LABELS:
+        service_name = _ROLE_SERVICE_NAMES[role]
+        payload = await _fetch_k8s_resource(f"/api/v1/namespaces/{namespace}/endpoints/{service_name}")
+        for subset in payload.get("subsets") or []:
+            ports = subset.get("ports") or []
+            port_value = next((int(port.get("port")) for port in ports if port.get("port")), 8080)
+            for address in subset.get("addresses") or []:
+                ip = str(address.get("ip") or "").strip()
+                target_ref = address.get("targetRef") or {}
+                pod_name = str(target_ref.get("name") or address.get("hostname") or ip).strip()
+                if not ip or not pod_name:
+                    continue
+                dedupe_key = (role, ip)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                pods.append(PodTarget(pod_name=pod_name, role=role, ip=ip, port=port_value))
     return sorted(pods, key=lambda item: (item.role, item.pod_name))
 
 
 def _discover_local_pod_ip() -> list[PodTarget]:
     role = str(os.environ.get("SECFLOW_BINARY_SECURITY_ROLE") or "").strip().lower()
     pod_ip = str(os.environ.get("POD_IP") or "").strip()
-    if role not in _ROLE_LABELS or not pod_ip:
+    if role not in _AGGREGATED_ROLE_LABELS or not pod_ip:
         return []
     return [PodTarget(pod_name=str(os.environ.get("HOSTNAME") or pod_ip), role=role, ip=pod_ip)]
 

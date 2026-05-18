@@ -1,4 +1,5 @@
 import asyncio
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -8,6 +9,8 @@ from app.metrics_aggregate import (
     AggregatedMetricsPayload,
     PodTarget,
     ScrapeResult,
+    _discover_binary_security_pods,
+    _discover_local_pod_ip,
     aggregate_prometheus_samples,
     render_aggregated_metrics,
 )
@@ -108,6 +111,58 @@ class MetricsAggregateTests(unittest.TestCase):
             response = asyncio.run(main.aggregate_metrics_endpoint())
         self.assertEqual(200, response.status_code)
         self.assertIn("demo 1", response.body.decode("utf-8", errors="ignore"))
+
+    def test_discover_binary_security_pods_reads_ready_service_endpoints(self):
+        async def fake_fetch(path: str):
+            if path.endswith("/endpoints/secflow-app-binary-security"):
+                return {
+                    "subsets": [
+                        {
+                            "addresses": [
+                                {"ip": "10.0.0.1", "targetRef": {"name": "api-1"}},
+                                {"ip": "10.0.0.2", "targetRef": {"name": "api-2"}},
+                            ],
+                            "ports": [{"port": 8080}],
+                        }
+                    ]
+                }
+            if path.endswith("/endpoints/secflow-app-binary-security-reducer"):
+                return {
+                    "subsets": [
+                        {
+                            "addresses": [
+                                {"ip": "10.0.1.1", "targetRef": {"name": "reducer-1"}},
+                            ],
+                            "ports": [{"port": 8080}],
+                        }
+                    ]
+                }
+            return {}
+
+        with patch("app.metrics_aggregate._fetch_k8s_resource", side_effect=fake_fetch):
+            pods = asyncio.run(_discover_binary_security_pods())
+
+        self.assertEqual(
+            [
+                PodTarget(pod_name="api-1", role="api", ip="10.0.0.1", port=8080),
+                PodTarget(pod_name="api-2", role="api", ip="10.0.0.2", port=8080),
+                PodTarget(pod_name="reducer-1", role="reducer", ip="10.0.1.1", port=8080),
+            ],
+            pods,
+        )
+
+    def test_local_fallback_only_applies_to_aggregated_roles(self):
+        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker", "POD_IP": "10.0.0.9"}, clear=True):
+            self.assertEqual([], _discover_local_pod_ip())
+        with patch.dict(
+            os.environ,
+            {"SECFLOW_BINARY_SECURITY_ROLE": "api", "POD_IP": "10.0.0.8", "HOSTNAME": "api-fallback"},
+            clear=True,
+        ):
+            self.assertEqual(
+                [PodTarget(pod_name="api-fallback", role="api", ip="10.0.0.8", port=8080)],
+                _discover_local_pod_ip(),
+            )
 
 
 if __name__ == "__main__":
