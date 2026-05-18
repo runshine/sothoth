@@ -2221,9 +2221,9 @@ class TaskManager:
             status_priority = {
                 "running": 0,
                 "dispatching": 1,
-                "queued": 2,
-                "pending": 3,
-                "failed": 4,
+                "failed": 2,
+                "queued": 3,
+                "pending": 4,
             }
             items = sorted(
                 items,
