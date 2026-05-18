@@ -364,7 +364,9 @@ def _deduplicate_entry_keys(entries: list[dict[str, Any]]) -> list[dict[str, Any
         candidate = _entry_key_with_suffix(base_key or _slug(str(suffix_source)), suffix_source, index + 1)
         attempt = 2
         while candidate in used:
-            candidate = _entry_key_with_suffix(base_key or _slug(str(suffix_source)), f"{suffix_source}-{attempt}", index + 1)
+            # Use a short deterministic fallback suffix so retries cannot be
+            # truncated back into the same candidate for long function strings.
+            candidate = _entry_key_with_suffix(base_key or _slug(str(suffix_source)), f"{index + 1}-{attempt}", index + 1)
             attempt += 1
         current["entry_key"] = candidate
         used.add(candidate)

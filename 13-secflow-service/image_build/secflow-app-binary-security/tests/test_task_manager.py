@@ -34,7 +34,7 @@ from app.schemas import (
     BinarySecurityTaskPolicyUpdatePayload,
 )
 from app.service import task_manager as task_manager_module
-from app.service.task_manager import TaskManager, _now
+from app.service.task_manager import TaskManager, _deduplicate_entry_keys, _now
 
 
 class _FakeQuery:
@@ -263,6 +263,37 @@ class TaskManagerTests(unittest.TestCase):
             payload = json.loads(summary_path.read_text("utf-8"))
             self.assertIn("writer", payload)
             self.assertFalse(list(Path(tmp).glob(f".{BinarySecurityTask.SUMMARY_FILENAME}.*.tmp")))
+
+    def test_deduplicate_entry_keys_handles_long_duplicate_suffixes(self):
+        long_signature = (
+            "VeryLongNamespace::VeryLongClassName::VeryLongMethodNameWithExtremelyLongSuffix("
+            "const std::string& request, const std::string& response, const std::string& context)"
+        )
+        entries = [
+            {
+                "entry_key": "source_project-image-PullImage-1",
+                "raw_function_name": long_signature,
+                "function_name": "PullImage",
+                "file_name": "image.cc",
+            },
+            {
+                "entry_key": "source_project-image-PullImage-1",
+                "raw_function_name": long_signature,
+                "function_name": "PullImage",
+                "file_name": "image.cc",
+            },
+            {
+                "entry_key": "source_project-image-PullImage-1",
+                "raw_function_name": long_signature,
+                "function_name": "PullImage",
+                "file_name": "image.cc",
+            },
+        ]
+
+        deduped = _deduplicate_entry_keys(entries)
+
+        self.assertEqual(3, len(deduped))
+        self.assertEqual(3, len({row["entry_key"] for row in deduped}))
 
     def test_write_json_concurrent_writes_use_unique_temp_files(self):
         with tempfile.TemporaryDirectory() as tmp:
