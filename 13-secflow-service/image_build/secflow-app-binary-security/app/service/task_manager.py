@@ -154,13 +154,11 @@ def _seconds_until(value: datetime | None) -> float | None:
         (value - _now()).total_seconds(),
         (value - datetime.utcnow()).total_seconds(),
     ]
-    non_negative = [remaining for remaining in candidates if remaining >= 0]
-    if non_negative:
-        # Prefer the smallest non-negative interpretation so UTC+8 naive values
-        # do not incorrectly look fresh for ~8 extra hours when compared using
-        # datetime.utcnow().
-        return min(non_negative)
-    return min(candidates)
+    # Lease timestamps can be mixed between UTC naive and UTC+8 naive writers.
+    # Choose the interpretation closest to "now" so expired local timestamps do
+    # not incorrectly remain fresh for ~8 extra hours under UTC comparison, and
+    # fresh UTC timestamps do not expire ~8 hours early under local comparison.
+    return min(candidates, key=lambda remaining: abs(remaining))
 
 
 def _slug(value: str) -> str:

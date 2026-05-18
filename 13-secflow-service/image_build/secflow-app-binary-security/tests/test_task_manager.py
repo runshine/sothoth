@@ -39,7 +39,7 @@ from app.schemas import (
     BinarySecurityUploadCompletePayload,
 )
 from app.service import task_manager as task_manager_module
-from app.service.task_manager import TaskManager, _deduplicate_entry_keys, _now
+from app.service.task_manager import TaskManager, _deduplicate_entry_keys, _now, _seconds_until
 
 
 class _FakeQuery:
@@ -6006,6 +6006,20 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(supported)
         self.assertIsNone(reason)
         self.assertEqual("firmware_unpack", stage_name)
+
+    def test_seconds_until_prefers_local_expired_interpretation(self):
+        lease_value = _now() - timedelta(minutes=5)
+        remaining = _seconds_until(lease_value)
+        self.assertIsNotNone(remaining)
+        self.assertLess(remaining, 0)
+        self.assertGreater(remaining, -600)
+
+    def test_seconds_until_prefers_nearest_future_interpretation(self):
+        lease_value = datetime.utcnow() + timedelta(minutes=5)
+        remaining = _seconds_until(lease_value)
+        self.assertIsNotNone(remaining)
+        self.assertGreater(remaining, 0)
+        self.assertLess(remaining, 600)
 
     def test_reclaim_stale_running_task_marks_stage_and_items_failed(self):
         task = BinarySecurityTask(
