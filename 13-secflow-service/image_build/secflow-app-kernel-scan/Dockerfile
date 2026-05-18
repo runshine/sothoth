@@ -12,7 +12,7 @@ ARG PIP_TRUSTED_HOST=repo.huaweicloud.com
 ARG NPM_REGISTRY_URL=https://repo.huaweicloud.com/repository/npm/
 ARG ANDROID_PLATFORM_TOOLS_URL=https://dl.google.com/android/repository/platform-tools-latest-linux.zip
 ARG ANDROID_NDK_URL=https://dl.google.com/android/repository/android-ndk-r29-linux.zip
-ARG ANDROID_NDK_SHA1=87e2bb7e9be5d6a1c6cdf5ec40dd4e0c6d07c30b
+ARG ANDROID_NDK_SHA1=dc5bd963c8fd5ba91762a8a282b39466fb7f6568
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -62,19 +62,33 @@ RUN apt-get update \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
 
+COPY tools/ /tmp/android-tool-cache/
+
 RUN set -eux; \
  mkdir -p /opt/android-tools /opt/android-ndk; \
- curl -fL --retry 3 --retry-delay 5 -o /tmp/platform-tools.zip "${ANDROID_PLATFORM_TOOLS_URL}"; \
- unzip -qo /tmp/platform-tools.zip -d /tmp/platform-tools; \
+ platform_tools_zip=/tmp/android-tool-cache/android-platform-tools.zip; \
+ ndk_zip=/tmp/android-tool-cache/android-ndk-r29.zip; \
+ if [ -s "${platform_tools_zip}" ]; then \
+   echo "Using cached Android platform-tools: ${platform_tools_zip}"; \
+ else \
+   echo "Downloading Android platform-tools: ${ANDROID_PLATFORM_TOOLS_URL}"; \
+   curl -fL --retry 3 --retry-delay 5 -o "${platform_tools_zip}" "${ANDROID_PLATFORM_TOOLS_URL}"; \
+ fi; \
+ unzip -qo "${platform_tools_zip}" -d /tmp/platform-tools; \
  cp /tmp/platform-tools/platform-tools/adb /opt/android-tools/adb; \
  cp /tmp/platform-tools/platform-tools/fastboot /opt/android-tools/fastboot; \
  chmod +x /opt/android-tools/adb /opt/android-tools/fastboot; \
- rm -rf /tmp/platform-tools /tmp/platform-tools.zip; \
- curl -fL --retry 3 --retry-delay 5 -o /tmp/android-ndk.zip "${ANDROID_NDK_URL}"; \
- if [ -n "${ANDROID_NDK_SHA1}" ]; then echo "${ANDROID_NDK_SHA1}  /tmp/android-ndk.zip" | sha1sum -c -; fi; \
- unzip -qo /tmp/android-ndk.zip -d /tmp/android-ndk; \
+ rm -rf /tmp/platform-tools; \
+ if [ -s "${ndk_zip}" ]; then \
+   echo "Using cached Android NDK: ${ndk_zip}"; \
+ else \
+   echo "Downloading Android NDK: ${ANDROID_NDK_URL}"; \
+   curl -fL --retry 3 --retry-delay 5 -o "${ndk_zip}" "${ANDROID_NDK_URL}"; \
+ fi; \
+ if [ -n "${ANDROID_NDK_SHA1}" ]; then echo "${ANDROID_NDK_SHA1}  ${ndk_zip}" | sha1sum -c -; fi; \
+ unzip -qo "${ndk_zip}" -d /tmp/android-ndk; \
  mv /tmp/android-ndk/android-ndk-*/* /opt/android-ndk/; \
- rm -rf /tmp/android-ndk /tmp/android-ndk.zip; \
+ rm -rf /tmp/android-ndk /tmp/android-tool-cache; \
  /opt/android-tools/adb version; \
  /opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang --version
 

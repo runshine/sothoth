@@ -153,7 +153,7 @@ Stage 之间的数据契约：
 
 **Android 工具链（adb / fastboot / NDK）：**
 
-Dockerfile 在镜像构建阶段从 Google 官方下载并安装：
+构建前推荐运行 `./scripts/prepare-android-tools.sh`，把下载产物缓存在 `./tools/`。Dockerfile 构建时优先使用缓存文件；缓存不存在时，也会在构建阶段从 Google 官方下载并安装：
 
 | 构建参数 | 默认地址 | 安装目标 |
 |---|---|---|

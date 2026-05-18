@@ -36,14 +36,36 @@ export KERNEL_HOST_PATH=/path/to/kernel/source
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-The image downloads Android platform-tools and Android NDK from Google during
-`docker build`, so `./tools` archives are no longer required.
+Android platform-tools and Android NDK are cached under `./tools`. Build with
+the helper script when you want the cache populated automatically:
+
+```bash
+./build-image.sh
+```
+
+The helper reuses these files if present, and downloads them from Google only
+when missing:
+
+```text
+./tools/android-platform-tools.zip
+./tools/android-ndk-r29.zip
+```
+
+The Dockerfile also uses those cached files during image build. The zip files
+are ignored by Git.
 
 Start the service:
 
 ```bash
 docker compose up -d --build
 docker compose logs -f secflow-app-kernel-scan
+```
+
+If you use `docker compose up --build` directly, run the cache step once first:
+
+```bash
+./scripts/prepare-android-tools.sh
+docker compose up -d --build
 ```
 
 Health check:

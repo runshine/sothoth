@@ -3,7 +3,6 @@ __pycache__/
 *.pyo
 .env
 state/
-tools/
 *.db
 .git/
 .gitignore
