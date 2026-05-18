@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import re
 from pathlib import Path
 from statistics import mean
@@ -280,6 +280,44 @@ def _pi_idempotency_key(task_id: str, item: B2STaskItem) -> str:
     return f"b2s:{task_id}:{item.id}:{_normalized_target(item.elf_path)}"
 
 
+def _new_pi_idempotency_key(task_id: str, item: B2STaskItem) -> str:
+    return f"{_pi_idempotency_key(task_id, item)}:attempt:{uuid4().hex[:8]}"
+
+
+def _item_pi_idempotency_key(item: B2STaskItem) -> str:
+    metadata = item.extra_metadata or {}
+    key = str(metadata.get("pi_idempotency_key") or "").strip()
+    return key or _pi_idempotency_key(item.task_id, item)
+
+
+def _parse_pi_timestamp(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = f"{raw[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        return parsed
+    return parsed.astimezone(timezone(timedelta(hours=8))).replace(tzinfo=None)
+
+
+def _pi_job_age_seconds(job: dict, *fields: str) -> float | None:
+    candidates = [_parse_pi_timestamp(job.get(field)) for field in fields]
+    candidates = [candidate for candidate in candidates if candidate is not None]
+    if not candidates:
+        return None
+    return max(0.0, (now_local() - max(candidates)).total_seconds())
+
+
 def _record_pi_metadata(item: B2STaskItem, **updates: object) -> None:
     metadata = item.extra_metadata or {}
     metadata.update({key: value for key, value in updates.items() if value is not None})
@@ -315,7 +353,7 @@ def _pi_job_payload(
     return {
         "target": item.elf_path,
         "output_dir": item.output_dir,
-        "idempotency_key": _pi_idempotency_key(item.task_id, item),
+        "idempotency_key": _item_pi_idempotency_key(item),
         "batch_size": pi_cfg.batch_size,
         "max_retries": pi_cfg.max_retries,
         "timeout_seconds": timeout_seconds,
@@ -355,7 +393,7 @@ def _apply_pi_job_to_item(db: Session, item: B2STaskItem, job: dict, *, worker_u
         item,
         pi_worker_url=worker_url,
         pi_job_id=item.pi_job_id,
-        pi_idempotency_key=_pi_idempotency_key(item.task_id, item),
+        pi_idempotency_key=_item_pi_idempotency_key(item),
         pi_last_seen_status=job.get("status"),
         pi_last_seen_at=isoformat_local(now_local()),
         pi_recover_reason=(item.extra_metadata or {}).get("pi_recover_reason"),
@@ -380,10 +418,15 @@ def _apply_pi_job_to_item(db: Session, item: B2STaskItem, job: dict, *, worker_u
         item.error_reason = None
 
 
-def _queue_item_for_dispatch(item: B2STaskItem, *, clean: bool = False) -> None:
+def _queue_item_for_dispatch(item: B2STaskItem, *, clean: bool = False, fresh_pi_job: bool = False) -> None:
     metadata = item.extra_metadata or {}
-    metadata["pi_idempotency_key"] = _pi_idempotency_key(item.task_id, item)
+    metadata["pi_idempotency_key"] = _new_pi_idempotency_key(item.task_id, item) if fresh_pi_job else _pi_idempotency_key(item.task_id, item)
     metadata["dispatch_clean"] = clean
+    metadata.pop("pi_last_seen_status", None)
+    metadata.pop("pi_last_seen_at", None)
+    metadata.pop("pi_last_recover_error", None)
+    metadata.pop("pi_conflict_job_id", None)
+    metadata.pop("pi_recover_reason", None)
     item.extra_metadata = metadata
     item.pi_job_id = None
     item.status = "pending"
@@ -399,13 +442,85 @@ def _queue_item_for_dispatch(item: B2STaskItem, *, clean: bool = False) -> None:
     item.scheduler_lease_until = None
 
 
+def _sync_observation_is_still_current(db: Session, item: B2STaskItem, observed_pi_job_id: str | None) -> bool:
+    """Guard sync_task against stale in-memory item state after rerun/retry/reset.
+
+    sync_task() may race with rerun_task()/retry_task(), which reset ``pi_job_id``
+    and queue the item again. Refresh the row before writing any upstream status
+    back; if the observed job id no longer matches, the current sync view is stale
+    and must not overwrite the newer state.
+    """
+    db.refresh(item)
+    current_pi_job_id = str(item.pi_job_id or "").strip() or None
+    observed = str(observed_pi_job_id or "").strip() or None
+    return current_pi_job_id == observed
+
+
+async def _requeue_stale_pi_job(
+    db: Session,
+    item: B2STaskItem,
+    job: dict,
+    *,
+    reason: str,
+    observed_pi_job_id: str | None,
+) -> bool:
+    if not _sync_observation_is_still_current(db, item, observed_pi_job_id):
+        return False
+    if item.pi_job_id:
+        try:
+            await get_pi_client(item_pi_worker_url(item)).cancel_job(item.pi_job_id)
+        except Exception as exc:
+            _record_pi_metadata(
+                item,
+                pi_last_recover_error=str(exc),
+                pi_recover_reason=reason,
+            )
+    _queue_item_for_dispatch(item, clean=True, fresh_pi_job=True)
+    _record_pi_metadata(
+        item,
+        pi_last_seen_status=job.get("status"),
+        pi_last_seen_at=isoformat_local(now_local()),
+        pi_recover_reason=reason,
+        pi_previous_job_id=observed_pi_job_id,
+    )
+    item.failure_type = "upstream_stale"
+    item.error_reason = "pi-re-agent任务长时间未推进，已取消旧job并重新排队"
+    return True
+
+
+async def _recover_stale_pi_job(db: Session, item: B2STaskItem, job: dict, observed_pi_job_id: str | None) -> bool:
+    raw_status = str(job.get("status") or "").strip().lower()
+    pi_cfg = get_config().pi_re_agent
+    if raw_status == "cancelling":
+        age = _pi_job_age_seconds(job, "cancel_requested_at", "updated_at")
+        if age is not None and age >= max(30, int(pi_cfg.cancelling_stale_after_seconds)):
+            return await _requeue_stale_pi_job(
+                db,
+                item,
+                job,
+                reason="stale_cancelling_requeued",
+                observed_pi_job_id=observed_pi_job_id,
+            )
+    if raw_status == "queued":
+        age = _pi_job_age_seconds(job, "heartbeat_at", "updated_at", "created_at")
+        if age is not None and age >= max(60, int(pi_cfg.queued_stale_after_seconds)):
+            return await _requeue_stale_pi_job(
+                db,
+                item,
+                job,
+                reason="stale_queued_requeued",
+                observed_pi_job_id=observed_pi_job_id,
+            )
+    return False
+
+
 async def dispatch_item_to_pi(db: Session, item: B2STaskItem, *, owner_id: str) -> bool:
     pi_cfg = get_config().pi_re_agent
     metadata = item.extra_metadata or {}
     worker_url = await choose_pi_worker(db, item.task_id, item.sequence_no)
     metadata["pi_worker_url"] = worker_url
     metadata["pi_endpoint_url"] = worker_url
-    metadata["pi_idempotency_key"] = _pi_idempotency_key(item.task_id, item)
+    metadata["pi_idempotency_key"] = str(metadata.get("pi_idempotency_key") or "").strip() or _pi_idempotency_key(item.task_id, item)
     item.extra_metadata = metadata
     item.dispatch_status = "dispatching"
     item.dispatch_attempts = int(item.dispatch_attempts or 0) + 1
@@ -636,6 +751,7 @@ async def sync_task(db: Session, task: B2STask) -> None:
     changed = False
     items = query_items(db, task.id)
     for item in items:
+        observed_pi_job_id = str(item.pi_job_id or "").strip() or None
         if not item.pi_job_id and item.status == "queued":
             _queue_item_for_dispatch(item, clean=bool((item.extra_metadata or {}).get("dispatch_clean")))
             item.failure_type = "upstream_lost"
@@ -647,6 +763,8 @@ async def sync_task(db: Session, task: B2STask) -> None:
         try:
             job = await get_pi_client(item_pi_worker_url(item)).get_job(item.pi_job_id)
         except UpstreamError as exc:
+            if not _sync_observation_is_still_current(db, item, observed_pi_job_id):
+                continue
             # Do not let one stale/unreachable worker make the whole task detail
             # API return 502. Keep the item visible and let users rerun/delete it.
             item.failure_type = "pi-re-agent"
@@ -658,6 +776,8 @@ async def sync_task(db: Session, task: B2STask) -> None:
                 "error": str(exc),
             })
             changed = True
+            continue
+        if not _sync_observation_is_still_current(db, item, observed_pi_job_id):
             continue
         if job is None:
             recovered = await _recover_missing_pi_job(db, item)
@@ -690,6 +810,9 @@ async def sync_task(db: Session, task: B2STask) -> None:
                 changed = True
                 continue
             changed = True
+        if await _recover_stale_pi_job(db, item, job, observed_pi_job_id):
+            changed = True
+            continue
         new_status = map_pi_status(job.get("status"))
         new_phase = map_pi_phase(job.get("phase"), job.get("status"))
         new_progress = build_item_progress(item, job)
@@ -838,14 +961,14 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
         metadata = item.extra_metadata or {}
         metadata.pop("pi_worker_url", None)
         metadata.pop("pi_endpoint_url", None)
-        metadata["pi_idempotency_key"] = _pi_idempotency_key(task.id, item)
+        metadata["pi_idempotency_key"] = _new_pi_idempotency_key(task.id, item)
         if provider:
             metadata["llm_provider_key"] = _normalize_llm_provider_key(provider.get("provider_key"))
             metadata["llm_provider_model"] = _normalize_llm_provider_key(provider.get("model"))
             metadata["llm_provider_display_name"] = str(provider.get("display_name") or "").strip() or None
             metadata["llm_provider_type"] = str(provider.get("provider_type") or "").strip() or None
         item.extra_metadata = metadata
-        _queue_item_for_dispatch(item, clean=True)
+        _queue_item_for_dispatch(item, clean=True, fresh_pi_job=True)
         db.flush()
     recompute_task_status(db, task)
     db.commit()
@@ -865,14 +988,14 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
         metadata = item.extra_metadata or {}
         metadata.pop("pi_worker_url", None)
         metadata.pop("pi_endpoint_url", None)
-        metadata["pi_idempotency_key"] = _pi_idempotency_key(task.id, item)
+        metadata["pi_idempotency_key"] = _new_pi_idempotency_key(task.id, item)
         if provider:
             metadata["llm_provider_key"] = _normalize_llm_provider_key(provider.get("provider_key"))
             metadata["llm_provider_model"] = _normalize_llm_provider_key(provider.get("model"))
             metadata["llm_provider_display_name"] = str(provider.get("display_name") or "").strip() or None
             metadata["llm_provider_type"] = str(provider.get("provider_type") or "").strip() or None
         item.extra_metadata = metadata
-        _queue_item_for_dispatch(item, clean=True)
+        _queue_item_for_dispatch(item, clean=True, fresh_pi_job=True)
     recompute_task_status(db, task)
     db.commit()
     get_observability().record_retry("retry", len(selected))

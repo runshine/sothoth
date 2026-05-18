@@ -36,10 +36,11 @@ class _FakeQuery:
 
 
 class _FakeDb:
-    def __init__(self, *, project_configs=None, tasks=None, task_items=None):
+    def __init__(self, *, project_configs=None, tasks=None, task_items=None, refresh_hook=None):
         self.project_configs = list(project_configs or [])
         self.tasks = list(tasks or [])
         self.task_items = list(task_items or [])
+        self.refresh_hook = refresh_hook
 
     def query(self, model, *args, **kwargs):
         del args, kwargs
@@ -67,7 +68,8 @@ class _FakeDb:
         pass
 
     def refresh(self, obj):
-        del obj
+        if self.refresh_hook is not None:
+            self.refresh_hook(obj)
 
 
 class _FakePiClient:
@@ -144,6 +146,15 @@ class TaskProviderResolutionTests(unittest.TestCase):
             mock.patch.object(task_service, "prepare_input_file", return_value=Path("/tmp/input/demo.elf")),
             mock.patch.object(task_service, "safe_output_dir", return_value=Path("/tmp/output")),
             mock.patch.object(task_service, "_project_default_llm_provider_key", return_value="team_codex"),
+            mock.patch.object(
+                task_service,
+                "get_cache_service",
+                return_value=SimpleNamespace(
+                    try_apply_cache_hit=mock.Mock(return_value=SimpleNamespace(hit=False)),
+                    store_success_cache=mock.Mock(return_value=False),
+                    delete_caches_for_source_task=mock.Mock(),
+                ),
+            ),
             mock.patch.object(
                 task_service,
                 "get_config",
@@ -239,10 +250,119 @@ class TaskProviderResolutionTests(unittest.TestCase):
         self.assertEqual([], fake_pi.payloads)
         self.assertEqual("pending", item.status)
         self.assertEqual("pending", item.dispatch_status)
-        self.assertEqual("b2s:task1:item1:/tmp/demo.elf", item.extra_metadata["pi_idempotency_key"])
+        self.assertRegex(item.extra_metadata["pi_idempotency_key"], r"^b2s:task1:item1:/tmp/demo\.elf:attempt:[0-9a-f]{8}$")
         self.assertTrue(item.extra_metadata["dispatch_clean"])
         self.assertEqual("team_codex", item.extra_metadata["llm_provider_key"])
         self.assertEqual("gpt-5.4", item.extra_metadata["llm_provider_model"])
+
+
+class SyncTaskStaleObservationTests(unittest.TestCase):
+    def test_sync_task_does_not_overwrite_item_reset_by_rerun(self):
+        task = B2STask(
+            id="task1",
+            project_id="p1",
+            task_origin_type="manual",
+            name="demo",
+            status="running",
+        )
+        item = B2STaskItem(
+            id="item1",
+            task_id="task1",
+            project_id="p1",
+            sequence_no=1,
+            elf_path="/tmp/demo.elf",
+            output_dir="/tmp/output",
+            status="running",
+        )
+        item.pi_job_id = "job-old"
+        item.phase = "header"
+        item.extra_metadata = {
+            "pi_worker_url": "http://pi",
+            "pi_endpoint_url": "http://pi",
+            "pi_last_seen_status": "running",
+        }
+
+        def _refresh(obj):
+            if obj is item:
+                obj.pi_job_id = None
+                obj.status = "pending"
+                obj.dispatch_status = "pending"
+                obj.phase = "queued"
+                obj.failure_type = None
+                obj.error_reason = None
+                obj.extra_metadata = {"dispatch_clean": True}
+
+        db = _FakeDb(tasks=[task], task_items=[item], refresh_hook=_refresh)
+        fake_pi_client = SimpleNamespace(
+            get_job=mock.AsyncMock(return_value={
+                "id": "job-old",
+                "status": "failed",
+                "phase": "header_synthesis",
+                "error": "stale failure should be ignored",
+                "progress": {},
+            })
+        )
+
+        with mock.patch.object(task_service, "get_pi_client", return_value=fake_pi_client):
+            asyncio.run(task_service.sync_task(db, task))
+
+        self.assertIsNone(item.pi_job_id)
+        self.assertEqual("pending", item.status)
+        self.assertEqual("queued", item.phase)
+        self.assertIsNone(item.failure_type)
+        self.assertIsNone(item.error_reason)
+        fake_pi_client.get_job.assert_awaited_once_with("job-old")
+
+    def test_sync_task_requeues_stale_cancelling_pi_job_with_fresh_idempotency_key(self):
+        task = B2STask(
+            id="task1",
+            project_id="p1",
+            task_origin_type="manual",
+            name="demo",
+            status="running",
+        )
+        item = B2STaskItem(
+            id="item1",
+            task_id="task1",
+            project_id="p1",
+            sequence_no=1,
+            elf_path="/tmp/demo.elf",
+            output_dir="/tmp/output",
+            status="running",
+        )
+        item.pi_job_id = "job-stuck"
+        item.phase = "body"
+        item.extra_metadata = {"pi_worker_url": "http://pi"}
+        db = _FakeDb(tasks=[task], task_items=[item])
+        fake_pi_client = SimpleNamespace(
+            get_job=mock.AsyncMock(return_value={
+                "id": "job-stuck",
+                "status": "cancelling",
+                "cancel_requested_at": "2026-05-18T07:00:00Z",
+                "updated_at": "2026-05-18T07:00:00Z",
+                "progress": {},
+            }),
+            cancel_job=mock.AsyncMock(return_value={"status": "ok"}),
+        )
+
+        with (
+            mock.patch.object(task_service, "get_pi_client", return_value=fake_pi_client),
+            mock.patch.object(task_service, "now_local", return_value=task_service.datetime(2026, 5, 18, 15, 10, 0)),
+            mock.patch.object(
+                task_service,
+                "get_config",
+                return_value=SimpleNamespace(pi_re_agent=SimpleNamespace(cancelling_stale_after_seconds=300, queued_stale_after_seconds=1800)),
+            ),
+        ):
+            asyncio.run(task_service.sync_task(db, task))
+
+        self.assertIsNone(item.pi_job_id)
+        self.assertEqual("pending", item.status)
+        self.assertEqual("pending", item.dispatch_status)
+        self.assertEqual("queued", item.phase)
+        self.assertRegex(item.extra_metadata["pi_idempotency_key"], r"^b2s:task1:item1:/tmp/demo\.elf:attempt:[0-9a-f]{8}$")
+        self.assertEqual("stale_cancelling_requeued", item.extra_metadata["pi_recover_reason"])
+        fake_pi_client.cancel_job.assert_awaited_once_with("job-stuck")
 
     def test_retry_stopped_task_uses_latest_project_provider_not_frozen_provider(self):
         task = B2STask(

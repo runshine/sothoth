@@ -70,6 +70,8 @@ class PiReAgentConfig(BaseModel):
     max_dispatch_batch_size: int = 16
     default_worker_max_concurrent_jobs: int = 3
     dispatcher_lease_seconds: int = 15
+    cancelling_stale_after_seconds: int = 300
+    queued_stale_after_seconds: int = 1800
     batch_size: int = 8192
     max_retries: int = 3
     agent_run_timeout_seconds: int = 3600
