@@ -5553,7 +5553,7 @@ class TaskManager:
         }
         reclaimed = False
         for task in stale_rows:
-            if task.id in local_workers:
+            if task.id in local_workers and str(task.dispatcher_instance_id or "").strip() == self.instance_id:
                 continue
             lease_remaining = _seconds_until(task.lease_expires_at)
             if lease_remaining is None:
@@ -5599,7 +5599,7 @@ class TaskManager:
         }
         reclaimed = False
         for task in stale_rows:
-            if task.id in local_workers:
+            if task.id in local_workers and str(task.dispatcher_instance_id or "").strip() == self.instance_id:
                 continue
             lease_remaining = _seconds_until(task.lease_expires_at)
             if lease_remaining is None:

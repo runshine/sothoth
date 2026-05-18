@@ -5927,6 +5927,69 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(task.finished_at)
         self.assertIn("心跳超时", task.last_error or "")
 
+    def test_reclaim_stale_running_task_does_not_skip_foreign_owner_local_worker(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            current_stage="dataflow_analysis",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw.bin",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="dead-worker-pod",
+        )
+        task.dispatch_started_at = _now() - timedelta(seconds=600)
+        task.lease_expires_at = None
+        task.updated_at = _now() - timedelta(seconds=600)
+
+        active_item = BinarySecurityStageItem(
+            id="si1",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="dataflow_analysis",
+            item_key="k1",
+            status="running",
+            downstream_task_id="dfa-1",
+        )
+
+        class _ReclaimDb(_FakeDb):
+            def query(self, model, *args, **kwargs):
+                model_name = getattr(model, "__name__", "")
+                if model_name == "BinarySecurityTask":
+                    return _FakeQuery([task])
+                if model_name == "BinarySecurityStageRun":
+                    return _FakeQuery([])
+                if model_name == "BinarySecurityStageItem":
+                    return _FakeQuery([active_item])
+                return _FakeQuery([])
+
+            def flush(self):
+                pass
+
+        class _ActiveWorker:
+            def done(self):
+                return False
+
+        original_loader = self.manager._load_service_config
+        self.manager._load_service_config = lambda db: SimpleNamespace(dispatch_timeout_seconds=60)
+        self.manager._workers[task.id] = _ActiveWorker()
+        try:
+            reclaimed = self.manager._reclaim_stale_running_locked(_ReclaimDb())
+        finally:
+            self.manager._load_service_config = original_loader
+            self.manager._workers.clear()
+
+        self.assertTrue(reclaimed)
+        self.assertEqual("running", task.status)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertIsNone(task.dispatch_started_at)
+        self.assertIsNone(task.lease_expires_at)
+        self.assertIsNone(task.last_error)
+
     def test_run_task_ignores_stale_worker_failure_after_retry(self):
         task = BinarySecurityTask(
             id="task1",
