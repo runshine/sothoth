@@ -18,6 +18,13 @@ spec:
     spec:
       securityContext:
         fsGroup: 1000
+      initContainers:
+        - name: init-kernel-scan-data
+          image: busybox:1.36
+          command: ["sh", "-c", "mkdir -p /data/workspace/kernel"]
+          volumeMounts:
+            - name: secflow-app-kernel-scan-data-nfs-pvc
+              mountPath: /data
       containers:
         - name: secflow-app-kernel-scan
           image: ghcr.io/runshine/secflow-app-kernel-scan:latest
@@ -53,13 +60,11 @@ spec:
             - name: secflow-app-kernel-scan-config
               mountPath: /app/config.yaml
               subPath: config.yaml
-            - name: secflow-app-kernel-scan-state-pvc
+            - name: secflow-app-kernel-scan-data-nfs-pvc
               mountPath: /var/lib/secflow-kernel-scan
-            - name: secflow-app-kernel-scan-workspace-pvc
+            - name: secflow-app-kernel-scan-data-nfs-pvc
               mountPath: /workspace
-            - name: secflow-app-kernel-scan-kernel-pvc
-              mountPath: /workspace/kernel
-              readOnly: true
+              subPath: workspace
           resources:
             requests:
               cpu: "2"
@@ -90,12 +95,6 @@ spec:
             items:
               - key: config.yaml
                 path: config.yaml
-        - name: secflow-app-kernel-scan-state-pvc
+        - name: secflow-app-kernel-scan-data-nfs-pvc
           persistentVolumeClaim:
-            claimName: secflow-app-kernel-scan-state-pvc
-        - name: secflow-app-kernel-scan-workspace-pvc
-          persistentVolumeClaim:
-            claimName: secflow-app-kernel-scan-workspace-pvc
-        - name: secflow-app-kernel-scan-kernel-pvc
-          persistentVolumeClaim:
-            claimName: secflow-app-kernel-scan-kernel-pvc
+            claimName: secflow-app-kernel-scan-data-nfs-pvc

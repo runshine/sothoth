@@ -5,10 +5,10 @@ metadata:
   namespace: secflow-ns
 data:
   config.yaml: |
-    # Single-PVC layout for this service:
-    # - /var/lib/secflow-kernel-scan -> state PVC
-    # - /workspace -> workspace PVC
-    # - /workspace/kernel -> kernel source PVC
+    # Single-PVC layout inside secflow-app-kernel-scan-data-nfs-pvc:
+    # - PVC root -> /var/lib/secflow-kernel-scan
+    # - PVC subdir workspace/ -> /workspace
+    # The workspace/kernel subtree must contain the kernel source tree.
     title: "SecFlow Kernel Scan Service"
     database_url: "sqlite:////var/lib/secflow-kernel-scan/kernel-scan.db"
     state_root: "/var/lib/secflow-kernel-scan"
