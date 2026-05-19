@@ -214,7 +214,6 @@ const App = {
     const manifestLinks = [
       ['result_relations_manifest', '结果关系'],
       ['results_manifest', '结果生命周期'],
-      ['coverage_ledger', '覆盖账本'],
     ].map(([key, label]) => {
       const item = m[key] || {};
       const cls = item.exists ? 'text-success' : 'text-muted';
@@ -228,7 +227,7 @@ const App = {
         <div><span class="metric-num">${m.taskable_result_count ?? 0}</span><span class="text-muted">taskable</span></div>
         <div><span class="metric-num">${m.supplemental_result_count ?? 0}</span><span class="text-muted">supplement</span></div>
         <div><span class="metric-num">${m.inactive_result_count ?? 0}</span><span class="text-muted">inactive</span></div>
-        <div><span class="metric-num">${(m.missing_referenced_results || []).length}</span><span class="text-muted">missing refs</span></div>
+        <div><span class="metric-num">${m.excluded_result_count ?? 0}</span><span class="text-muted">excluded</span></div>
       </div>
       <div class="manifest-links">${manifestLinks}</div>
       ${advisors ? `<div class="manifest-advisors">${advisors}</div>` : ''}

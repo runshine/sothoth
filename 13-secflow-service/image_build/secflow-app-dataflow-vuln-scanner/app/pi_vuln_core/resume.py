@@ -44,10 +44,7 @@ logger = get_logger("resume")
 _CYCLE_RE = re.compile(r"cycle_(\d+)")
 _NODE_RESUME_POLICY = "rerun_current_node"
 _WORKER_REWORK_STEP_ORDER = (
-    "worker::rework_triage",
-    "worker::rework_fp_repair",
     "worker::rework_missed_hunt",
-    "worker::rework_handoff",
 )
 
 
@@ -256,7 +253,7 @@ def _build_resume_cursor(
 
 def _worker_checkpoint_step_key(checkpoint: dict[str, Any]) -> str:
     step_key = str(checkpoint.get("step_key") or "").strip()
-    if step_key in {"worker::work", "worker::rework", *_WORKER_REWORK_STEP_ORDER}:
+    if step_key in {"worker::work", "worker::rework", "worker::rework_fp_repair", *_WORKER_REWORK_STEP_ORDER}:
         return step_key
     extra = checkpoint.get("extra") if isinstance(checkpoint.get("extra"), dict) else {}
     prompt_kind = str(
@@ -279,6 +276,10 @@ def _next_node_after_checkpoint(
 ) -> tuple[str, str]:
     if source_phase == "worker":
         source_status = str(checkpoint.get("status") or "").strip()
+        if source_step_key in {"worker::rework_triage", "worker::rework_fp_repair"}:
+            return "worker", "worker::rework_missed_hunt"
+        if source_step_key == "worker::rework_handoff":
+            return "summary", "summary"
         if source_step_key in _WORKER_REWORK_STEP_ORDER:
             try:
                 index = _WORKER_REWORK_STEP_ORDER.index(source_step_key)
@@ -730,9 +731,6 @@ def rebuild_review_state(atomic_work_dir: str | Path) -> ReviewState:
                 )
                 if not cycle_passed:
                     state.record_global_failure(cycle, cycle_feedback)
-        if state.global_review_history:
-            state.rebuild_issue_ledger_from_history()
-
     results_root = Path(work_dir) / "reviews" / "results"
     if results_root.is_dir():
         for result_dir in sorted(p for p in results_root.iterdir() if p.is_dir()):
@@ -759,17 +757,34 @@ def rebuild_review_state(atomic_work_dir: str | Path) -> ReviewState:
                 or latest_record.get("feedback")
                 or ""
             )
-            if bool(latest_record.get("passed", False)):
-                state.mark_result_passed(
+            verdict = str(latest_record.get("verdict") or "").strip().upper()
+            confidence = float(latest_record.get("confidence") or 0.0)
+            if bool(latest_record.get("passed", False)) or verdict == "CONFIRMED":
+                state.mark_result_confirmed(
                     result_file,
                     latest_cycle,
                     current_fingerprints.get(result_file, ""),
+                    verdict="CONFIRMED",
+                    confidence=confidence,
+                    feedback=feedback,
+                )
+            elif verdict == "FALSE_POSITIVE":
+                state.mark_result_false_positive(
+                    result_file,
+                    latest_cycle,
+                    current_fingerprints.get(result_file, ""),
+                    verdict="FALSE_POSITIVE",
+                    confidence=confidence,
+                    feedback=feedback,
                 )
             else:
-                state.record_result_failures(
-                    [FailedResultItem(filename=result_file, reason=feedback)],
+                state.mark_result_pending(
+                    result_file,
                     latest_cycle,
-                    file_fingerprints=current_fingerprints,
+                    current_fingerprints.get(result_file, ""),
+                    verdict="",
+                    confidence=confidence,
+                    feedback=feedback,
                 )
 
     _restore_cycle_level_state(work_dir, state)

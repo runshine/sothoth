@@ -156,6 +156,7 @@ class PacketAwareRuntime(ScenarioRuntimeBase):
                     "verdict": "PASS",
                     "feedback": "direct review ok",
                     "scores": {
+                        "coverage": 1.0,
                         "input_coverage": 1.0,
                         "export_followthrough": 1.0,
                         "used_coverage": 1.0,
@@ -177,6 +178,7 @@ class PacketAwareRuntime(ScenarioRuntimeBase):
                 "verdict": "PASS",
                 "feedback": "default pass",
                 "scores": {
+                    "coverage": 1.0,
                     "input_coverage": 1.0,
                     "export_followthrough": 1.0,
                     "used_coverage": 1.0,
@@ -256,8 +258,8 @@ class FreezePassedRuntime(ScenarioRuntimeBase):
                 return json.dumps(
                     {
                         "passed": False,
-                        "verdict": "INSUFFICIENT_INFO",
-                        "feedback": "证据不足，需要重写",
+                        "verdict": "FALSE_POSITIVE",
+                        "feedback": "现有证据显示 result_002 是误报",
                         "scores": {"issue_truth": 0.2},
                         "confidence": 0.8,
                     },
@@ -281,6 +283,7 @@ class FreezePassedRuntime(ScenarioRuntimeBase):
                     "verdict": "FAIL",
                     "feedback": "全局覆盖仍未通过",
                     "scores": {
+                        "coverage": 0.70,
                         "input_coverage": 1.0,
                         "export_followthrough": 0.70,
                         "used_coverage": 1.0,
@@ -310,6 +313,7 @@ class FreezePassedRuntime(ScenarioRuntimeBase):
                 "verdict": "PASS",
                 "feedback": "default pass",
                 "scores": {
+                    "coverage": 1.0,
                     "input_coverage": 1.0,
                     "export_followthrough": 1.0,
                     "used_coverage": 1.0,
@@ -380,6 +384,7 @@ class MixedGlobalIssueRuntime(ScenarioRuntimeBase):
                         "verdict": "FAIL",
                         "feedback": "混合问题：需要 worker 继续跟入，同时框架账本有轻微同步缺口",
                         "scores": {
+                            "coverage": 0.70,
                             "input_coverage": 1.0,
                             "export_followthrough": 0.70,
                             "used_coverage": 1.0,
@@ -400,7 +405,7 @@ class MixedGlobalIssueRuntime(ScenarioRuntimeBase):
                                 "actionable_by": "worker",
                             },
                             {
-                                "id": "ledger-sync-note",
+                                "id": "manifest-sync-note",
                                 "category": "metadata_sync",
                                 "target": "_meta/result_relations.json",
                                 "severity": "low",
@@ -420,6 +425,7 @@ class MixedGlobalIssueRuntime(ScenarioRuntimeBase):
                     "verdict": "PASS",
                     "feedback": "global ok after rework",
                     "scores": {
+                        "coverage": 1.0,
                         "input_coverage": 1.0,
                         "export_followthrough": 1.0,
                         "used_coverage": 1.0,
@@ -441,6 +447,7 @@ class MixedGlobalIssueRuntime(ScenarioRuntimeBase):
                 "verdict": "PASS",
                 "feedback": "default pass",
                 "scores": {
+                    "coverage": 1.0,
                     "input_coverage": 1.0,
                     "export_followthrough": 1.0,
                     "used_coverage": 1.0,
@@ -510,6 +517,7 @@ class PlateauRuntime(ScenarioRuntimeBase):
                     "verdict": "FAIL",
                     "feedback": "EXPORT 跟入没有改善",
                     "scores": {
+                        "coverage": 0.50,
                         "input_coverage": 1.0,
                         "export_followthrough": 0.50,
                         "used_coverage": 1.0,
@@ -539,6 +547,7 @@ class PlateauRuntime(ScenarioRuntimeBase):
                 "verdict": "PASS",
                 "feedback": "default pass",
                 "scores": {
+                    "coverage": 1.0,
                     "input_coverage": 1.0,
                     "export_followthrough": 1.0,
                     "used_coverage": 1.0,
@@ -656,15 +665,17 @@ async def test_result_review_still_runs_when_global_review_fails_and_freezes_pas
 
     assert cycle_001["outcome"] == "global_failed"
     assert cycle_001["result_review"]["passed_files"] == ["result_001.md"]
-    assert cycle_001["result_review"]["failed_files"][0]["filename"] == "result_002.md"
+    assert cycle_001["result_review"]["failed_files"] == []
+    assert cycle_001["result_review"]["vulnerability_status"]["false_positive_files"] == ["result_002.md"]
 
     assert cycle_002["outcome"] == "global_failed"
-    assert sorted(cycle_002["result_review"]["passed_files"]) == ["result_001.md", "result_002.md"]
+    assert sorted(cycle_002["result_review"]["passed_files"]) == ["result_001.md", "result_003.md"]
+    assert cycle_002["result_review"]["vulnerability_status"]["false_positive_files"] == ["result_002.md"]
 
     assert state["result_review_calls"] == [
         "result_001.md",
         "result_002.md",
-        "result_002.md",
+        "result_003.md",
     ]
     assert any("result_001.md" in msg and "已通过评审的结果" in msg for msg in state["worker_messages"])
 
@@ -782,227 +793,7 @@ def test_plateau_detection_uses_scores_key_for_score_stagnation(tmp_path: Path) 
     assert first["reason"]
 
 
-def test_repeated_issue_triggers_closure_even_with_small_score_gain(tmp_path: Path) -> None:
-    engine = object.__new__(AtomicWorkflowEngine)
-    ctx = WorkflowContext(
-        workflow_id="wf",
-        task_id="task",
-        task_file=str(tmp_path / "task.md"),
-        working_dir=str(tmp_path),
-        cycle=2,
-    )
-    review_state = ReviewState()
-    issue = {
-        "id": "CMP-ppldm-slot0",
-        "category": "coverage_gap",
-        "target": "PP/LDM slot-0",
-        "required_action": "查证 control-info production chain",
-        "actionable_by": "worker",
-    }
-    status_1 = review_state.update_issue_ledger(cycle=1, issues=[issue])
-    status_2 = review_state.update_issue_ledger(cycle=2, issues=[issue])
-    common = {
-        "global_passed": False,
-        "failed_result_count": 0,
-        "passed_result_count": 1,
-        "current_failed_result_files": [],
-        "result_fingerprint_digest": "same",
-        "result_files": ["result_001.md"],
-        "total_results": 1,
-        "historical_removed_result_count": 0,
-        "unreviewed_new_result_count": 0,
-        "global_failure_scope": "analysis",
-        "summary_fingerprint": "summary",
-        "summary_size": 100,
-        "supporting_docs_fingerprint": "docs",
-        "supporting_docs_count": 1,
-    }
-    metrics = [
-        {
-            **common,
-            "cycle": 1,
-            "scores": {"export_followthrough": 0.60},
-            "issue_ledger_status": status_1,
-        },
-        {
-            **common,
-            "cycle": 2,
-            "scores": {"export_followthrough": 0.65},
-            "issue_ledger_status": status_2,
-        },
-    ]
-
-    status = engine._update_plateau_state(
-        ctx=ctx,
-        review_state=review_state,
-        metrics_history=metrics,
-    )
-
-    assert status["same_issue_repeated"] is True
-    assert status["workflow_mode"] == "closure"
-    assert review_state.workflow_mode == "closure"
-
-
-def test_repeated_issue_over_budget_aborts_after_one_closure_cycle(tmp_path: Path) -> None:
-    engine = object.__new__(AtomicWorkflowEngine)
-    ctx = WorkflowContext(
-        workflow_id="wf",
-        task_id="task",
-        task_file=str(tmp_path / "task.md"),
-        working_dir=str(tmp_path),
-        cycle=3,
-        review_mode="closure",
-        plateau_streak=1,
-    )
-    review_state = ReviewState()
-    review_state.activate_closure_mode(2, "repeated issue")
-    issue = {
-        "id": "CMP-ppldm-slot0",
-        "category": "coverage_gap",
-        "target": "PP/LDM slot-0",
-        "required_action": "查证 control-info production chain",
-        "actionable_by": "worker",
-    }
-    statuses = [
-        review_state.update_issue_ledger(cycle=1, issues=[issue]),
-        review_state.update_issue_ledger(cycle=2, issues=[issue]),
-        review_state.update_issue_ledger(cycle=3, issues=[issue]),
-    ]
-    common = {
-        "global_passed": False,
-        "failed_result_count": 0,
-        "passed_result_count": 1,
-        "current_failed_result_files": [],
-        "result_fingerprint_digest": "same",
-        "result_files": ["result_001.md"],
-        "total_results": 1,
-        "historical_removed_result_count": 0,
-        "unreviewed_new_result_count": 0,
-        "global_failure_scope": "analysis",
-        "summary_fingerprint": "summary",
-        "summary_size": 100,
-        "supporting_docs_fingerprint": "docs",
-        "supporting_docs_count": 1,
-    }
-    metrics = [
-        {**common, "cycle": 1, "scores": {"export_followthrough": 0.60}, "issue_ledger_status": statuses[0]},
-        {**common, "cycle": 2, "scores": {"export_followthrough": 0.62}, "issue_ledger_status": statuses[1]},
-        {**common, "cycle": 3, "scores": {"export_followthrough": 0.64}, "issue_ledger_status": statuses[2]},
-    ]
-
-    status = engine._update_plateau_state(
-        ctx=ctx,
-        review_state=review_state,
-        metrics_history=metrics,
-    )
-
-    assert status["abort"] is True
-    assert status["same_issue_over_budget"] is True
-
-
-def test_issue_churn_enters_closure_when_results_are_stable(tmp_path: Path) -> None:
-    engine = object.__new__(AtomicWorkflowEngine)
-    ctx = WorkflowContext(
-        workflow_id="wf",
-        task_id="task",
-        task_file=str(tmp_path / "task.md"),
-        working_dir=str(tmp_path),
-        cycle=2,
-    )
-    review_state = ReviewState()
-    issue_1 = {
-        "id": "CMP-export-a",
-        "category": "coverage_gap",
-        "target": "EXPORT_A",
-        "required_action": "补齐 EXPORT_A",
-        "actionable_by": "summary",
-    }
-    issue_2 = {
-        "id": "CMP-export-b",
-        "category": "coverage_gap",
-        "target": "EXPORT_B",
-        "required_action": "补齐 EXPORT_B",
-        "actionable_by": "summary",
-    }
-    status_1 = review_state.update_issue_ledger(cycle=1, issues=[issue_1])
-    status_2 = review_state.update_issue_ledger(cycle=2, issues=[issue_2])
-    common = {
-        "global_passed": False,
-        "failed_result_count": 0,
-        "passed_result_count": 2,
-        "current_failed_result_files": [],
-        "result_fingerprint_digest": "same",
-        "result_files": ["result_001.md", "result_002.md"],
-        "total_results": 2,
-        "historical_removed_result_count": 0,
-        "unreviewed_new_result_count": 0,
-        "global_failure_scope": "summary_or_ledger",
-        "summary_fingerprint": "summary-a",
-        "summary_size": 100,
-        "supporting_docs_fingerprint": "docs-a",
-        "supporting_docs_count": 1,
-    }
-    metrics = [
-        {
-            **common,
-            "cycle": 1,
-            "scores": {"report_completeness": 0.74},
-            "issue_ledger_status": status_1,
-        },
-        {
-            **common,
-            "cycle": 2,
-            "summary_fingerprint": "summary-b",
-            "supporting_docs_fingerprint": "docs-b",
-            "scores": {"report_completeness": 0.79},
-            "issue_ledger_status": status_2,
-        },
-    ]
-
-    status = engine._update_plateau_state(
-        ctx=ctx,
-        review_state=review_state,
-        metrics_history=metrics,
-    )
-
-    assert status["issue_churn_detected"] is True
-    assert status["workflow_mode"] == "closure"
-    assert review_state.workflow_mode == "closure"
-
-
-def _summary_churn_metrics(review_state: ReviewState) -> list[dict]:
-    statuses = [
-        review_state.update_issue_ledger(
-            cycle=1,
-            issues=[{
-                "id": "SUM-a",
-                "category": "summary_sync",
-                "target": "summary.md",
-                "required_action": "同步 A",
-                "actionable_by": "summary",
-            }],
-        ),
-        review_state.update_issue_ledger(
-            cycle=2,
-            issues=[{
-                "id": "SUM-b",
-                "category": "summary_sync",
-                "target": "coverage_ledger.json",
-                "required_action": "同步 B",
-                "actionable_by": "summary",
-            }],
-        ),
-        review_state.update_issue_ledger(
-            cycle=3,
-            issues=[{
-                "id": "SUM-c",
-                "category": "summary_sync",
-                "target": "issue_ledger.json",
-                "required_action": "同步 C",
-                "actionable_by": "summary",
-            }],
-        ),
-    ]
+def _summary_stale_metrics() -> list[dict]:
     common = {
         "global_passed": False,
         "failed_result_count": 0,
@@ -1013,62 +804,50 @@ def _summary_churn_metrics(review_state: ReviewState) -> list[dict]:
         "total_results": 7,
         "historical_removed_result_count": 0,
         "unreviewed_new_result_count": 0,
-        "global_failure_scope": "summary_or_ledger",
+        "global_failure_scope": "summary_doc",
         "summary_size": 100,
         "supporting_docs_count": 3,
+        "summary_fingerprint": "summary-a",
+        "supporting_docs_fingerprint": "docs-a",
     }
     return [
         {
             **common,
             "cycle": 1,
             "scores": {"report_completeness": 0.40},
-            "summary_fingerprint": "summary-a",
-            "supporting_docs_fingerprint": "docs-a",
-            "issue_ledger_status": statuses[0],
         },
         {
             **common,
             "cycle": 2,
-            "scores": {"report_completeness": 0.45},
-            "summary_fingerprint": "summary-b",
-            "supporting_docs_fingerprint": "docs-b",
-            "issue_ledger_status": statuses[1],
-        },
-        {
-            **common,
-            "cycle": 3,
-            "scores": {"report_completeness": 0.50},
-            "summary_fingerprint": "summary-c",
-            "supporting_docs_fingerprint": "docs-c",
-            "issue_ledger_status": statuses[2],
+            "scores": {"report_completeness": 0.41},
         },
     ]
 
 
-def test_summary_repair_gets_attempt_before_issue_churn_abort(tmp_path: Path) -> None:
+def test_summary_repair_gets_attempt_before_plateau_abort(tmp_path: Path) -> None:
     engine = object.__new__(AtomicWorkflowEngine)
     ctx = WorkflowContext(
         workflow_id="wf",
         task_id="task",
         task_file=str(tmp_path / "task.md"),
         working_dir=str(tmp_path),
-        cycle=3,
+        cycle=2,
         review_mode="closure",
+        plateau_streak=2,
         summary_repair_attempts=0,
     )
     review_state = ReviewState()
-    review_state.activate_closure_mode(2, "summary/ledger sync")
+    review_state.activate_closure_mode(2, "summary sync")
 
     status = engine._update_plateau_state(
         ctx=ctx,
         review_state=review_state,
-        metrics_history=_summary_churn_metrics(review_state),
+        metrics_history=_summary_stale_metrics(),
     )
 
-    assert status["issue_churn_over_budget"] is True
     assert status["summary_repair_deferred_abort"] is True
     assert status["abort"] is False
-    assert "summary/ledger repair pending" in status["reason"]
+    assert "summary repair pending" in status["reason"]
 
 
 def test_summary_repair_budget_exhaustion_aborts_with_clear_reason(tmp_path: Path) -> None:
@@ -1078,23 +857,24 @@ def test_summary_repair_budget_exhaustion_aborts_with_clear_reason(tmp_path: Pat
         task_id="task",
         task_file=str(tmp_path / "task.md"),
         working_dir=str(tmp_path),
-        cycle=3,
+        cycle=2,
         review_mode="closure",
+        plateau_streak=2,
         summary_repair_attempts=2,
     )
     review_state = ReviewState()
-    review_state.activate_closure_mode(2, "summary/ledger sync")
+    review_state.activate_closure_mode(2, "summary sync")
 
     status = engine._update_plateau_state(
         ctx=ctx,
         review_state=review_state,
-        metrics_history=_summary_churn_metrics(review_state),
+        metrics_history=_summary_stale_metrics(),
     )
 
     assert status["abort"] is True
     assert status["terminal_status"] == "summary_incomplete"
     assert "0 个连续 cycle" not in status["reason"]
-    assert "全局评审 issue" in status["reason"]
+    assert "summary.md 未变化" in status["reason"]
 
 
 def test_terminal_status_classifies_runtime_timeout() -> None:

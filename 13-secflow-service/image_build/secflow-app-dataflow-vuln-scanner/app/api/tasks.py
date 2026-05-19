@@ -47,7 +47,8 @@ async def get_capabilities(subject=Depends(get_current_subject)):
         "service": "secflow-app-dataflow-vuln-scanner",
         "task_input_modes": task_input_modes,
         "required_inputs": ["data_flow", "source_dir"],
-        "data_flow_file_types": [".md", ".txt"],
+        "data_flow_input_kind": "directory",
+        "data_flow_directory_file_types": [".md", ".txt"],
         "source_file_types": [".c", ".h", ".cpp", ".hpp", ".cc", ".asm", ".S", ".s"],
         "models": [
             "icsl/zai-org/GLM-5",

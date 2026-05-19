@@ -17,7 +17,7 @@ class ResultReviewParseOutcome:
     needs_repair: bool = False
 
 
-_ALLOWED_CANONICAL_VERDICTS = {"CONFIRMED", "FALSE_POSITIVE", "INSUFFICIENT_INFO"}
+_ALLOWED_CANONICAL_VERDICTS = {"CONFIRMED", "FALSE_POSITIVE"}
 
 _CONFIDENCE_MAP = {
     "very_high": 0.95,
@@ -109,8 +109,8 @@ def parse_result_review_response(content: str) -> ResultReviewParseOutcome:
     if not raw:
         parsed = ParsedReviewResult(
             passed=False,
-            verdict="INSUFFICIENT_INFO",
-            feedback="INSUFFICIENT_INFO（证据不足） - 结果评审返回空响应",
+            verdict="",
+            feedback="结果评审返回空响应",
             feedback_detail="结果评审返回空响应",
             confidence=0.0,
             raw_content=content or "",
@@ -151,10 +151,28 @@ def parse_result_review_response(content: str) -> ResultReviewParseOutcome:
             needs_repair=True,
         )
 
+    if _contains_disallowed_inconclusive_signal(raw):
+        reason = "结果评审 verdict 只能是 CONFIRMED 或 FALSE_POSITIVE，不能使用 INSUFFICIENT_INFO/UNVERIFIED/无法确认"
+        parsed = ParsedReviewResult(
+            passed=False,
+            verdict="",
+            feedback=reason,
+            feedback_detail=raw,
+            confidence=_extract_confidence_from_text(raw),
+            raw_content=raw,
+        )
+        return ResultReviewParseOutcome(
+            parsed=parsed,
+            schema_valid=False,
+            parser_mode="invalid_inconclusive_verdict",
+            repair_reason=reason,
+            needs_repair=True,
+        )
+
     parsed = ParsedReviewResult(
         passed=False,
-        verdict="INSUFFICIENT_INFO",
-        feedback="INSUFFICIENT_INFO（证据不足） - 结果评审未返回可判定的标准 JSON",
+        verdict="",
+        feedback="结果评审未返回可判定的标准 JSON",
         feedback_detail="结果评审未返回可判定的标准 JSON",
         confidence=0.0,
         raw_content=raw,
@@ -182,9 +200,9 @@ def _parse_result_review_dict(
     if signal is None:
         signal = _truth_signal_from_explicit_passed(data)
     if signal is None:
-        signal = (False, "INSUFFICIENT_INFO")
+        signal = (False, "FALSE_POSITIVE")
         if not schema_reason:
-            schema_reason = "缺少可判定 truth verdict"
+            schema_reason = "缺少可判定 truth verdict，必须二选一输出 CONFIRMED 或 FALSE_POSITIVE"
 
     feedback_detail = _extract_feedback(data)
     if not feedback_detail:
@@ -264,7 +282,7 @@ def _is_canonical_result_review_dict(data: dict[str, Any]) -> tuple[bool, str]:
 
     verdict = str(data.get("verdict") or "").strip().upper()
     if verdict not in _ALLOWED_CANONICAL_VERDICTS:
-        return False, f"顶层 verdict 非法: {verdict or '<empty>'}"
+        return False, f"顶层 verdict 非法: {verdict or '<empty>'}；只能是 CONFIRMED 或 FALSE_POSITIVE"
 
     if not isinstance(data.get("feedback"), str) or not str(data.get("feedback")).strip():
         return False, "顶层 feedback 不能为空字符串"
@@ -289,8 +307,8 @@ def _is_canonical_result_review_dict(data: dict[str, Any]) -> tuple[bool, str]:
 
     if passed and verdict != "CONFIRMED":
         return False, "passed=true 时 verdict 必须为 CONFIRMED"
-    if not passed and verdict == "CONFIRMED":
-        return False, "passed=false 时 verdict 不能为 CONFIRMED"
+    if not passed and verdict != "FALSE_POSITIVE":
+        return False, "passed=false 时 verdict 必须为 FALSE_POSITIVE"
     return True, ""
 
 
@@ -303,8 +321,6 @@ def _should_repair_noncanonical_dict(
         return False
     if explicit_passed is False:
         if _has_explicit_verdict_signal(data, (False, "FALSE_POSITIVE")):
-            return False
-        if _has_explicit_verdict_signal(data, (False, "INSUFFICIENT_INFO")):
             return False
         return True
 
@@ -380,7 +396,7 @@ def _truth_signal_from_explicit_passed(data: dict[str, Any]) -> tuple[bool, str]
         bool_value = _coerce_bool(data.get(key))
         if bool_value is None:
             continue
-        verdict = "CONFIRMED" if bool_value else "INSUFFICIENT_INFO"
+        verdict = "CONFIRMED" if bool_value else "FALSE_POSITIVE"
         top_level_verdict = _truth_signal_from_text_value(data.get("verdict"))
         if top_level_verdict is not None:
             return top_level_verdict
@@ -401,8 +417,6 @@ def _truth_signal_from_text(text: str) -> tuple[bool, str] | None:
 
     if _matches_any(low, _FALSE_POSITIVE_PATTERNS):
         return False, "FALSE_POSITIVE"
-    if _matches_any(low, _INSUFFICIENT_INFO_PATTERNS):
-        return False, "INSUFFICIENT_INFO"
     if _matches_any(low, _PARTIAL_BUT_REAL_PATTERNS):
         return True, "CONFIRMED"
     if _matches_any(low, _CONFIRMED_PATTERNS):
@@ -414,6 +428,10 @@ def _truth_signal_from_text(text: str) -> tuple[bool, str] | None:
 
 def _matches_any(text: str, patterns: list[str]) -> bool:
     return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
+
+
+def _contains_disallowed_inconclusive_signal(text: str) -> bool:
+    return _matches_any(text.strip().lower(), _INSUFFICIENT_INFO_PATTERNS)
 
 
 def _canonicalize_verdict(verdict: str) -> str:
@@ -545,14 +563,13 @@ def _summarize_signal(verdict: str) -> str:
         return "底层问题真实存在"
     if verdict == "FALSE_POSITIVE":
         return "该报告属于误报"
-    return "无法确认底层问题是否真实存在"
+    return "必须二选一确认底层问题是否真实存在"
 
 
 def _format_feedback(verdict: str, detail: str) -> str:
     summary = {
         "CONFIRMED": "CONFIRMED（已确认）",
         "FALSE_POSITIVE": "FALSE_POSITIVE（误报）",
-        "INSUFFICIENT_INFO": "INSUFFICIENT_INFO（证据不足）",
     }.get(verdict, verdict)
     detail = re.sub(r"\s+", " ", (detail or "")).strip()
     if not detail:

@@ -40,7 +40,7 @@ def test_review_profiles_have_monotonic_execution_budgets() -> None:
     assert [fast.advisor_max_internal_turns, balanced.advisor_max_internal_turns, audit.advisor_max_internal_turns] == [0, 0, 0]
     assert fast.advisor_rpc_stdout_trace_bytes < balanced.advisor_rpc_stdout_trace_bytes < audit.advisor_rpc_stdout_trace_bytes
     assert [fast.advisor_rpc_stdout_abort_bytes, balanced.advisor_rpc_stdout_abort_bytes, audit.advisor_rpc_stdout_abort_bytes] == [0, 0, 0]
-    assert [fast.reflection_passes_per_cycle, balanced.reflection_passes_per_cycle, audit.reflection_passes_per_cycle] == [0, 1, 1]
+    assert [fast.reflection_passes_per_cycle, balanced.reflection_passes_per_cycle, audit.reflection_passes_per_cycle] == [1, 1, 1]
     assert [fast.reflection_max_internal_turns, balanced.reflection_max_internal_turns, audit.reflection_max_internal_turns] == [0, 0, 0]
     assert fast.reflection_rpc_stdout_trace_bytes < balanced.reflection_rpc_stdout_trace_bytes < audit.reflection_rpc_stdout_trace_bytes
     assert [fast.reflection_rpc_stdout_abort_bytes, balanced.reflection_rpc_stdout_abort_bytes, audit.reflection_rpc_stdout_abort_bytes] == [0, 0, 0]
@@ -70,9 +70,9 @@ def test_review_profiles_have_monotonic_score_gates() -> None:
     balanced_cmp = get_review_score_threshold_policy("balanced", "global_completeness")
     audit_cmp = get_review_score_threshold_policy("audit", "global_completeness")
     assert (
-        fast_cmp.score_thresholds["export_followthrough"]
-        < balanced_cmp.score_thresholds["export_followthrough"]
-        <= audit_cmp.score_thresholds["export_followthrough"]
+        fast_cmp.score_thresholds["coverage"]
+        < balanced_cmp.score_thresholds["coverage"]
+        <= audit_cmp.score_thresholds["coverage"]
     )
     assert (
         fast_cmp.score_threshold_ramp_cycles
@@ -275,7 +275,8 @@ def test_profile_template_compilation_applies_score_gates() -> None:
     global_reviews = config["workflows"]["atomic"][0]["roles"]["advisors"]["global_review"]
     completeness = next(item for item in global_reviews if item["instance_id"] == "global_completeness")
     depth = next(item for item in global_reviews if item["instance_id"] == "global_depth")
-    assert completeness["score_thresholds"]["export_followthrough"] == 1.00
+    assert completeness["score_fields"] == ["coverage"]
+    assert completeness["score_thresholds"]["coverage"] == 1.00
     assert completeness["score_threshold_ramp_cycles"] == 8
     assert depth["score_thresholds"]["code_evidence_depth"] == 0.95
     assert config["agents"][0]["runtime_config"]["rpc_stdout_abort_bytes"] == get_review_profile_policy("audit").worker_rpc_stdout_abort_bytes
@@ -329,6 +330,7 @@ def test_profile_template_compilation_syncs_review_cycles_to_engine() -> None:
     assert engine["review_profile"] == "fast"
     assert engine["review_enabled"] is False
     assert engine["max_review_cycles"] == 1
+    assert engine["reflection_passes_per_cycle"] == 1
 
 
 def test_profile_template_runtime_global_cycles_reach_engine() -> None:
@@ -450,7 +452,7 @@ def test_worker_reflection_stdout_abort_is_disabled_by_profile_even_for_stale_co
     assert limits["rpc_stdout_abort_bytes"] == 0
 
 
-def test_profile_gate_requires_artifacts_and_pattern_family_evidence(tmp_path) -> None:
+def test_profile_gate_no_longer_requires_framework_artifacts(tmp_path) -> None:
     work_dir = tmp_path / "work"
     (work_dir / "_meta").mkdir(parents=True)
     (work_dir / "results").mkdir()
@@ -459,36 +461,13 @@ def test_profile_gate_requires_artifacts_and_pattern_family_evidence(tmp_path) -
         "# Summary\n\n只记录了内存安全和整数溢出，缺少其余模式族。\n",
         encoding="utf-8",
     )
-    (work_dir / "_meta" / "coverage_ledger.json").write_text(
-        json.dumps({
-            "coverage_obligations": {
-                "total": 1,
-                "entries": [{
-                    "id": "USED:test",
-                    "kind": "used",
-                    "risk": "low",
-                    "status": "documented",
-                    "documented": True,
-                    "evidence_sources": ["supporting_docs/evidence_1.md"],
-                }],
-                "open_entries": [],
-                "quality": {
-                    "declared_counts": {},
-                    "declared_total": 1,
-                    "extracted_total": 1,
-                },
-            },
-        }),
-        encoding="utf-8",
-    )
 
     issues = GlobalReviewExecutor._profile_gate_issues(
         work_dir=str(work_dir),
         review_profile="audit",
     )
 
-    assert any(item["blocking_type"] == "profile_evidence_floor" for item in issues)
-    assert any(item["blocking_type"] == "profile_pattern_family_gap" for item in issues)
+    assert issues == []
 
 
 def test_profile_gate_accepts_required_pattern_family_evidence(tmp_path) -> None:
@@ -506,28 +485,6 @@ def test_profile_gate_accepts_required_pattern_family_evidence(tmp_path) -> None
             "源码级负面证据：边界值、状态机、资源释放与 race/timing not_applicable。\n",
             encoding="utf-8",
         )
-    (work_dir / "_meta" / "coverage_ledger.json").write_text(
-        json.dumps({
-            "coverage_obligations": {
-                "total": 1,
-                "entries": [{
-                    "id": "USED:test",
-                    "kind": "used",
-                    "risk": "low",
-                    "status": "documented",
-                    "documented": True,
-                    "evidence_sources": ["supporting_docs/evidence_1.md"],
-                }],
-                "open_entries": [],
-                "quality": {
-                    "declared_counts": {},
-                    "declared_total": 1,
-                    "extracted_total": 1,
-                },
-            },
-        }),
-        encoding="utf-8",
-    )
 
     issues = GlobalReviewExecutor._profile_gate_issues(
         work_dir=str(work_dir),
@@ -608,6 +565,34 @@ def test_strict_input_maps_to_audit_depth_budget() -> None:
         global_passed=True,
         global_feedback="",
         result_passed=True,
+    )
+
+    assert passed is True
+    assert feedback == ""
+
+
+def test_profile_min_discovery_gate_ignores_result_review_business_status() -> None:
+    atomic = object.__new__(AtomicWorkflowEngine)
+    atomic.wf = type(
+        "WF",
+        (),
+        {"engine": EngineConfig(review_profile="balanced", min_discovery_cycles_before_pass=1)},
+    )()
+    ctx = WorkflowContext(
+        workflow_id="wf",
+        task_id="task",
+        task_file="task.md",
+        working_dir="/tmp/work",
+        review_profile="balanced",
+    )
+
+    passed, feedback = atomic._apply_profile_min_discovery_gate(
+        ctx=ctx,
+        review_state=ReviewState(),
+        cycle=1,
+        global_passed=True,
+        global_feedback="",
+        result_passed=False,
     )
 
     assert passed is True

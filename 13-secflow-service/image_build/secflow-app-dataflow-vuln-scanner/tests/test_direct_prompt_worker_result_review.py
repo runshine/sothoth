@@ -191,6 +191,7 @@ class DirectPromptRuntime(BaseAgentRuntime):
                     "verdict": "FAIL",
                     "feedback": "需要继续跟入 EXPORT 链",
                     "scores": {
+                        "coverage": 0.5,
                         "input_coverage": 1.0,
                         "export_followthrough": 0.5,
                         "used_coverage": 1.0,
@@ -220,6 +221,7 @@ class DirectPromptRuntime(BaseAgentRuntime):
                 "verdict": "PASS",
                 "feedback": "issue 已关闭",
                 "scores": {
+                    "coverage": 1.0,
                     "input_coverage": 1.0,
                     "export_followthrough": 1.0,
                     "used_coverage": 1.0,

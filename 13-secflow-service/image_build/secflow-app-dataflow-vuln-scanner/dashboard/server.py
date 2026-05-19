@@ -353,23 +353,18 @@ def _manifest_path_summary(atomic: Path, path: Path) -> dict[str, Any]:
 def _load_manifest_summary(atomic: Path) -> dict[str, Any]:
     result_relations_path = atomic / "_meta" / "result_relations_manifest.json"
     results_manifest_path = atomic / "_meta" / "results_manifest.json"
-    coverage_ledger_path = atomic / "_meta" / "coverage_ledger.json"
 
     relations = _read_json(result_relations_path)
     results_manifest = _read_json(results_manifest_path)
-    coverage_ledger = _read_json(coverage_ledger_path)
     return {
         "result_relations_manifest": _manifest_path_summary(atomic, result_relations_path),
         "results_manifest": _manifest_path_summary(atomic, results_manifest_path),
-        "coverage_ledger": _manifest_path_summary(atomic, coverage_ledger_path),
         "total_result_files": results_manifest.get("total_result_files", len(relations.get("all_results", []))),
         "active_result_count": results_manifest.get("active_result_count", 0),
         "inactive_result_count": results_manifest.get("inactive_result_count", len(relations.get("inactive_results", []))),
         "taskable_result_count": results_manifest.get("taskable_result_count", len(relations.get("taskable_results", []))),
         "supplemental_result_count": results_manifest.get("supplemental_result_count", len(relations.get("supplemental_results", []))),
         "excluded_result_count": len(results_manifest.get("excluded_results", relations.get("excluded_results", [])) or []),
-        "missing_referenced_results": coverage_ledger.get("missing_referenced_results", []),
-        "unreferenced_active_results": coverage_ledger.get("unreferenced_active_results", []),
     }
 
 
@@ -1070,7 +1065,6 @@ def list_files(name: str, limit: int = Query(default=1200, le=5000)):
         add(atomic / "_meta" / "abnormal_exit.json", atomic, "Meta")
         add(atomic / "_meta" / "result_relations_manifest.json", atomic, "Meta / Result Manifests")
         add(atomic / "_meta" / "results_manifest.json", atomic, "Meta / Result Manifests")
-        add(atomic / "_meta" / "coverage_ledger.json", atomic, "Meta / Result Manifests")
         add(atomic / "_meta" / "checkpoints" / "current_step.json", atomic, "Meta / Checkpoints")
         add_glob(atomic / "_meta" / "checkpoints" / "steps", "cycle_*/*/*.json", atomic, "Meta / Checkpoints")
         add_glob(atomic / "_meta" / "reflections", "*.json", atomic, "Meta / Reflections")

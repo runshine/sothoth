@@ -38,6 +38,16 @@ from app.pi_vuln_core.utils.result_docs import (
     collect_multi_finding_result_reports,
     list_result_report_files,
 )
+from app.pi_vuln_core.utils.vulnerability_list import (
+    STATUS_CONFIRMED,
+    STATUS_FALSE_POSITIVE,
+    STATUS_PENDING,
+    confirmed_result_files,
+    false_positive_result_files,
+    pending_result_files,
+    status_counts,
+    sync_vulnerability_list_from_results,
+)
 from app.pi_vuln_core.utils.visual_log import vlog
 
 logger = get_logger("atomic_engine")
@@ -373,9 +383,9 @@ class AtomicWorkflowEngine:
         cycle: int,
         global_passed: bool,
         global_feedback: str,
-        result_passed: bool,
+        result_passed: bool | None = None,
     ) -> tuple[bool, str]:
-        if not global_passed or not result_passed:
+        if not global_passed:
             return global_passed, global_feedback
 
         policy = get_review_profile_policy(ctx.review_profile)
@@ -395,7 +405,7 @@ class AtomicWorkflowEngine:
                 f"下一轮必须按本档目标继续深挖：{policy.execution_goal}"
             ),
             "detail": (
-                f"本轮全局评审和结果评审已通过，但 profile execution policy "
+                f"本轮全局评审已通过，但 profile execution policy "
                 f"要求继续执行 {remaining} 个探索轮次，避免高档位过早停在低档结果。"
             ),
             "owner": "worker",
@@ -459,9 +469,6 @@ class AtomicWorkflowEngine:
         review_enabled = bool(getattr(self.wf.engine, "review_enabled", profile_policy.review_enabled)) and profile_policy.review_enabled
         if not review_enabled:
             total_cycle_limit = min(total_cycle_limit, 1)
-        if review_state.global_review_history and not review_state.issue_ledger:
-            review_state.rebuild_issue_ledger_from_history()
-
         phase_order = {
             AtomicWorkflowState.WORKER.value: 0,
             AtomicWorkflowState.REFLECT.value: 1,
@@ -555,7 +562,7 @@ class AtomicWorkflowEngine:
                 logger.info(
                     "summary_repair_skip_worker",
                     cycle=cycle,
-                    reason="summary_or_ledger repair uses summary stage only",
+                    reason="summary_doc repair uses summary stage only",
                 )
             else:
                 logger.info("resume_skip_worker", cycle=cycle, resume_state=cycle_resume_state)
@@ -589,7 +596,7 @@ class AtomicWorkflowEngine:
                 logger.info(
                     "summary_repair_skip_reflection",
                     cycle=cycle,
-                    reason="summary_or_ledger repair does not need discovery reflection",
+                    reason="summary_doc repair does not need discovery reflection",
                 )
             elif worker_partial_salvaged:
                 logger.info(
@@ -651,6 +658,12 @@ class AtomicWorkflowEngine:
 
                 # ── 4.5 结果粒度预检 ──
                 await self._precheck_result_granularity(ctx, review_state)
+                sync_vulnerability_list_from_results(
+                    working_dir=work_dir,
+                    results_dir=ctx.results_dir,
+                    summary_file=ctx.summary_file,
+                    cycle=cycle,
+                )
             else:
                 ctx.summary_file = ctx.summary_file or os.path.join(work_dir, "summary.md")
                 ctx.results_dir = ctx.results_dir or os.path.join(work_dir, "results")
@@ -771,7 +784,7 @@ class AtomicWorkflowEngine:
                 global_feedback[:100],
             )
 
-            # ── 6. 结果评审（即使 global review 不通过，也尽量冻结已通过结果，保证单调增长） ──
+            # ── 6. 结果评审（业务判定写入状态台账；框架级失败继续驱动修复） ──
             await self._transition_state(ctx, AtomicWorkflowState.RESULT_REVIEW)
             all_results = list_result_report_files(ctx.results_dir)
             current_fingerprints = calculate_result_fingerprints(ctx.results_dir)
@@ -784,7 +797,9 @@ class AtomicWorkflowEngine:
             vlog.result_review_start(cycle, len(all_results), len(pending))
 
             try:
-                result_passed, failed_items = await self.review_sched.run_result_review(
+                result_review_completed = True
+                result_review_error = ""
+                _result_review_passed, review_failed_items = await self.review_sched.run_result_review(
                     advisors_def=self.wf.roles.advisors,
                     task_file=ctx.task_file,
                     results_dir=ctx.results_dir,
@@ -799,13 +814,11 @@ class AtomicWorkflowEngine:
             except ResultReviewFrameworkError as exc:
                 error = f"结果评审框架错误：{exc}"
                 await self.recorder.record_warning(work_dir, error)
-                await self._transition_state(
-                    ctx,
-                    AtomicWorkflowState.FAILED,
-                    detail=error,
-                )
+                result_review_completed = False
+                result_review_error = error
+                review_failed_items = review_state.get_failed_results(all_results)
                 logger.error(
-                    "result_review_framework_error",
+                    "result_review_non_blocking_framework_error",
                     workflow_id=ctx.workflow_id,
                     task_id=ctx.task_id,
                     cycle=cycle,
@@ -813,12 +826,6 @@ class AtomicWorkflowEngine:
                     advisor_id=exc.advisor_id,
                     error_code=exc.error_code,
                     error=exc.reason,
-                )
-                return AtomicWorkflowResult(
-                    status=self._classify_terminal_status(error, default="review_error"),
-                    error=error,
-                    working_dir=ctx.working_dir,
-                    cycles_used=ctx.cycle,
                 )
 
             # 打印每个结果的评审情况
@@ -830,18 +837,28 @@ class AtomicWorkflowEngine:
                     reason = state.failure_reason[:80] if state else ""
                     vlog.result_review_item(f, False, reason)
 
-            passed_files = [
-                f for f in all_results
-                if review_state.is_result_passed(f, current_fingerprints.get(f))
-            ]
-            passed_count = len(passed_files)
-            failed_count = len(all_results) - passed_count
-            vlog.result_review_summary(passed_count, failed_count)
-
+            vulnerability_payload = sync_vulnerability_list_from_results(
+                working_dir=work_dir,
+                results_dir=ctx.results_dir,
+                summary_file=ctx.summary_file,
+                cycle=cycle,
+            )
+            vulnerability_counts = status_counts(vulnerability_payload)
+            confirmed_files = confirmed_result_files(vulnerability_payload)
+            false_positive_files = false_positive_result_files(vulnerability_payload, active_only=False)
+            pending_review_files = pending_result_files(vulnerability_payload)
+            passed_files = confirmed_files
+            by_filename = {}
+            for item in review_failed_items or []:
+                if item.filename in all_results:
+                    by_filename.setdefault(item.filename, item)
+            failed_items = sorted(by_filename.values(), key=lambda item: item.filename)
+            failed_count = len(failed_items)
             failed_dicts = [
-                {"filename": fi.filename, "reason": fi.reason}
-                for fi in failed_items
+                {"filename": item.filename, "reason": item.reason}
+                for item in failed_items
             ]
+            vlog.result_review_summary(len(confirmed_files), failed_count)
 
             global_passed, global_feedback = self._apply_profile_min_discovery_gate(
                 ctx=ctx,
@@ -849,15 +866,14 @@ class AtomicWorkflowEngine:
                 cycle=cycle,
                 global_passed=global_passed,
                 global_feedback=global_feedback,
-                result_passed=result_passed,
+                result_passed=None,
             )
             prelim_failure_scope = self._classify_global_failure_scope(review_state)
             summary_repair_routed = (
-                result_passed
-                and not global_passed
-                and prelim_failure_scope == "summary_or_ledger"
+                not global_passed
+                and prelim_failure_scope == "summary_doc"
             )
-            summary_repair_reason = "结果评审已通过，剩余问题集中在 summary/ledger 同步"
+            summary_repair_reason = "全局评审剩余问题集中在 summary 同步"
             if summary_repair_routed:
                 ctx.pending_summary_repair = True
                 ctx.review_mode = "closure"
@@ -874,8 +890,12 @@ class AtomicWorkflowEngine:
                 failed_items=failed_items,
                 failed_count=failed_count,
                 current_fingerprints=current_fingerprints,
+                vulnerability_status_counts=vulnerability_counts,
+                false_positive_files=false_positive_files,
+                pending_review_files=pending_review_files,
+                result_review_completed=result_review_completed,
+                result_review_error=result_review_error,
             )
-            ctx.issue_ledger_status = dict(cycle_metrics.get("issue_ledger_status") or {})
             cycle_metrics_history.append(cycle_metrics)
             plateau_status = self._update_plateau_state(
                 ctx=ctx,
@@ -888,7 +908,6 @@ class AtomicWorkflowEngine:
                 metrics=cycle_metrics,
                 plateau_status=plateau_status,
             )
-            self._write_issue_ledger(work_dir=work_dir, review_state=review_state)
             summary_issues = review_state.get_current_issue_records()
             if not summary_issues:
                 summary_issues = review_state.get_recent_issues(last_n=1)
@@ -905,27 +924,41 @@ class AtomicWorkflowEngine:
                 issues=summary_issues,
                 plateau_status=plateau_status,
                 global_advisor_results=global_advisor_results,
+                vulnerability_status={
+                    "counts": vulnerability_counts,
+                    "confirmed_files": confirmed_files,
+                    "false_positive_files": false_positive_files,
+                    "pending_review_files": pending_review_files,
+                    "review_completed": result_review_completed,
+                    "review_error": result_review_error,
+                },
             )
 
             if not global_passed:
                 review_state.record_global_failure(cycle, global_feedback)
-            if not result_passed:
-                review_state.record_result_failures(
-                    failed_items,
-                    cycle,
-                    file_fingerprints=current_fingerprints,
-                )
-                ctx.failed_result_items = failed_items
-            else:
-                ctx.failed_result_items = []
+            ctx.failed_result_items = list(failed_items)
 
-            if global_passed and result_passed:
+            if global_passed and failed_count == 0:
                 ctx.plateau_streak = 0
                 ctx.plateau_reason = ""
                 ctx.pending_summary_repair = False
                 ctx.summary_repair_attempts = 0
-                logger.info("all_reviews_passed", cycle=cycle, mode=ctx.review_mode)
+                logger.info(
+                    "global_reviews_passed_workflow_complete",
+                    cycle=cycle,
+                    mode=ctx.review_mode,
+                    result_review_completed=result_review_completed,
+                )
                 return None
+
+            if failed_count:
+                logger.info(
+                    "result_review_failed_retry",
+                    cycle=cycle,
+                    failed_count=failed_count,
+                    files=[item.filename for item in failed_items],
+                )
+                continue
 
             failure_scope = str(cycle_metrics.get("global_failure_scope") or "")
             if not global_passed and failure_scope == "framework":
@@ -985,40 +1018,24 @@ class AtomicWorkflowEngine:
                     mode=ctx.review_mode,
                     issues=0,
                 )
-            if not result_passed:
-                logger.info(
-                    "result_review_failed_retry",
-                    cycle=cycle,
-                    failed_count=len(failed_items),
-                    mode=ctx.review_mode,
-                )
-
         error = f"达到最大评审循环次数 {total_cycle_limit}，仍未通过评审"
         if cycle_metrics_history:
             last = cycle_metrics_history[-1]
             if (
                 not last.get("global_passed")
                 and int(last.get("failed_result_count") or 0) == 0
-                and last.get("global_failure_scope") == "summary_or_ledger"
+                and last.get("global_failure_scope") == "summary_doc"
             ):
-                error = (
-                    f"达到最大评审循环次数 {total_cycle_limit}，结果评审已通过，"
-                    "但 summary/ledger 同步仍未通过"
-                )
+                error = f"达到最大评审循环次数 {total_cycle_limit}，但 summary 同步仍未通过"
         await self.recorder.record_warning(work_dir, error)
         await self._transition_state(
             ctx,
             AtomicWorkflowState.FAILED,
             detail=error,
         )
-        terminal_status = "summary_incomplete" if "summary/ledger" in error else "failed"
+        terminal_status = "summary_incomplete" if "summary" in error else "failed"
         if cycle_metrics_history:
-            last_status = cycle_metrics_history[-1].get("issue_ledger_status") or {}
-            dominant_issue = last_status.get("dominant_issue") or None
-            plateau_like_status = self._classify_plateau_terminal_status(
-                cycle_metrics_history[-1],
-                dominant_issue,
-            )
+            plateau_like_status = self._classify_plateau_terminal_status(cycle_metrics_history[-1], None)
             if plateau_like_status != "review_plateau":
                 terminal_status = plateau_like_status
         return AtomicWorkflowResult(
@@ -1041,6 +1058,11 @@ class AtomicWorkflowEngine:
         failed_items: list,
         failed_count: int,
         current_fingerprints: dict[str, str] | None = None,
+        vulnerability_status_counts: dict[str, int] | None = None,
+        false_positive_files: list[str] | None = None,
+        pending_review_files: list[str] | None = None,
+        result_review_completed: bool = True,
+        result_review_error: str = "",
     ) -> dict:
         summary_size = 0
         summary_fingerprint = ""
@@ -1055,17 +1077,24 @@ class AtomicWorkflowEngine:
         if not current_issues:
             current_issues = review_state.get_recent_issues(last_n=1)
         current_failed_files = [item.filename for item in failed_items]
-        unreviewed_new_results = [
-            name for name in all_results
-            if name not in set(passed_files) and name not in set(current_failed_files)
-        ]
+        if pending_review_files is not None:
+            pending_set = set(pending_review_files)
+            current_failed_set = set(current_failed_files)
+            unreviewed_new_results = [
+                name for name in all_results
+                if name in pending_set and name not in current_failed_set
+            ]
+        else:
+            unreviewed_new_results = [
+                name for name in all_results
+                if name not in set(passed_files) and name not in set(current_failed_files)
+            ]
         historical_removed_result_count = self._count_removed_result_backups(ctx.working_dir)
         current_fingerprints = current_fingerprints or {}
         result_fingerprint_digest = self._result_fingerprint_digest(current_fingerprints)
         supporting_docs_dir = os.path.join(ctx.working_dir, "supporting_docs")
         supporting_docs_fingerprint = self._markdown_tree_digest(supporting_docs_dir)
         supporting_docs_count = self._count_markdown_files(supporting_docs_dir)
-        issue_ledger_status = review_state.get_issue_ledger_status()
         return {
             "cycle": cycle,
             "workflow_mode": ctx.review_mode,
@@ -1084,6 +1113,14 @@ class AtomicWorkflowEngine:
             "failed_result_count": failed_count,
             "current_failed_result_count": len(current_failed_files),
             "current_failed_result_files": current_failed_files,
+            "confirmed_result_count": int((vulnerability_status_counts or {}).get(STATUS_CONFIRMED, len(passed_files))),
+            "false_positive_result_count": int((vulnerability_status_counts or {}).get(STATUS_FALSE_POSITIVE, 0)),
+            "pending_review_result_count": int((vulnerability_status_counts or {}).get(STATUS_PENDING, 0)),
+            "false_positive_result_files": list(false_positive_files or []),
+            "pending_review_result_files": list(pending_review_files or []),
+            "vulnerability_status_counts": dict(vulnerability_status_counts or {}),
+            "result_review_completed": bool(result_review_completed),
+            "result_review_error": result_review_error,
             "historical_removed_result_count": historical_removed_result_count,
             "unreviewed_new_result_count": len(unreviewed_new_results),
             "unreviewed_new_result_files": unreviewed_new_results,
@@ -1093,8 +1130,6 @@ class AtomicWorkflowEngine:
             "summary_fingerprint": summary_fingerprint,
             "supporting_docs_count": supporting_docs_count,
             "supporting_docs_fingerprint": supporting_docs_fingerprint,
-            "issue_ledger_status": issue_ledger_status,
-            "issue_signatures": list(issue_ledger_status.get("repeated_signatures") or []),
         }
 
     @staticmethod
@@ -1108,7 +1143,7 @@ class AtomicWorkflowEngine:
                 key in {"limitations_honesty", "report_completeness"}
                 for key in scores
             ):
-                return "summary_or_ledger"
+                return "summary_doc"
             return "unknown"
         actionable = {
             str(item.get("actionable_by") or item.get("owner") or "").strip().lower()
@@ -1122,26 +1157,25 @@ class AtomicWorkflowEngine:
         }
         if actionable == {"framework"}:
             return "framework"
-        if issues and all(AtomicWorkflowEngine._is_summary_or_ledger_issue(item) for item in issues):
-            return "summary_or_ledger"
+        if issues and all(AtomicWorkflowEngine._is_summary_doc_issue(item) for item in issues):
+            return "summary_doc"
         if actionable:
-            if actionable <= {"report", "summary", "ledger"}:
-                return "summary_or_ledger"
+            if actionable <= {"report", "summary"}:
+                return "summary_doc"
             return "analysis"
         report_categories = {
             "report_completeness",
             "limitations_honesty",
             "summary",
-            "ledger",
             "metadata",
             "metadata_sync",
         }
         if categories and categories <= report_categories:
-            return "summary_or_ledger"
+            return "summary_doc"
         return "analysis"
 
     @staticmethod
-    def _is_summary_or_ledger_issue(issue: dict) -> bool:
+    def _is_summary_doc_issue(issue: dict) -> bool:
         owner = str(issue.get("actionable_by") or issue.get("owner") or "").strip().lower()
         category = str(issue.get("category") or "").strip().lower()
         blocking_type = str(issue.get("blocking_type") or issue.get("blocker_type") or "").strip().lower()
@@ -1160,32 +1194,21 @@ class AtomicWorkflowEngine:
         ).lower()
         summary_blocking_types = {
             "documentation_gap",
-            "ledger_sync",
             "metadata_sync",
             "summary_only_evidence",
             "format_gap",
             "report_completeness",
             "limitations_honesty",
         }
-        ledger_sync_markers = (
-            "coverage_ledger.json",
-            "issue_ledger.json",
-            "evidence_sources",
-            "status=documented",
-            "同步到 coverage_ledger",
-            "同步到 ledger",
-        )
-        has_ledger_sync_marker = any(marker in text for marker in ledger_sync_markers)
         security_markers = ("export", "used", "input", "sink", "源码", "函数", "漏洞", "cwe", "边界", "绕过")
-        if owner == "worker" and any(marker in text for marker in security_markers) and not has_ledger_sync_marker and blocking_type not in summary_blocking_types:
+        if owner == "worker" and any(marker in text for marker in security_markers) and blocking_type not in summary_blocking_types:
             return False
-        if owner in {"report", "summary", "ledger"}:
+        if owner in {"report", "summary"}:
             return True
         if category in {
             "report_completeness",
             "limitations_honesty",
             "summary",
-            "ledger",
             "metadata",
             "metadata_sync",
             "format",
@@ -1194,7 +1217,7 @@ class AtomicWorkflowEngine:
             return True
         if blocking_type in summary_blocking_types:
             return True
-        return has_ledger_sync_marker
+        return False
 
     @staticmethod
     def _result_fingerprint_digest(fingerprints: dict[str, str]) -> str:
@@ -1280,13 +1303,7 @@ class AtomicWorkflowEngine:
             "progress_no_signal_abort_streak",
             profile_policy.progress_no_signal_abort_streak,
         )
-        same_issue_stagnation_threshold = cfg_int("same_issue_stagnation_threshold", 2)
-        same_issue_abort_threshold = cfg_int("same_issue_abort_threshold", 3)
-        per_issue_attempt_budget = cfg_int("per_issue_attempt_budget", 2)
         summary_repair_attempt_budget = cfg_int("summary_repair_attempt_budget", 2)
-        analysis_closure_cycles = cfg_int("analysis_closure_cycles", 1)
-        issue_churn_closure_window = cfg_int("issue_churn_closure_window", 2)
-        issue_churn_abort_window = cfg_int("issue_churn_abort_window", 3)
         score_min_delta = cfg_float("score_min_delta", 0.03)
 
         if not metrics_history:
@@ -1294,7 +1311,6 @@ class AtomicWorkflowEngine:
                 "stagnant": False,
                 "streak": ctx.plateau_streak,
                 "workflow_mode": ctx.review_mode,
-                "issue_ledger_status": review_state.get_issue_ledger_status(),
             }
 
         current = metrics_history[-1]
@@ -1315,14 +1331,13 @@ class AtomicWorkflowEngine:
             else:
                 closure_streak_threshold = max(closure_streak_threshold, 2)
                 abort_streak_threshold = max(abort_streak_threshold, 3)
-        if current["global_passed"] and current["failed_result_count"] == 0:
+        if current["global_passed"]:
             ctx.plateau_streak = 0
             ctx.plateau_reason = ""
             return {
                 "stagnant": False,
                 "streak": 0,
                 "workflow_mode": ctx.review_mode,
-                "issue_ledger_status": current.get("issue_ledger_status") or {},
             }
 
         if len(metrics_history) < 2:
@@ -1330,7 +1345,6 @@ class AtomicWorkflowEngine:
                 "stagnant": False,
                 "streak": ctx.plateau_streak,
                 "workflow_mode": ctx.review_mode,
-                "issue_ledger_status": current.get("issue_ledger_status") or {},
             }
 
         prev = metrics_history[-2]
@@ -1372,38 +1386,8 @@ class AtomicWorkflowEngine:
         no_new_unreviewed_results = int(current.get("unreviewed_new_result_count") or 0) == 0
         failure_scope = str(current.get("global_failure_scope") or "")
 
-        issue_status = current.get("issue_ledger_status") or {}
-        prev_issue_status = prev.get("issue_ledger_status") or {}
-        active_issue_not_decreased = (
-            int(issue_status.get("active_issue_count") or 0)
-            >= int(prev_issue_status.get("active_issue_count") or 0)
-        )
-        current_issue_not_decreased = (
-            int(issue_status.get("current_issue_count") or 0)
-            >= int(prev_issue_status.get("current_issue_count") or 0)
-        )
-        dominant_issue = issue_status.get("dominant_issue") or None
-        try:
-            max_issue_consecutive = int(issue_status.get("max_consecutive_count") or 0)
-        except (TypeError, ValueError):
-            max_issue_consecutive = 0
-        same_issue_repeated = max_issue_consecutive >= same_issue_stagnation_threshold
-        same_issue_over_budget = (
-            max_issue_consecutive >= same_issue_abort_threshold
-            or max_issue_consecutive > per_issue_attempt_budget
-        )
-        result_review_passed = int(current.get("failed_result_count") or 0) == 0
-        issue_churn_detected = self._issue_churn_detected(
-            metrics_history,
-            window=issue_churn_closure_window,
-        )
-        issue_churn_over_budget = self._issue_churn_detected(
-            metrics_history,
-            window=issue_churn_abort_window,
-        )
         summary_repair_budget_available = (
-            failure_scope == "summary_or_ledger"
-            and result_review_passed
+            failure_scope == "summary_doc"
             and not current.get("global_passed")
             and ctx.summary_repair_attempts < summary_repair_attempt_budget
         )
@@ -1411,26 +1395,9 @@ class AtomicWorkflowEngine:
         stable_score_failure = scores_not_improved
         stable_result_failure = failed_result_ids_unchanged and result_artifacts_unchanged
         summary_freshness_failure = (
-            failure_scope == "summary_or_ledger"
+            failure_scope == "summary_doc"
             and summary_artifact_unchanged
             and supporting_docs_unchanged
-        )
-        same_issue_failure = (
-            same_issue_repeated
-            and result_artifacts_unchanged
-            and passed_not_grown
-            and no_new_unreviewed_results
-            and (
-                scores_not_improved
-                or supporting_docs_unchanged
-                or ctx.review_mode == "closure"
-            )
-        )
-        issue_churn_failure = (
-            issue_churn_detected
-            and result_review_passed
-            and passed_not_grown
-            and no_new_unreviewed_results
         )
         score_no_signal = scores_not_improved or not current_scores or not prev_scores
         no_effective_progress_failure = (
@@ -1440,15 +1407,13 @@ class AtomicWorkflowEngine:
             and passed_not_grown
             and no_new_unreviewed_results
             and score_no_signal
-            and active_issue_not_decreased
-            and current_issue_not_decreased
         )
 
         reasons: list[str] = []
         if no_effective_progress_failure:
             reasons.append(
                 "audit 有效进展信号不足：未新增/修正 result，supporting_docs 未变化，"
-                "通过结果未增长，issue/coverage 未收敛，且全局评分无有效提升"
+                "通过结果未增长，且全局评分无有效提升"
             )
         if scores_not_improved:
             reasons.append(f"全局评审分数有效提升不足（max_gain={max_score_gain:.3f} < {score_min_delta:.3f}）")
@@ -1464,23 +1429,15 @@ class AtomicWorkflowEngine:
             reasons.append("已冻结通过结果数量未增长")
         if no_new_unreviewed_results:
             reasons.append("没有新增待评审结果")
-        if same_issue_repeated:
-            signature = str((dominant_issue or {}).get("signature") or "")
-            reasons.append(f"同一全局评审 issue 连续出现 {max_issue_consecutive} 轮：{signature}")
-        if issue_churn_detected:
-            reasons.append(
-                f"全局评审 issue 在最近 {issue_churn_closure_window} 个 cycle 中持续轮换，"
-                "result review 已稳定但 global blocker 未形成固定收敛队列"
-            )
         if summary_freshness_failure:
-            reasons.append("summary/ledger 类失败未带来正式文档变化")
+            reasons.append("summary 类失败未带来正式文档变化")
 
         stagnant = (
             (stable_score_failure or stable_result_failure)
             and result_artifacts_unchanged
             and passed_not_grown
             and no_new_unreviewed_results
-        ) or same_issue_failure or summary_freshness_failure or issue_churn_failure or no_effective_progress_failure
+        ) or summary_freshness_failure or no_effective_progress_failure
 
         switched_to_closure = False
         abort = False
@@ -1494,15 +1451,6 @@ class AtomicWorkflowEngine:
 
         should_enter_closure = (
             stagnant and ctx.plateau_streak >= closure_streak_threshold
-        ) or (
-            result_review_passed
-            and not current.get("global_passed")
-            and failure_scope in {"analysis", "summary_or_ledger", "unknown"}
-            and same_issue_repeated
-        ) or (
-            issue_churn_detected
-            and result_review_passed
-            and not current.get("global_passed")
         )
         if should_enter_closure and ctx.review_mode != "closure":
             ctx.review_mode = "closure"
@@ -1523,21 +1471,11 @@ class AtomicWorkflowEngine:
             if closure_since is not None else
             0
         )
-        analysis_closure_expired = (
-            failure_scope == "analysis"
-            and result_review_passed
-            and same_issue_repeated
-            and closure_age >= analysis_closure_cycles
-        )
-
         would_abort = (
             ctx.review_mode == "closure"
             and not switched_to_closure
             and (
                 (stagnant and ctx.plateau_streak >= abort_streak_threshold)
-                or (same_issue_over_budget and closure_age >= 1)
-                or (issue_churn_over_budget and closure_age >= 1)
-                or (analysis_closure_expired and stagnant)
             )
         )
         if would_abort and summary_repair_budget_available:
@@ -1550,7 +1488,7 @@ class AtomicWorkflowEngine:
             )
         elif would_abort:
             abort = True
-            terminal_status = self._classify_plateau_terminal_status(current, dominant_issue)
+            terminal_status = self._classify_plateau_terminal_status(current, None)
 
         abort_reason = ctx.plateau_reason
         if abort:
@@ -1559,20 +1497,11 @@ class AtomicWorkflowEngine:
                     f"评审在 {ctx.plateau_streak} 个连续 cycle 中停滞，"
                     f"且进入 closure 模式后仍未收敛：{abort_reason}"
                 )
-            elif issue_churn_over_budget:
-                abort_reason = (
-                    f"closure 模式下全局评审 issue 在最近 {issue_churn_abort_window} 个 cycle 中持续轮换，"
-                    "且没有形成可收敛的固定修复队列"
-                )
-            elif same_issue_over_budget:
-                abort_reason = (
-                    f"同一全局评审 issue 已超过尝试预算（max_consecutive={max_issue_consecutive}）"
-                )
             else:
                 abort_reason = "closure 模式下评审停滞超过预算"
         elif summary_repair_budget_available:
             abort_reason = (
-                f"summary/ledger repair pending "
+                f"summary repair pending "
                 f"({ctx.summary_repair_attempts}/{summary_repair_attempt_budget})"
             )
 
@@ -1590,14 +1519,9 @@ class AtomicWorkflowEngine:
             "no_effective_progress_failure": no_effective_progress_failure,
             "summary_artifact_unchanged": summary_artifact_unchanged,
             "supporting_docs_unchanged": supporting_docs_unchanged,
-            "same_issue_repeated": same_issue_repeated,
-            "same_issue_over_budget": same_issue_over_budget,
-            "issue_churn_detected": issue_churn_detected,
-            "issue_churn_over_budget": issue_churn_over_budget,
             "summary_repair_attempts": ctx.summary_repair_attempts,
             "summary_repair_attempt_budget": summary_repair_attempt_budget,
             "summary_repair_deferred_abort": bool(would_abort and summary_repair_budget_available),
-            "issue_ledger_status": issue_status,
             "reason": abort_reason,
         }
 
@@ -1615,40 +1539,9 @@ class AtomicWorkflowEngine:
         return max(gains) if gains else 0.0
 
     @staticmethod
-    def _issue_churn_detected(metrics_history: list[dict], *, window: int) -> bool:
-        """Detect serially changing global blockers after result review stabilizes."""
-        if window < 2 or len(metrics_history) < window:
-            return False
-        recent = metrics_history[-window:]
-        signature_sets: list[tuple[str, ...]] = []
-        for item in recent:
-            if item.get("global_passed"):
-                return False
-            if int(item.get("failed_result_count") or 0) != 0:
-                return False
-            issue_status = item.get("issue_ledger_status") or {}
-            signatures = issue_status.get("current_signatures") or []
-            if not signatures:
-                dominant = issue_status.get("dominant_issue") or {}
-                signature = str(dominant.get("signature") or "").strip()
-                signatures = [signature] if signature else []
-            normalized = tuple(sorted(str(sig) for sig in signatures if str(sig).strip()))
-            if not normalized:
-                return False
-            signature_sets.append(normalized)
-
-        distinct_sets = set(signature_sets)
-        if len(distinct_sets) < window:
-            return False
-        for previous, current in zip(signature_sets, signature_sets[1:]):
-            if set(previous) & set(current):
-                return False
-        return True
-
-    @staticmethod
     def _classify_plateau_terminal_status(current_metrics: dict, dominant_issue: dict | None) -> str:
         failure_scope = str(current_metrics.get("global_failure_scope") or "")
-        if failure_scope == "summary_or_ledger":
+        if failure_scope == "summary_doc":
             return "summary_incomplete"
 
         issue = dominant_issue or {}
@@ -1704,19 +1597,6 @@ class AtomicWorkflowEngine:
                 **metrics,
                 "plateau_status": plateau_status,
             },
-        )
-
-    @staticmethod
-    def _write_issue_ledger(
-        *,
-        work_dir: str,
-        review_state: ReviewState,
-    ) -> None:
-        meta_dir = os.path.join(work_dir, "_meta")
-        os.makedirs(meta_dir, exist_ok=True)
-        write_json(
-            os.path.join(meta_dir, "issue_ledger.json"),
-            review_state.get_issue_ledger_snapshot(),
         )
 
     async def _precheck_result_granularity(

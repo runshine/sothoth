@@ -21,7 +21,6 @@ DEFAULT_MONITORED_PATHS = (
     "supporting_docs",
     "_meta/result_relations_manifest.json",
     "_meta/results_manifest.json",
-    "_meta/coverage_ledger.json",
 )
 
 

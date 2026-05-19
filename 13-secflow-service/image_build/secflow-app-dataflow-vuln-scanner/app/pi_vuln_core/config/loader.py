@@ -28,6 +28,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 logger = get_logger("config")
 
 GLOBAL_REVIEW_SCORE_KEYS = {
+    "coverage",
     "input_coverage",
     "export_followthrough",
     "used_coverage",

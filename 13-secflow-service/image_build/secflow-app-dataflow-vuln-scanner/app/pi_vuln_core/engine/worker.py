@@ -38,9 +38,7 @@ from app.pi_vuln_core.review.state import ReviewState
 from app.pi_vuln_core.utils.file_ops import read_file, read_json, write_file, write_json
 from app.pi_vuln_core.utils.result_docs import (
     classify_final_result_files,
-    coverage_ledger_path,
     extract_result_number,
-    format_coverage_obligation_summary,
     infer_result_lifecycle_from_text,
     is_result_report_filename,
     list_result_report_files,
@@ -68,24 +66,9 @@ class WorkerExecutor:
 
     REWORK_STAGE_DEFS = (
         {
-            "id": "triage",
-            "step_key": "worker::rework_triage",
-            "prompt_filename": "worker_rework_triage.md",
-        },
-        {
-            "id": "false_positive_repair",
-            "step_key": "worker::rework_fp_repair",
-            "prompt_filename": "worker_rework_fp_repair.md",
-        },
-        {
             "id": "missed_vuln_hunting",
             "step_key": "worker::rework_missed_hunt",
             "prompt_filename": "worker_rework_missed_hunt.md",
-        },
-        {
-            "id": "closure_handoff",
-            "step_key": "worker::rework_handoff",
-            "prompt_filename": "worker_rework_handoff.md",
         },
     )
 
@@ -368,19 +351,32 @@ class WorkerExecutor:
 
     @classmethod
     def _staged_rework_prompt_files(cls, wf_def: AtomicWorkflowDef) -> list[dict[str, str]]:
-        rework_prompt_file = getattr(
-            wf_def.roles.worker.prompts.work,
-            "rework_prompt_file",
-            None,
-        )
-        if not rework_prompt_file:
+        work_prompts = wf_def.roles.worker.prompts.work
+        prompt_dirs: list[Path] = []
+        for prompt_file in (
+            getattr(work_prompts, "rework_prompt_file", None),
+            getattr(work_prompts, "user_prompt_file", None),
+            getattr(work_prompts, "system_prompt_file", None),
+        ):
+            if prompt_file:
+                prompt_dir = Path(str(prompt_file)).parent
+                if prompt_dir not in prompt_dirs:
+                    prompt_dirs.append(prompt_dir)
+
+        if not prompt_dirs:
             return []
-        base_path = Path(rework_prompt_file)
+
+        prompt_dir = prompt_dirs[0]
+        for candidate_dir in prompt_dirs:
+            if all((candidate_dir / str(item["prompt_filename"])).is_file() for item in cls.REWORK_STAGE_DEFS):
+                prompt_dir = candidate_dir
+                break
+        else:
+            return []
+
         stages: list[dict[str, str]] = []
         for item in cls.REWORK_STAGE_DEFS:
-            prompt_file = str(base_path.with_name(str(item["prompt_filename"])))
-            if not os.path.isfile(prompt_file):
-                return []
+            prompt_file = str(prompt_dir / str(item["prompt_filename"]))
             stages.append({
                 "id": str(item["id"]),
                 "step_key": str(item["step_key"]),
@@ -410,18 +406,8 @@ class WorkerExecutor:
         for stage in stages:
             stage_id = str(stage.get("id") or "")
             should_run = True
-            if stage_id == "triage":
-                should_run = route["has_failed_results"] and route["has_missed_hunt_work"]
-            elif stage_id == "false_positive_repair":
-                should_run = route["has_failed_results"]
-            elif stage_id == "missed_vuln_hunting":
+            if stage_id == "missed_vuln_hunting":
                 should_run = route["has_missed_hunt_work"]
-            elif stage_id == "closure_handoff":
-                should_run = (
-                    route["has_failed_results"]
-                    or route["has_summary_handoff"]
-                    or route["has_repeated_issue_summary"]
-                )
 
             if should_run:
                 selected.append(stage)
@@ -445,46 +431,34 @@ class WorkerExecutor:
         ctx: WorkflowContext,
         review_state: ReviewState,
     ) -> dict[str, Any]:
-        """Classify current blockers into result repair, security hunt, or summary/ledger handoff."""
+        """Classify current blockers into result repair, security hunt, or summary handoff."""
         is_closure = ctx.review_mode == "closure" or review_state.workflow_mode == "closure"
-        summary_or_ledger_rework = self._has_summary_or_ledger_rework(ctx, review_state)
+        summary_doc_rework = self._has_summary_doc_rework(ctx, review_state)
         failed_files = self._get_rework_failed_files(ctx, review_state)
         active_entries = review_state.get_active_issue_entries(include_framework=False)
         worker_issue_entries, summary_handoff_entries = self._split_rework_issue_entries(active_entries)
-        coverage_targets = self._select_rework_coverage_targets(
-            ctx=ctx,
-            max_items=self._rework_coverage_target_limit(
-                get_review_profile_policy(ctx.review_profile).name,
-                summary_repair_only=summary_or_ledger_rework and not failed_files,
-            ),
-            security_only=is_closure or summary_or_ledger_rework,
-        )
         unstructured_analysis_feedback = self._has_unstructured_analysis_feedback(
             review_state,
             is_closure=is_closure,
-            summary_or_ledger_rework=summary_or_ledger_rework,
+            summary_doc_rework=summary_doc_rework,
         )
         has_missed_hunt_work = bool(
             worker_issue_entries
-            or coverage_targets
             or unstructured_analysis_feedback
         )
-        if is_closure and not failed_files and not worker_issue_entries and not coverage_targets:
+        if is_closure and not failed_files and not worker_issue_entries:
             has_missed_hunt_work = False
 
         return {
             "is_closure": is_closure,
-            "summary_or_ledger_rework": summary_or_ledger_rework,
-            "has_failed_results": bool(failed_files),
-            "failed_files": failed_files,
+            "summary_doc_rework": summary_doc_rework,
+            "has_failed_results": False,
+            "failed_files": [],
             "worker_issue_count": len(worker_issue_entries),
             "summary_handoff_count": len(summary_handoff_entries),
-            "coverage_target_count": len(coverage_targets),
             "has_missed_hunt_work": has_missed_hunt_work,
-            "has_summary_handoff": bool(summary_handoff_entries or summary_or_ledger_rework),
-            "has_repeated_issue_summary": bool(
-                review_state.format_issue_ledger_summary(min_consecutive=2, max_items=1)
-            ),
+            "has_summary_handoff": bool(summary_handoff_entries or summary_doc_rework),
+            "has_repeated_issue_summary": False,
         }
 
     def _get_rework_failed_files(
@@ -510,9 +484,9 @@ class WorkerExecutor:
         review_state: ReviewState,
         *,
         is_closure: bool,
-        summary_or_ledger_rework: bool,
+        summary_doc_rework: bool,
     ) -> bool:
-        if is_closure or summary_or_ledger_rework:
+        if is_closure or summary_doc_rework:
             return False
         for record in reversed(review_state.global_review_history):
             if record.passed:
@@ -941,11 +915,7 @@ class WorkerExecutor:
         return await agent.send_message(**kwargs)
 
     def _sync_worker_scaffolds(self, ctx: WorkflowContext) -> None:
-        """Generate stable result/coverage ledgers before the Worker prompt.
-
-        This makes scope gates visible from cycle 1 instead of only after the
-        summary/review phases have already discovered missing obligations.
-        """
+        """Generate stable result manifests before the Worker prompt."""
         results_dir = ctx.results_dir or os.path.join(ctx.working_dir, "results")
         summary_file = ctx.summary_file or os.path.join(ctx.working_dir, "summary.md")
         supporting_docs_dir = self._supporting_docs_dir(ctx.working_dir)
@@ -1049,7 +1019,6 @@ class WorkerExecutor:
                 "- 若为补充/修正报告，文件开头必须写 `- **原始报告**: result_NNN.md` 与 `- **本报告性质**: 补充分析/修正`。",
             ])
         return "\n".join([
-            "## result_NNN.md 强制模板（按疑点上报字段组织）",
             "",
             "每个 `results/result_NNN.md` 必须严格按下列结构撰写；缺少关键字段会导致评审返工。",
             "",
@@ -1077,7 +1046,6 @@ class WorkerExecutor:
             "",
             "## 3. 数据流绑定（必须）",
             "- **data_flow_file**: <原始数据流文件路径>",
-            "- **coverage_obligation_id**: <INPUT/EXPORT/USED/CLEANED/STAR obligation id；未知需说明>",
             "- **data_flow_kind**: INPUT / EXPORT / USED / CLEANED / STAR",
             "- **data_flow_source_line**: <数据流报告行号或原文片段>",
             "- **INPUT**: <INPUT-N、字段、偏移、攻击者可控性>",
@@ -1174,7 +1142,7 @@ class WorkerExecutor:
                 current_results=current_result_files,
                 actionable_by="worker",
             )
-            or self._has_summary_or_ledger_rework(ctx, review_state)
+            or self._has_summary_doc_rework(ctx, review_state)
         )
 
     @staticmethod
@@ -1185,7 +1153,7 @@ class WorkerExecutor:
             return f"(任务文件读取失败: {exc})"
 
     @classmethod
-    def _has_summary_or_ledger_rework(
+    def _has_summary_doc_rework(
         cls,
         ctx: WorkflowContext,
         review_state: ReviewState,
@@ -1196,15 +1164,14 @@ class WorkerExecutor:
             for issue in recent_issues
         ):
             return False
-        if "summary/ledger" in (ctx.plateau_reason or ""):
+        if "summary" in (ctx.plateau_reason or ""):
             return True
 
-        summary_owners = {"report", "summary", "ledger"}
+        summary_owners = {"report", "summary"}
         summary_categories = {
             "report_completeness",
             "limitations_honesty",
             "summary",
-            "ledger",
             "metadata",
             "metadata_sync",
         }
@@ -1213,7 +1180,7 @@ class WorkerExecutor:
             owner = str(issue.get("actionable_by") or issue.get("owner") or "").strip().lower()
             category = str(issue.get("category") or "").strip().lower()
             entry = {"issue": issue, "blocking_type": issue.get("blocking_type") or issue.get("category")}
-            if cls._is_summary_or_ledger_issue_entry(entry):
+            if cls._is_summary_doc_issue_entry(entry):
                 has_summary_issue = True
                 continue
             if owner and owner not in summary_owners:
@@ -1256,13 +1223,7 @@ class WorkerExecutor:
 
     def _build_output_contract_text(self, ctx: WorkflowContext) -> str:
         contract = self._build_output_contract(ctx)
-        return "\n".join([
-            f"- SUMMARY=`{self._path_for_prompt(ctx, contract['summary_file'])}`",
-            f"- RESULTS=`{self._path_for_prompt(ctx, contract['results_dir'])}`",
-            f"- SUPPORTING=`{self._path_for_prompt(ctx, contract['supporting_docs_dir'])}`",
-            f"- PREVIOUS_LIMITATIONS=`{self._path_for_prompt(ctx, contract['previous_limitations_file'])}`",
-            "- 结果文件命名：`result_NNN.md`",
-        ])
+        return f"summary.md: {os.path.abspath(contract['summary_file'])}"
 
     def _build_worker_output_contract_text(self, ctx: WorkflowContext) -> str:
         contract = self._build_worker_output_contract(ctx)
@@ -1344,9 +1305,6 @@ class WorkerExecutor:
             f"- 本阶段正式结果目录: `{ctx.results_dir or os.path.join(ctx.working_dir, 'results')}`",
             f"- 本阶段辅助文档目录: `{self._supporting_docs_dir(ctx.working_dir)}`",
             f"- 后续 summary 阶段整理的总结报告: `{ctx.summary_file or os.path.join(ctx.working_dir, 'summary.md')}`",
-            f"- 后续 summary 阶段同步的局限性记录: `{previous_limitations_file}`",
-            "",
-            self._format_profile_execution_context(ctx),
         ]
         audit_appendix = (
             self._load_profile_worker_appendix(system_prompt_file, ctx)
@@ -1355,9 +1313,6 @@ class WorkerExecutor:
         )
         if audit_appendix:
             lines.extend(["", audit_appendix])
-        coverage_context = self._format_coverage_obligation_context(ctx)
-        if coverage_context:
-            lines.extend(["", coverage_context])
         lines.extend([
             "",
             "## 开始前必须读取",
@@ -1369,12 +1324,6 @@ class WorkerExecutor:
             lines.append(f"- `{ctx.summary_file}`")
         for name in current_result_files:
             lines.append(f"- `{os.path.join(ctx.working_dir, 'results', name)}`")
-
-        lines.extend([
-            "",
-            "## 本阶段输出位置 contract",
-            self._build_worker_output_contract_text(ctx),
-        ])
         return "\n".join(lines)
 
     def _build_rework_prompt(
@@ -1420,7 +1369,7 @@ class WorkerExecutor:
     ) -> dict[str, Any]:
         """Build dynamic sections shared by file-based and fallback rework prompts."""
         is_closure = (ctx.review_mode == "closure" or review_state.workflow_mode == "closure")
-        summary_or_ledger_rework = self._has_summary_or_ledger_rework(ctx, review_state)
+        summary_doc_rework = self._has_summary_doc_rework(ctx, review_state)
         failed_sources = [
             item.filename for item in (ctx.failed_result_items or [])
             if is_result_report_filename(item.filename)
@@ -1433,16 +1382,12 @@ class WorkerExecutor:
             ]
         failed_files = sorted(dict.fromkeys(failed_sources))
         summary_repair_only = (
-            (is_closure or summary_or_ledger_rework)
+            (is_closure or summary_doc_rework)
             and not failed_files
-            and summary_or_ledger_rework
+            and summary_doc_rework
         )
         result_repair_only = bool(failed_files)
-        policy = get_review_profile_policy(ctx.review_profile)
-        repeated_issue_summary = review_state.format_issue_ledger_summary(
-            min_consecutive=2,
-            max_items=5,
-        )
+        repeated_issue_summary = ""
 
         global_review_feedback = ""
         if review_state.last_global_feedback:
@@ -1452,11 +1397,6 @@ class WorkerExecutor:
             ])
 
         repeated_issue_summary_text = ""
-        if repeated_issue_summary:
-            repeated_issue_summary_text = "\n".join([
-                "## 重复阻塞项 ledger",
-                repeated_issue_summary,
-            ])
 
         backlog_max_items = 6 if summary_repair_only or is_closure else 10
         open_backlog = review_state.format_open_issue_backlog(
@@ -1472,21 +1412,6 @@ class WorkerExecutor:
 
         active_entries = review_state.get_active_issue_entries(include_framework=False)
         worker_issue_entries, summary_handoff_entries = self._split_rework_issue_entries(active_entries)
-        coverage_targets = self._select_rework_coverage_targets(
-            ctx=ctx,
-            max_items=self._rework_coverage_target_limit(
-                policy.name,
-                summary_repair_only=summary_repair_only,
-            ),
-            security_only=is_closure or summary_or_ledger_rework,
-        )
-
-        if summary_repair_only:
-            summary_repair_limits = {"fast": 6, "balanced": 12, "strict": 20, "audit": 32}
-            coverage_max_open = summary_repair_limits.get(policy.name, 12)
-        else:
-            coverage_max_open = None
-        coverage_context = self._format_coverage_obligation_context(ctx, max_open=coverage_max_open)
 
         failed_result_reasons = ""
         if failed_files:
@@ -1526,7 +1451,6 @@ class WorkerExecutor:
             issue_closure_file=issue_closure_file,
             failed_files=failed_files,
             worker_issue_entries=worker_issue_entries,
-            coverage_targets=coverage_targets,
         )
         return {
             "cycle": str(ctx.cycle),
@@ -1545,7 +1469,6 @@ class WorkerExecutor:
                 failed_files=failed_files,
                 worker_issue_entries=worker_issue_entries,
                 summary_handoff_entries=summary_handoff_entries,
-                coverage_targets=coverage_targets,
             ),
             "review_delta_text": self._build_review_delta_text(
                 ctx=ctx,
@@ -1556,7 +1479,6 @@ class WorkerExecutor:
             "global_review_feedback": global_review_feedback,
             "repeated_issue_summary": repeated_issue_summary_text,
             "active_issue_backlog": active_issue_backlog,
-            "coverage_context": coverage_context,
             "completeness_rework_plan": self._build_advisor_driven_rework_plan(
                 review_state=review_state,
                 advisor_tokens=("global_completeness", "completeness", "全面"),
@@ -1592,16 +1514,14 @@ class WorkerExecutor:
                 review_state=review_state,
                 failed_files=failed_files,
             ),
-            "coverage_hypothesis_queue": self._build_coverage_hypothesis_queue(
+            "issue_hypothesis_queue": self._build_issue_hypothesis_queue(
                 worker_issue_entries=worker_issue_entries,
-                coverage_targets=coverage_targets,
             ),
             "rework_priority_queue": self._build_rework_priority_queue(
                 ctx=ctx,
                 review_state=review_state,
                 failed_files=failed_files,
                 worker_issue_entries=worker_issue_entries,
-                coverage_targets=coverage_targets,
             ),
             "summary_handoff_queue": self._build_summary_handoff_queue(summary_handoff_entries),
             "failed_result_reasons": failed_result_reasons,
@@ -1614,7 +1534,6 @@ class WorkerExecutor:
                 result_repair_only=result_repair_only,
                 is_closure=is_closure,
                 worker_issue_count=len(worker_issue_entries),
-                coverage_target_count=len(coverage_targets),
             ),
             "numbering_rules": numbering_rules,
             "convergence_requirements": convergence_requirements,
@@ -1652,7 +1571,7 @@ class WorkerExecutor:
             if plan_kind == "completeness":
                 return "\n".join([
                     "- 当前没有可识别的全面性评审记录。",
-                    "- 若本轮仍有 active worker issue 或 high/STAR coverage target，请只把它们当作高收益漏洞假设来源。",
+                    "- 若本轮仍有 active worker issue，请只把它们当作高收益漏洞假设来源。",
                 ])
             return "\n".join([
                 "- 当前没有可识别的深入性评审记录。",
@@ -1703,9 +1622,9 @@ class WorkerExecutor:
                     )
                     issue_entry = {"issue": issue, "blocking_type": blocking_type}
                     if plan_kind == "completeness":
-                        if self._is_summary_or_ledger_issue_entry(issue_entry):
+                        if self._is_summary_doc_issue_entry(issue_entry):
                             model_action = (
-                                "summary/ledger 同步或文档证据问题：交给 handoff/summary 阶段整理，"
+                                "summary 同步或文档证据问题：交给 handoff/summary 阶段整理，"
                                 "不要转成漏洞挖掘任务。"
                             )
                         elif self._is_security_worker_issue_entry(issue_entry):
@@ -1718,9 +1637,9 @@ class WorkerExecutor:
                                 "低收益或非安全类反馈：默认跳过漏洞挖掘，只在 handoff/summary 中记录 residual。"
                             )
                     else:
-                        if self._is_summary_or_ledger_issue_entry(issue_entry):
+                        if self._is_summary_doc_issue_entry(issue_entry):
                             model_action = (
-                                "文档/ledger 同步问题：不进入深挖，交给 summary 阶段处理。"
+                                "文档同步问题：不进入深挖，交给 summary 阶段处理。"
                             )
                         else:
                             model_action = (
@@ -1737,7 +1656,7 @@ class WorkerExecutor:
                         issue_line += f"; acceptance={acceptance[:240]}"
                     lines.append(issue_line)
                 if len(issues) > 5:
-                    lines.append(f"  - ... 另有 {len(issues) - 5} 个 failed advisor issue，详见 `_meta/issue_ledger.json`。")
+                    lines.append(f"  - ... 另有 {len(issues) - 5} 个 failed advisor issue，请参考本轮评审记录。")
             else:
                 feedback = str(getattr(record, "feedback", "") or "").strip()
                 lines.append("- 本 failed advisor 未返回结构化 issue；仅把下面短 feedback 当 fallback 线索，不作为完整任务清单。")
@@ -1752,15 +1671,9 @@ class WorkerExecutor:
         review_state: ReviewState,
         failed_files: list[str],
     ) -> str:
-        if not failed_files:
-            return "\n".join([
-                "- 当前没有 failed result；误报修复节点应快速确认无需修改结果文件。",
-                "- 不要为了填充本节点而新增弱 result；把 token 留给漏报补扫节点。",
-            ])
+        return "- fp_repair 节点已删除；旧漏洞确认/误报状态由结果评审写入漏洞列表，Worker 不做误报修复。"
 
         lines = [
-            "- failed result 必须逐个处理，不能原样保留弱报告。",
-            "- 处理结果只能是：补证确认 / 严重度或前提修正 / 拆分为新真实漏洞 / false_positive 或 withdrawn。",
         ]
         for item in review_state.get_failed_results(current_results=ctx.pre_cycle_result_files):
             if item.filename not in failed_files:
@@ -1785,8 +1698,8 @@ class WorkerExecutor:
         ][:1]
         if not records:
             if plan_kind == "completeness":
-                return "- 当前没有可识别的全面性评审记录；triage 不需要为它分配专门漏报补扫方向。"
-            return "- 当前没有可识别的深入性评审记录；triage 不需要为它分配专门深挖方向。"
+                return "- 当前没有可识别的全面性评审记录；missed_hunt 不需要为它分配专门漏报补扫方向。"
+            return "- 当前没有可识别的深入性评审记录；missed_hunt 不需要为它分配专门深挖方向。"
 
         record = records[0]
         advisor_id = str(getattr(record, "advisor_id", "") or "global_review")
@@ -1798,8 +1711,8 @@ class WorkerExecutor:
 
         if passed:
             lines.extend([
-                "- no_action: 该 advisor 本轮通过；不生成 triage 任务。",
-                "- guardrail: 不要把 PASS 正反馈当作 missed-hunt 或 fp-repair 驱动；完整 feedback 不注入 rework。",
+                "- no_action: 该 advisor 本轮通过；不生成 missed_hunt 任务。",
+                "- guardrail: 不要把 PASS 正反馈当作 missed_hunt 驱动；完整 feedback 不注入 rework。",
             ])
             return "\n".join(lines)
 
@@ -1852,20 +1765,7 @@ class WorkerExecutor:
         review_state: ReviewState,
         failed_files: list[str],
     ) -> str:
-        if not failed_files:
-            return "- 当前没有 failed result；triage 不需要安排误报修复。"
-
-        failed_items = [
-            item for item in review_state.get_failed_results(current_results=ctx.pre_cycle_result_files)
-            if item.filename in failed_files
-        ]
-        ordered_names = [item.filename for item in failed_items] or list(failed_files)
-        names = ", ".join(f"`{name}`" for name in ordered_names[:8])
-        extra = f"；另有 {len(ordered_names) - 8} 个" if len(ordered_names) > 8 else ""
-        return (
-            f"- P0 failed result: {names}{extra}。"
-            "triage 只需标记这些文件需要优先修复/撤回/补证；详细失败原因和源码核验由下一节点处理。"
-        )
+        return "- 结果修复节点已删除；missed_hunt 只处理漏报/新漏洞方向。"
 
     def _build_missed_hunt_variant_seeds(
         self,
@@ -1917,13 +1817,6 @@ class WorkerExecutor:
         else:
             lines.append("- 当前没有可用的 active result 变体种子；优先从 advisor feedback 生成候选。")
 
-        if failed_files:
-            lines.extend([
-                "### Failed-result adjacency",
-                "- fp_repair 若证伪了 failed result，不要停在撤回；继续检查相邻真实风险：同一函数的兄弟分支、同一 sink 的其他输入源、同一 guard 的边界绕过。",
-                "- failed result 本身不得原样升级为新漏洞；只有发现独立真实路径才新增更高编号 result。",
-            ])
-
         return "\n".join(lines)
 
     @staticmethod
@@ -1968,15 +1861,13 @@ class WorkerExecutor:
                 return value.strip("`* ")
         return ""
 
-    def _build_coverage_hypothesis_queue(
+    def _build_issue_hypothesis_queue(
         self,
         *,
         worker_issue_entries: list[dict[str, Any]],
-        coverage_targets: list[dict[str, Any]],
     ) -> str:
         lines = [
-            "- coverage/issue ledger 只作为漏洞假设来源，不是机械填表目标。",
-            "- 优先处理 STAR、high-risk EXPORT/USED、advisor 明确点名、靠近危险 sink 的路径。",
+            "- 优先处理 advisor 明确点名、靠近危险 sink 的路径。",
         ]
         if worker_issue_entries:
             lines.append("### Worker-actionable issue hypotheses")
@@ -1986,24 +1877,9 @@ class WorkerExecutor:
             )
             if len(worker_issue_entries) > 6:
                 lines.append(f"- ... 另有 {len(worker_issue_entries) - 6} 个 worker issue，低收益项本轮可不处理。")
-        if coverage_targets:
-            lines.append("### High-yield coverage hypotheses")
-            lines.extend(self._format_coverage_target_for_prompt(item) for item in coverage_targets[:8])
-            if len(coverage_targets) > 8:
-                lines.append(f"- ... 另有 {len(coverage_targets) - 8} 个 coverage target，详见 coverage ledger。")
-        if not worker_issue_entries and not coverage_targets:
-            lines.append("- 当前没有高收益 coverage/issue 假设；本轮漏报补扫应主要依据 advisor feedback。")
+        if not worker_issue_entries:
+            lines.append("- 当前没有高收益假设；本轮漏报补扫应主要依据 advisor feedback。")
         return "\n".join(lines)
-
-    @staticmethod
-    def _rework_coverage_target_limit(
-        profile_name: str,
-        *,
-        summary_repair_only: bool = False,
-    ) -> int:
-        if summary_repair_only:
-            return {"fast": 4, "balanced": 8, "audit": 12}.get(profile_name, 8)
-        return {"fast": 4, "balanced": 8, "audit": 10}.get(profile_name, 8)
 
     @staticmethod
     def _issue_owner(item: dict[str, Any]) -> str:
@@ -2062,17 +1938,16 @@ class WorkerExecutor:
         return line_marker or any(marker in lowered for marker in security_markers)
 
     @classmethod
-    def _is_summary_or_ledger_issue_entry(cls, item: dict[str, Any]) -> bool:
+    def _is_summary_doc_issue_entry(cls, item: dict[str, Any]) -> bool:
         owner = cls._issue_owner(item)
         category = cls._issue_category(item)
         blocking_type = cls._issue_blocking_type(item)
         text = cls._issue_prompt_text(item)
-        summary_owners = {"summary", "report", "ledger"}
+        summary_owners = {"summary", "report"}
         summary_categories = {
             "report_completeness",
             "limitations_honesty",
             "summary",
-            "ledger",
             "metadata",
             "metadata_sync",
             "format",
@@ -2080,30 +1955,17 @@ class WorkerExecutor:
         }
         summary_blocking_types = {
             "documentation_gap",
-            "ledger_sync",
             "metadata_sync",
             "summary_only_evidence",
             "format_gap",
             "report_completeness",
             "limitations_honesty",
         }
-        ledger_sync_markers = (
-            "coverage_ledger.json",
-            "issue_ledger.json",
-            "evidence_sources",
-            "status=documented",
-            "ledger 中",
-            "同步到 coverage_ledger",
-            "同步到 ledger",
-        )
-        has_ledger_sync_marker = any(marker in text for marker in ledger_sync_markers)
-        if owner == "worker" and cls._text_has_security_signal(text) and not has_ledger_sync_marker and blocking_type not in summary_blocking_types:
+        if owner == "worker" and cls._text_has_security_signal(text) and blocking_type not in summary_blocking_types:
             return False
         if owner in summary_owners:
             return True
         if category in summary_categories or blocking_type in summary_blocking_types:
-            return True
-        if has_ledger_sync_marker:
             return True
         if "summary" in text and ("同步" in text or "table" in text or "表格" in text):
             return True
@@ -2111,7 +1973,7 @@ class WorkerExecutor:
 
     @classmethod
     def _is_security_worker_issue_entry(cls, item: dict[str, Any]) -> bool:
-        if cls._is_summary_or_ledger_issue_entry(item):
+        if cls._is_summary_doc_issue_entry(item):
             return False
         owner = cls._issue_owner(item)
         if owner == "framework":
@@ -2127,9 +1989,7 @@ class WorkerExecutor:
             "analysis_gap",
             "source_evidence_gap",
             "evidence_gap",
-            "coverage_gap",
             "scan_depth",
-            "used_coverage",
             "export_followthrough",
         }
         if blocking_type in security_types or category in security_types:
@@ -2146,7 +2006,7 @@ class WorkerExecutor:
         for item in entries:
             if cls._issue_owner(item) == "framework":
                 continue
-            if cls._is_summary_or_ledger_issue_entry(item):
+            if cls._is_summary_doc_issue_entry(item):
                 summary_entries.append(item)
                 continue
             if cls._is_security_worker_issue_entry(item):
@@ -2154,61 +2014,6 @@ class WorkerExecutor:
             else:
                 summary_entries.append(item)
         return worker_entries, summary_entries
-
-    def _select_rework_coverage_targets(
-        self,
-        *,
-        ctx: WorkflowContext,
-        max_items: int,
-        security_only: bool = False,
-    ) -> list[dict[str, Any]]:
-        ledger_file = coverage_ledger_path(ctx.working_dir)
-        if not ledger_file.is_file() or max_items <= 0:
-            return []
-        try:
-            ledger = read_json(ledger_file)
-        except Exception:
-            return []
-        obligations = ledger.get("coverage_obligations") if isinstance(ledger, dict) else {}
-        open_entries = obligations.get("open_entries") if isinstance(obligations, dict) else []
-        if not isinstance(open_entries, list):
-            return []
-
-        risk_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-        kind_rank = {"star": 0, "export": 1, "used": 2, "cleaned": 3, "input": 4}
-
-        def _sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
-            risk = str(item.get("risk") or "medium").strip().lower()
-            kind = str(item.get("kind") or "").strip().lower()
-            return (
-                risk_rank.get(risk, 2),
-                kind_rank.get(kind, 9),
-                str(item.get("id") or item.get("value") or ""),
-            )
-
-        candidates = [item for item in open_entries if isinstance(item, dict)]
-        if security_only:
-            candidates = [item for item in candidates if self._is_security_coverage_target(item)]
-        candidates.sort(key=_sort_key)
-        return candidates[:max_items]
-
-    @staticmethod
-    def _is_security_coverage_target(item: dict[str, Any]) -> bool:
-        risk = str(item.get("risk") or "").strip().lower()
-        kind = str(item.get("kind") or item.get("label") or "").strip().lower()
-        value = " ".join(
-            str(item.get(key) or "")
-            for key in ("id", "value", "source_file", "source_line", "sink", "target")
-        ).lower()
-        if risk in {"critical", "high"}:
-            return True
-        if kind in {"star", "used"}:
-            return True
-        if item.get("source_file") and (
-            "sink" in value or "danger" in value or "危险" in value or re.search(r"\bL\d{2,}\b", value)
-        ):
-            return True
-        return bool("sink" in value or "危险" in value or "cwe" in value or "漏洞" in value)
 
     @staticmethod
     def _path_for_prompt(ctx: WorkflowContext, path: str | Path) -> str:
@@ -2234,8 +2039,6 @@ class WorkerExecutor:
         results_dir = ctx.results_dir or os.path.join(ctx.working_dir, "results")
         supporting_docs_dir = self._supporting_docs_dir(ctx.working_dir)
         previous_limitations_file = os.path.join(ctx.working_dir, "previous_limitations.md")
-        issue_ledger_file = os.path.join(ctx.working_dir, "_meta", "issue_ledger.json")
-        coverage_file = coverage_ledger_path(ctx.working_dir)
         lines = [
             "## 共享 session 增量上下文",
             "- 共用同一个 Worker session；本 prompt 只补充本轮 delta，历史细节按需读取文件。",
@@ -2243,7 +2046,7 @@ class WorkerExecutor:
             f"- WORKDIR=`{ctx.working_dir}`",
             f"- TASK=`{self._path_for_prompt(ctx, ctx.task_file)}`",
             f"- SUMMARY=`{self._path_for_prompt(ctx, summary_path)}`; RESULTS=`{self._path_for_prompt(ctx, results_dir)}`; SUPPORTING=`{self._path_for_prompt(ctx, supporting_docs_dir)}`",
-            f"- PREVIOUS_LIMITATIONS=`{self._path_for_prompt(ctx, previous_limitations_file)}`; ISSUE_LEDGER=`{self._path_for_prompt(ctx, issue_ledger_file)}`; COVERAGE_LEDGER=`{self._path_for_prompt(ctx, coverage_file)}`",
+            f"- PREVIOUS_LIMITATIONS=`{self._path_for_prompt(ctx, previous_limitations_file)}`",
         ]
         if ctx.review_mode == "closure" or review_state.workflow_mode == "closure":
             lines.append("- 当前已经进入 **closure（收敛）模式**。")
@@ -2259,16 +2062,9 @@ class WorkerExecutor:
         failed_files: list[str],
         worker_issue_entries: list[dict[str, Any]],
         summary_handoff_entries: list[dict[str, Any]],
-        coverage_targets: list[dict[str, Any]],
     ) -> str:
         results_dir = ctx.results_dir or os.path.join(ctx.working_dir, "results")
-        issue_ledger_file = os.path.join(ctx.working_dir, "_meta", "issue_ledger.json")
-        coverage_file = str(coverage_ledger_path(ctx.working_dir))
         required: list[str] = [ctx.task_file]
-
-        for path in (coverage_file, issue_ledger_file):
-            if os.path.isfile(path):
-                required.append(path)
 
         for name in failed_files:
             path = os.path.join(results_dir, name)
@@ -2283,11 +2079,6 @@ class WorkerExecutor:
                 issue.get("source_file"),
             ):
                 required.extend(self._resolve_rework_read_paths(ctx, str(value or "").strip()))
-
-        for item in coverage_targets[:5]:
-            source_file = str(item.get("source_file") or "").strip()
-            if source_file and os.path.isfile(source_file):
-                required.append(source_file)
 
         unique: list[str] = []
         for path in required:
@@ -2358,15 +2149,6 @@ class WorkerExecutor:
             line += f"; acceptance={acceptance[:160]}"
         return line
 
-    @staticmethod
-    def _format_coverage_target_for_prompt(item: dict[str, Any]) -> str:
-        value = str(item.get("value") or "")[:180]
-        return (
-            f"- `{item.get('id')}`: kind={item.get('label') or item.get('kind')}; "
-            f"value=`{value}`; risk={item.get('risk') or 'medium'}; "
-            "status=open"
-        )
-
     def _build_rework_priority_queue(
         self,
         *,
@@ -2374,42 +2156,32 @@ class WorkerExecutor:
         review_state: ReviewState,
         failed_files: list[str],
         worker_issue_entries: list[dict[str, Any]],
-        coverage_targets: list[dict[str, Any]],
     ) -> str:
         lines = [
             "## 本轮增量目标队列（按优先级执行）",
-            "- P0：未通过 result 的最小必要修复、补证、撤回或转 supporting_docs。",
-            "- P1：worker 可执行 active issues。",
-            "- P2：与本轮问题直接相关或高风险/STAR 的 open coverage obligations。",
-            "- 不在下列队列中的大量 open obligations 不要求本轮全部处理，避免把返工变成全量重扫。",
+            "- P1：worker 可执行 active issues（漏报/深度缺口）。",
+            "- 旧 result 只用于避免重复，不作为误报修复任务。",
         ]
-        if failed_files:
-            lines.extend(["", "### P0 failed results"])
-            for item in review_state.get_failed_results(current_results=ctx.pre_cycle_result_files):
-                if item.filename in failed_files:
-                    lines.append(f"- `{item.filename}`: {item.reason.strip()[:260]}")
+        failed_files = []
         if worker_issue_entries:
             lines.extend(["", "### P1 worker active issues"])
             lines.extend(self._format_issue_entry_for_prompt(item) for item in worker_issue_entries[:8])
             if len(worker_issue_entries) > 8:
-                lines.append(f"- ... 另有 {len(worker_issue_entries) - 8} 个 worker issue，详见 `_meta/issue_ledger.json`")
-        if coverage_targets:
-            lines.extend(["", "### P2 coverage targets"])
-            lines.extend(self._format_coverage_target_for_prompt(item) for item in coverage_targets)
-        if not failed_files and not worker_issue_entries and not coverage_targets:
-            lines.extend(["", "- 当前没有强制 Worker 返工目标；若只是 summary/ledger 同步问题，请只补充 summary 阶段需要的 supporting_docs 证据。"])
+                lines.append(f"- ... 另有 {len(worker_issue_entries) - 8} 个 worker issue，请参考本轮评审反馈。")
+        if not failed_files and not worker_issue_entries:
+            lines.extend(["", "- 当前没有强制 Worker 返工目标；若只是 summary 同步问题，请只补充 summary 阶段需要的 supporting_docs 证据。"])
         return "\n".join(lines)
 
     def _build_summary_handoff_queue(self, summary_handoff_entries: list[dict[str, Any]]) -> str:
         lines = [
-            "- 下列问题主要由后续 summary 阶段统一整理、同步或说明；Worker 只需补足必要证据，不要手工改 `_meta/`。",
+            "- 下列问题主要由后续 summary 阶段统一整理或说明；Worker 只需补足必要证据。",
         ]
         if summary_handoff_entries:
             lines.extend(self._format_issue_entry_for_prompt(item) for item in summary_handoff_entries[:6])
             if len(summary_handoff_entries) > 6:
-                lines.append(f"- ... 另有 {len(summary_handoff_entries) - 6} 个 summary/ledger issue，详见 `_meta/issue_ledger.json`")
+                lines.append(f"- ... 另有 {len(summary_handoff_entries) - 6} 个 summary issue，请参考本轮评审反馈。")
         else:
-            lines.append("- 当前没有单独的 summary/ledger handoff issue。")
+            lines.append("- 当前没有单独的 summary handoff issue。")
         return "\n".join(lines)
 
     @staticmethod
@@ -2419,35 +2191,33 @@ class WorkerExecutor:
         result_repair_only: bool,
         is_closure: bool,
         worker_issue_count: int = 0,
-        coverage_target_count: int = 0,
     ) -> str:
         lines = [
             "## 返工范围硬约束",
             "- 返工不是重新漏洞挖掘，而是基于本轮增量目标队列做定向闭环。",
-            "- 本轮新增探索必须至少命中以下一项：P0 failed result、P1 worker issue、P2 coverage target 或明确源码证据缺口。",
+            "- 本轮新增探索必须至少命中以下一项：P1 worker issue 或明确源码证据缺口。",
             "- 脱离 INPUT / EXPORT / USED / CLEANED / ★ 主轴的全源码发散不得写入正式结果。",
             "- 如果历史 session 中的旧目标与本轮队列冲突，以本轮队列为准。",
         ]
         if summary_repair_only:
             lines.extend([
-                "- 本轮主要为 summary/ledger handoff：只补充后续 summary 阶段需要的 supporting_docs 证据。",
-                "- 禁止新增、删除、重写、重新编号 `results/result_NNN.md`；不要手工编辑 `_meta/` 下框架生成文件。",
+                "- 本轮主要为 summary handoff：只补充后续 summary 阶段需要的 supporting_docs 证据。",
+                "- 禁止新增、删除、重写、重新编号 `results/result_NNN.md`。",
             ])
         elif result_repair_only:
             lines.extend([
-                "- 当前包含失败 result：先完成 P0 修复/撤回/补证，再处理 P1/P2 队列中列出的目标。",
-                "- 不要因为 ledger 中还有大量 open obligations 而全量扩张攻击面。",
-                "- 新增 result 只能用于拆分独立真实漏洞，或补充已证实的更高编号修正报告。",
+                "- 结果修复节点已删除；忽略旧漏洞状态，只围绕全局评审缺口寻找新的独立漏洞。",
+                "- 不要把返工扩张成全量攻击面重扫。",
             ])
         elif is_closure:
             lines.extend([
-                "- 当前为 closure：优先关闭 P1 active issues 与 P2 high/STAR coverage targets。",
+                "- 当前为 closure：优先关闭 P1 active issues。",
                 "- 若源码/外部依赖缺失，写 accepted_residual/external_blocked 与人工验收条件，不要反复写继续分析。",
             ])
         else:
             lines.append("- discovery 返工只围绕评审反馈定向扩展，不重新全量重扫。")
         lines.append(
-            f"- 本轮队列规模：worker issues={worker_issue_count}, coverage targets={coverage_target_count}。"
+            f"- 本轮队列规模：worker issues={worker_issue_count}。"
         )
         return "\n".join(lines)
 
@@ -2459,7 +2229,6 @@ class WorkerExecutor:
         issue_closure_file: str,
         failed_files: list[str] | None = None,
         worker_issue_entries: list[dict[str, Any]] | None = None,
-        coverage_targets: list[dict[str, Any]] | None = None,
     ) -> str:
         issue_lines = []
         for name in failed_files or []:
@@ -2480,29 +2249,24 @@ class WorkerExecutor:
             if issue_id:
                 safe_issue_id = ReviewState.prompt_safe_issue_id(issue_id)
                 issue_lines.append(f"| {safe_issue_id} | {target} |  |  |  |  |")
-        for item in (coverage_targets or [])[:8]:
-            obligation_id = str(item.get("id") or "").strip()
-            target = str(item.get("value") or item.get("target") or "").strip()
-            if obligation_id:
-                issue_lines.append(f"| {obligation_id} | {target} |  |  |  |  |")
         if not issue_lines:
-            issue_lines.append("| <issue_id 或 obligation_id> | <目标> | <source_closed/promoted_to_result/accepted_residual/unused/not_applicable/external_blocked> | <本轮动作> | <results/... 或 supporting_docs/...> | <剩余限制> |")
+            issue_lines.append("| <issue_id> | <目标> | <source_closed/promoted_to_result/accepted_residual/not_applicable/external_blocked> | <本轮动作> | <results/... 或 supporting_docs/...> | <剩余限制> |")
         return "\n".join([
             "## issue closure 记录要求",
             f"本轮必须创建或更新：`{issue_closure_file}`",
-            "只需要覆盖本轮 P0/P1/P2 目标队列，不要求覆盖全部 open obligations。",
+            "只需要覆盖本轮 P0/P1/P2 目标队列。",
             "",
             "建议内容模板：",
             "",
             "```markdown",
             f"# Issue Closure Cycle {ctx.cycle:03d}",
             "",
-            "| issue_id / obligation_id | target | status | action | evidence | residual/限制 |",
+            "| issue_id | target | status | action | evidence | residual/限制 |",
             "|---|---|---|---|---|---|",
             *issue_lines,
             "```",
             "",
-            "status 只能使用：source_closed / promoted_to_result / accepted_residual / unused / not_applicable / external_blocked。",
+            "status 只能使用：source_closed / promoted_to_result / accepted_residual / not_applicable / external_blocked。",
         ])
 
     def _build_rework_convergence_requirements(
@@ -2519,13 +2283,10 @@ class WorkerExecutor:
             lines.append("- 当前已经进入 **closure（收敛）模式**。")
             lines.append("- 本轮只补充后续 summary 阶段需要的 `supporting_docs/` 证据与 handoff 说明。")
             lines.append("- 不要新增、删除、重写或重新编号 `results/result_NNN.md`；结果评审已经通过。")
-            lines.append("- 不要手工编辑 `_meta/` 下的框架生成文件；只修正正式文档，让框架在 summary 后重新同步 manifest/ledger。")
+            lines.append("- 不要手工编辑 `_meta/` 下的框架生成文件；只修正正式文档。")
         elif result_repair_only:
-            lines.append("- 本轮重点是**修复/删除未通过结果**：先逐个证伪 failed result，再决定补证、修正、撤回或保留。")
-            lines.append("- 当前只聚焦**修复/删除未通过结果**，不要把结果修复轮扩张成全量攻击面重扫。")
-            lines.append("- 本轮先完成 P0 未通过结果的修复/撤回/补证，再处理 P1/P2 队列中明确列出的目标。")
-            lines.append("- 不要继续扩张攻击面；只有失败结果证伪过程中发现的独立真实漏洞才允许新增报告。")
-            lines.append("- 不要继续扩张到队列之外的攻击面；未列出的 open obligations 留给后续轮次或 summary handoff。")
+            lines.append("- 结果修复节点已删除；本轮不处理旧漏洞状态，只围绕全局评审缺口寻找新的独立漏洞。")
+            lines.append("- 不要继续扩张到队列之外的攻击面；未列出的低收益方向留给后续轮次或 summary handoff。")
         elif is_closure:
             lines.append("- 当前已经进入 **closure（收敛）模式**。")
             lines.append("- 优先关闭本轮 P1/P2 队列，不要继续扩张攻击面。")
@@ -2561,7 +2322,6 @@ class WorkerExecutor:
             "repeated_issue_summary",
             "rework_priority_queue",
             "summary_handoff_queue",
-            "failed_result_reasons",
             "rework_scope_policy",
         ):
             if sections.get(key):
@@ -2591,8 +2351,6 @@ class WorkerExecutor:
         results_dir = ctx.results_dir or os.path.join(ctx.working_dir, "results")
         supporting_docs_dir = self._supporting_docs_dir(ctx.working_dir)
         previous_limitations_file = os.path.join(ctx.working_dir, "previous_limitations.md")
-        issue_ledger_file = os.path.join(ctx.working_dir, "_meta", "issue_ledger.json")
-        coverage_file = coverage_ledger_path(ctx.working_dir)
         supporting_docs = list_supporting_markdown_files(supporting_docs_dir)
         result_files = ctx.pre_cycle_result_files or self._list_result_files(results_dir)
 
@@ -2606,13 +2364,11 @@ class WorkerExecutor:
             f"- results_dir: `{results_dir}`",
             f"- supporting_docs_dir: `{supporting_docs_dir}`",
             f"- previous_limitations: `{previous_limitations_file}`",
-            f"- issue ledger: `{issue_ledger_file}`",
-            f"- coverage ledger: `{coverage_file}`",
             "",
             "### 开始前必须读取",
             f"- `{ctx.task_file}`",
         ]
-        for candidate in (summary_path, previous_limitations_file, str(coverage_file), issue_ledger_file):
+        for candidate in (summary_path, previous_limitations_file):
             if os.path.isfile(candidate):
                 lines.append(f"- `{candidate}`")
         for name in result_files:
@@ -2626,7 +2382,7 @@ class WorkerExecutor:
             self._format_profile_execution_context(ctx),
             "",
             "### 返工原则",
-            "- 先关闭 active issue backlog 与 coverage ledger 的 open obligations；不要只处理最近一条自然语言反馈。",
+            "- 优先回应本轮评审反馈中明确指出的源码证据缺口。",
             "- 对每个阻塞项必须给出 `source_closed`、`promoted_to_result`、`accepted_residual`、`unused/not_applicable` 之一的明确状态。",
             "- 若受外部源码/上下文限制不可闭环，写入 supporting_docs 并在 summary 局限性章节保留 residual，不要反复写“继续分析”。",
         ])
@@ -2639,16 +2395,10 @@ class WorkerExecutor:
             pattern_focus = ", ".join(policy.required_pattern_families)
         else:
             pattern_focus = "优先沿数据流主轴验证显性、高置信漏洞。"
-        coverage_focus = (
-            "需要主动闭环本轮范围内的关键 INPUT/EXPORT/USED/CLEANED/STAR obligations。"
-            if policy.enforce_coverage_gate else
-            "快速筛选优先；不要求为了覆盖率做低风险、低置信的无边界扩张。"
-        )
         depth_lanes = WorkerExecutor._prompt_facing_depth_lanes(policy)
         lines = [
             "## 本轮挖掘目标与深度提示",
             f"- 本轮目标: {policy.execution_goal}",
-            f"- 覆盖取向: {coverage_focus}",
             f"- 漏洞模式重点: {pattern_focus}",
             "- 深挖路线:",
         ]
@@ -2668,7 +2418,7 @@ class WorkerExecutor:
         if policy.name == "audit":
             return (
                 "沿主路径、高风险端点和关键 EXPORT/USED 路线继续深挖。",
-                "STAR/EXPORT/USED obligation 深度闭环，并对 INPUT/CLEANED 保留可复核边界。",
+                "对 STAR/EXPORT/USED 线索深度闭环，并对 INPUT/CLEANED 保留可复核边界。",
                 "跨函数、跨协议族、跨方向的漏洞变体搜索。",
                 "未立项端点的可复核负证据矩阵。",
                 "可利用性前提、攻击者能力、配置依赖和 residual 边界审计。",
@@ -2686,29 +2436,6 @@ class WorkerExecutor:
             text[:max_chars].rstrip()
             + f"\n\n[section clipped: omitted {omitted} chars; full details are in review artifacts under `_meta/` and `reviews/`]\n"
         )
-
-    def _format_coverage_obligation_context(self, ctx: WorkflowContext, *, max_open: int | None = None) -> str:
-        policy = get_review_profile_policy(ctx.review_profile)
-        max_open = (
-            int(max_open)
-            if max_open is not None else
-            policy.max_open_obligations_in_worker_prompt
-        )
-        ledger_file = coverage_ledger_path(ctx.working_dir)
-        prompt_ledger_file = self._path_for_prompt(ctx, ledger_file)
-        if not ledger_file.is_file():
-            return (
-                "## Coverage / issue radar\n"
-                f"- 尚未生成 `{prompt_ledger_file}`；本轮 summary 后框架会根据 task/data-flow 与正式产物同步。"
-            )
-        try:
-            ledger = read_json(ledger_file)
-        except Exception as exc:
-            return f"## Coverage / issue radar\n- 读取 `{prompt_ledger_file}` 失败：{exc}"
-        return "\n".join([
-            f"## Coverage / issue radar\n- 读取 `{prompt_ledger_file}` 作为高收益漏洞路径雷达；不要求机械关闭全部 open 项。",
-            format_coverage_obligation_summary(ledger, max_open=max_open),
-        ])
 
     @staticmethod
     def _extract_result_number(name: str) -> int | None:
@@ -2768,7 +2495,7 @@ class WorkerExecutor:
                 )
 
         protected_files = sorted(
-            name for name in review_state.get_passed_result_filenames(current_results=pre_cycle_files)
+            name for name in pre_cycle_files
             if name in pre_cycle_set and name in active_passed_results
         )
         snapshots: dict[str, str] = {}
@@ -2779,18 +2506,12 @@ class WorkerExecutor:
             except FileNotFoundError:
                 continue
 
+        # Result-review business statuses (confirmed/false_positive/pending)
+        # are owned by the reviewer and vulnerability_list.json. Rework should
+        # not treat any old result as a repair target, so keep failed snapshots
+        # empty in the normal path.
         failed_snapshots: dict[str, str] = {}
         failed_reasons: dict[str, str] = {}
-        for item in review_state.get_failed_results():
-            name = item.filename
-            if name not in pre_cycle_set:
-                continue
-            path = os.path.join(results_dir, name)
-            try:
-                failed_snapshots[name] = read_file(path)
-                failed_reasons[name] = item.reason
-            except FileNotFoundError:
-                continue
 
         ctx.pre_cycle_result_files = pre_cycle_files
         ctx.protected_result_files = protected_files
@@ -3510,22 +3231,15 @@ class WorkerExecutor:
         prompt = read_file(summary_cfg.prompt_file)
         summary_state = review_state or ReviewState()
         summary_state.workflow_mode = ctx.review_mode
-        issue_ledger_path = os.path.join(ctx.working_dir, '_meta', 'issue_ledger.json')
-        previous_limitations_path = os.path.join(ctx.working_dir, 'previous_limitations.md')
         summary_runtime_context = "\n".join([
-            f"- 当前轮次：第 {ctx.cycle} 轮；Cycle={ctx.cycle}; mode={ctx.review_mode or summary_state.workflow_mode}",
-            f"- WORKDIR=`{ctx.working_dir}`",
-            f"- TASK=`{self._path_for_prompt(ctx, ctx.task_file)}`; COVERAGE_LEDGER=`{self._path_for_prompt(ctx, coverage_ledger_path(ctx.working_dir))}`; ISSUE_LEDGER=`{self._path_for_prompt(ctx, issue_ledger_path)}`",
-            "",
-            "### Summary 阶段开始前必须读取",
-            f"- `{self._path_for_prompt(ctx, ctx.task_file)}`",
-            f"- `{self._path_for_prompt(ctx, coverage_ledger_path(ctx.working_dir))}`（若存在）",
-            f"- `{self._path_for_prompt(ctx, issue_ledger_path)}`（若存在）",
-            f"- `{self._path_for_prompt(ctx, previous_limitations_path)}`（若存在）",
-            f"- `{self._path_for_prompt(ctx, summary_path)}`（若存在）",
-            f"- `{self._path_for_prompt(ctx, results_dir)}` 下当前所有 `result_NNN.md`",
-            f"- `{self._path_for_prompt(ctx, supporting_docs_dir)}` 下当前所有辅助审计文档",
+            f"当前轮次：第 {ctx.cycle} 轮",
+            f"工作模式：{ctx.review_mode or summary_state.workflow_mode}",
+            f"任务文件: {os.path.abspath(ctx.task_file)}",
+            f"工作目录: {os.path.abspath(ctx.working_dir)}",
         ])
+        summary_section_template, summary_section_count, summary_limitations_requirement = (
+            self._summary_section_contract_for_cycle(ctx.cycle)
+        )
         try:
             prompt = render_string(
                 prompt,
@@ -3541,12 +3255,16 @@ class WorkerExecutor:
                 supporting_docs_dir=supporting_docs_dir,
                 previous_limitations_file=os.path.join(ctx.working_dir, "previous_limitations.md"),
                 summary_runtime_context=summary_runtime_context,
+                summary_section_template=summary_section_template,
+                summary_section_count=str(summary_section_count),
+                summary_limitations_requirement=summary_limitations_requirement,
                 summary_rework_rules=self._build_summary_rework_rules(ctx) or "(本轮无额外返工规则)",
                 summary_feedback_context=self._build_summary_feedback_context(ctx, summary_state),
                 output_contract_text=self._build_output_contract_text(ctx),
             )
         except TemplateRenderError as exc:
             raise WorkerStageError("summary", f"Summary prompt 渲染失败：{exc}") from exc
+        prompt = prompt.rstrip("\n")
 
         logger.info("summary_start", workflow_id=ctx.workflow_id)
         record_step_checkpoint(
@@ -3611,6 +3329,33 @@ class WorkerExecutor:
 
         return summary_path, results_dir
 
+    @staticmethod
+    def _summary_section_contract_for_cycle(cycle: int) -> tuple[str, int, str]:
+        if int(cycle) <= 1:
+            return (
+                "\n".join([
+                    "# 数据流驱动漏洞挖掘总结",
+                    "",
+                    "1. 攻击面分析",
+                    "2. 分析覆盖度",
+                    "3. 漏洞汇总表",
+                    "4. 局限性与不足",
+                ]),
+                4,
+                "\n\n`局限性与不足`章节必须诚实、具体地列出当前分析的盲区、未覆盖的攻击面、潜在的误报风险和无法判断的关键路径；注意，不要写成空泛模板。\n",
+            )
+        return (
+            "\n".join([
+                "# 数据流驱动漏洞挖掘总结",
+                "",
+                "1. 攻击面分析",
+                "2. 分析覆盖度",
+                "3. 漏洞汇总表",
+            ]),
+            3,
+            "\n\n",
+        )
+
     def _build_summary_feedback_context(
         self,
         ctx: WorkflowContext,
@@ -3623,23 +3368,8 @@ class WorkerExecutor:
         lines.extend(["", format_review_profile_policy(ctx.review_profile)])
         if ctx.plateau_reason:
             lines.append(f"- 收敛/返工原因：{ctx.plateau_reason}")
-        repeated_issue_summary = review_state.format_issue_ledger_summary(
-            min_consecutive=2,
-            max_items=5,
-        )
-        if repeated_issue_summary:
-            lines.extend([
-                "",
-                "## 重复阻塞项 ledger",
-                repeated_issue_summary,
-                "",
-                "## Residual 同步要求",
-                "- 若 Worker 已将重复阻塞项判定为 `accepted_residual`，summary.md 的“局限性与未覆盖区域”必须保留该 residual 的原因、证据边界和人工验收条件。",
-                "- 若已闭环，summary.md 必须说明闭环依据，不要静默删除上一轮局限性。",
-            ])
         policy = get_review_profile_policy(ctx.review_profile)
         summary_backlog_limits = {"fast": 4, "balanced": 8, "strict": 12, "audit": 16}
-        summary_coverage_limits = {"fast": 8, "balanced": 18, "strict": 30, "audit": 50}
         open_backlog = review_state.format_open_issue_backlog(
             max_items=summary_backlog_limits.get(policy.name, 8),
             include_framework=False,
@@ -3649,20 +3379,6 @@ class WorkerExecutor:
                 "",
                 "## Active issue backlog",
                 open_backlog,
-            ])
-        coverage_context = self._format_coverage_obligation_context(
-            ctx,
-            max_open=summary_coverage_limits.get(policy.name, 18),
-        )
-        if coverage_context:
-            lines.extend([
-                "",
-                coverage_context,
-                "",
-                "## Coverage ledger 同步要求",
-                "- summary.md 必须包含一张 coverage closure matrix，对 coverage ledger 中的 INPUT/EXPORT/USED/CLEANED/STAR obligations 给出 status 与 evidence。",
-                "- status 只能使用：`source_closed`、`promoted_to_result`、`accepted_residual`、`unused`、`not_applicable`、`external_blocked`。",
-                "- 对 open obligation，必须在 summary 或 supporting_docs 中写明闭环证据、residual 原因或不可适用理由；不要只写泛化类别。",
             ])
         recent_feedback = self._clip_prompt_section(
             review_state.format_recent_feedback(last_n=1),
@@ -3687,7 +3403,7 @@ class WorkerExecutor:
             lines.extend([
                 "",
                 "## Closure 输出边界",
-                "- 优先修复 summary.md、previous_limitations.md、supporting_docs/ 与 manifest/ledger 的一致性。",
+                "- 优先修复 summary.md、previous_limitations.md、supporting_docs/ 与正式结果的一致性。",
                 "- 若结果评审已经通过，不要为了整理 summary 重新编号、删除或重写已通过的 result_NNN.md。",
             ])
         return "\n".join(lines)

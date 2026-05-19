@@ -102,7 +102,6 @@ def is_terminal_checkpoint(checkpoint: dict[str, Any] | None) -> bool:
 def _worker_step_aliases(step_key: str) -> list[str]:
     staged_rework = {
         "worker::rework_triage",
-        "worker::rework_fp_repair",
         "worker::rework_missed_hunt",
         "worker::rework_handoff",
     }

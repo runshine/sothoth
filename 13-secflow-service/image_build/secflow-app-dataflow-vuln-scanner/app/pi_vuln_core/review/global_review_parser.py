@@ -18,13 +18,7 @@ class GlobalReviewParseOutcome:
 
 
 _REQUIRED_GLOBAL_SCORE_KEYS = (
-    "input_coverage",
-    "export_followthrough",
-    "used_coverage",
-    "vuln_pattern_breadth",
-    "code_evidence_depth",
-    "limitations_honesty",
-    "report_completeness",
+    "coverage",
 )
 
 

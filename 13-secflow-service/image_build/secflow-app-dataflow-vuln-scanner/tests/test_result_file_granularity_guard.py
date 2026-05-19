@@ -96,6 +96,7 @@ class MultiFindingResultRuntime(BaseAgentRuntime):
                     "verdict": "PASS",
                     "feedback": "global pass",
                     "scores": {
+                        "coverage": 1.0,
                         "input_coverage": 1.0,
                         "export_followthrough": 1.0,
                         "used_coverage": 1.0,

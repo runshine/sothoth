@@ -56,12 +56,10 @@ def _is_profile_gate_issue(issue: dict[str, Any]) -> bool:
     blocking_type = str(issue.get("blocking_type") or "").strip().lower()
     return (
         issue_id.startswith("PROFILE-")
-        or category == "coverage_gate"
+        or category == "profile_evidence_gate"
         or blocking_type
         in {
-            "coverage_obligation_open",
             "summary_only_evidence",
-            "coverage_ledger_under_extracted",
             "metadata_sync",
         }
     )
@@ -119,7 +117,6 @@ def derive_profile_gate_summary(global_review: dict[str, Any], metrics: dict[str
         "框架范围验收硬门槛未通过" in feedback
         or "[profile_min_discovery_cycles]" in feedback
         or "PROFILE-" in feedback
-        or "coverage gate" in feedback.lower()
     )
     global_passed = bool(global_review.get("passed", False))
     failed = (not global_passed) and (
@@ -147,51 +144,6 @@ def _read_json(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
-
-
-def _issue_record_from_ledger_entry(entry: dict[str, Any]) -> dict[str, Any]:
-    issue = entry.get("issue") if isinstance(entry.get("issue"), dict) else {}
-    record = dict(issue)
-    issue_ids = [str(item).strip() for item in (entry.get("issue_ids") or []) if str(item).strip()]
-    advisor_ids = [str(item).strip() for item in (entry.get("advisor_ids") or []) if str(item).strip()]
-    if not record.get("id"):
-        record["id"] = issue_ids[0] if issue_ids else str(entry.get("signature") or "")
-    record.setdefault("signature", str(entry.get("signature") or ""))
-    record.setdefault("semantic_key", str(entry.get("semantic_key") or ""))
-    record.setdefault("first_seen_cycle", _safe_int(entry.get("first_seen_cycle")))
-    record.setdefault("last_seen_cycle", _safe_int(entry.get("last_seen_cycle")))
-    record.setdefault("seen_count", _safe_int(entry.get("seen_count")))
-    record.setdefault("consecutive_count", _safe_int(entry.get("consecutive_count")))
-    if entry.get("actionable_by") and not record.get("actionable_by"):
-        record["actionable_by"] = str(entry.get("actionable_by") or "")
-    if entry.get("blocking_type") and not record.get("blocking_type"):
-        record["blocking_type"] = str(entry.get("blocking_type") or "")
-    if entry.get("acceptance_criteria") and not record.get("acceptance_criteria"):
-        record["acceptance_criteria"] = str(entry.get("acceptance_criteria") or "")
-    if advisor_ids and not record.get("advisor_id"):
-        record["advisor_id"] = ",".join(advisor_ids)
-    return record
-
-
-def load_active_issue_records_from_ledger(atomic: str | Path) -> list[dict[str, Any]] | None:
-    ledger_file = Path(atomic) / "_meta" / "issue_ledger.json"
-    if not ledger_file.is_file():
-        return None
-    ledger = _read_json(ledger_file)
-    if not isinstance(ledger.get("entries"), list):
-        return None
-    entries = [
-        item for item in ledger.get("entries", [])
-        if isinstance(item, dict) and bool(item.get("active")) and not bool(item.get("resolved"))
-    ]
-    entries.sort(
-        key=lambda item: (
-            -_safe_int(item.get("last_seen_cycle")),
-            -_safe_int(item.get("seen_count")),
-            str(item.get("signature") or ""),
-        )
-    )
-    return [_issue_record_from_ledger_entry(item) for item in entries]
 
 
 def _read_text(path: Path, max_bytes: int = 0) -> str:
@@ -851,22 +803,23 @@ def _manifest_path_summary(atomic: Path, path: Path) -> dict[str, Any]:
 def _load_manifest_summary(atomic: Path) -> dict[str, Any]:
     relations_path = atomic / "_meta" / "result_relations_manifest.json"
     results_path = atomic / "_meta" / "results_manifest.json"
-    coverage_path = atomic / "_meta" / "coverage_ledger.json"
+    vuln_list_path = atomic / "_meta" / "vulnerability_list.json"
     relations = _read_json(relations_path)
     results = _read_json(results_path)
-    coverage = _read_json(coverage_path)
+    vuln_list = _read_json(vuln_list_path)
     return {
         "result_relations_manifest": _manifest_path_summary(atomic, relations_path),
         "results_manifest": _manifest_path_summary(atomic, results_path),
-        "coverage_ledger": _manifest_path_summary(atomic, coverage_path),
+        "vulnerability_list": _manifest_path_summary(atomic, vuln_list_path),
+        "vulnerability_status_counts": vuln_list.get("counts", {}),
         "total_result_files": results.get("total_result_files", len(relations.get("all_results", []))),
         "active_result_count": results.get("active_result_count", 0),
         "inactive_result_count": results.get("inactive_result_count", len(relations.get("inactive_results", []))),
         "taskable_result_count": results.get("taskable_result_count", len(relations.get("taskable_results", []))),
         "supplemental_result_count": results.get("supplemental_result_count", len(relations.get("supplemental_results", []))),
         "excluded_result_count": len(results.get("excluded_results", relations.get("excluded_results", [])) or []),
-        "missing_referenced_results": coverage.get("missing_referenced_results", []),
-        "unreferenced_active_results": coverage.get("unreferenced_active_results", []),
+        "missing_referenced_results": [],
+        "unreferenced_active_results": [],
     }
 
 
@@ -1030,6 +983,12 @@ def _collect_results(atomic: Path) -> list[dict[str, Any]]:
     if not results_dir.is_dir():
         return []
     entry_by_name = _result_manifest_entries_by_name(atomic)
+    vuln_list = _read_json(atomic / "_meta" / "vulnerability_list.json")
+    vuln_by_name = {
+        str(item.get("result_file") or ""): item
+        for item in (vuln_list.get("entries") or [])
+        if isinstance(item, dict)
+    }
     results: list[dict[str, Any]] = []
     for file_path in sorted(results_dir.glob("result_*.md")):
         review_dir = atomic / "reviews" / "results" / file_path.stem
@@ -1045,14 +1004,16 @@ def _collect_results(atomic: Path) -> list[dict[str, Any]]:
                     break
         title = _extract_markdown_title(file_path)
         manifest_entry = entry_by_name.get(file_path.name, {})
+        vuln_entry = vuln_by_name.get(file_path.name, {})
+        vulnerability_status = str(vuln_entry.get("status") or "")
         results.append(
             {
                 "filename": file_path.name,
                 "path": _rel_to_atomic(file_path, atomic),
                 "title": title,
                 "size": file_path.stat().st_size,
-                "passed": latest_review.get("passed"),
-                "verdict": latest_review.get("verdict", ""),
+                "passed": (True if vulnerability_status == "confirmed" else False if vulnerability_status == "false_positive" else latest_review.get("passed")),
+                "verdict": vuln_entry.get("verdict") or latest_review.get("verdict", ""),
                 "confidence": latest_review.get("confidence", 0),
                 "review_cycle": latest_review.get("cycle", 0),
                 "feedback": latest_review.get("feedback", ""),
@@ -1063,7 +1024,10 @@ def _collect_results(atomic: Path) -> list[dict[str, Any]]:
                 "role": manifest_entry.get("role", ""),
                 "lifecycle_status": manifest_entry.get("lifecycle_status", ""),
                 "active": manifest_entry.get("active", True),
-                "taskable": manifest_entry.get("taskable", True),
+                "taskable": False if vulnerability_status in {"false_positive", "pending_review"} else manifest_entry.get("taskable", True),
+                "vuln_id": vuln_entry.get("vuln_id", ""),
+                "vulnerability_status": vulnerability_status,
+                "status_label": vuln_entry.get("status_label", ""),
                 "delivery_bucket": manifest_entry.get("delivery_bucket", "results"),
                 "multi_finding": manifest_entry.get("multi_finding", False),
                 "vulnerability_headings": manifest_entry.get("vulnerability_headings", []),
@@ -1341,19 +1305,6 @@ def inspect_run_detail(workspace_root: str | Path) -> dict[str, Any]:
         )
     feedback_files = _sorted_json_files(atomic / "_meta" / "review_feedback")
     latest_issues = _read_json(feedback_files[-1]).get("issues", []) if feedback_files else []
-    active_issues = load_active_issue_records_from_ledger(atomic)
-    ledger_file = atomic / "_meta" / "issue_ledger.json"
-    latest_feedback_file = feedback_files[-1] if feedback_files else None
-    ledger_is_fresh = (
-        active_issues is not None
-        and (
-            latest_feedback_file is None
-            or not latest_feedback_file.is_file()
-            or ledger_file.stat().st_mtime >= latest_feedback_file.stat().st_mtime
-        )
-    )
-    if ledger_is_fresh:
-        latest_issues = active_issues
     last_activity = _find_last_activity(atomic, run_dir)
     current_step = _load_current_step_checkpoint(atomic)
     step_history = _collect_step_checkpoints(atomic)
@@ -1614,7 +1565,6 @@ def inspect_files(workspace_root: str | Path, limit: int = 1200) -> list[dict[st
         add(atomic / "_meta" / "abnormal_exit.json", atomic, "Meta")
         add(atomic / "_meta" / "result_relations_manifest.json", atomic, "Meta / Result Manifests")
         add(atomic / "_meta" / "results_manifest.json", atomic, "Meta / Result Manifests")
-        add(atomic / "_meta" / "coverage_ledger.json", atomic, "Meta / Result Manifests")
         add_glob(atomic / "_meta" / "reflections", "*.json", atomic, "Meta / Reflections")
         add_glob(atomic / "_meta" / "review_summaries", "*.json", atomic, "Meta / Review Summaries")
         add_glob(atomic / "_meta" / "cycle_metrics", "*.json", atomic, "Meta / Cycle Metrics")

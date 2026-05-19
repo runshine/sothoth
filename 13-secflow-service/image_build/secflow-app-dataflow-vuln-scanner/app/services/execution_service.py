@@ -1509,11 +1509,13 @@ class ExecutionService:
                 detail="output_dir is not supported by run_vuln_scan.py launcher; final outputs are written to the task output directory",
             )
         data_flow_path = self._resolve_dataflow_input_ref(project_id=project_id, ref=data_flow_ref, expected="data_flow")
-        if not data_flow_path.is_file():
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected file but got: {data_flow_path}")
+        if not (data_flow_path.is_dir() or data_flow_path.is_file()):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {data_flow_path}")
         source_dir_path = self._resolve_dataflow_input_ref(project_id=project_id, ref=source_dir_ref, expected="source_dir")
         if not source_dir_path.is_dir():
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {source_dir_path}")
+        from run_vuln_scan import data_flow_manifest_input
+        data_flow_manifest = data_flow_manifest_input(data_flow_path)
         runs_root = self._resolve_dataflow_cli_runs_root(project_id=project_id, request=request)
         options = request.get("options") if isinstance(request.get("options"), dict) else {}
         run_name = self._build_dataflow_cli_run_name(
@@ -1530,7 +1532,9 @@ class ExecutionService:
             "runs_root": abs_path(runs_root),
             "run_dir": abs_path(run_dir),
             "task_md_path": abs_path(task_md_path),
-            "data_flow_file": abs_path(data_flow_path),
+            "data_flow_input": abs_path(data_flow_path),
+            "data_flow_dir": data_flow_manifest["data_flow_dir"],
+            "data_flow_files": data_flow_manifest["data_flow_files"],
             "source_dir": abs_path(source_dir_path),
         }
 
@@ -1562,14 +1566,15 @@ class ExecutionService:
             input_manifest["input"] = {"resume_run_dir": plan.get("resume_run_dir")}
         else:
             from run_vuln_scan import generate_task_md
-            task_content = generate_task_md(plan["data_flow_file"], plan["source_dir"]).strip() + "\n"
+            task_content = generate_task_md(plan["data_flow_input"], plan["source_dir"]).strip() + "\n"
             write_text(
                 task_md_path,
                 task_content,
             )
             import hashlib
             input_manifest["input"] = {
-                "data_flow_file": plan.get("data_flow_file"),
+                "data_flow_dir": plan.get("data_flow_dir"),
+                "data_flow_files": plan.get("data_flow_files") or [],
                 "source_dir": plan.get("source_dir"),
             }
             input_manifest["prompt"].update({
@@ -1615,7 +1620,7 @@ class ExecutionService:
 
         argv = [
             "--data-flow",
-            plan["data_flow_file"],
+            plan["data_flow_input"],
             "--source-dir",
             plan["source_dir"],
             "--runs-root",
@@ -1708,6 +1713,8 @@ class ExecutionService:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="dataflow scan request is incomplete")
 
         source_data_flow = self._resolve_dataflow_input_ref(project_id=project_id, ref=data_flow_ref, expected="data_flow")
+        if not (source_data_flow.is_dir() or source_data_flow.is_file()):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {source_data_flow}")
         source_source_dir = self._resolve_dataflow_input_ref(project_id=project_id, ref=source_dir_ref, expected="source_dir")
         workspace_base = None
         output_base = None
@@ -1729,17 +1736,22 @@ class ExecutionService:
         if workspace_base is not None and effective_output_base is None:
             effective_output_base = workspace_base / "output"
         scan_input_dir = ensure_dir(materialized_input_dir / "dataflow_scan")
-        data_flow_name = sanitize_name(str(data_flow_ref.get("filename") or source_data_flow.name or "data_flow.md"))
-        data_flow_target = scan_input_dir / "data_flow" / data_flow_name
+        data_flow_target = scan_input_dir / "data_flow"
         source_target = scan_input_dir / "source"
-        self._copy_ref_to_target(source_path=source_data_flow, target_path=data_flow_target, expected="file")
+        if source_data_flow.is_file():
+            data_flow_target = data_flow_target / sanitize_name(str(data_flow_ref.get("filename") or source_data_flow.name or "data_flow.md"))
+            self._copy_ref_to_target(source_path=source_data_flow, target_path=data_flow_target, expected="file")
+        else:
+            self._copy_ref_to_target(source_path=source_data_flow, target_path=data_flow_target, expected="directory")
         self._copy_ref_to_target(source_path=source_source_dir, target_path=source_target, expected="directory")
 
-        from run_vuln_scan import generate_task_md
+        from run_vuln_scan import data_flow_manifest_input, generate_task_md
 
         generated_markdown = generate_task_md(abs_path(data_flow_target), abs_path(source_target))
+        materialized_data_flow = data_flow_manifest_input(data_flow_target)
         materialized = {
-            "data_flow_file": abs_path(data_flow_target),
+            "data_flow_dir": materialized_data_flow["data_flow_dir"],
+            "data_flow_files": materialized_data_flow["data_flow_files"],
             "source_dir": abs_path(source_target),
             "original_data_flow": data_flow_ref,
             "original_source_dir": source_dir_ref,
@@ -2998,29 +3010,6 @@ class ExecutionService:
 
         startup_grace = self._process_start_grace_seconds()
         base["startup_grace_seconds"] = startup_grace
-        if run_status in _ACTIVE_RUN_INDEX_STATUSES or trigger_status in _ACTIVE_RUN_INDEX_STATUSES or execution_status in _ACTIVE_RUN_INDEX_STATUSES:
-            started_at = None
-            if execution is not None:
-                started_at = execution.process_started_at or execution.started_at or started_at
-            if started_at is None and trigger is not None:
-                started_at = trigger.started_at
-            if started_at is not None:
-                started_age = int(max((checked_at - started_at).total_seconds(), 0))
-                base["started_age_seconds"] = started_age
-                if started_age <= startup_grace:
-                    base.update(
-                        {
-                            "can_retry": False,
-                            "is_running": True,
-                            "display_status": "starting",
-                            "display_label": "启动中",
-                            "severity": "info",
-                            "reason": "Run 刚进入运行态，等待进程注册或心跳落盘",
-                            "source": "startup_grace",
-                        }
-                    )
-                    return base
-
         process_payload = self._read_run_process_file(run_index.run_root_path)
         if process_payload:
             heartbeat_at = self._parse_process_timestamp(
@@ -3064,6 +3053,29 @@ class ExecutionService:
                     }
                 )
                 return base
+
+        if run_status in _ACTIVE_RUN_INDEX_STATUSES or trigger_status in _ACTIVE_RUN_INDEX_STATUSES or execution_status in _ACTIVE_RUN_INDEX_STATUSES:
+            started_at = None
+            if execution is not None:
+                started_at = execution.process_started_at or execution.started_at or started_at
+            if started_at is None and trigger is not None:
+                started_at = trigger.started_at
+            if started_at is not None:
+                started_age = int(max((checked_at - started_at).total_seconds(), 0))
+                base["started_age_seconds"] = started_age
+                if started_age <= startup_grace:
+                    base.update(
+                        {
+                            "can_retry": False,
+                            "is_running": True,
+                            "display_status": "starting",
+                            "display_label": "启动中",
+                            "severity": "info",
+                            "reason": "Run 刚进入运行态，等待进程注册或心跳落盘",
+                            "source": "startup_grace",
+                        }
+                    )
+                    return base
 
         if run_status in _ACTIVE_RUN_INDEX_STATUSES or trigger_status in _ACTIVE_RUN_INDEX_STATUSES or execution_status in _ACTIVE_RUN_INDEX_STATUSES:
             base.update(

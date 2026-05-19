@@ -34,12 +34,10 @@ def _is_profile_gate_issue(issue: dict[str, Any]) -> bool:
     blocking_type = str(issue.get("blocking_type") or "").strip().lower()
     return (
         issue_id.startswith("PROFILE-")
-        or category == "coverage_gate"
+        or category == "profile_evidence_gate"
         or blocking_type
         in {
-            "coverage_obligation_open",
             "summary_only_evidence",
-            "coverage_ledger_under_extracted",
             "metadata_sync",
         }
     )
@@ -61,7 +59,6 @@ def _profile_gate_summary(
         "框架范围验收硬门槛未通过" in feedback
         or "[profile_min_discovery_cycles]" in feedback
         or "PROFILE-" in feedback
-        or "coverage gate" in feedback.lower()
     )
     failed = (not global_passed) and (bool(profile_issues) or (advisors_all_passed and feedback_mentions_gate))
     status = "failed" if failed else "passed" if global_passed else "not_applicable"
@@ -397,6 +394,7 @@ class ExecutionRecorder:
         issues: list[dict] | None = None,
         plateau_status: dict | None = None,
         global_advisor_results: list[dict] | None = None,
+        vulnerability_status: dict | None = None,
     ) -> None:
         """
         记录每轮评审汇总
@@ -442,6 +440,7 @@ class ExecutionRecorder:
                     {"filename": f["filename"], "reason_preview": f["reason"][:200]}
                     for f in failed_results
                 ],
+                "vulnerability_status": vulnerability_status or {},
             },
             "plateau_status": plateau_status or {},
             "outcome": ("all_passed" if (global_passed and len(failed_results) == 0)

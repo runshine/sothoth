@@ -301,7 +301,7 @@ workflow-framework/
 │   ├── vuln_scan/                    # ★ 漏洞挖掘专用 prompts
 │   │   ├── worker_system.md          #   Worker 人设
 │   │   ├── worker_user.md            #   初始挖掘指令模板
-│   │   ├── worker_rework.md          #   返工/closure 指令模板
+│   │   ├── worker_rework_missed_hunt.md # 返工漏报补扫
 │   │   ├── reflect_completeness.md   #   自我反思
 │   │   ├── summary.md                #   总结输出格式
 │   │   ├── global_review_completeness_sys.md  # 全面性评审标准
@@ -376,8 +376,8 @@ python -m src.main --config <path> [--keep-workspace | --clean-workspace] [--log
 └──────┬───────┘    ③ 自我反思 (覆盖度/深度/质量自检)                │  results/     │
        │            ④ 总结 (写 summary.md + results/*.md)           │   result_*.md │
        ▼            ⑤ 全局评审 (整体质量检查)                       └───────────────┘
-  run_vuln_scan.py  ⑥ 结果评审 (逐个漏洞误报检测)                   ┌───────────────┐
-                    ⑦ 不通过? → 注入反馈回②, 最多 N 轮              │ run.log       │
+  run_vuln_scan.py  ⑥ 结果评审 (逐个漏洞真实性验证并更新漏洞列表)     ┌───────────────┐
+                    ⑦ 全局评审不通过? → 围绕漏报/深度缺口回②        │ run.log       │
                     ⑧ 结束插件 (归档 → 收集 → 生成下阶段任务)        └───────────────┘
 ```
 
@@ -395,7 +395,7 @@ python -m src.main --config <path> [--keep-workspace | --clean-workspace] [--log
 | 全局评审 | summary + 所有结果 | 数据流覆盖度、源码分析深度、报告完整性 |
 | 结果评审 | 每个 result_NNN.md | 代码证据、数据流路径、触发条件、影响评估 |
 
-评审员会尝试**证伪**每个漏洞报告。只有经过证伪仍成立的发现才能通过。
+评审员会尝试**证伪**每个漏洞报告，并由框架写入 `_meta/vulnerability_list.json`：`pending_review`（待评审）、`confirmed`（确认）、`false_positive`（误报）。误报判定只由结果评审 agent 完成；后续 Rework 不再修复旧漏洞报告，而是只关注全局评审指出的新漏洞/漏报挖掘方向。
 
 ---
 
@@ -426,7 +426,8 @@ vuln_scan_initial_001/
 │
 ├── final_output/                   ★ 干净的最终产出目录
 │   ├── summary.md                     综合工作报告 + 漏洞汇总
-│   ├── results/                       漏洞详细报告
+│   ├── vulnerability_list.json        最终漏洞状态列表
+│   ├── results/                       已确认漏洞详细报告
 │   │   ├── result_001.md
 │   │   ├── result_002.md
 │   │   └── ...
@@ -436,6 +437,7 @@ vuln_scan_initial_001/
 │
 ├── _meta/
 │   ├── state.json                     当前状态快照 (completed/failed)
+│   ├── vulnerability_list.json        漏洞发现状态列表 (待评审/确认/误报)
 │   ├── workflow_result.json           执行结果 (状态/轮次/错误)
 │   ├── reflections/                   Worker 自我反思记录
 │   │   └── reflect_001_*.json            每轮反思的问答
@@ -637,7 +639,9 @@ class MyRuntime(BaseAgentRuntime):
 
 - **评审对象**：`results/` 下每个 `.md` 文件
 - **执行方式**：结果间并行（默认模板已开启，默认并发上限 3，可配置）× 结果内串行
-- **默认**：`re_review_on_cycle: false`（已通过不重审）
+- **默认**：`re_review_on_cycle: false`（已确认/已标误报且文件指纹未变则不重审）
+- 业务结论写回漏洞列表：`CONFIRMED` → 确认，`FALSE_POSITIVE` → 误报，`INSUFFICIENT_INFO` → 保持待评审/证据不足。
+- `FALSE_POSITIVE` 是结果评审给出的终态标注，不再触发 Worker 误报修复。
 
 ### 评审响应解析
 

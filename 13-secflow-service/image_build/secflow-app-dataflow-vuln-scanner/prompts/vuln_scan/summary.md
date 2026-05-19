@@ -1,61 +1,40 @@
 请整理所有漏洞分析结果，尤其是数据流驱动漏洞分析结果，生成稳定、可评审、可下游消费的最终总结。
 
 ## 当前轮次
+
 Cycle {cycle}
 
 ## 当前执行上下文
+
 {summary_runtime_context}
 
 ## 输出位置
 {output_contract_text}
 
-## 本轮额外规则
-{summary_rework_rules}
-
-## 评审反馈上下文
-{summary_feedback_context}
 
 ## 执行要求
-1. 直接整理工作目录中的正式产物，不要依赖中间对话内容。
-2. 本阶段接管 `summary.md` 与 `previous_limitations.md`；前序 Worker/Reflection 主要负责 `results/` 与 `supporting_docs/`。
-3. 不要在 summary 阶段新增、删除、重编号或重写 `results/result_NNN.md`，除非当前评审明确要求结果修复。
-4. 不要把辅助文档写进 `results/`，不要把结果写进 `sessions/` 或 `calls/`。
+直接整理工作目录中的正式产物，不要依赖中间对话内容。
 
-## summary.md 固定章节 contract
-将 `{summary_file}` 写成 7 个固定章节，标题编号和名称必须一致：
-1. `## 1. 攻击面分析`
-2. `## 2. 分析覆盖度`
-   - 必须包含 `### 2.1 Coverage Closure Matrix`
-   - 必须包含 `### 2.2 Open / Residual Obligations`
-3. `## 3. EXPORT 跟入汇总`
-4. `## 4. 关键发现验证`
-5. `## 5. 漏洞汇总表`
-6. `## 6. 风险评估与修复建议`
-7. `## 7. 局限性与未覆盖区域`
+## summary.md 固定章节模板
 
-## 表格字段 contract
-- Coverage Closure Matrix 字段：`obligation_id / 类型 / 对象 / 数据流来源 / status / evidence / residual/限制`。
-- EXPORT 跟入汇总字段：`EXPORT/函数 / 数据流来源 / 跟入结论 / status / evidence / residual/限制`。
-- 关键发现验证字段：`★/发现 / 源码验证结论 / status / evidence / residual/限制`。
-- 漏洞汇总表字段：`result_file / title / CWE/category / severity / confidence / 数据流绑定 / 状态 / 备注`。
-- 局限性表字段：`项目 / 类型 / 原因 / residual status / 人工验收条件`。
+请将 {summary_file} 写成以下结构，章节标题必须保留编号和名称：
 
-## Coverage / issue 状态要求
-- status 只能使用：`source_closed`、`promoted_to_result`、`accepted_residual`、`unused`、`not_applicable`、`external_blocked`。
-- evidence 必须指向 `results/*.md`、`supporting_docs/*.md` 或 summary 具体章节；不要只写“已分析”。
-- 对 active issue backlog 中每个 issue，summary.md 或 supporting_docs 必须明确写出关闭状态和证据。
-- `previous_limitations.md` 必须与第 7 节同步，且不得静默删除上一轮 residual；若已闭环，写明闭环依据。
+```
+{summary_section_template}
+```
 
 ## results/ 一致性要求
-- 漏洞汇总表必须与 `results/` 中的独立漏洞报告一一对应。
-- 补充/修正报告不要重复计入“有效漏洞数量”，并说明它关联哪份原报告。
-- `results/` 目录只允许保留 `result_NNN.md`；辅助材料必须在 `supporting_docs/`。
+
+`漏洞汇总表`必须与 results/ 中的独立漏洞报告一一对应；若某个 result_NNN.md 只是对已存在漏洞的补充/修正，不要在“有效漏洞数量”里重复计数。
+若存在补充/修正报告，请在该文件开头明确写出 - 原始报告: result_NNN.md 与 - 本报告性质: 补充分析/修正，并在 summary 中说明它关联哪份原报告。
+results/ 目录只允许保留 result_NNN.md；辅助材料必须在 supporting_docs/。{summary_limitations_requirement}
+## 本阶段核心目标
+
+生成完整、准确、结构化的总结文档。
+确保 summary.md 与 results/、supporting_docs/ 内容一致。
+
 
 ## 输出前自检
-- [ ] `summary.md` 严格包含 7 个固定章节标题
-- [ ] Coverage / EXPORT / 关键发现 / 漏洞汇总 / 局限性表字段完整
-- [ ] status 只使用允许枚举
-- [ ] `results/` 中只包含 `result_NNN.md`
-- [ ] `supporting_docs/` 中只包含辅助审计文档
-- [ ] `previous_limitations.md` 已与 summary 第 7 节同步
-- [ ] active issue backlog 每项都有明确状态与 evidence
+[ ] summary.md 严格包含 {summary_section_count} 个固定章节标题
+[ ] results/ 中只包含 result_NNN.md
+[ ] supporting_docs/ 中只包含辅助审计文档

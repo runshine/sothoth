@@ -693,7 +693,6 @@ def _normalize_issue(item: Any) -> dict[str, Any]:
         or item.get("externalDependency")
         or ""
     ).strip()
-    max_retries = item.get("max_retries_for_same_issue") or item.get("maxRetriesForSameIssue")
     if not any([issue_id, category, target, required_action, detail, owner, actionable_by]):
         return {}
 
@@ -717,11 +716,6 @@ def _normalize_issue(item: Any) -> dict[str, Any]:
         normalized["acceptance_criteria"] = acceptance_criteria
     if external_dependency:
         normalized["external_dependency"] = external_dependency
-    if max_retries is not None:
-        try:
-            normalized["max_retries_for_same_issue"] = int(max_retries)
-        except (TypeError, ValueError):
-            normalized["max_retries_for_same_issue"] = str(max_retries).strip()
     return normalized
 
 

@@ -40,7 +40,6 @@ from app.services.run_inspector import (
     inspect_run_summary,
     inspect_session_file,
     inspect_sessions,
-    load_active_issue_records_from_ledger,
 )
 from app.time_utils import UTC_PLUS_8, ensure_local, isoformat_local, now_local
 
@@ -260,7 +259,6 @@ def _compute_source_mtime_hint(run_root: Path, atomic_work_path: str | None = No
             atomic / "_meta" / "workflow_result.json",
             atomic / "_meta" / "results_manifest.json",
             atomic / "_meta" / "result_relations_manifest.json",
-            atomic / "_meta" / "coverage_ledger.json",
             atomic / "_meta" / "review_summaries",
             atomic / "_meta" / "review_feedback",
             atomic / "_meta" / "cycle_metrics",
@@ -1506,10 +1504,6 @@ class RunIndexService:
                 command = cli_payload.get("command") if isinstance(cli_payload.get("command"), list) else []
                 command_display = str(cli_payload.get("command_display") or "")
         latest_issues = _load_externalized_list_payload(run_index.run_root_path, run_index.latest_issues_json)
-        if run_index.atomic_work_path and not _run_index_is_active(run_index):
-            active_issues = load_active_issue_records_from_ledger(run_index.atomic_work_path)
-            if active_issues is not None:
-                latest_issues = active_issues
         try:
             file_payloads = inspect_files(run_index.run_root_path, limit=1200)
         except HTTPException:

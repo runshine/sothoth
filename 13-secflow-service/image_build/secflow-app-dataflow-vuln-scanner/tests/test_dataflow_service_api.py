@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -496,9 +497,11 @@ def test_business_dataflow_task_materializes_inputs_and_runs(service_config_path
 
     case_root = Path(project_root) / "files" / "default" / "case-a"
     source_dir = case_root / "source"
+    data_flow_dir = case_root / "data_flow"
     source_dir.mkdir(parents=True, exist_ok=True)
+    data_flow_dir.mkdir(parents=True, exist_ok=True)
     (source_dir / "demo.c").write_text("int demo(char *p) { return p[0]; }\n", encoding="utf-8")
-    (case_root / "data_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
+    (data_flow_dir / "data_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
 
     app = create_app()
     client = TestClient(app)
@@ -510,7 +513,7 @@ def test_business_dataflow_task_materializes_inputs_and_runs(service_config_path
             "project_id": "default",
             "profile_id": profile["profile_id"],
             "title": "business scan",
-            "data_flow": {"source": "project_filesystem", "path": "/case-a/data_flow.md"},
+            "data_flow": {"source": "project_filesystem", "path": "/case-a/data_flow"},
             "source_dir": {"source": "project_filesystem", "path": "/case-a/source"},
             "model": "mock/model",
             "thinking": "medium",
@@ -529,7 +532,8 @@ def test_business_dataflow_task_materializes_inputs_and_runs(service_config_path
     cli_plan = payload["task_metadata"]["dataflow_cli"]
     expected_run_name = "business-scan"
     assert cli_plan["launcher"] == "run_vuln_scan.py"
-    assert cli_plan["data_flow_file"] == str((case_root / "data_flow.md").resolve())
+    assert cli_plan["data_flow_dir"] == str(data_flow_dir.resolve())
+    assert cli_plan["data_flow_files"] == [str((data_flow_dir / "data_flow.md").resolve())]
     assert cli_plan["source_dir"] == str(source_dir.resolve())
     assert Path(cli_plan["run_dir"]).parent.name == "secflow-app-dataflow-vuln-scanner"
     assert cli_plan["run_name"] == expected_run_name
@@ -548,11 +552,15 @@ def test_business_dataflow_task_materializes_inputs_and_runs(service_config_path
     run_payload = run_detail.json()
     assert run_payload["config"]["thinking"] == ""
     assert "run_vuln_scan.py" in run_payload["command_display"]
-    assert "--model mock/model" in run_payload["command_display"]
+    assert "--model mock/model" in run_payload["command_display"] or "--config " in run_payload["command_display"]
     assert f"--run-name {expected_run_name}" in run_payload["command_display"]
     assert "--timeout-max-retries 3" in run_payload["command_display"]
     assert "--timeout-retry-interval-seconds 30" in run_payload["command_display"]
     assert run_payload["raw"]["dataflow_cli"]["command_display"] == run_payload["command_display"]
+    input_manifest = json.loads((Path(cli_plan["run_dir"]) / "input" / "input_manifest.json").read_text(encoding="utf-8"))
+    assert input_manifest["input"]["data_flow_dir"] == str(data_flow_dir.resolve())
+    assert input_manifest["input"]["data_flow_files"] == [str((data_flow_dir / "data_flow.md").resolve())]
+    assert "data_flow_file" not in input_manifest["input"]
 
     run_files = client.get(f"/api/dataflow-vuln-scanner/runs/{run_resolve.json()['run_id']}/files")
     assert run_files.status_code == 200

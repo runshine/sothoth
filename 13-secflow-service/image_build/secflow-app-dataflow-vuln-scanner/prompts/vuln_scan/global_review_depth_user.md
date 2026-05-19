@@ -12,7 +12,7 @@
 
 ## Worker 漏洞挖掘清单基线
 若需核对 Worker 的稳定角色/输出契约，请 `read` 此文件：`{worker_system_prompt_file}`。
-实际漏洞模式广度由本轮范围动态裁剪，已在下方评审上下文的范围要求与 Coverage / issue radar 中体现；不要机械要求超出本轮范围的全量清单。
+实际漏洞模式广度由本轮范围动态裁剪，已在下方评审上下文的范围要求和近期评审反馈中体现；不要机械要求超出本轮范围的全量清单。
 
 ## 当前评审上下文
 {review_context}
@@ -27,7 +27,7 @@
 
 ## 审计任务
 1. 核对 Worker 是否对最可能产出真实漏洞的关键路径做了相关漏洞模式扫描。
-2. 若当前是 closure 模式，只检查仍影响漏洞真实性、漏报风险或误报风险的 active issues / coverage signals。
+2. 若当前是 closure 模式，只检查仍影响漏洞真实性、漏报风险或误报风险的 active issues。
 3. 判断关键校验是否做了绕过分析（边界值、符号混用、竞争条件）。
 4. 判断 EXPORT 跟入后是否继续下钻到危险使用点、可信边界或重要 residual。
 5. 判断代码证据是否充分（源码片段、完整路径、字段级触发条件）。
@@ -59,5 +59,5 @@
 - `passed=false` 时 `verdict` 必须是 `FAIL`，并尽量返回结构化 `issues`
 - 每个 issue 必须标注 `actionable_by`：需要继续分析/补证据填 `worker`；只需整理 summary/limitations/supporting_docs 填 `summary`；框架生成文件、schema、只读契约或 advisor 运行问题填 `framework`
 - 每个 issue 必须标注 `blocking_type` 与 `acceptance_criteria`；若受外部源码/上下文限制不可闭环，使用 `blocking_type=needs_external_source`
-- 不要因普通 open obligation、coverage 数字、supporting_docs 数量、报告格式或低收益文档缺失判失败
+- 不要因普通覆盖数字、supporting_docs 数量、报告格式或低收益文档缺失判失败
 - 不要写任何文件

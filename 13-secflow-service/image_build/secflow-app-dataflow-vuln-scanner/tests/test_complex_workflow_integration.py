@@ -161,6 +161,7 @@ class ComplexWorkflowRuntime(BaseAgentRuntime):
                     "verdict": "PASS",
                     "feedback": f"Cycle {cycle} global review pass",
                     "scores": {
+                        "coverage": 1.0,
                         "input_coverage": 1.0,
                         "export_followthrough": 1.0,
                         "used_coverage": 1.0,
@@ -182,6 +183,7 @@ class ComplexWorkflowRuntime(BaseAgentRuntime):
                 "verdict": "PASS",
                 "feedback": "default advisor pass",
                 "scores": {
+                    "coverage": 1.0,
                     "input_coverage": 1.0,
                     "export_followthrough": 1.0,
                     "used_coverage": 1.0,
@@ -221,7 +223,7 @@ class ComplexWorkflowRuntime(BaseAgentRuntime):
 
 
 @pytest.mark.asyncio
-async def test_complex_rework_workflow_preserves_passed_results_and_backs_up_deleted_reports(
+async def test_complex_workflow_tracks_false_positive_without_worker_rework(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -249,7 +251,7 @@ async def test_complex_rework_workflow_preserves_passed_results_and_backs_up_del
     artifacts = await run_framework_config(config)
 
     assert artifacts.result.success is True
-    assert len(artifacts.result.final_tasks) == 2
+    assert len(artifacts.result.final_tasks) == 1
 
     atomic_dir = (
         Path(config.global_config.workspace_root)
@@ -259,66 +261,43 @@ async def test_complex_rework_workflow_preserves_passed_results_and_backs_up_del
     )
     results_dir = atomic_dir / "results"
     final_output_dir = atomic_dir / "final_output"
-    supporting_docs_dir = atomic_dir / "supporting_docs"
-    removed_dir = atomic_dir / "removed_results" / "cycle_002"
 
     assert sorted(p.name for p in results_dir.glob("result_*.md")) == [
+        "result_001.md",
         "result_002.md",
-        "result_003.md",
     ]
+    assert (results_dir / "result_001.md").read_text(encoding="utf-8") == "# false positive report cycle1\n"
     assert (results_dir / "result_002.md").read_text(encoding="utf-8") == "# passed report cycle1\n"
-    assert (results_dir / "result_003.md").read_text(encoding="utf-8") == (
-        "# new report created by overwriting protected file\n"
-    )
 
-    assert (supporting_docs_dir / "REMOVED.md").read_text(encoding="utf-8") == (
-        "# removed audit log\n\n- result_001.md removed as false positive\n"
-    )
-    assert (supporting_docs_dir / "USED_ENDPOINTS.md").read_text(encoding="utf-8") == (
-        "# used endpoints appendix\n\n- endpoint-001 safe\n"
-    )
-
-    assert (removed_dir / "result_001.md").read_text(encoding="utf-8") == "# false positive report cycle1\n"
-    removed_meta = json.loads((removed_dir / "result_001.json").read_text(encoding="utf-8"))
-    assert removed_meta["original_filename"] == "result_001.md"
-    assert removed_meta["removed_in_cycle"] == 2
-    assert removed_meta["reason"] == "误报，已从最终结果删除"
+    assert not (atomic_dir / "removed_results").exists()
 
     assert sorted(p.name for p in (final_output_dir / "results").glob("result_*.md")) == [
         "result_002.md",
-        "result_003.md",
     ]
-    assert sorted(p.name for p in (final_output_dir / "supporting_docs").glob("*.md")) == [
-        "REMOVED.md",
-        "USED_ENDPOINTS.md",
+    assert sorted(p.name for p in (final_output_dir / "false_positive_results").glob("result_*.md")) == [
+        "result_001.md",
     ]
-    assert (final_output_dir / "removed_results" / "cycle_002" / "result_001.md").exists()
 
     final_output_index = json.loads((final_output_dir / "index.json").read_text(encoding="utf-8"))
-    assert "supporting_docs/REMOVED.md" in final_output_index["files"]
-    assert "supporting_docs/USED_ENDPOINTS.md" in final_output_index["files"]
-    assert "removed_results/cycle_002/result_001.md" in final_output_index["files"]
-    assert "removed_results/cycle_002/result_001.json" in final_output_index["files"]
+    assert "results/result_002.md" in final_output_index["files"]
+    assert "false_positive_results/result_001.md" in final_output_index["files"]
+    assert final_output_index["vulnerability_status"]["confirmed_files"] == ["result_002.md"]
+    assert final_output_index["vulnerability_status"]["false_positive_files"] == ["result_001.md"]
 
     next_tasks = json.loads((atomic_dir / "output" / "next_tasks.json").read_text(encoding="utf-8"))
-    assert [task["id"] for task in next_tasks["tasks"]] == ["result_002", "result_003"]
+    assert [task["id"] for task in next_tasks["tasks"]] == ["result_002"]
 
     cycle_001 = json.loads((atomic_dir / "_meta" / "review_summaries" / "cycle_001.json").read_text(encoding="utf-8"))
-    cycle_002 = json.loads((atomic_dir / "_meta" / "review_summaries" / "cycle_002.json").read_text(encoding="utf-8"))
     cycle_001_metrics = json.loads((atomic_dir / "_meta" / "cycle_metrics" / "cycle_001.json").read_text(encoding="utf-8"))
-    cycle_002_metrics = json.loads((atomic_dir / "_meta" / "cycle_metrics" / "cycle_002.json").read_text(encoding="utf-8"))
-    assert cycle_001["outcome"] == "results_failed"
-    assert cycle_001["result_review"]["failed_files"][0]["filename"] == "result_001.md"
-    assert cycle_002["outcome"] == "all_passed"
-    assert sorted(cycle_002["result_review"]["passed_files"]) == ["result_002.md", "result_003.md"]
-    assert cycle_001_metrics["current_failed_result_count"] == 1
+    assert cycle_001["outcome"] == "all_passed"
+    assert cycle_001["result_review"]["passed_files"] == ["result_002.md"]
+    assert cycle_001["result_review"]["failed_files"] == []
+    assert cycle_001["result_review"]["vulnerability_status"]["false_positive_files"] == ["result_001.md"]
+    assert cycle_001_metrics["current_failed_result_count"] == 0
     assert cycle_001_metrics["historical_removed_result_count"] == 0
-    assert cycle_002_metrics["current_failed_result_count"] == 0
-    assert cycle_002_metrics["historical_removed_result_count"] == 1
-    assert cycle_002_metrics["unreviewed_new_result_count"] == 0
+    assert cycle_001_metrics["false_positive_result_count"] == 1
+    assert cycle_001_metrics["unreviewed_new_result_count"] == 0
 
     summary_text = (atomic_dir / "summary.md").read_text(encoding="utf-8")
-    assert "result_003.md" in summary_text
-    assert "supporting_docs/REMOVED.md" in summary_text
-    assert "supporting_docs/USED_ENDPOINTS.md" in summary_text
-    assert "result_001.md" not in summary_text
+    assert "result_001.md" in summary_text
+    assert "result_002.md" in summary_text

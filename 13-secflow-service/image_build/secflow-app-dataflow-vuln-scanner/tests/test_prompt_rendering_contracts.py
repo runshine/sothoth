@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 
 import pytest
@@ -190,7 +189,7 @@ def test_pipeline_worker_prompt_receives_task_alias(tmp_path: Path) -> None:
     assert str(work_dir) in prompt
 
 
-def test_summary_or_ledger_issue_enters_rework_prompt(tmp_path: Path) -> None:
+def test_summary_issue_enters_rework_prompt(tmp_path: Path) -> None:
     task_file = tmp_path / "task.md"
     task_file.write_text("# scan task\n", encoding="utf-8")
     work_dir = tmp_path / "work"
@@ -207,7 +206,7 @@ def test_summary_or_ledger_issue_enters_rework_prompt(tmp_path: Path) -> None:
         cycle=2,
         review_mode="closure",
         failed_result_items=[],
-        plateau_reason="结果评审已通过，剩余问题集中在 summary/ledger 同步",
+        plateau_reason="结果评审已通过，剩余问题集中在 summary 同步",
     )
     state = ReviewState()
     state.workflow_mode = "closure"
@@ -218,11 +217,11 @@ def test_summary_or_ledger_issue_enters_rework_prompt(tmp_path: Path) -> None:
         scores={"report_completeness": 0.6},
         issues=[
             {
-                "id": "summary-ledger-sync",
+                "id": "summary-sync",
                 "category": "report_completeness",
                 "target": "summary.md",
                 "severity": "high",
-                "required_action": "同步 summary.md 与 coverage ledger",
+                "required_action": "同步 summary.md 与 supporting_docs",
                 "actionable_by": "summary",
             }
         ],
@@ -236,7 +235,7 @@ def test_summary_or_ledger_issue_enters_rework_prompt(tmp_path: Path) -> None:
 
     assert "第 2 轮评审返工" in prompt
     assert "summary 漏洞汇总表没有同步 supporting docs" in prompt
-    assert "本轮主要为 summary/ledger handoff" in prompt
+    assert "本轮主要为 summary handoff" in prompt
     assert "只补充后续 summary 阶段需要的 `supporting_docs/` 证据" in prompt
     assert "不要新增、删除、重写或重新编号 `results/result_NNN.md`" in prompt
 
@@ -248,12 +247,12 @@ def test_configured_rework_prompt_template_is_used(tmp_path: Path) -> None:
     results_dir = work_dir / "results"
     results_dir.mkdir(parents=True)
     (results_dir / "result_001.md").write_text("# old result\n", encoding="utf-8")
-    rework_prompt = tmp_path / "worker_rework.md"
+    rework_prompt = tmp_path / "custom_rework.md"
     rework_prompt.write_text(
         "REWORK TEMPLATE {cycle}\n"
         "{active_issue_backlog}\n"
         "{failed_result_reasons}\n"
-        "{coverage_context}\n",
+        "{issue_hypothesis_queue}\n",
         encoding="utf-8",
     )
     wf = _workflow_with_worker_prompt(
@@ -298,7 +297,7 @@ def test_configured_rework_prompt_template_is_used(tmp_path: Path) -> None:
     assert "worker-gap" in prompt
     assert "result_001.md" in prompt
     assert "needs stronger source evidence" in prompt
-    assert "Coverage / issue radar" in prompt
+    assert "Worker-actionable issue hypotheses" in prompt
 
 
 def test_default_rework_prompt_is_incremental_for_shared_worker_session(tmp_path: Path) -> None:
@@ -306,35 +305,12 @@ def test_default_rework_prompt_is_incremental_for_shared_worker_session(tmp_path
     task_file.write_text("# scan task\n", encoding="utf-8")
     work_dir = tmp_path / "work"
     results_dir = work_dir / "results"
-    meta_dir = work_dir / "_meta"
     results_dir.mkdir(parents=True)
-    meta_dir.mkdir(parents=True)
     (results_dir / "result_001.md").write_text("# passed\n", encoding="utf-8")
     (results_dir / "result_002.md").write_text("# failed\n", encoding="utf-8")
-    (meta_dir / "coverage_ledger.json").write_text(
-        json.dumps(
-            {
-                "coverage_obligations": {
-                    "open_entries": [
-                        {
-                            "id": "USED:danger_len",
-                            "kind": "used",
-                            "label": "USED",
-                            "value": "danger_len@L42",
-                            "risk": "high",
-                            "status": "open",
-                        }
-                    ]
-                }
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
     wf = _workflow_with_worker_prompt(
         Path("prompts/vuln_scan/worker_user.md"),
         Path("prompts/vuln_scan/summary.md"),
-        rework_prompt=Path("prompts/vuln_scan/worker_rework.md"),
     )
     ctx = WorkflowContext(
         workflow_id="wf",
@@ -376,19 +352,19 @@ def test_default_rework_prompt_is_incremental_for_shared_worker_session(tmp_path
         state,
     )
 
-    assert "Worker 的所有 cycle 共用同一个 session" in prompt
+    assert "共用同一个 Worker session" in prompt
     assert "本轮增量目标队列" in prompt
-    assert "### P0 failed results" in prompt
+    assert "### P0 failed results" not in prompt
     assert "### P1 worker active issues" in prompt
-    assert "### P2 coverage targets" in prompt
-    assert "Summary / Ledger handoff" in prompt
+    assert "后续 summary 阶段统一整理" in prompt
     assert "summary-table-sync" in prompt
-    assert "不要求本轮关闭全部 open obligations" in prompt
+    assert "不要继续扩张到队列之外" in prompt
     assert "只处理失败 result" not in prompt
+    assert "误报压制与失败结果修复" not in prompt
     assert "不要重新通读所有历史 result/supporting_docs" in prompt
 
 
-def test_rework_triage_omits_pass_feedback_and_keeps_failed_issue_actions(tmp_path: Path) -> None:
+def test_missed_hunt_omits_pass_feedback_and_keeps_failed_issue_actions(tmp_path: Path) -> None:
     task_file = tmp_path / "task.md"
     task_file.write_text("# scan task\n", encoding="utf-8")
     work_dir = tmp_path / "work"
@@ -398,7 +374,6 @@ def test_rework_triage_omits_pass_feedback_and_keeps_failed_issue_actions(tmp_pa
     wf = _workflow_with_worker_prompt(
         Path("prompts/vuln_scan/worker_user.md"),
         Path("prompts/vuln_scan/summary.md"),
-        rework_prompt=Path("prompts/vuln_scan/worker_rework.md"),
     )
     ctx = WorkflowContext(
         workflow_id="wf",
@@ -448,15 +423,15 @@ def test_rework_triage_omits_pass_feedback_and_keeps_failed_issue_actions(tmp_pa
     prompt = executor._build_rework_stage_prompt(
         ctx=ctx,
         review_state=state,
-        prompt_file="prompts/vuln_scan/worker_rework_triage.md",
+        prompt_file="prompts/vuln_scan/worker_rework_missed_hunt.md",
     )
 
-    assert "全面性评审 FAIL issues / PASS guardrail" in prompt
+    assert "全面性评审指出的缺失范围" in prompt
     assert "CMP-export-sink-gap" in prompt
     assert "acceptance=给出 source_closed 或 promoted_to_result 的源码证据" in prompt
-    assert "深入性评审 FAIL issues / PASS guardrail" in prompt
+    assert "深入性评审指出的深挖方向" in prompt
     assert "no_action: 该 advisor 本轮通过" in prompt
-    assert "完整 feedback 不注入 rework" in prompt
+    assert "完整内容保留在 review artifacts 中" in prompt
     assert "关键路径已充分扫描" not in prompt
     assert "漏洞发现质量优秀" not in prompt
 
@@ -482,7 +457,7 @@ def test_staged_rework_sequence_uses_one_worker_session_and_checkpoints(tmp_path
                 "system_prompt": system_prompt,
             })
             return AgentResponse(
-                content="triage ok",
+                content="missed hunt ok",
                 conversation_id=session_id,
                 turn_count=len(self.messages),
                 finished=True,
@@ -517,7 +492,6 @@ def test_staged_rework_sequence_uses_one_worker_session_and_checkpoints(tmp_path
     wf = _workflow_with_worker_prompt(
         Path("prompts/vuln_scan/worker_user.md"),
         Path("prompts/vuln_scan/summary.md"),
-        rework_prompt=Path("prompts/vuln_scan/worker_rework.md"),
     )
     ctx = WorkflowContext(
         workflow_id="wf",
@@ -578,20 +552,16 @@ def test_staged_rework_sequence_uses_one_worker_session_and_checkpoints(tmp_path
 
     assert response.metadata["rework_sequence"] is True
     assert response.metadata["skip_reflection_after_worker"] is True
-    assert len(agent.messages) == 4
+    assert len(agent.messages) == 1
     assert {item["session_id"] for item in agent.messages} == {"worker-session-1"}
     assert agent.messages[0]["kind"] == "multi_turn"
-    assert all(item["kind"] == "send_message" for item in agent.messages[1:])
-    assert "全面性评审 FAIL issues / PASS guardrail" in agent.messages[0]["message"]
-    assert "误报压制与失败结果修复" in agent.messages[1]["message"]
-    assert "依据评审缺口挖掘遗漏漏洞" in agent.messages[2]["message"]
-    assert "Rework Handoff" in agent.messages[3]["message"]
+    assert "依据评审缺口挖掘遗漏漏洞" in agent.messages[0]["message"]
+    assert "Rework Handoff" not in agent.messages[0]["message"]
+    assert "全面性评审 FAIL issues / PASS guardrail" not in agent.messages[0]["message"]
+    assert "误报压制与失败结果修复" not in "\n".join(item["message"] for item in agent.messages)
 
     for step_key in (
-        "worker::rework_triage",
-        "worker::rework_fp_repair",
         "worker::rework_missed_hunt",
-        "worker::rework_handoff",
     ):
         checkpoint = load_step_checkpoint(
             work_dir,
@@ -634,7 +604,7 @@ def test_withdrawn_result_is_not_carried_into_fp_repair(tmp_path: Path) -> None:
     assert state.result_states["result_002.md"].lifecycle_status == "withdrawn"
 
 
-def test_staged_rework_routes_documentation_gap_to_handoff_only(tmp_path: Path) -> None:
+def test_staged_rework_skips_summary_only_documentation_gap(tmp_path: Path) -> None:
     class FakeWorkerAgent:
         def __init__(self) -> None:
             self.messages: list[dict[str, str]] = []
@@ -662,7 +632,6 @@ def test_staged_rework_routes_documentation_gap_to_handoff_only(tmp_path: Path) 
     wf = _workflow_with_worker_prompt(
         Path("prompts/vuln_scan/worker_user.md"),
         Path("prompts/vuln_scan/summary.md"),
-        rework_prompt=Path("prompts/vuln_scan/worker_rework.md"),
     )
     ctx = WorkflowContext(
         workflow_id="wf",
@@ -673,23 +642,23 @@ def test_staged_rework_routes_documentation_gap_to_handoff_only(tmp_path: Path) 
         review_mode="closure",
         worker_session_id="worker-session-1",
         worker_session_cycle=4,
-        plateau_reason="结果评审已通过，剩余问题集中在 summary/ledger 同步",
+        plateau_reason="结果评审已通过，剩余问题集中在 summary 同步",
     )
     state = ReviewState()
     state.workflow_mode = "closure"
     state.record_global_review_result(
         cycle=3,
         passed=False,
-        feedback="coverage ledger evidence_sources 未同步",
+        feedback="summary 与 supporting_docs 未同步",
         scores={"report_completeness": 0.8},
         advisor_id="global_completeness",
         issues=[
             {
-                "id": "CMP-ledger-sync",
-                "category": "coverage_gap",
-                "target": "_meta/coverage_ledger.json",
-                "required_action": "summary 的 coverage closure matrix 已写结论，但 coverage_ledger.json evidence_sources 为空，需要同步 ledger",
-                "actionable_by": "worker",
+                "id": "CMP-summary-sync",
+                "category": "report_completeness",
+                "target": "summary.md",
+                "required_action": "summary 的漏洞汇总表需要同步 supporting_docs 证据",
+                "actionable_by": "summary",
                 "blocking_type": "documentation_gap",
             }
         ],
@@ -707,18 +676,12 @@ def test_staged_rework_routes_documentation_gap_to_handoff_only(tmp_path: Path) 
         )
     )
 
-    assert response.metadata["rework_skipped_stages"] == [
-        "triage",
-        "false_positive_repair",
-        "missed_vuln_hunting",
-    ]
-    assert len(agent.messages) == 1
-    assert "Rework Handoff" in agent.messages[0]["message"]
-    assert "依据评审缺口挖掘遗漏漏洞" not in agent.messages[0]["message"]
-    assert "documentation_gap" in agent.messages[0]["message"]
+    assert response.metadata["rework_skipped_stages"] == ["missed_vuln_hunting"]
+    assert len(agent.messages) == 0
+    assert response.content == ""
 
 
-def test_repeated_analysis_issue_adds_residual_protocol_to_closure_prompt(tmp_path: Path) -> None:
+def test_active_analysis_issue_enters_closure_prompt(tmp_path: Path) -> None:
     task_file = tmp_path / "task.md"
     task_file.write_text("# scan task\n", encoding="utf-8")
     work_dir = tmp_path / "work"
@@ -770,6 +733,6 @@ def test_repeated_analysis_issue_adds_residual_protocol_to_closure_prompt(tmp_pa
         state,
     )
 
-    assert "重复阻塞项 ledger" in prompt
+    assert "CMP-ppldm-slot0" in prompt
     assert "accepted_residual" in prompt
-    assert "residual_cycle_003.md" in prompt
+    assert "查证 PP/LDM slot-0" in prompt

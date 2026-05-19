@@ -4,5 +4,17 @@
     "title": "Dataflow Node-level Resume",
     "created": "2026-05-14T02:34:32.709Z",
     "completed": null
+  },
+  "review-driven-vuln-agents": {
+    "status": "in-progress",
+    "title": "Review-Driven Multi-Agent Vulnerability Discovery",
+    "created": "2026-05-15T07:42:41.805Z",
+    "completed": null
+  },
+  "vulnerability-status-ledger": {
+    "status": "done",
+    "title": "Vulnerability Status Ledger",
+    "created": "2026-05-15T09:31:16.014Z",
+    "completed": "2026-05-15T09:54:08.398Z"
   }
 }

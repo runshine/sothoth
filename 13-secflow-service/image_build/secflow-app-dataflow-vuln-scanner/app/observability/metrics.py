@@ -445,10 +445,6 @@ def _collect_cycle_metrics(db: Session, builder: MetricsBuilder) -> None:
             "no_effective_progress_failure",
             "summary_artifact_unchanged",
             "supporting_docs_unchanged",
-            "same_issue_repeated",
-            "same_issue_over_budget",
-            "issue_churn_detected",
-            "issue_churn_over_budget",
             "summary_repair_deferred_abort",
         ):
             plateau_totals[flag_name] += _bool_gauge(plateau_status.get(flag_name))

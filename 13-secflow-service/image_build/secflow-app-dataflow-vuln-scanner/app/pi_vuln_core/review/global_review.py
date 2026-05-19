@@ -47,8 +47,6 @@ from app.pi_vuln_core.review.state import ReviewState, GlobalReviewRecord
 from app.pi_vuln_core.utils.file_ops import read_file, read_json, write_json
 from app.pi_vuln_core.utils.result_docs import (
     classify_final_result_files,
-    coverage_ledger_path,
-    format_coverage_obligation_summary,
     list_result_report_files,
     list_supporting_markdown_files,
     results_manifest_path,
@@ -64,6 +62,7 @@ async def _already_done(payload: dict):
 
 
 _KNOWN_SCORE_KEYS: tuple[str, ...] = (
+    "coverage",
     "input_coverage",
     "export_followthrough",
     "used_coverage",
@@ -361,7 +360,10 @@ class GlobalReviewExecutor:
         agent = self.agents.get(advisor_def.agent_id)
         worker_system_prompt_file = self._infer_worker_system_prompt_file(advisor_def)
 
-        system_prompt = read_file(advisor_def.system_prompt_file)
+        system_prompt = self._build_global_review_system_prompt(
+            advisor_def=advisor_def,
+            cycle=cycle,
+        )
         user_prompt_tpl = read_file(advisor_def.user_prompt_template)
         required_score_keys = self._required_score_keys_for_advisor(advisor_def)
         user_prompt = render_string(
@@ -377,7 +379,6 @@ class GlobalReviewExecutor:
             previous_limitations_file=review_context["previous_limitations_file"],
             result_relations_manifest_file=review_context["result_relations_manifest_file"],
             results_manifest_file=review_context["results_manifest_file"],
-            coverage_ledger_file=review_context["coverage_ledger_file"],
             review_context=review_context["context_text"],
             advisor_instance_id=advisor_def.instance_id,
             advisor_role_name=advisor_def.role_name,
@@ -405,11 +406,10 @@ class GlobalReviewExecutor:
             "global_review_start",
             advisor=advisor_def.instance_id,
             cycle=cycle,
-            summary_file=review_context["summary_file"],
-            result_relations_manifest_file=review_context["result_relations_manifest_file"],
-            results_manifest_file=review_context["results_manifest_file"],
-            coverage_ledger_file=review_context["coverage_ledger_file"],
-        )
+                summary_file=review_context["summary_file"],
+                result_relations_manifest_file=review_context["result_relations_manifest_file"],
+                results_manifest_file=review_context["results_manifest_file"],
+            )
         response = None
         guard_before = None
         early_violations: list[str] = []
@@ -769,6 +769,25 @@ class GlobalReviewExecutor:
         return str(candidate) if candidate.is_file() else ""
 
     @staticmethod
+    def _build_global_review_system_prompt(*, advisor_def: AdvisorInstanceDef, cycle: int) -> str:
+        prompt = read_file(advisor_def.system_prompt_file)
+        identity = " ".join([
+            str(advisor_def.instance_id or ""),
+            str(advisor_def.role_name or ""),
+            str(advisor_def.system_prompt_file or ""),
+        ]).lower()
+        if int(cycle) <= 1 and ("completeness" in identity or "全面" in identity):
+            prompt = prompt.replace(
+                "1. 判断 Worker 是否已经把攻击面、数据流覆盖和结果/局限性记录做到了接近穷尽",
+                "1. 判断当前漏洞挖掘工作是否已经把数据流覆盖做到了接近穷尽",
+            )
+            prompt = prompt.replace(
+                "你主要负责以下维度（具体阈值由框架在 user prompt 中注入）：",
+                "你主要负责以下维度：",
+            )
+        return prompt
+
+    @staticmethod
     def _required_score_keys_for_advisor(advisor_def: AdvisorInstanceDef) -> list[str]:
         return [str(key).strip() for key in advisor_def.score_fields if str(key).strip()]
 
@@ -872,8 +891,6 @@ class GlobalReviewExecutor:
         previous_limitations, previous_meta = self._load_previous_limitations(work_dir, cycle)
         result_relations_manifest_file = Path(work_dir) / "_meta" / "result_relations_manifest.json"
         results_manifest_file = results_manifest_path(work_dir)
-        coverage_ledger_file = coverage_ledger_path(work_dir)
-        coverage_obligation_summary = self._format_coverage_obligation_context(coverage_ledger_file)
         # 轻量反馈链：注入最近轮次的评审反馈，同时保留 active issue backlog。
         recent_feedback = self._format_recent_review_feedback(review_state, cycle)
         open_issue_backlog = review_state.format_open_issue_backlog(max_items=12)
@@ -891,10 +908,9 @@ class GlobalReviewExecutor:
             f"- 上一轮局限性来源: {previous_meta.get('kind', '')} (轮次={previous_meta.get('cycle', 0)})",
             f"- 结果关系清单: `{result_relations_manifest_file}`",
             f"- 结果生命周期清单: `{results_manifest_file}`",
-            f"- 框架覆盖账本: `{coverage_ledger_file}`",
             "",
             "## 开始前必须读取",
-            "- task、summary、results manifest、coverage ledger（路径见上）",
+            "- task、summary、results manifest（路径见上）",
         ]
         if previous_limitations.strip():
             lines.append("- 上一轮局限性章节（已内联在下方）")
@@ -924,8 +940,6 @@ class GlobalReviewExecutor:
         lines.extend([
             "",
             format_review_profile_policy(review_profile, compact=True),
-            "",
-            coverage_obligation_summary,
         ])
         if open_issue_backlog:
             lines.extend([
@@ -937,9 +951,9 @@ class GlobalReviewExecutor:
             lines.extend([
                 "",
                 "## Closure 评审模式",
-                "- 当前已进入 closure：优先验证 active issue backlog 和 coverage ledger 的 open obligations 是否按本轮验收要求被关闭、接受 residual、标记 unused/not_applicable 或 external_blocked。",
-                "- 不要把本轮评审重新展开成无限全量重扫；新 blocker 只允许针对 coverage ledger 中具体 obligation，或明确高严重度且可验证的新增遗漏。",
-                "- 若 Worker 已给出 source_closed/accepted_residual/unused/not_applicable/external_blocked 且证据自洽，应接受 closure，不要反复要求无新增信息的继续分析。",
+                "- 当前已进入 closure：优先验证 active issue backlog 是否被源码证据、漏洞报告、supporting_docs 或 accepted residual 处理。",
+                "- 不要把本轮评审重新展开成无限全量重扫；新 blocker 必须指向明确高严重度且可验证的新增遗漏。",
+                "- 若 Worker 已给出 source_closed/accepted_residual/not_applicable/external_blocked 且证据自洽，应接受 closure，不要反复要求无新增信息的继续分析。",
             ])
         if recent_feedback:
             lines.extend([
@@ -952,19 +966,6 @@ class GlobalReviewExecutor:
                 "",
                 "## 近期评审反馈",
                 "(无历史评审反馈)",
-            ])
-        repeated_issues = review_state.format_issue_ledger_summary(
-            min_consecutive=2,
-            max_items=5,
-        )
-        if repeated_issues:
-            lines.extend([
-                "",
-                "## 重复阻塞项 ledger（框架检测）",
-                repeated_issues,
-                "",
-                "- 若同一 issue 仍未闭环，请复用相同 id，并补充 `blocking_type` 与 `acceptance_criteria`。",
-                "- 若 Worker 已给出 residual 证据且确实受外部源码/上下文限制，请将 blocker 标为 `needs_external_source` 或接受 summary 的 residual 说明；不要反复要求无新增信息的“继续分析”。",
             ])
         if previous_limitations.strip():
             lines.extend([
@@ -983,7 +984,6 @@ class GlobalReviewExecutor:
             "previous_limitations_file": str(previous_meta.get("path") or ""),
             "result_relations_manifest_file": str(result_relations_manifest_file),
             "results_manifest_file": str(results_manifest_file),
-            "coverage_ledger_file": str(coverage_ledger_file),
             "context_text": "\n".join(lines),
             "repair_hint": repair_hint,
         }
@@ -1228,303 +1228,7 @@ class GlobalReviewExecutor:
         work_dir: str,
         review_profile: str,
     ) -> list[dict[str, str]]:
-        policy = get_review_profile_policy(review_profile)
-        if not policy.enforce_coverage_gate:
-            return []
-
-        ledger_file = coverage_ledger_path(work_dir)
-        if not ledger_file.is_file():
-            return [{
-                "id": f"PROFILE-{policy.name}-coverage-ledger-missing",
-                "category": "coverage_gate",
-                "target": str(ledger_file),
-                "severity": "high",
-                "required_action": "重新同步 coverage ledger；summary 阶段必须生成 `_meta/coverage_ledger.json` 后才能通过本轮验收。",
-                "detail": "本轮验收要求 coverage gate，但 coverage ledger 不存在。",
-                "owner": "framework",
-                "actionable_by": "framework",
-                "blocking_type": "metadata_sync",
-                "acceptance_criteria": "`_meta/coverage_ledger.json` 存在，且包含 data-flow/task-derived coverage_obligations。",
-            }]
-
-        try:
-            ledger = read_json(ledger_file)
-        except Exception as exc:
-            return [{
-                "id": f"PROFILE-{policy.name}-coverage-ledger-unreadable",
-                "category": "coverage_gate",
-                "target": str(ledger_file),
-                "severity": "high",
-                "required_action": "修复 coverage ledger JSON，使框架可以读取并执行 profile gate。",
-                "detail": f"读取 coverage ledger 失败：{exc}",
-                "owner": "framework",
-                "actionable_by": "framework",
-                "blocking_type": "metadata_sync",
-                "acceptance_criteria": "`_meta/coverage_ledger.json` 是合法 JSON。",
-            }]
-
-        obligations = ledger.get("coverage_obligations") or {}
-        if not isinstance(obligations, dict):
-            obligations = {}
-        entries = [
-            item for item in (obligations.get("entries") or [])
-            if isinstance(item, dict)
-        ]
-        open_entries = [
-            item for item in entries
-            if not bool(item.get("documented")) or str(item.get("status") or "") == "open"
-        ]
-
-        issues: list[dict[str, str]] = []
-        quality = obligations.get("quality") or {}
-        declared_total = 0
-        if isinstance(quality, dict):
-            declared_counts = quality.get("declared_counts") or {}
-            if isinstance(declared_counts, dict):
-                for key in ("input", "export", "used", "cleaned", "star"):
-                    try:
-                        declared_total += int(declared_counts.get(key) or 0)
-                    except (TypeError, ValueError):
-                        pass
-        total = len(entries)
-        if (
-            policy.require_dataflow_extraction
-            and declared_total >= 10
-            and total < max(1, int(declared_total * policy.min_declared_extraction_ratio))
-        ):
-            issues.append({
-                "id": f"PROFILE-{policy.name}-coverage-under-extracted",
-                "category": "coverage_gate",
-                "target": str(ledger_file),
-                "severity": "high",
-                "required_action": "从原始 data-flow 文件抽取端点级 INPUT/EXPORT/USED/CLEANED/STAR obligations，而不是只抽 task.md 摘要。",
-                "detail": (
-                    f"本轮验收要求端点级账本；task 声明约 {declared_total} 个义务，"
-                    f"当前 ledger 仅 {total} 个，低于 {policy.min_declared_extraction_ratio:.0%} 抽取下限。"
-                ),
-                "owner": "framework",
-                "actionable_by": "framework",
-                "blocking_type": "coverage_ledger_under_extracted",
-                "acceptance_criteria": "coverage_ledger.coverage_obligations.entries 覆盖原始 data-flow 的主要端点，至少达到本轮验收要求的抽取比例。",
-            })
-
-        required_risks = set(policy.required_risks)
-        required_kinds = set(policy.required_kinds)
-        blocking_open = [
-            item for item in open_entries
-            if str(item.get("risk") or "medium").lower() in required_risks
-            or str(item.get("kind") or "").lower() in required_kinds
-        ]
-        if blocking_open:
-            preview = "; ".join(
-                f"{item.get('id')}[{item.get('risk') or 'medium'}]"
-                for item in blocking_open[:10]
-            )
-            issues.append({
-                "id": f"PROFILE-{policy.name}-coverage-open-required",
-                "category": "coverage_gate",
-                "target": str(ledger_file),
-                "severity": "high",
-                "required_action": (
-                    f"关闭本轮必须闭环的 open obligations：{preview}"
-                ),
-                "detail": (
-                    f"本轮验收不允许 {len(blocking_open)} 个 "
-                    "STAR/高风险/指定风险等级 coverage obligations 仍为 open。"
-                ),
-                "owner": "worker",
-                "actionable_by": "worker",
-                "blocking_type": "coverage_obligation_open",
-                "acceptance_criteria": "相关 obligations 在 ledger 中变为 documented，并在 result/supporting_docs/summary 中给出 source_closed/promoted_to_result/accepted_residual/unused/not_applicable/external_blocked 证据。",
-            })
-
-        if not policy.allow_summary_only_evidence:
-            summary_only = [
-                item for item in entries
-                if bool(item.get("documented"))
-                and str(item.get("risk") or "medium").lower() in required_risks
-                and set(item.get("evidence_sources") or []) == {"summary.md"}
-            ]
-            if summary_only:
-                preview = "; ".join(str(item.get("id") or "") for item in summary_only[:10])
-                issues.append({
-                    "id": f"PROFILE-{policy.name}-summary-only-evidence",
-                    "category": "coverage_gate",
-                    "target": str(ledger_file),
-                    "severity": "high",
-                    "required_action": "为高/中风险 obligations 补充 result 或 supporting_docs 源码证据；summary-only 不能作为本轮验收的充分证据。",
-                    "detail": f"以下 obligations 只有 summary.md 证据：{preview}",
-                    "owner": "worker",
-                    "actionable_by": "worker",
-                    "blocking_type": "summary_only_evidence",
-                    "acceptance_criteria": "相关 obligations 的 evidence_sources 至少包含 results/*.md 或 supporting_docs/*.md。",
-                })
-
-        issues.extend(
-            GlobalReviewExecutor._profile_evidence_artifact_issues(
-                work_dir=work_dir,
-                policy=policy,
-            )
-        )
-        issues.extend(
-            GlobalReviewExecutor._profile_pattern_family_issues(
-                work_dir=work_dir,
-                policy=policy,
-            )
-        )
-        return issues
-
-    @staticmethod
-    def _profile_evidence_artifact_issues(
-        *,
-        work_dir: str,
-        policy,
-    ) -> list[dict[str, str]]:
-        required_count = int(getattr(policy, "min_evidence_artifacts", 0) or 0)
-        if required_count <= 0:
-            return []
-        if not GlobalReviewExecutor._profile_has_coverage_surface(work_dir):
-            return []
-
-        work_path = Path(work_dir)
-        results_dir = work_path / "results"
-        summary_file = work_path / "summary.md"
-        supporting_docs_dir = work_path / "supporting_docs"
-        try:
-            selection = classify_final_result_files(
-                results_dir,
-                summary_file if summary_file.is_file() else None,
-            )
-            result_count = len(selection.get("taskable_results") or [])
-        except Exception:
-            result_count = len(list_result_report_files(results_dir))
-        supporting_count = len(list_supporting_markdown_files(supporting_docs_dir))
-        artifact_count = result_count + supporting_count
-        if artifact_count >= required_count:
-            return []
-
-        return [{
-            "id": f"PROFILE-{policy.name}-evidence-artifact-floor",
-            "category": "profile_evidence_gate",
-            "target": str(work_path),
-            "severity": "medium" if policy.name in {"fast", "balanced"} else "high",
-            "required_action": (
-                f"本轮范围至少需要 {required_count} 个证据产物；"
-                "若无新增漏洞，用 supporting_docs 记录源码级负面证据、模式覆盖和 residual 边界。"
-            ),
-            "detail": (
-                f"本轮验收要求 evidence artifacts >= {required_count}，"
-                f"当前 taskable results={result_count}, supporting_docs={supporting_count}, "
-                f"total={artifact_count}。"
-            ),
-            "owner": "worker",
-            "actionable_by": "worker",
-            "blocking_type": "profile_evidence_floor",
-            "acceptance_criteria": (
-                "results/*.md 或 supporting_docs/*.md 中留下足够的源码级正/负证据；"
-                "深度验收不能只复用初步 summary 结论。"
-            ),
-        }]
-
-    @staticmethod
-    def _profile_pattern_family_issues(
-        *,
-        work_dir: str,
-        policy,
-    ) -> list[dict[str, str]]:
-        required = [
-            str(item)
-            for item in (getattr(policy, "required_pattern_families", ()) or ())
-            if str(item).strip()
-        ]
-        if not required:
-            return []
-        if not GlobalReviewExecutor._profile_has_coverage_surface(work_dir):
-            return []
-
-        corpus = GlobalReviewExecutor._read_profile_evidence_corpus(work_dir)
-        missing = [
-            family for family in required
-            if not _PROFILE_PATTERN_FAMILY_PATTERNS.get(
-                family,
-                re.compile(re.escape(family), re.IGNORECASE),
-            ).search(corpus)
-        ]
-        if not missing:
-            return []
-
-        missing_labels = ", ".join(
-            _PROFILE_PATTERN_FAMILY_LABELS.get(item, item)
-            for item in missing
-        )
-        return [{
-            "id": f"PROFILE-{policy.name}-pattern-family-coverage",
-            "category": "profile_evidence_gate",
-            "target": str(Path(work_dir)),
-            "severity": "medium" if policy.name == "balanced" else "high",
-            "required_action": (
-                "补齐本轮要求的漏洞模式族扫描记录；缺失模式族："
-                f"{missing_labels}。"
-            ),
-            "detail": (
-                "本轮验收要求在 summary/results/supporting_docs 中"
-                f"留下模式族覆盖或不适用证据；当前缺失：{missing_labels}。"
-            ),
-            "owner": "worker",
-            "actionable_by": "worker",
-            "blocking_type": "profile_pattern_family_gap",
-            "acceptance_criteria": (
-                "对缺失模式族补充源码级正/负扫描结论；若不适用，"
-                "在 supporting_docs 中明确 not_applicable/accepted_residual 及原因。"
-            ),
-        }]
-
-    @staticmethod
-    def _profile_has_coverage_surface(work_dir: str) -> bool:
-        ledger_file = coverage_ledger_path(work_dir)
-        if not ledger_file.is_file():
-            return False
-        try:
-            ledger = read_json(ledger_file)
-        except Exception:
-            return False
-        obligations = ledger.get("coverage_obligations") or {}
-        if not isinstance(obligations, dict):
-            return False
-        try:
-            total = int(obligations.get("total") or 0)
-        except (TypeError, ValueError):
-            total = 0
-        quality = obligations.get("quality") or {}
-        declared_total = 0
-        if isinstance(quality, dict):
-            try:
-                declared_total = int(quality.get("declared_total") or 0)
-            except (TypeError, ValueError):
-                declared_total = 0
-        return total > 0 or declared_total > 0
-
-    @staticmethod
-    def _read_profile_evidence_corpus(work_dir: str) -> str:
-        work_path = Path(work_dir)
-        parts: list[str] = []
-
-        def append_file(path: Path) -> None:
-            if not path.is_file():
-                return
-            try:
-                parts.append(read_file(path)[:200_000])
-            except Exception:
-                return
-
-        append_file(work_path / "summary.md")
-        results_dir = work_path / "results"
-        for name in list_result_report_files(results_dir):
-            append_file(results_dir / name)
-        supporting_docs_dir = work_path / "supporting_docs"
-        for name in list_supporting_markdown_files(supporting_docs_dir):
-            append_file(supporting_docs_dir / name)
-        return "\n".join(parts)
+        return []
 
     @staticmethod
     def _format_profile_gate_feedback(issues: list[dict[str, str]]) -> str:
@@ -1539,27 +1243,14 @@ class GlobalReviewExecutor:
     def _format_closure_review_policy(workflow_mode: str) -> str:
         if workflow_mode != "closure":
             return (
-                "- discovery 模式：可以做全量覆盖/深度审计，但 issue 必须指向具体 obligation、函数或文件，并给出可验证 acceptance_criteria。"
+                "- discovery 模式：可以做全量覆盖/深度审计，但 issue 必须指向具体函数、文件、数据流路径或可验证证据缺口。"
             )
         return "\n".join([
-            "- closure 模式：本轮不是重新发散漏洞挖掘，而是验证仍影响漏洞真实性、漏报风险或误报风险的 active issues / coverage signals。",
-            "- 优先检查 `_meta/coverage_ledger.json` 中高风险、靠近 sink、被评审点名的 open signals，以及 `_meta/issue_ledger.json` 的 active entries。",
-            "- 若高价值 signal 已在 summary/supporting_docs/results 中以 source_closed、promoted_to_result、accepted_residual、unused、not_applicable 或 external_blocked 自洽处理，应判定该项关闭。",
+            "- closure 模式：本轮不是重新发散漏洞挖掘，而是验证仍影响漏洞真实性、漏报风险或误报风险的 active issues。",
+            "- 优先检查最近评审点名的高价值源码路径、sink、result/supporting_docs 证据缺口。",
+            "- 若高价值问题已在 summary/supporting_docs/results 中以 source_closed、promoted_to_result、accepted_residual、not_applicable 或 external_blocked 自洽处理，应判定该项关闭。",
             "- 只有发现具体、可验证、且会影响最终结论的高严重遗漏时才新增 issue；不要用笼统的“继续深入/仍不够全面”阻断。",
         ])
-
-    @staticmethod
-    def _format_coverage_obligation_context(coverage_ledger_file: Path) -> str:
-        if not coverage_ledger_file.is_file():
-            return (
-                "## Coverage / issue radar\n"
-                f"- `{coverage_ledger_file}` 尚不存在；若本轮 summary 已生成但账本缺失，应标记 framework/metadata_sync。"
-            )
-        try:
-            ledger = read_json(coverage_ledger_file)
-        except Exception as exc:
-            return f"## Coverage / issue radar\n- 读取 `{coverage_ledger_file}` 失败：{exc}"
-        return format_coverage_obligation_summary(ledger, max_open=12)
 
     def _write_review_feedback_snapshot(
         self,
@@ -1577,7 +1268,6 @@ class GlobalReviewExecutor:
                 "workflow_mode": review_state.workflow_mode,
                 "issue_count": len(current_issues),
                 "issues": current_issues,
-                "issue_ledger_status": review_state.get_issue_ledger_status(),
                 "last_global_scores": review_state.last_global_scores,
                 "last_global_feedback": review_state.last_global_feedback,
             },

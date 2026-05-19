@@ -119,6 +119,7 @@ class MockAgentRuntime(BaseAgentRuntime):
                     "verdict": "PASS",
                     "feedback": "Mock review passed",
                     "scores": {
+                        "coverage": 1.0,
                         "input_coverage": 1.0,
                         "export_followthrough": 1.0,
                         "used_coverage": 1.0,

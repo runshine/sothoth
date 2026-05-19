@@ -109,7 +109,6 @@ class WorkflowContext:
     review_profile: str = "balanced"       # fast | balanced | audit (strict maps to audit)
     plateau_streak: int = 0
     plateau_reason: str = ""
-    issue_ledger_status: dict[str, Any] = field(default_factory=dict)
     pending_summary_repair: bool = False
     summary_repair_attempts: int = 0
 

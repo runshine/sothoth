@@ -388,12 +388,6 @@
           "reset_worker_session_per_cycle": false,
           "plateau_closure_streak": 2,
           "plateau_abort_streak": 3,
-          "same_issue_stagnation_threshold": 2,
-          "same_issue_abort_threshold": 3,
-          "per_issue_attempt_budget": 2,
-          "analysis_closure_cycles": 1,
-          "issue_churn_closure_window": 2,
-          "issue_churn_abort_window": 3,
           "score_min_delta": 0.03
         },
         "roles": {
@@ -403,8 +397,7 @@
             "prompts": {
               "work": {
                 "system_prompt_file": "prompts/vuln_scan/worker_system.md",
-                "user_prompt_file": "prompts/vuln_scan/worker_user.md",
-                "rework_prompt_file": "prompts/vuln_scan/worker_rework.md"
+                "user_prompt_file": "prompts/vuln_scan/worker_user.md"
               },
               "reflection": [
                 {
@@ -430,25 +423,13 @@
                 "system_prompt_file": "prompts/vuln_scan/global_review_completeness_sys.md",
                 "user_prompt_template": "prompts/vuln_scan/global_review_completeness_user.md",
                 "score_fields": [
-                  "input_coverage",
-                  "export_followthrough",
-                  "used_coverage",
-                  "limitations_honesty",
-                  "report_completeness"
+                  "coverage"
                 ],
                 "score_thresholds_start": {
-                  "input_coverage": 0.8,
-                  "export_followthrough": 0.7,
-                  "used_coverage": 0.7,
-                  "limitations_honesty": 0.75,
-                  "report_completeness": 0.7
+                  "coverage": 0.8
                 },
                 "score_thresholds": {
-                  "input_coverage": 0.95,
-                  "export_followthrough": 0.9,
-                  "used_coverage": 0.9,
-                  "limitations_honesty": 0.9,
-                  "report_completeness": 0.88
+                  "coverage": 0.95
                 },
                 "score_threshold_ramp_cycles": 5
               },

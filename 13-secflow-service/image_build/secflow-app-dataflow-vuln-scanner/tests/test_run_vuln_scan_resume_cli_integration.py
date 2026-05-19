@@ -183,6 +183,7 @@ class ResumeCliIntegrationRuntime(BaseAgentRuntime):
                             "verdict": "FAIL",
                             "feedback": "EXPORT 跟入没有改善",
                             "scores": {
+                                "coverage": 0.50,
                                 "input_coverage": 1.0,
                                 "export_followthrough": 0.50,
                                 "used_coverage": 1.0,
@@ -211,6 +212,7 @@ class ResumeCliIntegrationRuntime(BaseAgentRuntime):
                     "verdict": "PASS",
                     "feedback": "所有 issue 已关闭",
                     "scores": {
+                        "coverage": 1.0,
                         "input_coverage": 1.0,
                         "export_followthrough": 1.0,
                         "used_coverage": 1.0,
@@ -232,6 +234,7 @@ class ResumeCliIntegrationRuntime(BaseAgentRuntime):
                 "verdict": "PASS",
                 "feedback": "default pass",
                 "scores": {
+                    "coverage": 1.0,
                     "input_coverage": 1.0,
                     "export_followthrough": 1.0,
                     "used_coverage": 1.0,

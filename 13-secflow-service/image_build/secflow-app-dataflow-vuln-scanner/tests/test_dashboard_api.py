@@ -98,10 +98,6 @@ def test_dashboard_observability_api(monkeypatch, tmp_path):
             "vulnerability_headings": ["VULN-001"],
         }],
     })
-    _write_json(atomic / "_meta" / "coverage_ledger.json", {
-        "missing_referenced_results": [],
-        "unreferenced_active_results": [],
-    })
     _write_json(atomic / "_meta" / "issues" / "cycle_001.json", {"cycle": 1, "issues": []})
     _write(atomic / "summary.md", "# Summary\n")
     _write(atomic / "previous_limitations.md", "# Limits\n")

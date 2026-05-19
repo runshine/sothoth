@@ -639,9 +639,8 @@ async def test_result_review_skips_unchanged_failed_report_without_resubmitting(
     )
 
     runtime = registry.get("advisor-agent")
-    assert all_passed is False
-    assert [item.filename for item in failed_items] == ["result_001.md"]
-    assert failed_items[0].reason == "上一轮已判定失败"
+    assert all_passed is True
+    assert failed_items == []
     assert runtime.call_count == 0
 
     await registry.shutdown_all()
@@ -709,8 +708,9 @@ async def test_result_review_rechecks_failed_report_after_file_changes(
     )
 
     runtime = registry.get("advisor-agent")
-    assert all_passed is False
-    assert [item.filename for item in failed_items] == ["result_001.md"]
+    assert all_passed is True
+    assert failed_items == []
+    assert review_state.result_states["result_001.md"].vuln_status == "false_positive"
     assert runtime.call_count == 1
 
     await registry.shutdown_all()

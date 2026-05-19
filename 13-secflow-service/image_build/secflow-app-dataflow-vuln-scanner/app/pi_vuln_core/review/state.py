@@ -1,15 +1,15 @@
 """
 评审状态追踪
 
-跨 cycle 追踪评审状态，支持轻量反馈链与 issue ledger。
+跨 cycle 追踪评审状态，支持轻量反馈链。
 
 设计原则：
   - Advisor 输出 passed/failed + scores + issues[]（结构化反馈）
   - 框架以 append-only 方式存储每轮评审记录
   - Worker 收到最近 N 轮的自然语言反馈
-  - 框架用 issue 指纹检测重复阻塞项，避免评审循环空转
+  - 框架只保留当前失败轮次的结构化 issue 作为轻量反馈
   - 通过/失败由 Advisor 判定，框架不做语义推断
-  - 收敛检测同时参考 scores 趋势、产物变化和 issue ledger
+  - 收敛检测参考 scores 趋势、产物变化和最近评审反馈
 """
 
 from __future__ import annotations
@@ -21,6 +21,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.pi_vuln_core.utils.result_docs import list_result_report_files
+from app.pi_vuln_core.utils.vulnerability_list import (
+    STATUS_CONFIRMED,
+    STATUS_FALSE_POSITIVE,
+    STATUS_LABELS,
+    STATUS_PENDING,
+    TERMINAL_STATUSES,
+)
 
 
 @dataclass
@@ -32,6 +39,12 @@ class ResultItemState:
     fingerprint: str = ""
     lifecycle_status: str = "candidate"
     active: bool = True
+    vuln_status: str = STATUS_PENDING
+    status_label: str = STATUS_LABELS[STATUS_PENDING]
+    verdict: str = ""
+    confidence: float = 0.0
+    review_feedback: str = ""
+    reviewed: bool = False
 
 
 @dataclass
@@ -51,45 +64,6 @@ class FailedResultItem:
     filename: str
     reason: str
     cycle: int = 0
-
-
-@dataclass
-class IssueLedgerEntry:
-    """跨 cycle 跟踪的全局评审阻塞项。"""
-    signature: str
-    semantic_key: str
-    first_seen_cycle: int
-    last_seen_cycle: int
-    seen_count: int = 0
-    consecutive_count: int = 0
-    cycles: list[int] = field(default_factory=list)
-    issue: dict[str, Any] = field(default_factory=dict)
-    issue_ids: list[str] = field(default_factory=list)
-    advisor_ids: list[str] = field(default_factory=list)
-    actionable_by: str = ""
-    blocking_type: str = ""
-    acceptance_criteria: str = ""
-    active: bool = True
-    resolved: bool = False
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "signature": self.signature,
-            "semantic_key": self.semantic_key,
-            "first_seen_cycle": self.first_seen_cycle,
-            "last_seen_cycle": self.last_seen_cycle,
-            "seen_count": self.seen_count,
-            "consecutive_count": self.consecutive_count,
-            "cycles": list(self.cycles),
-            "issue_ids": list(self.issue_ids),
-            "advisor_ids": list(self.advisor_ids),
-            "actionable_by": self.actionable_by,
-            "blocking_type": self.blocking_type,
-            "acceptance_criteria": self.acceptance_criteria,
-            "active": self.active,
-            "resolved": self.resolved,
-            "issue": dict(self.issue),
-        }
 
 
 def calculate_file_sha256(path: str) -> str:
@@ -157,20 +131,6 @@ class ReviewState:
         self.closure_reason: str = ""
         self.closure_since_cycle: int | None = None
 
-        # issue ledger：按语义指纹追踪重复问题，供 plateau / closure 决策使用。
-        self.issue_ledger: dict[str, IssueLedgerEntry] = {}
-        self._last_issue_signatures: set[str] = set()
-        self.last_issue_ledger_status: dict[str, Any] = {
-            "current_issue_count": 0,
-            "active_issue_count": 0,
-            "current_signatures": [],
-            "current_semantic_keys": [],
-            "repeated_signatures": [],
-            "max_consecutive_count": 0,
-            "max_seen_count": 0,
-            "dominant_issue": None,
-        }
-
     # ─────────────────────────────────────────────
     # 结果评审
     # ─────────────────────────────────────────────
@@ -193,11 +153,7 @@ class ReviewState:
         cycle: int,
         fingerprint: str = "",
     ) -> None:
-        self.result_states[result_filename] = ResultItemState(
-            passed=True,
-            last_reviewed_cycle=cycle,
-            fingerprint=fingerprint,
-        )
+        self.mark_result_confirmed(result_filename, cycle, fingerprint)
 
     def record_result_failure(
         self,
@@ -205,10 +161,11 @@ class ReviewState:
         cycle: int,
         reason: str = "",
     ) -> None:
-        self.result_states[result_filename] = ResultItemState(
-            passed=False,
-            last_reviewed_cycle=cycle,
-            failure_reason=reason,
+        self.mark_result_pending(
+            result_filename,
+            cycle,
+            verdict="",
+            feedback=reason,
         )
 
     def mark_result_inactive(
@@ -271,11 +228,17 @@ class ReviewState:
         return [
             FailedResultItem(
                 filename=name,
-                reason=state.failure_reason,
+                reason=state.failure_reason or state.review_feedback,
                 cycle=state.last_reviewed_cycle,
             )
             for name, state in self.result_states.items()
-            if state.active and not state.passed and (current_set is None or name in current_set)
+            if (
+                state.active
+                and not state.passed
+                and state.vuln_status not in {STATUS_FALSE_POSITIVE, STATUS_CONFIRMED}
+                and bool(state.failure_reason)
+                and (current_set is None or name in current_set)
+            )
         ]
 
     def get_passed_result_filenames(
@@ -285,7 +248,7 @@ class ReviewState:
         current_set = set(current_results or []) if current_results is not None else None
         return [
             name for name, state in self.result_states.items()
-            if state.passed and (current_set is None or name in current_set)
+            if state.passed and state.vuln_status == STATUS_CONFIRMED and (current_set is None or name in current_set)
         ]
 
     def activate_closure_mode(self, cycle: int, reason: str) -> None:
@@ -328,19 +291,6 @@ class ReviewState:
             if entry not in self._global_feedbacks:
                 self._global_feedbacks.append(entry)
 
-        if passed and not resolved_issue_ids:
-            resolved_issue_ids = []
-            for entry in self.issue_ledger.values():
-                if entry.active and not entry.resolved:
-                    resolved_issue_ids.extend(entry.issue_ids)
-                    resolved_issue_ids.append(entry.signature)
-
-        self.update_issue_ledger(
-            cycle=cycle,
-            issues=[] if passed else effective_issues,
-            resolved_issue_ids=resolved_issue_ids,
-        )
-
         return {
             "cycle": cycle,
             "passed": passed,
@@ -372,48 +322,8 @@ class ReviewState:
         return issues
 
     # ─────────────────────────────────────────────
-    # issue ledger / 收敛辅助
+    # 当前评审问题视图
     # ─────────────────────────────────────────────
-
-    @classmethod
-    def issue_signature(cls, issue: dict[str, Any]) -> tuple[str, str]:
-        """返回稳定 issue 指纹与可读语义 key。
-
-        Advisor 的 issue id 可能跨轮漂移，因此指纹优先使用
-        actionable/category/target/detail/required_action 的规范化组合。
-        """
-        if not isinstance(issue, dict):
-            issue = {"detail": str(issue)}
-
-        actionable = cls._normalize_issue_text(
-            issue.get("actionable_by") or issue.get("owner") or "worker",
-            max_len=40,
-        )
-        category = cls._normalize_issue_text(issue.get("category") or "global_review", max_len=60)
-        target = cls._normalize_issue_text(issue.get("target") or issue.get("path") or "", max_len=120)
-        detail = cls._normalize_issue_text(
-            issue.get("required_action")
-            or issue.get("detail")
-            or issue.get("description")
-            or issue.get("summary")
-            or issue.get("id")
-            or "",
-            max_len=220,
-        )
-        fallback_id = cls._normalize_issue_id(str(issue.get("id") or issue.get("issue_id") or ""))
-        semantic_key = "|".join(
-            part for part in (actionable, category, target or fallback_id, detail) if part
-        )
-        if not semantic_key:
-            semantic_key = "global_review|unknown"
-        digest = hashlib.sha1(semantic_key.encode("utf-8", errors="replace")).hexdigest()[:16]
-        return f"issue:{digest}", semantic_key
-
-    @staticmethod
-    def _normalize_issue_id(value: str) -> str:
-        text = (value or "").strip().lower()
-        text = re.sub(r"^(cmp|dpt|global[-_]?review|global[-_]?completeness|global[-_]?depth)[-_:]+", "", text)
-        return re.sub(r"[^a-z0-9_.:/-]+", "-", text)[:120]
 
     @staticmethod
     def _normalize_issue_text(value: Any, *, max_len: int) -> str:
@@ -425,214 +335,80 @@ class ReviewState:
         text = re.sub(r"[\u200b-\u200f\ufeff]", "", text)
         return text[:max_len]
 
-    def update_issue_ledger(
-        self,
-        *,
-        cycle: int,
-        issues: list[dict[str, Any]] | None = None,
-        resolved_issue_ids: list[str] | None = None,
-    ) -> dict[str, Any]:
-        current_signatures: set[str] = set()
-        current_entries: list[IssueLedgerEntry] = []
-        resolved_ids = {
-            str(item).strip()
-            for item in (resolved_issue_ids or [])
-            if str(item).strip()
-        }
-
-        for raw_issue in issues or []:
-            issue = dict(raw_issue) if isinstance(raw_issue, dict) else {"detail": str(raw_issue)}
-            signature, semantic_key = self.issue_signature(issue)
-            current_signatures.add(signature)
-
-            entry = self.issue_ledger.get(signature)
-            if entry is None:
-                entry = IssueLedgerEntry(
-                    signature=signature,
-                    semantic_key=semantic_key,
-                    first_seen_cycle=cycle,
-                    last_seen_cycle=0,
-                )
-                self.issue_ledger[signature] = entry
-
-            if entry.last_seen_cycle != cycle:
-                entry.seen_count += 1
-                entry.consecutive_count = (
-                    entry.consecutive_count + 1
-                    if signature in self._last_issue_signatures else
-                    1
-                )
-                entry.cycles.append(cycle)
-
-            entry.last_seen_cycle = cycle
-            entry.issue = issue
-            entry.semantic_key = semantic_key
-            entry.active = True
-            entry.resolved = False
-            entry.actionable_by = str(issue.get("actionable_by") or issue.get("owner") or "").strip()
-            entry.blocking_type = str(issue.get("blocking_type") or issue.get("blocker_type") or "").strip()
-            acceptance = issue.get("acceptance_criteria") or issue.get("acceptance") or ""
-            if isinstance(acceptance, list):
-                acceptance = "; ".join(str(item).strip() for item in acceptance if str(item).strip())
-            entry.acceptance_criteria = str(acceptance).strip()
-            self._append_unique(entry.issue_ids, str(issue.get("id") or issue.get("issue_id") or "").strip())
-            self._append_unique(entry.advisor_ids, str(issue.get("advisor_id") or issue.get("source") or "").strip())
-            current_entries.append(entry)
-
-        for signature, entry in self.issue_ledger.items():
-            if signature not in current_signatures and entry.last_seen_cycle < cycle:
-                entry.active = False
-                entry.consecutive_count = 0
-            if self._entry_resolved(entry, resolved_ids):
-                entry.active = False
-                entry.resolved = True
-                entry.consecutive_count = 0
-
-        self._last_issue_signatures = current_signatures
-        self.last_issue_ledger_status = self._build_issue_ledger_status(current_entries)
-        return dict(self.last_issue_ledger_status)
-
-    def rebuild_issue_ledger_from_history(self) -> dict[str, Any]:
-        """从 append-only 全局评审记录重建 issue ledger（用于 resume）。"""
-        self.issue_ledger = {}
-        self._last_issue_signatures = set()
-        self.last_issue_ledger_status = {
-            "current_issue_count": 0,
-            "active_issue_count": 0,
-            "current_signatures": [],
-            "current_semantic_keys": [],
-            "repeated_signatures": [],
-            "max_consecutive_count": 0,
-            "max_seen_count": 0,
-            "dominant_issue": None,
-        }
-        cycles = sorted({record.cycle for record in self.global_review_history})
-        for cycle in cycles:
-            issues: list[dict[str, Any]] = []
-            for record in self.global_review_history:
-                if record.cycle != cycle or record.passed:
-                    continue
-                for issue in record.issues:
-                    enriched = dict(issue)
-                    if record.advisor_id:
-                        enriched.setdefault("advisor_id", record.advisor_id)
-                    issues.append(enriched)
-            self.update_issue_ledger(cycle=cycle, issues=issues)
-        return dict(self.last_issue_ledger_status)
-
-    @staticmethod
-    def _append_unique(items: list[str], value: str) -> None:
-        if value and value not in items:
-            items.append(value)
-
-    @staticmethod
-    def _entry_resolved(entry: IssueLedgerEntry, resolved_ids: set[str]) -> bool:
-        if not resolved_ids:
-            return False
-        candidates = {entry.signature, entry.semantic_key}
-        candidates.update(item for item in entry.issue_ids if item)
-        normalized_resolved = {ReviewState._normalize_issue_id(item) for item in resolved_ids}
-        normalized_candidates = {ReviewState._normalize_issue_id(item) for item in candidates}
-        return bool(candidates & resolved_ids or normalized_candidates & normalized_resolved)
-
-    def _build_issue_ledger_status(
-        self,
-        current_entries: list[IssueLedgerEntry],
-    ) -> dict[str, Any]:
-        active_entries = [entry for entry in self.issue_ledger.values() if entry.active]
-        dominant = max(
-            current_entries or active_entries,
-            key=lambda item: (item.consecutive_count, item.seen_count, item.last_seen_cycle),
-            default=None,
-        )
-        repeated = [
-            entry.signature
-            for entry in current_entries
-            if entry.consecutive_count >= 2
+    @classmethod
+    def _issue_semantic_key(cls, issue: dict[str, Any]) -> str:
+        if not isinstance(issue, dict):
+            issue = {"detail": str(issue)}
+        parts = [
+            issue.get("actionable_by") or issue.get("owner") or "worker",
+            issue.get("category") or "global_review",
+            issue.get("target") or issue.get("path") or issue.get("id") or issue.get("issue_id") or "",
+            issue.get("required_action")
+            or issue.get("detail")
+            or issue.get("description")
+            or issue.get("summary")
+            or "",
         ]
-        return {
-            "current_issue_count": len(current_entries),
-            "active_issue_count": len(active_entries),
-            "current_signatures": [entry.signature for entry in current_entries],
-            "current_semantic_keys": [entry.semantic_key for entry in current_entries],
-            "repeated_signatures": repeated,
-            "max_consecutive_count": max(
-                (entry.consecutive_count for entry in current_entries),
-                default=0,
-            ),
-            "max_seen_count": max(
-                (entry.seen_count for entry in current_entries),
-                default=0,
-            ),
-            "dominant_issue": dominant.to_dict() if dominant else None,
-        }
-
-    def get_issue_ledger_status(self) -> dict[str, Any]:
-        return dict(self.last_issue_ledger_status)
-
-    def get_issue_ledger_snapshot(self) -> dict[str, Any]:
-        entries = sorted(
-            (entry.to_dict() for entry in self.issue_ledger.values()),
-            key=lambda item: (
-                not bool(item.get("active")),
-                -int(item.get("last_seen_cycle") or 0),
-                str(item.get("signature") or ""),
-            ),
+        key = "|".join(
+            cls._normalize_issue_text(part, max_len=160)
+            for part in parts
+            if str(part or "").strip()
         )
-        return {
-            "schema_version": 1,
-            "workflow_mode": self.workflow_mode,
-            "closure_since_cycle": self.closure_since_cycle,
-            "closure_reason": self.closure_reason,
-            "last_status": self.get_issue_ledger_status(),
-            "entries": entries,
-        }
+        return key or "global_review|unknown"
 
-    def format_issue_ledger_summary(
-        self,
-        *,
-        min_consecutive: int = 2,
-        max_items: int = 5,
-    ) -> str:
-        entries = [
-            entry for entry in self.issue_ledger.values()
-            if entry.active and entry.consecutive_count >= min_consecutive
-        ]
-        entries.sort(key=lambda item: (-item.consecutive_count, -item.last_seen_cycle, item.signature))
-        if not entries:
-            return ""
-        lines = []
-        for entry in entries[:max_items]:
-            detail = (
-                entry.issue.get("required_action")
-                or entry.issue.get("detail")
-                or entry.semantic_key
-            )
-            target = entry.issue.get("target") or "(未指定 target)"
-            safe_signature = self.prompt_safe_issue_id(entry.signature)
-            safe_blocking_type = self.prompt_safe_blocking_type(entry.blocking_type)
-            lines.append(
-                f"- {safe_signature}: 连续 {entry.consecutive_count} 轮，target={target}，"
-                f"actionable_by={entry.actionable_by or 'worker'}，blocking_type={safe_blocking_type or 'unspecified'}，"
-                f"要求={str(detail)[:220]}"
-            )
-            if entry.acceptance_criteria:
-                lines.append(f"  acceptance_criteria: {entry.acceptance_criteria[:220]}")
-        return "\n".join(lines)
+    @classmethod
+    def _issue_entry_from_record(cls, issue: dict[str, Any], *, cycle: int, advisor_id: str = "") -> dict[str, Any]:
+        item = dict(issue) if isinstance(issue, dict) else {"detail": str(issue)}
+        if advisor_id:
+            item.setdefault("advisor_id", advisor_id)
+        semantic_key = cls._issue_semantic_key(item)
+        digest = hashlib.sha1(semantic_key.encode("utf-8", errors="replace")).hexdigest()[:12]
+        issue_id = str(item.get("id") or item.get("issue_id") or "").strip() or f"issue:{digest}"
+        actionable_by = str(item.get("actionable_by") or item.get("owner") or "").strip()
+        blocking_type = str(item.get("blocking_type") or item.get("blocker_type") or "").strip()
+        acceptance = item.get("acceptance_criteria") or item.get("acceptance") or ""
+        if isinstance(acceptance, list):
+            acceptance = "; ".join(str(value).strip() for value in acceptance if str(value).strip())
+        return {
+            "signature": issue_id,
+            "semantic_key": semantic_key,
+            "first_seen_cycle": cycle,
+            "last_seen_cycle": cycle,
+            "seen_count": 1,
+            "consecutive_count": 1,
+            "issue": item,
+            "issue_ids": [issue_id],
+            "advisor_ids": [advisor_id] if advisor_id else [],
+            "actionable_by": actionable_by,
+            "blocking_type": blocking_type,
+            "acceptance_criteria": str(acceptance).strip(),
+        }
 
     def get_active_issue_entries(self, *, include_framework: bool = True) -> list[dict[str, Any]]:
-        """Return all active unresolved global-review blockers."""
-        entries = [
-            entry for entry in self.issue_ledger.values()
-            if entry.active and not entry.resolved
-        ]
+        """Return current unresolved global-review blockers from recent feedback."""
+        entries: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        latest_cycle = max((int(item.get("cycle") or 0) for item in self._global_feedbacks), default=0)
+        for feedback in reversed(self._global_feedbacks):
+            cycle = int(feedback.get("cycle") or 0)
+            if latest_cycle and cycle != latest_cycle:
+                continue
+            for raw_issue in feedback.get("issues", []) or []:
+                if not isinstance(raw_issue, dict):
+                    continue
+                entry = self._issue_entry_from_record(raw_issue, cycle=cycle, advisor_id=str(raw_issue.get("advisor_id") or ""))
+                key = entry["semantic_key"]
+                if key in seen:
+                    continue
+                seen.add(key)
+                entries.append(entry)
         if not include_framework:
             entries = [
                 entry for entry in entries
-                if (entry.actionable_by or "").strip().lower() != "framework"
+                if str(entry.get("actionable_by") or "").strip().lower() != "framework"
             ]
-        entries.sort(key=lambda item: (-item.last_seen_cycle, -item.seen_count, item.signature))
-        return [entry.to_dict() for entry in entries]
+        entries.sort(key=lambda item: (-int(item.get("last_seen_cycle") or 0), str(item.get("signature") or "")))
+        return entries
 
     def get_current_issue_records(self, *, include_framework: bool = True) -> list[dict[str, Any]]:
         """Return active unresolved issues in the UI/API-facing issue shape."""
@@ -672,7 +448,7 @@ class ReviewState:
         max_items: int = 12,
         include_framework: bool = True,
     ) -> str:
-        """Format active issue ledger entries as a closure backlog."""
+        """Format current active issues as a closure backlog."""
         entries = self.get_active_issue_entries(include_framework=include_framework)
         if not entries:
             return "(当前没有 active global-review issue backlog)"
@@ -699,7 +475,7 @@ class ReviewState:
             if acceptance:
                 lines.append(f"  acceptance_criteria: {str(acceptance)[:260]}")
         if len(entries) > max_items:
-            lines.append(f"- ... 另有 {len(entries) - max_items} 个 active issue，详见 `_meta/issue_ledger.json`")
+            lines.append(f"- ... 另有 {len(entries) - max_items} 个 active issue，请参考最近的全局评审记录")
         return "\n".join(lines)
 
     def format_recent_feedback(self, last_n: int = 2) -> str:
@@ -784,23 +560,111 @@ class ReviewState:
             if state.active and not state.passed and (current_set is None or name in current_set)
         ]
 
-    def mark_result_passed(self, filename: str, cycle: int, file_fingerprint: str = "") -> None:
+    def mark_result_confirmed(
+        self,
+        filename: str,
+        cycle: int,
+        fingerprint: str = "",
+        verdict: str = "CONFIRMED",
+        confidence: float = 0.0,
+        feedback: str = "",
+    ) -> None:
         self.result_states[filename] = ResultItemState(
-            passed=True, last_reviewed_cycle=cycle, fingerprint=file_fingerprint,
+            passed=True,
+            last_reviewed_cycle=cycle,
+            fingerprint=fingerprint,
+            vuln_status=STATUS_CONFIRMED,
+            status_label=STATUS_LABELS[STATUS_CONFIRMED],
+            verdict="CONFIRMED",
+            confidence=float(confidence or 0.0),
+            review_feedback=feedback or "",
+            reviewed=True,
         )
 
-    def mark_result_failed(self, filename: str, cycle: int, reason: str = "", file_fingerprint: str = "") -> None:
+    def mark_result_false_positive(
+        self,
+        filename: str,
+        cycle: int,
+        fingerprint: str = "",
+        verdict: str = "FALSE_POSITIVE",
+        confidence: float = 0.0,
+        feedback: str = "",
+    ) -> None:
         self.result_states[filename] = ResultItemState(
-            passed=False, last_reviewed_cycle=cycle, failure_reason=reason, fingerprint=file_fingerprint,
+            passed=False,
+            last_reviewed_cycle=cycle,
+            failure_reason="",
+            fingerprint=fingerprint,
+            vuln_status=STATUS_FALSE_POSITIVE,
+            status_label=STATUS_LABELS[STATUS_FALSE_POSITIVE],
+            verdict="FALSE_POSITIVE",
+            confidence=float(confidence or 0.0),
+            review_feedback=feedback or "",
+            reviewed=True,
         )
+
+    def mark_result_pending(
+        self,
+        filename: str,
+        cycle: int,
+        fingerprint: str = "",
+        verdict: str = "",
+        confidence: float = 0.0,
+        feedback: str = "",
+    ) -> None:
+        self.result_states[filename] = ResultItemState(
+            passed=False,
+            last_reviewed_cycle=cycle,
+            failure_reason=feedback or "",
+            fingerprint=fingerprint,
+            vuln_status=STATUS_PENDING,
+            status_label=STATUS_LABELS[STATUS_PENDING],
+            verdict="" if str(verdict or "").strip().upper() not in {"CONFIRMED", "FALSE_POSITIVE"} else str(verdict).strip().upper(),
+            confidence=float(confidence or 0.0),
+            review_feedback=feedback or "",
+            reviewed=bool(verdict or feedback),
+        )
+
+    def mark_result_passed(self, filename: str, cycle: int, file_fingerprint: str = "") -> None:
+        self.mark_result_confirmed(filename, cycle, file_fingerprint)
+
+    def mark_result_failed(self, filename: str, cycle: int, reason: str = "", file_fingerprint: str = "") -> None:
+        self.mark_result_pending(filename, cycle, file_fingerprint, "", feedback=reason)
 
     def is_result_failed(self, filename: str, current_fingerprint: str | None = None) -> bool:
         state = self.result_states.get(filename)
-        if state is None or state.passed or not state.active:
+        if state is None or state.passed or not state.active or state.vuln_status in TERMINAL_STATUSES:
             return False
         if current_fingerprint and state.fingerprint and current_fingerprint != state.fingerprint:
             return False
+        return bool(state.failure_reason)
+
+    def is_result_terminal_reviewed(self, filename: str, current_fingerprint: str | None = None) -> bool:
+        state = self.result_states.get(filename)
+        if state is None or not state.active or state.vuln_status not in TERMINAL_STATUSES:
+            return False
+        if current_fingerprint and state.fingerprint:
+            return current_fingerprint == state.fingerprint
         return True
+
+    def get_result_files_by_status(self, status: str, current_results: list[str] | None = None) -> list[str]:
+        current_set = set(current_results or []) if current_results is not None else None
+        return sorted(
+            name for name, state in self.result_states.items()
+            if state.active and state.vuln_status == status and (current_set is None or name in current_set)
+        )
+
+    def get_result_status_counts(self, current_results: list[str] | None = None) -> dict[str, int]:
+        counts = {"total": 0, STATUS_PENDING: 0, STATUS_CONFIRMED: 0, STATUS_FALSE_POSITIVE: 0, "inactive": 0}
+        current_set = set(current_results or []) if current_results is not None else None
+        for name, state in self.result_states.items():
+            if current_set is not None and name not in current_set:
+                continue
+            counts["total"] += 1
+            if not state.active:
+                counts["inactive"] += 1
+            counts[state.vuln_status] = counts.get(state.vuln_status, 0) + 1
+        return counts
 
     def has_failures(
         self,
@@ -816,7 +680,7 @@ class ReviewState:
         """
         desired_owner = (actionable_by or "").strip().lower()
         failed = self.get_failed_results(current_results=current_results)
-        if failed and (not desired_owner or desired_owner == "worker"):
+        if failed and not desired_owner:
             return True
 
         recent_issues = self.get_recent_issues(last_n=self.FEEDBACK_WINDOW)
@@ -870,14 +734,13 @@ class ReviewState:
             "schema_contract",
             "metadata",
             "metadata_sync",
-            "ledger",
             "summary",
         }
         return category not in non_worker_categories
 
     def is_result_review_stable(self) -> bool:
         active_states = [state for state in self.result_states.values() if state.active]
-        return bool(self.result_states) and all(state.passed for state in active_states)
+        return bool(self.result_states) and all(state.vuln_status in TERMINAL_STATUSES for state in active_states)
 
     def get_pending_results(
         self,
@@ -902,9 +765,12 @@ class ReviewState:
             current_fp = fps.get(name, "")
             old_fp = state.fingerprint or ""
             if old_fp and current_fp and old_fp == current_fp:
-                continue  # 指纹未变，跳过
+                if state.vuln_status in TERMINAL_STATUSES:
+                    continue  # 指纹未变且已有终态，跳过
+                if state.vuln_status == STATUS_PENDING and state.reviewed:
+                    continue  # 证据不足等非终态但未变化，避免重复提交
             if not old_fp and not current_fp:
-                if state.passed:
-                    continue  # 无指纹但已通过，跳过
+                if state.vuln_status in TERMINAL_STATUSES:
+                    continue  # 无指纹但已有终态，跳过
             pending.append(name)
         return sorted(pending)

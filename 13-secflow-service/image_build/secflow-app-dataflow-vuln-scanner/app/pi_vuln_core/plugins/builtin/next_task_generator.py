@@ -4,6 +4,13 @@ import os
 from app.pi_vuln_core.plugins.base import BasePlugin, PluginContext, PluginResult, PluginResultCode
 from app.pi_vuln_core.utils.file_ops import read_file, write_file, write_json
 from app.pi_vuln_core.utils.result_docs import sync_result_relations_manifest
+from app.pi_vuln_core.utils.vulnerability_list import (
+    STATUS_CONFIRMED,
+    STATUS_PENDING,
+    entries_by_result_file,
+    files_by_status,
+    load_vulnerability_list,
+)
 from app.pi_vuln_core.utils.template import render_template
 from app.pi_vuln_core.utils.logger import get_logger
 
@@ -52,7 +59,14 @@ class NextTaskGeneratorPlugin(BasePlugin):
                 results_dir=ctx.results_dir,
                 summary_file=ctx.summary_file,
             )
-            results_list = list(result_selection.get("taskable_results", []))
+            vuln_payload = load_vulnerability_list(ctx.working_dir)
+            vuln_entries = entries_by_result_file(vuln_payload)
+            confirmed = files_by_status(vuln_payload, STATUS_CONFIRMED)
+            pending = files_by_status(vuln_payload, STATUS_PENDING)
+            if vuln_entries:
+                results_list = sorted(dict.fromkeys([*confirmed, *pending]))
+            else:
+                results_list = list(result_selection.get("taskable_results", []))
 
         # 如果有配置 agent_id + prompt，使用 AI 生成
         if agent_id and prompt_tpl and ctx.agent_registry:
@@ -98,7 +112,7 @@ class NextTaskGeneratorPlugin(BasePlugin):
                 {
                     "tasks": task_files,
                     "result_selection": {
-                        "taskable_results": result_selection.get("taskable_results", []),
+                        "taskable_results": results_list,
                         "supplemental_results": result_selection.get("supplemental_results", []),
                         "excluded_results": result_selection.get("excluded_results", []),
                         "selection_source": result_selection.get("selection_source", "all_result_files"),

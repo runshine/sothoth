@@ -156,13 +156,7 @@ class EngineConfig(BaseModel):
     reset_worker_session_per_cycle: bool = False
     plateau_closure_streak: int = Field(default=2, ge=1)
     plateau_abort_streak: int = Field(default=3, ge=1)
-    same_issue_stagnation_threshold: int = Field(default=2, ge=1)
-    same_issue_abort_threshold: int = Field(default=3, ge=1)
-    per_issue_attempt_budget: int = Field(default=2, ge=1)
     summary_repair_attempt_budget: int = Field(default=2, ge=1)
-    analysis_closure_cycles: int = Field(default=1, ge=1)
-    issue_churn_closure_window: int = Field(default=2, ge=2)
-    issue_churn_abort_window: int = Field(default=3, ge=2)
     score_min_delta: float = Field(default=0.03, ge=0.0)
 
 

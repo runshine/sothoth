@@ -421,8 +421,8 @@ def test_rework_prompt_filters_framework_issues_and_stale_deleted_results(tmp_pa
     assert "supporting_docs" in prompt
     assert "后续显式 summary 阶段" in prompt
     assert "近期全局评审反馈" in prompt or "未通过评审" in prompt
-    assert "修复/删除未通过结果" in prompt
-    assert "不要继续扩张攻击面" in prompt
+    assert "本轮不处理旧漏洞状态" in prompt
+    assert "不要继续扩张到队列之外的攻击面" in prompt
     assert "新增" in prompt and "result_NNN.md" in prompt
 
 
@@ -450,9 +450,7 @@ def test_initial_worker_context_marks_summary_outputs_as_deferred(tmp_path: Path
     assert "本阶段正式结果目录" in context
     assert "本阶段辅助文档目录" in context
     assert "后续 summary 阶段整理的总结报告" in context
-    assert "后续 summary 阶段同步的局限性记录" in context
-    assert "本阶段输出位置 contract" in context
-    assert "将在后续显式 summary 阶段统一整理" in context
+    assert "开始前必须读取" in context
 
 
 def test_reflection_scope_becomes_mode_aware_in_rework_cycles(tmp_path: Path):
@@ -517,11 +515,11 @@ def test_rework_prompt_switches_to_result_repair_only_without_worker_issues(tmp_
     executor = WorkerExecutor(agent_registry=None, recorder=None)  # type: ignore[arg-type]
     prompt = executor._build_rework_prompt(ctx, state)
 
-    # 无 worker issue 时，不应出现 issue 章节，但应出现结果修复要求
+    # 无 worker issue 时，不应出现 issue 章节；rework 只保留 missed_hunt 方向。
     assert "未关闭的 Worker 可执行 issue" not in prompt
-    assert "修复/删除未通过结果" in prompt
-    assert "只聚焦**修复/删除未通过结果**" in prompt
-    assert "不要继续扩张攻击面" in prompt
+    assert "修复/删除未通过结果" not in prompt
+    assert "本轮不处理旧漏洞状态" in prompt
+    assert "不要继续扩张到队列之外的攻击面" in prompt
     assert "## 本轮双目标（必须同时满足）" not in prompt
 
 

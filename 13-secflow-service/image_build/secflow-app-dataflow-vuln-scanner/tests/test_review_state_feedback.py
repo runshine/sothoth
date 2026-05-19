@@ -110,15 +110,15 @@ def test_mixed_framework_and_worker_global_issues_are_routed_to_rework() -> None
             cycle=1,
             advisor_id="global_completeness",
             passed=False,
-            feedback="coverage still open and ledger extractor has one artifact",
+            feedback="analysis still open and manifest sync has one artifact",
             issues=[
                 {
-                    "id": "coverage-open-required",
-                    "category": "coverage_gate",
+                    "id": "export-followthrough-open",
+                    "category": "analysis_gap",
                     "actionable_by": "worker",
                 },
                 {
-                    "id": "ledger-artifact",
+                    "id": "manifest-artifact",
                     "category": "framework_gap",
                     "actionable_by": "framework",
                 },
@@ -173,7 +173,6 @@ def test_parsed_global_issues_preserve_blocker_protocol_fields() -> None:
                         "actionable_by": "worker",
                         "blocking_type": "needs_external_source",
                         "acceptance_criteria": "补齐生产链源码或记录 residual",
-                        "max_retries_for_same_issue": 2,
                     }
                 ],
             },
@@ -184,30 +183,9 @@ def test_parsed_global_issues_preserve_blocker_protocol_fields() -> None:
     issue = parsed.issues[0]
     assert issue["blocking_type"] == "needs_external_source"
     assert issue["acceptance_criteria"] == "补齐生产链源码或记录 residual"
-    assert issue["max_retries_for_same_issue"] == 2
 
 
-def test_issue_ledger_fingerprints_repeated_semantic_issues() -> None:
-    state = ReviewState()
-    issue = {
-        "id": "CMP-ppldm-slot0",
-        "category": "coverage_gap",
-        "target": "PP/LDM slot-0",
-        "required_action": "查证 PP/LDM slot-0 control-info production chain",
-        "actionable_by": "worker",
-    }
-
-    first = state.update_issue_ledger(cycle=1, issues=[issue])
-    second = state.update_issue_ledger(cycle=2, issues=[{**issue, "id": "CMP-ppldm-slot0-v2"}])
-
-    assert first["max_consecutive_count"] == 1
-    assert second["max_consecutive_count"] == 2
-    assert second["repeated_signatures"]
-    snapshot = state.get_issue_ledger_snapshot()
-    assert snapshot["entries"][0]["seen_count"] == 2
-
-
-def test_current_issue_records_follow_active_ledger_not_stale_history() -> None:
+def test_current_issue_records_follow_latest_feedback_not_stale_history() -> None:
     state = ReviewState()
     stale_issue = {
         "id": "CMP-old",
@@ -217,12 +195,12 @@ def test_current_issue_records_follow_active_ledger_not_stale_history() -> None:
         "actionable_by": "worker",
     }
     active_profile_issue = {
-        "id": "PROFILE-balanced-coverage-open-required",
-        "category": "coverage_gate",
-        "target": "_meta/coverage_ledger.json",
-        "required_action": "关闭当前 open obligations",
+        "id": "CMP-active-export",
+        "category": "analysis_gap",
+        "target": "IPSEC_SOCK_SendToSocket",
+        "required_action": "继续跟入 EXPORT 链",
         "actionable_by": "worker",
-        "blocking_type": "coverage_obligation_open",
+        "blocking_type": "analysis_gap",
     }
 
     state.global_review_history.append(
@@ -248,9 +226,9 @@ def test_current_issue_records_follow_active_ledger_not_stale_history() -> None:
     )
 
     current = state.get_current_issue_records()
-    assert [item["id"] for item in current] == ["PROFILE-balanced-coverage-open-required"]
+    assert [item["id"] for item in current] == ["CMP-active-export"]
     assert current[0]["seen_count"] == 1
-    assert current[0]["blocking_type"] == "coverage_obligation_open"
+    assert current[0]["blocking_type"] == "analysis_gap"
 
 
 def test_review_feedback_snapshot_uses_active_issues_and_clears_after_pass(tmp_path) -> None:
@@ -264,11 +242,11 @@ def test_review_feedback_snapshot_uses_active_issues_and_clears_after_pass(tmp_p
         "actionable_by": "worker",
     }
     active_profile_issue = {
-        "id": "PROFILE-balanced-summary-only-evidence",
-        "category": "coverage_gate",
-        "target": "_meta/coverage_ledger.json",
+        "id": "SUM-summary-evidence",
+        "category": "report_completeness",
+        "target": "summary.md",
         "required_action": "补充 supporting_docs 证据",
-        "actionable_by": "worker",
+        "actionable_by": "summary",
         "blocking_type": "summary_only_evidence",
     }
 
@@ -297,8 +275,7 @@ def test_review_feedback_snapshot_uses_active_issues_and_clears_after_pass(tmp_p
     executor._write_review_feedback_snapshot(str(tmp_path), 2, state)
     snapshot = json.loads((tmp_path / "_meta" / "review_feedback" / "cycle_002.json").read_text(encoding="utf-8"))
     assert snapshot["issue_count"] == 1
-    assert [item["id"] for item in snapshot["issues"]] == ["PROFILE-balanced-summary-only-evidence"]
-    assert snapshot["issue_ledger_status"]["active_issue_count"] == 1
+    assert [item["id"] for item in snapshot["issues"]] == ["SUM-summary-evidence"]
 
     state.record_global_review_result(
         cycle=3,
@@ -355,4 +332,4 @@ def test_summary_actionable_issue_enters_summary_scope() -> None:
         )
     )
 
-    assert AtomicWorkflowEngine._classify_global_failure_scope(state) == "summary_or_ledger"
+    assert AtomicWorkflowEngine._classify_global_failure_scope(state) == "summary_doc"

@@ -17,8 +17,8 @@ Completeness advisor 已经是前置关卡，负责覆盖率。你要重点抓"�
 
 ### 零、Closure 模式优先验收已知阻塞项
 - 如果当前工作模式是 `closure`，不要把本轮重新扩张为全量深挖
-- 先核对 `_meta/issue_ledger.json` 的 active issues 与 `_meta/coverage_ledger.json` 的 open obligations 是否已被源码证据、漏洞报告、supporting_docs 或 accepted residual 关闭
-- 已经有 `source_closed`、`promoted_to_result`、`accepted_residual`、`unused`、`not_applicable`、`external_blocked` 且证据自洽的项，应视为关闭
+- 先核对 active issues 是否已被源码证据、漏洞报告、supporting_docs 或 accepted residual 关闭
+- 已经有 `source_closed`、`promoted_to_result`、`accepted_residual`、`not_applicable`、`external_blocked` 且证据自洽的项，应视为关闭
 - 新增 depth blocker 必须是具体、可验证、高价值的深度缺口；不要用“仍需更深入/仍可能有风险”这种开放式要求阻断
 
 ### 一、漏洞模式扫描广度

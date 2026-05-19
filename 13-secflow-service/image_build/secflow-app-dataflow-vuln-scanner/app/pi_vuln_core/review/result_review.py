@@ -47,6 +47,7 @@ from app.pi_vuln_core.utils.result_docs import (
     list_result_report_files,
     list_supporting_markdown_files,
 )
+from app.pi_vuln_core.utils.vulnerability_list import apply_result_review_verdict
 from app.pi_vuln_core.utils.template import render_string
 from app.pi_vuln_core.utils.logger import get_logger
 
@@ -172,14 +173,14 @@ class ResultReviewExecutor:
             )
         carried_failed_items = [
             FailedResultItem(
-                filename=result_file,
-                reason=review_state.result_states[result_file].failure_reason,
+                filename=name,
+                reason=review_state.result_states[name].failure_reason,
+                cycle=review_state.result_states[name].last_reviewed_cycle,
             )
-            for result_file in all_result_files
-            if result_file not in pending
-            and review_state.is_result_failed(
-                result_file,
-                current_fingerprints.get(result_file),
+            for name in sorted(current_cycle_framework_failed)
+            if review_state.is_result_failed(
+                name,
+                current_fingerprints.get(name, ""),
             )
         ]
 
@@ -258,33 +259,40 @@ class ResultReviewExecutor:
                     reason=f"结果评审框架异常：{outcome}",
                 ) from outcome
             elif not outcome:
-                # outcome=False 表示不通过，具体原因已在 _review_single 中记录
-                failed_items.append(FailedResultItem(
-                    filename=result_file,
-                    reason=review_state.result_states.get(
-                        result_file, type("", (), {"failure_reason": "未知"})
-                    ).failure_reason
-                ))
-            else:
-                existing_state = review_state.result_states.get(result_file)
-                if (
-                    existing_state is not None
-                    and not existing_state.passed
-                    and existing_state.active
-                    and existing_state.last_reviewed_cycle == cycle
-                    and existing_state.failure_reason
-                ):
+                state = review_state.result_states.get(result_file)
+                if state is not None and review_state.is_result_failed(result_file, current_fingerprint):
                     failed_items.append(FailedResultItem(
                         filename=result_file,
-                        reason=existing_state.failure_reason,
+                        reason=state.failure_reason or state.review_feedback or "结果评审未通过",
                         cycle=cycle,
                     ))
-                    continue
-                review_state.mark_result_passed(
-                    result_file,
-                    cycle,
-                    current_fingerprint,
-                )
+            else:
+                # _review_single has already persisted business verdicts into
+                # ReviewState and vulnerability_list.json. Do not convert
+                # FALSE_POSITIVE into Worker repair items.
+                continue
+
+        # Parallel result reviews may update vulnerability_list.json concurrently.
+        # Re-apply the in-memory states serially so the final list contains all
+        # reviewed results from this cycle.
+        for result_file in all_result_files:
+            state = review_state.result_states.get(result_file)
+            if state is None or state.last_reviewed_cycle != cycle:
+                continue
+            verdict = str(state.verdict or "").strip().upper()
+            if verdict not in {"CONFIRMED", "FALSE_POSITIVE"}:
+                continue
+            apply_result_review_verdict(
+                working_dir=work_dir,
+                results_dir=results_dir,
+                result_file=result_file,
+                verdict=verdict,
+                passed=(verdict == "CONFIRMED"),
+                confidence=state.confidence,
+                feedback=state.review_feedback or state.failure_reason,
+                cycle=cycle,
+                fingerprint=current_fingerprints.get(result_file, ""),
+            )
 
         all_passed = len(failed_items) == 0
 
@@ -391,12 +399,14 @@ class ResultReviewExecutor:
         work_dir: str,
     ) -> dict[str, str]:
         supporting_docs_dir = Path(work_dir) / "supporting_docs"
+        vulnerability_list_file = Path(work_dir) / "_meta" / "vulnerability_list.json"
         supporting_docs = list_supporting_markdown_files(supporting_docs_dir)
         lines = [
             "## 当前待验证对象",
             f"- 任务文件: `{task_file}`",
             f"- 待验证报告: `{result_path}`",
             f"- 辅助文档目录: `{supporting_docs_dir}`",
+            f"- 漏洞状态列表（只读，最终 verdict 由框架写回）: `{vulnerability_list_file}`",
             "",
             "## 开始前必须读取",
             f"- `{task_file}`",
@@ -443,6 +453,14 @@ class ResultReviewExecutor:
         verdict = str(data.get("verdict") or "").strip()
         if parser_mode == "agent_error" or verdict == "ERROR":
             return None
+        verdict_upper = verdict.upper()
+        passed = bool(data.get("passed", False))
+        if verdict_upper not in {"CONFIRMED", "FALSE_POSITIVE"}:
+            return None
+        if passed and verdict_upper != "CONFIRMED":
+            return None
+        if not passed and verdict_upper != "FALSE_POSITIVE":
+            return None
         return data
 
     async def _review_single(
@@ -488,7 +506,33 @@ class ResultReviewExecutor:
                 result_file=result_file,
             )
             if existing_record is not None:
-                if bool(existing_record.get("passed", False)):
+                reason = str(
+                    existing_record.get("feedback_detail")
+                    or existing_record.get("feedback")
+                    or "结果评审未通过"
+                )
+                verdict = str(existing_record.get("verdict") or "").strip().upper()
+                confidence = existing_record.get("confidence") or 0.0
+                if bool(existing_record.get("passed", False)) or verdict == "CONFIRMED":
+                    review_state.mark_result_confirmed(
+                        result_file,
+                        cycle,
+                        current_fingerprint or "",
+                        verdict="CONFIRMED",
+                        confidence=float(confidence or 0.0),
+                        feedback=reason,
+                    )
+                    apply_result_review_verdict(
+                        working_dir=work_dir,
+                        results_dir=results_dir,
+                        result_file=result_file,
+                        verdict="CONFIRMED",
+                        passed=True,
+                        confidence=float(confidence or 0.0),
+                        feedback=reason,
+                        cycle=cycle,
+                        fingerprint=current_fingerprint or "",
+                    )
                     logger.info(
                         "result_review_resume_skip_existing_advisor",
                         result_file=result_file,
@@ -496,18 +540,27 @@ class ResultReviewExecutor:
                         cycle=cycle,
                     )
                     continue
-                reason = str(
-                    existing_record.get("feedback_detail")
-                    or existing_record.get("feedback")
-                    or "结果评审未通过"
+                if verdict == "FALSE_POSITIVE":
+                    review_state.mark_result_false_positive(
+                        result_file,
+                        cycle,
+                        current_fingerprint or "",
+                        verdict="FALSE_POSITIVE",
+                        confidence=float(confidence or 0.0),
+                        feedback=reason,
+                    )
+                apply_result_review_verdict(
+                    working_dir=work_dir,
+                    results_dir=results_dir,
+                    result_file=result_file,
+                    verdict="FALSE_POSITIVE",
+                    passed=False,
+                    confidence=float(confidence or 0.0),
+                    feedback=reason,
+                    cycle=cycle,
+                    fingerprint=current_fingerprint or "",
                 )
-                review_state.mark_result_failed(
-                    result_file,
-                    cycle,
-                    reason,
-                    current_fingerprint or "",
-                )
-                return False
+                return True
 
             agent = self.agents.get(advisor_def.agent_id)
 
@@ -684,23 +737,38 @@ class ResultReviewExecutor:
                     initial_response_content=response.content or "",
                 )
                 if not parse_outcome.schema_valid:
-                    parse_outcome = ResultReviewParseOutcome(
-                        parsed=ParsedReviewResult(
-                            passed=False,
-                            verdict="INSUFFICIENT_INFO",
-                            feedback="INSUFFICIENT_INFO（证据不足） - 结果评审未返回 canonical JSON，已按失败处理",
-                            feedback_detail=(
-                                parse_outcome.repair_reason
-                                or "结果评审未返回 canonical JSON，已按失败处理"
-                            ),
-                            scores={},
-                            confidence=0.0,
-                            raw_content=raw_chain,
-                        ),
+                    reason = parse_outcome.repair_reason or "结果评审未返回 canonical JSON"
+                    await self.recorder.record_result_review(
+                        work_dir=work_dir,
+                        result_file=result_file,
+                        advisor_id=advisor_def.instance_id,
+                        cycle=cycle,
+                        passed=False,
+                        content=reason,
+                        agent_id=advisor_def.agent_id,
+                        role_name=advisor_def.role_name,
+                        raw_content=raw_chain,
+                        verdict="ERROR",
+                        detail_feedback=reason,
                         schema_valid=False,
                         parser_mode=parse_outcome.parser_mode,
-                        repair_reason=parse_outcome.repair_reason,
-                        needs_repair=False,
+                        repair_attempts=repair_attempts,
+                    )
+                    record_step_checkpoint(
+                        work_dir,
+                        cycle=cycle,
+                        phase="result_review",
+                        step_key=step_key,
+                        status="failed",
+                        agent_id=advisor_def.agent_id,
+                        session_id=session_id,
+                        detail=reason,
+                    )
+                    raise ResultReviewFrameworkError(
+                        result_file=result_file,
+                        advisor_id=advisor_def.instance_id,
+                        reason=reason,
+                        error_code="result_review_schema_invalid",
                     )
                 parsed = parse_outcome.parsed
 
@@ -772,37 +840,42 @@ class ResultReviewExecutor:
                     repair_attempts=repair_attempts,
                 )
 
-                if not parsed.passed:
-                    # 当前结果不通过 → 放弃继续评审 (R6g)
-                    review_state.mark_result_failed(
+                if parsed.verdict == "FALSE_POSITIVE":
+                    review_state.mark_result_false_positive(
                         result_file,
                         cycle,
-                        parsed.feedback_detail or parsed.feedback,
                         current_fingerprint or "",
+                        verdict=parsed.verdict,
+                        confidence=parsed.confidence,
+                        feedback=parsed.feedback_detail or parsed.feedback,
                     )
-                    record_step_checkpoint(
-                        work_dir,
-                        cycle=cycle,
-                        phase="result_review",
-                        step_key=step_key,
-                        status="completed",
-                        agent_id=advisor_def.agent_id,
-                        session_id=session_id,
-                        extra={
-                            "passed": False,
-                            "repair_attempts": repair_attempts,
-                            "runtime_retries_used": runtime_retries_used,
-                            "runtime_retry_limit": retry_limit,
-                        },
+                elif parsed.passed or parsed.verdict == "CONFIRMED":
+                    review_state.mark_result_confirmed(
+                        result_file,
+                        cycle,
+                        current_fingerprint or "",
+                        verdict="CONFIRMED",
+                        confidence=parsed.confidence,
+                        feedback=parsed.feedback_detail or parsed.feedback,
                     )
-                    logger.info("result_review_failed",
-                                 result_file=result_file,
-                                 advisor=advisor_def.instance_id,
-                                 cycle=cycle,
-                                 parser_mode=parse_outcome.parser_mode,
-                                 schema_valid=parse_outcome.schema_valid,
-                                 repair_attempts=repair_attempts)
-                    return False
+                else:
+                    raise ResultReviewFrameworkError(
+                        result_file=result_file,
+                        advisor_id=advisor_def.instance_id,
+                        reason=f"结果评审返回了非法 business verdict: {parsed.verdict or '<empty>'}",
+                        error_code="result_review_invalid_verdict",
+                    )
+                apply_result_review_verdict(
+                    working_dir=work_dir,
+                    results_dir=results_dir,
+                    result_file=result_file,
+                    verdict=parsed.verdict,
+                    passed=parsed.passed,
+                    confidence=parsed.confidence,
+                    feedback=parsed.feedback_detail or parsed.feedback,
+                    cycle=cycle,
+                    fingerprint=current_fingerprint or "",
+                )
 
                 record_step_checkpoint(
                     work_dir,
@@ -906,16 +979,16 @@ class ResultReviewExecutor:
             "- 这是一份补充分析 / correction / supplement / VALID_CORRECTION 报告\n\n"
             "只有以下两类情况判不通过：\n"
             "1. FALSE_POSITIVE：问题本身不存在，或被遗漏的完整检查有效阻断\n"
-            "2. INSUFFICIENT_INFO：你无法确定底层问题是否真实存在\n\n"
+            "2. 如果证据不完整，也必须基于现有材料在 CONFIRMED / FALSE_POSITIVE 中二选一，并在 feedback 说明不确定点；禁止输出 INSUFFICIENT_INFO。\n\n"
             "严格要求：\n"
             "1. 只能输出一个 JSON 对象，禁止任何前言、总结、解释、Markdown 代码块。\n"
-            "2. verdict 只能是 CONFIRMED / FALSE_POSITIVE / INSUFFICIENT_INFO，禁止使用 VALID_CORRECTION、REAL、TRUE_POSITIVE_WITH_CAVEATS、verification_result 等 alias。\n"
+            "2. verdict 只能是 CONFIRMED / FALSE_POSITIVE，禁止使用 INSUFFICIENT_INFO、UNVERIFIED、VALID_CORRECTION、REAL、TRUE_POSITIVE_WITH_CAVEATS、verification_result 等 alias。\n"
             "3. scores 必须是对象，且必须包含唯一必需字段 `issue_truth`，字段值必须是 0.0-1.0 数值，不能写 HIGH/MEDIUM/LOW。\n"
             "4. confidence 也必须是 0.0-1.0 数值，不能写 HIGH/MEDIUM/LOW。\n\n"
             "严格输出：\n"
             "{\n"
             '  "passed": true 或 false,\n'
-            '  "verdict": "CONFIRMED" | "FALSE_POSITIVE" | "INSUFFICIENT_INFO",\n'
+            '  "verdict": "CONFIRMED" | "FALSE_POSITIVE",\n'
             '  "feedback": "一句话说明结论；若通过，可顺带写需要修正的严重度/攻击链/前提等",\n'
             '  "scores": {"issue_truth": 0.0},\n'
             '  "confidence": 0.0\n'

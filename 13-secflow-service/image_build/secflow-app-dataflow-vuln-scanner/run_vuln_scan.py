@@ -4,7 +4,7 @@
 
 用法:
   python run_vuln_scan.py \
-    --data-flow /path/to/data_flow_analysis.md \
+    --data-flow /path/to/dataflows/ \
     --source-dir /path/to/source_code/ \
     [--run-name my_scan] \
     [--model icsl/zai-org/GLM-5] \
@@ -24,6 +24,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sys
 import uuid
 from datetime import datetime
@@ -121,125 +122,266 @@ def _mark_run_finished(run_dir: str | Path, *, status: str, exit_code: int) -> N
     )
 
 
-def generate_task_md(data_flow_file: str, source_dir: str) -> str:
-    """根据输入参数生成 task.md 内容"""
+DATA_FLOW_FILE_SUFFIXES = {".md", ".txt"}
 
-    # 从数据流文件中提取函数信息（如果可能）
-    func_info = ""
-    try:
-        content = Path(data_flow_file).read_text(encoding="utf-8")
-        for line in content.split("\n"):
-            if line.startswith("# 数据流追踪：") or line.startswith("# 数据流追踪:"):
-                func_name = line.split("：")[-1].split(":")[-1].strip()
-                func_info = f"\n请**完整阅读**该文件，理解目标函数 `{func_name}` 的数据流结构。\n"
-                break
-    except Exception:
-        pass
 
-    # 统计源码文件
-    source_stats = []
-    if os.path.isdir(source_dir):
-        c_files = list(Path(source_dir).rglob("*.c"))
-        h_files = list(Path(source_dir).rglob("*.h"))
-        asm_files = list(Path(source_dir).rglob("*.asm"))
-        if c_files:
-            source_stats.append(f"{len(c_files)} 个 .c 文件")
-        if h_files:
-            source_stats.append(f"{len(h_files)} 个 .h 文件")
-        if asm_files:
-            source_stats.append(f"{len(asm_files)} 个 .asm 文件")
+def discover_data_flow_files(data_flow_path: str | Path) -> list[Path]:
+    """Return data-flow result files from a directory, with legacy file support."""
+    path = Path(data_flow_path)
+    if path.is_file():
+        return [path]
+    if not path.is_dir():
+        return []
+    return sorted(
+        item
+        for item in path.rglob("*")
+        if item.is_file() and item.suffix.lower() in DATA_FLOW_FILE_SUFFIXES
+    )
 
-    stats_line = f"包含 {', '.join(source_stats)}。" if source_stats else ""
 
-    # 从数据流文件提取关键统计
-    analysis_hints = _extract_analysis_hints(data_flow_file)
+def data_flow_manifest_input(data_flow_path: str | Path) -> dict[str, object]:
+    path = Path(data_flow_path)
+    data_flow_dir = path if path.is_dir() else path.parent
+    return {
+        "data_flow_dir": os.path.abspath(data_flow_dir),
+        "data_flow_files": [os.path.abspath(item) for item in discover_data_flow_files(path)],
+    }
+
+
+def generate_task_md(dataflow_dir: str, source_dir: str) -> str:
+    """根据数据流污点分析目录和源码目录生成 task.md 内容。"""
+
+    dataflow_root = Path(dataflow_dir)
+    source_root = Path(source_dir)
+    dataflow_files = discover_data_flow_files(dataflow_root)
+    final_report = _find_final_report(dataflow_root, dataflow_files)
+    sub_reports = _find_sub_dataflow_reports(dataflow_root, dataflow_files)
+    overview = _extract_dataflow_overview(final_report, dataflow_files)
+    marker_counts = _extract_analysis_marker_counts(final_report, dataflow_files)
+    source_files = _discover_source_files(source_root)
+
+    root_name = str(overview.get("root_function") or "").strip()
+    tracked_count = overview.get("tracked_count")
+    if root_name and tracked_count:
+        target_scope = f"入口函数 `{root_name}` 及调用链中共 {tracked_count} 个跟踪函数"
+    elif root_name:
+        target_scope = f"入口函数 `{root_name}` 及其调用链函数"
+    elif tracked_count:
+        target_scope = f"入口函数及调用链中共 {tracked_count} 个跟踪函数"
+    else:
+        target_scope = "入口函数及其调用链函数"
+    dataflow_lines = [f"`{os.path.abspath(dataflow_root)}`", ""]
+    if final_report:
+        dataflow_lines.append(
+            f"- `{os.path.abspath(final_report)}`：从入口函数开始的整体污点分析报告，"
+            "包含根函数、调用链函数列表、污点源、传播路径、DIRECT_SINK/USED/EXPORT/CLEANED "
+            "终点和安全备注。"
+        )
+    elif dataflow_root.is_file():
+        dataflow_lines.append(
+            f"- `{os.path.abspath(dataflow_root)}`：数据流污点分析结果文件，用于定位入口、污点源、传播路径和终点。"
+        )
+    else:
+        dataflow_lines.append("- 未发现 `final_report.md`，需要从目录中的数据流结果文件建立入口和调用链视图。")
+
+    if sub_reports:
+        dataflow_subdir = dataflow_root / "dataflow"
+        subdir_label = os.path.abspath(dataflow_subdir) if dataflow_subdir.is_dir() else "dataflow/"
+        dataflow_lines.append(
+            f"- `{subdir_label}`：子函数级污点分析结果，共 {len(sub_reports)} 个 `.md` 文件。"
+            "每个文件对应一个被跟入函数，记录该函数接收的污点、内部传播、导入对象、终点和高危操作。"
+        )
+    elif dataflow_root.is_dir():
+        dataflow_lines.append("- `dataflow/`：未发现子函数级 `.md` 报告，请以整体报告和源码为准。")
+
+    dataflow_lines.append("")
+    dataflow_lines.append("数据流标记含义：")
+    dataflow_lines.extend(_format_marker_meaning_lines())
+
+    marker_lines = _format_marker_counts(marker_counts)
+    if marker_lines:
+        dataflow_lines.append("")
+        dataflow_lines.append("分析概览：")
+        dataflow_lines.extend(marker_lines)
+
+    source_lines = [f"`{os.path.abspath(source_root)}`", ""]
+    if source_files:
+        source_lines.append("该目录包含反编译源码和辅助文件：")
+        source_lines.extend(_format_source_file_lines(source_root, source_files))
+        source_lines.append("")
+        source_lines.append(
+            "源码用于验证数据流报告中的函数签名、行号、条件判断、内存访问、拷贝长度、"
+            "指针偏移、外部调用和清洗逻辑。"
+        )
+    else:
+        source_lines.append("当前未枚举到 `.c`、`.h` 或 `.asm` 文件，请确认源码目录路径是否正确。")
 
     return f"""# 漏洞挖掘任务
 
-## 目标
-基于数据流分析结果，对目标函数及其调用链进行深度安全漏洞挖掘。
+## 任务目标
+基于数据流污点分析结果，对{target_scope}进行漏洞挖掘。重点验证污点从入口参数、派生对象、网络或管道数据进入后，在源码中的传播、边界检查、清洗、外部调用和危险内存操作是否形成可利用问题。
 
-## 数据流分析文件
-`{os.path.abspath(data_flow_file)}`
-{func_info}
-## 源码目录
-`{os.path.abspath(source_dir)}`
+## 输入目录
 
-该目录包含数据流分析涉及的所有源码文件（.c, .h, .asm）。{stats_line}
+### 数据流污点分析结果目录
+{chr(10).join(dataflow_lines)}
 
-{analysis_hints}
-## 要求
-1. 首先**完整阅读**数据流分析文件，理解目标函数的行为和所有数据流路径
-2. 阅读源码目录中的相关代码文件，验证数据流分析的结论
-3. 对每个 EXPORT 终点（数据传入外部函数），跟入源码继续追踪
-4. 对每个 USED 终点（数据参与操作），检查操作安全性
-5. 对数据流分析的关键发现（★ 标记），进行源码级验证
-6. 对每个确认的漏洞，给出完整的证据链（从 INPUT 到危险操作）
+### 源码目录
+{chr(10).join(source_lines)}
+
+## 分析要求
+1. 先阅读 `final_report.md`，建立入口函数、调用链和高危传播路径的整体视图。
+2. 再按需要阅读 `dataflow/` 中对应的子函数报告，补齐跨函数传播、导入污点对象和终点语义。
+3. 对照源码目录中的反编译源码按数据流污点传播路径进行漏洞挖掘和报告生成。
+4. 输出漏洞时必须给出从污点源到危险操作的证据链，并引用数据流报告文件和源码位置。
 """
 
 
-def _extract_analysis_hints(data_flow_file: str) -> str:
-    """从数据流文件中提取分析提示"""
+def _read_text_if_exists(path: Path | None) -> str:
+    if not path or not path.is_file():
+        return ""
     try:
-        content = Path(data_flow_file).read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return ""
 
-    hints = []
 
-    # 统计 INPUT 数量（去重: 只计唯一的 INPUT-N 编号）
-    import re
-    input_ids = set(re.findall(r'INPUT-(\d+)', content))
-    if input_ids:
-        hints.append(f"- 数据流分析已识别 {len(input_ids)} 个外部输入")
+def _find_final_report(dataflow_root: Path, dataflow_files: list[Path]) -> Path | None:
+    if dataflow_root.is_file():
+        return dataflow_root
+    candidate = dataflow_root / "final_report.md"
+    if candidate.is_file():
+        return candidate
+    for item in dataflow_files:
+        if item.name == "final_report.md":
+            return item
+    return dataflow_files[0] if len(dataflow_files) == 1 else None
 
-    # 从统计表中提取终点数量（更精确）
-    export_count = 0
-    used_count = 0
-    cleaned_count = 0
-    for line in content.split("\n"):
-        line_stripped = line.strip()
-        # 匹配统计表行: | 🟡 EXPORT | 5 | ...
-        if "🟡 EXPORT" in line_stripped and "|" in line_stripped:
-            parts = [p.strip() for p in line_stripped.split("|")]
-            for p in parts:
-                if p.isdigit():
-                    export_count = max(export_count, int(p))
-                    break
-        elif "📌 USED" in line_stripped and "|" in line_stripped:
-            parts = [p.strip() for p in line_stripped.split("|")]
-            for p in parts:
-                if p.isdigit():
-                    used_count = max(used_count, int(p))
-                    break
-        elif "🟢 CLEANED" in line_stripped and "|" in line_stripped:
-            parts = [p.strip() for p in line_stripped.split("|")]
-            for p in parts:
-                if p.isdigit():
-                    cleaned_count = max(cleaned_count, int(p))
-                    break
 
-    if export_count > 0:
-        hints.append(f"- 有 {export_count} 个 EXPORT 终点需要跟入源码分析")
-    if used_count > 0:
-        hints.append(f"- 有 {used_count} 个 USED 终点需要检查安全性")
-    if cleaned_count == 0 and (export_count > 0 or used_count > 0):
-        hints.append("- 无数据清洗操作（CLEANED=0），需评估整体安全风险")
+def _find_sub_dataflow_reports(dataflow_root: Path, dataflow_files: list[Path]) -> list[Path]:
+    dataflow_subdir = dataflow_root / "dataflow"
+    if dataflow_subdir.is_dir():
+        return sorted(
+            item
+            for item in dataflow_subdir.glob("*.md")
+            if item.is_file()
+        )
+    return sorted(
+        item
+        for item in dataflow_files
+        if item.parent.name == "dataflow" and item.suffix.lower() == ".md"
+    )
 
-    # 关键发现
-    key_findings = []
-    for line in content.split("\n"):
-        if line.strip().startswith("### ★") or line.strip().startswith("★"):
-            finding = line.strip().lstrip("#").lstrip("★").strip()
-            if finding:
-                key_findings.append(f"  - ★ {finding}")
-    if key_findings:
-        hints.append("- 关键发现：")
-        hints.extend(key_findings)
 
-    if hints:
-        return "## 分析重点\n" + "\n".join(hints) + "\n"
-    return ""
+def _extract_dataflow_overview(
+    final_report: Path | None,
+    dataflow_files: list[Path],
+) -> dict[str, object]:
+    text = _read_text_if_exists(final_report)
+    if not text:
+        for item in dataflow_files:
+            text = _read_text_if_exists(item)
+            if text:
+                break
+
+    root_function = ""
+    tracked_count = 0
+    functions: list[str] = []
+    if text:
+        root_match = re.search(r"\*\*根函数\*\*\s*[:：]\s*`?([^`\n]+?)`?\s*$", text, re.M)
+        if not root_match:
+            root_match = re.search(r"^#\s*完整数据流分析\s*[:：]\s*`?([^`\n]+?)`?\s*$", text, re.M)
+        if not root_match:
+            root_match = re.search(r"^#\s*数据流追踪\s*[:：]\s*`?([^`\n]+?)`?\s*$", text, re.M)
+        if root_match:
+            root_function = root_match.group(1).strip()
+
+        count_match = re.search(r"\*\*跟踪函数总数\*\*\s*[:：]\s*(\d+)", text)
+        if count_match:
+            tracked_count = int(count_match.group(1))
+
+        functions = re.findall(r"^\s*\d+\.\s*`([^`\n]+)`", text, re.M)
+
+    return {
+        "root_function": root_function,
+        "tracked_count": tracked_count,
+        "functions": functions,
+        "function_samples": functions[:12],
+    }
+
+
+def _extract_analysis_marker_counts(
+    final_report: Path | None,
+    dataflow_files: list[Path],
+) -> dict[str, int]:
+    text = _read_text_if_exists(final_report)
+    if not text:
+        text = "\n".join(_read_text_if_exists(item) for item in dataflow_files)
+    lines = [line.strip() for line in text.splitlines()]
+    return {
+        "input": len(set(re.findall(r"\bINPUT-(\d+)\b", text))),
+        "direct_sink": sum(1 for line in lines if "DIRECT_SINK" in line),
+        "export": sum(1 for line in lines if "EXPORT" in line),
+        "used": sum(1 for line in lines if "USED" in line),
+        "cleaned": sum(1 for line in lines if "CLEANED" in line),
+    }
+
+
+def _format_marker_counts(marker_counts: dict[str, int]) -> list[str]:
+    lines = []
+    if marker_counts.get("input"):
+        lines.append(f"- 数据流分析已识别 {marker_counts['input']} 个外部输入")
+    if marker_counts.get("direct_sink"):
+        lines.append(f"- 有 {marker_counts['direct_sink']} 处 DIRECT_SINK 标记")
+    if marker_counts.get("used"):
+        lines.append(f"- 有 {marker_counts['used']} 个 USED 标记")
+    if marker_counts.get("export"):
+        lines.append(f"- 有 {marker_counts['export']} 个 EXPORT 标记")
+    if marker_counts.get("cleaned"):
+        lines.append(f"- 有 {marker_counts['cleaned']} 个 CLEANED 标记")
+    return lines
+
+
+def _format_marker_meaning_lines() -> list[str]:
+    return [
+        "- `DIRECT_SINK`：污点在当前函数内直接进入高危操作（最高优先级核查点。比如污点控制 memcpy/strcpy/sprintf 的大小或指针、整数截断、污点下标、污点偏移、污点控制循环边界等。它表示“这里可能直接形成漏洞”，但仍需源码验证。）",
+        "- `USED`：污点被当前函数最终消费（表示数据流到这里结束或被用于某个操作，但不一定是危险操作。常见如返回值、比较、日志、统计计数、格式化参数、普通状态处理等。需要看具体用途判断是否有安全影响。）",
+        "- `EXPORT`：污点被传出当前分析边界（通常是传给找不到定义的函数、外部库函数、标准 C/C++ 库函数等。后端会把 EXPORT/extern/未找到定义 过滤掉，不再递归跟入。它不是“安全”或“危险”的结论，而是“污点流出去了，当前系统无法继续展开”。）",
+        "- `CLEANED`：污点被清洗或验证，需要确认清洗逻（表示分析认为污点已被切断或变成安全值。例如长度被上限约束、偏移被边界校验、输出被常量赋值。这个标记也需要验证：检查是否真的支配后续使用、检查条件是否充分。）",
+    ]
+
+
+def _discover_source_files(source_root: Path) -> list[Path]:
+    if not source_root.is_dir():
+        return []
+    suffix_order = {".c": 0, ".h": 1, ".asm": 2}
+    return sorted(
+        (
+            item
+            for item in source_root.rglob("*")
+            if item.is_file() and item.suffix.lower() in suffix_order
+        ),
+        key=lambda item: (suffix_order[item.suffix.lower()], str(item.relative_to(source_root))),
+    )
+
+
+def _format_source_file_lines(source_root: Path, source_files: list[Path]) -> list[str]:
+    descriptions = {
+        ".c": "反编译 C 代码，主要用于验证函数实现、条件判断、污点传播和危险操作。",
+        ".h": "头文件，主要用于查看结构体、类型、宏和函数声明。",
+        ".asm": "汇编/反汇编结果，主要用于在反编译代码不明确时核对指令和地址。"
+    }
+    lines = []
+    for item in source_files[:30]:
+        try:
+            rel = item.relative_to(source_root)
+        except ValueError:
+            rel = item
+        desc = descriptions.get(item.suffix.lower(), "源码辅助文件。")
+        lines.append(f"- `{rel}`：{desc}")
+    if len(source_files) > 30:
+        lines.append(f"- 其余 {len(source_files) - 30} 个源码文件按需查阅。")
+    return lines
 
 
 def _windows_short_ids(run_name: str) -> tuple[str, str]:
@@ -438,13 +580,7 @@ def generate_config(
                         "reset_worker_session_per_cycle": False,
                         "plateau_closure_streak": profile_policy.progress_no_signal_closure_streak,
                         "plateau_abort_streak": profile_policy.progress_no_signal_abort_streak,
-                        "same_issue_stagnation_threshold": 2,
-                        "same_issue_abort_threshold": 3,
-                        "per_issue_attempt_budget": 2,
                         "summary_repair_attempt_budget": 2,
-                        "analysis_closure_cycles": 1,
-                        "issue_churn_closure_window": 2,
-                        "issue_churn_abort_window": 3,
                         "score_min_delta": 0.03,
                     },
                     "roles": {
@@ -457,8 +593,6 @@ def generate_config(
                                         prompts_dir, "worker_system.md"),
                                     "user_prompt_file": os.path.join(
                                         prompts_dir, "worker_user.md"),
-                                    "rework_prompt_file": os.path.join(
-                                        prompts_dir, "worker_rework.md"),
                                 },
                                 "reflection": [
                                     {
@@ -822,6 +956,14 @@ def _collect_resume_diagnostics(
 
     passed_results = []
     failed_results = []
+    vulnerability_status_counts = {}
+    vulnerability_list_file = atomic_dir / "_meta" / "vulnerability_list.json"
+    if vulnerability_list_file.is_file():
+        try:
+            vulnerability_payload = json.loads(vulnerability_list_file.read_text(encoding="utf-8"))
+            vulnerability_status_counts = dict(vulnerability_payload.get("counts") or {})
+        except Exception:
+            vulnerability_status_counts = {}
     if review_state is not None:
         if hasattr(review_state, "get_passed_result_filenames"):
             passed_results = list(review_state.get_passed_result_filenames())
@@ -863,6 +1005,7 @@ def _collect_resume_diagnostics(
         "workflow_mode": workflow_mode or "discovery",
         "passed_count": passed_count,
         "failed_count": failed_count,
+        "vulnerability_status_counts": vulnerability_status_counts,
         "issue_count": len(issues),
         "issues_preview": issues_preview,
         "failed_global_advisor_id": str(global_review_summary.get("failed_advisor_id") or "").strip(),
@@ -899,8 +1042,17 @@ def _format_resume_diagnostic_lines(diagnostics: dict, *, completed_cycles: int,
             failed_label += f" / {failed_global_role_name}"
         lines.append(f"  失败层级:   {failed_label}")
 
-    lines.append(f"  已通过结果: {int(diagnostics.get('passed_count') or 0)}")
-    lines.append(f"  待修结果:   {int(diagnostics.get('failed_count') or 0)}")
+    vuln_counts = diagnostics.get("vulnerability_status_counts") or {}
+    if vuln_counts:
+        lines.append(
+            "  漏洞状态:   "
+            f"确认={int(vuln_counts.get('confirmed') or 0)}, "
+            f"误报={int(vuln_counts.get('false_positive') or 0)}, "
+            f"待评审={int(vuln_counts.get('pending_review') or 0)}"
+        )
+    else:
+        lines.append(f"  已通过结果: {int(diagnostics.get('passed_count') or 0)}")
+        lines.append(f"  待修结果:   {int(diagnostics.get('failed_count') or 0)}")
     lines.append(f"  Issues: {int(diagnostics.get('issue_count') or 0)}")
 
     scores = diagnostics.get("scores") or {}
@@ -1047,7 +1199,7 @@ def main(argv: list[str] | None = None):
 示例:
   # 基本用法
   python run_vuln_scan.py \
-    --data-flow /path/to/data_flow.md \
+    --data-flow /path/to/dataflows/ \
     --source-dir /path/to/source/
 
   # 继续已有 run 的当前进度，再追加 5 轮评审
@@ -1063,39 +1215,39 @@ def main(argv: list[str] | None = None):
 
   # 使用自定义配置文件 (复制 config.vuln_scan_default.json 后修改)
   python run_vuln_scan.py \
-    --data-flow /path/to/data_flow.md \
+    --data-flow /path/to/dataflows/ \
     --source-dir /path/to/source/ \
     -c my_config.json
 
   # 指定模型和运行名称
   python run_vuln_scan.py \
-    --data-flow /path/to/data_flow.md \
+    --data-flow /path/to/dataflows/ \
     --source-dir /path/to/source/ \
     --run-name my_scan \
     --model icsl/zai-org/GLM-5
 
   # 使用 litellm 的其他模型
   python run_vuln_scan.py \
-    --data-flow /path/to/data_flow.md \
+    --data-flow /path/to/dataflows/ \
     --source-dir /path/to/source/ \
     --model litellm/MiniMax/MiniMax-M2.5
 
   # 增加评审轮次
   python run_vuln_scan.py \
-    --data-flow /path/to/data_flow.md \
+    --data-flow /path/to/dataflows/ \
     --source-dir /path/to/source/ \
     --max-cycles 5
 
   # 执行后清理工作目录
   python run_vuln_scan.py \
-    --data-flow /path/to/data_flow.md \
+    --data-flow /path/to/dataflows/ \
     --source-dir /path/to/source/ \
     --clean
 """)
 
     parser.add_argument(
         "--data-flow", "-d", default=None,
-        help="数据流分析结果文件路径 (.md)")
+        help="数据流分析结果目录路径（兼容旧的单文件路径）")
     parser.add_argument(
         "--source-dir", "-s", default=None,
         help="源码目录路径（包含 .c, .h, .asm 文件）")
@@ -1326,8 +1478,8 @@ def main(argv: list[str] | None = None):
     else:
         args.model = _normalize_model_name(args.model, args.provider)
 
-    if not os.path.isfile(args.data_flow):
-        print(f"❌ 数据流文件不存在: {args.data_flow}", file=sys.stderr)
+    if not (os.path.isdir(args.data_flow) or os.path.isfile(args.data_flow)):
+        print(f"❌ 数据流目录不存在: {args.data_flow}", file=sys.stderr)
         sys.exit(1)
 
     if not os.path.isdir(args.source_dir):
@@ -1347,7 +1499,8 @@ def main(argv: list[str] | None = None):
         sys.exit(1)
 
     if args.run_name is None:
-        stem = Path(args.data_flow).stem
+        data_flow_path = Path(args.data_flow)
+        stem = data_flow_path.name if data_flow_path.is_dir() else data_flow_path.stem
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.run_name = f"{stem}_{timestamp}"
 
@@ -1377,7 +1530,7 @@ def main(argv: list[str] | None = None):
                 "schema_version": 1,
                 "task": {"run_name": args.run_name},
                 "input": {
-                    "data_flow_file": os.path.abspath(args.data_flow),
+                    **data_flow_manifest_input(args.data_flow),
                     "source_dir": os.path.abspath(args.source_dir),
                 },
                 "prompt": {
@@ -1437,7 +1590,7 @@ def main(argv: list[str] | None = None):
     print("═" * 60)
     print("  数据流驱动漏洞挖掘")
     print("═" * 60)
-    print(f"  数据流文件: {os.path.abspath(args.data_flow)}")
+    print(f"  数据流目录: {os.path.abspath(Path(args.data_flow) if Path(args.data_flow).is_dir() else Path(args.data_flow).parent)}")
     print(f"  源码目录:   {os.path.abspath(args.source_dir)}")
     print(f"  运行名称:   {args.run_name}")
     print(f"  模型:       {model_display or _format_model_display(args.model)}")

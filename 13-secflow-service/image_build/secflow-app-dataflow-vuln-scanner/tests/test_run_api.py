@@ -149,10 +149,6 @@ def _create_run_workspace(run_root: Path) -> None:
             "vulnerability_headings": ["VULN-001"],
         }],
     })
-    _write_json(atomic / "_meta" / "coverage_ledger.json", {
-        "missing_referenced_results": [],
-        "unreferenced_active_results": [],
-    })
     _write(atomic / "summary.md", "# Summary\n")
     _write(atomic / "results" / "result_001.md", "# Confirmed issue\nbody")
     _write_json(atomic / "reviews" / "global" / "cycle_001" / "global_completeness.json", {
@@ -646,14 +642,14 @@ def test_run_cycle_marks_profile_gate_failure_separately(service_config_path):
     atomic = run_root / "workspace" / "pipeline_demo_run_001" / "stage_01_vuln_scan" / "vuln_scan_initial_001"
     feedback = (
         "[框架范围验收硬门槛未通过]\n"
-        "- SCOPE-coverage-open-required: 本轮验收不允许 2 个 obligations 仍为 open。"
+        "- SCOPE-metadata-sync: 本轮验收发现结果清单元数据不同步。"
     )
     profile_issue = {
-        "id": "PROFILE-audit-coverage-open-required",
-        "category": "coverage_gate",
-        "target": "_meta/coverage_ledger.json",
-        "required_action": "关闭本轮必须闭环的 open obligations",
-        "blocking_type": "coverage_obligation_open",
+        "id": "PROFILE-audit-metadata-sync",
+        "category": "metadata_sync",
+        "target": "_meta/results_manifest.json",
+        "required_action": "同步结果清单元数据",
+        "blocking_type": "metadata_sync",
     }
 
     time.sleep(0.02)
@@ -713,8 +709,8 @@ def test_run_cycle_marks_profile_gate_failure_separately(service_config_path):
     assert cycle_detail.json()["profile_gate"]["failed"] is True
 
 
-def test_run_detail_latest_issues_prefers_active_issue_ledger(tmp_path):
-    run_root = tmp_path / "ledger_latest_issues_20260512_010203"
+def test_run_detail_latest_issues_prefers_latest_review_feedback(tmp_path):
+    run_root = tmp_path / "latest_issues_20260512_010203"
     _create_run_workspace(run_root)
     atomic = run_root / "workspace" / "pipeline_demo_run_001" / "stage_01_vuln_scan" / "vuln_scan_initial_001"
     stale_issue = {
@@ -725,57 +721,27 @@ def test_run_detail_latest_issues_prefers_active_issue_ledger(tmp_path):
         "actionable_by": "worker",
     }
     active_issue = {
-        "id": "PROFILE-balanced-coverage-open-required",
-        "category": "coverage_gate",
-        "target": "_meta/coverage_ledger.json",
-        "required_action": "关闭当前 open obligations",
+        "id": "CMP-active-export",
+        "category": "analysis_gap",
+        "target": "IPSEC_SOCK_SendToSocket",
+        "required_action": "继续跟入 EXPORT 链",
         "actionable_by": "worker",
-        "blocking_type": "coverage_obligation_open",
+        "blocking_type": "analysis_gap",
     }
     _write_json(atomic / "_meta" / "review_feedback" / "cycle_001.json", {
         "cycle": 1,
         "issue_count": 1,
         "issues": [stale_issue],
     })
-    _write_json(atomic / "_meta" / "issue_ledger.json", {
-        "schema_version": 1,
-        "last_status": {"active_issue_count": 1},
-        "entries": [
-            {
-                "signature": "issue:profile",
-                "semantic_key": "worker|coverage_gate|ledger|关闭当前 open obligations",
-                "first_seen_cycle": 1,
-                "last_seen_cycle": 2,
-                "seen_count": 2,
-                "consecutive_count": 2,
-                "issue_ids": [active_issue["id"]],
-                "advisor_ids": [],
-                "actionable_by": "worker",
-                "blocking_type": "coverage_obligation_open",
-                "acceptance_criteria": "ledger 中不再有 blocking open obligations",
-                "active": True,
-                "resolved": False,
-                "issue": active_issue,
-            },
-            {
-                "signature": "issue:old",
-                "semantic_key": "worker|coverage_gap|result_001.md|旧 advisor 问题",
-                "first_seen_cycle": 1,
-                "last_seen_cycle": 1,
-                "seen_count": 1,
-                "consecutive_count": 0,
-                "issue_ids": [stale_issue["id"]],
-                "active": False,
-                "resolved": False,
-                "issue": stale_issue,
-            },
-        ],
+    _write_json(atomic / "_meta" / "review_feedback" / "cycle_002.json", {
+        "cycle": 2,
+        "issue_count": 1,
+        "issues": [active_issue],
     })
 
     detail = inspect_run_detail(run_root)
-    assert [item["id"] for item in detail["latest_issues"]] == ["PROFILE-balanced-coverage-open-required"]
-    assert detail["latest_issues"][0]["seen_count"] == 2
-    assert detail["latest_issues"][0]["blocking_type"] == "coverage_obligation_open"
+    assert [item["id"] for item in detail["latest_issues"]] == ["CMP-active-export"]
+    assert detail["latest_issues"][0]["blocking_type"] == "analysis_gap"
 
 
 def test_run_retry_queue_cancel_and_delete(service_config_path, monkeypatch):
@@ -1255,7 +1221,7 @@ def test_run_status_preserves_specific_terminal_workflow_result(service_config_p
     _write_json(atomic / "_meta" / "workflow_result.json", {
         "status": "summary_incomplete",
         "timestamp": "2026-05-07T10:20:03Z",
-        "detail": {"cycles_used": 2, "error": "summary/ledger sync incomplete"},
+        "detail": {"cycles_used": 2, "error": "summary sync incomplete"},
     })
 
     detail = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")

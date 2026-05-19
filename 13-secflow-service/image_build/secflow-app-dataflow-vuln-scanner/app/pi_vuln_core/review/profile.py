@@ -15,7 +15,6 @@ class ReviewProfilePolicy:
     name: ReviewProfileName
     description: str
     review_enabled: bool
-    enforce_coverage_gate: bool
     require_dataflow_extraction: bool
     required_risks: tuple[str, ...]
     required_kinds: tuple[str, ...]
@@ -33,7 +32,6 @@ class ReviewProfilePolicy:
     progress_no_signal_abort_streak: int
     min_evidence_artifacts: int
     required_pattern_families: tuple[str, ...]
-    max_open_obligations_in_worker_prompt: int
     worker_rpc_stdout_trace_bytes: int
     worker_rpc_stdout_abort_bytes: int
     advisor_max_internal_turns: int
@@ -79,7 +77,6 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         name="fast",
         description="初步筛选：聚焦显性数据流漏洞与关键证据整理。",
         review_enabled=False,
-        enforce_coverage_gate=False,
         require_dataflow_extraction=False,
         required_risks=(),
         required_kinds=(),
@@ -87,7 +84,7 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         allow_summary_only_evidence=True,
         default_max_review_cycles=1,
         max_worker_turns_per_cycle=80,
-        reflection_passes_per_cycle=0,
+        reflection_passes_per_cycle=1,
         reflection_max_internal_turns=0,
         reflection_rpc_stdout_trace_bytes=512 * 1024,
         reflection_rpc_stdout_abort_bytes=0,
@@ -97,7 +94,6 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         progress_no_signal_abort_streak=1,
         min_evidence_artifacts=0,
         required_pattern_families=(),
-        max_open_obligations_in_worker_prompt=8,
         worker_rpc_stdout_trace_bytes=2 * 1024 * 1024,
         worker_rpc_stdout_abort_bytes=0,
         advisor_max_internal_turns=0,
@@ -114,7 +110,6 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         name="balanced",
         description="标准深度：面向中高危与关键路径，目标是挖到大部分主要漏洞。",
         review_enabled=True,
-        enforce_coverage_gate=True,
         require_dataflow_extraction=True,
         required_risks=("critical", "high"),
         required_kinds=("star",),
@@ -136,14 +131,13 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
             "integer_safety",
             "input_validation",
         ),
-        max_open_obligations_in_worker_prompt=24,
         worker_rpc_stdout_trace_bytes=4 * 1024 * 1024,
         worker_rpc_stdout_abort_bytes=0,
         advisor_max_internal_turns=0,
         advisor_rpc_stdout_trace_bytes=4 * 1024 * 1024,
         advisor_rpc_stdout_abort_bytes=0,
         execution_goal="覆盖 STAR、高风险端点和关键 EXPORT/USED，优先挖出大部分中高危漏洞。",
-        closure_policy="closure 只验证 active backlog、STAR 和高风险 open obligations，不重新无限发散。",
+        closure_policy="closure 只验证 active backlog、STAR 和高风险源码缺口，不重新无限发散。",
         depth_lanes=(
             "主入口到 packet/mbuf 解析链的输入可控性复核",
             "STAR/高风险 EXPORT 下游继续跟入",
@@ -155,7 +149,6 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         name="audit",
         description="深度审计：追求更多、更深且可复核的漏洞证据。",
         review_enabled=True,
-        enforce_coverage_gate=True,
         require_dataflow_extraction=True,
         required_risks=("critical", "high", "medium"),
         required_kinds=("star", "export", "used"),
@@ -180,17 +173,16 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
             "resource_lifetime",
             "concurrency_timing",
         ),
-        max_open_obligations_in_worker_prompt=80,
         worker_rpc_stdout_trace_bytes=8 * 1024 * 1024,
         worker_rpc_stdout_abort_bytes=0,
         advisor_max_internal_turns=0,
         advisor_rpc_stdout_trace_bytes=8 * 1024 * 1024,
         advisor_rpc_stdout_abort_bytes=0,
         execution_goal="深度审计关键数据流、变体和跨路径副作用；尽量挖出最多且最深的漏洞。",
-        closure_policy="closure 优先验证 active backlog 与关键 obligations；无有效进展时收敛，external_blocked 必须显式保留。",
+        closure_policy="closure 优先验证 active backlog 与关键源码缺口；无有效进展时收敛，external_blocked 必须显式保留。",
         depth_lanes=(
             "标准关键路径、主入口、高风险端点和关键 EXPORT/USED 路线",
-            "STAR/EXPORT/USED obligation 深度闭环，并对 INPUT/CLEANED 保留可复核边界",
+            "STAR/EXPORT/USED 路线深度闭环，并对 INPUT/CLEANED 保留可复核边界",
             "跨函数、跨协议族、跨方向的漏洞变体搜索",
             "未立项端点的可复核负证据矩阵",
             "可利用性前提、攻击者能力、配置依赖和 residual 边界审计",
@@ -201,11 +193,7 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
 
 
 _COMPLETENESS_SCORE_FIELDS = (
-    "input_coverage",
-    "export_followthrough",
-    "used_coverage",
-    "limitations_honesty",
-    "report_completeness",
+    "coverage",
 )
 _DEPTH_SCORE_FIELDS = (
     "vuln_pattern_breadth",
@@ -218,18 +206,10 @@ _SCORE_THRESHOLD_POLICIES: dict[str, dict[str, ReviewScoreThresholdPolicy]] = {
         "global_completeness": ReviewScoreThresholdPolicy(
             score_fields=_COMPLETENESS_SCORE_FIELDS,
             score_thresholds_start={
-                "input_coverage": 0.45,
-                "export_followthrough": 0.35,
-                "used_coverage": 0.35,
-                "limitations_honesty": 0.45,
-                "report_completeness": 0.45,
+                "coverage": 0.45,
             },
             score_thresholds={
-                "input_coverage": 0.70,
-                "export_followthrough": 0.55,
-                "used_coverage": 0.55,
-                "limitations_honesty": 0.65,
-                "report_completeness": 0.60,
+                "coverage": 0.70,
             },
             score_threshold_ramp_cycles=2,
         ),
@@ -250,18 +230,10 @@ _SCORE_THRESHOLD_POLICIES: dict[str, dict[str, ReviewScoreThresholdPolicy]] = {
         "global_completeness": ReviewScoreThresholdPolicy(
             score_fields=_COMPLETENESS_SCORE_FIELDS,
             score_thresholds_start={
-                "input_coverage": 0.80,
-                "export_followthrough": 0.70,
-                "used_coverage": 0.70,
-                "limitations_honesty": 0.75,
-                "report_completeness": 0.70,
+                "coverage": 0.80,
             },
             score_thresholds={
-                "input_coverage": 0.95,
-                "export_followthrough": 0.90,
-                "used_coverage": 0.90,
-                "limitations_honesty": 0.90,
-                "report_completeness": 0.88,
+                "coverage": 0.95,
             },
             score_threshold_ramp_cycles=5,
         ),
@@ -282,18 +254,10 @@ _SCORE_THRESHOLD_POLICIES: dict[str, dict[str, ReviewScoreThresholdPolicy]] = {
         "global_completeness": ReviewScoreThresholdPolicy(
             score_fields=_COMPLETENESS_SCORE_FIELDS,
             score_thresholds_start={
-                "input_coverage": 0.90,
-                "export_followthrough": 0.85,
-                "used_coverage": 0.85,
-                "limitations_honesty": 0.85,
-                "report_completeness": 0.80,
+                "coverage": 0.90,
             },
             score_thresholds={
-                "input_coverage": 1.00,
-                "export_followthrough": 1.00,
-                "used_coverage": 1.00,
-                "limitations_honesty": 0.99,
-                "report_completeness": 0.98,
+                "coverage": 1.00,
             },
             score_threshold_ramp_cycles=8,
         ),
@@ -670,11 +634,6 @@ def format_review_profile_policy(value: str | None, *, compact: bool = False) ->
         if policy.required_pattern_families else
         "不强制固定模式族；按数据流证据和本轮目标裁剪。"
     )
-    coverage_focus = (
-        "需要按本轮范围闭环关键 coverage obligations。"
-        if policy.enforce_coverage_gate else
-        "初步筛选优先，不因覆盖率做无边界扩张。"
-    )
     dataflow_focus = (
         f"目标抽取比例约 {policy.min_declared_extraction_ratio:.0%}"
         if policy.min_declared_extraction_ratio > 0 else
@@ -683,7 +642,7 @@ def format_review_profile_policy(value: str | None, *, compact: bool = False) ->
     summary_only = (
         "可作为辅助证据，但高风险结论仍应优先落到 result/supporting_docs"
         if policy.allow_summary_only_evidence else
-        "不足以单独支撑高/中风险 obligation，需补充 result 或 supporting_docs 证据"
+        "不足以单独支撑高/中风险结论，需补充 result 或 supporting_docs 证据"
     )
     depth_lanes = _prompt_facing_depth_lanes(policy)
     if compact:
@@ -694,13 +653,11 @@ def format_review_profile_policy(value: str | None, *, compact: bool = False) ->
                 f"- 关注点: risks={required}; kinds={kinds}; dataflow={dataflow_focus}; "
                 f"summary_only={summary_only}; patterns={pattern_focus}"
             ),
-            f"- coverage: {coverage_focus}",
             f"- 目标: {policy.execution_goal}",
         ])
     return "\n".join([
         "## 本轮审查范围与验收要求",
         f"- 定位: {policy.description}",
-        f"- 覆盖闭环取向: {coverage_focus}",
         f"- 重点 risk: {required}",
         f"- 重点 kind: {kinds}",
         f"- data-flow 抽取取向: {dataflow_focus}",
@@ -718,7 +675,7 @@ def _prompt_facing_depth_lanes(policy: ReviewProfilePolicy) -> tuple[str, ...]:
         return tuple(policy.depth_lanes)
     return (
         "沿主路径、高风险端点和关键 EXPORT/USED 路线继续深挖。",
-        "STAR/EXPORT/USED obligation 深度闭环，并对 INPUT/CLEANED 保留可复核边界。",
+        "STAR/EXPORT/USED 路线深度闭环，并对 INPUT/CLEANED 保留可复核边界。",
         "跨函数、跨协议族、跨方向的漏洞变体搜索。",
         "未立项端点的可复核负证据矩阵。",
         "可利用性前提、攻击者能力、配置依赖和 residual 边界审计。",
