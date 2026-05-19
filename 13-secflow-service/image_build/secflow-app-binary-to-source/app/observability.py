@@ -114,6 +114,23 @@ class B2SObservability:
     def record_retry(self, mode: str, count: int) -> None:
         self.prom.inc("retries", amount=float(count), mode=mode)
 
+    def record_cache_request(self, *, mode: str, reuse_cache: bool) -> None:
+        self.prom.inc("cache_requests", mode=mode, reuse_cache=str(bool(reuse_cache)).lower())
+
+    def record_cache_hit(self, *, mode: str) -> None:
+        self.prom.inc("cache_hits", mode=mode)
+
+    def record_cache_miss(self, *, mode: str, reason: str) -> None:
+        self.prom.inc("cache_misses", mode=mode, reason=reason or "unknown")
+
+    def record_cache_bypassed(self, *, mode: str) -> None:
+        self.prom.inc("cache_bypassed", mode=mode)
+
+    def record_cache_store(self, *, mode: str, result: str) -> None:
+        self.prom.inc("cache_store", mode=mode, result=result)
+        if result == "updated":
+            self.prom.inc("cache_replace", mode=mode)
+
     def metrics_response(self) -> Response:
         return Response(content=self.prom.render(_build_snapshot_lines()), media_type="text/plain; version=0.0.4; charset=utf-8")
 
@@ -135,6 +152,7 @@ def _snapshot_lines(db: Session) -> list[str]:
         item_pi_worker_url,
         map_pi_phase,
     )
+    from app.model import B2SAnalysisCache
 
     lines: list[str] = []
     cluster_snapshot = get_pi_cluster_monitor()._snapshot
@@ -147,6 +165,7 @@ def _snapshot_lines(db: Session) -> list[str]:
     upstream_status_counts: dict[str, int] = defaultdict(int)
     failure_type_counts: dict[str, int] = defaultdict(int)
     worker_loads: dict[str, int] = {worker: 0 for worker in configured_pi_workers()}
+    cache_mode_counts: dict[str, int] = defaultdict(int)
 
     for task in tasks:
         task_status_counts[str(task.status or "unknown")] += 1
@@ -163,6 +182,15 @@ def _snapshot_lines(db: Session) -> list[str]:
             worker_loads.setdefault(worker_url, 0)
             if item.status in {"queued", "running"}:
                 worker_loads[worker_url] += 1
+    cache_rows = db.query(B2SAnalysisCache).filter(B2SAnalysisCache.status == "ready").all()
+    for row in cache_rows:
+        key = str(row.cache_key or "")
+        if key.endswith("_fast"):
+            cache_mode_counts["fast"] += 1
+        elif key.endswith("_deep"):
+            cache_mode_counts["deep"] += 1
+        else:
+            cache_mode_counts["unknown"] += 1
 
     for status_name, count in sorted(task_status_counts.items()):
         lines.append(f'secflow_binary_to_source_task_status{{status="{status_name}"}} {count}')
@@ -176,6 +204,9 @@ def _snapshot_lines(db: Session) -> list[str]:
         lines.append(f'secflow_binary_to_source_error_type{{error_type="{error_type}"}} {count}')
     for worker_url, count in sorted(worker_loads.items()):
         lines.append(f'secflow_binary_to_source_worker_load{{worker="{worker_url}"}} {count}')
+    lines.append(f"secflow_binary_to_source_cache_entries {len(cache_rows)}")
+    for mode, count in sorted(cache_mode_counts.items()):
+        lines.append(f'secflow_binary_to_source_cache_entries_by_mode{{mode="{mode}"}} {count}')
     lines.append(f"secflow_binary_to_source_pi_cluster_capacity {cluster_snapshot.total_capacity}")
     lines.append(f"secflow_binary_to_source_pi_cluster_workers {cluster_snapshot.worker_count}")
     lines.append(f"secflow_binary_to_source_pi_cluster_running_jobs {cluster_snapshot.running_jobs}")

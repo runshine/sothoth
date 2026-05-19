@@ -132,6 +132,14 @@ def _normalize_llm_provider_key(value: object) -> str | None:
     return key or None
 
 
+def _normalize_reuse_cache(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"0", "false", "off", "no"}
+
+
 def _provider_model_name(provider: dict | None) -> str | None:
     if not provider:
         return None
@@ -565,7 +573,11 @@ async def dispatch_item_to_pi(db: Session, item: B2STaskItem, *, owner_id: str) 
         item.dispatch_status = "dispatched"
         _apply_pi_job_to_item(db, item, job, worker_url=worker_url)
         if item.status == "success":
-            get_cache_service().store_success_cache(db, item)
+            get_cache_service().store_success_cache(
+                db,
+                item,
+                upsert=not _normalize_reuse_cache((item.extra_metadata or {}).get("reuse_cache")),
+            )
         get_observability().record_item_submit(item, worker_url)
         return True
     except Exception as exc:
@@ -711,6 +723,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
     job_mode = req.mode or ({"hybrid": "fast", "agent": "deep"}.get(req.engine or "") if req.engine else None)
     job_engine = mode_engine_map.get(job_mode or "") or req.engine or pi_cfg.engine
     job_mode = job_mode or {"hybrid": "fast", "agent": "deep"}.get(job_engine)
+    reuse_cache = _normalize_reuse_cache(req.reuse_cache)
     for idx, elf in enumerate(req.elf_tasks, start=1):
         source_elf_path = ensure_path_in_project(project_id, elf.elf_path, must_be_file=True)
         input_elf_path = prepare_input_file(project_id, task.id, idx, source_elf_path)
@@ -745,13 +758,21 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             "budget_exhausted_action": budget_exhausted_action,
             "mode": job_mode,
             "engine": job_engine,
+            "reuse_cache": reuse_cache,
             "pi_idempotency_key": _pi_idempotency_key(task.id, item),
             "dispatch_clean": False,
         }
-        cache_result = get_cache_service().try_apply_cache_hit(db, project_id, item, input_elf_path)
-        if not cache_result.hit:
+        cache_service = get_cache_service()
+        cache_result = None
+        if reuse_cache:
+            cache_result = cache_service.try_apply_cache_hit(db, item, input_elf_path)
+        else:
+            cache_service.prepare_cache_metadata(item, input_elf_path)
+            get_observability().record_cache_request(mode=str(job_mode or "fast"), reuse_cache=False)
+            get_observability().record_cache_bypassed(mode=str(job_mode or "fast"))
+        if not cache_result or not cache_result.hit:
             _queue_item_for_dispatch(item, clean=False)
-        refresh_item_function_stats(item, inspect_files=cache_result.hit)
+        refresh_item_function_stats(item, inspect_files=bool(cache_result and cache_result.hit))
         db.add(item)
         db.flush()
     recompute_task_status(db, task)
@@ -763,6 +784,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
 
 async def sync_task(db: Session, task: B2STask) -> None:
     changed = False
+    previous_status = str(task.status or "")
     items = query_items(db, task.id)
     for item in items:
         observed_pi_job_id = str(item.pi_job_id or "").strip() or None
@@ -857,7 +879,11 @@ async def sync_task(db: Session, task: B2STask) -> None:
             item.generated_files = build_generated_files(item, output)
             if refresh_item_function_stats(item, inspect_files=True):
                 changed = True
-            if get_cache_service().store_success_cache(db, item):
+            if get_cache_service().store_success_cache(
+                db,
+                item,
+                upsert=not _normalize_reuse_cache((item.extra_metadata or {}).get("reuse_cache")),
+            ):
                 changed = True
         if new_status == "failed":
             item.phase = "failed"
@@ -874,8 +900,8 @@ async def sync_task(db: Session, task: B2STask) -> None:
             item.finished_at = now_local()
             get_observability().record_item_finished(item)
         changed = True
-    if changed:
-        recompute_task_status(db, task)
+    recompute_task_status(db, task)
+    if changed or str(task.status or "") != previous_status:
         db.commit()
         db.refresh(task)
 
@@ -932,8 +958,6 @@ async def delete_task(db: Session, task: B2STask) -> None:
                 # Deletion should not be blocked by a stale/unreachable upstream
                 # job.  DB rows and the task workspace are still removed below.
                 pass
-
-    get_cache_service().delete_caches_for_source_task(db, task.project_id, task.id)
 
     task_dir = app_task_root(task.project_id, task.id)
     root = project_root(task.project_id)
@@ -1191,8 +1215,9 @@ def recompute_task_status(db: Session, task: B2STask) -> None:
     elif waiting_total == total:
         task.status = "pending"
     elif waiting_total > 0 and terminal_total > 0:
-        # Items have already produced terminal results and the task has started,
-        # but there are still undispatched leftovers waiting for capacity.
+        # Once any item has reached a terminal result, the task has already
+        # started even if the remaining items are still waiting in the local
+        # dispatch queue for downstream capacity.
         task.status = "running"
     elif counts["success_items"] > 0 and counts["failed_items"] + counts["cancelled_items"] > 0:
         task.status = "partial"
@@ -1625,6 +1650,7 @@ def build_task_config_snapshot(task: B2STask, items: list[B2STaskItem]) -> TaskC
         agent_run_timeout_seconds=int(_first_non_empty(items, "agent_run_timeout_seconds") or 0) or None,
         agent_timeout_retry_enabled=bool(_first_non_empty(items, "agent_timeout_retry_enabled")) if _first_non_empty(items, "agent_timeout_retry_enabled") is not None else None,
         agent_timeout_max_retries=int(_first_non_empty(items, "agent_timeout_max_retries") or 0) or None,
+        reuse_cache=_normalize_reuse_cache(_first_non_empty(items, "reuse_cache")),
         budget_exhausted_action=str(_first_non_empty(items, "budget_exhausted_action") or "").strip() or None,
         input_count=len(input_items),
         input_items=input_items,

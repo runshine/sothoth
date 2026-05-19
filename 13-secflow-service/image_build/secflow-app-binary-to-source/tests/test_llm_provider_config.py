@@ -135,6 +135,12 @@ class TaskProviderResolutionTests(unittest.TestCase):
     def test_create_task_uses_project_default_provider_and_freezes_metadata(self):
         db = _FakeDb()
         fake_pi = _FakePiClient()
+        cache_service = SimpleNamespace(
+            try_apply_cache_hit=mock.Mock(return_value=SimpleNamespace(hit=False)),
+            prepare_cache_metadata=mock.Mock(),
+            store_success_cache=mock.Mock(return_value=False),
+            delete_caches_for_source_task=mock.Mock(),
+        )
         req = TaskCreate(
             task_id="task1",
             name="demo",
@@ -149,11 +155,7 @@ class TaskProviderResolutionTests(unittest.TestCase):
             mock.patch.object(
                 task_service,
                 "get_cache_service",
-                return_value=SimpleNamespace(
-                    try_apply_cache_hit=mock.Mock(return_value=SimpleNamespace(hit=False)),
-                    store_success_cache=mock.Mock(return_value=False),
-                    delete_caches_for_source_task=mock.Mock(),
-                ),
+                return_value=cache_service,
             ),
             mock.patch.object(
                 task_service,
@@ -193,6 +195,60 @@ class TaskProviderResolutionTests(unittest.TestCase):
         self.assertTrue(db.task_items[0].extra_metadata["pi_idempotency_key"].endswith(":/tmp/input/demo.elf"))
         self.assertEqual("team_codex", db.task_items[0].extra_metadata["llm_provider_key"])
         self.assertEqual("gpt-5.4", db.task_items[0].extra_metadata["llm_provider_model"])
+        self.assertTrue(db.task_items[0].extra_metadata["reuse_cache"])
+        cache_service.try_apply_cache_hit.assert_called_once()
+        cache_service.prepare_cache_metadata.assert_not_called()
+
+    def test_create_task_without_reuse_cache_skips_hit_lookup_and_freezes_flag(self):
+        db = _FakeDb()
+        cache_service = SimpleNamespace(
+            try_apply_cache_hit=mock.Mock(return_value=SimpleNamespace(hit=False)),
+            prepare_cache_metadata=mock.Mock(),
+            store_success_cache=mock.Mock(return_value=False),
+            delete_caches_for_source_task=mock.Mock(),
+        )
+        req = TaskCreate(
+            task_id="task2",
+            name="demo-no-cache",
+            reuse_cache=False,
+            elf_tasks=[ElfTaskInput(elf_path="/tmp/demo.elf")],
+        )
+
+        with (
+            mock.patch.object(task_service, "ensure_path_in_project", return_value=Path("/tmp/demo.elf")),
+            mock.patch.object(task_service, "prepare_input_file", return_value=Path("/tmp/input/demo.elf")),
+            mock.patch.object(task_service, "safe_output_dir", return_value=Path("/tmp/output")),
+            mock.patch.object(task_service, "_project_default_llm_provider_key", return_value="team_codex"),
+            mock.patch.object(task_service, "get_cache_service", return_value=cache_service),
+            mock.patch.object(task_service, "get_observability", return_value=SimpleNamespace(
+                record_cache_request=mock.Mock(),
+                record_cache_bypassed=mock.Mock(),
+                record_task_created=mock.Mock(),
+            )),
+            mock.patch.object(
+                task_service,
+                "get_config",
+                return_value=SimpleNamespace(
+                    pi_re_agent=SimpleNamespace(
+                        batch_size=8192,
+                        max_retries=3,
+                        concurrency=4,
+                        agent_run_timeout_seconds=3600,
+                        agent_timeout_retry_enabled=True,
+                        agent_timeout_max_retries=3,
+                        engine="hybrid",
+                        model=None,
+                    ),
+                    configcenter_service=SimpleNamespace(enabled=False),
+                ),
+            ),
+        ):
+            response = asyncio.run(task_service.create_task(db, "p1", req, "tester"))
+
+        self.assertEqual("task2", response.id)
+        self.assertFalse(db.task_items[0].extra_metadata["reuse_cache"])
+        cache_service.try_apply_cache_hit.assert_not_called()
+        cache_service.prepare_cache_metadata.assert_called_once()
 
     def test_retry_task_backfills_project_default_provider_when_metadata_missing(self):
         task = B2STask(

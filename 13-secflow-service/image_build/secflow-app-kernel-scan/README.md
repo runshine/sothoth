@@ -74,6 +74,35 @@ Health check:
 curl http://localhost:18081/api/app/kernel-scan/health
 ```
 
+## Deploy To Kubernetes
+
+Build and push the service image first:
+
+```bash
+IMAGE=ghcr.io/runshine/secflow-app-kernel-scan:latest ./build-image.sh
+docker push ghcr.io/runshine/secflow-app-kernel-scan:latest
+```
+
+GitHub Actions can also build and push this image automatically with
+`.github/workflows/build-secflow-app-kernel-scan-image.yaml`. After the image is
+available, create the Claude API secret:
+
+```bash
+kubectl -n secflow-ns create secret generic secflow-app-kernel-scan-secret \
+  --from-literal=ANTHROPIC_API_KEY='sk-...' \
+  --from-literal=ANTHROPIC_BASE_URL=''
+```
+
+Apply the manifests:
+
+```bash
+kubectl apply -k .
+kubectl -n secflow-ns get pods,svc,pvc -l name=secflow-app-kernel-scan
+```
+
+The deployment is intentionally single-replica because it uses SQLite and a
+local scheduler state directory.
+
 ## ADB Device Setup
 
 PoC tasks no longer accept ADB IP in `/tasks`. Configure the remote ADB server first:

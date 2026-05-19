@@ -128,7 +128,7 @@ class B2SAnalysisCache(Base):
     __tablename__ = "secflow_b2s_analysis_cache"
 
     id = Column(String(32), primary_key=True)
-    cache_key = Column(String(64), nullable=False, unique=True, index=True)
+    cache_key = Column(String(80), nullable=False, unique=True, index=True)
     file_sha256 = Column(String(64), nullable=False, index=True)
     file_size = Column(BigInteger, nullable=False, default=0)
     elf_basename = Column(String(255), nullable=True)
@@ -189,6 +189,7 @@ def init_database() -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_task_item_progress_columns(engine)
     _ensure_task_origin_columns(engine)
+    _ensure_analysis_cache_columns(engine)
 
 
 def _ensure_task_item_progress_columns(engine) -> None:
@@ -250,6 +251,23 @@ def _ensure_task_origin_columns(engine) -> None:
         statements.append(f"ALTER TABLE {table_name} ADD COLUMN parent_stage_item_key VARCHAR(255) NULL")
     if not statements:
         return
+    with engine.begin() as conn:
+        for statement in statements:
+            conn.exec_driver_sql(statement)
+
+
+def _ensure_analysis_cache_columns(engine) -> None:
+    table_name = B2SAnalysisCache.__tablename__
+    columns = {column["name"]: column for column in inspect(engine).get_columns(table_name)}
+    statements: list[str] = []
+    cache_key = columns.get("cache_key")
+    if cache_key is not None:
+        try:
+            current_length = int(getattr(cache_key.get("type"), "length", 0) or 0)
+        except Exception:
+            current_length = 0
+        if 0 < current_length < 80:
+            statements.append(f"ALTER TABLE {table_name} MODIFY COLUMN cache_key VARCHAR(80) NOT NULL")
     with engine.begin() as conn:
         for statement in statements:
             conn.exec_driver_sql(statement)
