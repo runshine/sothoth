@@ -8286,6 +8286,10 @@ class TaskManager:
             task.lease_expires_at = None
             self._enqueue_action(task.id)
             return
+        if task.status == "failed":
+            self._invalidate_task_execution(task)
+            task.finished_at = task.finished_at or _now()
+            return
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
         statuses = [run.status for run in stage_runs]
         if any(status in {"running", "dispatching"} for status in statuses):
@@ -8489,6 +8493,8 @@ class TaskManager:
             try:
                 for input_item in inputs:
                     item_key, item_name, parent_key, input_ref = identity(input_item)
+                    if not str(item_key or "").strip():
+                        raise ValidationError(f"阶段 {stage_run.stage_name} 初始化阶段子任务失败: item_key 为空")
                     identity_key = build_stage_item_identity_key(item_key, parent_key)
                     if retry_failed_only and identity_key not in retry_item_keys:
                         continue
@@ -9576,7 +9582,7 @@ class TaskManager:
         retry_existing: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         del token
-        system_inputs = self._system_analysis_inputs(task)
+        system_inputs = self._system_analysis_inputs(task, db=db)
         if not system_inputs:
             return "failed", {"error": "缺少可用于系统分析的输入"}
         executable_inputs = self._prepare_stage_items_for_execution(
@@ -9705,7 +9711,50 @@ class TaskManager:
             "error": failed[0].get("error") if failed else None,
         }
 
-    def _system_analysis_inputs(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+    def _is_valid_system_analysis_input(self, row: dict[str, Any]) -> bool:
+        return bool(str(row.get("firmware_key") or "").strip())
+
+    def _normalize_system_analysis_input(self, row: dict[str, Any]) -> dict[str, Any]:
+        firmware_key = str(row.get("firmware_key") or row.get("item_key") or row.get("filename") or "").strip()
+        unpacked_root = str(row.get("unpacked_root") or row.get("source_root") or row.get("archive_root") or "").strip()
+        filename = str(row.get("filename") or firmware_key or "firmware").strip()
+        return {
+            "firmware_key": firmware_key,
+            "firmware_name": str(row.get("firmware_name") or Path(filename).stem or firmware_key).strip(),
+            "filename": filename,
+            "input_path": str(row.get("input_path") or row.get("path") or "").strip(),
+            "unpacked_root": unpacked_root,
+            "source_root": str(row.get("source_root") or unpacked_root).strip(),
+            "task_type": row.get("task_type") or TASK_TYPE_BINARY,
+        }
+
+    def _system_analysis_inputs_from_firmware_items(self, db: Session, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for item in self._stage_items(db, task.id, "firmware_unpack"):
+            if self._normalize_item_status(item.status) != "success":
+                continue
+            input_ref = dict(item.input_ref or {})
+            output_ref = dict(item.output_ref or {})
+            result = dict(item.result or {})
+            archive_root = str(output_ref.get("archive_root") or output_ref.get("unpacked_root") or result.get("archive_root") or result.get("unpacked_root") or "").strip()
+            candidate = self._normalize_system_analysis_input(
+                {
+                    **input_ref,
+                    **result,
+                    "firmware_key": result.get("firmware_key") or item.item_key or input_ref.get("firmware_key"),
+                    "firmware_name": result.get("firmware_name") or item.item_name or input_ref.get("firmware_name"),
+                    "filename": result.get("filename") or input_ref.get("filename") or item.item_name or item.item_key,
+                    "input_path": result.get("input_path") or input_ref.get("path") or input_ref.get("input_path"),
+                    "unpacked_root": result.get("unpacked_root") or archive_root,
+                    "source_root": result.get("source_root") or result.get("unpacked_root") or archive_root,
+                    "task_type": result.get("task_type") or TASK_TYPE_BINARY,
+                }
+            )
+            if self._is_valid_system_analysis_input(candidate):
+                rows.append(candidate)
+        return rows
+
+    def _system_analysis_inputs(self, task: BinarySecurityTask, db: Session | None = None) -> list[dict[str, Any]]:
         if self._task_type(task) == TASK_TYPE_SOURCE:
             input_dir = Path(task.workspace_root) / "input"
             if not input_dir.exists():
@@ -9720,7 +9769,17 @@ class TaskManager:
                     "task_type": TASK_TYPE_SOURCE,
                 }
             ]
-        return list(task.summary.get("firmware_unpack_results") or [])
+        summary_rows = [
+            self._normalize_system_analysis_input(row)
+            for row in list(task.summary.get("firmware_unpack_results") or [])
+            if isinstance(row, dict)
+        ]
+        valid_summary_rows = [row for row in summary_rows if self._is_valid_system_analysis_input(row)]
+        if valid_summary_rows:
+            return valid_summary_rows
+        if db is not None:
+            return self._system_analysis_inputs_from_firmware_items(db, task)
+        return []
 
     async def _run_system_analysis_item(
         self,

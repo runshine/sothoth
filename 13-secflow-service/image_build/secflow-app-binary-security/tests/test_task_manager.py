@@ -686,6 +686,38 @@ class TaskManagerTests(unittest.TestCase):
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertIsNotNone(task.finished_at)
 
+    def test_refresh_task_status_after_sync_does_not_resurrect_failed_task(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="pod-a",
+            dispatch_started_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=1),
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[run])
+
+        self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual("failed", task.status)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertIsNotNone(task.finished_at)
+
     def test_downstream_status_event_does_not_resurrect_cancelled_task(self):
         with tempfile.TemporaryDirectory() as tmp:
             engine = create_engine("sqlite:///:memory:")
@@ -4968,6 +5000,54 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(TASK_TYPE_SOURCE, rows[0]["task_type"])
             self.assertEqual(str(workspace / "input"), rows[0]["unpacked_root"])
             self.assertEqual(str(workspace / "input"), rows[0]["source_root"])
+
+    def test_binary_system_analysis_inputs_fallback_to_firmware_stage_items(self):
+        task = BinarySecurityTask(id="t1", project_id="p1", name="binary-task", task_type=TASK_TYPE_BINARY, status="running", firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
+        task.summary = {"firmware_unpack_results": [{"firmware_key": None, "unpacked_root": None}]}
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="firmware_unpack",
+            item_key="fw.bin",
+            item_name="fw.bin",
+            status="success",
+        )
+        item.input_ref = {"filename": "fw.bin", "path": "/input/fw.bin"}
+        item.output_ref = {"archive_root": "/archive/fw"}
+        item.result = {
+            "firmware_key": "fw.bin",
+            "firmware_name": "fw",
+            "filename": "fw.bin",
+            "input_path": "/input/fw.bin",
+            "unpacked_root": "/archive/fw",
+            "source_root": "/archive/fw",
+        }
+        db = _ModelAwareDb(stage_items=[item])
+
+        rows = self.manager._system_analysis_inputs(task, db=db)
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("fw.bin", rows[0]["firmware_key"])
+        self.assertEqual("/archive/fw", rows[0]["unpacked_root"])
+        self.assertEqual("/archive/fw", rows[0]["source_root"])
+
+    def test_prepare_stage_items_for_execution_rejects_empty_item_key(self):
+        task = BinarySecurityTask(id="t1", project_id="p1", name="binary-task", task_type=TASK_TYPE_BINARY, status="running", firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
+        stage_run = BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="system_analysis", sequence_no=2, status="running")
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run])
+
+        with self.assertRaises(ValidationError):
+            self.manager._prepare_stage_items_for_execution(
+                db,
+                task=task,
+                stage_run=stage_run,
+                inputs=[{"firmware_key": None}],
+                downstream_service="system_analyse",
+                identity=lambda row: (row.get("firmware_key"), None, row.get("firmware_key"), row),
+                output_ref=lambda _row: {},
+            )
 
     def test_source_entry_analysis_inputs_come_from_high_risk_modules(self):
         task = BinarySecurityTask(id="s1", project_id="p1", name="source-task", task_type=TASK_TYPE_SOURCE, status="pending", firmware_source="project_filesystem", firmware_path="/src", output_root="/o", workspace_root="/w")
