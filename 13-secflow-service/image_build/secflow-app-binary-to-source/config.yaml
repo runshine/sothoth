@@ -59,11 +59,8 @@ storage:
 
 cache:
   enabled: true
-  scope: "project"
   root_dir: "/data/files/.secflow-cache/binary-to-source"
   materialize_mode: "copy"
-  ttl_days: 90
-  max_size_gb: 500
   cache_success_only: true
 
 registry:

@@ -37,7 +37,7 @@ class CacheLookupResult:
 
 
 class B2SCacheService:
-    """Global cache for successful B2S item analysis outputs."""
+    """Shared cache for successful B2S item analysis outputs."""
 
     def enabled(self) -> bool:
         return bool(get_config().cache.enabled)
@@ -96,7 +96,7 @@ class B2SCacheService:
         cache_meta = {
             "enabled": bool(self.enabled()),
             "hit": False,
-            "scope": "global",
+            "sharing_mode": "shared",
             "cache_key": self.build_cache_key(digest.sha256, mode),
             "file_sha256": digest.sha256,
             "file_size": digest.size,
@@ -300,7 +300,7 @@ class B2SCacheService:
     def _write_manifest(self, canonical_dir: Path, item: B2STaskItem, cache_meta: dict[str, Any], *, replaced: bool) -> None:
         payload = {
             "cache_key": cache_meta.get("cache_key"),
-            "scope": "global",
+            "sharing_mode": "shared",
             "source_project_id": item.project_id,
             "source_task_id": item.task_id,
             "source_item_id": item.id,

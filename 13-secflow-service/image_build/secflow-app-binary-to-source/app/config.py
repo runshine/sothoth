@@ -93,11 +93,8 @@ class StorageConfig(BaseModel):
 
 class CacheConfig(BaseModel):
     enabled: bool = True
-    scope: Literal["project", "global"] = "project"
     root_dir: str = "/data/files/.secflow-cache/binary-to-source"
     materialize_mode: Literal["copy", "hardlink", "symlink"] = "copy"
-    ttl_days: int = 90
-    max_size_gb: Optional[int] = 500
     cache_success_only: bool = True
 
 
