@@ -688,6 +688,7 @@ STAGE_RETRY_ENDPOINTS = {
     "dataflow_analysis": ("dataflow_analyse", "restart"),
     "vuln_scan": ("dataflow_vuln_scanner", "retry"),
 }
+SERVICE_STAGE_NAMES = {service: stage_name for stage_name, (service, _action) in STAGE_RETRY_ENDPOINTS.items()}
 SOURCE_TASK_INPUT_KEY = "source_project"
 SERVICE_OUTPUT_FOLDERS = {
     "firmware_unpacker": "firmware-unpacker",
@@ -1807,7 +1808,7 @@ class TaskManager:
         stage_sequence = self._stage_sequence_for_task(task)
         first_stage = stage_sequence[0]
         self._invalidate_task_execution(task)
-        downstream_refs = self._downstream_refs_for_stages(db, task, stage_sequence)
+        downstream_refs = self._retry_downstream_refs_for_stages(db, task, stage_sequence)
         if downstream_refs:
             await self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token())
         self._clear_stage_outputs_from(task, first_stage, mark_stale=False)
@@ -1852,7 +1853,9 @@ class TaskManager:
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
         downstream_stages = stage_sequence[target_index + 1:]
-        all_downstream_refs = downstream_refs + self._downstream_refs_for_stages(db, task, downstream_stages)
+        all_downstream_refs = self._dedupe_downstream_refs(
+            downstream_refs + self._retry_downstream_refs_for_stages(db, task, downstream_stages)
+        )
         self._invalidate_task_execution(task)
         if all_downstream_refs:
             await self._cleanup_downstream_refs(db, task, all_downstream_refs, self._service_token())
@@ -1893,7 +1896,7 @@ class TaskManager:
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
         self._invalidate_task_execution(task)
-        downstream_refs = self._downstream_refs_for_stages(db, task, affected_stages)
+        downstream_refs = self._retry_downstream_refs_for_stages(db, task, affected_stages)
         if downstream_refs:
             await self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token())
         self._clear_stage_outputs_from(task, target_stage, mark_stale=False)
@@ -9086,6 +9089,31 @@ class TaskManager:
             seen.add(key)
             unique.append({**ref, "service": service, "task_id": task_id})
         return unique
+
+    def _normalize_downstream_ref_stage_name(self, ref: dict[str, Any]) -> str | None:
+        stage_name = str(ref.get("stage_name") or "").strip()
+        if stage_name:
+            return stage_name
+        service = str(ref.get("service") or "").strip()
+        return SERVICE_STAGE_NAMES.get(service)
+
+    def _retry_downstream_refs_for_stages(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_names: list[str],
+    ) -> list[dict[str, str]]:
+        normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
+        if not normalized:
+            return []
+        allowed = set(normalized)
+        refs = self._downstream_refs_for_stages(db, task, normalized)
+        orphan_refs = [
+            ref
+            for ref in self._discover_parent_linked_downstream_refs(db, task)
+            if self._normalize_downstream_ref_stage_name(ref) in allowed
+        ]
+        return self._dedupe_downstream_refs(refs + orphan_refs)
 
     def _discover_parent_linked_downstream_refs(self, db: Session, task: BinarySecurityTask) -> list[dict[str, str]]:
         """Find old child tasks that are no longer referenced by current stage items."""

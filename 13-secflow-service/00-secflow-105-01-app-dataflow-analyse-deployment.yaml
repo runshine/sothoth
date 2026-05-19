@@ -18,7 +18,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-app-dataflow-analyse
-        image: ghcr.io/runshine/secflow-app-dataflow-analyse:20260519-8a15530
+        image: ghcr.io/runshine/secflow-app-dataflow-analyse:20260519-e5c5318
         imagePullPolicy: Always
         env:
           - name: TZ

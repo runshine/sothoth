@@ -3571,19 +3571,21 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 output_root=str(Path(tmp) / "output"),
                 workspace_root=tmp,
             )
-            item = BinarySecurityStageItem(
-                id="item1",
-                task_id="task1",
-                project_id="p1",
-                stage_name="system_analysis",
-                item_key="fw1",
-                item_name="fw1",
-                parent_key="fw1",
-                downstream_service="system_analyse",
-                downstream_task_id="sa-1",
-                status="failed",
-            )
-            db = _ModelAwareDb(tasks=[task], stage_items=[item])
+            items = [
+                BinarySecurityStageItem(
+                    id="item1",
+                    task_id="task1",
+                    project_id="p1",
+                    stage_name="system_analysis",
+                    item_key="fw1",
+                    item_name="fw1",
+                    parent_key="fw1",
+                    downstream_service="system_analyse",
+                    downstream_task_id="sa-1",
+                    status="failed",
+                )
+            ]
+            db = _ModelAwareDb(tasks=[task], stage_items=items)
             calls = []
 
             async def fake_cleanup(db_arg, task_arg, refs_arg, token_arg):
@@ -3597,16 +3599,23 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             original_cleanup = self.manager._cleanup_downstream_refs
+            original_discover = self.manager._discover_parent_linked_downstream_refs
             self.manager._cleanup_downstream_refs = fake_cleanup
+            self.manager._discover_parent_linked_downstream_refs = lambda _db, _task: [
+                {"service": "system_analyse", "task_id": "sa-1", "project_id": "p1", "stage_name": "system_analysis"},
+                {"service": "system_analyse", "task_id": "sa-orphan", "project_id": "p1", "stage_name": "system_analysis"},
+                {"service": "dataflow_analyse", "task_id": "dfa-other", "project_id": "p1", "stage_name": "dataflow_analysis"},
+            ]
             try:
                 self.manager.retry_task(db, project_id="p1", task_id="task1")
                 self._finish_retry_prepare(db, task)
             finally:
                 self.manager._cleanup_downstream_refs = original_cleanup
+                self.manager._discover_parent_linked_downstream_refs = original_discover
 
             self.assertEqual(1, len(calls))
             self.assertEqual("task1", calls[0]["task_id"])
-            self.assertEqual("sa-1", calls[0]["refs"][0]["task_id"])
+            self.assertEqual(["sa-1", "sa-orphan", "dfa-other"], [ref["task_id"] for ref in calls[0]["refs"]])
 
     def test_cleanup_downstream_refs_waits_for_system_analyse_to_stop_before_delete(self):
         refs = [{"service": "system_analyse", "task_id": "sat-1", "project_id": "p1", "stage_name": "system_analysis"}]
@@ -4210,24 +4219,120 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             original_cancel = self.manager._cancel_downstream_refs
             original_delete = self.manager._delete_downstream_refs
             original_retry_support = self.manager._stage_retry_support
+            original_discover = self.manager._discover_parent_linked_downstream_refs
             try:
                 self.manager._cancel_downstream_refs = fake_cancel_downstream_refs
                 self.manager._delete_downstream_refs = fake_delete_downstream_refs
                 self.manager._stage_retry_support = lambda _db, _task, _stage_name: (True, None)
+                self.manager._discover_parent_linked_downstream_refs = lambda _db, _task: [
+                    {"service": "system_analyse", "task_id": "sat_1", "project_id": "p1", "stage_name": "system_analysis"},
+                    {"service": "system_analyse", "task_id": "sat_orphan", "project_id": "p1", "stage_name": "system_analysis"},
+                    {"service": "entry_analyse", "task_id": "eat_1", "project_id": "p1", "stage_name": "entry_analysis"},
+                    {"service": "firmware_unpacker", "task_id": "fw_ignored", "project_id": "p1", "stage_name": "firmware_unpack"},
+                ]
                 self.manager.retry_stage(db, project_id="p1", task_id="s1", stage_name="system_analysis")
             finally:
                 self.manager._cancel_downstream_refs = original_cancel
                 self.manager._delete_downstream_refs = original_delete
                 self.manager._stage_retry_support = original_retry_support
+                self.manager._discover_parent_linked_downstream_refs = original_discover
 
             expected_refs = [
                 {"service": "system_analyse", "task_id": "sat_1", "project_id": "p1", "stage_name": "system_analysis"},
+                {"service": "system_analyse", "task_id": "sat_orphan", "project_id": "p1", "stage_name": "system_analysis"},
                 {"service": "entry_analyse", "task_id": "eat_1", "project_id": "p1", "stage_name": "entry_analysis"},
             ]
             self.assertEqual(expected_refs, cancelled_refs)
             self.assertEqual(expected_refs, deleted_refs)
             self.assertEqual([], db.stage_items)
             self.assertEqual("pending", task.status)
+
+    def test_retry_failed_items_cleanup_includes_orphaned_downstream_refs_in_affected_stages(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {
+            "retry_plan": {
+                "target_stage": "system_analysis",
+                "mode": "retry_stage_failed_items",
+                "retry_item_keys": ["fw1::fw1"],
+            }
+        }
+        runs = [
+            BinarySecurityStageRun(id="sr1", task_id="task1", project_id="p1", stage_name="system_analysis", sequence_no=1, status="failed"),
+            BinarySecurityStageRun(id="sr2", task_id="task1", project_id="p1", stage_name="entry_analysis", sequence_no=2, status="failed"),
+        ]
+        items = [
+            BinarySecurityStageItem(
+                id="item1",
+                task_id="task1",
+                project_id="p1",
+                stage_run_id="sr1",
+                stage_name="system_analysis",
+                item_key="fw1",
+                item_name="fw1",
+                parent_key="fw1",
+                item_identity_key="fw1::fw1",
+                downstream_service="system_analyse",
+                downstream_task_id="sa-1",
+                status="failed",
+            ),
+            BinarySecurityStageItem(
+                id="item2",
+                task_id="task1",
+                project_id="p1",
+                stage_run_id="sr2",
+                stage_name="entry_analysis",
+                item_key="mod1",
+                item_name="mod1",
+                parent_key="fw1",
+                downstream_service="entry_analyse",
+                downstream_task_id="ea-1",
+                status="failed",
+            ),
+        ]
+        db = _ModelAwareDb(tasks=[task], stage_runs=runs, stage_items=items)
+        calls = []
+
+        async def fake_cleanup(db_arg, task_arg, refs_arg, token_arg):
+            calls.append({"db": db_arg, "task_id": task_arg.id, "refs": refs_arg, "token": token_arg})
+
+        async def fake_sync(*args, **kwargs):
+            del args, kwargs
+            return None
+
+        original_cleanup = self.manager._cleanup_downstream_refs
+        original_sync = self.manager.sync_downstream_status
+        original_discover = self.manager._discover_parent_linked_downstream_refs
+        try:
+            self.manager._cleanup_downstream_refs = fake_cleanup
+            self.manager.sync_downstream_status = fake_sync
+            self.manager._discover_parent_linked_downstream_refs = lambda _db, _task: [
+                {"service": "system_analyse", "task_id": "sa-orphan", "project_id": "p1", "stage_name": "system_analysis"},
+                {"service": "entry_analyse", "task_id": "ea-orphan", "project_id": "p1", "stage_name": "entry_analysis"},
+                {"service": "firmware_unpacker", "task_id": "fw-ignored", "project_id": "p1", "stage_name": "firmware_unpack"},
+            ]
+            affected = asyncio.run(self.manager._prepare_retry_failed_items(db, task, "system_analysis"))
+        finally:
+            self.manager._cleanup_downstream_refs = original_cleanup
+            self.manager.sync_downstream_status = original_sync
+            self.manager._discover_parent_linked_downstream_refs = original_discover
+
+        self.assertEqual(["system_analysis", "entry_analysis"], affected)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(
+            ["sa-1", "ea-1", "sa-orphan", "ea-orphan"],
+            [ref["task_id"] for ref in calls[0]["refs"]],
+        )
 
     def test_refresh_task_status_after_stage_retry_requeues_downstream_stage(self):
         task = BinarySecurityTask(
