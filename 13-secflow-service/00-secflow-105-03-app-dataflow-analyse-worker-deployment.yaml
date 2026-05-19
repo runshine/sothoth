@@ -52,6 +52,10 @@ spec:
             value: "15"
           - name: DFA_MAX_LOCAL_RUNNING_TASKS
             value: "4"
+          - name: DFA_CLUSTER_EXPECTED_WORKERS
+            value: "6"
+          - name: DFA_CLUSTER_EXPECTED_WORKER_CAPACITY
+            value: "4"
           - name: DFA_DISPATCH_POLL_INTERVAL_SECONDS
             value: "3"
         ports:

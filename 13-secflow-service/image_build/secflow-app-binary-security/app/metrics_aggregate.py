@@ -106,6 +106,142 @@ class AggregatedMetricsPayload:
     metadata: AggregateMetadata
 
 
+def _sample_value(
+    aggregated: dict[str, AggregatedMetricSeries],
+    metric_name: str,
+    labels: dict[str, str] | None = None,
+) -> float | None:
+    series = aggregated.get(metric_name)
+    if not series:
+        return None
+    label_key = tuple(sorted((labels or {}).items()))
+    value = series.samples.get(label_key)
+    return float(value) if value is not None else None
+
+
+def _histogram_average(
+    aggregated: dict[str, AggregatedMetricSeries],
+    family_name: str,
+    labels: dict[str, str] | None = None,
+) -> float | None:
+    sum_value = _sample_value(aggregated, f"{family_name}_sum", labels)
+    count_value = _sample_value(aggregated, f"{family_name}_count", labels)
+    if sum_value is None or count_value is None or count_value <= 0:
+        return None
+    return float(sum_value) / float(count_value)
+
+
+def _append_binary_security_health_metrics(
+    lines: list[str],
+    aggregated: dict[str, AggregatedMetricSeries],
+    metadata: AggregateMetadata,
+) -> None:
+    pending_event_depth = _sample_value(
+        aggregated,
+        "secflow_binary_security_state_event_queue_depth",
+        {"status": "pending"},
+    )
+    oldest_pending_age = _sample_value(
+        aggregated,
+        "secflow_binary_security_state_event_oldest_age_seconds",
+        {"status": "pending"},
+    )
+    dead_letter_depth = _sample_value(
+        aggregated,
+        "secflow_binary_security_state_event_queue_depth",
+        {"status": "dead_letter"},
+    )
+    archive_queued_jobs = sum(
+        value
+        for label_key, value in (aggregated.get("secflow_binary_security_archive_jobs_by_status") or AggregatedMetricSeries("gauge", None)).samples.items()
+        if dict(label_key).get("status") == "queued"
+    )
+    archive_running_jobs = sum(
+        value
+        for label_key, value in (aggregated.get("secflow_binary_security_archive_jobs_by_status") or AggregatedMetricSeries("gauge", None)).samples.items()
+        if dict(label_key).get("status") == "running"
+    )
+    reducer_avg_duration = _histogram_average(
+        aggregated,
+        "secflow_binary_security_state_reducer_duration_seconds",
+    )
+    event_avg_lag = _histogram_average(
+        aggregated,
+        "secflow_binary_security_state_event_lag_seconds",
+    )
+    lock_wait_avg = _histogram_average(
+        aggregated,
+        "secflow_binary_security_task_state_lock_wait_seconds",
+    )
+    lock_held_avg = _histogram_average(
+        aggregated,
+        "secflow_binary_security_task_state_lock_held_seconds",
+    )
+    health_metrics = {
+        "secflow_binary_security_health_aggregate_partial": (
+            "Whether the current aggregate snapshot is partial.",
+            1.0 if metadata.partial else 0.0,
+        ),
+        "secflow_binary_security_health_pending_event_depth": (
+            "Current pending state-event depth for binary-security orchestration.",
+            float(pending_event_depth or 0.0),
+        ),
+        "secflow_binary_security_health_oldest_pending_age_seconds": (
+            "Age in seconds of the oldest pending state event.",
+            float(oldest_pending_age or 0.0),
+        ),
+        "secflow_binary_security_health_dead_letter_depth": (
+            "Current dead-letter queue depth for reducer state events.",
+            float(dead_letter_depth or 0.0),
+        ),
+        "secflow_binary_security_health_archive_queued_jobs": (
+            "Current queued archive jobs across stages.",
+            float(archive_queued_jobs),
+        ),
+        "secflow_binary_security_health_archive_running_jobs": (
+            "Current running archive jobs across stages.",
+            float(archive_running_jobs),
+        ),
+        "secflow_binary_security_health_reducer_avg_duration_seconds": (
+            "Average reducer run duration in seconds.",
+            float(reducer_avg_duration or 0.0),
+        ),
+        "secflow_binary_security_health_event_avg_lag_seconds": (
+            "Average reducer event lag in seconds.",
+            float(event_avg_lag or 0.0),
+        ),
+        "secflow_binary_security_health_lock_wait_avg_seconds": (
+            "Average task state lock wait duration in seconds.",
+            float(lock_wait_avg or 0.0),
+        ),
+        "secflow_binary_security_health_lock_held_avg_seconds": (
+            "Average task state lock held duration in seconds.",
+            float(lock_held_avg or 0.0),
+        ),
+    }
+    for metric_name, (help_text, value) in health_metrics.items():
+        lines.append(f"# HELP {metric_name} {help_text}")
+        lines.append(f"# TYPE {metric_name} gauge")
+        lines.append(f"{metric_name} {value}")
+    lines.append(
+        "# HELP secflow_binary_security_metrics_aggregate_role_expected Whether a role is expected in the aggregate topology."
+    )
+    lines.append("# TYPE secflow_binary_security_metrics_aggregate_role_expected gauge")
+    lines.append(
+        "# HELP secflow_binary_security_metrics_aggregate_role_covered Whether at least one scrape succeeded for the role."
+    )
+    lines.append("# TYPE secflow_binary_security_metrics_aggregate_role_covered gauge")
+    for role in sorted(_ROLE_LABELS):
+        expected = 1.0 if role in _AGGREGATED_ROLE_LABELS else 0.0
+        covered = 1.0 if metadata.successful_by_role.get(role, 0) > 0 else 0.0
+        lines.append(
+            f'secflow_binary_security_metrics_aggregate_role_expected{{role="{role}"}} {expected}'
+        )
+        lines.append(
+            f'secflow_binary_security_metrics_aggregate_role_covered{{role="{role}"}} {covered}'
+        )
+
+
 def _sample_family_name(name: str) -> str:
     return re.sub(r"_(bucket|sum|count|total|created)$", "", name)
 
@@ -275,6 +411,7 @@ def render_aggregated_metrics(
     lines.append(
         f"secflow_binary_security_metrics_aggregate_last_success_timestamp_seconds {metadata.generated_at}"
     )
+    _append_binary_security_health_metrics(lines, aggregated, metadata)
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 

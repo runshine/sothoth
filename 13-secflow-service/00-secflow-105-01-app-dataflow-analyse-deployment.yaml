@@ -41,6 +41,10 @@ spec:
             value: "false"
           - name: DFA_ENABLE_REGISTRY
             value: "true"
+          - name: DFA_CLUSTER_EXPECTED_WORKERS
+            value: "6"
+          - name: DFA_CLUSTER_EXPECTED_WORKER_CAPACITY
+            value: "4"
         ports:
         - containerPort: 8080
         volumeMounts:

@@ -92,6 +92,93 @@ class MetricsAggregateTests(unittest.TestCase):
         ).decode("utf-8", errors="ignore")
         self.assertIn("secflow_binary_security_metrics_aggregate_scrape_targets", payload)
         self.assertIn("secflow_binary_security_metrics_aggregate_partial 1.0", payload)
+        self.assertIn('secflow_binary_security_metrics_aggregate_role_expected{role="api"} 1.0', payload)
+        self.assertIn('secflow_binary_security_metrics_aggregate_role_covered{role="worker"} 1.0', payload)
+
+    def test_render_aggregated_metrics_includes_binary_security_health_metrics(self):
+        payload = render_aggregated_metrics(
+            {
+                "secflow_binary_security_state_event_queue_depth": SimpleNamespace(
+                    metric_type="gauge",
+                    help_text="Queue depth",
+                    samples={
+                        ((("status", "pending"),)): 7.0,
+                        ((("status", "dead_letter"),)): 2.0,
+                    },
+                ),
+                "secflow_binary_security_state_event_oldest_age_seconds": SimpleNamespace(
+                    metric_type="gauge",
+                    help_text="Queue age",
+                    samples={((("status", "pending"),)): 91.0},
+                ),
+                "secflow_binary_security_archive_jobs_by_status": SimpleNamespace(
+                    metric_type="gauge",
+                    help_text="Archive jobs",
+                    samples={
+                        ((("stage", "entry_analysis"), ("status", "queued"))): 3.0,
+                        ((("stage", "entry_analysis"), ("status", "running"))): 1.0,
+                        ((("stage", "dataflow_analysis"), ("status", "queued"))): 4.0,
+                    },
+                ),
+                "secflow_binary_security_state_reducer_duration_seconds_sum": SimpleNamespace(
+                    metric_type="histogram",
+                    help_text="Reducer duration sum",
+                    samples={(): 12.0},
+                ),
+                "secflow_binary_security_state_reducer_duration_seconds_count": SimpleNamespace(
+                    metric_type="histogram",
+                    help_text="Reducer duration count",
+                    samples={(): 4.0},
+                ),
+                "secflow_binary_security_state_event_lag_seconds_sum": SimpleNamespace(
+                    metric_type="histogram",
+                    help_text="Event lag sum",
+                    samples={(): 40.0},
+                ),
+                "secflow_binary_security_state_event_lag_seconds_count": SimpleNamespace(
+                    metric_type="histogram",
+                    help_text="Event lag count",
+                    samples={(): 5.0},
+                ),
+                "secflow_binary_security_task_state_lock_wait_seconds_sum": SimpleNamespace(
+                    metric_type="histogram",
+                    help_text="Lock wait sum",
+                    samples={(): 3.0},
+                ),
+                "secflow_binary_security_task_state_lock_wait_seconds_count": SimpleNamespace(
+                    metric_type="histogram",
+                    help_text="Lock wait count",
+                    samples={(): 6.0},
+                ),
+                "secflow_binary_security_task_state_lock_held_seconds_sum": SimpleNamespace(
+                    metric_type="histogram",
+                    help_text="Lock held sum",
+                    samples={(): 9.0},
+                ),
+                "secflow_binary_security_task_state_lock_held_seconds_count": SimpleNamespace(
+                    metric_type="histogram",
+                    help_text="Lock held count",
+                    samples={(): 3.0},
+                ),
+            },
+            metadata=AggregateMetadata(
+                attempted_by_role={"api": 2, "worker": 0, "reducer": 1},
+                successful_by_role={"api": 2, "worker": 0, "reducer": 1},
+                partial=False,
+                generated_at=5678.9,
+            ),
+        ).decode("utf-8", errors="ignore")
+        self.assertIn("secflow_binary_security_health_aggregate_partial 0.0", payload)
+        self.assertIn("secflow_binary_security_health_pending_event_depth 7.0", payload)
+        self.assertIn("secflow_binary_security_health_oldest_pending_age_seconds 91.0", payload)
+        self.assertIn("secflow_binary_security_health_dead_letter_depth 2.0", payload)
+        self.assertIn("secflow_binary_security_health_archive_queued_jobs 7.0", payload)
+        self.assertIn("secflow_binary_security_health_archive_running_jobs 1.0", payload)
+        self.assertIn("secflow_binary_security_health_reducer_avg_duration_seconds 3.0", payload)
+        self.assertIn("secflow_binary_security_health_event_avg_lag_seconds 8.0", payload)
+        self.assertIn("secflow_binary_security_health_lock_wait_avg_seconds 0.5", payload)
+        self.assertIn("secflow_binary_security_health_lock_held_avg_seconds 3.0", payload)
+        self.assertIn('secflow_binary_security_metrics_aggregate_role_covered{role="worker"} 0.0', payload)
 
     def test_aggregate_endpoint_returns_partial_result_when_some_scrapes_fail(self):
         from app import main
