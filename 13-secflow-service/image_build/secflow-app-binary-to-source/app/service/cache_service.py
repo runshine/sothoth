@@ -8,7 +8,6 @@ import os
 import re
 import shutil
 from dataclasses import dataclass
-from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -18,10 +17,10 @@ from sqlalchemy.orm import Session
 
 from app.config import get_config
 from app.model import B2SAnalysisCache, B2STaskItem
+from app.observability import get_observability
 from app.time_utils import isoformat_local, now_local
 
-CACHE_KEY_RE = re.compile(r"^[a-f0-9]{64}$")
-_SIGNATURE_VERSION = "v1"
+CACHE_KEY_RE = re.compile(r"^[a-f0-9]{64}_(fast|deep)$")
 
 
 @dataclass(frozen=True)
@@ -38,7 +37,7 @@ class CacheLookupResult:
 
 
 class B2SCacheService:
-    """Project-scoped cache for successful B2S item analysis outputs."""
+    """Global cache for successful B2S item analysis outputs."""
 
     def enabled(self) -> bool:
         return bool(get_config().cache.enabled)
@@ -55,31 +54,16 @@ class B2SCacheService:
                 digest.update(chunk)
         return FileDigest(sha256=digest.hexdigest(), size=size)
 
-    def build_analysis_signature(self, metadata: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        cfg = get_config().pi_re_agent
-        payload = {
-            "signature_version": _SIGNATURE_VERSION,
-            "engine": metadata.get("engine") or cfg.engine,
-            "mode": metadata.get("mode"),
-            "batch_size": cfg.batch_size,
-            "max_retries": cfg.max_retries,
-            "concurrency": metadata.get("concurrency") or cfg.concurrency,
-            "llm_provider_key": metadata.get("llm_provider_key"),
-            "llm_provider_model": metadata.get("llm_provider_model") or cfg.model,
-            "file_list": sorted(str(item) for item in (metadata.get("file_list") or [])),
-            "agent_timeout_retry_enabled": metadata.get("agent_timeout_retry_enabled", cfg.agent_timeout_retry_enabled),
-            "agent_timeout_max_retries": metadata.get("agent_timeout_max_retries", cfg.agent_timeout_max_retries),
-        }
-        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest(), payload
+    def normalize_cache_mode(self, metadata: dict[str, Any] | None) -> str:
+        mode = str((metadata or {}).get("mode") or "").strip().lower()
+        return "deep" if mode == "deep" else "fast"
 
-    def build_cache_key(self, project_id: str, file_sha256: str, analysis_signature: str) -> str:
-        scope = get_config().cache.scope
-        parts = [file_sha256, analysis_signature]
-        if scope == "project":
-            parts.insert(0, project_id)
-        raw = "\n".join(parts)
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    def build_cache_key(self, file_sha256: str, mode: str) -> str:
+        digest = str(file_sha256 or "").strip().lower()
+        normalized_mode = "deep" if str(mode or "").strip().lower() == "deep" else "fast"
+        if not re.fullmatch(r"[a-f0-9]{64}", digest):
+            raise ValueError("invalid file sha256")
+        return f"{digest}_{normalized_mode}"
 
     def cache_root(self) -> Path:
         return Path(get_config().cache.root_dir).resolve()
@@ -99,40 +83,51 @@ class B2SCacheService:
         ).first()
         if not row:
             return None
-        if row.expires_at is not None and row.expires_at <= now_local():
-            return None
         output_dir = Path(row.canonical_output_dir)
         if not output_dir.is_dir() or not (output_dir.parent / "READY").is_file():
             return None
         return row
 
-    def try_apply_cache_hit(self, db: Session, project_id: str, item: B2STaskItem, input_path: Path) -> CacheLookupResult:
-        if not self.enabled():
-            metadata = item.extra_metadata or {}
-            metadata["cache"] = {"enabled": False}
-            item.extra_metadata = metadata
-            return CacheLookupResult(hit=False, miss_reason="disabled")
-
+    def prepare_cache_metadata(self, item: B2STaskItem, input_path: Path) -> dict[str, Any]:
         digest = self.compute_file_digest(input_path)
-        signature_hash, signature_payload = self.build_analysis_signature(item.extra_metadata or {})
-        cache_key = self.build_cache_key(project_id, digest.sha256, signature_hash)
         metadata = item.extra_metadata or {}
-        metadata["cache"] = {
-            "enabled": True,
+        mode = self.normalize_cache_mode(metadata)
+        reuse_cache = bool(metadata.get("reuse_cache", True))
+        cache_meta = {
+            "enabled": bool(self.enabled()),
             "hit": False,
-            "scope": get_config().cache.scope,
-            "cache_key": cache_key,
+            "scope": "global",
+            "cache_key": self.build_cache_key(digest.sha256, mode),
             "file_sha256": digest.sha256,
             "file_size": digest.size,
-            "analysis_signature": signature_hash,
-            "analysis_signature_payload": signature_payload,
+            "cache_mode": mode,
+            "analysis_signature": mode,
+            "analysis_signature_payload": {"mode": mode},
+            "reuse_cache_at_create": reuse_cache,
         }
+        metadata["cache"] = cache_meta
         item.extra_metadata = metadata
+        return cache_meta
 
+    def try_apply_cache_hit(self, db: Session, item: B2STaskItem, input_path: Path) -> CacheLookupResult:
+        metadata = item.extra_metadata or {}
+        mode = self.normalize_cache_mode(metadata)
+        reuse_cache = bool(metadata.get("reuse_cache", True))
+        get_observability().record_cache_request(mode=mode, reuse_cache=reuse_cache)
+        if not self.enabled():
+            metadata["cache"] = {"enabled": False}
+            item.extra_metadata = metadata
+            get_observability().record_cache_miss(mode=mode, reason="disabled")
+            return CacheLookupResult(hit=False, miss_reason="disabled")
+
+        cache_meta = self.prepare_cache_metadata(item, input_path)
+        cache_key = str(cache_meta.get("cache_key") or "")
         cache = self.lookup_ready_cache(db, cache_key)
         if not cache:
-            metadata["cache"]["miss_reason"] = "not_found"
+            metadata = item.extra_metadata or {}
+            metadata.setdefault("cache", {}).update({"miss_reason": "not_found"})
             item.extra_metadata = metadata
+            get_observability().record_cache_miss(mode=mode, reason="not_found")
             return CacheLookupResult(hit=False, cache_key=cache_key, miss_reason="not_found")
 
         self._materialize_output(Path(cache.canonical_output_dir), Path(item.output_dir))
@@ -156,7 +151,7 @@ class B2SCacheService:
         item.started_at = now_local()
         item.finished_at = now_local()
         metadata = item.extra_metadata or {}
-        metadata["cache"].update({
+        metadata.setdefault("cache", {}).update({
             "hit": True,
             "miss_reason": None,
             "source_project_id": cache.source_project_id,
@@ -171,83 +166,91 @@ class B2SCacheService:
         item.extra_metadata = metadata
         cache.hit_count = int(cache.hit_count or 0) + 1
         cache.last_hit_at = now_local()
+        get_observability().record_cache_hit(mode=mode)
         return CacheLookupResult(hit=True, cache_key=cache_key)
 
-    def store_success_cache(self, db: Session, item: B2STaskItem) -> bool:
+    def store_success_cache(self, db: Session, item: B2STaskItem, *, upsert: bool = False) -> bool:
+        mode = self.normalize_cache_mode(item.extra_metadata or {})
         if not self.enabled() or item.status != "success":
+            get_observability().record_cache_store(mode=mode, result="failed")
             return False
         metadata = item.extra_metadata or {}
         cache_meta = metadata.get("cache") if isinstance(metadata.get("cache"), dict) else {}
         if cache_meta.get("hit"):
+            get_observability().record_cache_store(mode=mode, result="skipped")
             return False
         cache_key = str(cache_meta.get("cache_key") or "")
         if not cache_key or not CACHE_KEY_RE.fullmatch(cache_key):
-            return False
-        if self.lookup_ready_cache(db, cache_key):
+            get_observability().record_cache_store(mode=mode, result="failed")
             return False
         source_output = Path(item.output_dir)
         if not source_output.is_dir():
+            get_observability().record_cache_store(mode=mode, result="failed")
+            return False
+
+        existing = self.lookup_ready_cache(db, cache_key)
+        if existing and not upsert:
+            get_observability().record_cache_store(mode=mode, result="skipped")
             return False
 
         canonical_dir = self.canonical_dir(cache_key)
         canonical_output = canonical_dir / "output"
         tmp_dir = self.cache_root() / f".{cache_key}.building.{os.getpid()}.{uuid4().hex}"
+        backup_dir = self.cache_root() / f".{cache_key}.backup.{os.getpid()}.{uuid4().hex}"
         try:
             if tmp_dir.exists():
                 shutil.rmtree(tmp_dir)
             tmp_output = tmp_dir / "output"
             shutil.copytree(source_output, tmp_output)
             canonical_dir.parent.mkdir(parents=True, exist_ok=True)
-            if not canonical_dir.exists():
+            replaced = bool(existing and upsert)
+            if replaced and canonical_dir.exists():
+                os.replace(canonical_dir, backup_dir)
+                os.replace(tmp_dir, canonical_dir)
+                shutil.rmtree(backup_dir, ignore_errors=True)
+            elif not canonical_dir.exists():
                 os.replace(tmp_dir, canonical_dir)
             else:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
-            self._write_manifest(canonical_dir, item, cache_meta)
+            self._write_manifest(canonical_dir, item, cache_meta, replaced=replaced)
             (canonical_dir / "READY").write_text(isoformat_local(now_local()), encoding="utf-8")
 
-            row = B2SAnalysisCache(
-                id=uuid4().hex[:16],
-                cache_key=cache_key,
-                file_sha256=str(cache_meta.get("file_sha256") or ""),
-                file_size=int(cache_meta.get("file_size") or 0),
-                elf_basename=Path(item.elf_path).name,
-                analysis_signature=str(cache_meta.get("analysis_signature") or ""),
-                analysis_signature_json=json.dumps(cache_meta.get("analysis_signature_payload") or {}, ensure_ascii=False),
-                status="ready",
-                source_project_id=item.project_id,
-                source_task_id=item.task_id,
-                source_item_id=item.id,
-                canonical_output_dir=str(canonical_output),
-                canonical_input_path=item.elf_path,
-                generated_files_json=json.dumps(self._canonical_generated_files(item, canonical_output), ensure_ascii=False),
-                function_stats_json=json.dumps(metadata.get("function_stats") or {}, ensure_ascii=False),
-                progress_json=item.progress_json,
-                metadata_json=json.dumps({"source_metadata": metadata.get("cache") or {}}, ensure_ascii=False),
-                expires_at=now_local() + timedelta(days=get_config().cache.ttl_days) if get_config().cache.ttl_days > 0 else None,
-            )
+            row = existing or B2SAnalysisCache(id=uuid4().hex[:16], cache_key=cache_key)
+            row.file_sha256 = str(cache_meta.get("file_sha256") or "")
+            row.file_size = int(cache_meta.get("file_size") or 0)
+            row.elf_basename = Path(item.elf_path).name
+            row.analysis_signature = str(cache_meta.get("analysis_signature") or "")
+            row.analysis_signature_json = json.dumps(cache_meta.get("analysis_signature_payload") or {}, ensure_ascii=False)
+            row.status = "ready"
+            row.source_project_id = item.project_id
+            row.source_task_id = item.task_id
+            row.source_item_id = item.id
+            row.canonical_output_dir = str(canonical_output)
+            row.canonical_input_path = item.elf_path
+            row.generated_files_json = json.dumps(self._canonical_generated_files(item, canonical_output), ensure_ascii=False)
+            row.function_stats_json = json.dumps(metadata.get("function_stats") or {}, ensure_ascii=False)
+            row.progress_json = item.progress_json
+            row.metadata_json = json.dumps({"source_metadata": metadata.get("cache") or {}}, ensure_ascii=False)
+            row.expires_at = None
             try:
                 with db.begin_nested():
-                    db.add(row)
+                    if not existing:
+                        db.add(row)
                     db.flush()
             except IntegrityError:
+                get_observability().record_cache_store(mode=mode, result="failed")
                 return False
+            get_observability().record_cache_store(mode=mode, result="updated" if replaced else "created")
             return True
         except Exception:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+            shutil.rmtree(backup_dir, ignore_errors=True)
+            get_observability().record_cache_store(mode=mode, result="failed")
             raise
 
     def delete_caches_for_source_task(self, db: Session, project_id: str, task_id: str) -> int:
-        rows = db.query(B2SAnalysisCache).filter(
-            B2SAnalysisCache.source_project_id == project_id,
-            B2SAnalysisCache.source_task_id == task_id,
-        ).all()
-        deleted = 0
-        for row in rows:
-            cache_dir = Path(row.canonical_output_dir).parent if row.canonical_output_dir else self.canonical_dir(row.cache_key)
-            shutil.rmtree(cache_dir, ignore_errors=True)
-            db.delete(row)
-            deleted += 1
-        return deleted
+        del db, project_id, task_id
+        return 0
 
     def _materialize_output(self, source: Path, target: Path) -> None:
         target = target.resolve()
@@ -294,15 +297,19 @@ class B2SCacheService:
                 result.append(str(raw))
         return result
 
-    def _write_manifest(self, canonical_dir: Path, item: B2STaskItem, cache_meta: dict[str, Any]) -> None:
+    def _write_manifest(self, canonical_dir: Path, item: B2STaskItem, cache_meta: dict[str, Any], *, replaced: bool) -> None:
         payload = {
             "cache_key": cache_meta.get("cache_key"),
-            "scope": get_config().cache.scope,
+            "scope": "global",
             "source_project_id": item.project_id,
             "source_task_id": item.task_id,
             "source_item_id": item.id,
             "file_sha256": cache_meta.get("file_sha256"),
             "analysis_signature": cache_meta.get("analysis_signature"),
+            "mode": cache_meta.get("cache_mode"),
+            "reuse_cache_at_create": cache_meta.get("reuse_cache_at_create"),
+            "cache_replaced_by_task_id": item.task_id if replaced else None,
+            "cache_replaced_at": isoformat_local(now_local()) if replaced else None,
             "created_at": isoformat_local(now_local()),
         }
         (canonical_dir / "manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

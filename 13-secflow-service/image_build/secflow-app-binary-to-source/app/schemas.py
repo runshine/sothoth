@@ -34,6 +34,7 @@ class TaskCreate(BaseModel):
     agent_timeout_max_retries: Optional[int] = None
     mode: Optional[Literal["fast", "deep"]] = None
     engine: Optional[Literal["hybrid", "agent"]] = None
+    reuse_cache: Optional[bool] = None
     task_origin_type: Optional[str] = None
     parent_project_id: Optional[str] = None
     parent_task_id: Optional[str] = None
@@ -148,6 +149,7 @@ class TaskConfigSnapshot(BaseModel):
     agent_run_timeout_seconds: Optional[int] = None
     agent_timeout_retry_enabled: Optional[bool] = None
     agent_timeout_max_retries: Optional[int] = None
+    reuse_cache: Optional[bool] = None
     budget_exhausted_action: Optional[str] = None
     input_count: int = 0
     input_items: list[TaskConfigInputItem] = Field(default_factory=list)
