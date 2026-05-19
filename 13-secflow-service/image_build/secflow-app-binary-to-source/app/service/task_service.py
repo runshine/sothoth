@@ -538,9 +538,17 @@ async def _requeue_stale_pi_job(
 async def _recover_stale_pi_job(db: Session, item: B2STaskItem, job: dict, observed_pi_job_id: str | None) -> bool:
     raw_status = str(job.get("status") or "").strip().lower()
     pi_cfg = get_config().pi_re_agent
+    cancelling_stale_after_seconds = max(
+        30,
+        int(getattr(pi_cfg, "cancelling_stale_after_seconds", 300)),
+    )
+    queued_stale_after_seconds = max(
+        60,
+        int(getattr(pi_cfg, "queued_stale_after_seconds", 1800)),
+    )
     if raw_status == "cancelling":
         age = _pi_job_age_seconds(job, "cancel_requested_at", "updated_at")
-        if age is not None and age >= max(30, int(pi_cfg.cancelling_stale_after_seconds)):
+        if age is not None and age >= cancelling_stale_after_seconds:
             return await _requeue_stale_pi_job(
                 db,
                 item,
@@ -550,7 +558,7 @@ async def _recover_stale_pi_job(db: Session, item: B2STaskItem, job: dict, obser
             )
     if raw_status == "queued":
         age = _pi_job_age_seconds(job, "heartbeat_at", "updated_at", "created_at")
-        if age is not None and age >= max(60, int(pi_cfg.queued_stale_after_seconds)):
+        if age is not None and age >= queued_stale_after_seconds:
             return await _requeue_stale_pi_job(
                 db,
                 item,
@@ -849,6 +857,28 @@ async def sync_task(db: Session, task: B2STask) -> None:
                 "phase": item.phase,
                 "progress": item.progress or {},
                 "error": str(exc),
+            })
+            changed = True
+            continue
+        except Exception as exc:
+            if not _sync_observation_is_still_current(db, item, observed_pi_job_id):
+                continue
+            if terminal_metrics_backfill_only:
+                _record_pi_metadata(
+                    item,
+                    pi_runtime_metric_missing_reason="sync_unexpected_error",
+                    pi_runtime_metric_last_checked_at=isoformat_local(now_local()),
+                    pi_runtime_metric_last_error=str(exc),
+                )
+                changed = True
+                continue
+            item.failure_type = "pi-re-agent"
+            item.error_reason = f"sync task unexpected error: {exc}"
+            item.progress = build_item_progress(item, {
+                "status": item.status,
+                "phase": item.phase,
+                "progress": item.progress or {},
+                "error": item.error_reason,
             })
             changed = True
             continue
