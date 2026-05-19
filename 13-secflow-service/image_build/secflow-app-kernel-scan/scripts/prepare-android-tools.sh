@@ -6,7 +6,7 @@ TOOLS_DIR="${ANDROID_TOOLS_CACHE_DIR:-${ROOT_DIR}/tools}"
 
 PLATFORM_TOOLS_URL="${ANDROID_PLATFORM_TOOLS_URL:-https://dl.google.com/android/repository/platform-tools-latest-linux.zip}"
 NDK_URL="${ANDROID_NDK_URL:-https://dl.google.com/android/repository/android-ndk-r29-linux.zip}"
-NDK_SHA1="${ANDROID_NDK_SHA1:-dc5bd963c8fd5ba91762a8a282b39466fb7f6568}"
+NDK_SHA1="${ANDROID_NDK_SHA1:-}"
 
 PLATFORM_TOOLS_ZIP="${TOOLS_DIR}/android-platform-tools.zip"
 NDK_ZIP="${TOOLS_DIR}/android-ndk-r29.zip"
