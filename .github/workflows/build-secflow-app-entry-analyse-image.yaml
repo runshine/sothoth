@@ -21,44 +21,126 @@ jobs:
         id: date
         run: echo "date_tag=$(date +'%Y%m%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-  build-and-push:
+  build-amd64:
     needs: prepare
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - name: Checkout sothoth (no submodules)
-        uses: actions/checkout@v4
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v6
         with:
-          submodules: false
+          submodules: true
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
 
-      - name: Checkout entry_analyse submodule content
-        run: |
-          SUBMODULE_SHA=$(git ls-tree HEAD 13-secflow-service/image_build/secflow-app-entry-analyse | awk '{print $3}')
-          echo "Submodule SHA: $SUBMODULE_SHA"
-          git clone https://x-access-token:${{ secrets.PRIVATE_REPO_PAT }}@github.com/ict-bin/entry_analyse.git \
-            13-secflow-service/image_build/secflow-app-entry-analyse
-          cd 13-secflow-service/image_build/secflow-app-entry-analyse
-          git checkout $SUBMODULE_SHA
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Build amd64 image
+        run: |
+          docker build \
+            --file 13-secflow-service/image_build/secflow-app-entry-analyse/Dockerfile \
+            --tag ghcr.io/runshine/secflow-app-entry-analyse:amd64-latest \
+            --tag ghcr.io/runshine/secflow-app-entry-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
+            13-secflow-service/image_build/secflow-app-entry-analyse/
 
-      - name: Build and push image
-        uses: docker/build-push-action@v5
+      - name: Push amd64 image
+        run: |
+          # docker push runshine0819/secflow-app-entry-analyse:amd64-latest
+          docker push ghcr.io/runshine/secflow-app-entry-analyse:amd64-latest
+          # docker push runshine0819/secflow-app-entry-analyse:amd64-${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/secflow-app-entry-analyse:amd64-${{ needs.prepare.outputs.date_tag }}
+
+  build-arm64:
+    needs: prepare
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v6
         with:
-          context: 13-secflow-service/image_build/secflow-app-entry-analyse
-          file: 13-secflow-service/image_build/secflow-app-entry-analyse/Dockerfile
-          push: true
-          platforms: linux/amd64
-          tags: |
-            ghcr.io/runshine/secflow-app-entry-analyse:latest
-            ghcr.io/runshine/secflow-app-entry-analyse:${{ needs.prepare.outputs.date_tag }}
+          submodules: true
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build arm64 image
+        run: |
+          docker build \
+            --file 13-secflow-service/image_build/secflow-app-entry-analyse/Dockerfile \
+            --tag ghcr.io/runshine/secflow-app-entry-analyse:arm64-latest \
+            --tag ghcr.io/runshine/secflow-app-entry-analyse:arm64-${{ needs.prepare.outputs.date_tag }} \
+            13-secflow-service/image_build/secflow-app-entry-analyse/
+
+      - name: Push arm64 image
+        run: |
+          # docker push runshine0819/secflow-app-entry-analyse:arm64-latest
+          docker push ghcr.io/runshine/secflow-app-entry-analyse:arm64-latest
+          # docker push runshine0819/secflow-app-entry-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/secflow-app-entry-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
+
+  merge-manifest:
+    needs: [prepare, build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest (latest)
+        run: |
+          docker manifest create ghcr.io/runshine/secflow-app-entry-analyse:latest \
+            --amend ghcr.io/runshine/secflow-app-entry-analyse:amd64-latest \
+            --amend ghcr.io/runshine/secflow-app-entry-analyse:arm64-latest
+          docker manifest push ghcr.io/runshine/secflow-app-entry-analyse:latest
+          # docker manifest create runshine0819/secflow-app-entry-analyse:latest \
+            # --amend runshine0819/secflow-app-entry-analyse:amd64-latest \
+            # --amend runshine0819/secflow-app-entry-analyse:arm64-latest || true
+          # docker manifest push runshine0819/secflow-app-entry-analyse:latest || true
+
+      - name: Create and push multi-arch manifest (date tag)
+        run: |
+          docker manifest create ghcr.io/runshine/secflow-app-entry-analyse:${{ needs.prepare.outputs.date_tag }} \
+            --amend ghcr.io/runshine/secflow-app-entry-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
+            --amend ghcr.io/runshine/secflow-app-entry-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
+          docker manifest push ghcr.io/runshine/secflow-app-entry-analyse:${{ needs.prepare.outputs.date_tag }}
+          # docker manifest create runshine0819/secflow-app-entry-analyse:${{ needs.prepare.outputs.date_tag }} \
+            # --amend runshine0819/secflow-app-entry-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
+            # --amend runshine0819/secflow-app-entry-analyse:arm64-${{ needs.prepare.outputs.date_tag }} || true
+          # docker manifest push runshine0819/secflow-app-entry-analyse:${{ needs.prepare.outputs.date_tag }} || true
