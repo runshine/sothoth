@@ -58,6 +58,9 @@ spec:
             - name: kernel-scan-data
               mountPath: /workspace
               subPath: workspace
+            - name: kernel-scan-data
+              mountPath: /workspace/kernel
+              subPath: workspace/kernel
           resources:
             requests:
               cpu: "2"

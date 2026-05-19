@@ -65,6 +65,9 @@ spec:
             - name: secflow-app-kernel-scan-data-nfs-pvc
               mountPath: /workspace
               subPath: workspace
+            - name: secflow-app-kernel-scan-data-nfs-pvc
+              mountPath: /workspace/kernel
+              subPath: workspace/kernel
           resources:
             requests:
               cpu: "2"

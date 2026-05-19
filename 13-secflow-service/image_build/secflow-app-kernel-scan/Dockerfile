@@ -126,8 +126,6 @@ RUN mkdir -p /home/scanner/.claude/projects \
 
 EXPOSE 8080
 
-VOLUME ["/var/lib/secflow-kernel-scan", "/workspace/kernel"]
-
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD python3 -c "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/api/app/kernel-scan/health', timeout=5)" || exit 1
 
