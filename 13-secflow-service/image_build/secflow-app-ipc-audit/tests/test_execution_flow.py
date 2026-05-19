@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -32,6 +34,7 @@ class ExecutionFlowTest(unittest.TestCase):
         self._set_env("IPC_AUDIT_DATABASE_URL", f"sqlite:///{self.state_root / 'ipc-audit.db'}")
         self._set_env("IPC_AUDIT_STATE_ROOT", str(self.state_root))
         self._set_env("IPC_AUDIT_EXECUTION_MODE", "mock")
+        self._set_env("IPC_AUDIT_LEASE_DURATION_SECONDS", "2")
         self._set_env("IPC_AUDIT_POC_ENABLED", "true")
         self._set_env("IPC_AUDIT_POC_RUNTIME_AVAILABLE", "true")
         self._set_env(
@@ -71,6 +74,7 @@ class ExecutionFlowTest(unittest.TestCase):
         self._clear_env("IPC_AUDIT_DATABASE_URL")
         self._clear_env("IPC_AUDIT_STATE_ROOT")
         self._clear_env("IPC_AUDIT_EXECUTION_MODE")
+        self._clear_env("IPC_AUDIT_LEASE_DURATION_SECONDS")
         self._clear_env("IPC_AUDIT_POC_ENABLED")
         self._clear_env("IPC_AUDIT_POC_RUNTIME_AVAILABLE")
         self._clear_env("IPC_AUDIT_WORKSPACES_JSON")
@@ -146,6 +150,46 @@ class ExecutionFlowTest(unittest.TestCase):
                 ),
                 self.subject,
             )
+
+    def test_slow_provider_resolution_does_not_expire_worker_lease(self) -> None:
+        task = get_task_service().create_task(
+            TaskCreateRequest(
+                title="slow-provider-resolution",
+                workspace_id="oh61-main",
+                pipeline_mode="audit_only",
+                input_ref=InputRef(kind="custom_project", project_path="foundation/demo/service"),
+            ),
+            self.subject,
+        )
+        attempt_id = get_task_service().claim_next_attempt("tester-worker")
+        self.assertIsNotNone(attempt_id)
+
+        execution_service = get_execution_service()
+        original_attach = execution_service._attach_provider_runtime
+        recovered: dict[str, int] = {}
+
+        def slow_attach_provider_runtime(context: dict[str, object]) -> None:
+            time.sleep(2.5)
+            original_attach(context)
+
+        def recover_after_lease_window() -> None:
+            time.sleep(2.3)
+            recovered["count"] = get_task_service().recover_expired_attempts()
+
+        execution_service._attach_provider_runtime = slow_attach_provider_runtime
+        recovery_thread = threading.Thread(target=recover_after_lease_window, daemon=True)
+        recovery_thread.start()
+        try:
+            execution_service.run_attempt(str(attempt_id))
+        finally:
+            execution_service._attach_provider_runtime = original_attach
+            recovery_thread.join(timeout=5)
+
+        detail = get_task_service().get_task(task.task_id)
+        attempt = get_task_service().get_attempt(task.task_id, str(detail.latest_attempt_id))
+        self.assertEqual(recovered.get("count"), 0)
+        self.assertEqual(detail.status, "succeeded")
+        self.assertEqual(attempt.status, "succeeded")
 
     @staticmethod
     def _set_env(key: str, value: str) -> None:

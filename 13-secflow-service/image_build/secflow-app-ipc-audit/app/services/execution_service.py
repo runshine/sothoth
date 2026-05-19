@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import logging
+import threading
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -25,54 +27,94 @@ logger = logging.getLogger(__name__)
 class ExecutionService:
     def run_attempt(self, attempt_id: str) -> None:
         context = self._load_context(attempt_id)
-        try:
-            self._attach_provider_runtime(context)
-            if str(context["pipeline_mode"]) == "custom_graph":
-                graph_result = self._run_custom_graph(context)
-                if graph_result.overall_status == "cancelled":
+        with self._attempt_heartbeat_guard(attempt_id):
+            try:
+                self._attach_provider_runtime(context)
+                if str(context["pipeline_mode"]) == "custom_graph":
+                    graph_result = self._run_custom_graph(context)
+                    if graph_result.overall_status == "cancelled":
+                        raise CancelledError("task cancelled")
+                    if graph_result.overall_status == "timed_out":
+                        raise TimedOutError(graph_result.overall_message)
+                    if graph_result.overall_status == "failed":
+                        raise StageFailedError("custom_graph", graph_result.overall_message)
+                    if graph_result.overall_status == "partial_success":
+                        self._complete_attempt(
+                            str(context["task_id"]),
+                            attempt_id,
+                            task_status="partial_success",
+                            attempt_status="partial_success",
+                            message=graph_result.overall_message,
+                        )
+                        return
+                    self._complete_attempt(
+                        str(context["task_id"]),
+                        attempt_id,
+                        task_status="succeeded",
+                        attempt_status="succeeded",
+                        message=graph_result.overall_message,
+                    )
+                    return
+
+                audit_report_path: Path | None = None
+                start_stage = str(context["effective_config"].get("start_stage") or "audit")
+
+                if start_stage == "audit":
+                    audit_result = self._run_stage(context, "audit")
+                    audit_report_path = audit_result.output_path
+                    if audit_result.status == "cancelled":
+                        raise CancelledError("task cancelled")
+                    if audit_result.status == "timed_out":
+                        raise TimedOutError(audit_result.message)
+                    if audit_result.status != "succeeded":
+                        raise StageFailedError(audit_result.stage_name, audit_result.message)
+                else:
+                    self._mark_stage_skipped(context, "audit", "retry starts from poc")
+                    audit_report_path = self._resolve_source_audit_report(context)
+
+                if self._is_cancel_requested(str(context["task_id"]), attempt_id):
                     raise CancelledError("task cancelled")
-                if graph_result.overall_status == "timed_out":
-                    raise TimedOutError(graph_result.overall_message)
-                if graph_result.overall_status == "failed":
-                    raise StageFailedError("custom_graph", graph_result.overall_message)
-                if graph_result.overall_status == "partial_success":
+
+                if str(context["pipeline_mode"]) == "audit_only":
+                    self._mark_stage_skipped(context, "poc", "pipeline does not include poc")
+                    self._complete_attempt(
+                        str(context["task_id"]),
+                        attempt_id,
+                        task_status="succeeded",
+                        attempt_status="succeeded",
+                        message="task completed",
+                    )
+                    return
+
+                if not self._poc_available():
+                    self._mark_stage_skipped(context, "poc", "poc disabled")
+                    self._complete_attempt(
+                        str(context["task_id"]),
+                        attempt_id,
+                        task_status="succeeded",
+                        attempt_status="succeeded",
+                        message="task completed",
+                    )
+                    return
+
+                if audit_report_path is None:
+                    raise RuntimeError("audit report path unavailable for poc stage")
+
+                poc_result = self._run_stage(context, "poc", source_audit_report=audit_report_path)
+                if poc_result.status == "cancelled":
+                    raise CancelledError("task cancelled")
+                if poc_result.status == "timed_out":
+                    raise TimedOutError(poc_result.message)
+                if poc_result.status != "succeeded":
                     self._complete_attempt(
                         str(context["task_id"]),
                         attempt_id,
                         task_status="partial_success",
                         attempt_status="partial_success",
-                        message=graph_result.overall_message,
+                        message=poc_result.message,
                     )
                     return
-                self._complete_attempt(
-                    str(context["task_id"]),
-                    attempt_id,
-                    task_status="succeeded",
-                    attempt_status="succeeded",
-                    message=graph_result.overall_message,
-                )
-                return
-            audit_report_path: Path | None = None
-            start_stage = str(context["effective_config"].get("start_stage") or "audit")
 
-            if start_stage == "audit":
-                audit_result = self._run_stage(context, "audit")
-                audit_report_path = audit_result.output_path
-                if audit_result.status == "cancelled":
-                    raise CancelledError("task cancelled")
-                if audit_result.status == "timed_out":
-                    raise TimedOutError(audit_result.message)
-                if audit_result.status != "succeeded":
-                    raise StageFailedError(audit_result.stage_name, audit_result.message)
-            else:
-                self._mark_stage_skipped(context, "audit", "retry starts from poc")
-                audit_report_path = self._resolve_source_audit_report(context)
-
-            if self._is_cancel_requested(str(context["task_id"]), attempt_id):
-                raise CancelledError("task cancelled")
-
-            if str(context["pipeline_mode"]) == "audit_only":
-                self._mark_stage_skipped(context, "poc", "pipeline does not include poc")
                 self._complete_attempt(
                     str(context["task_id"]),
                     attempt_id,
@@ -80,60 +122,38 @@ class ExecutionService:
                     attempt_status="succeeded",
                     message="task completed",
                 )
-                return
-
-            if not self._poc_available():
-                self._mark_stage_skipped(context, "poc", "poc disabled")
-                self._complete_attempt(
-                    str(context["task_id"]),
-                    attempt_id,
-                    task_status="succeeded",
-                    attempt_status="succeeded",
-                    message="task completed",
-                )
-                return
-
-            if audit_report_path is None:
-                raise RuntimeError("audit report path unavailable for poc stage")
-
-            poc_result = self._run_stage(context, "poc", source_audit_report=audit_report_path)
-            if poc_result.status == "cancelled":
-                raise CancelledError("task cancelled")
-            if poc_result.status == "timed_out":
-                raise TimedOutError(poc_result.message)
-            if poc_result.status != "succeeded":
-                self._complete_attempt(
-                    str(context["task_id"]),
-                    attempt_id,
-                    task_status="partial_success",
-                    attempt_status="partial_success",
-                    message=poc_result.message,
-                )
-                return
-
-            self._complete_attempt(
-                str(context["task_id"]),
-                attempt_id,
-                task_status="succeeded",
-                attempt_status="succeeded",
-                message="task completed",
-            )
-        except CancelledError as exc:
-            self._cancel_attempt(str(context["task_id"]), attempt_id, str(exc))
-        except TimedOutError as exc:
-            logger.warning("attempt %s timed out: %s", attempt_id, exc)
-            self._timeout_attempt(str(context["task_id"]), attempt_id, str(exc))
-        except StageFailedError as exc:
-            logger.warning("attempt %s stage %s failed: %s", attempt_id, exc.stage_name, exc.message)
-            self._fail_attempt(str(context["task_id"]), attempt_id, exc.message)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("attempt %s failed: %s", attempt_id, exc)
-            self._fail_attempt(str(context["task_id"]), attempt_id, str(exc))
-        finally:
-            try:
-                self._write_runtime_manifest(context)
+            except CancelledError as exc:
+                self._cancel_attempt(str(context["task_id"]), attempt_id, str(exc))
+            except TimedOutError as exc:
+                logger.warning("attempt %s timed out: %s", attempt_id, exc)
+                self._timeout_attempt(str(context["task_id"]), attempt_id, str(exc))
+            except StageFailedError as exc:
+                logger.warning("attempt %s stage %s failed: %s", attempt_id, exc.stage_name, exc.message)
+                self._fail_attempt(str(context["task_id"]), attempt_id, exc.message)
             except Exception as exc:  # noqa: BLE001
-                logger.exception("failed to write runtime manifest for %s: %s", attempt_id, exc)
+                logger.exception("attempt %s failed: %s", attempt_id, exc)
+                self._fail_attempt(str(context["task_id"]), attempt_id, str(exc))
+            finally:
+                try:
+                    self._write_runtime_manifest(context)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("failed to write runtime manifest for %s: %s", attempt_id, exc)
+
+    @contextmanager
+    def _attempt_heartbeat_guard(self, attempt_id: str):
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._heartbeat_loop,
+            args=(attempt_id, stop_event),
+            name=f"ipc-audit-heartbeat-{attempt_id[:12]}",
+            daemon=True,
+        )
+        thread.start()
+        try:
+            yield
+        finally:
+            stop_event.set()
+            thread.join(timeout=2)
 
     def _run_stage(
         self,
@@ -767,6 +787,16 @@ class ExecutionService:
             )
             conn.commit()
 
+    def _heartbeat_loop(self, attempt_id: str, stop_event: threading.Event) -> None:
+        interval = self._heartbeat_guard_interval_seconds()
+        while not stop_event.wait(timeout=0):
+            try:
+                self._heartbeat(attempt_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("failed to heartbeat attempt %s: %s", attempt_id, exc)
+            if stop_event.wait(timeout=interval):
+                return
+
     def _heartbeat(self, attempt_id: str) -> None:
         now = utc_now_z()
         lease = self._future_time(get_config().execution.lease_duration_seconds)
@@ -776,9 +806,17 @@ class ExecutionService:
                 update ipc_audit_task_attempts
                 set heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
                 where attempt_id = ?
+                  and status in ('claimed', 'running', 'cancel_requested')
                 """,
                 (now, lease, now, attempt_id),
             )
+
+    @staticmethod
+    def _heartbeat_guard_interval_seconds() -> float:
+        cfg = get_config().execution
+        lease_seconds = max(float(cfg.lease_duration_seconds), 1.0)
+        configured_heartbeat = max(float(cfg.heartbeat_interval_seconds), 1.0)
+        return min(configured_heartbeat, max(1.0, lease_seconds / 3.0))
 
     def _load_context(self, attempt_id: str) -> dict[str, object]:
         with get_database().connect() as conn:
