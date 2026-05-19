@@ -11013,6 +11013,15 @@ class TaskManager:
                         status = "failed"
             elif retrying and self._has_retryable_downstream_task(item):
                 created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=None)
+                item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+                session.commit()
+                status, payload = await self._poll_until_terminal(
+                    lambda: get_dataflow_analyse_client().get_task(item.downstream_task_id),
+                    success_statuses={"passed", "success"},
+                    failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
+                    task=task,
+                    item=item,
+                )
             else:
                 created = await get_dataflow_analyse_client().create_task(
                     task.project_id,
