@@ -39,6 +39,28 @@ def _config(**overrides):
 
 
 class PiClusterTests(unittest.TestCase):
+    def test_cluster_snapshot_uses_global_queue_count_without_double_counting(self):
+        snapshot = pi_cluster.PiClusterSnapshot(workers=[
+            pi_cluster.PiWorkerSnapshot(
+                worker_id="pi-1",
+                url="http://pi-1:8000",
+                healthy=True,
+                max_concurrent_jobs=3,
+                running_jobs=1,
+                queued_jobs=4,
+            ),
+            pi_cluster.PiWorkerSnapshot(
+                worker_id="pi-2",
+                url="http://pi-2:8000",
+                healthy=True,
+                max_concurrent_jobs=3,
+                running_jobs=2,
+                queued_jobs=4,
+            ),
+        ])
+
+        self.assertEqual(4, snapshot.queued_jobs)
+
     def test_discover_worker_urls_prefers_k8s_headless_results(self):
         async def _run():
             with (

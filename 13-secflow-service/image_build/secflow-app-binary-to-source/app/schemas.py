@@ -466,6 +466,70 @@ class B2SArtifactContentResponse(BaseModel):
     next_offset: Optional[int] = None
 
 
+class B2SCacheSummary(BaseModel):
+    visible_entries: int = 0
+    current_project_entries: int = 0
+    fast_entries: int = 0
+    deep_entries: int = 0
+    total_hit_count: int = 0
+    latest_hit_at: Optional[str] = None
+
+
+class B2SCacheEntry(BaseModel):
+    cache_key: str
+    status: str
+    mode: str
+    elf_basename: Optional[str] = None
+    source_project_id: Optional[str] = None
+    source_task_id: Optional[str] = None
+    source_item_id: Optional[str] = None
+    file_sha256: str
+    file_size: int = 0
+    analysis_signature: Optional[str] = None
+    hit_count: int = 0
+    last_hit_at: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    canonical_output_dir: Optional[str] = None
+    canonical_input_path: Optional[str] = None
+    cache_dir_exists: bool = False
+    ready_marker_exists: bool = False
+    manifest_exists: bool = False
+    output_dir_exists: bool = False
+
+
+class B2SCacheListResponse(BaseModel):
+    total: int = 0
+    items: list[B2SCacheEntry] = Field(default_factory=list)
+    summary: B2SCacheSummary = Field(default_factory=B2SCacheSummary)
+
+
+class B2SCacheDetailResponse(B2SCacheEntry):
+    generated_files: list[str] = Field(default_factory=list)
+    source_metadata: dict[str, Any] = Field(default_factory=dict)
+    manifest: Optional[dict[str, Any]] = None
+    manifest_parse_error: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class B2SCacheDeleteResponse(BaseModel):
+    status: str
+    cache_key: str
+    deleted: bool = False
+    message: Optional[str] = None
+
+
+class B2SCacheBatchDeleteRequest(BaseModel):
+    cache_keys: list[str] = Field(min_length=1)
+
+
+class B2SCacheBatchDeleteResponse(BaseModel):
+    status: str
+    deleted_count: int = 0
+    failed_count: int = 0
+    results: list[B2SCacheDeleteResponse] = Field(default_factory=list)
+
+
 class TaskListResponse(BaseModel):
     total: int
     items: list[TaskResponse]

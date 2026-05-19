@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from sqlalchemy import case, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -34,6 +35,14 @@ class CacheLookupResult:
     hit: bool
     cache_key: str | None = None
     miss_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class CacheDeleteResult:
+    cache_key: str
+    deleted: bool
+    status: str
+    message: str | None = None
 
 
 class B2SCacheService:
@@ -75,6 +84,13 @@ class B2SCacheService:
     def canonical_output_dir(self, cache_key: str) -> Path:
         return self.canonical_dir(cache_key) / "output"
 
+    @staticmethod
+    def cache_mode_from_key(cache_key: str) -> str:
+        key = str(cache_key or "")
+        if key.endswith("_deep"):
+            return "deep"
+        return "fast" if key.endswith("_fast") else "unknown"
+
     def lookup_ready_cache(self, db: Session, cache_key: str) -> B2SAnalysisCache | None:
         self._validate_cache_key(cache_key)
         row = db.query(B2SAnalysisCache).filter(
@@ -87,6 +103,128 @@ class B2SCacheService:
         if not output_dir.is_dir() or not (output_dir.parent / "READY").is_file():
             return None
         return row
+
+    def list_cache_entries(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        limit: int = 100,
+        offset: int = 0,
+        include_all_projects: bool = False,
+        mode: str | None = None,
+        status: str | None = "ready",
+        cache_key: str | None = None,
+        elf_basename: str | None = None,
+        source_task_id: str | None = None,
+        source_item_id: str | None = None,
+        has_hits: str | None = None,
+    ) -> dict[str, Any]:
+        query = self._apply_cache_list_filters(
+            db.query(B2SAnalysisCache),
+            project_id=project_id,
+            include_all_projects=include_all_projects,
+            mode=mode,
+            status=status,
+            cache_key=cache_key,
+            elf_basename=elf_basename,
+            source_task_id=source_task_id,
+            source_item_id=source_item_id,
+            has_hits=has_hits,
+        )
+        total = query.count()
+        paged_rows = (
+            query.order_by(B2SAnalysisCache.last_hit_at.desc(), B2SAnalysisCache.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        return {
+            "total": total,
+            "items": [self._serialize_cache_entry(row) for row in paged_rows],
+            "summary": self._build_summary(
+                db,
+                project_id=project_id,
+                include_all_projects=include_all_projects,
+                mode=mode,
+                status=status,
+                cache_key=cache_key,
+                elf_basename=elf_basename,
+                source_task_id=source_task_id,
+                source_item_id=source_item_id,
+                has_hits=has_hits,
+            ),
+        }
+
+    def get_cache_entry_detail(self, db: Session, cache_key: str) -> dict[str, Any] | None:
+        self._validate_cache_key(cache_key)
+        row = db.query(B2SAnalysisCache).filter(B2SAnalysisCache.cache_key == cache_key).first()
+        if not row:
+            return None
+        payload = self._serialize_cache_entry(row)
+        payload["generated_files"] = self._loads(row.generated_files_json, [])
+        metadata = self._loads(row.metadata_json, {})
+        payload["metadata"] = metadata if isinstance(metadata, dict) else {}
+        source_metadata = payload["metadata"].get("source_metadata") if isinstance(payload["metadata"], dict) else {}
+        payload["source_metadata"] = source_metadata if isinstance(source_metadata, dict) else {}
+        manifest_data, manifest_error = self._read_manifest(row)
+        payload["manifest"] = manifest_data
+        payload["manifest_parse_error"] = manifest_error
+        return payload
+
+    def delete_cache_entry(self, db: Session, cache_key: str) -> CacheDeleteResult:
+        self._validate_cache_key(cache_key)
+        row = db.query(B2SAnalysisCache).filter(B2SAnalysisCache.cache_key == cache_key).first()
+        if not row:
+            return CacheDeleteResult(cache_key=cache_key, deleted=False, status="not_found", message="缓存条目不存在")
+        if str(row.status or "") != "ready":
+            return CacheDeleteResult(cache_key=cache_key, deleted=False, status="invalid_status", message="仅允许删除 ready 状态的缓存条目")
+
+        output_dir = Path(str(row.canonical_output_dir or "")).resolve()
+        cache_dir = output_dir.parent
+        try:
+            self._ensure_path_within_cache_root(cache_dir)
+        except ValueError as exc:
+            return CacheDeleteResult(cache_key=cache_key, deleted=False, status="invalid_path", message=str(exc))
+
+        message = "缓存目录和数据库记录已删除"
+        try:
+            if cache_dir.exists():
+                if not cache_dir.is_dir():
+                    return CacheDeleteResult(cache_key=cache_key, deleted=False, status="invalid_path", message="缓存目录路径不是目录")
+                shutil.rmtree(cache_dir)
+            else:
+                message = "缓存目录缺失，已清理孤儿数据库记录"
+            db.delete(row)
+            db.commit()
+            return CacheDeleteResult(cache_key=cache_key, deleted=True, status="deleted", message=message)
+        except Exception as exc:
+            db.rollback()
+            return CacheDeleteResult(cache_key=cache_key, deleted=False, status="delete_failed", message=str(exc))
+
+    def batch_delete_cache_entries(self, db: Session, cache_keys: list[str]) -> dict[str, Any]:
+        results: list[CacheDeleteResult] = []
+        for cache_key in cache_keys:
+            try:
+                results.append(self.delete_cache_entry(db, cache_key))
+            except ValueError as exc:
+                results.append(CacheDeleteResult(cache_key=cache_key, deleted=False, status="invalid_key", message=str(exc)))
+        deleted_count = sum(1 for item in results if item.deleted)
+        failed_count = len(results) - deleted_count
+        return {
+            "status": "ok" if failed_count == 0 else "partial_success",
+            "deleted_count": deleted_count,
+            "failed_count": failed_count,
+            "results": [
+                {
+                    "status": item.status,
+                    "cache_key": item.cache_key,
+                    "deleted": item.deleted,
+                    "message": item.message,
+                }
+                for item in results
+            ],
+        }
 
     def prepare_cache_metadata(self, item: B2STaskItem, input_path: Path) -> dict[str, Any]:
         digest = self.compute_file_digest(input_path)
@@ -313,6 +451,135 @@ class B2SCacheService:
             "created_at": isoformat_local(now_local()),
         }
         (canonical_dir / "manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _serialize_cache_entry(self, row: B2SAnalysisCache) -> dict[str, Any]:
+        output_dir = Path(str(row.canonical_output_dir or "")).resolve()
+        cache_dir = output_dir.parent
+        ready_marker = cache_dir / "READY"
+        manifest_path = cache_dir / "manifest.json"
+        return {
+            "cache_key": str(row.cache_key or ""),
+            "status": str(row.status or ""),
+            "mode": self.cache_mode_from_key(str(row.cache_key or "")),
+            "elf_basename": row.elf_basename,
+            "source_project_id": row.source_project_id,
+            "source_task_id": row.source_task_id,
+            "source_item_id": row.source_item_id,
+            "file_sha256": str(row.file_sha256 or ""),
+            "file_size": int(row.file_size or 0),
+            "analysis_signature": row.analysis_signature,
+            "hit_count": int(row.hit_count or 0),
+            "last_hit_at": isoformat_local(row.last_hit_at) if row.last_hit_at else None,
+            "created_at": isoformat_local(row.created_at) if row.created_at else None,
+            "updated_at": isoformat_local(row.updated_at) if row.updated_at else None,
+            "canonical_output_dir": str(row.canonical_output_dir or ""),
+            "canonical_input_path": row.canonical_input_path,
+            "cache_dir_exists": cache_dir.is_dir(),
+            "ready_marker_exists": ready_marker.is_file(),
+            "manifest_exists": manifest_path.is_file(),
+            "output_dir_exists": output_dir.is_dir(),
+        }
+
+    def _build_summary(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        include_all_projects: bool,
+        mode: str | None,
+        status: str | None,
+        cache_key: str | None,
+        elf_basename: str | None,
+        source_task_id: str | None,
+        source_item_id: str | None,
+        has_hits: str | None,
+    ) -> dict[str, Any]:
+        summary_query = self._apply_cache_list_filters(
+            db.query(
+                func.count(B2SAnalysisCache.id),
+                func.sum(case((B2SAnalysisCache.source_project_id == project_id, 1), else_=0)),
+                func.sum(case((B2SAnalysisCache.cache_key.like("%_fast"), 1), else_=0)),
+                func.sum(case((B2SAnalysisCache.cache_key.like("%_deep"), 1), else_=0)),
+                func.sum(func.coalesce(B2SAnalysisCache.hit_count, 0)),
+                func.max(B2SAnalysisCache.last_hit_at),
+            ),
+            project_id=project_id,
+            include_all_projects=include_all_projects,
+            mode=mode,
+            status=status,
+            cache_key=cache_key,
+            elf_basename=elf_basename,
+            source_task_id=source_task_id,
+            source_item_id=source_item_id,
+            has_hits=has_hits,
+        )
+        visible_entries, current_project_entries, fast_entries, deep_entries, total_hit_count, latest_hit = (
+            summary_query.one()
+        )
+        return {
+            "visible_entries": int(visible_entries or 0),
+            "current_project_entries": int(current_project_entries or 0),
+            "fast_entries": int(fast_entries or 0),
+            "deep_entries": int(deep_entries or 0),
+            "total_hit_count": int(total_hit_count or 0),
+            "latest_hit_at": isoformat_local(latest_hit) if latest_hit else None,
+        }
+
+    def _apply_cache_list_filters(
+        self,
+        query,
+        *,
+        project_id: str,
+        include_all_projects: bool,
+        mode: str | None,
+        status: str | None,
+        cache_key: str | None,
+        elf_basename: str | None,
+        source_task_id: str | None,
+        source_item_id: str | None,
+        has_hits: str | None,
+    ):
+        if not include_all_projects:
+            query = query.filter(B2SAnalysisCache.source_project_id == project_id)
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status and normalized_status != "all":
+            query = query.filter(B2SAnalysisCache.status == normalized_status)
+        normalized_mode = str(mode or "").strip().lower()
+        if normalized_mode == "fast":
+            query = query.filter(B2SAnalysisCache.cache_key.like("%_fast"))
+        elif normalized_mode == "deep":
+            query = query.filter(B2SAnalysisCache.cache_key.like("%_deep"))
+        if cache_key:
+            query = query.filter(B2SAnalysisCache.cache_key.contains(str(cache_key).strip()))
+        if elf_basename:
+            query = query.filter(B2SAnalysisCache.elf_basename.contains(str(elf_basename).strip()))
+        if source_task_id:
+            query = query.filter(B2SAnalysisCache.source_task_id.contains(str(source_task_id).strip()))
+        if source_item_id:
+            query = query.filter(B2SAnalysisCache.source_item_id.contains(str(source_item_id).strip()))
+        normalized_hits = str(has_hits or "").strip().lower()
+        if normalized_hits == "hit":
+            query = query.filter(B2SAnalysisCache.hit_count > 0)
+        elif normalized_hits in {"never", "no_hit"}:
+            query = query.filter(or_(B2SAnalysisCache.hit_count == 0, B2SAnalysisCache.hit_count.is_(None)))
+        return query
+
+    def _read_manifest(self, row: B2SAnalysisCache) -> tuple[dict[str, Any] | None, str | None]:
+        manifest_path = Path(str(row.canonical_output_dir or "")).resolve().parent / "manifest.json"
+        if not manifest_path.is_file():
+            return None, None
+        try:
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+            return raw if isinstance(raw, dict) else {"value": raw}, None
+        except Exception as exc:
+            return None, str(exc)
+
+    def _ensure_path_within_cache_root(self, path: Path) -> None:
+        root = self.cache_root().resolve()
+        target = path.resolve()
+        if target == root or root in target.parents:
+            return
+        raise ValueError("缓存目录不在 cache.root_dir 下，拒绝删除")
 
     @staticmethod
     def _loads(raw: str | None, default: Any) -> Any:

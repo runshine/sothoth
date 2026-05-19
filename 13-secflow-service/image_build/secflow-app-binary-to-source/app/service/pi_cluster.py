@@ -46,7 +46,7 @@ class PiClusterSnapshot:
 
     @property
     def queued_jobs(self) -> int:
-        return sum(worker.queued_jobs for worker in self.workers if worker.healthy)
+        return max((worker.queued_jobs for worker in self.workers if worker.healthy), default=0)
 
     @property
     def available_slots(self) -> int:

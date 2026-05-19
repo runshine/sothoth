@@ -8,13 +8,15 @@ from fastapi import APIRouter, Depends, Header, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.exception import UnauthorizedError
+from app.exception import NotFoundError, UnauthorizedError, ValidationError
 from app.model import B2STask, get_db
-from app.schemas import ActionResponse, B2SArtifactContentResponse, B2SServiceConfig, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, SessionFileResponse, SessionIndexResponse, TaskBatchDeleteItemResult, TaskBatchDeleteRequest, TaskBatchDeleteResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskListResponse, TaskObservabilitySummary, TaskPrepareResponse, TaskRelationshipResponse, TaskResponse, TaskResultSummary, TokenUser
+from app.schemas import ActionResponse, B2SArtifactContentResponse, B2SCacheBatchDeleteRequest, B2SCacheBatchDeleteResponse, B2SCacheDeleteResponse, B2SCacheDetailResponse, B2SCacheListResponse, B2SServiceConfig, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, SessionFileResponse, SessionIndexResponse, TaskBatchDeleteItemResult, TaskBatchDeleteRequest, TaskBatchDeleteResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskListResponse, TaskObservabilitySummary, TaskPrepareResponse, TaskRelationshipResponse, TaskResponse, TaskResultSummary, TokenUser
 from app.service.auth import get_auth_service
+from app.service.cache_service import get_cache_service
 from app.service.configcenter import get_configcenter_client
 from app.service.config_service import get_config_service
 from app.service.project import get_project_service
+from app.service.pi_cluster import get_pi_cluster_monitor
 from app.service.security import validate_project_id
 from app.service.task_service import (
     build_task_detail,
@@ -46,6 +48,28 @@ router = APIRouter(prefix="/api/app/binary-to-source", tags=["binary-to-source"]
 
 class ConfigSaveRequest(BaseModel):
     config: dict
+
+
+class PiWorkerCapacityResponse(BaseModel):
+    worker_id: str
+    url: str
+    healthy: bool
+    max_concurrent_jobs: int
+    running_jobs: int = 0
+    queued_jobs: int = 0
+    available_slots: int = 0
+    source: str = "capacity"
+    error: str | None = None
+
+
+class PiClusterCapacityResponse(BaseModel):
+    worker_count: int = 0
+    total_capacity: int = 0
+    running_jobs: int = 0
+    queued_jobs: int = 0
+    available_slots: int = 0
+    updated_at: str | None = None
+    workers: list[PiWorkerCapacityResponse]
 
 
 def _provider_summary(payload: dict) -> dict:
@@ -140,6 +164,91 @@ async def save_b2s_config(
     return B2SServiceConfig(**saved)
 
 
+@router.get("/projects/{project_id}/cache", response_model=B2SCacheListResponse)
+async def list_b2s_cache(
+    project_id: str,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    include_all_projects: bool = Query(False),
+    mode: Optional[str] = Query(None),
+    status: Optional[str] = Query("ready"),
+    cache_key: Optional[str] = Query(None),
+    elf_basename: Optional[str] = Query(None),
+    source_task_id: Optional[str] = Query(None),
+    source_item_id: Optional[str] = Query(None),
+    has_hits: Optional[str] = Query(None),
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    payload = get_cache_service().list_cache_entries(
+        db,
+        project_id=project_id,
+        limit=limit,
+        offset=offset,
+        include_all_projects=include_all_projects,
+        mode=mode,
+        status=status,
+        cache_key=cache_key,
+        elf_basename=elf_basename,
+        source_task_id=source_task_id,
+        source_item_id=source_item_id,
+        has_hits=has_hits,
+    )
+    return B2SCacheListResponse(**payload)
+
+
+@router.get("/projects/{project_id}/cache/{cache_key}", response_model=B2SCacheDetailResponse)
+async def get_b2s_cache_detail(
+    project_id: str,
+    cache_key: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    del project_id
+    try:
+        payload = get_cache_service().get_cache_entry_detail(db, cache_key)
+    except ValueError as exc:
+        raise ValidationError(str(exc))
+    if not payload:
+        raise NotFoundError("缓存条目不存在")
+    return B2SCacheDetailResponse(**payload)
+
+
+@router.delete("/projects/{project_id}/cache/{cache_key}", response_model=B2SCacheDeleteResponse)
+async def delete_b2s_cache_entry(
+    project_id: str,
+    cache_key: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    del project_id
+    try:
+        result = get_cache_service().delete_cache_entry(db, cache_key)
+    except ValueError as exc:
+        raise ValidationError(str(exc))
+    return B2SCacheDeleteResponse(
+        status=result.status,
+        cache_key=result.cache_key,
+        deleted=result.deleted,
+        message=result.message,
+    )
+
+
+@router.post("/projects/{project_id}/cache/batch-delete", response_model=B2SCacheBatchDeleteResponse)
+async def batch_delete_b2s_cache_entries(
+    project_id: str,
+    payload: B2SCacheBatchDeleteRequest,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    del project_id
+    try:
+        result = get_cache_service().batch_delete_cache_entries(db, payload.cache_keys)
+    except ValueError as exc:
+        raise ValidationError(str(exc))
+    return B2SCacheBatchDeleteResponse(**result)
+
+
 @router.get("/projects/{project_id}/tasks", response_model=TaskListResponse)
 async def list_tasks(
     project_id: str,
@@ -165,6 +274,38 @@ async def list_tasks(
             db.refresh(task)
     items = [build_task_response(db, task) for task in tasks]
     return TaskListResponse(total=total, items=items)
+
+
+@router.get("/projects/{project_id}/pi-cluster", response_model=PiClusterCapacityResponse)
+async def get_pi_cluster_capacity(
+    project_id: str,
+    _: TokenUser = Depends(get_current_context),
+):
+    del project_id
+    snapshot = await get_pi_cluster_monitor().refresh()
+    workers = [
+        PiWorkerCapacityResponse(
+            worker_id=worker.worker_id,
+            url=worker.url,
+            healthy=worker.healthy,
+            max_concurrent_jobs=worker.max_concurrent_jobs,
+            running_jobs=worker.running_jobs,
+            queued_jobs=worker.queued_jobs,
+            available_slots=max(0, worker.max_concurrent_jobs - worker.running_jobs) if worker.healthy else 0,
+            source=worker.source,
+            error=worker.error,
+        )
+        for worker in snapshot.workers
+    ]
+    return PiClusterCapacityResponse(
+        worker_count=snapshot.worker_count,
+        total_capacity=snapshot.total_capacity,
+        running_jobs=snapshot.running_jobs,
+        queued_jobs=snapshot.queued_jobs,
+        available_slots=snapshot.available_slots,
+        updated_at=snapshot.updated_at,
+        workers=workers,
+    )
 
 
 @router.post("/projects/{project_id}/tasks/prepare", response_model=TaskPrepareResponse)
