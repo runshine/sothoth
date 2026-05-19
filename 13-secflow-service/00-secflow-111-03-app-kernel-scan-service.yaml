@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: secflow-app-kernel-scan
+  namespace: secflow-ns
+spec:
+  type: ClusterIP
+  selector:
+    name: secflow-app-kernel-scan
+  ports:
+    - port: 80
+      targetPort: http
+      protocol: TCP
+      name: secflow-app-kernel-scan
