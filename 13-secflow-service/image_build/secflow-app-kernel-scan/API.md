@@ -13,31 +13,23 @@ Base URL: `/api/app/kernel-scan`
 
 ### POST /devices/adb/connect — 连接远程 ADB 设备
 
-前端提供远端 ADB server IP 或 `ip:port`，后端先在容器服务进程内设置 `ADB_SERVER_SOCKET=tcp:<ip>:<port>`；如果不带端口，默认补 `:15037`。接口执行 `adb devices`，并在发现 `device` 状态设备且 `adb -s <serial> shell true` 成功后，才把同一个 `export ADB_SERVER_SOCKET=...` 写入 `~/.bashrc`。接口响应只返回 `adb devices` 命令结果。
+接口不再接收 IP 参数，前端发空请求即可。后端固定使用 `172.31.30.81:15037`，在容器服务进程内设置 `ADB_SERVER_SOCKET=tcp:172.31.30.81:15037`。接口执行 `adb devices`，并在发现 `device` 状态设备且 `adb -s <serial> shell true` 成功后，才把同一个 `export ADB_SERVER_SOCKET=...` 写入 `~/.bashrc`。接口响应只返回 `adb devices` 命令结果。
 
 **Request Body:**
 
 ```json
-{
-  "ip": "192.168.1.10"
-}
+{}
 ```
 
 **Response (200):**
 
 ```json
 {
-  "command": ["ADB_SERVER_SOCKET=tcp:192.168.1.10:15037", "adb", "devices"],
+  "command": ["ADB_SERVER_SOCKET=tcp:172.31.30.81:15037", "adb", "devices"],
   "return_code": 0,
   "output": "List of devices attached\nemulator-5554\tdevice\n"
 }
 ```
-
-**错误码 / 失败返回：**
-
-| Status | 说明 |
-|--------|------|
-| 422 | `ip` 为空 |
 
 `adb devices` 执行失败、adb 不存在或超时时仍返回同结构响应，前端通过 `return_code` 和 `output` 判断命令结果；超时或未启动时 `return_code` 为 `null`。
 

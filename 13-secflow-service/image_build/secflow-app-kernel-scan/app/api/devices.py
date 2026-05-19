@@ -1,19 +1,17 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import APIRouter
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.services.adb_service import run_adb_devices
 
 router = APIRouter()
 
+DEFAULT_ADB_SERVER_IP = "172.31.30.81"
+
 
 class AdbConnectRequest(BaseModel):
-    ip: str = Field(
-        ...,
-        description="远端 ADB server IP 或 `ip:port`。不带端口时默认使用 5037。",
-        examples=["192.168.1.10"],
-    )
+    model_config = ConfigDict(extra="forbid")
 
 
 class AdbDevicesResponse(BaseModel):
@@ -27,18 +25,14 @@ class AdbDevicesResponse(BaseModel):
     response_model=AdbDevicesResponse,
     summary="连接远程 ADB 设备",
     description=(
-        "前端提供远端 ADB server IP 或 `ip:port`，后端在容器服务进程内设置 "
-        "`ADB_SERVER_SOCKET=tcp:<ip>:<port>`（默认 5037），后续 adb/PoC 子进程会继承该值。"
+        "接口不再接收 IP 参数；后端固定连接 `172.31.30.81:15037`，并在容器服务进程内设置 "
+        "`ADB_SERVER_SOCKET=tcp:172.31.30.81:15037`，后续 adb/PoC 子进程会继承该值。"
         "仅当 `adb devices` 中存在 `device` 状态设备且 `adb shell true` 成功时，才写入 `~/.bashrc`。"
         "接口只执行并返回 `adb devices` 命令结果。"
     ),
 )
-def connect_adb(req: AdbConnectRequest):
-    ip = req.ip.strip()
-    if not ip:
-        raise HTTPException(422, "ip is required")
-
-    result = run_adb_devices(ip)
+def connect_adb(req: AdbConnectRequest | None = None):
+    result = run_adb_devices(DEFAULT_ADB_SERVER_IP)
     response = AdbDevicesResponse(
         command=result.command,
         return_code=result.return_code,

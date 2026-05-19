@@ -48,10 +48,10 @@ class TaskCreateRequest(BaseModel):
     device_ip: str | None = Field(
         None,
         description=(
-            "兼容旧字段。PoC stage 不再要求前端传该字段；远端 ADB server 由 `~/.bashrc` 中的 "
-            "`ADB_SERVER_SOCKET` 提供。"
+            "兼容旧字段。PoC stage 不再要求前端传该字段；`/devices/adb/connect` 固定连接 "
+            "`172.31.30.81:15037`，并由 `~/.bashrc` 中的 `ADB_SERVER_SOCKET` 提供给 PoC。"
         ),
-        examples=["192.168.1.10"],
+        examples=[None],
     )
     entrylist: str | None = Field(
         None,

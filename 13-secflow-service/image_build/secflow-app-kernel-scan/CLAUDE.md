@@ -87,7 +87,7 @@ queued → running → succeeded / partial_success / failed
 | Method | Path | 关键点 |
 |--------|------|--------|
 | GET | /workspace/browse | 前端文件浏览器；`path` 为绝对路径（默认 `/workspace`），返回值也是绝对路径，可直接回传 |
-| POST | /devices/adb/connect | 前端传远端 ADB server `ip` 或 `ip:port`，后端设置 `ADB_SERVER_SOCKET=tcp:<ip>:15037`，执行 `adb devices`，且只有 `adb shell` 成功后才写入 `~/.bashrc`；接口只返回 `adb devices` 命令结果，显式端口则使用该端口 |
+| POST | /devices/adb/connect | 前端发空请求即可，后端固定设置 `ADB_SERVER_SOCKET=tcp:172.31.30.81:15037`，执行 `adb devices`，且只有 `adb shell` 成功后才写入 `~/.bashrc`；接口只返回 `adb devices` 命令结果 |
 | POST | /tasks | `pipeline_mode` / `kernel_dir` / `entrylist` / `report_dir` / 三个 `*_threads` 可选覆盖；PoC 设备来自 `~/.bashrc` |
 | GET | /tasks | 分页 |
 | GET | /tasks/{id} | 附带 `stage_runs` |

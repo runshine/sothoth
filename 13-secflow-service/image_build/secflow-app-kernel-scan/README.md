@@ -105,17 +105,17 @@ local scheduler state directory.
 
 ## ADB Device Setup
 
-PoC tasks no longer accept ADB IP in `/tasks`. Configure the remote ADB server first:
+PoC tasks no longer accept ADB IP in `/tasks`. Configure the fixed remote ADB server first:
 
 ```bash
 curl -X POST http://localhost:18081/api/app/kernel-scan/devices/adb/connect \
   -H 'Content-Type: application/json' \
-  -d '{"ip":"192.168.1.10"}'
+  -d '{}'
 ```
 
 The endpoint:
 
-- normalizes the value to `ADB_SERVER_SOCKET=tcp:<ip>:<port>`; default port is `15037`
+- accepts an empty request body and always uses `ADB_SERVER_SOCKET=tcp:172.31.30.81:15037`
 - runs `adb devices`
 - verifies that `adb shell true` works on an online device
 - writes `export ADB_SERVER_SOCKET=...` into `~/.bashrc`

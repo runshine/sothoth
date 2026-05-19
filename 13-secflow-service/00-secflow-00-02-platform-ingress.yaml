@@ -149,6 +149,13 @@ spec:
                 name: secflow-app-code-server
                 port:
                   number: 80
+          - path: /api/app/kernel-scan
+            pathType: Prefix
+            backend:
+              service:
+                name: secflow-app-kernel-scan
+                port:
+                  number: 80
   tls:
     - hosts:
         - secflow.ai.icsl.huawei.com
