@@ -144,3 +144,4 @@ jobs:
             # --amend runshine0819/secflow-app-entry-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
             # --amend runshine0819/secflow-app-entry-analyse:arm64-${{ needs.prepare.outputs.date_tag }} || true
           # docker manifest push runshine0819/secflow-app-entry-analyse:${{ needs.prepare.outputs.date_tag }} || true
+
