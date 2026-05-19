@@ -28,11 +28,19 @@ jobs:
       contents: read
       packages: write
     steps:
-      - name: Checkout (with submodules)
+      - name: Checkout sothoth (no submodules)
         uses: actions/checkout@v4
         with:
-          submodules: true
-          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          submodules: false
+
+      - name: Checkout entry_analyse submodule content
+        run: |
+          SUBMODULE_SHA=$(git ls-tree HEAD 13-secflow-service/image_build/secflow-app-entry-analyse | awk '{print $3}')
+          echo "Submodule SHA: $SUBMODULE_SHA"
+          git clone https://github.com/ict-bin/entry_analyse.git \
+            13-secflow-service/image_build/secflow-app-entry-analyse
+          cd 13-secflow-service/image_build/secflow-app-entry-analyse
+          git checkout $SUBMODULE_SHA
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
