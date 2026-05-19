@@ -135,6 +135,10 @@ def get_max_retries_reached_action() -> str:
 
 
 def get_reuse_agent_between_rounds(role: str | None = None) -> bool:
+    # Reviewers must evaluate the current output from a clean context each round.
+    # Reusing reviewer sessions can carry a previous fail verdict into later rounds.
+    if str(role or "").strip() == "reviewer":
+        return False
     try:
         from app.model import get_config_value, get_db_session
 

@@ -52,14 +52,18 @@ from app.services.observability import generate_metrics_payload, metrics_content
 from app.services.task_events import list_task_events
 from app.services.task_manager import (
     cancel_task,
+    cancel_evolution_job,
     confirm_evolution_tool_replacement,
+    delete_evolution_job,
     delete_tasks,
     get_evolution_job,
     get_evolution_log,
     get_evolution_sessions,
+    list_all_evolution_jobs,
     list_evolution_jobs,
     list_evolution_rounds,
     request_task_result_cache_refresh,
+    retry_evolution_job,
     retry_task,
     submit_evolution_job,
     submit_unpack_task,
@@ -323,6 +327,8 @@ def _get_task_progress(task_id: str) -> dict:
     stage4_path = _round_log_path(run_dir, 0, "fallback.json")
     stage5_path = _round_log_path(run_dir, 0, "stage5_skill_generate.json")
     cleaner_path = _round_log_path(run_dir, 0, "cleaner_messages.json")
+    cleaner_log_path = _round_log_path(run_dir, 0, "cleaner.log")
+    cleaner_artifact_path = cleaner_path if cleaner_path.exists() else cleaner_log_path
     tool_reviewer_messages = _round_log_path(run_dir, 0, "reviewer_messages.json")
     round_dirs = _llm_round_dirs(run_dir)
     executor_logs = [path / "executor_messages.json" for path in round_dirs if (path / "executor_messages.json").exists()]
@@ -445,9 +451,9 @@ def _get_task_progress(task_id: str) -> dict:
         phases[2]["detail"] = "预处理已直接完成解包，跳过"
         phases[3]["status"] = "skipped"
         phases[3]["detail"] = "预处理已直接完成解包，跳过"
-        phases[4]["status"] = "success" if cleaner_path.exists() else ("running" if task_status == "running" else "pending")
+        phases[4]["status"] = "success" if cleaner_artifact_path.exists() else ("running" if task_status == "running" else "pending")
         phases[4]["detail"] = "正在收尾清理输出目录" if phases[4]["status"] == "running" else "清理已完成"
-        phases[4]["updated_at"] = _mtime_iso_text(cleaner_path)
+        phases[4]["updated_at"] = _mtime_iso_text(cleaner_artifact_path)
     else:
         if stage2_path.exists():
             stage2_data = _read_json_file(stage2_path)
@@ -555,7 +561,10 @@ def _get_task_progress(task_id: str) -> dict:
                 if review_status == "success":
                     review_detail = "最终轮评审已通过"
                 elif review_status == "failed":
-                    review_detail = "最终轮评审未通过，任务失败"
+                    if task_result == "max_retries_reached" and task_status == "success":
+                        review_detail = "最终轮评审未通过，达到最大轮次后按配置判定通过"
+                    else:
+                        review_detail = "最终轮评审未通过，任务失败"
             elif has_tool_review:
                 if task_current_stage == "review":
                     review_status = "running"
@@ -580,10 +589,13 @@ def _get_task_progress(task_id: str) -> dict:
 
         cleanup_status = "pending"
         cleanup_detail = None
-        if cleaner_path.exists():
+        if cleaner_artifact_path.exists():
             cleanup_status = "success"
             cleanup_detail = "清理已完成"
-        elif task_current_stage == "cleanup":
+        elif task_status == "success":
+            cleanup_status = "success"
+            cleanup_detail = "清理已完成"
+        elif task_current_stage == "cleanup" and task_status == "running":
             cleanup_status = "running"
             cleanup_detail = "正在清理中间产物和重复文件"
         elif task_status in {"failed", "cancelled"}:
@@ -594,7 +606,7 @@ def _get_task_progress(task_id: str) -> dict:
             "LLM 清理",
             cleanup_status,
             cleanup_detail,
-            _mtime_iso_text(cleaner_path),
+            _mtime_iso_text(cleaner_artifact_path),
         )
 
     current_phase = None
@@ -2209,6 +2221,29 @@ async def create_task_evolution_legacy(
 
 
 @router.get(
+    "/api/app/firmware-unpacker/projects/{project_id}/evolution-jobs",
+    response_model=EvolutionJobListResponse,
+)
+async def list_project_evolution_jobs(
+    project_id: str,
+    status: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    return list_all_evolution_jobs(
+        project_id=project_id,
+        status=str(status or "").strip() or None,
+        search=str(search or "").strip() or None,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get(
     "/api/app/firmware-unpacker/tasks/{task_id}/evolution-jobs",
     response_model=EvolutionJobListResponse,
 )
@@ -2220,6 +2255,42 @@ async def list_task_evolution_jobs_legacy(
     await _get_task_with_access(task_id, token)
     items = list_evolution_jobs(task_id)
     return {"total": len(items), "items": items}
+
+
+@router.get(
+    "/api/app/firmware-unpacker/evolution-jobs",
+    response_model=EvolutionJobListResponse,
+)
+async def list_evolution_jobs_legacy(
+    project_id: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    normalized_project_id = _normalize_project_id(project_id)
+    if normalized_project_id:
+        await ensure_project_access(normalized_project_id, token)
+    payload = list_all_evolution_jobs(
+        project_id=normalized_project_id,
+        status=str(status or "").strip() or None,
+        search=str(search or "").strip() or None,
+        limit=limit,
+        offset=offset,
+    )
+    if not normalized_project_id:
+        filtered_items = []
+        for item in payload.get("items", []):
+            task = item.get("source_task") if isinstance(item, dict) else None
+            task_project_id = _normalize_project_id((task or {}).get("project_id") if isinstance(task, dict) else item.get("project_id"))
+            if task_project_id:
+                await ensure_project_access(task_project_id, token)
+            filtered_items.append(item)
+        payload["items"] = filtered_items
+        payload["total"] = len(filtered_items)
+    return payload
 
 
 @router.get(
@@ -2295,6 +2366,63 @@ async def get_evolution_logs_legacy(
     if payload is None:
         raise NotFoundError("进化任务日志", job_id)
     return payload
+
+
+@router.post(
+    "/api/app/firmware-unpacker/evolution-jobs/{job_id}/cancel",
+    response_model=ActionResponse,
+)
+async def cancel_evolution_job_legacy(
+    job_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    job = get_evolution_job(job_id)
+    if job is None:
+        raise NotFoundError("进化任务", job_id)
+    await _get_task_with_access(str(job.get("task_id") or ""), token)
+    try:
+        return cancel_evolution_job(job_id)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+
+
+@router.post(
+    "/api/app/firmware-unpacker/evolution-jobs/{job_id}/retry",
+    response_model=ActionResponse,
+)
+async def retry_evolution_job_legacy(
+    job_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    job = get_evolution_job(job_id)
+    if job is None:
+        raise NotFoundError("进化任务", job_id)
+    await _get_task_with_access(str(job.get("task_id") or ""), token)
+    try:
+        return retry_evolution_job(job_id)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+
+
+@router.delete(
+    "/api/app/firmware-unpacker/evolution-jobs/{job_id}",
+    response_model=ActionResponse,
+)
+async def delete_evolution_job_legacy(
+    job_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    job = get_evolution_job(job_id)
+    if job is None:
+        raise NotFoundError("进化任务", job_id)
+    await _get_task_with_access(str(job.get("task_id") or ""), token)
+    try:
+        return delete_evolution_job(job_id)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
 
 
 @router.post(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel
 
@@ -417,6 +417,7 @@ class EvolutionJobResponse(BaseModel):
     run_root: Optional[str] = None
     session_root: Optional[str] = None
     task_output_path: Optional[str] = None
+    source_task: Optional[dict[str, Any]] = None
     round_count: int = 0
     rounds: List[EvolutionRoundResponse] = []
 

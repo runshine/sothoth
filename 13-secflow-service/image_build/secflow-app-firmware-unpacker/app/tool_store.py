@@ -32,6 +32,7 @@ def _comment_header_lines(tool_path: Path) -> list[str]:
     lines: list[str] = []
     try:
         with tool_path.open("r", encoding="utf-8") as handle:
+            in_docstring_header = False
             for raw_line in handle:
                 line = raw_line.rstrip("\n")
                 stripped = line.strip()
@@ -41,6 +42,11 @@ def _comment_header_lines(tool_path: Path) -> list[str]:
                     continue
                 if stripped.startswith("#!"):
                     continue
+                if stripped in {'"""', "'''"} and not lines:
+                    in_docstring_header = True
+                    continue
+                if in_docstring_header and stripped in {'"""', "'''"}:
+                    break
                 if not stripped.startswith("#"):
                     if lines:
                         break

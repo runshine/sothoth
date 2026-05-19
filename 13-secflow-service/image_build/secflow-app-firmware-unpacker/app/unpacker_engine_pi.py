@@ -287,12 +287,28 @@ class PiRpcClient:
         self.proc.stdin.write(json.dumps(command) + "\n")
         self.proc.stdin.flush()
 
+    def _process_exit_error(self, stop_type: str) -> RuntimeError:
+        returncode = self.proc.poll()
+        stderr_text = ""
+        if returncode is not None:
+            try:
+                if self.proc.stderr is not None:
+                    stderr_text = self.proc.stderr.read().strip()
+            except Exception:
+                stderr_text = ""
+        detail = f"pi process exited before emitting {stop_type}"
+        if returncode is not None:
+            detail += f" (exit_code={returncode})"
+        if stderr_text:
+            detail += f": {stderr_text[-4000:]}"
+        return RuntimeError(detail)
+
     def _read_until(self, stop_type: str):
         assert self.proc.stdout is not None
         while True:
             line = self.proc.stdout.readline()
             if not line:
-                raise RuntimeError(f"pi process exited before emitting {stop_type}")
+                raise self._process_exit_error(stop_type)
             line = line.strip()
             if not line:
                 continue
@@ -336,9 +352,11 @@ class PiRpcClient:
     ) -> str:
         self._mark_session_active()
         timer: threading.Timer | None = None
+        timed_out = threading.Event()
         try:
             if timeout_seconds is not None and float(timeout_seconds) > 0:
                 def _kill_for_timeout() -> None:
+                    timed_out.set()
                     try:
                         if self.proc.poll() is None:
                             pgid = os.getpgid(self.proc.pid)
@@ -396,7 +414,7 @@ class PiRpcClient:
 
             return self.extract_assistant_text(events)
         except RuntimeError:
-            if self.proc.poll() is not None and timeout_seconds is not None and float(timeout_seconds) > 0:
+            if timed_out.is_set() and self.proc.poll() is not None and timeout_seconds is not None and float(timeout_seconds) > 0:
                 raise RuntimeError(f"Prompt timed out after {float(timeout_seconds):.0f}s")
             raise
         finally:

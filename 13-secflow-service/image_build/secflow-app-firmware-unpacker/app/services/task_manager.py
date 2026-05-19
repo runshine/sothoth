@@ -66,8 +66,10 @@ STAGE_LABELS = {
     "llm_unpack": "LLM 解包",
     "review": "LLM 评审",
     "cleanup": "清理收尾",
+    "completed": "已完成",
     "evolution": "手动进化",
     "tool_execute": "工具执行",
+    "evolution_execute": "工具进化执行",
     "evolve": "工具进化",
 }
 SKILL_GENERATION_PENDING = "pending"
@@ -854,12 +856,15 @@ def _manifest_path(input_dir: Path) -> Path:
 
 def _write_task_manifest(input_dir: Path, source_firmware_path: str, output_path: str, run_path: str) -> Path:
     manifest_path = _manifest_path(input_dir)
+    tool_log_path = str(Path(run_path) / "tool.log") if run_path else ""
     manifest_path.write_text(
         json.dumps(
             {
                 "input_path": source_firmware_path,
                 "output_path": output_path,
-                "log_path": run_path,
+                "run_path": run_path,
+                "log_path": tool_log_path,
+                "log_file_path": tool_log_path,
             },
             ensure_ascii=False,
             indent=2,
@@ -2645,7 +2650,7 @@ def submit_evolution_job(task_id: str, *, created_by: str = "task_manager") -> d
             status=EVOLUTION_PENDING,
             current_round=0,
             max_rounds=EVOLUTION_MAX_ROUNDS,
-            current_stage="tool_execute",
+            current_stage="evolution_execute",
             created_by=created_by,
         )
         db.add(job)
@@ -2695,6 +2700,58 @@ def list_evolution_jobs(task_id: str) -> list[dict[str, Any]]:
         db.close()
 
 
+def list_all_evolution_jobs(
+    *,
+    project_id: str | None = None,
+    status: str | None = None,
+    search: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict[str, Any]:
+    from sqlalchemy import or_
+
+    from app.model import FirmwareEvolutionJob, UnpackTask, get_db_session
+
+    db = get_db_session()
+    try:
+        query = db.query(FirmwareEvolutionJob, UnpackTask).join(UnpackTask, FirmwareEvolutionJob.task_id == UnpackTask.id)
+        if project_id:
+            query = query.filter(FirmwareEvolutionJob.project_id == project_id)
+        if status:
+            query = query.filter(FirmwareEvolutionJob.status == status)
+        keyword = str(search or "").strip()
+        if keyword:
+            like = f"%{keyword}%"
+            query = query.filter(
+                or_(
+                    FirmwareEvolutionJob.id.like(like),
+                    FirmwareEvolutionJob.task_id.like(like),
+                    UnpackTask.firmware_path.like(like),
+                    UnpackTask.output_path.like(like),
+                )
+            )
+        total = query.count()
+        rows = (
+            query.order_by(FirmwareEvolutionJob.created_at.desc())
+            .offset(max(0, int(offset or 0)))
+            .limit(max(1, min(500, int(limit or 100))))
+            .all()
+        )
+        items = []
+        for job, task in rows:
+            output_path = str(task.output_path or "").strip() if task is not None else ""
+            payload = _enrich_evolution_job_payload(
+                job.to_dict(),
+                task=task,
+                job_root=_derive_evolution_job_root(output_path, job.id) if output_path else None,
+            )
+            payload["source_task"] = task.to_dict() if task is not None else None
+            items.append(payload)
+        return {"total": total, "items": items}
+    finally:
+        db.close()
+
+
 def get_evolution_job(job_id: str) -> dict[str, Any] | None:
     from app.model import FirmwareEvolutionJob, FirmwareEvolutionRound, UnpackTask, get_db_session
 
@@ -2727,6 +2784,134 @@ def get_evolution_job(job_id: str) -> dict[str, Any] | None:
             }
         )
         return payload
+    finally:
+        db.close()
+
+
+def cancel_evolution_job(job_id: str) -> dict[str, Any]:
+    from app.model import FirmwareEvolutionJob, UnpackTask, get_db_session
+
+    db = get_db_session()
+    try:
+        job = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
+        if job is None:
+            raise ValueError("进化任务不存在")
+        task = db.query(UnpackTask).filter(UnpackTask.id == job.task_id).first()
+        if str(job.status or "") not in {EVOLUTION_PENDING, EVOLUTION_RUNNING}:
+            return {"message": "进化任务已处于终态", "task_id": job.task_id}
+        job.status = EVOLUTION_CANCELLED
+        job.lease_expires_at = None
+        job.completed_at = now_local()
+        job.error_message = "用户手动结束进化任务"
+        if task is not None:
+            task.latest_evolution_job_id = job.id
+            task.latest_evolution_status = EVOLUTION_CANCELLED
+            task.latest_evolution_completed_at = job.completed_at
+            _record_task_event_from_row(
+                task,
+                event_type="evolution_cancelled",
+                summary="手动进化任务已结束",
+                stage_key="evolution",
+                status=task.status,
+                detail={"job_id": job.id},
+                created_by="task_manager",
+            )
+        db.commit()
+        if task is not None:
+            _write_task_result_cache(task.id)
+        return {"message": "进化任务结束请求已提交", "task_id": job.task_id}
+    finally:
+        db.close()
+
+
+def retry_evolution_job(job_id: str) -> dict[str, Any]:
+    from app.model import FirmwareEvolutionJob, FirmwareEvolutionRound, UnpackTask, get_db_session
+
+    db = get_db_session()
+    try:
+        job = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
+        if job is None:
+            raise ValueError("进化任务不存在")
+        if str(job.status or "") in {EVOLUTION_PENDING, EVOLUTION_RUNNING}:
+            raise ValueError("运行中的进化任务不能重试")
+        task = db.query(UnpackTask).filter(UnpackTask.id == job.task_id).first()
+        if task is None:
+            raise ValueError("进化任务对应主任务不存在")
+        existing = (
+            db.query(FirmwareEvolutionJob)
+            .filter(
+                FirmwareEvolutionJob.task_id == job.task_id,
+                FirmwareEvolutionJob.id != job.id,
+                FirmwareEvolutionJob.status.in_([EVOLUTION_PENDING, EVOLUTION_RUNNING]),
+            )
+            .first()
+        )
+        if existing is not None:
+            raise ValueError("当前主任务已有运行中的进化任务")
+        db.query(FirmwareEvolutionRound).filter(FirmwareEvolutionRound.job_id == job.id).delete()
+        source_tool_path = _resolve_evolution_source_tool_path(task, job)
+        job.status = EVOLUTION_PENDING
+        job.current_round = 0
+        job.current_stage = "evolution_execute"
+        job.owner_id = None
+        job.lease_expires_at = None
+        job.error_message = None
+        job.started_at = None
+        job.completed_at = None
+        job.final_skill_path = None
+        job.replaced_skill_path = None
+        job.review_passed = False
+        task.latest_evolution_job_id = job.id
+        task.latest_evolution_status = EVOLUTION_PENDING
+        task.latest_evolution_started_at = None
+        task.latest_evolution_completed_at = None
+        task.latest_evolution_final_skill_path = None
+        db.commit()
+        _record_task_event_from_row(
+            task,
+            event_type="evolution_retry_queued",
+            summary="手动进化任务已重新排队",
+            stage_key="evolution",
+            status=task.status,
+            detail={"job_id": job.id},
+            created_by="task_manager",
+        )
+        _write_task_result_cache(task.id)
+        return {"message": "进化任务重试已受理", "task_id": job.task_id}
+    finally:
+        db.close()
+
+
+def delete_evolution_job(job_id: str) -> dict[str, Any]:
+    from app.model import FirmwareEvolutionJob, FirmwareEvolutionRound, UnpackTask, get_db_session
+
+    db = get_db_session()
+    try:
+        job = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
+        if job is None:
+            raise ValueError("进化任务不存在")
+        if str(job.status or "") in {EVOLUTION_PENDING, EVOLUTION_RUNNING}:
+            raise ValueError("运行中的进化任务不能删除，请先结束")
+        task_id = job.task_id
+        task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+        db.query(FirmwareEvolutionRound).filter(FirmwareEvolutionRound.job_id == job.id).delete()
+        db.delete(job)
+        latest = (
+            db.query(FirmwareEvolutionJob)
+            .filter(FirmwareEvolutionJob.task_id == task_id, FirmwareEvolutionJob.id != job_id)
+            .order_by(FirmwareEvolutionJob.created_at.desc())
+            .first()
+        )
+        if task is not None:
+            task.latest_evolution_job_id = latest.id if latest is not None else None
+            task.latest_evolution_status = latest.status if latest is not None else None
+            task.latest_evolution_started_at = latest.started_at if latest is not None else None
+            task.latest_evolution_completed_at = latest.completed_at if latest is not None else None
+            task.latest_evolution_final_skill_path = latest.final_skill_path if latest is not None else None
+        db.commit()
+        if task is not None:
+            _write_task_result_cache(task.id)
+        return {"message": "进化任务已删除", "task_id": task_id}
     finally:
         db.close()
 
@@ -2769,6 +2954,7 @@ def get_evolution_log(job_id: str, round_id: int, role: str) -> dict[str, Any] |
     from app.unpacker_engine_logs import read_text_tail
 
     role_file_map = {
+        "evolution_executor": ["evolution_executor_transcript.log", "evolution_executor_messages.json"],
         "tool_executor": ["tool_executor_transcript.log", "tool_executor_messages.json"],
         "reviewer": ["reviewer_transcript.log", "reviewer_messages.json"],
         "evolver": ["evolver_transcript.log", "evolver_messages.json"],
@@ -2982,6 +3168,17 @@ def process_evolution_jobs(limit: int = 1) -> int:
             current = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
             task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
             if current is None or task is None:
+                processed += 1
+                continue
+            if str(current.status or "") == EVOLUTION_CANCELLED:
+                current.owner_id = owner_id
+                current.lease_expires_at = None
+                current.completed_at = current.completed_at or now_local()
+                task.latest_evolution_job_id = job_id
+                task.latest_evolution_status = EVOLUTION_CANCELLED
+                task.latest_evolution_completed_at = current.completed_at
+                db.commit()
+                _write_task_result_cache(task_id)
                 processed += 1
                 continue
             db.query(FirmwareEvolutionRound).filter(FirmwareEvolutionRound.job_id == job_id).delete()
@@ -3288,14 +3485,17 @@ def _update_task_result(task_id: str, result: dict, *, run_token: Optional[str] 
             summary = f"任务已取消：{result.get('message') or 'Task was cancelled'}"
         elif result_status == "success":
             task.status = TaskStatus.SUCCESS.value
+            task.current_stage = "completed"
             event_type = "task_succeeded"
             summary = "任务执行成功"
         elif result_status == "max_retries_reached" and get_max_retries_reached_action() == "success":
             task.status = TaskStatus.SUCCESS.value
+            task.current_stage = "completed"
             event_type = "task_succeeded"
             summary = "任务达到最大重试次数，按配置判定为通过"
         else:
             task.status = TaskStatus.FAILED.value
+            task.current_stage = "failed"
             event_type = "task_failed"
             summary = f"任务失败：{result.get('message') or result_status or 'unknown'}"
 

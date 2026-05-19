@@ -427,7 +427,7 @@ DEFAULT_CONFIGS = [
     ("max_retries_reached_action", "success", "string", "达到最大重试轮数后默认动作：success=按通过处理，failed=按失败处理"),
     ("reuse_agent_between_rounds", "true", "bool", "兼容旧版的全局轮次间智能体复用策略；新版本请改用各角色独立配置"),
     ("reuse_agent_between_rounds_executor", "true", "bool", "不同重试轮次之间是否复用固件解包通用执行器智能体会话：true=复用，false=每轮新建"),
-    ("reuse_agent_between_rounds_reviewer", "true", "bool", "不同重试轮次之间是否复用固件解包评审器智能体会话：true=复用，false=每轮新建"),
+    ("reuse_agent_between_rounds_reviewer", "false", "bool", "不同重试轮次之间是否复用固件解包评审器智能体会话：true=复用，false=每轮新建；建议保持 false，避免上一轮失败结论污染下一轮评审"),
     ("reuse_agent_between_rounds_cleaner", "true", "bool", "是否复用固件解包清理器智能体会话：true=复用，false=每次新建"),
     ("reuse_agent_between_rounds_skill_author", "true", "bool", "是否复用固件解包技能生成器智能体会话：true=复用，false=每次新建"),
     ("reuse_agent_between_rounds_skill_executor", "true", "bool", "是否复用固件解包命中技能执行器智能体会话：true=复用，false=每次新建"),
