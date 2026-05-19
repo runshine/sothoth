@@ -54,11 +54,25 @@ verify_sha1() {
     echo "[tools] warning: neither sha1sum nor shasum is available; skipping SHA1 check" >&2
 }
 
-download_if_missing "$PLATFORM_TOOLS_URL" "$PLATFORM_TOOLS_ZIP" "Android platform-tools"
-download_if_missing "$NDK_URL" "$NDK_ZIP" "Android NDK r29"
+download_with_validation() {
+    local url="$1"
+    local dest="$2"
+    local name="$3"
+    local expected_sha1="${4:-}"
 
-if [ -n "$NDK_SHA1" ]; then
-    verify_sha1 "$NDK_SHA1" "$NDK_ZIP"
-fi
+    download_if_missing "$url" "$dest" "$name"
+
+    if [ -n "$expected_sha1" ]; then
+        if ! verify_sha1 "$expected_sha1" "$dest"; then
+            echo "[tools] cached ${name} failed checksum, re-downloading: ${dest}" >&2
+            rm -f "$dest"
+            download_if_missing "$url" "$dest" "$name"
+            verify_sha1 "$expected_sha1" "$dest"
+        fi
+    fi
+}
+
+download_with_validation "$PLATFORM_TOOLS_URL" "$PLATFORM_TOOLS_ZIP" "Android platform-tools"
+download_with_validation "$NDK_URL" "$NDK_ZIP" "Android NDK r29" "$NDK_SHA1"
 
 echo "[tools] cache ready: ${TOOLS_DIR}"

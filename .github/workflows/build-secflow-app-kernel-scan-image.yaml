@@ -33,9 +33,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: 13-secflow-service/image_build/secflow-app-kernel-scan/tools
-          key: secflow-app-kernel-scan-android-tools-v1-${{ hashFiles('13-secflow-service/image_build/secflow-app-kernel-scan/scripts/prepare-android-tools.sh') }}
+          key: secflow-app-kernel-scan-android-tools-v2-${{ hashFiles('13-secflow-service/image_build/secflow-app-kernel-scan/scripts/prepare-android-tools.sh') }}
           restore-keys: |
-            secflow-app-kernel-scan-android-tools-v1-
+            secflow-app-kernel-scan-android-tools-v2-
 
       - name: Prepare Android tool cache
         run: |
