@@ -1168,15 +1168,15 @@ def recompute_task_status(db: Session, task: B2STask) -> None:
     items = query_items(db, task.id)
     counts = count_status(items)
     total = len(items)
+    terminal_total = (
+        counts["success_items"]
+        + counts["failed_items"]
+        + counts["cancelled_items"]
+        + counts["partial_items"]
+    )
+    active_total = counts["queued_items"] + counts["running_items"]
+    waiting_total = counts["pending_items"]
     if total == 0:
-        task.status = "pending"
-    elif counts["failed_items"] > 0 and counts["failed_items"] + counts["cancelled_items"] + counts["success_items"] == total:
-        task.status = "partial" if counts["success_items"] > 0 else "failed"
-    elif counts["running_items"] > 0:
-        task.status = "running"
-    elif counts["queued_items"] > 0 or counts["pending_items"] > 0:
-        # 前端执行队列页面按 task.status=pending 查询等待/排队任务；
-        # item 级别仍保留 queued_items 统计。
         task.status = "pending"
     elif counts["success_items"] == total:
         task.status = "completed"
@@ -1184,6 +1184,16 @@ def recompute_task_status(db: Session, task: B2STask) -> None:
         task.status = "cancelled"
     elif counts["failed_items"] == total:
         task.status = "failed"
+    elif terminal_total == total:
+        task.status = "partial" if counts["success_items"] > 0 or counts["partial_items"] > 0 else "failed"
+    elif active_total > 0:
+        task.status = "running"
+    elif waiting_total == total:
+        task.status = "pending"
+    elif waiting_total > 0 and terminal_total > 0:
+        # Items have already produced terminal results and the task has started,
+        # but there are still undispatched leftovers waiting for capacity.
+        task.status = "running"
     elif counts["success_items"] > 0 and counts["failed_items"] + counts["cancelled_items"] > 0:
         task.status = "partial"
     else:
