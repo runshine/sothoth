@@ -763,6 +763,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
 
 async def sync_task(db: Session, task: B2STask) -> None:
     changed = False
+    previous_status = str(task.status or "")
     items = query_items(db, task.id)
     for item in items:
         observed_pi_job_id = str(item.pi_job_id or "").strip() or None
@@ -874,8 +875,8 @@ async def sync_task(db: Session, task: B2STask) -> None:
             item.finished_at = now_local()
             get_observability().record_item_finished(item)
         changed = True
-    if changed:
-        recompute_task_status(db, task)
+    recompute_task_status(db, task)
+    if changed or str(task.status or "") != previous_status:
         db.commit()
         db.refresh(task)
 

@@ -17,7 +17,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-app-binary-to-source-manager
-        image: ghcr.io/runshine/secflow-app-binary-to-source:20260519-dc49eeb
+        image: ghcr.io/runshine/secflow-app-binary-to-source:20260519-84ccb75
         imagePullPolicy: Always
         ports:
         - containerPort: 8080

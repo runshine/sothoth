@@ -73,3 +73,29 @@ class RecomputeTaskStatusTests(unittest.TestCase):
             task_service.recompute_task_status(db=mock.Mock(), task=task)
 
         self.assertEqual("completed", task.status)
+
+
+class SyncTaskStatusTests(unittest.TestCase):
+    def test_sync_task_recomputes_aggregate_status_even_without_item_changes(self) -> None:
+        task = _task(status="pending")
+        items = [_item(1, "success"), _item(2, "pending")]
+
+        class _FakeDb:
+            def __init__(self) -> None:
+                self.committed = 0
+                self.refreshed = 0
+
+            def commit(self) -> None:
+                self.committed += 1
+
+            def refresh(self, _obj) -> None:
+                self.refreshed += 1
+
+        fake_db = _FakeDb()
+        with mock.patch.object(task_service, "query_items", return_value=items):
+            asyncio_run = __import__("asyncio").run
+            asyncio_run(task_service.sync_task(fake_db, task))
+
+        self.assertEqual("running", task.status)
+        self.assertEqual(1, fake_db.committed)
+        self.assertEqual(1, fake_db.refreshed)
