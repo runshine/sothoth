@@ -222,6 +222,31 @@ class _AsyncDataflowClientStub:
         return {"task_id": "dfa-created"}
 
 
+class _AsyncSystemAnalyseClientStub:
+    def __init__(self, *, listed=None, fetched=None, fail_on_create=False):
+        self.listed = listed or {"items": []}
+        self.fetched = fetched or {}
+        self.fail_on_create = fail_on_create
+        self.created = 0
+
+    async def list_tasks(self, *args, **kwargs):
+        del args, kwargs
+        return self.listed
+
+    async def get_task(self, task_id):
+        return dict(self.fetched.get(task_id) or {"task_id": task_id, "status": "passed"})
+
+    async def create_task(self, *args, **kwargs):
+        del args, kwargs
+        self.created += 1
+        if self.fail_on_create:
+            raise AssertionError("create_task should not be called")
+        return {"task_id": "sat-created"}
+
+    async def get_task_result(self, task_id):
+        return {"task_id": task_id}
+
+
 class TaskManagerTests(unittest.TestCase):
     def setUp(self):
         self.manager = TaskManager()
@@ -6832,6 +6857,20 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.create_calls = 0
                 self.get_calls = 0
+                self.list_calls = 0
+
+            async def list_tasks(self, *args, **kwargs):
+                self.list_calls += 1
+                return {
+                    "items": [
+                        {
+                            "task_id": "sat_existing",
+                            "status": "running",
+                            "parent_stage_item_id": "i1",
+                            "updated_at": "2026-05-19T00:00:00",
+                        }
+                    ]
+                }
 
             async def create_task(self, *args, **kwargs):
                 self.create_calls += 1
@@ -6873,6 +6912,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._is_task_cancelled = original_is_cancelled
 
         self.assertEqual(0, fake_client.create_calls)
+        self.assertEqual(1, fake_client.list_calls)
         self.assertEqual("sat_existing", existing_item.downstream_task_id)
         self.assertEqual("success", result["status"])
 
@@ -7132,6 +7172,35 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(payload)
         self.assertEqual("dfa-passed", payload["task_id"])
         self.assertEqual("dfa-passed", item.downstream_task_id)
+
+    def test_find_reusable_system_analysis_payload_prefers_active_duplicate_task(self):
+        task = BinarySecurityTask(id="t1", project_id="p1")
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_key="fw-1",
+            downstream_service="system_analyse",
+            downstream_task_id="sat-old",
+            status="queued",
+        )
+        client = _AsyncSystemAnalyseClientStub(
+            listed={
+                "items": [
+                    {"task_id": "sat-passed", "status": "passed", "item_key": "fw-1", "updated_at": "2026-05-18T23:32:56"},
+                    {"task_id": "sat-pending", "status": "pending", "item_key": "fw-1", "updated_at": "2026-05-18T23:27:54"},
+                    {"task_id": "sat-running", "status": "running", "parent_stage_item_id": "si1", "updated_at": "2026-05-18T23:34:41"},
+                ]
+            }
+        )
+
+        with patch.object(task_manager_module, "get_system_analyse_client", return_value=client):
+            payload = asyncio.run(self.manager._find_reusable_system_analysis_payload(task, item))
+
+        self.assertIsNotNone(payload)
+        self.assertEqual("sat-running", payload["task_id"])
+        self.assertEqual("sat-running", item.downstream_task_id)
 
     def test_run_dataflow_item_retry_path_polls_after_restart(self):
         task = BinarySecurityTask(id="t1", name="source-task", project_id="p1", workspace_root="/tmp/ws")

@@ -39,6 +39,27 @@ class SystemAnalyseClient(JsonHttpClient):
     async def get_task(self, task_id: str) -> dict:
         return await self.get(f"/tasks/{task_id}")
 
+    async def list_tasks(
+        self,
+        project_id: str,
+        *,
+        parent_task_id: str | None = None,
+        page: int = 1,
+        per_page: int = 100,
+        sort_by: str = "updated_at",
+        sort_order: str = "desc",
+    ) -> dict:
+        params: dict[str, Any] = {
+            "project_id": project_id,
+            "page": page,
+            "per_page": per_page,
+            "sort_by": sort_by,
+            "sort_order": sort_order,
+        }
+        if parent_task_id:
+            params["parent_task_id"] = parent_task_id
+        return await self.get("/tasks", params=params)
+
     async def get_task_result(self, task_id: str) -> dict:
         return await self.get(f"/tasks/{task_id}/result")
 

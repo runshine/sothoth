@@ -8660,6 +8660,48 @@ class TaskManager:
             item.downstream_task_id = selected_task_id
         return selected
 
+    async def _find_reusable_system_analysis_payload(
+        self,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+    ) -> dict[str, Any] | None:
+        item_key = str(item.item_key or "").strip()
+        if not item_key:
+            return None
+        try:
+            listed = await get_system_analyse_client().list_tasks(
+                task.project_id,
+                parent_task_id=task.id,
+                per_page=100,
+                sort_by="updated_at",
+                sort_order="desc",
+            )
+        except Exception:
+            return None
+        rows = listed.get("items") if isinstance(listed, dict) else None
+        if not isinstance(rows, list):
+            return None
+        candidates = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            origin_item_id = str(row.get("parent_stage_item_id") or "").strip()
+            row_item_key = str(row.get("item_key") or row.get("firmware_key") or "").strip()
+            if origin_item_id and origin_item_id == str(item.id or "").strip():
+                candidates.append(row)
+                continue
+            if row_item_key and row_item_key == item_key:
+                candidates.append(row)
+        if not candidates:
+            return None
+        candidates.sort(key=self._sort_downstream_payload_priority)
+        selected = candidates[0]
+        selected_task_id = str(selected.get("task_id") or selected.get("id") or "").strip()
+        current_task_id = str(item.downstream_task_id or "").strip()
+        if selected_task_id and selected_task_id != current_task_id:
+            item.downstream_task_id = selected_task_id
+        return selected
+
     def _stage_retry_support(
         self,
         db: Session,
@@ -9846,8 +9888,43 @@ class TaskManager:
                     item=item,
                 )
             else:
-                if retrying and self._has_retryable_downstream_task(item):
+                reusable_payload = None if retrying else await self._find_reusable_system_analysis_payload(task, item)
+                if reusable_payload is not None:
+                    downstream_status = str(reusable_payload.get("status") or "").lower()
+                    mapped_reusable_status = self._map_downstream_status(downstream_status)
+                    if mapped_reusable_status in {"queued", "running"}:
+                        item.status = mapped_reusable_status
+                        session.commit()
+                        status, payload = await self._poll_until_terminal(
+                            lambda: get_system_analyse_client().get_task(item.downstream_task_id),
+                            success_statuses={"passed", "success"},
+                            failure_statuses={"failed", "error", "cancelled"},
+                            task=task,
+                            item=item,
+                        )
+                    else:
+                        session.commit()
+                        payload = await get_system_analyse_client().get_task(item.downstream_task_id)
+                        downstream_status = str(payload.get("status") or "").lower()
+                        if downstream_status in {"passed", "success"}:
+                            status = "success"
+                        elif downstream_status == "cancelled":
+                            status = "cancelled"
+                        elif downstream_status == "downstream_missing":
+                            status = "downstream_missing"
+                        else:
+                            status = "failed"
+                elif retrying and self._has_retryable_downstream_task(item):
                     created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=None)
+                    item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+                    session.commit()
+                    status, payload = await self._poll_until_terminal(
+                        lambda: get_system_analyse_client().get_task(item.downstream_task_id),
+                        success_statuses={"passed", "success"},
+                        failure_statuses={"failed", "error", "cancelled"},
+                        task=task,
+                        item=item,
+                    )
                 else:
                     created = await get_system_analyse_client().create_task(
                         task.project_id,
@@ -9856,15 +9933,15 @@ class TaskManager:
                         _downstream_origin_payload(task, item),
                         analysis_mode=self._task_type(task),
                     )
-                item.downstream_task_id = created.get("task_id") or item.downstream_task_id
-                session.commit()
-                status, payload = await self._poll_until_terminal(
-                    lambda: get_system_analyse_client().get_task(item.downstream_task_id),
-                    success_statuses={"passed", "success"},
-                    failure_statuses={"failed", "error", "cancelled"},
-                    task=task,
-                    item=item,
-                )
+                    item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+                    session.commit()
+                    status, payload = await self._poll_until_terminal(
+                        lambda: get_system_analyse_client().get_task(item.downstream_task_id),
+                        success_statuses={"passed", "success"},
+                        failure_statuses={"failed", "error", "cancelled"},
+                        task=task,
+                        item=item,
+                    )
             result_payload = {}
             if status == "success":
                 try:
