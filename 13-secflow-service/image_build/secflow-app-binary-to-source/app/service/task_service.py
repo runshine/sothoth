@@ -1191,8 +1191,9 @@ def recompute_task_status(db: Session, task: B2STask) -> None:
     elif waiting_total == total:
         task.status = "pending"
     elif waiting_total > 0 and terminal_total > 0:
-        # Items have already produced terminal results and the task has started,
-        # but there are still undispatched leftovers waiting for capacity.
+        # Once any item has reached a terminal result, the task has already
+        # started even if the remaining items are still waiting in the local
+        # dispatch queue for downstream capacity.
         task.status = "running"
     elif counts["success_items"] > 0 and counts["failed_items"] + counts["cancelled_items"] > 0:
         task.status = "partial"
