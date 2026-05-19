@@ -1,33 +1,7 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: secflow-app-kernel-scan-state-pvc
-  namespace: secflow-ns
-spec:
-  storageClassName: nfs-storage-192.168.13.66
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 20Gi
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: secflow-app-kernel-scan-workspace-pvc
-  namespace: secflow-ns
-spec:
-  storageClassName: nfs-storage-192.168.13.66
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 200Gi
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: secflow-app-kernel-scan-kernel-pvc
+  name: secflow-app-kernel-scan-data-nfs-pvc
   namespace: secflow-ns
 spec:
   storageClassName: nfs-storage-192.168.13.66
@@ -35,4 +9,4 @@ spec:
     - ReadWriteMany
   resources:
     requests:
-      storage: 300Gi
+      storage: 200Gi
