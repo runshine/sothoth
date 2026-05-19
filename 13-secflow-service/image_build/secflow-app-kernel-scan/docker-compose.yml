@@ -8,7 +8,7 @@ services:
         PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/python:3.11-slim}
         ANDROID_PLATFORM_TOOLS_URL: ${ANDROID_PLATFORM_TOOLS_URL:-https://dl.google.com/android/repository/platform-tools-latest-linux.zip}
         ANDROID_NDK_URL: ${ANDROID_NDK_URL:-https://dl.google.com/android/repository/android-ndk-r29-linux.zip}
-        ANDROID_NDK_SHA1: ${ANDROID_NDK_SHA1:-dc5bd963c8fd5ba91762a8a282b39466fb7f6568}
+        ANDROID_NDK_SHA1: ${ANDROID_NDK_SHA1:-}
       platforms:
         - linux/amd64
     platform: linux/amd64

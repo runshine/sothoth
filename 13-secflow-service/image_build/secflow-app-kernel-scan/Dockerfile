@@ -12,7 +12,7 @@ ARG PIP_TRUSTED_HOST=repo.huaweicloud.com
 ARG NPM_REGISTRY_URL=https://repo.huaweicloud.com/repository/npm/
 ARG ANDROID_PLATFORM_TOOLS_URL=https://dl.google.com/android/repository/platform-tools-latest-linux.zip
 ARG ANDROID_NDK_URL=https://dl.google.com/android/repository/android-ndk-r29-linux.zip
-ARG ANDROID_NDK_SHA1=dc5bd963c8fd5ba91762a8a282b39466fb7f6568
+ARG ANDROID_NDK_SHA1=
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
