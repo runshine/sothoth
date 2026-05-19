@@ -409,6 +409,7 @@ def _normalize_pipeline_payload(context: StageContext, payload: dict[str, Any]) 
     if not isinstance(nodes_value, list) or not nodes_value:
         raise ValueError("pipeline.nodes must be a non-empty array")
     normalized_nodes: list[dict[str, Any]] = []
+    default_timeout_seconds = int(get_config().execution.task_timeout_seconds)
     seen_ids: set[str] = set()
     for node in nodes_value:
         if not isinstance(node, dict):
@@ -425,6 +426,7 @@ def _normalize_pipeline_payload(context: StageContext, payload: dict[str, Any]) 
         normalized_node.setdefault("agent", "opencode")
         normalized_node.setdefault("target", {"kind": "local", "cwd": str(context.repo_root)})
         normalized_node.setdefault("tools", "read_write")
+        normalized_node.setdefault("timeout_seconds", default_timeout_seconds)
         normalized_nodes.append(normalized_node)
     normalized_payload = dict(payload)
     normalized_payload.setdefault("working_dir", str(context.repo_root))

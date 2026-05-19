@@ -393,6 +393,10 @@ class AgentFlowCliModeTest(unittest.TestCase):
             attempt.effective_config["materialized_graph_source"]["content"]["nodes"][1]["depends_on"],
             ["stage1"],
         )
+        self.assertEqual(
+            [item["timeout_seconds"] for item in attempt.effective_config["materialized_graph_source"]["content"]["nodes"]],
+            [load_config().execution.task_timeout_seconds, load_config().execution.task_timeout_seconds],
+        )
 
         stage1_content = get_task_service().get_stage_session_file(
             task.task_id,
