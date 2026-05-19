@@ -631,6 +631,23 @@ class ActionResponse(BaseModel):
     message: Optional[str] = None
 
 
+class TaskBatchDeleteRequest(BaseModel):
+    task_ids: list[str] = Field(min_length=1)
+
+
+class TaskBatchDeleteItemResult(BaseModel):
+    task_id: str
+    status: str
+    message: Optional[str] = None
+
+
+class TaskBatchDeleteResponse(BaseModel):
+    status: str
+    deleted_count: int = 0
+    failed_count: int = 0
+    results: list[TaskBatchDeleteItemResult] = Field(default_factory=list)
+
+
 _SCHEMA_TYPES = {
     "Optional": Optional,
     "LlmProviderSummary": LlmProviderSummary,

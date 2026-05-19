@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.exception import UnauthorizedError
 from app.model import B2STask, get_db
-from app.schemas import ActionResponse, B2SArtifactContentResponse, B2SServiceConfig, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, SessionFileResponse, SessionIndexResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskListResponse, TaskObservabilitySummary, TaskPrepareResponse, TaskRelationshipResponse, TaskResponse, TaskResultSummary, TokenUser
+from app.schemas import ActionResponse, B2SArtifactContentResponse, B2SServiceConfig, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, SessionFileResponse, SessionIndexResponse, TaskBatchDeleteItemResult, TaskBatchDeleteRequest, TaskBatchDeleteResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskListResponse, TaskObservabilitySummary, TaskPrepareResponse, TaskRelationshipResponse, TaskResponse, TaskResultSummary, TokenUser
 from app.service.auth import get_auth_service
 from app.service.configcenter import get_configcenter_client
 from app.service.config_service import get_config_service
@@ -349,6 +349,42 @@ async def delete_b2s_task(
     task = get_task_or_404(db, project_id, task_id)
     await delete_task(db, task)
     return ActionResponse(status="ok", task_id=task_id, message="任务及文件已删除")
+
+
+@router.post("/projects/{project_id}/tasks/batch-delete", response_model=TaskBatchDeleteResponse)
+async def batch_delete_b2s_tasks(
+    project_id: str,
+    payload: TaskBatchDeleteRequest,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    results: list[TaskBatchDeleteItemResult] = []
+    seen: set[str] = set()
+    task_ids: list[str] = []
+    for task_id in payload.task_ids:
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        task_ids.append(task_id)
+    for task_id in task_ids:
+        task = db.query(B2STask).filter(B2STask.project_id == project_id, B2STask.id == task_id).first()
+        if not task:
+            results.append(TaskBatchDeleteItemResult(task_id=task_id, status="failed", message="任务不存在"))
+            continue
+        try:
+            await delete_task(db, task)
+            results.append(TaskBatchDeleteItemResult(task_id=task_id, status="ok", message="任务及文件已删除"))
+        except Exception as exc:
+            db.rollback()
+            results.append(TaskBatchDeleteItemResult(task_id=task_id, status="failed", message=str(exc)))
+    deleted_count = sum(1 for item in results if item.status == "ok")
+    failed_count = len(results) - deleted_count
+    return TaskBatchDeleteResponse(
+        status="ok" if failed_count == 0 else "partial",
+        deleted_count=deleted_count,
+        failed_count=failed_count,
+        results=results,
+    )
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/rerun", response_model=ActionResponse)
