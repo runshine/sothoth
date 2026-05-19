@@ -335,14 +335,39 @@ def _record_pi_metadata(item: B2STaskItem, **updates: object) -> None:
 def _record_pi_runtime_metrics(item: B2STaskItem, job: dict) -> bool:
     progress = job.get("progress") if isinstance(job, dict) else None
     metrics = progress.get("runtime_metrics") if isinstance(progress, dict) else None
-    if not isinstance(metrics, dict):
-        return False
     metadata = dict(item.extra_metadata or {})
-    if metadata.get("pi_runtime_metrics") == metrics:
+    if not isinstance(metrics, dict):
+        reason = _pi_runtime_metric_missing_reason(item, job)
+        if metadata.get("pi_runtime_metric_missing_reason") == reason:
+            return False
+        metadata["pi_runtime_metric_missing_reason"] = reason
+        metadata["pi_runtime_metric_last_checked_at"] = isoformat_local(now_local())
+        item.extra_metadata = metadata
+        return False
+    if (
+        metadata.get("pi_runtime_metrics") == metrics
+        and metadata.get("pi_runtime_metric_missing_reason") is None
+    ):
         return False
     metadata["pi_runtime_metrics"] = metrics
+    metadata.pop("pi_runtime_metric_missing_reason", None)
+    metadata["pi_runtime_metric_last_seen_at"] = isoformat_local(now_local())
     item.extra_metadata = metadata
     return True
+
+
+def _pi_runtime_metric_missing_reason(item: B2STaskItem, job: dict | None = None) -> str:
+    status = str((job or {}).get("status") or item.status or "").strip().lower()
+    pi_job_id = str(item.pi_job_id or "").strip()
+    if not pi_job_id:
+        return "pi_job_missing"
+    if status in {"queued", "pending"}:
+        return "queued_or_pending"
+    if status in {"running", "cancelling"} or str(item.status or "").lower() == "running":
+        return "running_not_reported"
+    if item.failure_type == "upstream_lost":
+        return "upstream_missing"
+    return "legacy_or_unavailable"
 
 
 def _merge_item_progress(item: B2STaskItem, **updates: object) -> bool:
@@ -794,12 +819,26 @@ async def sync_task(db: Session, task: B2STask) -> None:
             item.error_reason = "pi-re-agent job id missing; 已回到B2S队列等待重新派发"
             changed = True
             continue
-        if not item.pi_job_id or item.status in TERMINAL:
+        if not item.pi_job_id:
             continue
+        terminal_metrics_backfill_only = item.status in TERMINAL
+        if terminal_metrics_backfill_only:
+            metadata = item.extra_metadata if isinstance(item.extra_metadata, dict) else {}
+            if isinstance(metadata.get("pi_runtime_metrics"), dict):
+                continue
         try:
             job = await get_pi_client(item_pi_worker_url(item)).get_job(item.pi_job_id)
         except UpstreamError as exc:
             if not _sync_observation_is_still_current(db, item, observed_pi_job_id):
+                continue
+            if terminal_metrics_backfill_only:
+                _record_pi_metadata(
+                    item,
+                    pi_runtime_metric_missing_reason="upstream_unreachable",
+                    pi_runtime_metric_last_checked_at=isoformat_local(now_local()),
+                    pi_runtime_metric_last_error=str(exc),
+                )
+                changed = True
                 continue
             # Do not let one stale/unreachable worker make the whole task detail
             # API return 502. Keep the item visible and let users rerun/delete it.
@@ -814,6 +853,18 @@ async def sync_task(db: Session, task: B2STask) -> None:
             changed = True
             continue
         if not _sync_observation_is_still_current(db, item, observed_pi_job_id):
+            continue
+        if terminal_metrics_backfill_only:
+            if job is None:
+                _record_pi_metadata(
+                    item,
+                    pi_runtime_metric_missing_reason="upstream_missing",
+                    pi_runtime_metric_last_checked_at=isoformat_local(now_local()),
+                )
+                changed = True
+                continue
+            if _record_pi_runtime_metrics(item, job):
+                changed = True
             continue
         if job is None:
             recovered = await _recover_missing_pi_job(db, item)
@@ -2484,8 +2535,14 @@ def build_agent_runtime_summary(items: list[B2STaskItem]) -> AgentRuntimeSummary
 def build_business_runtime_metrics_summary(items: list[B2STaskItem]) -> dict[str, Any]:
     available = 0
     missing = 0
+    terminal_available = 0
+    running_available = 0
+    missing_reasons: dict[str, int] = {}
+    status_distribution: dict[str, int] = {}
     phase_totals: dict[str, float] = {}
     phase_counts: dict[str, int] = {}
+    running_phase_totals: dict[str, float] = {}
+    running_phase_counts: dict[str, int] = {}
     artifact_totals: dict[str, float] = {}
     engines: dict[str, int] = {}
     batch_count = passed_batches = failed_batches = 0
@@ -2499,34 +2556,55 @@ def build_business_runtime_metrics_summary(items: list[B2STaskItem]) -> dict[str
         metrics = metadata.get("pi_runtime_metrics")
         if not isinstance(metrics, dict):
             missing += 1
+            reason = str(metadata.get("pi_runtime_metric_missing_reason") or _pi_runtime_metric_missing_reason(item))
+            missing_reasons[reason] = missing_reasons.get(reason, 0) + 1
             continue
         available += 1
         engine = str(metrics.get("engine") or "unknown")
         engines[engine] = engines.get(engine, 0) + 1
+        metric_status = str(metrics.get("status") or item.status or "unknown").strip().lower()
+        if metric_status == "completed":
+            metric_status = "success"
+        if metric_status not in TERMINAL and str(item.status or "").lower() in TERMINAL:
+            metric_status = str(item.status or "unknown").lower()
+        status_distribution[metric_status] = status_distribution.get(metric_status, 0) + 1
+        is_terminal_metric = metric_status in TERMINAL
+        if is_terminal_metric:
+            terminal_available += 1
+        elif metric_status == "running":
+            running_available += 1
         phases = metrics.get("phase_durations_seconds") if isinstance(metrics.get("phase_durations_seconds"), dict) else {}
         for phase, value in phases.items():
             try:
                 duration = float(value or 0)
             except Exception:
                 duration = 0.0
-            phase_totals[str(phase)] = phase_totals.get(str(phase), 0.0) + duration
-            phase_counts[str(phase)] = phase_counts.get(str(phase), 0) + 1
+            if duration <= 0:
+                continue
+            if is_terminal_metric:
+                phase_totals[str(phase)] = phase_totals.get(str(phase), 0.0) + duration
+                phase_counts[str(phase)] = phase_counts.get(str(phase), 0) + 1
+            elif metric_status == "running":
+                running_phase_totals[str(phase)] = running_phase_totals.get(str(phase), 0.0) + duration
+                running_phase_counts[str(phase)] = running_phase_counts.get(str(phase), 0) + 1
 
         batch_summary = metrics.get("batch_summary") if isinstance(metrics.get("batch_summary"), dict) else {}
-        batch_count += int(batch_summary.get("batch_count") or 0)
-        passed_batches += int(batch_summary.get("passed_batches") or 0)
-        failed_batches += int(batch_summary.get("failed_batches") or 0)
-        total_attempts += int(batch_summary.get("total_attempts") or 0)
+        if is_terminal_metric:
+            batch_count += int(batch_summary.get("batch_count") or 0)
+            passed_batches += int(batch_summary.get("passed_batches") or 0)
+            failed_batches += int(batch_summary.get("failed_batches") or 0)
+            total_attempts += int(batch_summary.get("total_attempts") or 0)
 
         function_summary = metrics.get("function_summary") if isinstance(metrics.get("function_summary"), dict) else {}
-        total_functions += int(function_summary.get("total_functions") or 0)
-        completed_functions += int(function_summary.get("completed_functions") or 0)
-        failed_functions += int(function_summary.get("failed_functions") or 0)
+        if is_terminal_metric:
+            total_functions += int(function_summary.get("total_functions") or 0)
+            completed_functions += int(function_summary.get("completed_functions") or 0)
+            failed_functions += int(function_summary.get("failed_functions") or 0)
         try:
             throughput = float(function_summary.get("functions_per_second") or 0)
         except Exception:
             throughput = 0.0
-        if throughput > 0:
+        if is_terminal_metric and throughput > 0:
             throughput_values.append(throughput)
 
         artifact_summary = metrics.get("artifact_summary") if isinstance(metrics.get("artifact_summary"), dict) else {}
@@ -2547,11 +2625,26 @@ def build_business_runtime_metrics_summary(items: list[B2STaskItem]) -> dict[str
         phase: round(total / max(1, phase_counts.get(phase, 0)), 6)
         for phase, total in sorted(phase_totals.items())
     }
+    running_phase_averages = {
+        phase: round(total / max(1, running_phase_counts.get(phase, 0)), 6)
+        for phase, total in sorted(running_phase_totals.items())
+    }
     return {
         "available_items": available,
         "missing_items": missing,
+        "coverage": {
+            "total_items": len(items),
+            "available_items": available,
+            "missing_items": missing,
+            "coverage_rate": round(available / len(items), 6) if items else 0,
+            "terminal_available_items": terminal_available,
+            "running_available_items": running_available,
+        },
+        "missing_reasons": missing_reasons,
+        "sample_status_distribution": status_distribution,
         "engines": engines,
         "phase_average_seconds": phase_averages,
+        "running_phase_average_seconds": running_phase_averages,
         "header_recovery_avg_seconds": phase_averages.get("header_synthesis", 0),
         "body_recovery_avg_seconds": phase_averages.get("body_generation", 0),
         "batch_summary": {
@@ -2561,6 +2654,8 @@ def build_business_runtime_metrics_summary(items: list[B2STaskItem]) -> dict[str
             "total_attempts": total_attempts,
             "retry_rate": round(max(0, total_attempts - batch_count) / total_attempts, 6) if total_attempts else 0,
             "validation_pass_rate": round(passed_batches / batch_count, 6) if batch_count else 0,
+            "failure_rate": round(failed_batches / batch_count, 6) if batch_count else 0,
+            "avg_attempts_per_batch": round(total_attempts / batch_count, 6) if batch_count else 0,
         },
         "function_summary": {
             "total_functions": total_functions,

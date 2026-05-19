@@ -4,6 +4,7 @@ import json
 import threading
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -285,40 +286,128 @@ def _observe_histogram_sample(samples: dict[tuple[tuple[str, str], ...], list[fl
     slot[1] += 1.0
 
 
+_TERMINAL_ITEM_STATUSES = {"success", "failed", "cancelled"}
+
+
+def _runtime_metric_status(item: B2STaskItem, metrics: dict[str, Any]) -> str:
+    raw = str(metrics.get("status") or item.status or "unknown").strip().lower()
+    if raw in {"completed", "success"}:
+        return "success"
+    if raw in {"failed", "cancelled"}:
+        return raw
+    if str(item.status or "").strip().lower() in _TERMINAL_ITEM_STATUSES:
+        return str(item.status or "unknown").strip().lower()
+    if raw in {"running", "cancelling"}:
+        return "running"
+    if raw in {"queued", "pending"}:
+        return raw
+    return raw or "unknown"
+
+
+def _runtime_metric_missing_reason(item: B2STaskItem) -> str:
+    metadata = item.extra_metadata if isinstance(item.extra_metadata, dict) else {}
+    reason = str(metadata.get("pi_runtime_metric_missing_reason") or "").strip()
+    if reason:
+        return reason
+    status = str(item.status or "").strip().lower()
+    if not item.pi_job_id:
+        return "pi_job_missing"
+    if status in {"pending", "queued"}:
+        return "queued_or_pending"
+    if status == "running":
+        return "running_not_reported"
+    return "legacy_or_unavailable"
+
+
+def _runtime_metric_seen_timestamp(item: B2STaskItem, metrics: dict[str, Any]) -> float | None:
+    metadata = item.extra_metadata if isinstance(item.extra_metadata, dict) else {}
+    for value in (
+        metadata.get("pi_runtime_metric_last_seen_at"),
+        metrics.get("finished_at"),
+        metrics.get("updated_at"),
+        metrics.get("started_at"),
+    ):
+        if not value:
+            continue
+        raw = str(value).strip()
+        if raw.endswith("Z"):
+            raw = f"{raw[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except Exception:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    if item.updated_at:
+        return item.updated_at.replace(tzinfo=timezone.utc).timestamp()
+    return None
+
+
 def _append_business_runtime_snapshot_lines(lines: list[str], items: list[B2STaskItem]) -> None:
     phase_samples: dict[tuple[tuple[str, str], ...], list[float]] = {}
+    completed_phase_samples: dict[tuple[tuple[str, str], ...], list[float]] = {}
+    running_phase_samples: dict[tuple[tuple[str, str], ...], list[float]] = {}
     header_samples: dict[tuple[tuple[str, str], ...], list[float]] = {}
     body_samples: dict[tuple[tuple[str, str], ...], list[float]] = {}
     batch_samples: dict[tuple[tuple[str, str], ...], list[float]] = {}
     batch_attempts: dict[tuple[str, str], float] = defaultdict(float)
     batch_validation: dict[tuple[str, str], float] = defaultdict(float)
+    batch_totals_by_engine: dict[str, float] = defaultdict(float)
+    batch_passed_by_engine: dict[str, float] = defaultdict(float)
+    batch_failed_by_engine: dict[str, float] = defaultdict(float)
+    batch_attempts_by_engine: dict[str, float] = defaultdict(float)
     artifact_bytes: dict[str, float] = defaultdict(float)
     token_usage: dict[str, float] = defaultdict(float)
     token_cost = 0.0
     throughput_total: dict[str, float] = defaultdict(float)
     throughput_count: dict[str, float] = defaultdict(float)
+    completed_functions_by_engine: dict[str, float] = defaultdict(float)
+    body_duration_by_engine: dict[str, float] = defaultdict(float)
     available = 0
     missing = 0
+    missing_by_reason: dict[str, float] = defaultdict(float)
+    latest_seen_timestamp = 0.0
 
     for item in items:
         metadata = item.extra_metadata if isinstance(item.extra_metadata, dict) else {}
         metrics = metadata.get("pi_runtime_metrics")
         if not isinstance(metrics, dict):
             missing += 1
+            missing_by_reason[_runtime_metric_missing_reason(item)] += 1.0
             continue
         available += 1
         engine = str(metrics.get("engine") or "unknown")
-        status = str(metrics.get("status") or item.status or "unknown")
+        status = _runtime_metric_status(item, metrics)
+        is_terminal_sample = status in _TERMINAL_ITEM_STATUSES
+        latest_seen_timestamp = max(latest_seen_timestamp, _runtime_metric_seen_timestamp(item, metrics) or 0.0)
         phases = metrics.get("phase_durations_seconds") if isinstance(metrics.get("phase_durations_seconds"), dict) else {}
         for phase, value in phases.items():
             phase_name = str(phase)
-            _observe_histogram_sample(phase_samples, value, phase=phase_name, engine=engine, status=status)
-            if phase_name == "header_synthesis":
+            duration = _safe_float(value)
+            if duration <= 0:
+                continue
+            _observe_histogram_sample(phase_samples, duration, phase=phase_name, engine=engine, status=status)
+            if is_terminal_sample:
+                _observe_histogram_sample(completed_phase_samples, duration, phase=phase_name, engine=engine, status=status)
+            elif status == "running":
+                _observe_histogram_sample(running_phase_samples, duration, phase=phase_name, engine=engine)
+            if phase_name == "header_synthesis" and is_terminal_sample:
                 _observe_histogram_sample(header_samples, value, engine=engine, status=status)
-            elif phase_name == "body_generation":
+            elif phase_name == "body_generation" and is_terminal_sample:
                 _observe_histogram_sample(body_samples, value, engine=engine, status=status)
+                body_duration_by_engine[engine] += duration
 
         batch_summary = metrics.get("batch_summary") if isinstance(metrics.get("batch_summary"), dict) else {}
+        batch_count = _safe_float(batch_summary.get("batch_count"))
+        passed_batches = _safe_float(batch_summary.get("passed_batches"))
+        failed_batches = _safe_float(batch_summary.get("failed_batches"))
+        total_attempts = _safe_float(batch_summary.get("total_attempts"))
+        if is_terminal_sample:
+            batch_totals_by_engine[engine] += batch_count
+            batch_passed_by_engine[engine] += passed_batches
+            batch_failed_by_engine[engine] += failed_batches
+            batch_attempts_by_engine[engine] += total_attempts
         for batch in batch_summary.get("batches") or []:
             if not isinstance(batch, dict):
                 continue
@@ -333,6 +422,8 @@ def _append_business_runtime_snapshot_lines(lines: list[str], items: list[B2STas
         if throughput > 0:
             throughput_total[engine] += throughput
             throughput_count[engine] += 1.0
+        if is_terminal_sample:
+            completed_functions_by_engine[engine] += _safe_float(function_summary.get("completed_functions"))
 
         artifact_summary = metrics.get("artifact_summary") if isinstance(metrics.get("artifact_summary"), dict) else {}
         for kind, value in artifact_summary.items():
@@ -350,7 +441,23 @@ def _append_business_runtime_snapshot_lines(lines: list[str], items: list[B2STas
         "# TYPE secflow_binary_to_source_business_metric_missing_items gauge",
         f"secflow_binary_to_source_business_metric_missing_items {missing}",
     ])
+    lines.extend([
+        "# HELP secflow_binary_to_source_runtime_metric_available_items Items with pi runtime metrics.",
+        "# TYPE secflow_binary_to_source_runtime_metric_available_items gauge",
+        f"secflow_binary_to_source_runtime_metric_available_items {available}",
+        "# HELP secflow_binary_to_source_runtime_metric_missing_items Items without pi runtime metrics by reason.",
+        "# TYPE secflow_binary_to_source_runtime_metric_missing_items gauge",
+    ])
+    if missing_by_reason:
+        for reason, value in sorted(missing_by_reason.items()):
+            lines.append(f"secflow_binary_to_source_runtime_metric_missing_items{_metric_labels(reason=reason)} {value}")
+    else:
+        lines.append(f"secflow_binary_to_source_runtime_metric_missing_items{_metric_labels(reason='none')} 0")
+    lines.append("# TYPE secflow_binary_to_source_latest_runtime_metric_seen_timestamp gauge")
+    lines.append(f"secflow_binary_to_source_latest_runtime_metric_seen_timestamp {latest_seen_timestamp}")
     _append_histogram_samples(lines, "secflow_binary_to_source_business_phase_duration_seconds", phase_samples)
+    _append_histogram_samples(lines, "secflow_binary_to_source_completed_phase_duration_seconds", completed_phase_samples)
+    _append_histogram_samples(lines, "secflow_binary_to_source_running_phase_duration_seconds", running_phase_samples)
     _append_histogram_samples(lines, "secflow_binary_to_source_header_recovery_duration_seconds", header_samples)
     _append_histogram_samples(lines, "secflow_binary_to_source_body_recovery_duration_seconds", body_samples)
     _append_histogram_samples(lines, "secflow_binary_to_source_batch_recovery_duration_seconds", batch_samples)
@@ -358,6 +465,28 @@ def _append_business_runtime_snapshot_lines(lines: list[str], items: list[B2STas
     for engine, total in sorted(throughput_total.items()):
         count = max(1.0, throughput_count.get(engine, 0.0))
         lines.append(f"secflow_binary_to_source_function_throughput{_metric_labels(engine=engine)} {total / count}")
+    lines.append("# TYPE secflow_binary_to_source_weighted_function_throughput gauge")
+    for engine, completed_functions in sorted(completed_functions_by_engine.items()):
+        body_seconds = body_duration_by_engine.get(engine, 0.0)
+        if body_seconds > 0:
+            lines.append(f"secflow_binary_to_source_weighted_function_throughput{_metric_labels(engine=engine)} {completed_functions / body_seconds}")
+    lines.append("# TYPE secflow_binary_to_source_batch_retry_rate gauge")
+    for engine, attempts in sorted(batch_attempts_by_engine.items()):
+        batches = batch_totals_by_engine.get(engine, 0.0)
+        rate = max(0.0, attempts - batches) / attempts if attempts > 0 else 0.0
+        lines.append(f"secflow_binary_to_source_batch_retry_rate{_metric_labels(engine=engine)} {rate}")
+    lines.append("# TYPE secflow_binary_to_source_batch_validation_pass_rate gauge")
+    for engine, batches in sorted(batch_totals_by_engine.items()):
+        rate = batch_passed_by_engine.get(engine, 0.0) / batches if batches > 0 else 0.0
+        lines.append(f"secflow_binary_to_source_batch_validation_pass_rate{_metric_labels(engine=engine)} {rate}")
+    lines.append("# TYPE secflow_binary_to_source_batch_failure_rate gauge")
+    for engine, batches in sorted(batch_totals_by_engine.items()):
+        rate = batch_failed_by_engine.get(engine, 0.0) / batches if batches > 0 else 0.0
+        lines.append(f"secflow_binary_to_source_batch_failure_rate{_metric_labels(engine=engine)} {rate}")
+    lines.append("# TYPE secflow_binary_to_source_avg_attempts_per_batch gauge")
+    for engine, batches in sorted(batch_totals_by_engine.items()):
+        attempts = batch_attempts_by_engine.get(engine, 0.0)
+        lines.append(f"secflow_binary_to_source_avg_attempts_per_batch{_metric_labels(engine=engine)} {attempts / batches if batches > 0 else 0.0}")
     lines.append("# TYPE secflow_binary_to_source_batch_attempts_total counter")
     for (engine, result), value in sorted(batch_attempts.items()):
         lines.append(f"secflow_binary_to_source_batch_attempts_total{_metric_labels(engine=engine, result=result)} {value}")
