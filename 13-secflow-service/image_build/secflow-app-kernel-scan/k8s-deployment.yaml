@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-app-kernel-scan
+  namespace: secflow-ns
+  labels:
+    name: secflow-app-kernel-scan
+spec:
+  # Keep one replica: the service uses SQLite and a local scheduler/state root.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      name: secflow-app-kernel-scan
+  template:
+    metadata:
+      labels:
+        name: secflow-app-kernel-scan
+    spec:
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: secflow-app-kernel-scan
+          image: ghcr.io/runshine/secflow-app-kernel-scan:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: secflow-app-kernel-scan-config
+            - secretRef:
+                name: secflow-app-kernel-scan-secret
+                optional: true
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          volumeMounts:
+            - name: kernel-scan-state
+              mountPath: /var/lib/secflow-kernel-scan
+            - name: kernel-scan-workspace
+              mountPath: /workspace
+            - name: kernel-source
+              mountPath: /workspace/kernel
+              readOnly: true
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "8"
+              memory: "16Gi"
+          readinessProbe:
+            httpGet:
+              path: /api/app/kernel-scan/ready
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /api/app/kernel-scan/health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: kernel-scan-state
+          persistentVolumeClaim:
+            claimName: secflow-app-kernel-scan-state-pvc
+        - name: kernel-scan-workspace
+          persistentVolumeClaim:
+            claimName: secflow-app-kernel-scan-workspace-pvc
+        - name: kernel-source
+          persistentVolumeClaim:
+            claimName: secflow-app-kernel-scan-kernel-pvc
