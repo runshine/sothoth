@@ -222,6 +222,99 @@ class ComplexWorkflowRuntime(BaseAgentRuntime):
         self._initialized = False
 
 
+class ResultReviewFrameworkErrorRuntime(BaseAgentRuntime):
+    async def initialize(self) -> None:
+        self._initialized = True
+
+    async def create_session(self) -> str:
+        session_id = f"session_{self.agent_id}_{len(self._sessions) + 1}"
+        self._sessions[session_id] = {"turns": 0}
+        return session_id
+
+    def _ensure_session(self, session_id: Optional[str]) -> tuple[str, dict]:
+        if session_id is None:
+            session_id = f"session_{self.agent_id}_{len(self._sessions) + 1}"
+        session = self._sessions.setdefault(session_id, {"turns": 0})
+        session["turns"] += 1
+        return session_id, session
+
+    async def send_message(
+        self,
+        message: str,
+        system_prompt: Optional[str] = None,
+        session_id: Optional[str] = None,
+        working_dir: Optional[str] = None,
+    ) -> AgentResponse:
+        session_id, session = self._ensure_session(session_id)
+
+        if self.agent_id == "pi-worker":
+            work_dir = Path(working_dir or ".")
+            results_dir = work_dir / "results"
+            results_dir.mkdir(parents=True, exist_ok=True)
+            if "请整理所有漏洞分析结果" in message:
+                (results_dir / "result_001.md").write_text("# candidate report\n", encoding="utf-8")
+                (work_dir / "summary.md").write_text("# summary\n\n- result_001.md\n", encoding="utf-8")
+                content = "summary ok"
+            elif "深度自审" in message or "自审" in message:
+                content = "reflection ok"
+            else:
+                content = "worker ok"
+        else:
+            if "待验证的漏洞报告" in message or "结果评审输出未满足框架 schema" in message:
+                content = "NOT JSON"
+            else:
+                content = json.dumps(
+                    {
+                        "passed": True,
+                        "verdict": "PASS",
+                        "feedback": "global review pass",
+                        "scores": {
+                            "coverage": 1.0,
+                            "input_coverage": 1.0,
+                            "export_followthrough": 1.0,
+                            "used_coverage": 1.0,
+                            "vuln_pattern_breadth": 1.0,
+                            "code_evidence_depth": 1.0,
+                            "limitations_honesty": 1.0,
+                            "report_completeness": 1.0,
+                        },
+                        "confidence": 0.99,
+                        "issues": [],
+                        "resolved_issues": [],
+                    },
+                    ensure_ascii=False,
+                )
+
+        return AgentResponse(
+            content=content,
+            conversation_id=session_id,
+            turn_count=session["turns"],
+            finished=True,
+        )
+
+    async def multi_turn_execute(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        working_dir: str,
+        max_turns: int = 30,
+        session_id: Optional[str] = None,
+    ) -> AgentResponse:
+        return await self.send_message(
+            message=user_prompt,
+            system_prompt=system_prompt,
+            session_id=session_id,
+            working_dir=working_dir,
+        )
+
+    async def close_session(self, session_id: str) -> None:
+        self._sessions.pop(session_id, None)
+
+    async def shutdown(self) -> None:
+        self._sessions.clear()
+        self._initialized = False
+
+
 @pytest.mark.asyncio
 async def test_complex_workflow_tracks_false_positive_without_worker_rework(
     monkeypatch: pytest.MonkeyPatch,
@@ -301,3 +394,45 @@ async def test_complex_workflow_tracks_false_positive_without_worker_rework(
     summary_text = (atomic_dir / "summary.md").read_text(encoding="utf-8")
     assert "result_001.md" in summary_text
     assert "result_002.md" in summary_text
+
+
+@pytest.mark.asyncio
+async def test_workflow_fails_when_result_review_does_not_finish_terminal_verdicts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setitem(AgentRuntimeRegistry.RUNTIME_MAP, "pi_agent", ResultReviewFrameworkErrorRuntime)
+
+    run_dir = tmp_path / "run-review-error"
+    input_task = tmp_path / "task_review_error.md"
+    input_task.write_text("# Review Error Task\n", encoding="utf-8")
+
+    config_payload = generate_config(
+        run_dir=str(run_dir),
+        task_file=str(input_task),
+        run_name="review-error",
+        model="mock-model",
+        provider="mock-provider",
+        max_cycles=1,
+        worker_timeout=30,
+        advisor_timeout=30,
+        thinking="low",
+        result_review_concurrency=1,
+    )
+    config = FrameworkConfig.model_validate(config_payload)
+
+    artifacts = await run_framework_config(config)
+
+    assert artifacts.result.success is False
+
+    atomic_dir = (
+        Path(config.global_config.workspace_root)
+        / f"pipeline_{config.execution.execution_id}"
+        / "stage_01_vuln_scan"
+        / "vuln_scan_initial_001"
+    )
+    cycle_001 = json.loads((atomic_dir / "_meta" / "review_summaries" / "cycle_001.json").read_text(encoding="utf-8"))
+    assert cycle_001["outcome"] == "review_error"
+    assert cycle_001["global_review"]["passed"] is True
+    assert cycle_001["result_review"]["vulnerability_status"]["review_completed"] is False
+    assert cycle_001["result_review"]["vulnerability_status"]["pending_review_files"] == ["result_001.md"]
