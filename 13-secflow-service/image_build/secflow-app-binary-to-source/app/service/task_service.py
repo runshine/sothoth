@@ -13,11 +13,12 @@ from statistics import mean
 from typing import Any
 from uuid import uuid4
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import get_config
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
-from app.model import B2STask, B2STaskItem
+from app.model import B2STask, B2STaskEvent as B2STaskEventModel, B2STaskItem
 from app.observability import get_observability
 from app.schemas import (
     AdvancedBatch,
@@ -27,6 +28,9 @@ from app.schemas import (
     AgentRuntimeSummary,
     B2SArtifact,
     B2SArtifactContentResponse,
+    B2STaskEvent as B2STaskEventResponse,
+    B2STaskEventSummary,
+    B2STaskTimelineResponse,
     B2SOverallProgress,
     RelationshipEdge,
     RelationshipNode,
@@ -112,6 +116,539 @@ _BUDGET_EXHAUSTED_MARKERS = (
 )
 FUNCTION_STATS_METADATA_KEY = "function_stats"
 FUNCTION_STATS_FIELDS = ("total_functions", "completed_functions", "failed_functions", "uncompleted_functions")
+TASK_EVENT_SOURCE_B2S = "b2s"
+TASK_EVENT_SOURCE_PI = "pi_re_agent"
+
+
+def _item_event_snapshot(item: B2STaskItem) -> dict[str, Any]:
+    metadata = item.extra_metadata if isinstance(item.extra_metadata, dict) else {}
+    progress = item.progress if isinstance(item.progress, dict) else {}
+    return {
+        "status": str(item.status or ""),
+        "phase": str(item.phase or ""),
+        "pi_job_id": str(item.pi_job_id or ""),
+        "worker_url": str(metadata.get("pi_worker_url") or metadata.get("pi_endpoint_url") or ""),
+        "progress": {
+            "total_batches": progress.get("total_batches"),
+            "completed_batches": progress.get("completed_batches"),
+            "current_batch": progress.get("current_batch"),
+            "current_attempt": progress.get("current_attempt"),
+            "current_function": progress.get("current_function"),
+            "completed_functions": progress.get("completed_functions"),
+            "message": progress.get("message"),
+        },
+        "runtime_metrics": metadata.get("pi_runtime_metrics"),
+    }
+
+
+def _item_metadata_event_snapshot(item: B2STaskItem) -> dict[str, Any]:
+    metadata = item.extra_metadata if isinstance(item.extra_metadata, dict) else {}
+    return {
+        "pi_recover_reason": str(metadata.get("pi_recover_reason") or ""),
+        "pi_last_recover_error": str(metadata.get("pi_last_recover_error") or ""),
+        "pi_runtime_metric_missing_reason": str(metadata.get("pi_runtime_metric_missing_reason") or ""),
+        "pi_conflict_job_id": str(metadata.get("pi_conflict_job_id") or ""),
+    }
+
+
+def _event_dedupe_key(*parts: object) -> str:
+    normalized = [str(part or "").strip() for part in parts]
+    return "|".join(normalized)
+
+
+def _create_task_event(
+    db: Session,
+    *,
+    task_id: str,
+    project_id: str,
+    event_type: str,
+    message: str,
+    source: str = TASK_EVENT_SOURCE_B2S,
+    level: str = "info",
+    item: B2STaskItem | None = None,
+    phase: str | None = None,
+    batch_id: int | None = None,
+    attempt: int | None = None,
+    function_name: str | None = None,
+    status: str | None = None,
+    pi_job_id: str | None = None,
+    payload: dict[str, Any] | None = None,
+    dedupe_key: str | None = None,
+) -> None:
+    key = str(dedupe_key or "").strip() or _event_dedupe_key(
+        task_id,
+        item.id if item else "",
+        event_type,
+        source,
+        phase,
+        batch_id,
+        attempt,
+        function_name,
+        status,
+        pi_job_id or (item.pi_job_id if item else ""),
+    )
+    if db.query(B2STaskEventModel.id).filter(B2STaskEventModel.dedupe_key == key).first():
+        return
+    event = B2STaskEventModel(
+        id=uuid4().hex[:16],
+        task_id=task_id,
+        project_id=project_id,
+        item_id=item.id if item else None,
+        sequence_no=item.sequence_no if item else None,
+        pi_job_id=pi_job_id or (item.pi_job_id if item else None),
+        source=source,
+        level=level,
+        event_type=event_type,
+        phase=phase or (item.phase if item else None),
+        batch_id=batch_id,
+        attempt=attempt,
+        function_name=function_name,
+        status=status,
+        message=message,
+        dedupe_key=key,
+        created_at=now_local(),
+    )
+    event.payload = payload or {}
+    db.add(event)
+    db.flush()
+
+
+def _safe_create_task_event(db: Session, **kwargs: Any) -> None:
+    if not hasattr(db, "begin_nested"):
+        return
+    nested = db.begin_nested()
+    try:
+        _create_task_event(db, **kwargs)
+        nested.commit()
+    except IntegrityError:
+        nested.rollback()
+
+
+def _build_task_event_summary(db: Session, task_id: str) -> B2STaskEventSummary:
+    events = db.query(B2STaskEventModel).filter(B2STaskEventModel.task_id == task_id).order_by(B2STaskEventModel.created_at.desc()).all()
+    summary = B2STaskEventSummary(total_events=len(events))
+    if not events:
+        return summary
+    latest = events[0]
+    summary.latest_event_type = latest.event_type
+    summary.latest_event_at = latest.created_at
+    for event in events:
+        if summary.last_batch_id is None and event.batch_id is not None:
+            summary.last_batch_id = int(event.batch_id)
+        if not summary.current_function and event.function_name:
+            summary.current_function = str(event.function_name)
+        if summary.current_attempt is None and event.attempt is not None:
+            summary.current_attempt = int(event.attempt)
+        if (
+            summary.last_batch_id is not None
+            and summary.current_function
+            and summary.current_attempt is not None
+        ):
+            break
+    return summary
+
+
+def get_task_timeline(db: Session, task: B2STask) -> B2STaskTimelineResponse:
+    events = db.query(B2STaskEventModel).filter(B2STaskEventModel.task_id == task.id).order_by(B2STaskEventModel.created_at.desc()).all()
+    return B2STaskTimelineResponse(
+        task_id=task.id,
+        events=[
+            B2STaskEventResponse(
+                id=event.id,
+                task_id=event.task_id,
+                project_id=event.project_id,
+                item_id=event.item_id,
+                sequence_no=event.sequence_no,
+                pi_job_id=event.pi_job_id,
+                source=event.source,
+                level=event.level,
+                event_type=event.event_type,
+                phase=event.phase,
+                batch_id=event.batch_id,
+                attempt=event.attempt,
+                function_name=event.function_name,
+                status=event.status,
+                message=event.message,
+                payload=event.payload,
+                created_at=event.created_at,
+            )
+            for event in events
+        ],
+    )
+
+
+def clear_task_timeline(db: Session, task: B2STask) -> int:
+    deleted = (
+        db.query(B2STaskEventModel)
+        .filter(B2STaskEventModel.task_id == task.id)
+        .delete(synchronize_session=False)
+    )
+    return int(deleted or 0)
+
+
+def delete_task_timeline_event(db: Session, task: B2STask, event_id: str) -> int:
+    deleted = (
+        db.query(B2STaskEventModel)
+        .filter(
+            B2STaskEventModel.task_id == task.id,
+            B2STaskEventModel.id == event_id,
+        )
+        .delete(synchronize_session=False)
+    )
+    return int(deleted or 0)
+
+
+def _record_item_snapshot_events(
+    db: Session,
+    *,
+    task: B2STask,
+    item: B2STaskItem,
+    previous: dict[str, Any] | None,
+    source: str,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    prev = previous or {}
+    prev_progress = prev.get("progress") if isinstance(prev.get("progress"), dict) else {}
+    prev_metrics = prev.get("runtime_metrics")
+    current = _item_event_snapshot(item)
+    current_progress = current.get("progress") if isinstance(current.get("progress"), dict) else {}
+    current_status = str(item.status or "").strip() or None
+    current_phase = str(item.phase or "").strip() or None
+    function_name = str(current_progress.get("current_function") or "").strip() or None
+    batch_id = current_progress.get("current_batch")
+    attempt = current_progress.get("current_attempt")
+    base_payload = dict(payload or {})
+    base_payload.update(
+        {
+            "item_id": item.id,
+            "sequence_no": item.sequence_no,
+            "pi_job_id": item.pi_job_id,
+        }
+    )
+
+    if str(prev.get("pi_job_id") or "") != str(current.get("pi_job_id") or "") and item.pi_job_id:
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=source,
+            event_type="pi_job_bound",
+            phase=current_phase,
+            status=current_status,
+            message=f"任务项 #{item.sequence_no} 绑定 pi job {item.pi_job_id}",
+            payload={**base_payload, "worker_url": current.get("worker_url")},
+            dedupe_key=_event_dedupe_key(task.id, item.id, "pi_job_bound", item.pi_job_id),
+        )
+
+    if str(prev.get("worker_url") or "") != str(current.get("worker_url") or "") and current.get("worker_url"):
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=source,
+            event_type="worker_assigned",
+            phase=current_phase,
+            status=current_status,
+            message=f"任务项 #{item.sequence_no} 分配到 worker {current.get('worker_url')}",
+            payload={**base_payload, "worker_url": current.get("worker_url")},
+            dedupe_key=_event_dedupe_key(task.id, item.id, "worker_assigned", current.get("worker_url"), item.pi_job_id),
+        )
+
+    if str(prev.get("status") or "") != str(current.get("status") or "") and current_status:
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=source,
+            event_type="item_status_changed",
+            phase=current_phase,
+            status=current_status,
+            message=f"任务项 #{item.sequence_no} 状态切换为 {current_status}",
+            payload={**base_payload, "previous_status": prev.get("status"), "current_status": current_status},
+            dedupe_key=_event_dedupe_key(task.id, item.id, "item_status_changed", current_status, item.pi_job_id),
+        )
+        if current_status in TERMINAL:
+            terminal_type = {
+                "success": "job_completed",
+                "failed": "job_failed",
+                "cancelled": "job_cancelled",
+            }.get(current_status)
+            if terminal_type:
+                _safe_create_task_event(
+                    db,
+                    task_id=task.id,
+                    project_id=task.project_id,
+                    item=item,
+                    source=source,
+                    event_type=terminal_type,
+                    phase=current_phase,
+                    status=current_status,
+                    message=f"任务项 #{item.sequence_no} 已{phase_label(current_phase)}，终态为 {current_status}",
+                    payload=base_payload,
+                    dedupe_key=_event_dedupe_key(task.id, item.id, terminal_type, current_status, item.pi_job_id),
+                )
+
+    if str(prev.get("phase") or "") != str(current.get("phase") or "") and current_phase:
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=source,
+            event_type="phase_changed",
+            phase=current_phase,
+            status=current_status,
+            message=f"任务项 #{item.sequence_no} 进入阶段 {phase_label(current_phase)}",
+            payload={**base_payload, "previous_phase": prev.get("phase"), "current_phase": current_phase},
+            dedupe_key=_event_dedupe_key(task.id, item.id, "phase_changed", current_phase, item.pi_job_id),
+        )
+
+    batch_changed = prev_progress.get("current_batch") != current_progress.get("current_batch")
+    attempt_changed = prev_progress.get("current_attempt") != current_progress.get("current_attempt")
+    function_changed = prev_progress.get("current_function") != current_progress.get("current_function")
+    completed_batches_changed = prev_progress.get("completed_batches") != current_progress.get("completed_batches")
+    completed_functions_changed = prev_progress.get("completed_functions") != current_progress.get("completed_functions")
+    progress_changed = any([batch_changed, attempt_changed, function_changed, completed_batches_changed, completed_functions_changed])
+
+    if batch_changed and batch_id is not None:
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=source,
+            event_type="batch_started",
+            phase=current_phase,
+            batch_id=int(batch_id),
+            attempt=int(attempt) if attempt is not None else None,
+            function_name=function_name,
+            status=current_status,
+            message=f"任务项 #{item.sequence_no} 进入 batch {batch_id}",
+            payload={**base_payload, "progress": current_progress},
+            dedupe_key=_event_dedupe_key(task.id, item.id, "batch_started", batch_id, item.pi_job_id),
+        )
+
+    if (batch_changed or attempt_changed) and batch_id is not None:
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=source,
+            event_type="batch_attempt_started",
+            phase=current_phase,
+            batch_id=int(batch_id),
+            attempt=int(attempt) if attempt is not None else None,
+            function_name=function_name,
+            status=current_status,
+            message=f"任务项 #{item.sequence_no} 开始 batch {batch_id} attempt {attempt or 1}",
+            payload={**base_payload, "progress": current_progress},
+            dedupe_key=_event_dedupe_key(task.id, item.id, "batch_attempt_started", batch_id, attempt, item.pi_job_id),
+        )
+
+    if function_changed and function_name:
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=source,
+            event_type="function_progress",
+            phase=current_phase,
+            batch_id=int(batch_id) if batch_id is not None else None,
+            attempt=int(attempt) if attempt is not None else None,
+            function_name=function_name,
+            status=current_status,
+            message=f"任务项 #{item.sequence_no} 正在处理函数 {function_name}",
+            payload={**base_payload, "progress": current_progress},
+            dedupe_key=_event_dedupe_key(task.id, item.id, "function_progress", batch_id, attempt, function_name, item.pi_job_id),
+        )
+
+    if completed_batches_changed and current_progress.get("completed_batches") is not None:
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=source,
+            event_type="batch_completed",
+            phase=current_phase,
+            batch_id=int(batch_id) if batch_id is not None else None,
+            attempt=int(attempt) if attempt is not None else None,
+            function_name=function_name,
+            status=current_status,
+            message=f"任务项 #{item.sequence_no} 已完成 {current_progress.get('completed_batches')} / {current_progress.get('total_batches') or '?'} 个 batch",
+            payload={**base_payload, "progress": current_progress},
+            dedupe_key=_event_dedupe_key(task.id, item.id, "batch_completed", current_progress.get("completed_batches"), item.pi_job_id),
+        )
+
+    if progress_changed:
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=source,
+            event_type="progress_snapshot_synced",
+            phase=current_phase,
+            batch_id=int(batch_id) if batch_id is not None else None,
+            attempt=int(attempt) if attempt is not None else None,
+            function_name=function_name,
+            status=current_status,
+            message=f"任务项 #{item.sequence_no} 进度快照已同步",
+            payload={**base_payload, "previous_progress": prev_progress, "progress": current_progress},
+            dedupe_key=_event_dedupe_key(
+                task.id,
+                item.id,
+                "progress_snapshot_synced",
+                current_progress.get("completed_batches"),
+                current_progress.get("completed_functions"),
+                batch_id,
+                attempt,
+                function_name,
+                item.pi_job_id,
+            ),
+        )
+
+    if prev_metrics != current.get("runtime_metrics") and current.get("runtime_metrics") is not None:
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=source,
+            event_type="runtime_metrics_updated",
+            phase=current_phase,
+            batch_id=int(batch_id) if batch_id is not None else None,
+            attempt=int(attempt) if attempt is not None else None,
+            function_name=function_name,
+            status=current_status,
+            message=f"任务项 #{item.sequence_no} 运行时指标已更新",
+            payload={**base_payload, "runtime_metrics": current.get("runtime_metrics")},
+            dedupe_key=_event_dedupe_key(
+                task.id,
+                item.id,
+                "runtime_metrics_updated",
+                current_status,
+                current_progress.get("completed_batches"),
+                current_progress.get("completed_functions"),
+                item.pi_job_id,
+            ),
+        )
+
+
+def _record_item_metadata_events(
+    db: Session,
+    *,
+    task: B2STask,
+    item: B2STaskItem,
+    previous: dict[str, Any] | None,
+    source: str,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    prev = previous or {}
+    current = _item_metadata_event_snapshot(item)
+    base_payload = dict(payload or {})
+    base_payload.update(
+        {
+            "item_id": item.id,
+            "sequence_no": item.sequence_no,
+            "pi_job_id": item.pi_job_id,
+        }
+    )
+    recover_reason = current.get("pi_recover_reason")
+    if recover_reason and recover_reason != prev.get("pi_recover_reason"):
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=source,
+            level="warning",
+            event_type="pi_recovery_observed",
+            status=item.status,
+            phase=item.phase,
+            message=f"任务项 #{item.sequence_no} 触发恢复动作: {recover_reason}",
+            payload={
+                **base_payload,
+                "previous_recover_reason": prev.get("pi_recover_reason"),
+                "recover_reason": recover_reason,
+            },
+            dedupe_key=_event_dedupe_key(task.id, item.id, "pi_recovery_observed", recover_reason, item.pi_job_id),
+        )
+    runtime_metric_missing_reason = current.get("pi_runtime_metric_missing_reason")
+    if runtime_metric_missing_reason and runtime_metric_missing_reason != prev.get("pi_runtime_metric_missing_reason"):
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=source,
+            level="warning",
+            event_type="runtime_metrics_missing",
+            status=item.status,
+            phase=item.phase,
+            message=f"任务项 #{item.sequence_no} 暂无运行时指标: {runtime_metric_missing_reason}",
+            payload={
+                **base_payload,
+                "previous_reason": prev.get("pi_runtime_metric_missing_reason"),
+                "reason": runtime_metric_missing_reason,
+            },
+            dedupe_key=_event_dedupe_key(task.id, item.id, "runtime_metrics_missing", runtime_metric_missing_reason, item.pi_job_id),
+        )
+    recover_error = current.get("pi_last_recover_error")
+    if recover_error and recover_error != prev.get("pi_last_recover_error"):
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=source,
+            level="warning",
+            event_type="pi_recovery_warning",
+            status=item.status,
+            phase=item.phase,
+            message=f"任务项 #{item.sequence_no} 恢复检查告警: {recover_error}",
+            payload={**base_payload, "recover_error": recover_error},
+            dedupe_key=_event_dedupe_key(task.id, item.id, "pi_recovery_warning", recover_error, item.pi_job_id),
+        )
+    conflict_job_id = current.get("pi_conflict_job_id")
+    if conflict_job_id and conflict_job_id != prev.get("pi_conflict_job_id"):
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=source,
+            level="warning",
+            event_type="pi_job_conflict_observed",
+            status=item.status,
+            phase=item.phase,
+            message=f"任务项 #{item.sequence_no} 观测到冲突 job {conflict_job_id}",
+            payload={**base_payload, "conflict_job_id": conflict_job_id},
+            dedupe_key=_event_dedupe_key(task.id, item.id, "pi_job_conflict_observed", conflict_job_id),
+        )
+
+
+def _record_task_status_event(db: Session, task: B2STask, previous_status: str | None) -> None:
+    current_status = str(task.status or "").strip() or None
+    prev_status = str(previous_status or "").strip() or None
+    if not current_status or current_status == prev_status:
+        return
+    _safe_create_task_event(
+        db,
+        task_id=task.id,
+        project_id=task.project_id,
+        source=TASK_EVENT_SOURCE_B2S,
+        event_type="task_status_changed",
+        status=current_status,
+        message=f"任务状态切换为 {current_status}",
+        payload={"previous_status": prev_status, "current_status": current_status},
+        dedupe_key=_event_dedupe_key(task.id, "task_status_changed", prev_status, current_status, task.updated_at),
+    )
 
 
 def _budget_exhausted_action_for_project(db: Session, project_id: str) -> str:
@@ -572,6 +1109,7 @@ async def _recover_stale_pi_job(db: Session, item: B2STaskItem, job: dict, obser
 async def dispatch_item_to_pi(db: Session, item: B2STaskItem, *, owner_id: str) -> bool:
     pi_cfg = get_config().pi_re_agent
     metadata = item.extra_metadata or {}
+    previous = _item_event_snapshot(item)
     worker_url = await choose_pi_worker(db, item.task_id, item.sequence_no)
     metadata["pi_worker_url"] = worker_url
     metadata["pi_endpoint_url"] = worker_url
@@ -586,6 +1124,21 @@ async def dispatch_item_to_pi(db: Session, item: B2STaskItem, *, owner_id: str) 
     item.phase = "queued"
     item.progress = build_item_progress(item, {"status": "queued", "phase": "queued", "progress": {}})
     db.flush()
+    task = db.query(B2STask).filter(B2STask.id == item.task_id).first()
+    if task is not None:
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=TASK_EVENT_SOURCE_B2S,
+            event_type="dispatch_requested",
+            phase=item.phase,
+            status=item.status,
+            message=f"任务项 #{item.sequence_no} 已请求派发到 pi-re-agent",
+            payload={"worker_url": worker_url, "dispatch_attempts": item.dispatch_attempts},
+            dedupe_key=_event_dedupe_key(task.id, item.id, "dispatch_requested", item.dispatch_attempts, worker_url),
+        )
 
     try:
         job = await _submit_or_reuse_pi_job(
@@ -605,6 +1158,28 @@ async def dispatch_item_to_pi(db: Session, item: B2STaskItem, *, owner_id: str) 
         )
         item.dispatch_status = "dispatched"
         _apply_pi_job_to_item(db, item, job, worker_url=worker_url)
+        if task is not None:
+            _record_item_snapshot_events(
+                db,
+                task=task,
+                item=item,
+                previous=previous,
+                source=TASK_EVENT_SOURCE_B2S,
+                payload={"worker_url": worker_url, "dispatch_attempts": item.dispatch_attempts},
+            )
+            _safe_create_task_event(
+                db,
+                task_id=task.id,
+                project_id=task.project_id,
+                item=item,
+                source=TASK_EVENT_SOURCE_B2S,
+                event_type="item_dispatched",
+                phase=item.phase,
+                status=item.status,
+                message=f"任务项 #{item.sequence_no} 已派发到 pi job {item.pi_job_id}",
+                payload={"worker_url": worker_url, "dispatch_attempts": item.dispatch_attempts},
+                dedupe_key=_event_dedupe_key(task.id, item.id, "item_dispatched", item.pi_job_id, item.dispatch_attempts),
+            )
         if item.status == "success":
             get_cache_service().store_success_cache(
                 db,
@@ -626,6 +1201,29 @@ async def dispatch_item_to_pi(db: Session, item: B2STaskItem, *, owner_id: str) 
         if item.status == "failed":
             item.finished_at = now_local()
             get_observability().record_item_finished(item)
+        if task is not None:
+            _record_item_snapshot_events(
+                db,
+                task=task,
+                item=item,
+                previous=previous,
+                source=TASK_EVENT_SOURCE_B2S,
+                payload={"worker_url": worker_url, "dispatch_attempts": item.dispatch_attempts, "error": str(exc)},
+            )
+            _safe_create_task_event(
+                db,
+                task_id=task.id,
+                project_id=task.project_id,
+                item=item,
+                source=TASK_EVENT_SOURCE_B2S,
+                event_type="dispatch_failed" if item.status == "failed" else "dispatch_conflicted",
+                phase=item.phase,
+                status=item.status,
+                level="warning" if item.status == "pending" else "error",
+                message=f"任务项 #{item.sequence_no} 派发失败: {exc}",
+                payload={"worker_url": worker_url, "dispatch_attempts": item.dispatch_attempts, "error": str(exc)},
+                dedupe_key=_event_dedupe_key(task.id, item.id, "dispatch_failed", item.dispatch_attempts, str(exc)),
+            )
         return False
 def _classify_pi_failure(error: str | None) -> str:
     text = str(error or "").lower()
@@ -737,6 +1335,20 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
     task.tags = req.tags
     db.add(task)
     db.flush()
+    _safe_create_task_event(
+        db,
+        task_id=task.id,
+        project_id=task.project_id,
+        event_type="task_created",
+        source=TASK_EVENT_SOURCE_B2S,
+        message=f"任务 {task.name} 已创建",
+        payload={
+            "name": task.name,
+            "task_origin_type": task.task_origin_type,
+            "input_count": len(req.elf_tasks),
+        },
+        dedupe_key=_event_dedupe_key(task.id, "task_created"),
+    )
 
     cfg = get_config()
     pi_cfg = cfg.pi_re_agent
@@ -808,6 +1420,53 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
         refresh_item_function_stats(item, inspect_files=bool(cache_result and cache_result.hit))
         db.add(item)
         db.flush()
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            event_type="item_registered",
+            source=TASK_EVENT_SOURCE_B2S,
+            phase=item.phase,
+            status=item.status,
+            message=f"任务项 #{idx} 已登记: {Path(item.elf_path).name}",
+            payload={
+                "elf_path": item.elf_path,
+                "output_dir": item.output_dir,
+                "mode": job_mode,
+                "engine": job_engine,
+                "cache_hit": bool(cache_result and cache_result.hit),
+            },
+            dedupe_key=_event_dedupe_key(task.id, item.id, "item_registered"),
+        )
+        if cache_result and cache_result.hit:
+            _safe_create_task_event(
+                db,
+                task_id=task.id,
+                project_id=task.project_id,
+                item=item,
+                event_type="cache_hit_applied",
+                source=TASK_EVENT_SOURCE_B2S,
+                phase=item.phase,
+                status=item.status,
+                message=f"任务项 #{idx} 复用已有缓存结果",
+                payload={"cache_key": getattr(cache_result, "cache_key", None)},
+                dedupe_key=_event_dedupe_key(task.id, item.id, "cache_hit_applied"),
+            )
+        else:
+            _safe_create_task_event(
+                db,
+                task_id=task.id,
+                project_id=task.project_id,
+                item=item,
+                event_type="item_queue_prepared",
+                source=TASK_EVENT_SOURCE_B2S,
+                phase=item.phase,
+                status=item.status,
+                message=f"任务项 #{idx} 已进入 B2S 派发队列",
+                payload={"dispatch_clean": bool((item.extra_metadata or {}).get("dispatch_clean"))},
+                dedupe_key=_event_dedupe_key(task.id, item.id, "item_queue_prepared"),
+            )
     recompute_task_status(db, task)
     db.commit()
     db.refresh(task)
@@ -820,11 +1479,29 @@ async def sync_task(db: Session, task: B2STask) -> None:
     previous_status = str(task.status or "")
     items = query_items(db, task.id)
     for item in items:
+        previous = _item_event_snapshot(item)
+        previous_metadata = _item_metadata_event_snapshot(item)
         observed_pi_job_id = str(item.pi_job_id or "").strip() or None
         if not item.pi_job_id and item.status == "queued":
             _queue_item_for_dispatch(item, clean=bool((item.extra_metadata or {}).get("dispatch_clean")))
             item.failure_type = "upstream_lost"
             item.error_reason = "pi-re-agent job id missing; 已回到B2S队列等待重新派发"
+            _safe_create_task_event(
+                db,
+                task_id=task.id,
+                project_id=task.project_id,
+                item=item,
+                source=TASK_EVENT_SOURCE_B2S,
+                level="warning",
+                event_type="missing_job_requeued",
+                phase=item.phase,
+                status=item.status,
+                message=f"任务项 #{item.sequence_no} 丢失 pi job id，已重新回到派发队列",
+                payload={"previous_pi_job_id": observed_pi_job_id},
+                dedupe_key=_event_dedupe_key(task.id, item.id, "missing_job_requeued", observed_pi_job_id, item.dispatch_attempts),
+            )
+            _record_item_snapshot_events(db, task=task, item=item, previous=previous, source=TASK_EVENT_SOURCE_B2S)
+            _record_item_metadata_events(db, task=task, item=item, previous=previous_metadata, source=TASK_EVENT_SOURCE_B2S)
             changed = True
             continue
         if not item.pi_job_id:
@@ -858,6 +1535,20 @@ async def sync_task(db: Session, task: B2STask) -> None:
                 "progress": item.progress or {},
                 "error": str(exc),
             })
+            _safe_create_task_event(
+                db,
+                task_id=task.id,
+                project_id=task.project_id,
+                item=item,
+                source=TASK_EVENT_SOURCE_B2S,
+                level="warning",
+                event_type="sync_observation_failed",
+                phase=item.phase,
+                status=item.status,
+                message=f"任务项 #{item.sequence_no} 同步 pi 状态失败: {exc}",
+                payload={"pi_job_id": observed_pi_job_id, "error": str(exc)},
+                dedupe_key=_event_dedupe_key(task.id, item.id, "sync_observation_failed", observed_pi_job_id, str(exc)),
+            )
             changed = True
             continue
         except Exception as exc:
@@ -880,6 +1571,20 @@ async def sync_task(db: Session, task: B2STask) -> None:
                 "progress": item.progress or {},
                 "error": item.error_reason,
             })
+            _safe_create_task_event(
+                db,
+                task_id=task.id,
+                project_id=task.project_id,
+                item=item,
+                source=TASK_EVENT_SOURCE_B2S,
+                level="warning",
+                event_type="sync_observation_failed",
+                phase=item.phase,
+                status=item.status,
+                message=f"任务项 #{item.sequence_no} 同步 pi 状态异常: {exc}",
+                payload={"pi_job_id": observed_pi_job_id, "error": str(exc)},
+                dedupe_key=_event_dedupe_key(task.id, item.id, "sync_observation_failed", observed_pi_job_id, str(exc)),
+            )
             changed = True
             continue
         if not _sync_observation_is_still_current(db, item, observed_pi_job_id):
@@ -891,9 +1596,12 @@ async def sync_task(db: Session, task: B2STask) -> None:
                     pi_runtime_metric_missing_reason="upstream_missing",
                     pi_runtime_metric_last_checked_at=isoformat_local(now_local()),
                 )
+                _record_item_metadata_events(db, task=task, item=item, previous=previous_metadata, source=TASK_EVENT_SOURCE_PI)
                 changed = True
                 continue
             if _record_pi_runtime_metrics(item, job):
+                _record_item_metadata_events(db, task=task, item=item, previous=previous_metadata, source=TASK_EVENT_SOURCE_PI)
+                _record_item_snapshot_events(db, task=task, item=item, previous=previous, source=TASK_EVENT_SOURCE_PI)
                 changed = True
             continue
         if job is None:
@@ -901,9 +1609,13 @@ async def sync_task(db: Session, task: B2STask) -> None:
             if recovered is not None:
                 job = recovered
             elif item.status == "failed":
+                _record_item_metadata_events(db, task=task, item=item, previous=previous_metadata, source=TASK_EVENT_SOURCE_B2S)
+                _record_item_snapshot_events(db, task=task, item=item, previous=previous, source=TASK_EVENT_SOURCE_B2S)
                 changed = True
                 continue
             elif item.status == "pending":
+                _record_item_metadata_events(db, task=task, item=item, previous=previous_metadata, source=TASK_EVENT_SOURCE_B2S)
+                _record_item_snapshot_events(db, task=task, item=item, previous=previous, source=TASK_EVENT_SOURCE_B2S)
                 changed = True
                 continue
             else:
@@ -924,10 +1636,28 @@ async def sync_task(db: Session, task: B2STask) -> None:
                     pi_last_seen_status="missing",
                     pi_last_seen_at=isoformat_local(now_local()),
                 )
+                _safe_create_task_event(
+                    db,
+                    task_id=task.id,
+                    project_id=task.project_id,
+                    item=item,
+                    source=TASK_EVENT_SOURCE_B2S,
+                    level="warning",
+                    event_type="missing_job_requeued",
+                    phase=item.phase,
+                    status=item.status,
+                    message=f"任务项 #{item.sequence_no} 未找到 pi job，已重新排队",
+                    payload={"previous_pi_job_id": observed_pi_job_id},
+                    dedupe_key=_event_dedupe_key(task.id, item.id, "missing_job_requeued", observed_pi_job_id, item.dispatch_attempts),
+                )
+                _record_item_metadata_events(db, task=task, item=item, previous=previous_metadata, source=TASK_EVENT_SOURCE_B2S)
+                _record_item_snapshot_events(db, task=task, item=item, previous=previous, source=TASK_EVENT_SOURCE_B2S)
                 changed = True
                 continue
             changed = True
         if await _recover_stale_pi_job(db, item, job, observed_pi_job_id):
+            _record_item_metadata_events(db, task=task, item=item, previous=previous_metadata, source=TASK_EVENT_SOURCE_B2S)
+            _record_item_snapshot_events(db, task=task, item=item, previous=previous, source=TASK_EVENT_SOURCE_B2S)
             changed = True
             continue
         new_status = map_pi_status(job.get("status"))
@@ -980,17 +1710,55 @@ async def sync_task(db: Session, task: B2STask) -> None:
         if new_status in TERMINAL and item.finished_at is None:
             item.finished_at = now_local()
             get_observability().record_item_finished(item)
+        _record_item_metadata_events(db, task=task, item=item, previous=previous_metadata, source=TASK_EVENT_SOURCE_PI)
+        _record_item_snapshot_events(
+            db,
+            task=task,
+            item=item,
+            previous=previous,
+            source=TASK_EVENT_SOURCE_PI,
+            payload={"pi_status": job.get("status"), "pi_phase": job.get("phase")},
+        )
         changed = True
     recompute_task_status(db, task)
+    _record_task_status_event(db, task, previous_status)
     if changed or str(task.status or "") != previous_status:
         db.commit()
         db.refresh(task)
 
 
 async def terminate_task(db: Session, task: B2STask) -> None:
+    previous_status = str(task.status or "")
+    _safe_create_task_event(
+        db,
+        task_id=task.id,
+        project_id=task.project_id,
+        source=TASK_EVENT_SOURCE_B2S,
+        level="warning",
+        event_type="task_cancel_requested",
+        status=task.status,
+        message="任务收到手工取消请求",
+        payload={},
+        dedupe_key=_event_dedupe_key(task.id, "task_cancel_requested", task.updated_at),
+    )
     for item in query_items(db, task.id):
+        previous = _item_event_snapshot(item)
         if item.status in TERMINAL:
             continue
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=TASK_EVENT_SOURCE_B2S,
+            level="warning",
+            event_type="item_cancel_requested",
+            phase=item.phase,
+            status=item.status,
+            message=f"任务项 #{item.sequence_no} 收到取消请求",
+            payload={"pi_job_id": item.pi_job_id},
+            dedupe_key=_event_dedupe_key(task.id, item.id, "item_cancel_requested", item.pi_job_id),
+        )
         if item.pi_job_id:
             await get_pi_client(item_pi_worker_url(item)).cancel_job(item.pi_job_id)
         item.status = "cancelled"
@@ -999,7 +1767,9 @@ async def terminate_task(db: Session, task: B2STask) -> None:
         refresh_item_function_stats(item, inspect_files=True)
         item.finished_at = now_local()
         get_observability().record_item_finished(item)
+        _record_item_snapshot_events(db, task=task, item=item, previous=previous, source=TASK_EVENT_SOURCE_B2S)
     recompute_task_status(db, task)
+    _record_task_status_event(db, task, previous_status)
     db.commit()
 
 
@@ -1023,7 +1793,7 @@ def clean_item_output_dir(project_id: str, task_id: str, sequence_no: int, outpu
     return resolved_output
 
 
-async def delete_task(db: Session, task: B2STask) -> None:
+async def delete_task(db: Session, task: B2STask) -> int:
     """Delete a B2S task record and its complete task-id filesystem tree.
 
     Files are stored under ``<project_root>/<app_root_name>/<task_id>``.  Only
@@ -1049,10 +1819,12 @@ async def delete_task(db: Session, task: B2STask) -> None:
             raise ValidationError("B2S任务路径不是目录，拒绝删除")
         shutil.rmtree(task_dir)
 
+    deleted_event_count = clear_task_timeline(db, task)
     for item in items:
         db.delete(item)
     db.delete(task)
     db.commit()
+    return deleted_event_count
 
 
 async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, cancel_running: bool = True) -> None:
@@ -1066,8 +1838,21 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
         raise NotFoundError("任务没有可重跑的任务项")
     selected_provider_key = _restart_llm_provider_key(db, task, items)
     provider = await materialize_llm_provider(selected_provider_key) if get_config().configcenter_service.enabled else None
+    previous_status = str(task.status or "")
+    _safe_create_task_event(
+        db,
+        task_id=task.id,
+        project_id=task.project_id,
+        source=TASK_EVENT_SOURCE_B2S,
+        event_type="task_rerun_requested",
+        status=task.status,
+        message="任务收到全量重跑请求",
+        payload={"clean_output": clean_output, "cancel_running": cancel_running},
+        dedupe_key=_event_dedupe_key(task.id, "task_rerun_requested", task.updated_at),
+    )
 
     for item in items:
+        previous = _item_event_snapshot(item)
         if cancel_running and item.pi_job_id and item.status not in TERMINAL:
             try:
                 await get_pi_client(item_pi_worker_url(item)).cancel_job(item.pi_job_id)
@@ -1078,6 +1863,19 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
 
         if clean_output:
             item.output_dir = str(clean_item_output_dir(task.project_id, task.id, item.sequence_no, item.output_dir))
+            _safe_create_task_event(
+                db,
+                task_id=task.id,
+                project_id=task.project_id,
+                item=item,
+                source=TASK_EVENT_SOURCE_B2S,
+                event_type="output_cleaned",
+                phase=item.phase,
+                status=item.status,
+                message=f"任务项 #{item.sequence_no} 输出目录已清空",
+                payload={"output_dir": item.output_dir},
+                dedupe_key=_event_dedupe_key(task.id, item.id, "output_cleaned", task.updated_at),
+            )
 
         metadata = item.extra_metadata or {}
         metadata.pop("pi_worker_url", None)
@@ -1090,8 +1888,23 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
             metadata["llm_provider_type"] = str(provider.get("provider_type") or "").strip() or None
         item.extra_metadata = metadata
         _queue_item_for_dispatch(item, clean=True, fresh_pi_job=True)
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=TASK_EVENT_SOURCE_B2S,
+            event_type="item_requeued",
+            phase=item.phase,
+            status=item.status,
+            message=f"任务项 #{item.sequence_no} 已重新排队等待重跑",
+            payload={"reason": "rerun"},
+            dedupe_key=_event_dedupe_key(task.id, item.id, "item_requeued", "rerun", item.extra_metadata.get("pi_idempotency_key")),
+        )
+        _record_item_snapshot_events(db, task=task, item=item, previous=previous, source=TASK_EVENT_SOURCE_B2S, payload={"reason": "rerun"})
         db.flush()
     recompute_task_status(db, task)
+    _record_task_status_event(db, task, previous_status)
     db.commit()
     get_observability().record_retry("rerun", len(items))
 
@@ -1103,9 +1916,22 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
         raise NotFoundError("未找到可重试的任务项")
     selected_provider_key = _restart_llm_provider_key(db, task, selected)
     provider = await materialize_llm_provider(selected_provider_key) if get_config().configcenter_service.enabled else None
+    previous_status = str(task.status or "")
+    _safe_create_task_event(
+        db,
+        task_id=task.id,
+        project_id=task.project_id,
+        source=TASK_EVENT_SOURCE_B2S,
+        event_type="task_retry_requested",
+        status=task.status,
+        message="任务收到失败项重试请求",
+        payload={"item_ids": item_ids or []},
+        dedupe_key=_event_dedupe_key(task.id, "task_retry_requested", json.dumps(sorted(item_ids or []), ensure_ascii=False), task.updated_at),
+    )
     for item in selected:
         if item.status not in {"failed", "cancelled"}:
             continue
+        previous = _item_event_snapshot(item)
         metadata = item.extra_metadata or {}
         metadata.pop("pi_worker_url", None)
         metadata.pop("pi_endpoint_url", None)
@@ -1117,7 +1943,22 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
             metadata["llm_provider_type"] = str(provider.get("provider_type") or "").strip() or None
         item.extra_metadata = metadata
         _queue_item_for_dispatch(item, clean=True, fresh_pi_job=True)
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=TASK_EVENT_SOURCE_B2S,
+            event_type="item_requeued",
+            phase=item.phase,
+            status=item.status,
+            message=f"任务项 #{item.sequence_no} 已重新排队等待重试",
+            payload={"reason": "retry"},
+            dedupe_key=_event_dedupe_key(task.id, item.id, "item_requeued", "retry", item.extra_metadata.get("pi_idempotency_key")),
+        )
+        _record_item_snapshot_events(db, task=task, item=item, previous=previous, source=TASK_EVENT_SOURCE_B2S, payload={"reason": "retry"})
     recompute_task_status(db, task)
+    _record_task_status_event(db, task, previous_status)
     db.commit()
     get_observability().record_retry("retry", len(selected))
 
@@ -1673,6 +2514,7 @@ def build_task_detail(db: Session, task: B2STask) -> TaskDetailResponse:
         agent_runtime_summary=build_agent_runtime_summary(raw_items),
         result_summary=build_task_result_summary(raw_items),
         observability_summary=build_task_observability_summary(raw_items),
+        event_summary=_build_task_event_summary(db, task.id),
     )
 
 
@@ -2338,7 +3180,7 @@ def build_task_session_index(items: list[B2STaskItem]) -> SessionIndexResponse:
             for run in advanced.runs:
                 for session in run.agent_sessions:
                     nodes.append(SessionIndexNode(
-                        node_id=f"{item.id}:{hashlib.md5(session.path.encode('utf-8')).hexdigest()[:12]}",
+                        node_id=_session_node_id(item.id, session.path),
                         item_id=item.id,
                         sequence_no=item.sequence_no,
                         item_name=item_name,
@@ -2370,33 +3212,81 @@ def build_task_session_index(items: list[B2STaskItem]) -> SessionIndexResponse:
     )
 
 
-def build_task_session_file(items: list[B2STaskItem], relative_path: str, offset: int = 0, limit: int = ADVANCED_MAX_BYTES) -> SessionFileResponse:
+def _session_node_id(item_id: str, session_path: str) -> str:
+    return f"{item_id}:{hashlib.md5(session_path.encode('utf-8')).hexdigest()[:12]}"
+
+
+def build_task_session_file(
+    items: list[B2STaskItem],
+    relative_path: str,
+    offset: int = 0,
+    limit: int = ADVANCED_MAX_BYTES,
+    item_id: str | None = None,
+    node_id: str | None = None,
+) -> SessionFileResponse:
     normalized = str(relative_path or "").replace("\\", "/").lstrip("/")
     if not normalized:
         raise NotFoundError("会话文件路径不能为空")
-    for item in items:
-        candidate = Path(item.output_dir).joinpath(normalized).resolve()
-        try:
-            candidate.relative_to(Path(item.output_dir).resolve())
-        except Exception:
-            continue
-        if not candidate.is_file():
-            continue
-        size = candidate.stat().st_size
+    scoped_items = items
+    if item_id:
+        scoped_items = [item for item in items if item.id == item_id]
+        if not scoped_items:
+            raise NotFoundError("会话文件所属 item 不存在")
+
+    matched_item: B2STaskItem | None = None
+    matched_file: Path | None = None
+
+    if node_id:
+        for item in scoped_items:
+            advanced = build_task_item_advanced(item, include_content=False)
+            for run in advanced.runs:
+                for session in run.agent_sessions:
+                    current_node_id = _session_node_id(item.id, session.path)
+                    current_rel_path = _session_relative_to_output(item, session.path)
+                    if current_node_id != node_id:
+                        continue
+                    if current_rel_path != normalized:
+                        raise NotFoundError("会话节点与路径不匹配")
+                    matched_item = item
+                    matched_file = Path(session.path)
+                    break
+                if matched_file:
+                    break
+            if matched_file:
+                break
+        if not matched_file:
+            raise NotFoundError("会话节点不存在")
+    else:
+        for item in scoped_items:
+            candidate = Path(item.output_dir).joinpath(normalized).resolve()
+            try:
+                candidate.relative_to(Path(item.output_dir).resolve())
+            except Exception:
+                continue
+            if not candidate.is_file():
+                continue
+            matched_item = item
+            matched_file = candidate
+            break
+
+    if matched_item and matched_file:
+        size = matched_file.stat().st_size
         safe_offset = max(0, int(offset or 0))
         safe_limit = max(1, min(int(limit or ADVANCED_MAX_BYTES), ADVANCED_MAX_BYTES))
-        with candidate.open("rb") as fp:
+        with matched_file.open("rb") as fp:
             fp.seek(safe_offset)
             raw = fp.read(safe_limit + 1)
         truncated = len(raw) > safe_limit
         content = raw[:safe_limit].decode("utf-8", errors="replace")
         next_offset = safe_offset + safe_limit if truncated or safe_offset + len(raw[:safe_limit]) < size else None
-        suffix = candidate.suffix.lower()
+        suffix = matched_file.suffix.lower()
         mime_type = "application/json" if suffix in {".json", ".jsonl"} else "text/markdown" if suffix == ".md" else "text/plain"
         return SessionFileResponse(
-            task_id=item.task_id,
+            task_id=matched_item.task_id,
+            node_id=_session_node_id(matched_item.id, str(matched_file)),
+            item_id=matched_item.id,
             relative_path=normalized,
-            full_path=str(candidate),
+            full_path=str(matched_file),
             size=size,
             content=content,
             truncated=bool(next_offset),
@@ -2887,29 +3777,46 @@ def build_overall_progress(items: list[B2STaskItem]) -> B2SOverallProgress:
     total_batches = 0
     completed_batches = 0
     has_functions = has_bytes = has_batches = False
+    function_coverage_items = 0
+    byte_coverage_items = 0
+    batch_coverage_items = 0
     for item in items:
         phase = item.phase or (item.progress or {}).get("phase") or item.status
         phase_summary[phase] = phase_summary.get(phase, 0) + 1
         progress = item.progress or {}
         if progress.get("total_functions") is not None:
             has_functions = True
+            function_coverage_items += 1
             total_functions += int(progress.get("total_functions") or 0)
             completed_functions += int(progress.get("completed_functions") or 0)
         if progress.get("total_bytes") is not None:
             has_bytes = True
+            byte_coverage_items += 1
             total_bytes += int(progress.get("total_bytes") or 0)
             completed_bytes += int(progress.get("completed_bytes") or 0)
         if progress.get("total_batches") is not None:
             has_batches = True
+            batch_coverage_items += 1
             total_batches += int(progress.get("total_batches") or 0)
             completed_batches += int(progress.get("completed_batches") or 0)
-    percent = _safe_percent(completed_functions, total_functions) if has_functions else None
-    if percent is None and has_batches:
+    percent = None
+    percent_basis = None
+    if has_functions and function_coverage_items == total_items:
+        percent = _safe_percent(completed_functions, total_functions)
+        if percent is not None:
+            percent_basis = "functions"
+    if percent is None and has_batches and batch_coverage_items == total_items:
         percent = _safe_percent(completed_batches, total_batches)
-    if percent is None and has_bytes:
+        if percent is not None:
+            percent_basis = "batches"
+    if percent is None and has_bytes and byte_coverage_items == total_items:
         percent = _safe_percent(completed_bytes, total_bytes)
+        if percent is not None:
+            percent_basis = "bytes"
     if percent is None:
         percent = _safe_percent(completed_items, total_items)
+        if percent is not None:
+            percent_basis = "items"
     return B2SOverallProgress(
         total_items=total_items,
         completed_items=completed_items,
@@ -2920,5 +3827,6 @@ def build_overall_progress(items: list[B2STaskItem]) -> B2SOverallProgress:
         total_batches=total_batches if has_batches else None,
         completed_batches=completed_batches if has_batches else None,
         percent=percent,
+        percent_basis=percent_basis,
         phase_summary=phase_summary,
     )

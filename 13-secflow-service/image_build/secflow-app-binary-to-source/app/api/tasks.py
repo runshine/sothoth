@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.exception import NotFoundError, UnauthorizedError, ValidationError
 from app.model import B2STask, get_db
-from app.schemas import ActionResponse, B2SArtifactContentResponse, B2SCacheBatchDeleteRequest, B2SCacheBatchDeleteResponse, B2SCacheDeleteResponse, B2SCacheDetailResponse, B2SCacheListResponse, B2SServiceConfig, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, SessionFileResponse, SessionIndexResponse, TaskBatchDeleteItemResult, TaskBatchDeleteRequest, TaskBatchDeleteResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskListResponse, TaskObservabilitySummary, TaskPrepareResponse, TaskRelationshipResponse, TaskResponse, TaskResultSummary, TokenUser
+from app.schemas import ActionResponse, B2SArtifactContentResponse, B2SCacheBatchDeleteRequest, B2SCacheBatchDeleteResponse, B2SCacheDeleteResponse, B2SCacheDetailResponse, B2SCacheListResponse, B2SServiceConfig, B2STaskTimelineResponse, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, SessionFileResponse, SessionIndexResponse, TaskBatchDeleteItemResult, TaskBatchDeleteRequest, TaskBatchDeleteResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskListResponse, TaskObservabilitySummary, TaskPrepareResponse, TaskRelationshipResponse, TaskResponse, TaskResultSummary, TokenUser
 from app.service.auth import get_auth_service
 from app.service.cache_service import get_cache_service
 from app.service.configcenter import get_configcenter_client
@@ -32,8 +32,10 @@ from app.service.task_service import (
     build_task_response,
     create_task,
     delete_task,
+    delete_task_timeline_event,
     get_task_item_or_404,
     get_task_or_404,
+    get_task_timeline,
     query_items,
     retry_task,
     rerun_task,
@@ -41,6 +43,7 @@ from app.service.task_service import (
     sync_task,
     generate_task_id,
     terminate_task,
+    clear_task_timeline,
 )
 
 router = APIRouter(prefix="/api/app/binary-to-source", tags=["binary-to-source"])
@@ -341,6 +344,45 @@ async def get_b2s_task(
     return build_task_detail(db, task)
 
 
+@router.get("/projects/{project_id}/tasks/{task_id}/timeline", response_model=B2STaskTimelineResponse)
+async def get_b2s_task_timeline(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    await sync_task(db, task)
+    return get_task_timeline(db, task)
+
+
+@router.delete("/projects/{project_id}/tasks/{task_id}/timeline", response_model=ActionResponse)
+async def clear_b2s_task_timeline(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    deleted_event_count = clear_task_timeline(db, task)
+    db.commit()
+    return ActionResponse(status="ok", task_id=task_id, message="任务时间线已清空", deleted_event_count=deleted_event_count)
+
+
+@router.delete("/projects/{project_id}/tasks/{task_id}/timeline/{event_id}", response_model=ActionResponse)
+async def delete_b2s_task_timeline_event(
+    project_id: str,
+    task_id: str,
+    event_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    deleted_event_count = delete_task_timeline_event(db, task, event_id)
+    db.commit()
+    return ActionResponse(status="ok", task_id=task_id, message="事件已删除", deleted_event_count=deleted_event_count)
+
+
 @router.get("/projects/{project_id}/tasks/{task_id}/sessions", response_model=SessionIndexResponse)
 async def get_b2s_task_sessions(
     project_id: str,
@@ -358,6 +400,8 @@ async def get_b2s_task_session_file(
     project_id: str,
     task_id: str,
     path: str = Query(...),
+    item_id: str | None = Query(None),
+    node_id: str | None = Query(None),
     offset: int = Query(0, ge=0),
     limit: int = Query(512 * 1024, ge=1, le=512 * 1024),
     _: TokenUser = Depends(get_current_context),
@@ -366,7 +410,7 @@ async def get_b2s_task_session_file(
     task = get_task_or_404(db, project_id, task_id)
     await sync_task(db, task)
     items = query_items(db, task.id)
-    return build_task_session_file(items, path, offset=offset, limit=limit)
+    return build_task_session_file(items, path, offset=offset, limit=limit, item_id=item_id, node_id=node_id)
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/relationships", response_model=TaskRelationshipResponse)
@@ -488,8 +532,8 @@ async def delete_b2s_task(
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    await delete_task(db, task)
-    return ActionResponse(status="ok", task_id=task_id, message="任务及文件已删除")
+    deleted_event_count = int((await delete_task(db, task)) or 0)
+    return ActionResponse(status="ok", task_id=task_id, message="任务及文件已删除", deleted_event_count=deleted_event_count)
 
 
 @router.post("/projects/{project_id}/tasks/batch-delete", response_model=TaskBatchDeleteResponse)
@@ -513,17 +557,19 @@ async def batch_delete_b2s_tasks(
             results.append(TaskBatchDeleteItemResult(task_id=task_id, status="failed", message="任务不存在"))
             continue
         try:
-            await delete_task(db, task)
-            results.append(TaskBatchDeleteItemResult(task_id=task_id, status="ok", message="任务及文件已删除"))
+            deleted_event_count = int((await delete_task(db, task)) or 0)
+            results.append(TaskBatchDeleteItemResult(task_id=task_id, status="ok", message="任务及文件已删除", deleted_event_count=deleted_event_count))
         except Exception as exc:
             db.rollback()
             results.append(TaskBatchDeleteItemResult(task_id=task_id, status="failed", message=str(exc)))
     deleted_count = sum(1 for item in results if item.status == "ok")
     failed_count = len(results) - deleted_count
+    deleted_event_count = sum(int(item.deleted_event_count or 0) for item in results)
     return TaskBatchDeleteResponse(
         status="ok" if failed_count == 0 else "partial",
         deleted_count=deleted_count,
         failed_count=failed_count,
+        deleted_event_count=deleted_event_count,
         results=results,
     )
 

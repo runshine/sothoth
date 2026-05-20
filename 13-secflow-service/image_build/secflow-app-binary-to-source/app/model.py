@@ -6,7 +6,7 @@ import json
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import BigInteger, Column, DateTime, Integer, String, Text, create_engine, inspect
+from sqlalchemy import BigInteger, Column, DateTime, Integer, String, Text, UniqueConstraint, create_engine, inspect
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import get_config
@@ -149,6 +149,40 @@ class B2SAnalysisCache(Base):
     created_at = Column(DateTime, default=now_local, nullable=False)
     updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
     expires_at = Column(DateTime, nullable=True, index=True)
+
+
+class B2STaskEvent(Base):
+    __tablename__ = "secflow_b2s_task_event"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_secflow_b2s_task_event_dedupe_key"),
+    )
+
+    id = Column(String(32), primary_key=True)
+    task_id = Column(String(32), nullable=False, index=True)
+    project_id = Column(String(64), nullable=False, index=True)
+    item_id = Column(String(32), nullable=True, index=True)
+    sequence_no = Column(Integer, nullable=True, index=True)
+    pi_job_id = Column(String(64), nullable=True, index=True)
+    source = Column(String(32), nullable=False, default="b2s", index=True)
+    level = Column(String(16), nullable=False, default="info", index=True)
+    event_type = Column(String(64), nullable=False, index=True)
+    phase = Column(String(32), nullable=True, index=True)
+    batch_id = Column(Integer, nullable=True, index=True)
+    attempt = Column(Integer, nullable=True)
+    function_name = Column(String(255), nullable=True)
+    status = Column(String(32), nullable=True, index=True)
+    message = Column(Text, nullable=False)
+    payload_json = Column(Text, nullable=True)
+    dedupe_key = Column(String(255), nullable=False, unique=True)
+    created_at = Column(DateTime, default=now_local, nullable=False, index=True)
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        return _loads(self.payload_json, {})
+
+    @payload.setter
+    def payload(self, value: dict[str, Any] | None) -> None:
+        self.payload_json = json.dumps(value or {}, ensure_ascii=False)
 
 
 def _loads(raw: Optional[str], default: Any) -> Any:
