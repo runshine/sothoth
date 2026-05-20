@@ -3475,6 +3475,7 @@ class TaskManager:
         operation_token: str | None = None
         action: str | None = None
         heartbeat_task: asyncio.Task | None = None
+        lease_heartbeat_task: asyncio.Task | None = None
         try:
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
             if (
@@ -3496,6 +3497,10 @@ class TaskManager:
             heartbeat_task = asyncio.create_task(
                 self._task_operation_lease_heartbeat(task.id, token=operation_token, operation=action),
                 name=f"binary-security-operation-lock-{task.id}",
+            )
+            lease_heartbeat_task = asyncio.create_task(
+                self._task_preparing_lease_heartbeat(task.id),
+                name=f"binary-security-preparing-lease-{task.id}",
             )
             target_stage = str(task.current_stage or "").strip() or None
             started_event = "task_continue_prepare_started" if action == TASK_ACTION_CONTINUE else "task_retry_prepare_started"
@@ -3603,6 +3608,9 @@ class TaskManager:
                 )
                 db.commit()
         finally:
+            if lease_heartbeat_task is not None:
+                lease_heartbeat_task.cancel()
+                await asyncio.gather(lease_heartbeat_task, return_exceptions=True)
             if heartbeat_task is not None:
                 heartbeat_task.cancel()
                 await asyncio.gather(heartbeat_task, return_exceptions=True)
@@ -4070,6 +4078,8 @@ class TaskManager:
 
     def _apply_stage_worker_start_requested_locked(self, db: Session, event: BinarySecurityStateEvent) -> None:
         payload = dict(event.payload or {})
+        if payload.get("stage_start_applied"):
+            return
         stage_name = str(event.stage_name or payload.get("stage_name") or "").strip()
         task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == event.task_id).first()
         if task is None or not stage_name:
@@ -4087,6 +4097,12 @@ class TaskManager:
         elif bool(payload.get("task_retry_mode")) and existing_stage_items:
             self._record_event(db, task, "stage_retry_started", f"阶段开始安全续跑: {stage_name}", stage_name=stage_name, payload={"state_event_id": event.id})
         self._record_event(db, task, "stage_started", f"阶段开始: {stage_name}", stage_name=stage_name, payload={"state_event_id": event.id})
+        event.payload = {
+            **payload,
+            "stage_start_applied": True,
+            "stage_start_applied_at": _now().isoformat(),
+            "stage_start_applied_by": self.instance_id,
+        }
 
     async def _apply_stage_worker_terminal_event_locked(self, db: Session, event: BinarySecurityStateEvent) -> None:
         payload = dict(event.payload or {})
@@ -6586,6 +6602,36 @@ class TaskManager:
                 logger.warning("binary-security operation lock lost: task=%s operation=%s", task_id, operation)
                 return
 
+    def _touch_task_preparing_heartbeat(self, task_id: str) -> None:
+        now = _now()
+        session = get_session_factory()()
+        try:
+            lease_expires_at = self._next_lease_expiry(session, now_value=now)
+            session.query(BinarySecurityTask).filter(
+                BinarySecurityTask.id == task_id,
+                BinarySecurityTask.status.in_(list(TASK_PREPARING_STATUSES)),
+                BinarySecurityTask.dispatcher_instance_id == self.instance_id,
+            ).update(
+                {
+                    BinarySecurityTask.updated_at: now,
+                    BinarySecurityTask.lease_expires_at: lease_expires_at,
+                },
+                synchronize_session=False,
+            )
+            session.commit()
+        finally:
+            session.close()
+
+    async def _task_preparing_lease_heartbeat(self, task_id: str) -> None:
+        interval_seconds = max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15))
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                await asyncio.to_thread(self._touch_task_preparing_heartbeat, task_id)
+            except Exception:
+                logger.exception("binary-security preparing lease heartbeat failed: task=%s", task_id)
+                return
+
     @contextmanager
     def _task_operation_lock(self, db: Session, task_id: str, *, operation: str, ttl_seconds: int = TASK_OPERATION_LOCK_TTL_SECONDS):
         token = self._acquire_task_operation_lease(db, task_id, operation=operation, ttl_seconds=ttl_seconds)
@@ -8269,6 +8315,7 @@ class TaskManager:
         )
 
     def _refresh_task_status_after_sync(self, db: Session, task: BinarySecurityTask) -> None:
+        current_status = str(task.status or "").strip()
         if task.status == "cancelled":
             self._invalidate_task_execution(task)
             task.finished_at = task.finished_at or _now()
@@ -8284,6 +8331,8 @@ class TaskManager:
             task.status = _preparing_status_for_action(pending_action)
             task.finished_at = None
             task.last_error = None
+            if current_status in TASK_PREPARING_STATUSES and str(task.dispatcher_instance_id or "").strip():
+                return
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
             task.lease_expires_at = None
@@ -10895,7 +10944,10 @@ class TaskManager:
                     module.get("source_root") or module.get("unpacked_root") or module["source_dir"],
                     _downstream_origin_payload(task, item),
                 )
-            item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+            created_task_id = str(created.get("task_id") or "").strip()
+            current_downstream_task_id = str(item.downstream_task_id or "").strip()
+            if created_task_id and (not current_downstream_task_id or current_downstream_task_id == created_task_id):
+                item.downstream_task_id = created_task_id
             session.commit()
             status, payload = await self._poll_until_terminal(
                 lambda: get_entry_analyse_client().get_task(item.downstream_task_id, token or ""),

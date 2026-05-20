@@ -517,6 +517,52 @@ class TaskManagerTests(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_stage_worker_start_event_is_idempotent_for_same_state_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = create_engine("sqlite:///:memory:")
+            Base.metadata.create_all(engine)
+            SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+            db = SessionLocal()
+            try:
+                task = BinarySecurityTask(
+                    id="t1",
+                    project_id="p1",
+                    name="source",
+                    status="running",
+                    task_type=TASK_TYPE_SOURCE,
+                    current_stage="system_analysis",
+                    firmware_source="project_filesystem",
+                    firmware_path="/src",
+                    output_root=str(Path(tmp) / "output"),
+                    workspace_root=tmp,
+                    started_at=_now(),
+                )
+                db.add(task)
+                event = BinarySecurityStateEvent(
+                    id="sev-start",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_name="entry_analysis",
+                    event_type="stage_worker_start_requested",
+                    idempotency_key="sev-start",
+                    status="processing",
+                    available_at=_now(),
+                )
+                event.payload = {"stage_name": "entry_analysis", "task_retry_mode": False, "stage_retry_mode": True, "target_stage_name": "entry_analysis"}
+                db.add(event)
+                db.commit()
+
+                self.manager._apply_stage_worker_start_requested_locked(db, event)
+                self.manager._apply_stage_worker_start_requested_locked(db, event)
+                db.commit()
+
+                task_events = db.query(BinarySecurityEvent).filter(BinarySecurityEvent.task_id == "t1").all()
+                self.assertEqual(1, sum(1 for row in task_events if row.event_type == "stage_started"))
+                self.assertEqual(1, sum(1 for row in task_events if row.event_type == "stage_retry_started"))
+                self.assertTrue(db.query(BinarySecurityStateEvent).filter(BinarySecurityStateEvent.id == "sev-start").first().payload.get("stage_start_applied"))
+            finally:
+                db.close()
+
     def test_stage_worker_terminal_event_creates_missing_stage_run_in_reducer(self):
         with tempfile.TemporaryDirectory() as tmp:
             engine = create_engine("sqlite:///:memory:")
@@ -1579,6 +1625,8 @@ class TaskManagerTests(unittest.TestCase):
                 "action_dispatch": True,
                 "archive_dispatch": False,
                 "downstream_reconcile": True,
+                "state_reducer": False,
+                "reducer_metrics_snapshot": False,
             },
             status["loops"],
         )
@@ -2728,6 +2776,32 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("retry_preparing", task.status)
         self.assertEqual("retry", task.pending_action)
         self.assertIsNone(task.finished_at)
+
+    def test_refresh_task_status_after_sync_keeps_preparing_dispatch_ownership(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="retry_preparing",
+            pending_action="retry_stage_full",
+            current_stage="entry_analysis",
+            dispatcher_instance_id="worker-a",
+            dispatch_started_at=_now(),
+            lease_expires_at=_now() + timedelta(seconds=30),
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        db = _ModelAwareDb(tasks=[task])
+
+        self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual("retry_preparing", task.status)
+        self.assertEqual("worker-a", task.dispatcher_instance_id)
+        self.assertIsNotNone(task.dispatch_started_at)
+        self.assertIsNotNone(task.lease_expires_at)
 
     def test_continue_task_starts_after_last_successful_stage(self):
         workspace = Path(tempfile.mkdtemp())
