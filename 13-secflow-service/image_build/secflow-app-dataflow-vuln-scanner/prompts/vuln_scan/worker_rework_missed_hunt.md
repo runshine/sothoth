@@ -20,8 +20,6 @@
 
 {convergence_requirements}
 
-## 已有漏洞与变体参考
-{missed_hunt_variant_seeds}
 
 ## 深挖方法
 1. 沿 `攻击者可控输入/状态 -> 传播 -> 校验 -> sink/危险操作 -> 影响` 重新审计。

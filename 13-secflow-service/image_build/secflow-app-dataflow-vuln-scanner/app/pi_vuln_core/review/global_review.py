@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import re
 from pathlib import Path
 from typing import Any
 
@@ -31,17 +30,16 @@ from app.pi_vuln_core.review.advisor_runtime_retry import (
     retry_session_hint,
     review_runtime_retry_limit,
 )
-from app.pi_vuln_core.review.previous_limitations import (
-    load_previous_limitations,
-)
 from app.pi_vuln_core.review.read_only_guard import (
     diff_read_only_snapshots,
     format_read_only_violations,
     take_read_only_snapshot,
 )
+from app.pi_vuln_core.review.previous_limitations import (
+    load_previous_limitations,
+)
 from app.pi_vuln_core.review.profile import (
     format_review_profile_policy,
-    get_review_profile_policy,
 )
 from app.pi_vuln_core.review.state import ReviewState, GlobalReviewRecord
 from app.pi_vuln_core.utils.file_ops import read_file, read_json, write_json
@@ -73,41 +71,6 @@ _KNOWN_SCORE_KEYS: tuple[str, ...] = (
 )
 
 _GLOBAL_REVIEW_SCHEMA_REPAIR_LIMIT = 2
-
-_PROFILE_PATTERN_FAMILY_LABELS: dict[str, str] = {
-    "memory_safety": "memory_safety/内存安全",
-    "integer_safety": "integer_safety/整数安全",
-    "input_validation": "input_validation/输入校验",
-    "logic_state": "logic_state/逻辑状态",
-    "resource_lifetime": "resource_lifetime/资源生命周期",
-    "concurrency_timing": "concurrency_timing/并发时序",
-}
-
-_PROFILE_PATTERN_FAMILY_PATTERNS: dict[str, re.Pattern[str]] = {
-    "memory_safety": re.compile(
-        r"(?i)(内存安全|越界|缓冲区|堆|栈|use[- ]?after[- ]?free|uaf|"
-        r"double[- ]?free|buffer|memcpy|memset|copy|overflow)"
-    ),
-    "integer_safety": re.compile(
-        r"(?i)(整数|溢出|下溢|截断|回绕|符号|signed|unsigned|integer|"
-        r"underflow|wrap|truncate|RAW_U(?:8|16|32|64)|长度)"
-    ),
-    "input_validation": re.compile(
-        r"(?i)(输入校验|输入验证|合法性|边界值|绕过|校验|validation|"
-        r"sanitize|sanitise|check|boundary)"
-    ),
-    "logic_state": re.compile(
-        r"(?i)(逻辑|状态机|状态|分支|路径|条件|绕过|state|logic|"
-        r"state machine|bypass)"
-    ),
-    "resource_lifetime": re.compile(
-        r"(?i)(资源|生命周期|泄漏|释放|引用计数|malloc|free|fd|"
-        r"resource|lifetime|leak|cleanup)"
-    ),
-    "concurrency_timing": re.compile(
-        r"(?i)(并发|竞争|时序|锁|TOCTOU|race|concurr|timing|lock)"
-    ),
-}
 
 
 class GlobalReviewExecutor:
@@ -157,7 +120,7 @@ class GlobalReviewExecutor:
         review_profile = (
             engine_config.review_profile if engine_config is not None else "fast"
         )
-        review_context = self._build_review_context_text(
+        prompt_context = self._build_review_context_text(
             task_file=task_file,
             summary_file=summary_file,
             results_dir=results_dir,
@@ -201,7 +164,7 @@ class GlobalReviewExecutor:
                 advisor_def=advisor_def,
                 index=index,
                 total_advisors=len(active_advisors),
-                review_context=review_context,
+                prompt_context=prompt_context,
                 task_file=task_file,
                 results_dir=results_dir,
                 work_dir=work_dir,
@@ -351,7 +314,7 @@ class GlobalReviewExecutor:
         advisor_def: AdvisorInstanceDef,
         index: int,
         total_advisors: int,
-        review_context: dict[str, str],
+        prompt_context: dict[str, str],
         task_file: str,
         results_dir: str,
         work_dir: str,
@@ -379,13 +342,13 @@ class GlobalReviewExecutor:
             workflow_mode=review_state.workflow_mode,
             current_issue_count=str(len(review_state.get_recent_issues(last_n=2))),
             task_file=task_file,
-            summary_file=review_context["summary_file"],
+            summary_file=prompt_context["summary_file"],
             results_dir=results_dir,
-            supporting_docs_dir=review_context["supporting_docs_dir"],
-            previous_limitations_file=review_context["previous_limitations_file"],
-            result_relations_manifest_file=review_context["result_relations_manifest_file"],
-            results_manifest_file=review_context["results_manifest_file"],
-            review_context=review_context["context_text"],
+            supporting_docs_dir=prompt_context["supporting_docs_dir"],
+            previous_limitations_file=prompt_context["previous_limitations_file"],
+            result_relations_manifest_file=prompt_context["result_relations_manifest_file"],
+            results_manifest_file=prompt_context["results_manifest_file"],
+            review_context=prompt_context["context_text"],
             advisor_instance_id=advisor_def.instance_id,
             advisor_role_name=advisor_def.role_name,
             current_global_review_index=str(index),
@@ -412,10 +375,8 @@ class GlobalReviewExecutor:
             "global_review_start",
             advisor=advisor_def.instance_id,
             cycle=cycle,
-                summary_file=review_context["summary_file"],
-                result_relations_manifest_file=review_context["result_relations_manifest_file"],
-                results_manifest_file=review_context["results_manifest_file"],
-            )
+            summary_file=prompt_context["summary_file"],
+        )
         response = None
         guard_before = None
         early_violations: list[str] = []
@@ -565,7 +526,7 @@ class GlobalReviewExecutor:
                 session_id=session_id,
                 system_prompt=system_prompt,
                 working_dir=work_dir,
-                review_context_hint=review_context["repair_hint"],
+                review_context_hint=prompt_context["repair_hint"],
                 initial_response_content=response.content or "",
                 required_score_keys=required_score_keys,
             )
@@ -852,37 +813,6 @@ class GlobalReviewExecutor:
             f"`{key}`" for key in cls._required_score_keys_for_advisor(advisor_def)
         )
 
-    @staticmethod
-    def _format_prior_advisor_findings(prior_outcomes: list[dict[str, object]]) -> str:
-        if not prior_outcomes:
-            return "(本轮暂无已完成的上游全局评审结果)"
-
-        lines: list[str] = []
-        for item in prior_outcomes:
-            advisor_id = str(item.get("advisor_id") or "")
-            role_name = str(item.get("role_name") or advisor_id)
-            passed = bool(item.get("passed"))
-            feedback = str(item.get("feedback") or "").strip().replace("\n", " ")
-            if len(feedback) > 260:
-                feedback = feedback[:260] + "..."
-            resolved = [str(v).strip() for v in (item.get("resolved_issue_ids") or []) if str(v).strip()]
-            issues = item.get("issues") or []
-
-            lines.append(f"- [{advisor_id}] {role_name}: {'PASS' if passed else 'FAIL'}")
-            if feedback:
-                lines.append(f"  - feedback_preview: {feedback}")
-            if resolved:
-                lines.append(f"  - resolved_issues: {', '.join(resolved)}")
-            if issues:
-                issue_ids = [
-                    ReviewState.prompt_safe_issue_id(issue.get('id') or '')
-                    for issue in issues
-                    if str(issue.get('id') or '').strip()
-                ]
-                if issue_ids:
-                    lines.append(f"  - issues: {', '.join(issue_ids)}")
-        return "\n".join(lines)
-
     def _build_review_context_text(
         self,
         *,
@@ -907,7 +837,6 @@ class GlobalReviewExecutor:
         previous_limitations, previous_meta = self._load_previous_limitations(work_dir, cycle)
         result_relations_manifest_file = Path(work_dir) / "_meta" / "result_relations_manifest.json"
         results_manifest_file = results_manifest_path(work_dir)
-        # 轻量反馈链：注入最近轮次的评审反馈，同时保留 active issue backlog。
         recent_feedback = self._format_recent_review_feedback(review_state, cycle)
         open_issue_backlog = review_state.format_open_issue_backlog(max_items=12)
         final_results = final_selection.get("final_results") or []
@@ -952,8 +881,6 @@ class GlobalReviewExecutor:
             f"- 未通过: {', '.join(sorted(failed_results)) if failed_results else '(无)'}",
             f"- 待评审: {', '.join(pending_results) if pending_results else '(无)'}",
             f"- 辅助文档: {', '.join(supporting_docs) if supporting_docs else '(无)'}",
-        ])
-        lines.extend([
             "",
             format_review_profile_policy(review_profile, compact=True),
         ])
@@ -989,7 +916,6 @@ class GlobalReviewExecutor:
                 "## 上一轮“局限性与未覆盖区域”章节（用于核对是否被静默删除）",
                 previous_limitations.strip(),
             ])
-
         repair_hint = (
             f"task=`{task_file}`, summary=`{summary_file}`, results_dir=`{results_dir}`, "
             f"supporting_docs_dir=`{supporting_docs_dir}`, previous_limitations_source={previous_meta.get('kind', '')}"
@@ -1266,6 +1192,18 @@ class GlobalReviewExecutor:
             "- 只有发现具体、可验证、且会影响最终结论的高严重遗漏时才新增 issue；不要用笼统的“继续深入/仍不够全面”阻断。",
         ])
 
+    def _load_previous_limitations(
+        self,
+        work_dir: str,
+        cycle: int,
+    ) -> tuple[str, dict[str, str | int | bool]]:
+        return load_previous_limitations(work_dir, cycle)
+
+    @staticmethod
+    def _format_recent_review_feedback(review_state: ReviewState, cycle: int) -> str:
+        """格式化最近轮次的评审反馈，供参谋参考。"""
+        return review_state.format_recent_feedback(last_n=2)
+
     def _write_review_feedback_snapshot(
         self,
         work_dir: str,
@@ -1286,67 +1224,6 @@ class GlobalReviewExecutor:
                 "last_global_feedback": review_state.last_global_feedback,
             },
         )
-
-    def _load_previous_limitations(
-        self,
-        work_dir: str,
-        cycle: int,
-    ) -> tuple[str, dict[str, str | int | bool]]:
-        return load_previous_limitations(work_dir, cycle)
-
-    @staticmethod
-    def _extract_markdown_section(content: str, titles: list[str]) -> str:
-        """提取 markdown 中指定标题章节的正文（包含标题行）"""
-        if not content:
-            return ""
-        lines = content.splitlines()
-        start_idx = None
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if not stripped.startswith("#"):
-                continue
-            normalized = re.sub(r"^#+\s*", "", stripped)
-            normalized = re.sub(r"^\d+(?:\.\d+)*\s*[.、]?\s*", "", normalized).strip()
-            if any(title in normalized for title in titles):
-                start_idx = i
-                break
-        if start_idx is None:
-            return ""
-
-        end_idx = len(lines)
-        for j in range(start_idx + 1, len(lines)):
-            if lines[j].strip().startswith("#"):
-                end_idx = j
-                break
-        return "\n".join(lines[start_idx:end_idx]).strip()
-
-    @staticmethod
-    def _is_substantive_limitations(content: str) -> bool:
-        if not content or not content.strip():
-            return False
-
-        payload_lines: list[str] = []
-        for raw_line in content.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-
-            normalized = re.sub(r"^#+\s*", "", line)
-            normalized = re.sub(r"^\d+(?:\.\d+)*\s*[.、]?\s*", "", normalized).strip()
-            if "局限性与未覆盖区域" in normalized or normalized == "局限性":
-                continue
-            if "详见" in line and "previous_limitations" in line:
-                continue
-            if re.fullmatch(r"[>`*_\-\s]+", line):
-                continue
-            payload_lines.append(line)
-
-        return bool(payload_lines)
-
-    @staticmethod
-    def _format_recent_review_feedback(review_state: ReviewState, cycle: int) -> str:
-        """格式化最近轮次的评审反馈，供参谋参考。"""
-        return review_state.format_recent_feedback(last_n=2)
 
     async def _record(
         self,

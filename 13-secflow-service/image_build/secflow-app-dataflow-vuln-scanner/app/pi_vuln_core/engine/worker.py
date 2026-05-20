@@ -66,6 +66,11 @@ class WorkerExecutor:
 
     REWORK_STAGE_DEFS = (
         {
+            "id": "profile_driven_exploration",
+            "step_key": "worker::profile_exploration",
+            "prompt_filename": "worker_profile_driven_exploration.md",
+        },
+        {
             "id": "missed_vuln_hunting",
             "step_key": "worker::rework_missed_hunt",
             "prompt_filename": "worker_rework_missed_hunt.md",
@@ -406,12 +411,16 @@ class WorkerExecutor:
         for stage in stages:
             stage_id = str(stage.get("id") or "")
             should_run = True
-            if stage_id == "missed_vuln_hunting":
+            record_skip = True
+            if stage_id == "profile_driven_exploration":
+                should_run = route["has_profile_exploration"]
+                record_skip = False
+            elif stage_id == "missed_vuln_hunting":
                 should_run = route["has_missed_hunt_work"]
 
             if should_run:
                 selected.append(stage)
-            else:
+            elif record_skip:
                 skipped.append(stage_id)
 
         if skipped:
@@ -437,16 +446,24 @@ class WorkerExecutor:
         failed_files = self._get_rework_failed_files(ctx, review_state)
         active_entries = review_state.get_active_issue_entries(include_framework=False)
         worker_issue_entries, summary_handoff_entries = self._split_rework_issue_entries(active_entries)
+        profile_issue_entries = [
+            item for item in worker_issue_entries
+            if self._is_profile_depth_budget_issue_entry(item)
+        ]
+        security_worker_issue_entries = [
+            item for item in worker_issue_entries
+            if not self._is_profile_depth_budget_issue_entry(item)
+        ]
         unstructured_analysis_feedback = self._has_unstructured_analysis_feedback(
             review_state,
             is_closure=is_closure,
             summary_doc_rework=summary_doc_rework,
         )
         has_missed_hunt_work = bool(
-            worker_issue_entries
+            security_worker_issue_entries
             or unstructured_analysis_feedback
         )
-        if is_closure and not failed_files and not worker_issue_entries:
+        if is_closure and not failed_files and not security_worker_issue_entries:
             has_missed_hunt_work = False
 
         return {
@@ -454,8 +471,10 @@ class WorkerExecutor:
             "summary_doc_rework": summary_doc_rework,
             "has_failed_results": False,
             "failed_files": [],
-            "worker_issue_count": len(worker_issue_entries),
+            "worker_issue_count": len(security_worker_issue_entries),
+            "profile_issue_count": len(profile_issue_entries),
             "summary_handoff_count": len(summary_handoff_entries),
+            "has_profile_exploration": bool(profile_issue_entries),
             "has_missed_hunt_work": has_missed_hunt_work,
             "has_summary_handoff": bool(summary_handoff_entries or summary_doc_rework),
             "has_repeated_issue_summary": False,
@@ -535,13 +554,14 @@ class WorkerExecutor:
 
         for index, stage in enumerate(stages):
             step_key = stage["step_key"]
+            stage_prompt_kind = self._prompt_kind_for_rework_stage(stage["id"])
             existing_checkpoint = load_step_checkpoint(
                 ctx.working_dir,
                 cycle=ctx.cycle,
                 phase="worker",
                 step_key=step_key,
             )
-            if self._can_skip_worker_node(existing_checkpoint, "rework"):
+            if self._can_skip_worker_node(existing_checkpoint, stage_prompt_kind):
                 skipped.append(stage["id"])
                 logger.info(
                     "resume_skip_worker_rework_subnode",
@@ -570,6 +590,7 @@ class WorkerExecutor:
                 prompt=prompt,
                 system_prompt=system_prompt if index == 0 else "",
                 max_turns=max_turns,
+                worker_prompt_kind=stage_prompt_kind,
             )
             partial_salvaged = partial_salvaged or bool(
                 (response.metadata or {}).get("partial_salvaged")
@@ -606,7 +627,11 @@ class WorkerExecutor:
             files_modified = []
 
         metadata = {
-            "worker_prompt_kind": "rework",
+            "worker_prompt_kind": (
+                self._prompt_kind_for_rework_stage(stages[-1]["id"])
+                if stages else
+                "rework"
+            ),
             "skip_reflection_after_worker": True,
             "rework_sequence": True,
             "rework_stages": [item["id"] for item in stages],
@@ -648,6 +673,12 @@ class WorkerExecutor:
         sections = self._build_rework_prompt_sections(ctx, review_state)
         return render_string(read_file(prompt_file), strict=True, **sections)
 
+    @staticmethod
+    def _prompt_kind_for_rework_stage(stage_id: str) -> str:
+        if stage_id == "profile_driven_exploration":
+            return "profile_exploration"
+        return "rework"
+
     async def _execute_rework_subnode(
         self,
         *,
@@ -660,6 +691,7 @@ class WorkerExecutor:
         prompt: str,
         system_prompt: str,
         max_turns: int,
+        worker_prompt_kind: str = "rework",
     ) -> AgentResponse:
         logger.info(
             "worker_rework_subnode_start",
@@ -678,7 +710,7 @@ class WorkerExecutor:
             status="started",
             agent_id=agent_id,
             session_id=session_id,
-            extra={"prompt_kind": "rework", "rework_stage": stage_id},
+            extra={"prompt_kind": worker_prompt_kind, "rework_stage": stage_id},
         )
 
         pre_worker_digest = self._worker_editable_artifact_digest(ctx)
@@ -698,7 +730,7 @@ class WorkerExecutor:
             )
         response.metadata = dict(response.metadata or {})
         response.metadata.update({
-            "worker_prompt_kind": "rework",
+            "worker_prompt_kind": worker_prompt_kind,
             "rework_stage": stage_id,
             "skip_reflection_after_worker": True,
         })
@@ -723,7 +755,7 @@ class WorkerExecutor:
                     detail=error,
                     extra={
                         "turn_count": response.turn_count,
-                        "prompt_kind": "rework",
+                        "prompt_kind": worker_prompt_kind,
                         "rework_stage": stage_id,
                     },
                 )
@@ -747,7 +779,7 @@ class WorkerExecutor:
                 detail=error,
                 extra={
                     "turn_count": response.turn_count,
-                    "prompt_kind": "rework",
+                    "prompt_kind": worker_prompt_kind,
                     "rework_stage": stage_id,
                 },
             )
@@ -773,7 +805,7 @@ class WorkerExecutor:
             session_id=session_id,
             extra={
                 "turn_count": response.turn_count,
-                "prompt_kind": "rework",
+                "prompt_kind": worker_prompt_kind,
                 "rework_stage": stage_id,
                 "internal_turn_count": response.metadata.get("internal_turn_count"),
                 "event_total_count": response.metadata.get("event_total_count"),
@@ -1412,6 +1444,14 @@ class WorkerExecutor:
 
         active_entries = review_state.get_active_issue_entries(include_framework=False)
         worker_issue_entries, summary_handoff_entries = self._split_rework_issue_entries(active_entries)
+        profile_issue_entries = [
+            item for item in worker_issue_entries
+            if self._is_profile_depth_budget_issue_entry(item)
+        ]
+        worker_issue_entries = [
+            item for item in worker_issue_entries
+            if not self._is_profile_depth_budget_issue_entry(item)
+        ]
 
         failed_result_reasons = ""
         if failed_files:
@@ -1472,6 +1512,11 @@ class WorkerExecutor:
             ),
             "failed_review_guidance": self._build_failed_review_guidance(
                 review_state=review_state,
+            ),
+            "profile_exploration_guidance": self._build_profile_exploration_guidance(
+                ctx=ctx,
+                review_state=review_state,
+                profile_issue_entries=profile_issue_entries,
             ),
             "review_delta_text": self._build_review_delta_text(
                 ctx=ctx,
@@ -1783,6 +1828,41 @@ class WorkerExecutor:
             return "- 当前没有来自未通过全局评审的漏洞方向；若本节点仍被执行，只围绕尚未闭环的真实源码路径做补扫。"
         return "\n".join(sections)
 
+    def _build_profile_exploration_guidance(
+        self,
+        *,
+        ctx: WorkflowContext,
+        review_state: ReviewState,
+        profile_issue_entries: list[dict[str, Any]],
+    ) -> str:
+        policy = get_review_profile_policy(ctx.review_profile)
+        depth_lanes = list(policy.depth_lanes or ())
+        lines = [
+            "## Profile-driven exploration 触发原因",
+            "- 触发类型：`profile_min_discovery_cycles` / `profile_depth_budget`。",
+            "- 这不是失败评审返工，也不是 missed hunt；上一轮业务评审可以已经通过。",
+            "- 本轮目标是按 review_profile 的执行预算继续做有边界的深度探索，避免高档位过早收敛。",
+            f"- review_profile: `{policy.name}`",
+            f"- execution_goal: {policy.execution_goal}",
+        ]
+        if depth_lanes:
+            lines.extend(["", "## 本档探索 lanes"])
+            lines.extend(f"- {lane}" for lane in depth_lanes)
+        if profile_issue_entries:
+            lines.extend(["", "## 框架生成的 profile 探索任务"])
+            lines.extend(self._format_issue_entry_for_prompt(item) for item in profile_issue_entries[:4])
+            if len(profile_issue_entries) > 4:
+                lines.append(f"- ... 另有 {len(profile_issue_entries) - 4} 个 profile 探索任务，按同一原则处理。")
+        lines.extend([
+            "",
+            "## 执行边界",
+            "- 从 task、summary、results、supporting_docs 和上一轮局限性中选择尚未充分覆盖的高价值方向。",
+            "- 已确认 result 只作为去重和变体种子；不要覆盖、重命名或重写 protected result。",
+            "- 若发现真实独立漏洞，新增更高编号 `results/result_NNN.md`。",
+            f"- 若没有新漏洞，写 `supporting_docs/profile_exploration_cycle_{ctx.cycle}.md`，记录探索 lane、源码负证据、未成洞原因和 residual 边界。",
+        ])
+        return "\n".join(lines)
+
     def _latest_matching_advisor_record(
         self,
         *,
@@ -2022,6 +2102,20 @@ class WorkerExecutor:
         ]
         return " ".join(str(part or "") for part in parts).lower()
 
+    @classmethod
+    def _is_profile_depth_budget_issue_entry(cls, item: dict[str, Any]) -> bool:
+        issue = item.get("issue") if isinstance(item.get("issue"), dict) else {}
+        category = cls._issue_category(item)
+        blocking_type = cls._issue_blocking_type(item)
+        advisor_id = str(issue.get("advisor_id") or item.get("advisor_id") or "").strip().lower()
+        issue_id = str(issue.get("id") or issue.get("issue_id") or item.get("signature") or "").strip().lower()
+        return (
+            category == "profile_depth_budget"
+            or blocking_type == "profile_depth_budget"
+            or advisor_id == "profile_execution_policy"
+            or issue_id.startswith("profile-")
+        )
+
     @staticmethod
     def _text_has_security_signal(text: str) -> bool:
         lowered = str(text or "").lower()
@@ -2101,6 +2195,9 @@ class WorkerExecutor:
         summary_entries: list[dict[str, Any]] = []
         for item in entries:
             if cls._issue_owner(item) == "framework":
+                continue
+            if cls._is_profile_depth_budget_issue_entry(item):
+                worker_entries.append(item)
                 continue
             if cls._is_summary_doc_issue_entry(item):
                 summary_entries.append(item)
@@ -2637,17 +2734,14 @@ class WorkerExecutor:
             name for name in ctx.pre_cycle_result_files
             if name not in set(ctx.protected_result_files)
         ]
-        protected_text = ", ".join(ctx.protected_result_files[:8]) or "无"
-        if len(ctx.protected_result_files) > 8:
-            protected_text += f" ... 另有 {len(ctx.protected_result_files) - 8} 个"
+        protected_text = ", ".join(ctx.protected_result_files) or "无"
         mutable_text = ", ".join(mutable_files[:8]) or "无"
         if len(mutable_files) > 8:
             mutable_text += f" ... 另有 {len(mutable_files) - 8} 个"
 
         lines = [
-            "## Result 文件稳定性 contract（摘要）",
+            "## Result 文件稳定性 contract",
             f"- 已通过评审的结果 protected(read-only)：{protected_text}",
-            f"- mutable failed/candidate：{mutable_text}",
             f"- 新增真实漏洞从 `result_{ctx.next_result_number:03d}.md` 开始；历史编号永不复用，已通过 result 不覆盖、不重命名。",
             "- `results/` 只放独立漏洞 `result_NNN.md`；辅助审计、撤回说明、coverage/residual 写入 `supporting_docs/`。",
             "- 一个 result 只描述一个独立漏洞；补充/修正报告必须标注原始报告与报告性质。",
@@ -3447,9 +3541,10 @@ class WorkerExecutor:
                 "1. 攻击面分析",
                 "2. 分析覆盖度",
                 "3. 漏洞汇总表",
+                "4. 局限性与不足",
             ]),
-            3,
-            "\n\n",
+            4,
+            "\n\n`局限性与不足`章节必须诚实、具体地列出当前分析的盲区、未覆盖的攻击面、潜在的误报风险和无法判断的关键路径；注意，不要写成空泛模板。\n",
         )
 
     def _build_summary_feedback_context(
