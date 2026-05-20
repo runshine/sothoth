@@ -141,6 +141,25 @@ class ProviderRuntimeMaterializationTest(unittest.TestCase):
         self.assertIn('base_url = "https://proxy.example.test/v1"', config_text)
         self.assertIn('env_key = "OPENAI_API_KEY"', config_text)
 
+    def test_resolve_runtime_without_provider_or_model_keeps_runtime_empty(self) -> None:
+        resolved = get_provider_runtime_service().resolve_runtime(
+            [],
+            executor_mode="agentflow_cli",
+            explicit_task_model=None,
+        )
+        materialized = get_provider_runtime_service().materialize_runtime(self.runtime_root, resolved)
+        process_env = get_provider_runtime_service().build_process_env(resolved, materialized)
+
+        self.assertEqual(resolved.provider_keys, [])
+        self.assertEqual(resolved.provider_snapshots, [])
+        self.assertEqual(resolved.merged_env, {})
+        self.assertEqual(resolved.merged_files, [])
+        self.assertIsNone(resolved.effective_model)
+        self.assertIsNone(resolved.executor_model)
+        self.assertNotIn("OPENAI_API_KEY", process_env)
+        self.assertFalse((materialized.home_dir / ".codex").exists())
+        self.assertFalse((materialized.xdg_config_home / "opencode").exists())
+
     def test_resolve_runtime_generates_opencode_config_from_provider_fields(self) -> None:
         import app.services.provider_client as provider_client_module
 

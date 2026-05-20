@@ -1,0 +1,75 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: secflow-app-ipc-audit-config
+  namespace: secflow-ns
+data:
+  config.yaml: |
+    # Single-PVC layout inside secflow-app-ipc-audit-data-nfs-pvc:
+    # - PVC root -> /var/lib/secflow-app-ipc-audit
+    # - PVC subdir files/ -> /workspace/files
+    # The files/ subtree must contain the OpenHarmony source tree, hdc, and qcow2 cache.
+    title: "SecFlow IPC Audit Service"
+    api_prefix: "/api/app/ipc-audit"
+    database_url: ""
+    database:
+      type: "mysql"
+      host: "mysql.sothothv2-ns.svc.cluster.local"
+      port: 3306
+      username: "secflow"
+      password: "Huawei12#$"
+      name: "secflow"
+    state_root: "/var/lib/secflow-app-ipc-audit"
+    default_workspace_id: "shared-files-root"
+
+    app:
+      host: "0.0.0.0"
+      port: 8080
+      debug: false
+
+    provider_source:
+      enabled: true
+      backend: "configcenter"
+      base_url: "http://secflow-platform-configcenter"
+      api_prefix: "/api/configcenter/service/llm"
+      timeout_seconds: 15
+      machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
+
+    execution:
+      mode: "opencode_cli"
+      max_parallel_tasks: 1
+      scheduler_tick_interval_seconds: 1
+      heartbeat_interval_seconds: 5
+      lease_duration_seconds: 30
+      task_timeout_seconds: 7200
+      cancel_check_interval_seconds: 1
+      process_terminate_grace_seconds: 5
+      poc_enabled: true
+      poc_runtime_available: false
+      codex_bin: "/usr/local/bin/codex"
+      opencode_bin: "/usr/local/bin/opencode"
+      codex_skip_git_repo_check: true
+      codex_json_output: true
+      codex_capture_last_message: true
+      opencode_missing_output_max_retries: 3
+      audit_sandbox_mode: "workspace-write"
+      audit_approval_policy: "never"
+      audit_network_access: false
+      poc_sandbox_mode: "workspace-write"
+      poc_approval_policy: "never"
+      poc_network_access: true
+      default_audit_skill: "openharmony-project-deep-oob-audit"
+      default_poc_skill: "openharmony-ipc-project-report-poc"
+      mock_stage_delay_seconds: 0.0
+
+    workspaces:
+      - workspace_id: "shared-files-root"
+        display_name: "IPC Audit Files Root"
+        repo_root: "/workspace/files"
+        entries_file: ".audit/ipc_entries.txt"
+        bundle_scan_roots:
+          - "."
+        allow_custom_project_path: true
+        supports_poc: true
+        default_pipeline_mode: "audit_then_poc"
+        is_default: true

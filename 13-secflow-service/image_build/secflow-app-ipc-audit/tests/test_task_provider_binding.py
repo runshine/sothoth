@@ -195,6 +195,49 @@ class TaskProviderBindingTest(unittest.TestCase):
         self.assertEqual(attempt.effective_config["model"], "manual/override-model")
         self.assertEqual(attempt.effective_config["task_model"], "manual/override-model")
 
+    def test_no_provider_and_no_model_keeps_runtime_unbound(self) -> None:
+        task = get_task_service().create_task(
+            TaskCreateRequest(
+                title="no-provider-no-model",
+                workspace_id="oh61-main",
+                pipeline_mode="custom_graph",
+                input_ref=InputRef(kind="custom_project", project_path="foundation/demo/service"),
+                executor_mode="agentflow_cli",
+                provider_keys=[],
+                model=None,
+                graph_source={
+                    "type": "inline_json",
+                    "content": {
+                        "name": "custom-graph",
+                        "nodes": [
+                            {
+                                "id": "audit",
+                                "agent": "opencode",
+                                "prompt": "repo [[ task.repo_root ]]",
+                            }
+                        ],
+                    },
+                },
+                report_outputs=[
+                    {
+                        "output_id": "audit_report",
+                        "node_id": "audit",
+                        "title": "Audit Report",
+                        "path": "exports/audit-report.md",
+                        "format": "markdown",
+                    }
+                ],
+            ),
+            self.subject,
+        )
+
+        attempt = get_task_service().get_attempt(task.task_id, str(task.latest_attempt_id))
+        effective_config = attempt.effective_config
+        self.assertEqual(effective_config["provider_keys"], [])
+        self.assertEqual(effective_config["provider_snapshots"], [])
+        self.assertIsNone(effective_config["model"])
+        self.assertIsNone(effective_config["task_model"])
+
     def _install_provider_client(self, details: dict[str, dict]) -> None:
         import app.services.provider_client as provider_client_module
 

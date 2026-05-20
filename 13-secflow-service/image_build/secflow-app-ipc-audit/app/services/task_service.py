@@ -38,6 +38,7 @@ from app.services.event_service import get_event_service
 from app.services.provider_client import ProviderClientError
 from app.services.provider_runtime import get_provider_runtime_service
 from app.services.workspace_service import get_workspace_service
+from app.workers.poc_runtime import build_in_container_qemu_runtime, build_poc_qemu_instance_name
 from app.workers.runner import (
     StageContext,
     discover_single_run_dir,
@@ -489,6 +490,7 @@ class TaskService:
             }
             report_output_map[payload["output_id"]] = payload
             report_output_list.append(payload)
+        poc_runtime = build_in_container_qemu_runtime(build_poc_qemu_instance_name(context.task_id))
         task_context = {
             "task_id": context.task_id,
             "attempt_id": context.attempt_id,
@@ -505,6 +507,7 @@ class TaskService:
             "attempt_root": str(context.attempt_root),
             "runtime_root": str(context.runtime_root),
             "stage_names": list(context.effective_config.get("stage_names") or []),
+            "poc_runtime": poc_runtime,
             "report_outputs": report_output_map,
             "report_outputs_list": report_output_list,
         }
@@ -1131,9 +1134,10 @@ class TaskService:
             conn.commit()
             return row["attempt_id"]
 
-    def recover_expired_attempts(self) -> int:
+    def recover_expired_attempts(self, *, excluded_attempt_ids: set[str] | None = None) -> int:
         now = utc_now_z()
         recovered = 0
+        excluded = excluded_attempt_ids or set()
         with get_database().connect() as conn:
             rows = conn.execute(
                 """
@@ -1146,27 +1150,36 @@ class TaskService:
                 (now,),
             ).fetchall()
             for row in rows:
+                attempt_id = str(row["attempt_id"])
+                if attempt_id in excluded:
+                    continue
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute(
                     """
                     update ipc_audit_task_attempts
                     set status = 'lost', updated_at = ?, finished_at = ?, failure_reason = 'lease expired'
                     where attempt_id = ?
+                      and status in ('claimed', 'running', 'cancel_requested')
+                      and lease_expires_at is not null
+                      and lease_expires_at < ?
                     """,
-                    (now, now, row["attempt_id"]),
+                    (now, now, attempt_id, now),
                 )
+                if conn.execute("select changes()").fetchone()[0] != 1:
+                    conn.commit()
+                    continue
                 conn.execute(
                     """
                     update ipc_audit_tasks
                     set status = 'failed', updated_at = ?, finished_at = ?, message = 'worker lease expired'
                     where task_id = ? and latest_attempt_id = ?
                     """,
-                    (now, now, row["task_id"], row["attempt_id"]),
+                    (now, now, row["task_id"], attempt_id),
                 )
                 get_event_service().append_event(
                     conn,
                     task_id=row["task_id"],
-                    attempt_id=row["attempt_id"],
+                    attempt_id=attempt_id,
                     stage_name=None,
                     event_type="worker.lost",
                     level="error",

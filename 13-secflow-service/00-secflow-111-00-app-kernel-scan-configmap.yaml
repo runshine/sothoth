@@ -27,7 +27,7 @@ data:
       entry_model: ""
       audit_model: ""
       poc_model: ""
-      max_parallel_tasks: 1
+      max_parallel_tasks: 10
       entry_threads: 4
       audit_threads: 4
       poc_threads: 2

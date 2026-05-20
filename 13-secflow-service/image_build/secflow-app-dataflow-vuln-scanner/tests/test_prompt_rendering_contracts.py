@@ -606,6 +606,125 @@ def test_withdrawn_result_is_not_carried_into_fp_repair(tmp_path: Path) -> None:
     assert state.result_states["result_002.md"].lifecycle_status == "withdrawn"
 
 
+def test_profile_min_cycle_uses_profile_exploration_stage_not_missed_hunt(tmp_path: Path) -> None:
+    class FakeWorkerAgent:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, str]] = []
+
+        async def multi_turn_execute(
+            self,
+            *,
+            system_prompt: str,
+            user_prompt: str,
+            working_dir: str,
+            max_turns: int,
+            session_id: str,
+        ) -> AgentResponse:
+            self.messages.append({
+                "kind": "multi_turn",
+                "session_id": session_id,
+                "message": user_prompt,
+                "system_prompt": system_prompt,
+            })
+            return AgentResponse(
+                content="profile exploration ok",
+                conversation_id=session_id,
+                turn_count=len(self.messages),
+                finished=True,
+            )
+
+        async def send_message(self, *, message: str, session_id: str, working_dir: str) -> AgentResponse:
+            self.messages.append({"kind": "send_message", "message": message, "session_id": session_id})
+            return AgentResponse(content="stage ok", conversation_id=session_id, turn_count=len(self.messages), finished=True)
+
+    task_file = tmp_path / "task.md"
+    task_file.write_text("# scan task\n", encoding="utf-8")
+    work_dir = tmp_path / "work"
+    (work_dir / "results").mkdir(parents=True)
+    wf = _workflow_with_worker_prompt(
+        Path("prompts/vuln_scan/worker_user.md"),
+        Path("prompts/vuln_scan/summary.md"),
+    )
+    ctx = WorkflowContext(
+        workflow_id="wf",
+        task_id="task",
+        task_file=str(task_file),
+        working_dir=str(work_dir),
+        cycle=3,
+        review_mode="discovery",
+        review_profile="audit",
+        worker_session_id="worker-session-1",
+        worker_session_cycle=3,
+        plateau_reason="profile_min_discovery_cycles",
+    )
+    issue = {
+        "id": "profile-audit-min-discovery-cycle-3",
+        "category": "profile_depth_budget",
+        "target": "cycle_003",
+        "severity": "high",
+        "required_action": "当前 review_profile=audit 至少需要 3 个探索轮次；下一轮继续深挖关键数据流。",
+        "actionable_by": "worker",
+        "blocking_type": "profile_depth_budget",
+        "acceptance_criteria": "完成 profile-driven exploration；没有新增漏洞则记录负证据。",
+    }
+    state = ReviewState()
+    state.record_global_review_result(
+        cycle=2,
+        passed=False,
+        feedback="[profile_min_discovery_cycles] audit profile requires one more exploration cycle",
+        scores={},
+        issues=[issue],
+    )
+    state.global_review_history.append(
+        GlobalReviewRecord(
+            cycle=2,
+            advisor_id="profile_execution_policy",
+            role_name="Review Profile Execution Policy",
+            passed=False,
+            feedback="[profile_min_discovery_cycles] audit profile requires one more exploration cycle",
+            issues=[issue],
+        )
+    )
+
+    agent = FakeWorkerAgent()
+    response = asyncio.run(
+        WorkerExecutor(agent_registry=None, recorder=None)._execute_rework_sequence(  # type: ignore[arg-type]
+            wf_def=wf,
+            ctx=ctx,
+            review_state=state,
+            agent=agent,
+            session_id="worker-session-1",
+            system_prompt="system",
+        )
+    )
+
+    assert response.metadata["worker_prompt_kind"] == "profile_exploration"
+    assert response.metadata["rework_stages"] == ["profile_driven_exploration"]
+    assert response.metadata["rework_skipped_stages"] == ["missed_vuln_hunting"]
+    assert len(agent.messages) == 1
+    assert "Profile-Driven Exploration" in agent.messages[0]["message"]
+    assert "这不是失败评审返工，也不是 missed hunt" in agent.messages[0]["message"]
+    assert "基于失败评审继续挖洞" not in agent.messages[0]["message"]
+    assert "上游评审节点已经完成筛选" not in agent.messages[0]["message"]
+    assert "profile_exploration_cycle_3.md" in agent.messages[0]["message"]
+
+    profile_checkpoint = load_step_checkpoint(
+        work_dir,
+        cycle=3,
+        phase="worker",
+        step_key="worker::profile_exploration",
+    )
+    assert profile_checkpoint is not None
+    assert profile_checkpoint["status"] == "completed"
+    assert profile_checkpoint["extra"]["prompt_kind"] == "profile_exploration"
+    assert load_step_checkpoint(
+        work_dir,
+        cycle=3,
+        phase="worker",
+        step_key="worker::rework_missed_hunt",
+    ) is None
+
+
 def test_staged_rework_skips_summary_only_documentation_gap(tmp_path: Path) -> None:
     class FakeWorkerAgent:
         def __init__(self) -> None:

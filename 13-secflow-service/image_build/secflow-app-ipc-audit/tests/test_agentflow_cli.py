@@ -75,6 +75,17 @@ class AgentFlowCliModeTest(unittest.TestCase):
             "IPC_AUDIT_AGENTFLOW_AGENT",
             "IPC_AUDIT_CODEX_BIN",
             "IPC_AUDIT_WORKSPACES_JSON",
+            "HDC_BIN",
+            "OHEMU_HELPER_BIN",
+            "OHEMU_WORKSPACE_ROOT",
+            "OHEMU_QCOW2_PREPARED_ROOT",
+            "OHEMU_RUNTIME_ROOT",
+            "OHEMU_ARCH",
+            "OHEMU_NETWORK_MODE",
+            "OHEMU_HDC_BIND",
+            "OHEMU_HDC_BASE_PORT",
+            "OHEMU_BOOT_DIR",
+            "OHEMU_SRC_DIR",
             "FAKE_AGENTFLOW_FAIL_NODE",
         ):
             os.environ.pop(key, None)
@@ -875,6 +886,78 @@ class AgentFlowCliModeTest(unittest.TestCase):
             str(attempt_root / "exports" / "builder2-report.md"),
         )
         self.assertEqual(pipeline_payload["nodes"][1]["depends_on"], ["builder1"])
+
+    def test_custom_graph_renders_poc_runtime_placeholders_from_env(self) -> None:
+        self._set_env("HDC_BIN", "/workspace/files/vendor/edu/docker/src/hdc")
+        self._set_env("OHEMU_HELPER_BIN", "/usr/local/bin/ipc-audit-qemu")
+        self._set_env("OHEMU_WORKSPACE_ROOT", "/workspace/files")
+        self._set_env("OHEMU_QCOW2_PREPARED_ROOT", "/workspace/files/vendor/edu/docker/volumes/qcow2_cache")
+        self._set_env("OHEMU_RUNTIME_ROOT", "/var/lib/secflow-ipc-audit/ohemu")
+        self._set_env("OHEMU_ARCH", "arm64")
+        self._set_env("OHEMU_NETWORK_MODE", "bridge")
+        self._set_env("OHEMU_HDC_BIND", "127.0.0.1")
+        self._set_env("OHEMU_HDC_BASE_PORT", "55555")
+        self._set_env("OHEMU_BOOT_DIR", "/workspace/files/vendor/edu/docker/volumes/qcow2_cache/arm64/boot")
+        self._set_env("OHEMU_SRC_DIR", "/workspace/files/vendor/edu/docker/src")
+
+        task = get_task_service().create_task(
+            TaskCreateRequest(
+                title="poc-runtime-placeholders",
+                workspace_id="oh61-main",
+                pipeline_mode="custom_graph",
+                input_ref=InputRef(kind="custom_project", project_path="foundation/demo/service"),
+                executor_mode="agentflow_cli",
+                model="gpt-5-codex",
+                graph_source={
+                    "type": "inline_json",
+                    "content": {
+                        "name": "poc-runtime-graph",
+                        "nodes": [
+                            {
+                                "id": "poc",
+                                "prompt": (
+                                    "helper [[ task.poc_runtime.helper_bin ]] "
+                                    "hdc [[ task.poc_runtime.hdc_bin ]] "
+                                    "root [[ task.poc_runtime.workspace_root ]] "
+                                    "instance [[ task.poc_runtime.instance_name ]]"
+                                ),
+                                "success_criteria": [
+                                    {
+                                        "kind": "file_nonempty",
+                                        "path": '[[ task.report_outputs["poc_report"].absolute_path ]]',
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                },
+                report_outputs=[
+                    {
+                        "output_id": "poc_report",
+                        "node_id": "poc",
+                        "title": "PoC Report",
+                        "path": "exports/poc-report.md",
+                        "format": "markdown",
+                        "required": True,
+                        "order": 10,
+                    }
+                ],
+            ),
+            self.subject,
+        )
+
+        attempt_id = get_task_service().claim_next_attempt("tester-worker")
+        self.assertIsNotNone(attempt_id)
+        get_execution_service().run_attempt(str(attempt_id))
+
+        detail = get_task_service().get_task(task.task_id)
+        attempt = get_task_service().get_attempt(task.task_id, str(detail.latest_attempt_id))
+        pipeline_payload = attempt.effective_config["materialized_graph_source"]["content"]
+        prompt = pipeline_payload["nodes"][0]["prompt"]
+        self.assertIn("/usr/local/bin/ipc-audit-qemu", prompt)
+        self.assertIn("/workspace/files/vendor/edu/docker/src/hdc", prompt)
+        self.assertIn("/workspace/files", prompt)
+        self.assertIn("instance ipc-audit-", prompt)
 
     def test_validate_graph_rejects_unrendered_secflow_placeholders(self) -> None:
         with self.assertRaises(HTTPException) as context:

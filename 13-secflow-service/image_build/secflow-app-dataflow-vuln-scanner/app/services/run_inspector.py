@@ -1520,15 +1520,24 @@ def inspect_files(workspace_root: str | Path, limit: int = 1200) -> list[dict[st
         raise HTTPException(404, "run workspace not found")
     atomic = _find_atomic_work_dir(run_dir)
     entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
 
     def add(path: Path, base: Path, category: str) -> None:
         if not path.is_file() or len(entries) >= limit:
             return
+        try:
+            rel_path = str(path.relative_to(base))
+        except ValueError:
+            rel_path = str(path)
+        key = f"{base.resolve()}::{rel_path}"
+        if key in seen:
+            return
+        seen.add(key)
         stat = path.stat()
         entries.append(
             {
                 "category": category,
-                "path": str(path.relative_to(base)),
+                "path": rel_path,
                 "name": path.name,
                 "size": stat.st_size,
                 "mtime": stat.st_mtime,
@@ -1555,21 +1564,35 @@ def inspect_files(workspace_root: str | Path, limit: int = 1200) -> list[dict[st
     add_glob(runtime / "input", "**/*.md", run_dir, "Run / Input")
     add_glob(run_dir / "trigger_inputs", "**/*.md", run_dir, "Input")
     if atomic:
+        add_glob(atomic / "input", "**/*.md", atomic, "Input")
         add(atomic / "summary.md", atomic, "Outputs")
         add(atomic / "final_output" / "summary.md", atomic, "Outputs")
         add_glob(atomic / "results", "*.md", atomic, "Outputs / Results")
         add_glob(atomic / "final_output" / "results", "*.md", atomic, "Outputs / Results")
         add_glob(atomic / "supporting_docs", "*.md", atomic, "Outputs / Supporting Docs")
+        add_glob(atomic / "final_output" / "supporting_docs", "*.md", atomic, "Outputs / Supporting Docs")
+        add_glob(atomic / "removed_results", "**/*.md", atomic, "Outputs / Removed Results")
+        add_glob(atomic / "removed_results", "**/*.json", atomic, "Outputs / Removed Results")
+        add_glob(atomic / "final_output" / "removed_results", "**/*.md", atomic, "Outputs / Removed Results")
+        add_glob(atomic / "final_output" / "removed_results", "**/*.json", atomic, "Outputs / Removed Results")
+        add(atomic / "final_output" / "index.json", atomic, "Outputs / Final Output")
+        add(atomic / "final_output" / "result_relations_manifest.json", atomic, "Outputs / Final Output")
+        add(atomic / "final_output" / "vulnerability_list.json", atomic, "Outputs / Final Output")
         add(atomic / "_meta" / "state.json", atomic, "Meta")
+        add(atomic / "_meta" / "state_transitions.jsonl", atomic, "Meta")
         add(atomic / "_meta" / "workflow_result.json", atomic, "Meta")
         add(atomic / "_meta" / "abnormal_exit.json", atomic, "Meta")
         add(atomic / "_meta" / "result_relations_manifest.json", atomic, "Meta / Result Manifests")
         add(atomic / "_meta" / "results_manifest.json", atomic, "Meta / Result Manifests")
+        add(atomic / "_meta" / "vulnerability_list.json", atomic, "Meta / Result Manifests")
+        add(atomic / "_meta" / "checkpoints" / "current_step.json", atomic, "Meta / Checkpoints")
+        add_glob(atomic / "_meta" / "checkpoints" / "steps", "**/*.json", atomic, "Meta / Checkpoints")
         add_glob(atomic / "_meta" / "reflections", "*.json", atomic, "Meta / Reflections")
         add_glob(atomic / "_meta" / "review_summaries", "*.json", atomic, "Meta / Review Summaries")
         add_glob(atomic / "_meta" / "cycle_metrics", "*.json", atomic, "Meta / Cycle Metrics")
         add_glob(atomic / "_meta" / "review_feedback", "*.json", atomic, "Meta / Review Feedback")
         add_glob(atomic / "_meta" / "summary_snapshots", "*.md", atomic, "Meta / Summary Snapshots")
+        add_glob(atomic / "_meta" / "previous_limitations_snapshots", "*.md", atomic, "Meta / Summary Snapshots")
         add_glob(atomic / "reviews" / "global", "cycle_*/*.json", atomic, "Reviews / Global")
         add_glob(atomic / "reviews" / "results", "result_*/cycle_*/*.json", atomic, "Reviews / Results")
         add_glob(atomic / "sessions", "*/*.jsonl", atomic, "Sessions")

@@ -274,9 +274,21 @@ class ExecutionService:
     def _is_cancel_requested(self, task_id: str, attempt_id: str) -> bool:
         with get_database().connect() as conn:
             row = conn.execute(
-                "select status from kernel_scan_tasks where task_id = ?", (task_id,)
+                """
+                select t.status as task_status, a.status as attempt_status
+                from kernel_scan_tasks t
+                join kernel_scan_attempts a on a.task_id = t.task_id
+                where t.task_id = ? and a.attempt_id = ?
+                """,
+                (task_id, attempt_id),
             ).fetchone()
-        return row is not None and row["status"] == "cancel_requested"
+        if row is None:
+            return True
+        if row["task_status"] == "cancel_requested":
+            return True
+        if row["attempt_status"] not in ("claimed", "running", "cancel_requested"):
+            return True
+        return False
 
 
 class _CancelledError(Exception):

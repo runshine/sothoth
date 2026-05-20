@@ -10,6 +10,7 @@ from jinja2 import Environment, StrictUndefined
 
 from app.core.config import get_config
 from app.core.time_utils import utc_now_z
+from app.workers.poc_runtime import build_in_container_qemu_runtime, build_poc_qemu_instance_name
 from app.workers.runner import (
     StageArtifact,
     StageContext,
@@ -216,6 +217,7 @@ def _build_template_context(context: StageContext, report_outputs: list[dict[str
         }
         report_output_map[payload["output_id"]] = payload
         report_output_list.append(payload)
+    poc_runtime = build_in_container_qemu_runtime(build_poc_qemu_instance_name(context.task_id))
     task_context = {
         "task_id": context.task_id,
         "attempt_id": context.attempt_id,
@@ -232,6 +234,7 @@ def _build_template_context(context: StageContext, report_outputs: list[dict[str
         "attempt_root": str(context.attempt_root),
         "runtime_root": str(context.runtime_root),
         "stage_names": _declared_stage_names(context),
+        "poc_runtime": poc_runtime,
         "report_outputs": report_output_map,
         "report_outputs_list": report_output_list,
     }
