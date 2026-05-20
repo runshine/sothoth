@@ -847,6 +847,11 @@ class AtomicWorkflowEngine:
             confirmed_files = confirmed_result_files(vulnerability_payload)
             false_positive_files = false_positive_result_files(vulnerability_payload, active_only=False)
             pending_review_files = pending_result_files(vulnerability_payload)
+            result_review_required = bool(self.wf.roles.advisors.result_review)
+            result_review_terminal = (
+                not result_review_required
+                or len(pending_review_files) == 0
+            )
             passed_files = confirmed_files
             by_filename = {}
             for item in review_failed_items or []:
@@ -938,7 +943,54 @@ class AtomicWorkflowEngine:
                 review_state.record_global_failure(cycle, global_feedback)
             ctx.failed_result_items = list(failed_items)
 
-            if global_passed and failed_count == 0:
+            if not result_review_completed:
+                error = result_review_error or "结果评审未成功完成"
+                await self.recorder.record_warning(work_dir, error)
+                await self._transition_state(
+                    ctx,
+                    AtomicWorkflowState.FAILED,
+                    detail=error,
+                )
+                logger.error(
+                    "result_review_framework_failure",
+                    workflow_id=ctx.workflow_id,
+                    task_id=ctx.task_id,
+                    cycle=cycle,
+                    error=error,
+                )
+                return AtomicWorkflowResult(
+                    status="review_error",
+                    error=error,
+                    working_dir=ctx.working_dir,
+                    cycles_used=ctx.cycle,
+                )
+
+            if result_review_required and not result_review_terminal:
+                error = (
+                    "结果评审未对所有 active result 给出终态判定；"
+                    "当前设计下 result review 不驱动 Worker 返工，因此工作流不能继续。"
+                )
+                await self.recorder.record_warning(work_dir, error)
+                await self._transition_state(
+                    ctx,
+                    AtomicWorkflowState.FAILED,
+                    detail=error,
+                )
+                logger.error(
+                    "result_review_non_terminal_results",
+                    workflow_id=ctx.workflow_id,
+                    task_id=ctx.task_id,
+                    cycle=cycle,
+                    pending_review_files=pending_review_files,
+                )
+                return AtomicWorkflowResult(
+                    status="review_error",
+                    error=error,
+                    working_dir=ctx.working_dir,
+                    cycles_used=ctx.cycle,
+                )
+
+            if global_passed and result_review_terminal:
                 ctx.plateau_streak = 0
                 ctx.plateau_reason = ""
                 ctx.pending_summary_repair = False
@@ -948,17 +1000,9 @@ class AtomicWorkflowEngine:
                     cycle=cycle,
                     mode=ctx.review_mode,
                     result_review_completed=result_review_completed,
+                    result_review_terminal=result_review_terminal,
                 )
                 return None
-
-            if failed_count:
-                logger.info(
-                    "result_review_failed_retry",
-                    cycle=cycle,
-                    failed_count=failed_count,
-                    files=[item.filename for item in failed_items],
-                )
-                continue
 
             failure_scope = str(cycle_metrics.get("global_failure_scope") or "")
             if not global_passed and failure_scope == "framework":

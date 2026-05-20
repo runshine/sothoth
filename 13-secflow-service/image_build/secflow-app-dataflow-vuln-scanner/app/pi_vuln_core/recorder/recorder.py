@@ -415,6 +415,17 @@ class ExecutionRecorder:
             else "advisor_failed" if failed_advisor
             else "global_failed"
         )
+        review_completed = bool((vulnerability_status or {}).get("review_completed", True))
+        pending_review_files = list((vulnerability_status or {}).get("pending_review_files") or [])
+        if global_passed and review_completed and len(failed_results) == 0 and not pending_review_files:
+            outcome = "all_passed"
+        elif not review_completed:
+            outcome = "review_error"
+        elif not global_passed:
+            outcome = "global_failed"
+        else:
+            outcome = "results_failed"
+
         record = {
             "cycle": cycle,
             "timestamp": _now_iso(),
@@ -443,9 +454,7 @@ class ExecutionRecorder:
                 "vulnerability_status": vulnerability_status or {},
             },
             "plateau_status": plateau_status or {},
-            "outcome": ("all_passed" if (global_passed and len(failed_results) == 0)
-                        else "global_failed" if not global_passed
-                        else "results_failed"),
+            "outcome": outcome,
         }
 
         summaries_dir = os.path.join(work_dir, "_meta", "review_summaries")
