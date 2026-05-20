@@ -26,7 +26,7 @@ from app.model import (
     TASK_TYPE_BINARY_MODULE,
     TASK_TYPE_SOURCE,
 )
-from app.exception import NotFoundError, ValidationError
+from app.exception import NotFoundError, UpstreamError, ValidationError
 from app.schemas import BinarySecurityServiceConfigPayload
 from app.schemas import (
     BinarySecurityInputFile,
@@ -4961,6 +4961,130 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["si0", "si1"], fetched_ids)
         self.assertEqual(2, resp.synced_downstream_count)
 
+    def test_sync_downstream_status_http_500_keeps_item_running(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="entry_analysis",
+            item_key="m1",
+            parent_key="source_project",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item])
+
+        original_fetch = self.manager._fetch_downstream_task_payload
+        async def _raise_500(*_args, **_kwargs):
+            raise UpstreamError("下游服务返回异常状态码: 500, body=boom")
+
+        self.manager._fetch_downstream_task_payload = _raise_500
+        try:
+            resp = asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id="p1",
+                    task_id="s1",
+                    stage_name="entry_analysis",
+                )
+            )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+
+        failed_events = [event for event in db.events if event.event_type == "downstream_status_sync_failed"]
+        self.assertEqual("running", item.status)
+        self.assertEqual("running", run.status)
+        self.assertEqual("running", task.status)
+        self.assertEqual(1, resp.failed_downstream_count)
+        self.assertTrue(failed_events)
+        self.assertEqual(500, failed_events[-1].payload.get("http_status"))
+        self.assertEqual("http_5xx", failed_events[-1].payload.get("error_type"))
+        self.assertFalse(bool(failed_events[-1].payload.get("state_applied")))
+        self.assertFalse(any(event.event_type == "downstream_status_event_applied" for event in db.events))
+
+    def test_sync_downstream_status_timeout_keeps_item_running(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="entry_analysis",
+            item_key="m1",
+            parent_key="source_project",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item])
+
+        original_fetch = self.manager._fetch_downstream_task_payload
+        async def _raise_timeout(*_args, **_kwargs):
+            raise UpstreamError("下游服务 GET 超时: http://entry/tasks/eat_1")
+
+        self.manager._fetch_downstream_task_payload = _raise_timeout
+        try:
+            resp = asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id="p1",
+                    task_id="s1",
+                    stage_name="entry_analysis",
+                )
+            )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+
+        failed_events = [event for event in db.events if event.event_type == "downstream_status_sync_failed"]
+        self.assertEqual("running", item.status)
+        self.assertEqual("running", run.status)
+        self.assertEqual("running", task.status)
+        self.assertEqual(1, resp.failed_downstream_count)
+        self.assertTrue(failed_events)
+        self.assertEqual("timeout", failed_events[-1].payload.get("error_type"))
+        self.assertFalse(bool(failed_events[-1].payload.get("state_applied")))
+
     def test_sync_downstream_status_prioritizes_failed_items_with_downstream_refs(self):
         task = BinarySecurityTask(
             id="s1",
@@ -5043,6 +5167,136 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(["si_failed", "si_q0"], fetched_ids)
         self.assertEqual(2, resp.synced_downstream_count)
+
+    def test_sync_downstream_status_unknown_status_is_skipped(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="entry_analysis",
+            item_key="m1",
+            parent_key="source_project",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item])
+
+        original_fetch = self.manager._fetch_downstream_task_payload
+        async def _fetch(_task, _item, _token):
+            return {"status": "mystery_state"}
+
+        self.manager._fetch_downstream_task_payload = _fetch
+        try:
+            resp = asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id="p1",
+                    task_id="s1",
+                    stage_name="entry_analysis",
+                )
+            )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+
+        skipped_events = [event for event in db.events if event.event_type == "downstream_status_sync_skipped"]
+        self.assertEqual("running", item.status)
+        self.assertEqual("running", run.status)
+        self.assertEqual("running", task.status)
+        self.assertEqual(1, resp.skipped_downstream_count)
+        self.assertTrue(skipped_events)
+        self.assertEqual("mystery_state", skipped_events[-1].payload.get("status_raw"))
+        self.assertIsNone(skipped_events[-1].payload.get("mapped_status"))
+        self.assertFalse(bool(skipped_events[-1].payload.get("state_applied")))
+
+    def test_sync_downstream_status_running_revives_failed_active_stage_task(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="failed",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="system_analysis",
+            item_key="fw1",
+            parent_key="fw1",
+            status="failed",
+            downstream_service="system_analyse",
+            downstream_task_id="sat_1",
+            error_message="old failure",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item])
+
+        original_fetch = self.manager._fetch_downstream_task_payload
+        original_write = self.manager._write_task_metadata_async
+        original_enqueue = self.manager._enqueue_task
+
+        async def _fetch(_task, _item, _token):
+            return {"status": "running"}
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._fetch_downstream_task_payload = _fetch
+        self.manager._write_task_metadata_async = _noop_write
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        try:
+            resp = asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id="p1",
+                    task_id="s1",
+                    stage_name="system_analysis",
+                )
+            )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+            self.manager._write_task_metadata_async = original_write
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual("running", item.status)
+        self.assertEqual("running", run.status)
+        self.assertEqual("running", task.status)
+        self.assertEqual(1, resp.synced_downstream_count)
 
     def test_sync_downstream_status_refreshes_parent_state_when_item_status_changes(self):
         task = BinarySecurityTask(
@@ -6811,7 +7065,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 id="task1",
                 project_id="p1",
                 name="n",
-                status="running",
+                status="failed",
                 current_stage="binary_to_source",
                 task_type=TASK_TYPE_BINARY,
                 firmware_source="project_filesystem",
@@ -6840,6 +7094,86 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 refs = self.manager._list_tasks_needing_downstream_sync(db)
             finally:
                 self.manager._task_needs_downstream_reconcile = original_needs_reconcile
+        finally:
+            db.close()
+
+        self.assertEqual([{"project_id": "p1", "task_id": "task1"}], refs)
+
+    def test_list_tasks_needing_downstream_sync_excludes_historical_failed_stage_items(self):
+        engine = create_engine("sqlite:///:memory:")
+        TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base.metadata.create_all(bind=engine)
+        db = TestingSessionLocal()
+        try:
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="failed",
+                current_stage="entry_analysis",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw.bin",
+                output_root="/o",
+                workspace_root="/w",
+            )
+            historical_item = BinarySecurityStageItem(
+                id="si1",
+                task_id="task1",
+                project_id="p1",
+                stage_run_id="sr1",
+                stage_name="system_analysis",
+                item_key="k1",
+                status="failed",
+                downstream_service="system_analyse",
+                downstream_task_id="sat-1",
+            )
+            db.add(task)
+            db.add(historical_item)
+            db.commit()
+
+            refs = self.manager._list_tasks_needing_downstream_sync(db)
+        finally:
+            db.close()
+
+        self.assertEqual([], refs)
+
+    def test_list_tasks_needing_downstream_sync_uses_retry_target_stage(self):
+        engine = create_engine("sqlite:///:memory:")
+        TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base.metadata.create_all(bind=engine)
+        db = TestingSessionLocal()
+        try:
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="failed",
+                current_stage="entry_analysis",
+                execution_mode="stage_retry_full",
+                target_stage_name="system_analysis",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw.bin",
+                output_root="/o",
+                workspace_root="/w",
+            )
+            retry_target_item = BinarySecurityStageItem(
+                id="si1",
+                task_id="task1",
+                project_id="p1",
+                stage_run_id="sr1",
+                stage_name="system_analysis",
+                item_key="k1",
+                status="failed",
+                downstream_service="system_analyse",
+                downstream_task_id="sat-1",
+            )
+            db.add(task)
+            db.add(retry_target_item)
+            db.commit()
+
+            refs = self.manager._list_tasks_needing_downstream_sync(db)
         finally:
             db.close()
 

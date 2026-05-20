@@ -261,6 +261,44 @@ class TaskObservabilityItem(BaseModel):
     issue_remaining: int = 0
 
 
+class BatchObservabilityRow(BaseModel):
+    item_id: str
+    sequence_no: int
+    item_name: str
+    batch_no: int
+    status: str
+    status_label: str
+    function_count: int = 0
+    total_size_bytes: int = 0
+    attempt_count: int = 0
+    current_attempt_no: Optional[int] = None
+    current_function: Optional[str] = None
+    review_count: int = 0
+    session_count: int = 0
+    has_source_output: bool = False
+    has_disasm_context: bool = False
+    latest_verdict: Optional[str] = None
+    latest_verdict_label: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    duration_ms: Optional[int] = None
+    last_event_at: Optional[str] = None
+    warnings: list[str] = Field(default_factory=list)
+
+
+class BatchObservabilitySummary(BaseModel):
+    total_batches: int = 0
+    running_batches: int = 0
+    passed_batches: int = 0
+    failed_batches: int = 0
+    partial_batches: int = 0
+    pending_batches: int = 0
+    unknown_batches: int = 0
+    avg_attempts_per_batch: float = 0
+    total_review_rounds: int = 0
+    active_batch_count: int = 0
+
+
 class TaskObservabilitySummary(BaseModel):
     task_id: str
     total_duration_ms: Optional[int] = None
@@ -285,6 +323,8 @@ class TaskObservabilitySummary(BaseModel):
     avg_quality_score: float = 0
     residual_risk_distribution: dict[str, int] = Field(default_factory=dict)
     business_runtime_metrics: Optional[dict[str, Any]] = None
+    batch_summary: BatchObservabilitySummary = Field(default_factory=BatchObservabilitySummary)
+    batches: list[BatchObservabilityRow] = Field(default_factory=list)
     items: list[TaskObservabilityItem] = Field(default_factory=list)
 
 
@@ -331,6 +371,72 @@ class SessionFileResponse(BaseModel):
     offset: int = 0
     limit: int = 0
     mime_type: str = "text/plain"
+
+
+class B2SAgentSessionEvidence(BaseModel):
+    key: str
+    label: str
+    value: str
+
+
+class B2SAgentSessionFileRef(BaseModel):
+    path: Optional[str] = None
+    node_id: Optional[str] = None
+    can_open: bool = False
+    read_api: Optional[str] = None
+
+
+class B2SAgentSessionRuntimeEntry(BaseModel):
+    session_id: str
+    node_id: Optional[str] = None
+    item_id: Optional[str] = None
+    sequence_no: Optional[int] = None
+    item_name: Optional[str] = None
+    run_name: Optional[str] = None
+    agent: Optional[str] = None
+    role: Optional[str] = None
+    stage: Optional[str] = None
+    batch_no: Optional[int] = None
+    attempt_no: Optional[int] = None
+    status: str
+    status_title: str
+    status_reason: str
+    is_current: bool = False
+    is_active: bool = False
+    is_orphan: bool = False
+    is_stale: bool = False
+    current_function: Optional[str] = None
+    pi_job_id: Optional[str] = None
+    pi_worker_url: Optional[str] = None
+    relative_path: Optional[str] = None
+    full_path: Optional[str] = None
+    size: int = 0
+    updated_at: Optional[str] = None
+    last_event_at: Optional[str] = None
+    file_ref: Optional[B2SAgentSessionFileRef] = None
+    evidence: list[B2SAgentSessionEvidence] = Field(default_factory=list)
+
+
+class B2SAgentSessionRuntimeSummary(BaseModel):
+    task_id: str
+    generated_at: Optional[str] = None
+    total_sessions: int = 0
+    active_sessions: int = 0
+    sessions_by_status: dict[str, int] = Field(default_factory=dict)
+    sessions_by_agent: dict[str, int] = Field(default_factory=dict)
+    sessions_by_role: dict[str, int] = Field(default_factory=dict)
+    sessions_by_stage: dict[str, int] = Field(default_factory=dict)
+    orphan_sessions: int = 0
+    stale_sessions: int = 0
+    warnings: list[str] = Field(default_factory=list)
+
+
+class B2SAgentSessionRuntimeResponse(BaseModel):
+    task_id: str
+    generated_at: Optional[str] = None
+    summary: B2SAgentSessionRuntimeSummary
+    sessions: list[B2SAgentSessionRuntimeEntry] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class RelationshipNode(BaseModel):
@@ -410,6 +516,7 @@ class TaskDetailResponse(TaskResponse):
     task_config_snapshot: Optional[TaskConfigSnapshot] = None
     effective_llm_provider: Optional["LlmProviderSummary"] = None
     agent_runtime_summary: Optional[AgentRuntimeSummary] = None
+    agent_session_runtime_summary: Optional[B2SAgentSessionRuntimeSummary] = None
     result_summary: Optional[TaskResultSummary] = None
     observability_summary: Optional[TaskObservabilitySummary] = None
     event_summary: Optional["B2STaskEventSummary"] = None

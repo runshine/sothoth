@@ -683,6 +683,13 @@ def _preparing_status_for_action(action: str) -> str:
 
 def _retry_mode_needs_plan(mode: str | None) -> bool:
     return bool(mode in {"task_retry_failed_items", "stage_retry_failed_items", "stage_retry_full"})
+ACTIVE_RECONCILE_TARGET_STAGE_MODES = {
+    "task_retry_failed_items",
+    "stage_retry_failed_items",
+    "stage_retry_full",
+    "task_retry",
+    "stage_retry",
+}
 STAGE_RETRY_ENDPOINTS = {
     "firmware_unpack": ("firmware_unpacker", "retry"),
     "system_analysis": ("system_analyse", "restart"),
@@ -2254,6 +2261,9 @@ class TaskManager:
             BinarySecurityStageItem.created_at.asc(),
             BinarySecurityStageItem.id.asc(),
         ).all()
+        auto_reconcile_scope = not stage_name and not item_id and not force
+        if auto_reconcile_scope:
+            items = [item for item in items if self._stage_item_in_active_reconcile_scope(task, item)]
         if item_id and not items:
             raise NotFoundError("阶段子任务不存在")
         if not item_id and items:
@@ -2353,6 +2363,11 @@ class TaskManager:
                             payload={
                                 "downstream_service": item.downstream_service,
                                 "downstream_task_id": item.downstream_task_id,
+                                "http_status": None,
+                                "error_type": None,
+                                "status_raw": downstream_status or None,
+                                "mapped_status": None,
+                                "state_applied": False,
                                 "downstream_status": downstream_status,
                             },
                         )
@@ -2370,6 +2385,9 @@ class TaskManager:
                                 downstream_status=downstream_status,
                                 payload=payload,
                                 error_message="下游子任务不存在",
+                                http_status=None,
+                                error_type=None,
+                                status_raw=downstream_status,
                                 force=force,
                             )
                             self._apply_downstream_status_inline(
@@ -2394,6 +2412,11 @@ class TaskManager:
                                 payload={
                                     "downstream_service": item.downstream_service,
                                     "downstream_task_id": item.downstream_task_id,
+                                    "http_status": None,
+                                    "error_type": None,
+                                    "status_raw": downstream_status,
+                                    "mapped_status": mapped_status,
+                                    "state_applied": bool(force or mapped_status != before_status),
                                     "before_status": before_status,
                                     "downstream_status": downstream_status,
                                     "after_status": mapped_status,
@@ -2412,6 +2435,9 @@ class TaskManager:
                                 downstream_status=downstream_status,
                                 payload=payload,
                                 error_message=error_message,
+                                http_status=None,
+                                error_type=None,
+                                status_raw=downstream_status,
                                 force=force,
                             )
                             self._apply_downstream_status_inline(
@@ -2436,6 +2462,11 @@ class TaskManager:
                                 payload={
                                     "downstream_service": item.downstream_service,
                                     "downstream_task_id": item.downstream_task_id,
+                                    "http_status": None,
+                                    "error_type": None,
+                                    "status_raw": downstream_status,
+                                    "mapped_status": mapped_status,
+                                    "state_applied": bool(force or mapped_status != before_status),
                                     "before_status": before_status,
                                     "downstream_status": downstream_status,
                                     "after_status": mapped_status,
@@ -2479,8 +2510,12 @@ class TaskManager:
                                     "archive_status": job.archive_status,
                                     "downstream_service": item.downstream_service,
                                     "downstream_task_id": item.downstream_task_id,
-                                    "downstream_status": downstream_status,
+                                    "http_status": None,
+                                    "error_type": None,
+                                    "status_raw": downstream_status,
                                     "mapped_status": mapped_status,
+                                    "state_applied": False,
+                                    "downstream_status": downstream_status,
                                     "archive_retry_required": True,
                                 },
                             )
@@ -2499,8 +2534,12 @@ class TaskManager:
                                 "archive_status": job.archive_status,
                                 "downstream_service": item.downstream_service,
                                 "downstream_task_id": item.downstream_task_id,
-                                "downstream_status": downstream_status,
+                                "http_status": None,
+                                "error_type": None,
+                                "status_raw": downstream_status,
                                 "mapped_status": mapped_status,
+                                "state_applied": False,
+                                "downstream_status": downstream_status,
                             },
                         )
                     touched_stages.add(item.stage_name)
@@ -2518,7 +2557,18 @@ class TaskManager:
                         error_message=None if mapped_status in {"queued", "running", "success"} else (
                             payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message
                         ),
+                        http_status=None,
+                        error_type=None,
+                        status_raw=downstream_status,
                         force=force,
+                    )
+                    self._apply_downstream_status_inline(
+                        item,
+                        mapped_status=mapped_status,
+                        downstream_payload=payload,
+                        error_message=None if mapped_status in {"queued", "running", "success"} else (
+                            payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message
+                        ),
                     )
                     touched_stages.add(item.stage_name)
                     synced_count += 1
@@ -2535,6 +2585,11 @@ class TaskManager:
                         payload={
                             "downstream_service": item.downstream_service,
                             "downstream_task_id": item.downstream_task_id,
+                            "http_status": None,
+                            "error_type": None,
+                            "status_raw": downstream_status,
+                            "mapped_status": mapped_status,
+                            "state_applied": bool(force or mapped_status != before_status),
                             "before_status": before_status,
                             "downstream_status": downstream_status,
                             "after_status": mapped_status,
@@ -2553,6 +2608,9 @@ class TaskManager:
                     downstream_status="downstream_missing",
                     payload={"status": "downstream_missing", "error": "下游子任务不存在"},
                     error_message="下游子任务不存在",
+                    http_status=404,
+                    error_type="not_found",
+                    status_raw="downstream_missing",
                     force=True,
                 )
                 self._apply_downstream_status_inline(
@@ -2574,6 +2632,11 @@ class TaskManager:
                     payload={
                         "downstream_service": item_downstream_service,
                         "downstream_task_id": item_downstream_task_id,
+                        "http_status": 404,
+                        "error_type": "not_found",
+                        "status_raw": "downstream_missing",
+                        "mapped_status": "downstream_missing",
+                        "state_applied": True,
                         "before_status": before_status,
                         "downstream_status": "downstream_missing",
                         "after_status": "downstream_missing",
@@ -2594,8 +2657,12 @@ class TaskManager:
                     payload={
                         "downstream_service": item_downstream_service,
                         "downstream_task_id": item_downstream_task_id,
+                        "http_status": self._extract_http_status_from_exception(exc),
                         "error": str(exc),
-                        "error_type": exc.__class__.__name__,
+                        "error_type": self._classify_downstream_sync_error(exc),
+                        "status_raw": None,
+                        "mapped_status": None,
+                        "state_applied": False,
                     },
                 )
         for current_stage in touched_stages:
@@ -4086,6 +4153,11 @@ class TaskManager:
                 "state_event_id": event.id,
                 "before_status": payload.get("before_status"),
                 "after_status": mapped_status,
+                "http_status": payload.get("http_status"),
+                "error_type": payload.get("error_type"),
+                "status_raw": payload.get("status_raw") or payload.get("downstream_status"),
+                "mapped_status": mapped_status,
+                "state_applied": True,
                 "downstream_status": payload.get("downstream_status"),
                 "downstream_service": item.downstream_service,
                 "downstream_task_id": item.downstream_task_id,
@@ -4830,7 +4902,7 @@ class TaskManager:
             db.query(BinarySecurityTask)
             .join(BinarySecurityStageItem, BinarySecurityStageItem.task_id == BinarySecurityTask.id)
             .filter(
-                BinarySecurityTask.status.in_(["pending", "dispatching", "running"]),
+                BinarySecurityTask.status.in_(["pending", "dispatching", "running", "failed"]),
                 BinarySecurityStageItem.downstream_service.isnot(None),
                 BinarySecurityStageItem.downstream_task_id.isnot(None),
                 BinarySecurityStageItem.status.in_(["pending", "queued", "running", "dispatching", "failed"]),
@@ -4842,6 +4914,8 @@ class TaskManager:
         seen: set[str] = set()
         for task in rows:
             if task.id in seen or task.id in local_workers:
+                continue
+            if not self._task_has_active_reconcile_items(db, task):
                 continue
             if not self._task_needs_downstream_reconcile(task):
                 continue
@@ -5574,7 +5648,7 @@ class TaskManager:
         )
 
     def _task_needs_downstream_reconcile(self, task: BinarySecurityTask) -> bool:
-        if task.status == "pending":
+        if task.status in {"pending", "failed"}:
             return True
         if not str(task.dispatcher_instance_id or "").strip():
             return True
@@ -5590,6 +5664,64 @@ class TaskManager:
             30,
         )
         return elapsed_seconds >= grace_seconds
+
+    def _active_reconcile_stage_name(self, task: BinarySecurityTask) -> str | None:
+        if (
+            str(task.execution_mode or "").strip() in ACTIVE_RECONCILE_TARGET_STAGE_MODES
+            and str(task.target_stage_name or "").strip()
+        ):
+            return str(task.target_stage_name).strip()
+        if str(task.current_stage or "").strip():
+            return str(task.current_stage).strip()
+        return None
+
+    def _stage_item_in_active_reconcile_scope(
+        self,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+    ) -> bool:
+        active_stage_name = self._active_reconcile_stage_name(task)
+        if not active_stage_name or str(item.stage_name or "").strip() != active_stage_name:
+            return False
+        if not str(item.downstream_service or "").strip() or not str(item.downstream_task_id or "").strip():
+            return False
+        return str(item.status or "").strip().lower() in {"pending", "queued", "running", "dispatching", "failed"}
+
+    def _task_has_active_reconcile_items(self, db: Session, task: BinarySecurityTask) -> bool:
+        active_stage_name = self._active_reconcile_stage_name(task)
+        if not active_stage_name:
+            return False
+        return any(
+            self._stage_item_in_active_reconcile_scope(task, item)
+            for item in self._stage_items(db, task.id, active_stage_name)
+        )
+
+    def _extract_http_status_from_exception(self, exc: Exception) -> int | None:
+        message = str(exc or "")
+        if not message:
+            return None
+        match = re.search(r"(?:状态码|status(?:_code)?)[:= ]+(\d{3})", message, re.IGNORECASE)
+        if match:
+            try:
+                return int(match.group(1))
+            except Exception:
+                return None
+        return None
+
+    def _classify_downstream_sync_error(self, exc: Exception) -> str:
+        http_status = self._extract_http_status_from_exception(exc)
+        lowered = str(exc or "").strip().lower()
+        if http_status is not None and http_status >= 500:
+            return "http_5xx"
+        if "timeout" in lowered or "超时" in lowered:
+            return "timeout"
+        if any(token in lowered for token in {"connect", "connection", "连接", "refused"}):
+            return "connection_error"
+        if any(token in lowered for token in {"auth", "unauthorized", "forbidden", "认证"}):
+            return "auth_error"
+        if isinstance(exc, (TypeError, ValueError, KeyError, AssertionError)):
+            return "unexpected_response"
+        return exc.__class__.__name__
 
     def _active_dispatch_count(self, db: Session) -> int:
         now_value = _now()
@@ -6939,6 +7071,9 @@ class TaskManager:
         downstream_status: str,
         payload: dict[str, Any],
         error_message: str | None = None,
+        http_status: int | None = None,
+        error_type: str | None = None,
+        status_raw: str | None = None,
         force: bool = False,
         event_type: str = "downstream_status_observed",
     ) -> BinarySecurityStateEvent | None:
@@ -6966,6 +7101,9 @@ class TaskManager:
                 "downstream_status": downstream_status,
                 "downstream_payload": downstream_payload,
                 "error_message": error_message,
+                "http_status": http_status,
+                "error_type": error_type,
+                "status_raw": status_raw or downstream_status,
                 "force": bool(force),
             },
         )
@@ -6981,6 +7119,9 @@ class TaskManager:
         downstream_status: str,
         payload: dict[str, Any],
         error_message: str | None = None,
+        http_status: int | None = None,
+        error_type: str | None = None,
+        status_raw: str | None = None,
         force: bool = False,
     ) -> BinarySecurityStateEvent | None:
         return self._enqueue_downstream_status_event(
@@ -6992,6 +7133,9 @@ class TaskManager:
             downstream_status=downstream_status,
             payload=payload,
             error_message=error_message,
+            http_status=http_status,
+            error_type=error_type,
+            status_raw=status_raw,
             force=force,
             event_type="downstream_terminal_observed",
         )
@@ -8731,7 +8875,7 @@ class TaskManager:
             task.lease_expires_at = None
             self._enqueue_action(task.id)
             return
-        if task.status == "failed":
+        if task.status == "failed" and not self._task_has_active_reconcile_items(db, task):
             self._invalidate_task_execution(task)
             task.finished_at = task.finished_at or _now()
             return

@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.exception import NotFoundError, UnauthorizedError, ValidationError
 from app.model import B2STask, B2STaskItem, get_db
-from app.schemas import ActionResponse, B2SArtifactContentResponse, B2SCacheBatchDeleteRequest, B2SCacheBatchDeleteResponse, B2SCacheDeleteResponse, B2SCacheDetailResponse, B2SCacheListResponse, B2SServiceConfig, B2STaskTimelineResponse, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, SessionFileResponse, SessionIndexResponse, TaskBatchDeleteItemResult, TaskBatchDeleteRequest, TaskBatchDeleteResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskListResponse, TaskObservabilitySummary, TaskPrepareResponse, TaskRelationshipResponse, TaskResponse, TaskResultSummary, TokenUser
+from app.schemas import ActionResponse, B2SAgentSessionRuntimeResponse, B2SArtifactContentResponse, B2SCacheBatchDeleteRequest, B2SCacheBatchDeleteResponse, B2SCacheDeleteResponse, B2SCacheDetailResponse, B2SCacheListResponse, B2SServiceConfig, B2STaskTimelineResponse, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, SessionFileResponse, SessionIndexResponse, TaskBatchDeleteItemResult, TaskBatchDeleteRequest, TaskBatchDeleteResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskListResponse, TaskObservabilitySummary, TaskPrepareResponse, TaskRelationshipResponse, TaskResponse, TaskResultSummary, TokenUser
 from app.service.auth import get_auth_service
 from app.service.cache_service import get_cache_service
 from app.service.configcenter import get_configcenter_client
@@ -27,6 +27,7 @@ from app.service.task_service import (
     build_task_item_artifacts,
     build_task_item_review_analytics,
     build_task_observability_summary,
+    build_task_agent_session_runtime,
     build_task_relationship,
     build_task_result_summary,
     build_task_session_file,
@@ -526,6 +527,19 @@ async def get_b2s_task_session_file(
     await sync_task(db, task)
     items = query_items(db, task.id)
     return build_task_session_file(items, path, offset=offset, limit=limit, item_id=item_id, node_id=node_id)
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/agent-sessions/runtime", response_model=B2SAgentSessionRuntimeResponse)
+async def get_b2s_task_agent_sessions_runtime(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    await sync_task(db, task)
+    items = query_items(db, task.id)
+    return build_task_agent_session_runtime(items)
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/relationships", response_model=TaskRelationshipResponse)

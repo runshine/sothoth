@@ -6,11 +6,13 @@ import hashlib
 import json
 import os
 import shutil
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import re
 from pathlib import Path
 from statistics import mean
 from typing import Any
+from urllib.parse import urlencode
 from uuid import uuid4
 
 from sqlalchemy.exc import IntegrityError
@@ -26,6 +28,13 @@ from app.schemas import (
     AdvancedRun,
     AgentRuntimeEntry,
     AgentRuntimeSummary,
+    BatchObservabilityRow,
+    BatchObservabilitySummary,
+    B2SAgentSessionEvidence,
+    B2SAgentSessionFileRef,
+    B2SAgentSessionRuntimeEntry,
+    B2SAgentSessionRuntimeResponse,
+    B2SAgentSessionRuntimeSummary,
     B2SAbnormalEvidence,
     B2SAbnormalReason,
     B2SAbnormalReasonEventSummary,
@@ -72,7 +81,7 @@ from app.service.llm_provider import materialize_llm_provider
 from app.service.pi_cluster import get_pi_cluster_monitor
 from app.service.pi_re_agent import get_pi_client
 from app.service.security import app_task_item_root, app_task_root, ensure_path_in_project, project_root, safe_input_dir, safe_output_dir, validate_task_id
-from app.time_utils import isoformat_local, now_local
+from app.time_utils import ensure_local, isoformat_local, now_local
 
 TERMINAL = {"success", "failed", "cancelled"}
 PI_STATUS_MAP = {
@@ -121,6 +130,55 @@ FUNCTION_STATS_METADATA_KEY = "function_stats"
 FUNCTION_STATS_FIELDS = ("total_functions", "completed_functions", "failed_functions", "uncompleted_functions")
 TASK_EVENT_SOURCE_B2S = "b2s"
 TASK_EVENT_SOURCE_PI = "pi_re_agent"
+AGENT_SESSION_STALE_SECONDS = 10 * 60
+AGENT_SESSION_ACTIVE_STATUSES = {"pending", "dispatched", "streaming", "waiting_review", "waiting_execution", "stale"}
+AGENT_SESSION_STATUS_TITLES = {
+    "pending": "待启动",
+    "dispatched": "已派发",
+    "streaming": "执行中",
+    "waiting_review": "等待评审",
+    "waiting_execution": "等待继续执行",
+    "completed": "已完成",
+    "failed": "已失败",
+    "cancelled": "已取消",
+    "stale": "会话失活",
+    "orphan": "孤立会话",
+}
+
+
+@dataclass
+class _CollectedSession:
+    session_id: str
+    node_id: str | None
+    item: B2STaskItem
+    item_name: str
+    run_name: str | None
+    agent: str | None
+    role: str | None
+    stage: str | None
+    batch_no: int | None
+    attempt_no: int | None
+    relative_path: str | None
+    full_path: str | None
+    size: int
+    updated_at: datetime | None
+
+
+@dataclass
+class _ItemRuntimeSnapshot:
+    item: B2STaskItem
+    item_name: str
+    status: str
+    phase: str | None
+    current_batch: int | None
+    current_attempt: int | None
+    current_function: str | None
+    pi_job_id: str | None
+    pi_worker_url: str | None
+    runtime_metrics: dict[str, Any] | None
+    runtime_metrics_updated_at: datetime | None
+    runtime_metric_missing_reason: str | None
+    updated_at: datetime | None
 
 
 def _abnormal_evidence(key: str, label: str, value: Any) -> B2SAbnormalEvidence | None:
@@ -2645,6 +2703,7 @@ def get_task_item_or_404(db: Session, task: B2STask, item_id: str) -> B2STaskIte
 def build_task_detail(db: Session, task: B2STask) -> TaskDetailResponse:
     base = build_task_response(db, task).model_dump()
     raw_items = query_items(db, task.id)
+    agent_session_runtime = build_task_agent_session_runtime(raw_items)
     items = [
         TaskItemResponse(
             id=i.id,
@@ -2673,6 +2732,7 @@ def build_task_detail(db: Session, task: B2STask) -> TaskDetailResponse:
         task_config_snapshot=build_task_config_snapshot(task, raw_items),
         effective_llm_provider=build_effective_llm_provider(raw_items),
         agent_runtime_summary=build_agent_runtime_summary(raw_items),
+        agent_session_runtime_summary=agent_session_runtime.summary,
         result_summary=build_task_result_summary(raw_items),
         observability_summary=build_task_observability_summary(raw_items),
         event_summary=_build_task_event_summary(db, task.id),
@@ -3331,6 +3391,340 @@ def _session_relative_to_output(item: B2STaskItem, full_path: str) -> str:
         return Path(full_path).name
 
 
+def _safe_mtime(path: str | None) -> datetime | None:
+    try:
+        if path and os.path.isfile(path):
+            return _ensure_local_datetime(datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc).astimezone())
+    except OSError:
+        return None
+    return None
+
+
+def _ensure_local_datetime(value: datetime | None) -> datetime | None:
+    return ensure_local(value)
+
+
+def _session_status_title(status: str) -> str:
+    return AGENT_SESSION_STATUS_TITLES.get(status, status or "未知")
+
+
+def _session_metric_bucket(entries: list[B2SAgentSessionRuntimeEntry], attr: str, fallback: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for entry in entries:
+        raw = getattr(entry, attr, None)
+        label = str(raw or "").strip() or fallback
+        counts[label] = counts.get(label, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: item[0]))
+
+
+def _agent_session_evidence(key: str, label: str, value: Any) -> B2SAgentSessionEvidence | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return B2SAgentSessionEvidence(key=key, label=label, value=text)
+
+
+def _item_runtime_metrics_updated_at(metrics: dict[str, Any] | None) -> datetime | None:
+    if not isinstance(metrics, dict):
+        return None
+    for key in ("updated_at", "last_updated_at", "observed_at"):
+        raw = str(metrics.get(key) or "").strip()
+        if not raw:
+            continue
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone()
+        except ValueError:
+            continue
+    return None
+
+
+def _build_item_runtime_snapshot(item: B2STaskItem) -> _ItemRuntimeSnapshot:
+    metadata = item.extra_metadata if isinstance(item.extra_metadata, dict) else {}
+    progress = item.progress if isinstance(item.progress, dict) else {}
+    runtime_metrics = metadata.get("pi_runtime_metrics") if isinstance(metadata.get("pi_runtime_metrics"), dict) else None
+    worker_url = str(metadata.get("pi_worker_url") or metadata.get("pi_endpoint_url") or "").strip() or None
+    return _ItemRuntimeSnapshot(
+        item=item,
+        item_name=Path(item.elf_path).name,
+        status=str(item.status or "").strip() or "pending",
+        phase=str(item.phase or "").strip() or None,
+        current_batch=_safe_int(progress.get("current_batch")),
+        current_attempt=_safe_int(progress.get("current_attempt")),
+        current_function=str(progress.get("current_function") or "").strip() or None,
+        pi_job_id=str(item.pi_job_id or "").strip() or None,
+        pi_worker_url=worker_url,
+        runtime_metrics=runtime_metrics,
+        runtime_metrics_updated_at=_item_runtime_metrics_updated_at(runtime_metrics),
+        runtime_metric_missing_reason=str(metadata.get("pi_runtime_metric_missing_reason") or "").strip() or None,
+        updated_at=_ensure_local_datetime(item.updated_at),
+    )
+
+
+def _collect_item_sessions(item: B2STaskItem) -> tuple[list[_CollectedSession], list[str]]:
+    sessions: list[_CollectedSession] = []
+    warnings: list[str] = []
+    try:
+        advanced = build_task_item_advanced(item, include_content=False)
+        item_name = Path(item.elf_path).name
+        for run in advanced.runs:
+            for session in run.agent_sessions:
+                path = str(session.path or "").strip() or None
+                sessions.append(_CollectedSession(
+                    session_id=f"{item.id}:{path or session.name}",
+                    node_id=_session_node_id(item.id, path) if path else None,
+                    item=item,
+                    item_name=item_name,
+                    run_name=run.name,
+                    agent=session.agent,
+                    role=session.role,
+                    stage=session.stage,
+                    batch_no=session.batch_no,
+                    attempt_no=session.attempt_no,
+                    relative_path=_session_relative_to_output(item, path) if path else None,
+                    full_path=path,
+                    size=int(session.size or 0),
+                    updated_at=_safe_mtime(path) or _ensure_local_datetime(item.updated_at),
+                ))
+    except Exception as exc:
+        warnings.append(f"item #{item.sequence_no} 运行态会话构建失败: {exc}")
+    return sessions, warnings
+
+
+def _session_matches_current(session: _CollectedSession, snapshot: _ItemRuntimeSnapshot) -> bool:
+    if snapshot.current_batch is not None and session.batch_no is not None and session.batch_no != snapshot.current_batch:
+        return False
+    if snapshot.current_attempt is not None and session.attempt_no is not None and session.attempt_no != snapshot.current_attempt:
+        return False
+    if snapshot.current_batch is None and snapshot.current_attempt is None:
+        return session.item.status not in TERMINAL
+    return True
+
+
+def _latest_observed_at(session: _CollectedSession | None, snapshot: _ItemRuntimeSnapshot) -> datetime | None:
+    candidates = [
+        _ensure_local_datetime(session.updated_at) if session else None,
+        _ensure_local_datetime(snapshot.updated_at),
+        _ensure_local_datetime(snapshot.runtime_metrics_updated_at),
+    ]
+    available = [value for value in candidates if value is not None]
+    return max(available) if available else None
+
+
+def _is_stale(session: _CollectedSession | None, snapshot: _ItemRuntimeSnapshot) -> bool:
+    if snapshot.status in TERMINAL:
+        return False
+    if snapshot.runtime_metric_missing_reason:
+        return True
+    observed_at = _latest_observed_at(session, snapshot)
+    if observed_at is None:
+        return False
+    return (_ensure_local_datetime(now_local()) - observed_at).total_seconds() > AGENT_SESSION_STALE_SECONDS
+
+
+def _infer_agent_session_status(
+    session: _CollectedSession | None,
+    snapshot: _ItemRuntimeSnapshot,
+    *,
+    virtual: bool,
+) -> tuple[str, str, bool]:
+    if snapshot.status == "failed":
+        return "failed", "所属任务项已失败。", False
+    if snapshot.status == "cancelled":
+        return "cancelled", "所属任务项已取消。", False
+    if snapshot.status == "success":
+        return "completed", "所属任务项已成功完成。", False
+
+    if _is_stale(session, snapshot):
+        reason = snapshot.runtime_metric_missing_reason or "会话文件或运行指标长时间未更新。"
+        return "stale", reason, bool(session and not _session_matches_current(session, snapshot))
+
+    if virtual:
+        if snapshot.pi_job_id:
+            return "dispatched", "任务已派发到下游执行器，当前轮次尚未生成稳定会话文件。", False
+        return "pending", "任务项已创建，但当前会话尚未启动。", False
+
+    assert session is not None
+    current = _session_matches_current(session, snapshot)
+    role = str(session.role or session.agent or "").lower()
+
+    if current and "validator" in role:
+        return "waiting_review", "当前执行轮正在等待评审会话收口。", False
+    if current:
+        return "streaming", "当前会话与任务项运行轮次对齐，仍在持续输出。", False
+    if (
+        snapshot.current_batch is not None
+        and session.batch_no == snapshot.current_batch
+        and snapshot.current_attempt is not None
+        and session.attempt_no is not None
+        and session.attempt_no < snapshot.current_attempt
+        and "executor" in role
+    ):
+        return "waiting_execution", "上一轮执行已结束，等待进入下一次 attempt。", False
+    if snapshot.status in {"queued", "running"} and session.full_path:
+        return "orphan", "检测到历史会话文件，但它已不属于当前活跃轮次。", True
+    return "completed", "该会话轮次已结束，当前任务项已推进到后续阶段。", False
+
+
+def _virtual_agent_identity(snapshot: _ItemRuntimeSnapshot) -> tuple[str, str, str]:
+    phase = str(snapshot.phase or "").lower()
+    if phase == "header":
+        return "header agent", "header", "头文件恢复"
+    if phase == "merge":
+        return "validator agent", "validator", "结果评审"
+    if phase in {"body", "batching", "ida"}:
+        return "executor agent", "executor", "函数恢复"
+    return "agent", "session", "待启动会话"
+
+
+def _build_agent_session_file_ref(project_id: str, task_id: str, item_id: str | None, session: _CollectedSession | None) -> B2SAgentSessionFileRef:
+    if session is None or not session.relative_path:
+        return B2SAgentSessionFileRef(can_open=False)
+    query = {
+        "path": session.relative_path,
+    }
+    if item_id:
+        query["item_id"] = item_id
+    if session.node_id:
+        query["node_id"] = session.node_id
+    return B2SAgentSessionFileRef(
+        path=session.relative_path,
+        node_id=session.node_id,
+        can_open=True,
+        read_api=f"/api/app/binary-to-source/projects/{project_id}/tasks/{task_id}/sessions/file?{urlencode(query)}",
+    )
+
+
+def _build_agent_session_evidence(
+    session: _CollectedSession | None,
+    snapshot: _ItemRuntimeSnapshot,
+    status_reason: str,
+) -> list[B2SAgentSessionEvidence]:
+    return [
+        item for item in [
+            _agent_session_evidence("item_id", "任务项", snapshot.item.id),
+            _agent_session_evidence("sequence_no", "序号", snapshot.item.sequence_no),
+            _agent_session_evidence("status", "任务项状态", snapshot.status),
+            _agent_session_evidence("phase", "当前阶段", snapshot.phase),
+            _agent_session_evidence("current_batch", "当前 Batch", snapshot.current_batch),
+            _agent_session_evidence("current_attempt", "当前 Attempt", snapshot.current_attempt),
+            _agent_session_evidence("current_function", "当前函数", snapshot.current_function),
+            _agent_session_evidence("pi_job_id", "Pi Job", snapshot.pi_job_id),
+            _agent_session_evidence("worker_url", "Worker", snapshot.pi_worker_url),
+            _agent_session_evidence("session_path", "会话文件", session.relative_path if session else None),
+            _agent_session_evidence("reason", "原因", status_reason),
+        ] if item is not None
+    ]
+
+
+def build_task_agent_session_runtime(items: list[B2STaskItem]) -> B2SAgentSessionRuntimeResponse:
+    warnings: list[str] = []
+    entries: list[B2SAgentSessionRuntimeEntry] = []
+    task_id = items[0].task_id if items else ""
+    project_id = items[0].project_id if items else ""
+    for item in items:
+        snapshot = _build_item_runtime_snapshot(item)
+        sessions, item_warnings = _collect_item_sessions(item)
+        warnings.extend(item_warnings)
+        if not sessions:
+            agent, role, stage = _virtual_agent_identity(snapshot)
+            status, status_reason, is_orphan = _infer_agent_session_status(None, snapshot, virtual=True)
+            entries.append(B2SAgentSessionRuntimeEntry(
+                session_id=f"{item.id}:virtual:{role}",
+                node_id=None,
+                item_id=item.id,
+                sequence_no=item.sequence_no,
+                item_name=snapshot.item_name,
+                run_name=None,
+                agent=agent,
+                role=role,
+                stage=stage,
+                batch_no=snapshot.current_batch,
+                attempt_no=snapshot.current_attempt,
+                status=status,
+                status_title=_session_status_title(status),
+                status_reason=status_reason,
+                is_current=True,
+                is_active=status in AGENT_SESSION_ACTIVE_STATUSES,
+                is_orphan=is_orphan,
+                is_stale=status == "stale",
+                current_function=snapshot.current_function,
+                pi_job_id=snapshot.pi_job_id,
+                pi_worker_url=snapshot.pi_worker_url,
+                relative_path=None,
+                full_path=None,
+                size=0,
+                updated_at=_safe_iso(snapshot.updated_at),
+                last_event_at=_safe_iso(snapshot.updated_at),
+                file_ref=_build_agent_session_file_ref(project_id, task_id, item.id, None),
+                evidence=_build_agent_session_evidence(None, snapshot, status_reason),
+            ))
+            continue
+
+        for session in sessions:
+            status, status_reason, is_orphan = _infer_agent_session_status(session, snapshot, virtual=False)
+            entries.append(B2SAgentSessionRuntimeEntry(
+                session_id=session.session_id,
+                node_id=session.node_id,
+                item_id=item.id,
+                sequence_no=item.sequence_no,
+                item_name=session.item_name,
+                run_name=session.run_name,
+                agent=session.agent,
+                role=session.role,
+                stage=session.stage,
+                batch_no=session.batch_no,
+                attempt_no=session.attempt_no,
+                status=status,
+                status_title=_session_status_title(status),
+                status_reason=status_reason,
+                is_current=_session_matches_current(session, snapshot),
+                is_active=status in AGENT_SESSION_ACTIVE_STATUSES,
+                is_orphan=is_orphan or status == "orphan",
+                is_stale=status == "stale",
+                current_function=snapshot.current_function,
+                pi_job_id=snapshot.pi_job_id,
+                pi_worker_url=snapshot.pi_worker_url,
+                relative_path=session.relative_path,
+                full_path=session.full_path,
+                size=session.size,
+                updated_at=_safe_iso(session.updated_at),
+                last_event_at=_safe_iso(snapshot.updated_at),
+                file_ref=_build_agent_session_file_ref(project_id, task_id, item.id, session),
+                evidence=_build_agent_session_evidence(session, snapshot, status_reason),
+            ))
+
+    entries.sort(
+        key=lambda entry: (
+            int(entry.sequence_no or 0),
+            0 if entry.is_current else 1,
+            str(entry.status or ""),
+            int(entry.batch_no or 0),
+            int(entry.attempt_no or 0),
+            str(entry.relative_path or ""),
+        )
+    )
+    summary = B2SAgentSessionRuntimeSummary(
+        task_id=task_id,
+        generated_at=isoformat_local(now_local()),
+        total_sessions=len(entries),
+        active_sessions=sum(1 for entry in entries if entry.is_active),
+        sessions_by_status=_session_metric_bucket(entries, "status", "unknown"),
+        sessions_by_agent=_session_metric_bucket(entries, "agent", "unknown"),
+        sessions_by_role=_session_metric_bucket(entries, "role", "unknown"),
+        sessions_by_stage=_session_metric_bucket(entries, "stage", "unknown"),
+        orphan_sessions=sum(1 for entry in entries if entry.is_orphan),
+        stale_sessions=sum(1 for entry in entries if entry.is_stale),
+        warnings=warnings,
+    )
+    return B2SAgentSessionRuntimeResponse(
+        task_id=task_id,
+        generated_at=summary.generated_at,
+        summary=summary,
+        sessions=entries,
+        warnings=warnings,
+    )
+
+
 def build_task_session_index(items: list[B2STaskItem]) -> SessionIndexResponse:
     nodes: list[SessionIndexNode] = []
     warnings: list[str] = []
@@ -3478,6 +3872,243 @@ def _item_duration_ms(item: B2STaskItem) -> int | None:
     end = item.finished_at or now_local()
     delta = end - item.started_at
     return max(0, int(delta.total_seconds() * 1000))
+
+
+def _batch_status_label(status: str) -> str:
+    labels = {
+        "pending": "待执行",
+        "running": "运行中",
+        "passed": "已通过",
+        "failed": "失败",
+        "partial": "部分完成",
+        "unknown": "未知",
+    }
+    return labels.get(status, status or "未知")
+
+
+def _safe_datetime_from_iso(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return _ensure_local_datetime(datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone())
+    except ValueError:
+        return None
+
+
+def _batch_mtime(path: str | None) -> datetime | None:
+    return _safe_mtime(path)
+
+
+def _parse_runtime_batch_summary(item: B2STaskItem) -> tuple[dict[int, dict[str, Any]], datetime | None]:
+    metadata = item.extra_metadata if isinstance(item.extra_metadata, dict) else {}
+    metrics = metadata.get("pi_runtime_metrics") if isinstance(metadata.get("pi_runtime_metrics"), dict) else {}
+    batch_summary = metrics.get("batch_summary") if isinstance(metrics.get("batch_summary"), dict) else {}
+    batches: dict[int, dict[str, Any]] = {}
+    for row in batch_summary.get("batches") or []:
+        if not isinstance(row, dict):
+            continue
+        batch_no = _safe_int(row.get("batch_id"))
+        if batch_no is None:
+            batch_no = _safe_int(row.get("batch_no"))
+        if batch_no is None:
+            continue
+        batches[batch_no] = row
+    return batches, _item_runtime_metrics_updated_at(metrics)
+
+
+def _parse_batch_manifest(run_dir: Path | None) -> dict[int, dict[str, Any]]:
+    manifest = _json_file(run_dir / "batch_manifest.json") if run_dir else None
+    batches: dict[int, dict[str, Any]] = {}
+    for row in manifest.get("batches") or [] if isinstance(manifest, dict) else []:
+        if not isinstance(row, dict):
+            continue
+        batch_no = _safe_int(row.get("id"))
+        if batch_no is None:
+            continue
+        batches[batch_no] = row
+    return batches
+
+
+def _parse_results_manifest(run_dir: Path | None) -> dict[int, dict[str, Any]]:
+    results = _json_file(run_dir / "results.json") if run_dir else None
+    by_batch: dict[int, dict[str, Any]] = {}
+    for row in results.get("results") or [] if isinstance(results, dict) else []:
+        if not isinstance(row, dict):
+            continue
+        batch_no = _safe_int(row.get("batch_id"))
+        if batch_no is None:
+            continue
+        by_batch[batch_no] = row
+    return by_batch
+
+
+def _parse_review_verdict(file: AdvancedFile | None) -> tuple[str | None, str | None]:
+    if not file:
+        return None, None
+    parsed = _parse_review_file(file)
+    verdict = str(parsed.get("verdict") or "").upper() or None
+    if verdict not in {"PASS", "FAIL"}:
+        verdict = None
+    return verdict, _verdict_label(verdict or "UNKNOWN") if verdict else None
+
+
+def _row_last_event_at(
+    item: B2STaskItem,
+    batch: AdvancedBatch | None,
+    sessions: list[AdvancedFile],
+    runtime_updated_at: datetime | None,
+    is_running: bool,
+) -> datetime | None:
+    candidates: list[datetime | None] = []
+    if batch:
+        for file in [batch.source, batch.disasm, *batch.review_snapshots, *batch.reviews]:
+            candidates.append(_batch_mtime(file.path if file else None))
+    for session in sessions:
+        candidates.append(_batch_mtime(session.path))
+    if is_running:
+        candidates.append(_ensure_local_datetime(item.updated_at))
+        candidates.append(runtime_updated_at)
+    available = [value for value in candidates if value is not None]
+    return max(available) if available else None
+
+
+def _build_batch_observability_row(
+    item: B2STaskItem,
+    *,
+    item_name: str,
+    advanced: TaskItemAdvancedResponse,
+    batch_no: int,
+    manifest_row: dict[str, Any] | None,
+    result_row: dict[str, Any] | None,
+    runtime_row: dict[str, Any] | None,
+    runtime_updated_at: datetime | None,
+    sessions: list[AdvancedFile],
+) -> BatchObservabilityRow:
+    progress = item.progress if isinstance(item.progress, dict) else {}
+    batch = next((candidate for run in advanced.runs for candidate in run.batches if int(candidate.batch_no or 0) == batch_no), None)
+    warnings: list[str] = []
+    has_source_output = bool(batch and batch.source) or bool(str((manifest_row or {}).get("output_file") or "").strip())
+    has_disasm_context = bool(batch and batch.disasm) or bool(str((manifest_row or {}).get("disasm_file") or "").strip())
+    review_count = len(batch.reviews) if batch else 0
+    session_count = len(sessions)
+    runtime_status = str((runtime_row or {}).get("status") or "").strip().lower()
+    runtime_attempts = _safe_int((runtime_row or {}).get("attempts")) or 0
+    runtime_function_count = _safe_int((runtime_row or {}).get("function_count"))
+    manifest_result = manifest_row.get("result") if isinstance(manifest_row, dict) and isinstance(manifest_row.get("result"), dict) else {}
+    manifest_attempts = _safe_int(manifest_result.get("attempts")) or 0
+    result_attempts = _safe_int((result_row or {}).get("attempts")) or 0
+    session_attempts = [int(session.attempt_no or 0) for session in sessions if session.attempt_no]
+    attempt_count = max(runtime_attempts, manifest_attempts, result_attempts, review_count, max(session_attempts) if session_attempts else 0)
+    verdict, verdict_label = _parse_review_verdict(batch.reviews[-1] if batch and batch.reviews else None)
+    if not verdict:
+        candidate = str((result_row or {}).get("verdict") or manifest_result.get("verdict") or "").upper()
+        if candidate in {"PASS", "FAIL"}:
+            verdict = candidate
+            verdict_label = _verdict_label(candidate)
+        elif runtime_status in {"pass", "passed", "success"}:
+            verdict = "PASS"
+            verdict_label = _verdict_label("PASS")
+        elif runtime_status and runtime_status not in {"running", "pending"}:
+            verdict = "FAIL"
+            verdict_label = _verdict_label("FAIL")
+    function_count = (
+        _safe_int((manifest_row or {}).get("func_count"))
+        or len((manifest_row or {}).get("functions") or [])
+        or _safe_int(manifest_result.get("func_count"))
+        or _safe_int((result_row or {}).get("func_count"))
+        or runtime_function_count
+        or 0
+    )
+    total_size_bytes = _safe_int((manifest_row or {}).get("total_size")) or 0
+    if total_size_bytes <= 0 and batch:
+        total_size_bytes = max(int(batch.source.size if batch.source else 0), int(batch.disasm.size if batch.disasm else 0), 0)
+    is_running = item.status not in TERMINAL and (
+        (_safe_int(progress.get("current_batch")) == batch_no)
+        or any("validator" in str(session.role or session.agent or "").lower() or "executor" in str(session.role or session.agent or "").lower() for session in sessions)
+    )
+    if is_running:
+        status = "running"
+    elif verdict == "PASS":
+        status = "passed"
+    elif verdict == "FAIL":
+        status = "failed"
+    elif has_source_output or review_count > 0 or session_count > 0:
+        status = "partial"
+    elif manifest_row or result_row or runtime_row or has_disasm_context:
+        status = "pending"
+    else:
+        status = "unknown"
+    if status == "unknown":
+        warnings.append("缺少 manifest、results、review 和 session 信号。")
+    current_attempt_no = _safe_int(progress.get("current_attempt")) if is_running else None
+    current_function = str(progress.get("current_function") or "").strip() or None
+    if not is_running:
+        current_function = None
+    last_event_at = _row_last_event_at(item, batch, sessions, runtime_updated_at, is_running)
+    duration_ms: int | None = None
+    runtime_duration_seconds = float((runtime_row or {}).get("duration_seconds") or 0.0)
+    if runtime_duration_seconds > 0:
+        duration_ms = max(0, int(runtime_duration_seconds * 1000))
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    if duration_ms is not None and last_event_at is not None:
+        if status == "running":
+            started_at = last_event_at - timedelta(milliseconds=duration_ms)
+        else:
+            finished_at = last_event_at
+            started_at = finished_at - timedelta(milliseconds=duration_ms)
+    return BatchObservabilityRow(
+        item_id=item.id,
+        sequence_no=item.sequence_no,
+        item_name=item_name,
+        batch_no=batch_no,
+        status=status,
+        status_label=_batch_status_label(status),
+        function_count=max(0, int(function_count or 0)),
+        total_size_bytes=max(0, int(total_size_bytes or 0)),
+        attempt_count=max(0, int(attempt_count or 0)),
+        current_attempt_no=current_attempt_no,
+        current_function=current_function,
+        review_count=review_count,
+        session_count=session_count,
+        has_source_output=has_source_output,
+        has_disasm_context=has_disasm_context,
+        latest_verdict=verdict,
+        latest_verdict_label=verdict_label,
+        started_at=_safe_iso(started_at),
+        finished_at=_safe_iso(finished_at),
+        duration_ms=duration_ms,
+        last_event_at=_safe_iso(last_event_at),
+        warnings=warnings,
+    )
+
+
+def _build_batch_observability_summary(rows: list[BatchObservabilityRow]) -> BatchObservabilitySummary:
+    total_review_rounds = sum(int(row.review_count or 0) for row in rows)
+    status_counts = {
+        "running": 0,
+        "passed": 0,
+        "failed": 0,
+        "partial": 0,
+        "pending": 0,
+        "unknown": 0,
+    }
+    for row in rows:
+        key = row.status if row.status in status_counts else "unknown"
+        status_counts[key] += 1
+    return BatchObservabilitySummary(
+        total_batches=len(rows),
+        running_batches=status_counts["running"],
+        passed_batches=status_counts["passed"],
+        failed_batches=status_counts["failed"],
+        partial_batches=status_counts["partial"],
+        pending_batches=status_counts["pending"],
+        unknown_batches=status_counts["unknown"],
+        avg_attempts_per_batch=round(sum(int(row.attempt_count or 0) for row in rows) / len(rows), 2) if rows else 0,
+        total_review_rounds=total_review_rounds,
+        active_batch_count=status_counts["running"],
+    )
 
 
 def _empty_review_analytics(item: B2STaskItem) -> ReviewAnalyticsResponse:
@@ -3752,6 +4383,7 @@ def build_business_runtime_metrics_summary(items: list[B2STaskItem]) -> dict[str
 
 def build_task_observability_summary(items: list[B2STaskItem]) -> TaskObservabilitySummary:
     rows: list[TaskObservabilityItem] = []
+    batch_rows: list[BatchObservabilityRow] = []
     durations: list[int] = []
     total_batches = total_sessions = total_attempts = 0
     passed_items = issue_total = issue_resolved = issue_remaining = 0
@@ -3761,7 +4393,7 @@ def build_task_observability_summary(items: list[B2STaskItem]) -> TaskObservabil
     overall_progress = build_overall_progress(items)
     for item in items:
         advanced = build_task_item_advanced(item, include_content=False)
-        analytics = _task_level_review_analytics(item)
+        analytics = _task_level_review_analytics(item, advanced)
         duration_ms = _item_duration_ms(item)
         if duration_ms is not None:
             durations.append(duration_ms)
@@ -3780,10 +4412,43 @@ def build_task_observability_summary(items: list[B2STaskItem]) -> TaskObservabil
         quality_scores.append(int(analytics.summary.final_quality_score or 0))
         risk_key = str(analytics.summary.residual_risk or "unknown")
         risk_distribution[risk_key] = risk_distribution.get(risk_key, 0) + 1
+        item_name = Path(item.elf_path).name
+        run_dir = _latest_run_dir(item)
+        manifest_batches = _parse_batch_manifest(run_dir)
+        result_batches = _parse_results_manifest(run_dir)
+        runtime_batches, runtime_updated_at = _parse_runtime_batch_summary(item)
+        session_map: dict[int, list[AdvancedFile]] = {}
+        for run in advanced.runs:
+            for session in run.agent_sessions:
+                if session.batch_no is None:
+                    continue
+                session_map.setdefault(int(session.batch_no), []).append(session)
+        batch_nos = {
+            *(int(batch.batch_no or 0) for run in advanced.runs for batch in run.batches if batch.batch_no is not None),
+            *manifest_batches.keys(),
+            *result_batches.keys(),
+            *runtime_batches.keys(),
+            *session_map.keys(),
+        }
+        current_batch = _safe_int((item.progress or {}).get("current_batch"))
+        if current_batch is not None:
+            batch_nos.add(current_batch)
+        for batch_no in sorted(no for no in batch_nos if no > 0):
+            batch_rows.append(_build_batch_observability_row(
+                item,
+                item_name=item_name,
+                advanced=advanced,
+                batch_no=batch_no,
+                manifest_row=manifest_batches.get(batch_no),
+                result_row=result_batches.get(batch_no),
+                runtime_row=runtime_batches.get(batch_no),
+                runtime_updated_at=runtime_updated_at,
+                sessions=session_map.get(batch_no, []),
+            ))
         rows.append(TaskObservabilityItem(
             item_id=item.id,
             sequence_no=item.sequence_no,
-            item_name=Path(item.elf_path).name,
+            item_name=item_name,
             status=item.status,
             duration_ms=duration_ms,
             batch_count=batch_count,
@@ -3797,6 +4462,8 @@ def build_task_observability_summary(items: list[B2STaskItem]) -> TaskObservabil
             issue_remaining=int(analytics.summary.issue_remaining or 0),
         ))
     total_duration_ms = sum(durations) if durations else None
+    sorted_batch_rows = sorted(batch_rows, key=lambda entry: (entry.sequence_no, entry.batch_no))
+    batch_summary = _build_batch_observability_summary(sorted_batch_rows)
     return TaskObservabilitySummary(
         task_id=items[0].task_id if items else "",
         total_duration_ms=total_duration_ms,
@@ -3821,6 +4488,8 @@ def build_task_observability_summary(items: list[B2STaskItem]) -> TaskObservabil
         avg_quality_score=round(mean(quality_scores), 1) if quality_scores else 0,
         residual_risk_distribution=risk_distribution,
         business_runtime_metrics=build_business_runtime_metrics_summary(items),
+        batch_summary=batch_summary,
+        batches=sorted_batch_rows,
         items=sorted(rows, key=lambda entry: entry.sequence_no),
     )
 
