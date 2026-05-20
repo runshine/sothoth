@@ -3985,6 +3985,56 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             fake_client.calls,
         )
 
+    def test_control_existing_downstream_task_marks_running_conflict_as_already_running(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="item1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module1",
+            item_name="mod",
+            parent_key="fw1",
+            downstream_service="entry_analyse",
+            downstream_task_id="ea-1",
+            status="failed",
+        )
+
+        async def fake_retry(*args, **kwargs):
+            del args, kwargs
+            raise ValidationError('{"detail":"任务仍在运行中，请先取消后再重启"}')
+
+        async def fake_fetch(*args, **kwargs):
+            del args, kwargs
+            return {"task_id": "ea-1", "status": "running"}
+
+        with (
+            patch.object(self.manager, "_invoke_existing_downstream_retry", side_effect=fake_retry),
+            patch.object(self.manager, "_fetch_downstream_task_payload", side_effect=fake_fetch),
+        ):
+            result = asyncio.run(
+                self.manager._control_existing_downstream_task(
+                    "entry_analysis",
+                    task=task,
+                    item=item,
+                    token="tok",
+                )
+            )
+
+        self.assertEqual("already_running", result["outcome"])
+        self.assertEqual("ea-1", result["payload"]["task_id"])
+        self.assertEqual("running", result["payload"]["status"])
+
     def test_retry_task_full_restart_cleans_existing_downstream_refs(self):
         with tempfile.TemporaryDirectory() as tmp:
             task = BinarySecurityTask(
@@ -8067,7 +8117,15 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("b2s-running", item.downstream_task_id)
 
     def test_run_b2s_item_reuses_active_downstream_task_instead_of_creating_new_one(self):
-        task = BinarySecurityTask(id="t1", name="source-task", project_id="p1", workspace_root="/tmp/ws")
+        task = BinarySecurityTask(
+            id="t1",
+            name="source-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+        )
         stage_run = BinarySecurityStageRun(
             id="sr1",
             task_id="t1",
@@ -8283,6 +8341,72 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("dfa-retried", item.downstream_task_id)
         self.assertEqual("failed", result["status"])
         self.assertEqual("boom", result["error"])
+
+    def test_run_entry_item_retry_running_conflict_polls_existing_downstream(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="source-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="mod",
+            parent_key="fw-1",
+            downstream_service="entry_analyse",
+            downstream_task_id="ea-old",
+            status="failed",
+            output_ref={},
+        )
+        module = {
+            "module_key": "module-1",
+            "module_name": "mod",
+            "firmware_key": "fw-1",
+            "source_dir": "/tmp/src",
+        }
+        fake_session = _ModelAwareDb()
+        polled = {"count": 0}
+
+        async def fake_poll(*args, **kwargs):
+            del args, kwargs
+            polled["count"] += 1
+            return "success", {"task_id": "ea-old", "status": "passed"}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(
+                self.manager,
+                "_control_existing_downstream_task",
+                return_value={"outcome": "already_running", "payload": {"task_id": "ea-old", "status": "running"}},
+            ),
+            patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
+            patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
+            patch.object(self.manager, "_parse_entries", return_value=[]),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+            patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
+        ):
+            result = asyncio.run(self.manager._run_entry_item(task, stage_run, module, token="tok", retrying=True))
+
+        self.assertEqual(1, polled["count"])
+        self.assertEqual("success", result["status"])
+        self.assertEqual("success", item.status)
+        self.assertIsNone(item.error_message)
 
 
 if __name__ == "__main__":

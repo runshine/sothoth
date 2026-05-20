@@ -24,7 +24,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, load_only
 
 from app.config import get_config
-from app.exception import ConflictError, NotFoundError, ValidationError
+from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
 from app.model import (
     STAGE_SEQUENCE,
     TASK_TERMINAL_STATUSES,
@@ -9189,6 +9189,133 @@ class TaskManager:
             return get_dataflow_vuln_scanner_client().retry_task(downstream_task_id, token or "")
         raise ValidationError(f"阶段 {stage_name} 未配置安全重试接口")
 
+    @staticmethod
+    def _extract_downstream_error_text(exc: Exception) -> str:
+        raw_message = str(getattr(exc, "message", exc) or "").strip()
+        if not raw_message:
+            return ""
+        try:
+            payload = json.loads(raw_message)
+        except Exception:
+            return raw_message
+        queue: list[Any] = [payload]
+        while queue:
+            current = queue.pop(0)
+            if isinstance(current, dict):
+                for key in ("detail", "error", "message", "msg"):
+                    value = current.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+                queue.extend(value for value in current.values() if isinstance(value, (dict, list)))
+            elif isinstance(current, list):
+                for value in current:
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+                    if isinstance(value, (dict, list)):
+                        queue.append(value)
+        return raw_message
+
+    @staticmethod
+    def _is_already_running_control_conflict(message: str) -> bool:
+        normalized = re.sub(r"\s+", "", str(message or "").lower())
+        if not normalized:
+            return False
+        running_tokens = (
+            "仍在运行",
+            "运行中",
+            "已经在运行",
+            "active",
+            "alreadyrunning",
+            "currentlyrunning",
+            "stillrunning",
+        )
+        control_tokens = (
+            "重启",
+            "重试",
+            "restart",
+            "retry",
+            "rerun",
+            "cancel",
+            "取消后再",
+            "先取消",
+        )
+        return any(token in normalized for token in running_tokens) and any(token in normalized for token in control_tokens)
+
+    async def _control_existing_downstream_task(
+        self,
+        stage_name: str,
+        *,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        token: str | None,
+    ) -> dict[str, Any]:
+        try:
+            payload = await self._invoke_existing_downstream_retry(stage_name, task=task, item=item, token=token)
+            return {"outcome": "accepted", "payload": payload, "error_message": None, "http_status": 200}
+        except NotFoundError as exc:
+            return {
+                "outcome": "not_found",
+                "payload": None,
+                "error_message": self._extract_downstream_error_text(exc) or "下游子任务不存在",
+                "http_status": getattr(exc, "status_code", 404),
+            }
+        except (ValidationError, ConflictError) as exc:
+            error_message = self._extract_downstream_error_text(exc) or str(exc)
+            result = {
+                "outcome": "already_running" if self._is_already_running_control_conflict(error_message) else "invalid_transition",
+                "payload": None,
+                "error_message": error_message,
+                "http_status": getattr(exc, "status_code", None),
+            }
+        except UpstreamError as exc:
+            return {
+                "outcome": "fatal_error",
+                "payload": None,
+                "error_message": self._extract_downstream_error_text(exc) or str(exc),
+                "http_status": getattr(exc, "status_code", 502),
+            }
+        except Exception as exc:
+            return {
+                "outcome": "fatal_error",
+                "payload": None,
+                "error_message": str(exc),
+                "http_status": None,
+            }
+
+        if not self._has_retryable_downstream_task(item):
+            return result
+        try:
+            payload = await self._fetch_downstream_task_payload(task, item, token or "")
+        except NotFoundError as exc:
+            return {
+                "outcome": "not_found",
+                "payload": None,
+                "error_message": self._extract_downstream_error_text(exc) or result["error_message"] or "下游子任务不存在",
+                "http_status": getattr(exc, "status_code", 404),
+            }
+        except Exception:
+            return result
+
+        mapped_status = self._map_downstream_status(str(payload.get("status") or ""))
+        if mapped_status in {"queued", "running"}:
+            return {**result, "outcome": "already_running", "payload": payload}
+        if mapped_status in {"success", "partial_success", "failed", "cancelled", "downstream_missing"}:
+            return {**result, "outcome": "already_terminal", "payload": payload}
+        return {**result, "payload": payload}
+
+    def _status_from_downstream_payload(self, payload: dict[str, Any], *, success_statuses: set[str]) -> str:
+        downstream_status = str(payload.get("status") or "").lower()
+        if downstream_status in success_statuses:
+            return "success"
+        mapped_status = self._map_downstream_status(downstream_status)
+        if mapped_status == "success":
+            return "success"
+        if mapped_status == "cancelled":
+            return "cancelled"
+        if mapped_status == "downstream_missing":
+            return "downstream_missing"
+        return "failed"
+
     def _has_retryable_downstream_task(self, item: BinarySecurityStageItem) -> bool:
         if not str(item.downstream_task_id or "").strip():
             return False
@@ -10224,7 +10351,40 @@ class TaskManager:
             )
             session.commit()
             if retrying and self._has_retryable_downstream_task(item):
-                created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=token)
+                control = await self._control_existing_downstream_task(stage_run.stage_name, task=task, item=item, token=token)
+                outcome = str(control.get("outcome") or "")
+                if outcome == "accepted":
+                    created = dict(control.get("payload") or {})
+                elif outcome == "already_running":
+                    payload = dict(control.get("payload") or {})
+                    item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
+                    item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
+                    item.started_at = item.started_at or _now()
+                    item.result = {"project_id": task.project_id}
+                    session.commit()
+                    status, payload = await self._poll_until_terminal(
+                        lambda: get_firmware_unpacker_client().get_task(task.project_id, item.downstream_task_id, token or ""),
+                        success_statuses={"success"},
+                        failure_statuses={"failed", "cancelled"},
+                        task=task,
+                        item=item,
+                    )
+                    created = None
+                elif outcome == "already_terminal":
+                    payload = dict(control.get("payload") or {})
+                    item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
+                    item.result = {"project_id": task.project_id}
+                    session.commit()
+                    status = self._status_from_downstream_payload(payload, success_statuses={"success"})
+                    created = None
+                elif outcome == "not_found":
+                    item.status = "downstream_missing"
+                    item.error_message = str(control.get("error_message") or "下游子任务不存在")
+                    item.finished_at = _now()
+                    session.commit()
+                    return {"status": "downstream_missing", "error": item.error_message, "item": input_file}
+                else:
+                    raise ValidationError(str(control.get("error_message") or "下游重试失败"))
             else:
                 created = await get_firmware_unpacker_client().create_task(
                     task.project_id,
@@ -10232,18 +10392,19 @@ class TaskManager:
                     token or "",
                     _downstream_origin_payload(task, item),
                 )
-            item.status = "running"
-            item.downstream_task_id = created.get("task_id") or item.downstream_task_id
-            item.started_at = _now()
-            item.result = {"project_id": task.project_id}
-            session.commit()
-            status, payload = await self._poll_until_terminal(
-                lambda: get_firmware_unpacker_client().get_task(task.project_id, item.downstream_task_id, token or ""),
-                success_statuses={"success"},
-                failure_statuses={"failed", "cancelled"},
-                task=task,
-                item=item,
-            )
+            if created is not None:
+                item.status = "running"
+                item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+                item.started_at = _now()
+                item.result = {"project_id": task.project_id}
+                session.commit()
+                status, payload = await self._poll_until_terminal(
+                    lambda: get_firmware_unpacker_client().get_task(task.project_id, item.downstream_task_id, token or ""),
+                    success_statuses={"success"},
+                    failure_statuses={"failed", "cancelled"},
+                    task=task,
+                    item=item,
+                )
             mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "downstream_missing" if status == "downstream_missing" else "failed"
             item.status = mapped_status
             item.error_message = None if mapped_status in {"success", "partial_success"} else (
@@ -10566,16 +10727,49 @@ class TaskManager:
                         else:
                             status = "failed"
                 elif retrying and self._has_retryable_downstream_task(item):
-                    created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=None)
-                    item.downstream_task_id = created.get("task_id") or item.downstream_task_id
-                    session.commit()
-                    status, payload = await self._poll_until_terminal(
-                        lambda: get_system_analyse_client().get_task(item.downstream_task_id),
-                        success_statuses={"passed", "success"},
-                        failure_statuses={"failed", "error", "cancelled"},
-                        task=task,
-                        item=item,
-                    )
+                    control = await self._control_existing_downstream_task(stage_run.stage_name, task=task, item=item, token=None)
+                    outcome = str(control.get("outcome") or "")
+                    if outcome == "accepted":
+                        created = dict(control.get("payload") or {})
+                        item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+                        item.status = "running"
+                        session.commit()
+                        status, payload = await self._poll_until_terminal(
+                            lambda: get_system_analyse_client().get_task(item.downstream_task_id),
+                            success_statuses={"passed", "success"},
+                            failure_statuses={"failed", "error", "cancelled"},
+                            task=task,
+                            item=item,
+                        )
+                    elif outcome == "already_running":
+                        payload = dict(control.get("payload") or {})
+                        item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
+                        item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
+                        session.commit()
+                        status, payload = await self._poll_until_terminal(
+                            lambda: get_system_analyse_client().get_task(item.downstream_task_id),
+                            success_statuses={"passed", "success"},
+                            failure_statuses={"failed", "error", "cancelled"},
+                            task=task,
+                            item=item,
+                        )
+                    elif outcome == "already_terminal":
+                        payload = dict(control.get("payload") or {})
+                        item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
+                        session.commit()
+                        status = self._status_from_downstream_payload(payload, success_statuses={"passed", "success"})
+                    elif outcome == "not_found":
+                        item.status = "downstream_missing"
+                        item.error_message = str(control.get("error_message") or "下游子任务不存在")
+                        item.finished_at = _now()
+                        session.commit()
+                        return {
+                            "status": "downstream_missing",
+                            "item": self._lightweight_system_analysis_input(firmware),
+                            "error": item.error_message,
+                        }
+                    else:
+                        raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
                     created = await get_system_analyse_client().create_task(
                         task.project_id,
@@ -11444,16 +11638,45 @@ class TaskManager:
                         else:
                             status = "failed"
                 elif retrying and self._has_retryable_downstream_task(item):
-                    created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=token)
-                    item.downstream_task_id = created.get("id") or item.downstream_task_id
-                    session.commit()
-                    status, payload = await self._poll_until_terminal(
-                        lambda: get_binary_to_source_client().get_task(task.project_id, item.downstream_task_id, token or ""),
-                        success_statuses={"success", "partial_success", "completed"},
-                        failure_statuses={"failed", "cancelled"},
-                        task=task,
-                        item=item,
-                    )
+                    control = await self._control_existing_downstream_task(stage_run.stage_name, task=task, item=item, token=token)
+                    outcome = str(control.get("outcome") or "")
+                    if outcome == "accepted":
+                        created = dict(control.get("payload") or {})
+                        item.downstream_task_id = created.get("id") or item.downstream_task_id
+                        item.status = "running"
+                        session.commit()
+                        status, payload = await self._poll_until_terminal(
+                            lambda: get_binary_to_source_client().get_task(task.project_id, item.downstream_task_id, token or ""),
+                            success_statuses={"success", "partial_success", "completed"},
+                            failure_statuses={"failed", "cancelled"},
+                            task=task,
+                            item=item,
+                        )
+                    elif outcome == "already_running":
+                        payload = dict(control.get("payload") or {})
+                        item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
+                        item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
+                        session.commit()
+                        status, payload = await self._poll_until_terminal(
+                            lambda: get_binary_to_source_client().get_task(task.project_id, item.downstream_task_id, token or ""),
+                            success_statuses={"success", "partial_success", "completed"},
+                            failure_statuses={"failed", "cancelled"},
+                            task=task,
+                            item=item,
+                        )
+                    elif outcome == "already_terminal":
+                        payload = dict(control.get("payload") or {})
+                        item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
+                        session.commit()
+                        status = self._status_from_downstream_payload(payload, success_statuses={"success", "partial_success", "completed"})
+                    elif outcome == "not_found":
+                        item.status = "downstream_missing"
+                        item.error_message = str(control.get("error_message") or "下游子任务不存在")
+                        item.finished_at = _now()
+                        session.commit()
+                        return {"status": "downstream_missing", "error": item.error_message, "item": module}
+                    else:
+                        raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
                     created = await get_binary_to_source_client().create_task(
                         task.project_id,
@@ -11611,7 +11834,37 @@ class TaskManager:
             )
             session.commit()
             if retrying and self._has_retryable_downstream_task(item):
-                created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=token)
+                control = await self._control_existing_downstream_task(stage_run.stage_name, task=task, item=item, token=token)
+                outcome = str(control.get("outcome") or "")
+                if outcome == "accepted":
+                    created = dict(control.get("payload") or {})
+                elif outcome == "already_running":
+                    payload = dict(control.get("payload") or {})
+                    item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
+                    item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
+                    session.commit()
+                    status, payload = await self._poll_until_terminal(
+                        lambda: get_entry_analyse_client().get_task(item.downstream_task_id, token or ""),
+                        success_statuses={"passed", "success"},
+                        failure_statuses={"failed", "error", "cancelled"},
+                        task=task,
+                        item=item,
+                    )
+                    created = None
+                elif outcome == "already_terminal":
+                    payload = dict(control.get("payload") or {})
+                    item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
+                    session.commit()
+                    status = self._status_from_downstream_payload(payload, success_statuses={"passed", "success"})
+                    created = None
+                elif outcome == "not_found":
+                    item.status = "downstream_missing"
+                    item.error_message = str(control.get("error_message") or "下游子任务不存在")
+                    item.finished_at = _now()
+                    session.commit()
+                    return {"status": "downstream_missing", "error": item.error_message, "item": module}
+                else:
+                    raise ValidationError(str(control.get("error_message") or "下游重试失败"))
             else:
                 created = await get_entry_analyse_client().create_task(
                     task.project_id,
@@ -11622,18 +11875,20 @@ class TaskManager:
                     module.get("source_root") or module.get("unpacked_root") or module["source_dir"],
                     _downstream_origin_payload(task, item),
                 )
-            created_task_id = str(created.get("task_id") or "").strip()
-            current_downstream_task_id = str(item.downstream_task_id or "").strip()
-            if created_task_id and (not current_downstream_task_id or current_downstream_task_id == created_task_id):
-                item.downstream_task_id = created_task_id
-            session.commit()
-            status, payload = await self._poll_until_terminal(
-                lambda: get_entry_analyse_client().get_task(item.downstream_task_id, token or ""),
-                success_statuses={"passed", "success"},
-                failure_statuses={"failed", "error", "cancelled"},
-                task=task,
-                item=item,
-            )
+            if created is not None:
+                created_task_id = str(created.get("task_id") or "").strip()
+                current_downstream_task_id = str(item.downstream_task_id or "").strip()
+                if created_task_id and (not current_downstream_task_id or current_downstream_task_id == created_task_id):
+                    item.downstream_task_id = created_task_id
+                item.status = "running"
+                session.commit()
+                status, payload = await self._poll_until_terminal(
+                    lambda: get_entry_analyse_client().get_task(item.downstream_task_id, token or ""),
+                    success_statuses={"passed", "success"},
+                    failure_statuses={"failed", "error", "cancelled"},
+                    task=task,
+                    item=item,
+                )
             service_output = self._materialize_stage_artifact(
                 self._service_output_path(task, item.downstream_service or stage_run.stage_name, module["module_key"], item.downstream_task_id),
                 item.downstream_task_id,
@@ -11906,16 +12161,45 @@ class TaskManager:
                     else:
                         status = "failed"
             elif retrying and self._has_retryable_downstream_task(item):
-                created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=None)
-                item.downstream_task_id = created.get("task_id") or item.downstream_task_id
-                session.commit()
-                status, payload = await self._poll_until_terminal(
-                    lambda: get_dataflow_analyse_client().get_task(item.downstream_task_id),
-                    success_statuses={"passed", "success"},
-                    failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
-                    task=task,
-                    item=item,
-                )
+                control = await self._control_existing_downstream_task(stage_run.stage_name, task=task, item=item, token=None)
+                outcome = str(control.get("outcome") or "")
+                if outcome == "accepted":
+                    created = dict(control.get("payload") or {})
+                    item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+                    item.status = "running"
+                    session.commit()
+                    status, payload = await self._poll_until_terminal(
+                        lambda: get_dataflow_analyse_client().get_task(item.downstream_task_id),
+                        success_statuses={"passed", "success"},
+                        failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
+                        task=task,
+                        item=item,
+                    )
+                elif outcome == "already_running":
+                    payload = dict(control.get("payload") or {})
+                    item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
+                    item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
+                    session.commit()
+                    status, payload = await self._poll_until_terminal(
+                        lambda: get_dataflow_analyse_client().get_task(item.downstream_task_id),
+                        success_statuses={"passed", "success"},
+                        failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
+                        task=task,
+                        item=item,
+                    )
+                elif outcome == "already_terminal":
+                    payload = dict(control.get("payload") or {})
+                    item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
+                    session.commit()
+                    status = self._status_from_downstream_payload(payload, success_statuses={"passed", "success"})
+                elif outcome == "not_found":
+                    item.status = "downstream_missing"
+                    item.error_message = str(control.get("error_message") or "下游子任务不存在")
+                    item.finished_at = _now()
+                    session.commit()
+                    return {"status": "downstream_missing", "error": item.error_message, "item": entry}
+                else:
+                    raise ValidationError(str(control.get("error_message") or "下游重试失败"))
             else:
                 created = await get_dataflow_analyse_client().create_task(
                     task.project_id,
@@ -12028,7 +12312,37 @@ class TaskManager:
             )
             session.commit()
             if retrying and self._has_retryable_downstream_task(item):
-                created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=token)
+                control = await self._control_existing_downstream_task(stage_run.stage_name, task=task, item=item, token=token)
+                outcome = str(control.get("outcome") or "")
+                if outcome == "accepted":
+                    created = dict(control.get("payload") or {})
+                elif outcome == "already_running":
+                    payload = dict(control.get("payload") or {})
+                    item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
+                    item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
+                    session.commit()
+                    status, payload = await self._poll_until_terminal(
+                        lambda: get_dataflow_vuln_scanner_client().get_task(item.downstream_task_id, token or ""),
+                        success_statuses={"success", "succeeded", "completed"},
+                        failure_statuses={"failed", "cancelled"},
+                        task=task,
+                        item=item,
+                    )
+                    created = None
+                elif outcome == "already_terminal":
+                    payload = dict(control.get("payload") or {})
+                    item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
+                    session.commit()
+                    status = self._status_from_downstream_payload(payload, success_statuses={"success", "succeeded", "completed"})
+                    created = None
+                elif outcome == "not_found":
+                    item.status = "downstream_missing"
+                    item.error_message = str(control.get("error_message") or "下游子任务不存在")
+                    item.finished_at = _now()
+                    session.commit()
+                    return {"status": "downstream_missing", "error": item.error_message, "item": dataflow_result}
+                else:
+                    raise ValidationError(str(control.get("error_message") or "下游重试失败"))
             else:
                 created = await get_dataflow_vuln_scanner_client().create_task(
                     task.project_id,
@@ -12038,15 +12352,17 @@ class TaskManager:
                     dataflow_result["source_dir"],
                     _downstream_origin_payload(task, item),
                 )
-            item.downstream_task_id = created.get("task_id") or item.downstream_task_id
-            session.commit()
-            status, payload = await self._poll_until_terminal(
-                lambda: get_dataflow_vuln_scanner_client().get_task(item.downstream_task_id, token or ""),
-                success_statuses={"success", "succeeded", "completed"},
-                failure_statuses={"failed", "cancelled"},
-                task=task,
-                item=item,
-            )
+            if created is not None:
+                item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+                item.status = "running"
+                session.commit()
+                status, payload = await self._poll_until_terminal(
+                    lambda: get_dataflow_vuln_scanner_client().get_task(item.downstream_task_id, token or ""),
+                    success_statuses={"success", "succeeded", "completed"},
+                    failure_statuses={"failed", "cancelled"},
+                    task=task,
+                    item=item,
+                )
             artifacts = await get_dataflow_vuln_scanner_client().get_artifacts(item.downstream_task_id, token or "")
             archive_payload = {
                 **payload,
