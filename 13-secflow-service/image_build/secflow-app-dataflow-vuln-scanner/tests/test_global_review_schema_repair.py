@@ -43,14 +43,12 @@ ALL_SCORE_THRESHOLDS = {
     "limitations_honesty": 0.95,
     "report_completeness": 0.9,
 }
-DEPTH_SCORE_FIELDS = ["vuln_pattern_breadth", "code_evidence_depth"]
+DEPTH_SCORE_FIELDS = ["vuln_pattern_breadth"]
 DEPTH_SCORE_THRESHOLDS_START = {
     "vuln_pattern_breadth": 0.6,
-    "code_evidence_depth": 0.6,
 }
 DEPTH_SCORE_THRESHOLDS = {
     "vuln_pattern_breadth": 0.85,
-    "code_evidence_depth": 0.85,
 }
 COMPLETENESS_SCORE_FIELDS = [
     "input_coverage",
@@ -211,7 +209,6 @@ class DepthOnlyScoreRuntime(RepairingGlobalRuntime):
                 "feedback": "depth evidence is sufficient",
                 "scores": {
                     "vuln_pattern_breadth": 0.95,
-                    "code_evidence_depth": 0.96,
                 },
                 "confidence": 0.94,
                 "issues": [],
@@ -493,8 +490,6 @@ async def _run_depth_only_review(
     summary_file.write_text("# summary\n\n## 7. 局限性与未覆盖区域\n", encoding="utf-8")
     task_file = work_dir / "task.md"
     task_file.write_text("# task\n", encoding="utf-8")
-    sys_prompt = tmp_path / "depth_sys.md"
-    sys_prompt.write_text("depth\n", encoding="utf-8")
     user_prompt = tmp_path / "depth_user.md"
     user_prompt.write_text(
         "advisor_instance_id: {advisor_instance_id}\n"
@@ -508,7 +503,7 @@ async def _run_depth_only_review(
         agent_id="advisor-agent",
         role_name="深入性审计",
         re_review_on_cycle=True,
-        system_prompt_file=str(sys_prompt),
+        system_prompt_file="",
         user_prompt_template=str(user_prompt),
         score_fields=DEPTH_SCORE_FIELDS,
         score_thresholds_start=DEPTH_SCORE_THRESHOLDS_START,
@@ -548,10 +543,16 @@ def test_global_review_schema_repair_prompt_uses_valid_comma_separated_scores() 
             repair_reason="missing scores",
             needs_repair=True,
         ),
-        required_score_keys=["vuln_pattern_breadth", "code_evidence_depth"],
+        required_score_keys=["vuln_pattern_breadth"],
     )
 
-    assert '"vuln_pattern_breadth": 0.0,\n    "code_evidence_depth": 0.0' in prompt
+    assert '"vuln_pattern_breadth": 0.0' in prompt
+    assert '"target": "symbol-or-file"' in prompt
+    assert '"required_action": "具体动作"' in prompt
+    assert "actionable_by" not in prompt
+    assert "blocking_type" not in prompt
+    assert "acceptance_criteria" not in prompt
+    assert "code_evidence_depth" not in prompt
     assert "input_coverage" not in prompt
 
 
@@ -570,7 +571,7 @@ async def test_global_depth_accepts_role_specific_scores_without_schema_repair(
     assert feedback == ""
     assert review_json["schema_valid"] is True
     assert review_json["repair_attempts"] == 0
-    assert set(review_json["scores"]) == {"vuln_pattern_breadth", "code_evidence_depth"}
+    assert set(review_json["scores"]) == {"vuln_pattern_breadth"}
     assert runtime.call_count == 1
 
 
@@ -621,8 +622,6 @@ async def test_split_global_review_keeps_upstream_resolutions_when_depth_fails(
     task_file = work_dir / "task.md"
     task_file.write_text("# task\n", encoding="utf-8")
 
-    completeness_sys = tmp_path / "global_review_completeness_sys.md"
-    completeness_sys.write_text("completeness\n", encoding="utf-8")
     completeness_user = tmp_path / "global_review_completeness_user.md"
     completeness_user.write_text(
         "advisor_instance_id: {advisor_instance_id}\n"
@@ -630,8 +629,6 @@ async def test_split_global_review_keeps_upstream_resolutions_when_depth_fails(
         "prior: {prior_global_findings}\n",
         encoding="utf-8",
     )
-    depth_sys = tmp_path / "global_review_depth_sys.md"
-    depth_sys.write_text("depth\n", encoding="utf-8")
     depth_user = tmp_path / "global_review_depth_user.md"
     depth_user.write_text(
         "advisor_instance_id: {advisor_instance_id}\n"
@@ -647,7 +644,7 @@ async def test_split_global_review_keeps_upstream_resolutions_when_depth_fails(
             agent_id="advisor-agent",
             role_name="全面性审计",
             re_review_on_cycle=True,
-            system_prompt_file=str(completeness_sys),
+            system_prompt_file="",
             user_prompt_template=str(completeness_user),
             score_fields=COMPLETENESS_SCORE_FIELDS,
             score_thresholds_start=COMPLETENESS_SCORE_THRESHOLDS_START,
@@ -658,7 +655,7 @@ async def test_split_global_review_keeps_upstream_resolutions_when_depth_fails(
             agent_id="advisor-agent",
             role_name="深入性审计",
             re_review_on_cycle=True,
-            system_prompt_file=str(depth_sys),
+            system_prompt_file="",
             user_prompt_template=str(depth_user),
             score_fields=DEPTH_SCORE_FIELDS,
             score_thresholds_start=DEPTH_SCORE_THRESHOLDS_START,

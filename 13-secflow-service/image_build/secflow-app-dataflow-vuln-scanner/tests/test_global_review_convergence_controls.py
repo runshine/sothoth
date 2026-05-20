@@ -141,7 +141,7 @@ class PacketAwareRuntime(ScenarioRuntimeBase):
                 ensure_ascii=False,
             )
 
-        if "最高强度的全面性与深入性审计" in message or "当前轮次" in message:
+        if "advisor_instance_id: global_" in message:
             state["global_prompt_len"] = len(message)
             state["summary_token_in_prompt"] = "HUGE_SUMMARY_TOKEN" in message
             summary_match = re.search(r"summary file: `([^`]+)`", message)
@@ -276,7 +276,7 @@ class FreezePassedRuntime(ScenarioRuntimeBase):
                 ensure_ascii=False,
             )
 
-        if "评审入口文件" in message or "当前轮次" in message:
+        if "advisor_instance_id: global_" in message:
             return json.dumps(
                 {
                     "passed": False,
@@ -374,7 +374,7 @@ class MixedGlobalIssueRuntime(ScenarioRuntimeBase):
                 ensure_ascii=False,
             )
 
-        if "评审入口文件" in message or "当前轮次" in message:
+        if "advisor_instance_id: global_" in message:
             state["global_review_calls"] += 1
             cycle = state["worker_summary_calls"]
             if cycle == 1:
@@ -510,7 +510,7 @@ class PlateauRuntime(ScenarioRuntimeBase):
                 ensure_ascii=False,
             )
 
-        if "评审入口文件" in message or "当前轮次" in message:
+        if "advisor_instance_id: global_" in message:
             return json.dumps(
                 {
                     "passed": False,

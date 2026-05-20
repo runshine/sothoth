@@ -197,7 +197,6 @@ _COMPLETENESS_SCORE_FIELDS = (
 )
 _DEPTH_SCORE_FIELDS = (
     "vuln_pattern_breadth",
-    "code_evidence_depth",
 )
 
 
@@ -217,11 +216,9 @@ _SCORE_THRESHOLD_POLICIES: dict[str, dict[str, ReviewScoreThresholdPolicy]] = {
             score_fields=_DEPTH_SCORE_FIELDS,
             score_thresholds_start={
                 "vuln_pattern_breadth": 0.35,
-                "code_evidence_depth": 0.45,
             },
             score_thresholds={
                 "vuln_pattern_breadth": 0.55,
-                "code_evidence_depth": 0.65,
             },
             score_threshold_ramp_cycles=2,
         ),
@@ -241,11 +238,9 @@ _SCORE_THRESHOLD_POLICIES: dict[str, dict[str, ReviewScoreThresholdPolicy]] = {
             score_fields=_DEPTH_SCORE_FIELDS,
             score_thresholds_start={
                 "vuln_pattern_breadth": 0.60,
-                "code_evidence_depth": 0.60,
             },
             score_thresholds={
                 "vuln_pattern_breadth": 0.82,
-                "code_evidence_depth": 0.82,
             },
             score_threshold_ramp_cycles=5,
         ),
@@ -265,11 +260,9 @@ _SCORE_THRESHOLD_POLICIES: dict[str, dict[str, ReviewScoreThresholdPolicy]] = {
             score_fields=_DEPTH_SCORE_FIELDS,
             score_thresholds_start={
                 "vuln_pattern_breadth": 0.75,
-                "code_evidence_depth": 0.75,
             },
             score_thresholds={
                 "vuln_pattern_breadth": 0.95,
-                "code_evidence_depth": 0.95,
             },
             score_threshold_ramp_cycles=8,
         ),

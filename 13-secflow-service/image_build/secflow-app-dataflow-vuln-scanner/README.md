@@ -304,9 +304,7 @@ workflow-framework/
 │   │   ├── worker_rework_missed_hunt.md # 返工漏报补扫
 │   │   ├── reflect_completeness.md   #   自我反思
 │   │   ├── summary.md                #   总结输出格式
-│   │   ├── global_review_completeness_sys.md  # 全面性评审标准
 │   │   ├── global_review_completeness_user.md # 全面性评审提问
-│   │   ├── global_review_depth_sys.md         # 深入性评审标准
 │   │   ├── global_review_depth_user.md        # 深入性评审提问
 │   │   ├── result_review_sys.md      #   结果评审标准
 │   │   └── result_review_user.md     #   结果评审提问

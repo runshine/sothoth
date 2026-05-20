@@ -426,12 +426,13 @@ def test_missed_hunt_omits_pass_feedback_and_keeps_failed_issue_actions(tmp_path
         prompt_file="prompts/vuln_scan/worker_rework_missed_hunt.md",
     )
 
-    assert "全面性评审指出的缺失范围" in prompt
+    assert "上游评审节点已经完成筛选" in prompt
+    assert "只包含**未通过**" in prompt
     assert "CMP-export-sink-gap" in prompt
     assert "acceptance=给出 source_closed 或 promoted_to_result 的源码证据" in prompt
-    assert "深入性评审指出的深挖方向" in prompt
-    assert "no_action: 该 advisor 本轮通过" in prompt
-    assert "完整内容保留在 review artifacts 中" in prompt
+    assert "failed issue / feedback 只是“攻击假设和方向”" in prompt
+    assert "no_action: 该 advisor 本轮通过" not in prompt
+    assert "完整内容保留在 review artifacts 中" not in prompt
     assert "关键路径已充分扫描" not in prompt
     assert "漏洞发现质量优秀" not in prompt
 
@@ -555,7 +556,8 @@ def test_staged_rework_sequence_uses_one_worker_session_and_checkpoints(tmp_path
     assert len(agent.messages) == 1
     assert {item["session_id"] for item in agent.messages} == {"worker-session-1"}
     assert agent.messages[0]["kind"] == "multi_turn"
-    assert "依据评审缺口挖掘遗漏漏洞" in agent.messages[0]["message"]
+    assert "基于失败评审继续挖洞" in agent.messages[0]["message"]
+    assert "上游评审节点已经完成筛选" in agent.messages[0]["message"]
     assert "Rework Handoff" not in agent.messages[0]["message"]
     assert "全面性评审 FAIL issues / PASS guardrail" not in agent.messages[0]["message"]
     assert "误报压制与失败结果修复" not in "\n".join(item["message"] for item in agent.messages)

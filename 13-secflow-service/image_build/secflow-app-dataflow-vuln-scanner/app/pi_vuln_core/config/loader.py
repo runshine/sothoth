@@ -117,7 +117,7 @@ class ConfigLoader:
         }
         if isinstance(obj, dict):
             for key, value in obj.items():
-                if key in prompt_keys and isinstance(value, str) and not os.path.isabs(value):
+                if key in prompt_keys and isinstance(value, str) and value.strip() and not os.path.isabs(value):
                     config_relative = (base_dir / value).resolve()
                     project_relative = (PROJECT_ROOT / value).resolve()
                     if config_relative.exists() or not project_relative.exists():
@@ -151,7 +151,7 @@ class ConfigLoader:
         }
         if isinstance(obj, dict):
             for key, value in obj.items():
-                if key in path_keys and isinstance(value, str):
+                if key in path_keys and isinstance(value, str) and value.strip():
                     obj[key] = from_msys_path(value) or value
                 else:
                     ConfigLoader._normalize_windows_paths(value)

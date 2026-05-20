@@ -1046,7 +1046,7 @@ class WorkerExecutor:
             "",
             "## 3. 数据流绑定（必须）",
             "- **data_flow_file**: <原始数据流文件路径>",
-            "- **data_flow_kind**: INPUT / EXPORT / USED / CLEANED / STAR",
+            "- **data_flow_kind**: INPUT / DIRECT_SINK / EXPORT / USED / CLEANED / STAR",
             "- **data_flow_source_line**: <数据流报告行号或原文片段>",
             "- **INPUT**: <INPUT-N、字段、偏移、攻击者可控性>",
             "- **传播路径**: INPUT → ... → sink",
@@ -1470,6 +1470,9 @@ class WorkerExecutor:
                 worker_issue_entries=worker_issue_entries,
                 summary_handoff_entries=summary_handoff_entries,
             ),
+            "failed_review_guidance": self._build_failed_review_guidance(
+                review_state=review_state,
+            ),
             "review_delta_text": self._build_review_delta_text(
                 ctx=ctx,
                 review_state=review_state,
@@ -1757,6 +1760,99 @@ class WorkerExecutor:
                 lines.append(f"- fallback_feedback: {self._clip_prompt_section(feedback, max_chars=320)}")
 
         return "\n".join(lines)
+
+    def _build_failed_review_guidance(
+        self,
+        *,
+        review_state: ReviewState,
+    ) -> str:
+        sections: list[str] = []
+        for advisor_tokens, title in (
+            (("global_completeness", "completeness", "全面"), "全面性评审"),
+            (("global_depth", "depth", "深入"), "深入性评审"),
+        ):
+            record = self._latest_matching_advisor_record(
+                review_state=review_state,
+                advisor_tokens=advisor_tokens,
+            )
+            if record is None or bool(getattr(record, "passed", False)):
+                continue
+            sections.extend(self._format_failed_review_record(record=record, title=title))
+
+        if not sections:
+            return "- 当前没有来自未通过全局评审的漏洞方向；若本节点仍被执行，只围绕尚未闭环的真实源码路径做补扫。"
+        return "\n".join(sections)
+
+    def _latest_matching_advisor_record(
+        self,
+        *,
+        review_state: ReviewState,
+        advisor_tokens: tuple[str, ...],
+    ) -> Any | None:
+        for record in reversed(review_state.global_review_history):
+            if self._record_matches_advisor(record, advisor_tokens):
+                return record
+        return None
+
+    def _format_failed_review_record(
+        self,
+        *,
+        record: Any,
+        title: str,
+    ) -> list[str]:
+        cycle = int(getattr(record, "cycle", 0) or 0)
+        lines = [f"### {title}（Cycle {cycle}）"]
+
+        scores = getattr(record, "scores", {}) or {}
+        if scores:
+            score_text = ", ".join(
+                f"{key}={float(value):.2f}"
+                for key, value in list(scores.items())[:4]
+            )
+            lines.append(f"- scores: {score_text}")
+
+        feedback = str(getattr(record, "feedback", "") or "").strip()
+        if feedback:
+            lines.append(
+                f"- feedback: {self._clip_prompt_section(feedback, max_chars=320)}"
+            )
+
+        issues = [
+            issue for issue in list(getattr(record, "issues", []) or [])
+            if isinstance(issue, dict)
+        ]
+        if not issues:
+            lines.append("- issues: 无结构化 issue；按上面的 feedback 自行回到源码和数据流定位路径。")
+            return lines
+
+        lines.append("- issues:")
+        for issue in issues[:4]:
+            issue_id = ReviewState.prompt_safe_issue_id(
+                issue.get("id") or issue.get("issue_id") or ""
+            ) or "(no-id)"
+            target = str(issue.get("target") or issue.get("path") or "").strip()[:180]
+            action = str(
+                issue.get("required_action")
+                or issue.get("detail")
+                or issue.get("description")
+                or ""
+            ).strip()[:260]
+            acceptance = str(
+                issue.get("acceptance_criteria")
+                or issue.get("acceptance")
+                or ""
+            ).strip()[:180]
+            line = f"  - `{issue_id}`"
+            if target:
+                line += f": target={target}"
+            if action:
+                line += f"; required_action={action}"
+            if acceptance:
+                line += f"; acceptance={acceptance}"
+            lines.append(line)
+        if len(issues) > 4:
+            lines.append(f"  - ... 另有 {len(issues) - 4} 个 issue，请按同一方向继续深挖。")
+        return lines
 
     def _build_result_repair_summary(
         self,
@@ -2071,7 +2167,7 @@ class WorkerExecutor:
             if os.path.isfile(path):
                 required.append(path)
 
-        for item in [*worker_issue_entries[:5], *summary_handoff_entries[:3]]:
+        for item in worker_issue_entries[:5]:
             issue = item.get("issue") if isinstance(item.get("issue"), dict) else {}
             for value in (
                 issue.get("target"),
@@ -2086,9 +2182,9 @@ class WorkerExecutor:
                 unique.append(path)
 
         lines = ["## 本轮必须读取的增量文件"]
-        lines.extend(f"- `{self._path_for_prompt(ctx, path)}`" for path in unique[:16])
-        if len(unique) > 16:
-            lines.append(f"- ... 另有 {len(unique) - 16} 个相关文件，按目标队列需要再读取。")
+        lines.extend(f"- `{self._path_for_prompt(ctx, path)}`" for path in unique[:10])
+        if len(unique) > 10:
+            lines.append(f"- ... 另有 {len(unique) - 10} 个相关文件，按本轮方向需要再读取。")
         lines.append("- 不要重新通读所有历史 result/supporting_docs；只按本轮目标队列追加读取。")
         return "\n".join(lines)
 

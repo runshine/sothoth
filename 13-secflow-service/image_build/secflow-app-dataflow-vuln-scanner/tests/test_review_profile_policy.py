@@ -60,9 +60,9 @@ def test_review_profiles_have_monotonic_score_gates() -> None:
     balanced_depth = get_review_score_threshold_policy("balanced", "global_depth")
     audit_depth = get_review_score_threshold_policy("audit", "global_depth")
     assert (
-        fast_depth.score_thresholds["code_evidence_depth"]
-        < balanced_depth.score_thresholds["code_evidence_depth"]
-        < audit_depth.score_thresholds["code_evidence_depth"]
+        fast_depth.score_thresholds["vuln_pattern_breadth"]
+        < balanced_depth.score_thresholds["vuln_pattern_breadth"]
+        < audit_depth.score_thresholds["vuln_pattern_breadth"]
     )
     assert get_review_score_threshold_policy("strict", "global_depth") == audit_depth
 
@@ -232,7 +232,8 @@ def test_generate_config_uses_profile_default_budget_when_max_cycles_not_set(
     assert "max_retry_wall_seconds" not in advisor_runtime
     global_reviews = config["workflows"]["atomic"][0]["roles"]["advisors"]["global_review"]
     depth_review = next(item for item in global_reviews if item["instance_id"] == "global_depth")
-    assert depth_review["score_thresholds"]["code_evidence_depth"] == 0.95
+    assert depth_review["score_fields"] == ["vuln_pattern_breadth"]
+    assert depth_review["score_thresholds"]["vuln_pattern_breadth"] == 0.95
     assert depth_review["score_threshold_ramp_cycles"] == 8
 
 
@@ -278,7 +279,8 @@ def test_profile_template_compilation_applies_score_gates() -> None:
     assert completeness["score_fields"] == ["coverage"]
     assert completeness["score_thresholds"]["coverage"] == 1.00
     assert completeness["score_threshold_ramp_cycles"] == 8
-    assert depth["score_thresholds"]["code_evidence_depth"] == 0.95
+    assert depth["score_fields"] == ["vuln_pattern_breadth"]
+    assert depth["score_thresholds"]["vuln_pattern_breadth"] == 0.95
     assert config["agents"][0]["runtime_config"]["rpc_stdout_abort_bytes"] == get_review_profile_policy("audit").worker_rpc_stdout_abort_bytes
     assert config["agents"][1]["runtime_config"]["rpc_stdout_abort_bytes"] == get_review_profile_policy("audit").advisor_rpc_stdout_abort_bytes
     assert config["agents"][1]["runtime_config"]["api_max_retries"] == 0

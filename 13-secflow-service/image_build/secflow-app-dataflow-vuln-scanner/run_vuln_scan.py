@@ -619,8 +619,7 @@ def generate_config(
                                     "agent_id": "pi-advisor",
                                     "role_name": "全面性审计",
                                     "re_review_on_cycle": True,
-                                    "system_prompt_file": os.path.join(
-                                        prompts_dir, "global_review_completeness_sys.md"),
+                                    "system_prompt_file": "",
                                     "user_prompt_template": os.path.join(
                                         prompts_dir, "global_review_completeness_user.md"),
                                     "score_fields": list(completeness_score_policy.score_fields),
@@ -633,8 +632,7 @@ def generate_config(
                                     "agent_id": "pi-advisor",
                                     "role_name": "深入性审计",
                                     "re_review_on_cycle": True,
-                                    "system_prompt_file": os.path.join(
-                                        prompts_dir, "global_review_depth_sys.md"),
+                                    "system_prompt_file": "",
                                     "user_prompt_template": os.path.join(
                                         prompts_dir, "global_review_depth_user.md"),
                                     "score_fields": list(depth_score_policy.score_fields),
@@ -827,7 +825,7 @@ def _resolve_prompt_paths(config: dict) -> None:
     def _walk_and_resolve(obj):
         if isinstance(obj, dict):
             for key, value in obj.items():
-                if key in prompt_keys and isinstance(value, str):
+                if key in prompt_keys and isinstance(value, str) and value.strip():
                     if not os.path.isabs(value):
                         obj[key] = str(PROJECT_ROOT / value)
                 else:

@@ -42,7 +42,7 @@ def _resolve_prompt_paths_inplace(obj, *, base_dir: Path) -> None:
     }
     if isinstance(obj, dict):
         for key, value in obj.items():
-            if key in prompt_keys and isinstance(value, str) and not os.path.isabs(value):
+            if key in prompt_keys and isinstance(value, str) and value.strip() and not os.path.isabs(value):
                 obj[key] = str(base_dir / value)
             else:
                 _resolve_prompt_paths_inplace(value, base_dir=base_dir)

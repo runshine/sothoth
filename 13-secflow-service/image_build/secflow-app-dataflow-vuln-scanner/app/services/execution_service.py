@@ -442,6 +442,7 @@ class ExecutionService:
         return response
 
     def _ensure_agent_state_dirs(self, agent_state_dirs: dict[str, dict[str, str]]) -> None:
+        models_source = self._pi_models_json_path()
         for item in agent_state_dirs.values():
             root_dir = ensure_dir(item["root_dir"])
             skills_dir = ensure_dir(item["skills_dir"])
@@ -452,6 +453,37 @@ class ExecutionService:
                 ensure_dir(home_skills)
             if home_memory != memory_dir:
                 ensure_dir(home_memory)
+            self._copy_pi_models_json(models_source, root_dir / "models.json")
+
+    def _pi_models_json_path(self) -> Path | None:
+        explicit_path = str(os.environ.get("PI_MODELS_JSON") or "").strip()
+        candidates = []
+        if explicit_path:
+            candidates.append(Path(explicit_path).expanduser())
+        candidates.append(Path(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")).expanduser() / "models.json")
+        candidates.append(Path("/root/.pi/agent/models.json"))
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    return candidate
+            except OSError:
+                logger.debug("skip unreadable pi models.json candidate: %s", candidate, exc_info=True)
+        return None
+
+    def _copy_pi_models_json(self, source: Path | None, target: Path) -> None:
+        if source is None:
+            return
+        try:
+            source = source.resolve()
+            target_parent = ensure_dir(target.parent)
+            target = target_parent / target.name
+            if target.exists() and target.resolve() == source:
+                return
+            tmp_path = target.with_name(f".{target.name}.tmp")
+            shutil.copyfile(source, tmp_path)
+            tmp_path.replace(target)
+        except Exception:
+            logger.warning("failed to copy pi models.json to agent state dir: source=%s target=%s", source, target, exc_info=True)
 
     def _apply_agent_state_dirs_to_compiled_config(
         self,

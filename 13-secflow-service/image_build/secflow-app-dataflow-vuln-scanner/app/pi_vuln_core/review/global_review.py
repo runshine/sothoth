@@ -337,7 +337,10 @@ class GlobalReviewExecutor:
             "passed": bool(data.get("passed", False)),
             "feedback": feedback,
             "detail_feedback": detail_feedback,
-            "scores": data.get("scores") or {},
+            "scores": GlobalReviewExecutor._filter_scores_for_advisor(
+                data.get("scores") or {},
+                advisor_def,
+            ),
             "issues": data.get("issues") or [],
             "already_recorded": True,
         }
@@ -360,9 +363,12 @@ class GlobalReviewExecutor:
         agent = self.agents.get(advisor_def.agent_id)
         worker_system_prompt_file = self._infer_worker_system_prompt_file(advisor_def)
 
-        system_prompt = self._build_global_review_system_prompt(
-            advisor_def=advisor_def,
-            cycle=cycle,
+        system_prompt = (
+            None
+            if self._is_completeness_advisor(advisor_def)
+            else self._build_global_review_system_prompt(
+                advisor_def=advisor_def,
+            ) or None
         )
         user_prompt_tpl = read_file(advisor_def.user_prompt_template)
         required_score_keys = self._required_score_keys_for_advisor(advisor_def)
@@ -564,6 +570,7 @@ class GlobalReviewExecutor:
                 required_score_keys=required_score_keys,
             )
             parsed = parse_outcome.parsed
+            parsed.scores = self._filter_scores_for_advisor(parsed.scores, advisor_def)
             resolved_issue_ids = list(parsed.resolved_issue_ids or [])
 
             if not parse_outcome.schema_valid:
@@ -752,6 +759,23 @@ class GlobalReviewExecutor:
         return merged
 
     @staticmethod
+    def _filter_scores_for_advisor(scores: dict | None, advisor_def: AdvisorInstanceDef) -> dict[str, float]:
+        if not isinstance(scores, dict):
+            return {}
+        allowed = GlobalReviewExecutor._required_score_keys_for_advisor(advisor_def)
+        if not allowed:
+            return {}
+        filtered: dict[str, float] = {}
+        for key in allowed:
+            if key not in scores:
+                continue
+            try:
+                filtered[key] = float(scores[key])
+            except (TypeError, ValueError):
+                continue
+        return filtered
+
+    @staticmethod
     def _prefix_issue_id(advisor_id: str, issue_id: str) -> str:
         issue_id = str(issue_id or "").strip()
         advisor_id = str(advisor_id or "").strip()
@@ -769,23 +793,15 @@ class GlobalReviewExecutor:
         return str(candidate) if candidate.is_file() else ""
 
     @staticmethod
-    def _build_global_review_system_prompt(*, advisor_def: AdvisorInstanceDef, cycle: int) -> str:
-        prompt = read_file(advisor_def.system_prompt_file)
-        identity = " ".join([
-            str(advisor_def.instance_id or ""),
-            str(advisor_def.role_name or ""),
-            str(advisor_def.system_prompt_file or ""),
-        ]).lower()
-        if int(cycle) <= 1 and ("completeness" in identity or "全面" in identity):
-            prompt = prompt.replace(
-                "1. 判断 Worker 是否已经把攻击面、数据流覆盖和结果/局限性记录做到了接近穷尽",
-                "1. 判断当前漏洞挖掘工作是否已经把数据流覆盖做到了接近穷尽",
-            )
-            prompt = prompt.replace(
-                "你主要负责以下维度（具体阈值由框架在 user prompt 中注入）：",
-                "你主要负责以下维度：",
-            )
-        return prompt
+    def _is_completeness_advisor(advisor_def: AdvisorInstanceDef) -> bool:
+        advisor_id = str(advisor_def.instance_id or "").strip().lower()
+        return advisor_id == "global_completeness" or "completeness" in advisor_id
+
+    @staticmethod
+    def _build_global_review_system_prompt(*, advisor_def: AdvisorInstanceDef) -> str:
+        if not str(advisor_def.system_prompt_file or "").strip():
+            return ""
+        return read_file(advisor_def.system_prompt_file)
 
     @staticmethod
     def _required_score_keys_for_advisor(advisor_def: AdvisorInstanceDef) -> list[str]:
@@ -993,7 +1009,7 @@ class GlobalReviewExecutor:
         *,
         agent,
         session_id: str,
-        system_prompt: str,
+        system_prompt: str | None,
         working_dir: str,
         review_context_hint: str,
         initial_response_content: str,
@@ -1067,10 +1083,8 @@ class GlobalReviewExecutor:
             "4. `confidence` 也必须是 0.0-1.0 数值，不能写 HIGH/MEDIUM/LOW。\n"
             "5. 如果保留 `verdict`，只能是 PASS 或 FAIL。\n"
             "6. 如果输出 `issues` / `resolved_issues`，它们必须分别是数组。passed=true 时 issues 必须为空数组。\n"
-            "7. passed=false 时，每个 issue 必须包含 actionable_by：worker / summary / framework 三选一。\n"
-            "8. passed=false 时，每个 issue 应包含 blocking_type 与 acceptance_criteria：\n"
-            "   blocking_type 取值建议：analysis_gap / evidence_gap / summary_sync / framework_contract / needs_external_source / accepted_residual。\n"
-            "   acceptance_criteria 写清下一轮怎样才算关闭该 issue。\n\n"
+            "7. passed=false 时，如果输出 issue，每个 issue 只保留 3 个字段：id / target / required_action。\n"
+            "8. `id` 用稳定短名字标识遗漏方向；`target` 写清函数 / 数据流点 / sink / 路径；`required_action` 直接写下一轮要跟什么、查什么、判断什么。\n\n"
             "请按下面 schema 直接返回：\n"
             "{\n"
             '  "passed": true 或 false,\n'
@@ -1080,7 +1094,7 @@ class GlobalReviewExecutor:
             f"{score_lines}\n"
             "  },\n"
             '  "confidence": 0.0,\n'
-            '  "issues": [{"id": "stable-id", "category": "coverage_gap", "target": "symbol-or-file", "severity": "high", "required_action": "具体动作", "actionable_by": "worker", "blocking_type": "analysis_gap", "acceptance_criteria": "可验证关闭条件"}],\n'
+            '  "issues": [{"id": "stable-id", "target": "symbol-or-file", "required_action": "具体动作"}],\n'
             '  "resolved_issues": []\n'
             "}\n\n"
             f"如果你需要回忆上下文，请依赖当前 session 与本轮评审对象：{review_context_hint}。"

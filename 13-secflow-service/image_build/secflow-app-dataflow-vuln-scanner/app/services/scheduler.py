@@ -37,6 +37,7 @@ class SchedulerService:
         self._tasks: List[asyncio.Task] = []
         self._running_tasks: Dict[str, Any] = {}
         self._worker_status = "active"
+        self._heartbeat_published = False
 
     @property
     def role(self) -> str:
@@ -180,6 +181,7 @@ class SchedulerService:
         try:
             worker = db.get(SchedulerWorker, self.pod_id)
             now = now_local()
+            first_heartbeat = not self._heartbeat_published
             if worker is None:
                 worker = SchedulerWorker(
                     pod_id=self.pod_id,
@@ -191,7 +193,13 @@ class SchedulerService:
                     metadata_json={"service": "secflow-app-dataflow-vuln-scanner", "role": self.role},
                 )
             else:
-                if self._worker_status not in {"draining", "offline"} and worker.status in {"active", "draining"}:
+                # Do not inherit stale DB "draining" on process startup; a restarted
+                # worker should come back active unless it receives a fresh drain.
+                if (
+                    not first_heartbeat
+                    and self._worker_status not in {"draining", "offline"}
+                    and worker.status in {"active", "draining"}
+                ):
                     self._worker_status = worker.status
                 worker.host_name = self.host_name
                 worker.capacity = self.capacity
@@ -201,6 +209,7 @@ class SchedulerService:
                 worker.metadata_json = {"service": "secflow-app-dataflow-vuln-scanner", "role": self.role}
             db.add(worker)
             db.commit()
+            self._heartbeat_published = True
         finally:
             db.close()
 

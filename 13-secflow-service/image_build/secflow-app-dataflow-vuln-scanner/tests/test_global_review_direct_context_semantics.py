@@ -170,10 +170,12 @@ def test_direct_context_marks_review_feedback_as_pre_review_snapshot(
     assert "当前结果状态摘要（评审前快照）" in context["context_text"]
     assert "补全 issue 关闭说明" in context["context_text"]
     user_prompt = Path("prompts/vuln_scan/global_review_completeness_user.md").read_text(encoding="utf-8")
-    sys_prompt = Path("prompts/vuln_scan/global_review_completeness_sys.md").read_text(encoding="utf-8")
     assert "覆盖是否足够全面" in user_prompt
-    assert "全面性评审员" in sys_prompt
-    assert "不要写任何文件" in user_prompt
+    assert "全面性评审员" in user_prompt
+    assert "scores` 只包含 `coverage`" in user_prompt
+    assert "只保留 3 个字段" in user_prompt
+    assert "`id`、`target`、`required_action`" in user_prompt
+    assert "禁止写入或修改任何文件" in user_prompt
 
 
 def test_direct_context_separates_supporting_docs_from_reviewable_results(

@@ -1,39 +1,40 @@
-# 第 {cycle} 轮 Rework：依据评审缺口挖掘遗漏漏洞
+# Missed Hunt：基于失败评审继续挖洞（Cycle {cycle}）
 
-本节点唯一目标是降低漏报率：**根据全面性评审和深入性评审指出的缺失，继续审计真实源码，挖掘之前轮次漏掉、跳过或只浅尝辄止的漏洞。** 不要把本节点做成 coverage closure、候选管理、JSON 记录或文档补全。
+你继续扮演 **data-flow driven vulnerability hunter**。
+本轮不是修文档、跑流程或全量重扫；唯一目标是：把上游未通过评审指出的缺口转化为更深入的源码审计，尽可能发现之前漏掉、跳过或浅挖的真实漏洞。
 
-{rework_session_context}
+## 评审反馈如何衔接
+上游评审节点已经完成筛选：下面只包含**未通过**的全面性评审 / 深入性评审反馈。
 
-## 全面性评审指出的缺失范围
-{completeness_rework_plan}
+- 未出现的评审 = 已通过或没有可执行漏洞方向；不要复述，也不要为它新增任务。
+- failed issue / feedback 只是“攻击假设和方向”，不是最终结论；必须回到真实数据流和源码验证。
+- 如果反馈很抽象，先把它落到具体的 INPUT / DIRECT_SINK / USED / EXPORT / CLEANED / ★、函数、分支、sink 或校验点。
 
-## 深入性评审指出的深挖方向
-{depth_rework_plan}
+## 失败评审给出的本轮方向
+{failed_review_guidance}
 
-## 已有结果的变体参考（只用于避免重复/寻找独立变体）
+{required_read_files}
+
+## 本轮结果稳定性约束
+{numbering_rules}
+
+{convergence_requirements}
+
+## 已有漏洞与变体参考
 {missed_hunt_variant_seeds}
 
-不要根据已有结果的确认/误报状态分流；状态由结果评审写回漏洞列表。本节点只判断是否存在新的独立漏洞路径。
+## 深挖方法
+1. 沿 `攻击者可控输入/状态 -> 传播 -> 校验 -> sink/危险操作 -> 影响` 重新审计。
+2. 全面性缺口：补未覆盖入口、兄弟分支、EXPORT/USED 下游、高风险 sink、未闭环数据流。
+3. 深入性缺口：补边界值、校验绕过、整数截断/符号混用、错误路径、状态差异、相邻变体。
+4. 优先寻找能形成新漏洞的独立路径；不要重复已有 result。
+5. 某个方向被源码证伪后，切换下一条高价值方向。
 
-## Issue 辅助线索
-{issue_hypothesis_queue}
+## 输出
+- 发现新的独立漏洞：新增 `results/result_NNN.md`，编号从当前最大 result 继续。
+- 发现已有漏洞的实质变体：新增更高编号 result，并说明它与原 result 的关系。
+- 没有新漏洞：写 `supporting_docs/missed_hunt_cycle_{cycle}.md`，只记录实际核查路径和未成洞原因。
+- 不整理 `summary.md`，不输出 JSON。
 
-## 本节点的源码审计方式
-- 先从全面性评审中选出最可能造成漏报的缺失范围：未覆盖入口、未跟入 EXPORT/USED、未检查兄弟分支、未分析的高风险 sink、未闭环的 INPUT 到 sink 路径。
-- 再从深入性评审中提取需要继续深挖的问题：保护条件是否真的充分、边界值是否绕过、类型转换/整数截断是否改变长度、错误路径/释放路径/并发时序是否和主路径不同、已有结论是否遗漏变体。
-- 对每条高价值缺口，必须读取实际代码并沿数据流跟踪：攻击者可控输入或状态 -> 关键变量传播 -> 校验点 -> sink/危险操作 -> 影响。不要只复述 summary 或评审意见。
-- 优先查“可能产出真实漏洞”的路径，而不是机械处理数量指标。Issue 只作为定位源码和风险路径的线索，不是本节点的完成目标。
-- 已有 result 只作为避免重复和寻找独立变体的种子：入/出方向、成功/失败路径、配置/状态差异、相邻函数或相似调用链是否存在同类但尚未报告的漏洞。
-- 如果源码证明某条路径没有漏洞，可以简短记录原因后切换到下一条高价值缺口，不要把本轮时间消耗在大批量 source_closed。
-
-## 产出规则
-- 发现真实新漏洞：新增最小粒度 `results/result_NNN.md`，必须说明它相对已有 result 的新增点，不要重复包装旧结论。
-- 发现已有 result 背后遗漏的独立变体：新增更高编号 result，并在开头标注它和原 result 的关系。
-- 未发现新漏洞：可创建或更新 `supporting_docs/missed_hunt_cycle_{cycle}.md`，只记录本轮实际审计过的高价值缺口、读取的关键源码位置、为什么没有形成漏洞；控制在 80 行以内。
-- 不创建 JSON manifest，不编辑 `summary.md`，不手工编辑 `_meta/` 或 `_meta/`。
-
-不要复制  大表，不要粘贴长源码，不要把 design-quality 建议伪装成安全漏洞。
-
-{numbering_rules}
+## result 写法
 {result_report_template}
-{direct_read_instruction}

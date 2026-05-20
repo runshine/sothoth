@@ -420,7 +420,7 @@
                 "agent_id": "pi-advisor",
                 "role_name": "全面性审计",
                 "re_review_on_cycle": true,
-                "system_prompt_file": "prompts/vuln_scan/global_review_completeness_sys.md",
+                "system_prompt_file": "",
                 "user_prompt_template": "prompts/vuln_scan/global_review_completeness_user.md",
                 "score_fields": [
                   "coverage"
@@ -438,19 +438,16 @@
                 "agent_id": "pi-advisor",
                 "role_name": "深入性审计",
                 "re_review_on_cycle": true,
-                "system_prompt_file": "prompts/vuln_scan/global_review_depth_sys.md",
+                "system_prompt_file": "",
                 "user_prompt_template": "prompts/vuln_scan/global_review_depth_user.md",
                 "score_fields": [
-                  "vuln_pattern_breadth",
-                  "code_evidence_depth"
+                  "vuln_pattern_breadth"
                 ],
                 "score_thresholds_start": {
-                  "vuln_pattern_breadth": 0.6,
-                  "code_evidence_depth": 0.6
+                  "vuln_pattern_breadth": 0.6
                 },
                 "score_thresholds": {
-                  "vuln_pattern_breadth": 0.82,
-                  "code_evidence_depth": 0.82
+                  "vuln_pattern_breadth": 0.82
                 },
                 "score_threshold_ramp_cycles": 5
               }
