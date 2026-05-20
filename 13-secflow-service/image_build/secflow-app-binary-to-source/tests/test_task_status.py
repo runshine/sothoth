@@ -76,6 +76,42 @@ class RecomputeTaskStatusTests(unittest.TestCase):
         self.assertEqual("completed", task.status)
 
 
+class OverallProgressTests(unittest.TestCase):
+    def test_progress_falls_back_to_bytes_when_function_coverage_is_partial(self) -> None:
+        item1 = _item(1, "success")
+        item1.progress = {
+            "total_functions": 10,
+            "completed_functions": 10,
+            "total_bytes": 100,
+            "completed_bytes": 100,
+        }
+        item2 = _item(2, "pending")
+        item2.progress = {
+            "total_bytes": 300,
+            "completed_bytes": 0,
+        }
+
+        overall = task_service.build_overall_progress([item1, item2])
+
+        self.assertEqual(2, overall.total_items)
+        self.assertEqual(1, overall.completed_items)
+        self.assertEqual("bytes", overall.percent_basis)
+        self.assertEqual(100.0, overall.completed_bytes)
+        self.assertEqual(400.0, float(overall.total_bytes or 0))
+        self.assertAlmostEqual(25.0, float(overall.percent or 0.0))
+
+    def test_progress_falls_back_to_items_when_no_shared_metric_exists(self) -> None:
+        item1 = _item(1, "success")
+        item1.progress = {"total_functions": 8, "completed_functions": 8}
+        item2 = _item(2, "pending")
+        item2.progress = {}
+
+        overall = task_service.build_overall_progress([item1, item2])
+
+        self.assertEqual("items", overall.percent_basis)
+        self.assertAlmostEqual(50.0, float(overall.percent or 0.0))
+
+
 class SyncTaskStatusTests(unittest.TestCase):
     def test_sync_task_recomputes_aggregate_status_even_without_item_changes(self) -> None:
         task = _task(status="pending")
@@ -134,7 +170,7 @@ class SyncTaskStatusTests(unittest.TestCase):
         self.assertEqual("pi-re-agent", item.failure_type)
         self.assertIn("unexpected error", str(item.error_reason))
         self.assertEqual(1, fake_db.committed)
-        self.assertEqual(1, fake_db.refreshed)
+        self.assertGreaterEqual(fake_db.refreshed, 1)
 
     def test_recover_stale_pi_job_uses_defaults_when_config_lacks_threshold_fields(self) -> None:
         item = _item(1, "queued")

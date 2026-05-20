@@ -43,6 +43,8 @@ spec:
           value: "15"
         - name: PI_RE_STUCK_SCAN_SECONDS
           value: "30"
+        - name: PI_RE_ACTIVE_SYNC_SECONDS
+          value: "10"
         - name: PI_RE_MAX_JOB_ATTEMPTS
           value: "3"
         - name: PI_RE_QUEUE_LIMIT

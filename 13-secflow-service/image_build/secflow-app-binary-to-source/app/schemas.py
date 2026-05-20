@@ -93,6 +93,7 @@ class B2SOverallProgress(BaseModel):
     total_batches: Optional[int] = None
     completed_batches: Optional[int] = None
     percent: Optional[float] = None
+    percent_basis: Optional[str] = None
     phase_summary: dict[str, int] = Field(default_factory=dict)
 
 
@@ -286,6 +287,8 @@ class SessionIndexResponse(BaseModel):
 
 class SessionFileResponse(BaseModel):
     task_id: str
+    node_id: Optional[str] = None
+    item_id: Optional[str] = None
     relative_path: str
     full_path: str
     size: int = 0
@@ -372,6 +375,41 @@ class TaskDetailResponse(TaskResponse):
     agent_runtime_summary: Optional[AgentRuntimeSummary] = None
     result_summary: Optional[TaskResultSummary] = None
     observability_summary: Optional[TaskObservabilitySummary] = None
+    event_summary: Optional["B2STaskEventSummary"] = None
+
+
+class B2STaskEvent(BaseModel):
+    id: str
+    task_id: str
+    project_id: str
+    item_id: Optional[str] = None
+    sequence_no: Optional[int] = None
+    pi_job_id: Optional[str] = None
+    source: str
+    level: str
+    event_type: str
+    phase: Optional[str] = None
+    batch_id: Optional[int] = None
+    attempt: Optional[int] = None
+    function_name: Optional[str] = None
+    status: Optional[str] = None
+    message: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class B2STaskEventSummary(BaseModel):
+    total_events: int = 0
+    latest_event_type: Optional[str] = None
+    latest_event_at: Optional[datetime] = None
+    last_batch_id: Optional[int] = None
+    current_function: Optional[str] = None
+    current_attempt: Optional[int] = None
+
+
+class B2STaskTimelineResponse(BaseModel):
+    task_id: str
+    events: list[B2STaskEvent] = Field(default_factory=list)
 
 
 class AdvancedFile(BaseModel):
@@ -695,6 +733,7 @@ class ActionResponse(BaseModel):
     status: str
     task_id: Optional[str] = None
     message: Optional[str] = None
+    deleted_event_count: int = 0
 
 
 class TaskBatchDeleteRequest(BaseModel):
@@ -705,18 +744,21 @@ class TaskBatchDeleteItemResult(BaseModel):
     task_id: str
     status: str
     message: Optional[str] = None
+    deleted_event_count: int = 0
 
 
 class TaskBatchDeleteResponse(BaseModel):
     status: str
     deleted_count: int = 0
     failed_count: int = 0
+    deleted_event_count: int = 0
     results: list[TaskBatchDeleteItemResult] = Field(default_factory=list)
 
 
 _SCHEMA_TYPES = {
     "Optional": Optional,
     "LlmProviderSummary": LlmProviderSummary,
+    "B2STaskEventSummary": B2STaskEventSummary,
 }
 
 B2SServiceConfig.model_rebuild(_types_namespace=_SCHEMA_TYPES)
