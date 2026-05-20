@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import selectors
+import signal
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -125,6 +126,7 @@ def run_logged_command(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=_claude_env(env_overrides),
+        start_new_session=True,
     )
     selector = selectors.DefaultSelector()
     if process.stdout is not None:
@@ -224,13 +226,34 @@ def _read_chunk(fd: int) -> bytes:
 def _terminate_process(process: subprocess.Popen) -> None:
     if process.poll() is not None:
         return
-    process.terminate()
     grace = max(float(get_config().execution.process_terminate_grace_seconds), 0.5)
+    pgid = _process_group_id(process)
+    _signal_group_or_process(process, pgid, signal.SIGTERM)
     try:
         process.wait(timeout=grace)
     except subprocess.TimeoutExpired:
-        process.kill()
+        _signal_group_or_process(process, pgid, signal.SIGKILL)
         process.wait()
+
+
+def _process_group_id(process: subprocess.Popen) -> int | None:
+    try:
+        return os.getpgid(process.pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        return None
+
+
+def _signal_group_or_process(process: subprocess.Popen, pgid: int | None, sig: int) -> None:
+    if pgid is not None:
+        try:
+            os.killpg(pgid, sig)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        process.send_signal(sig)
+    except (ProcessLookupError, OSError):
+        pass
 
 
 def _drain_process_output(process: subprocess.Popen, handle) -> None:

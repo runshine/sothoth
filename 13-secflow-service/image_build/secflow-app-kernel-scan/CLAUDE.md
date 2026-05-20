@@ -92,6 +92,7 @@ queued → running → succeeded / partial_success / failed
 | GET | /tasks | 分页 |
 | GET | /tasks/{id} | 附带 `stage_runs` |
 | POST | /tasks/{id}/cancel | 仅 queued/running 可取消 |
+| POST | /tasks/{id}/restart | 仅终态可重启；复用原配置新建 attempt，task 回 queued；不清理产物目录 |
 | DELETE | /tasks/{id} | 仅终态可删，级联删 DB + 清理 `state_root/tasks/{id}` + `/workspace/{entry,audit,poc}/{id}/` |
 | GET | /tasks/{id}/events | `after_seq` 游标分页 |
 | GET | /tasks/{id}/entry/result | entry 文本结果，`?format=text` 直出纯文本 |

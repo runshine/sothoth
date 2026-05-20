@@ -166,6 +166,14 @@ class DeleteResponse(BaseModel):
     status: str = Field(..., description="删除后的状态", examples=["deleted"])
 
 
+class RestartResponse(BaseModel):
+    """重启任务响应"""
+
+    task_id: str
+    attempt_id: str = Field(..., description="新创建的执行尝试 ID")
+    status: str = Field(..., description="重启后的任务状态", examples=["queued"])
+
+
 class EventResponse(BaseModel):
     """事件条目"""
 
@@ -301,6 +309,31 @@ def delete_task(task_id: str):
             "task is not in a terminal state; cancel it and wait for it to finish before deleting",
         )
     return {"task_id": task_id, "status": "deleted"}
+
+
+@router.post(
+    "/tasks/{task_id}/restart",
+    response_model=RestartResponse,
+    summary="重启任务",
+    description=(
+        "重新运行一个已终态的任务（`succeeded` / `partial_success` / `failed` / `cancelled`）。"
+        "复用任务原有的 `pipeline_mode` / `kernel_dir` / `entrylist` / 线程数等配置，"
+        "创建一次新的 attempt 并将任务状态置回 `queued`，由后台调度器拉起执行。\n\n"
+        "**说明：**\n"
+        "- 不会清理已有产物目录（`/workspace/{entry,audit,poc}/{task_id}/`），新执行会按原路径覆盖写入；如需干净环境请改用删除+重建。\n"
+        "- 仍在 `queued` / `running` / `cancel_requested` 状态的任务无法重启，请先取消并等待终止。"
+    ),
+)
+def restart_task(task_id: str):
+    outcome = get_task_service().restart_task(task_id)
+    if outcome == "not_found":
+        raise HTTPException(404, "task not found")
+    if outcome == "busy":
+        raise HTTPException(
+            409,
+            "task is not in a terminal state; cancel it and wait for it to finish before restarting",
+        )
+    return outcome
 
 
 @router.get(

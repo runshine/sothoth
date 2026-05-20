@@ -2,6 +2,16 @@
 
 Base URL: `/api/app/kernel-scan`
 
+## 服务地址
+
+| 部署形态 | Host | Port | 完整示例 |
+|---------|------|------|----------|
+| 容器内监听 | `0.0.0.0` | `8080` | `http://127.0.0.1:8080/api/app/kernel-scan/health`（容器内 / healthcheck） |
+| docker-compose 默认 | 宿主机 IP | `18081`（可由 `KERNEL_SCAN_PORT` 覆盖） | `http://<host>:18081/api/app/kernel-scan/health` |
+| 当前部署机（参考） | `172.31.30.81` | `18081` | `http://172.31.30.81:18081/api/app/kernel-scan/health` |
+
+宿主机端口由 docker-compose 的 `ports: "${KERNEL_SCAN_PORT:-18081}:8080"` 决定；容器内端口和监听地址由环境变量 `KERNEL_SCAN_HOST` / `KERNEL_SCAN_PORT` 控制（容器内默认 `0.0.0.0:8080`）。下文所有路径均以 Base URL `/api/app/kernel-scan` 为前缀。
+
 ## Health
 
 | Method | Path | Description |
@@ -301,6 +311,36 @@ proc_sys_read read
 {
   "task_id": "kscan-task-xxxxxxxx",
   "status": "deleted"
+}
+```
+
+### POST /tasks/{task_id}/restart — 重启任务
+
+重新运行一个已终态的任务。服务复用任务原有的 `pipeline_mode` / `kernel_dir` / `entrylist` / `report_dir` / 线程数等配置，新建一次 attempt（`attempt_no = attempt_count + 1`），并把任务状态置回 `queued`，由后台调度器拉取执行。`/tasks/{task_id}` 返回的 `stage_runs` 会切换到新 attempt 的记录。
+
+**说明：**
+
+- 仅当任务处于终态（`succeeded` / `partial_success` / `failed` / `cancelled`）时可重启；`queued` / `running` / `cancel_requested` 状态请先取消并等待终止。
+- **不会清理** 已有产物目录（`workspace_root/{entry,audit,poc}/{task_id}/`），新执行会按原路径覆盖写入；如需干净环境请改用 `DELETE /tasks/{task_id}` 后重新创建。
+- 历史 attempts / stage_runs / events 全部保留在数据库中，不会被删除。
+
+**Request Body:** 无（空 body 即可）。
+
+**Responses:**
+
+| Status | 说明 |
+|--------|------|
+| 200 | 已创建新 attempt 并入队 |
+| 404 | 任务不存在 |
+| 409 | 任务未处于终态，拒绝重启 |
+
+**200 Body:**
+
+```json
+{
+  "task_id": "kscan-task-xxxxxxxx",
+  "attempt_id": "kscan-attempt-yyyyyyyy",
+  "status": "queued"
 }
 ```
 

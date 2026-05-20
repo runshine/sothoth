@@ -155,6 +155,59 @@ class TaskService:
                     logger.warning("failed to remove task workspace dir %s: %s", task_ws_dir, exc)
         return "deleted"
 
+    def restart_task(self, task_id: str) -> dict | str:
+        """Restart a terminal task by enqueuing a new attempt.
+
+        Returns:
+          - dict {task_id, attempt_id, status} on success
+          - "not_found" : task does not exist
+          - "busy"      : task is not in a terminal state
+        """
+        now = utc_now_z()
+        with get_database().connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "select status, attempt_count, latest_attempt_id from kernel_scan_tasks where task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if not row:
+                conn.execute("ROLLBACK")
+                return "not_found"
+            if row["status"] not in TERMINAL_TASK_STATUSES:
+                conn.execute("ROLLBACK")
+                return "busy"
+
+            effective_config_json = "{}"
+            if row["latest_attempt_id"]:
+                prev = conn.execute(
+                    "select effective_config_json from kernel_scan_attempts where attempt_id = ?",
+                    (row["latest_attempt_id"],),
+                ).fetchone()
+                if prev and prev["effective_config_json"]:
+                    effective_config_json = prev["effective_config_json"]
+
+            next_no = (row["attempt_count"] or 0) + 1
+            attempt_id = self._create_attempt(
+                conn, task_id, next_no, effective_config_json=effective_config_json
+            )
+            conn.execute(
+                """
+                update kernel_scan_tasks
+                set status = 'queued',
+                    current_stage = NULL,
+                    latest_attempt_id = ?,
+                    attempt_count = ?,
+                    started_at = NULL,
+                    finished_at = NULL,
+                    message = NULL,
+                    updated_at = ?
+                where task_id = ?
+                """,
+                (attempt_id, next_no, now, task_id),
+            )
+            conn.commit()
+        return {"task_id": task_id, "attempt_id": attempt_id, "status": "queued"}
+
     def claim_next_attempt(self, worker_id: str) -> str | None:
         now = utc_now_z()
         lease = self._future_time(get_config().execution.lease_duration_seconds)
