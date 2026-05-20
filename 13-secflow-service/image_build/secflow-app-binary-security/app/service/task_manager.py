@@ -6308,6 +6308,7 @@ class TaskManager:
         files_list_path = input_dir / "module-files.list"
         rel_paths = [str(item.get("relative_path") or item.get("filename") or "").strip().replace("\\", "/") for item in input_files]
         files_list_path.write_text("\n".join(path for path in rel_paths if path) + ("\n" if rel_paths else ""), encoding="utf-8")
+        selected_at = _now().isoformat()
         module = {
             "module_key": module_key,
             "module_name": module_name,
@@ -6320,6 +6321,10 @@ class TaskManager:
             "unpacked_root": str(input_dir),
             "source_root": str(input_dir),
             "file_count": len(input_files),
+            "risk_level": "高",
+            "risk_source": "manual_input",
+            "selected_by": "manual_input",
+            "selected_at": selected_at,
         }
         return {
             "module_input": {
@@ -6331,7 +6336,7 @@ class TaskManager:
             "selected_modules": [module],
             "candidate_modules": [module],
             "system_analysis_modules": [module],
-            "high_risk_modules": [],
+            "high_risk_modules": [module],
             "system_analysis_bypassed": True,
         }
 
@@ -11204,9 +11209,9 @@ class TaskManager:
         token: str | None,
         retry_existing: bool = False,
     ) -> tuple[str, dict[str, Any]]:
-        b2s_success = self._entry_analysis_inputs(task)
+        b2s_success = self._entry_analysis_inputs(db, task)
         if not b2s_success:
-            return "failed", {"error": "没有可用于入口分析的源码模块"}
+            return "failed", {"error": self._missing_entry_analysis_input_reason(db, task)}
         executable_inputs = self._prepare_stage_items_for_execution(
             db,
             task=task,
@@ -11233,10 +11238,37 @@ class TaskManager:
         )
         return self._aggregate_stage_items(db, task, results, "entry_results")
 
-    def _entry_analysis_inputs(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+    def _entry_analysis_inputs(self, db: Session, task: BinarySecurityTask) -> list[dict[str, Any]]:
         if self._task_type(task) == TASK_TYPE_SOURCE:
             return list(task.summary.get("selected_modules") or [])
-        return list(task.summary.get("b2s_results") or [])
+        b2s_results = list(task.summary.get("b2s_results") or [])
+        if b2s_results:
+            return b2s_results
+        rebuilt = self._rebuild_summary_results_from_stage_items(db, task, "binary_to_source", "b2s_results")
+        return list(rebuilt or [])
+
+    def _missing_entry_analysis_input_reason(self, db: Session, task: BinarySecurityTask) -> str:
+        items = self._stage_items(db, task.id, "binary_to_source")
+        if not items:
+            return "binary-to-source 阶段尚未产出任何可用于入口分析的源码模块"
+        active_statuses = {"pending", "queued", "running", "dispatching"}
+        active_items = [item for item in items if (self._normalize_downstream_status(item.status) or item.status) in active_statuses]
+        if active_items:
+            return "binary-to-source 阶段仍在运行，尚未生成可用于入口分析的源码产物"
+        success_items = [item for item in items if (self._normalize_downstream_status(item.status) or item.status) == "success"]
+        if success_items:
+            return "binary-to-source 阶段已有成功条目，但未找到可用于入口分析的源码产物"
+        failed_items = [
+            item
+            for item in items
+            if (self._normalize_downstream_status(item.status) or item.status) in {"failed", "cancelled", "downstream_missing"}
+        ]
+        first_error = next((str(item.error_message).strip() for item in failed_items if str(item.error_message).strip()), "")
+        if first_error:
+            return first_error
+        if failed_items:
+            return "binary-to-source 阶段没有成功产物，无法推进入口分析"
+        return "没有可用于入口分析的源码模块"
 
     async def _stage_dataflow_analysis(
         self,

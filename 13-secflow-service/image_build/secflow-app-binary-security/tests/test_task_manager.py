@@ -5770,9 +5770,97 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, len(selected))
             self.assertEqual(TASK_TYPE_BINARY_MODULE, selected[0]["task_type"])
             self.assertEqual("ipsec", selected[0]["module_name"])
+            self.assertEqual("高", selected[0]["risk_level"])
+            self.assertEqual("manual_input", selected[0]["risk_source"])
+            self.assertEqual("manual_input", selected[0]["selected_by"])
             self.assertEqual(str(input_dir / "module-files.list"), selected[0]["files_list"])
+            self.assertEqual(selected, summary["high_risk_modules"])
             self.assertEqual(["core/ipsec_main.so", "plugins/ipsec_helper.so"], (input_dir / "module-files.list").read_text(encoding="utf-8").splitlines())
             self.assertTrue(summary["system_analysis_bypassed"])
+
+    def test_entry_analysis_inputs_rebuild_from_binary_to_source_stage_items(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="module-task",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            status="running",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {"b2s_results": []}
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="binary_to_source",
+            item_key="ipsec",
+            item_name="ipsec",
+            status="success",
+        )
+        item.input_ref = {
+            "firmware_key": "module-input",
+            "firmware_name": "ipsec",
+            "module_key": "ipsec",
+            "module_name": "ipsec",
+        }
+        item.result = {
+            "source_dir": "/archive/b2s/ipsec",
+            "module_dir": "/archive/b2s/ipsec/module",
+            "source_root": "/archive/b2s/ipsec",
+            "files_list": "/archive/b2s/ipsec/module/files.list",
+            "task_type": TASK_TYPE_BINARY_MODULE,
+        }
+        db = _ModelAwareDb(tasks=[task], stage_items=[item])
+
+        rows = self.manager._entry_analysis_inputs(db, task)
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("/archive/b2s/ipsec", rows[0]["source_dir"])
+        self.assertEqual("ipsec", rows[0]["module_name"])
+        self.assertEqual(rows, task.summary["b2s_results"])
+
+    def test_stage_entry_analysis_uses_binary_to_source_failure_reason_when_inputs_missing(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="module-task",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            status="running",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {"b2s_results": []}
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=3,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si-b2s",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-b2s",
+            stage_name="binary_to_source",
+            item_key="ipsec",
+            item_name="ipsec",
+            status="failed",
+            error_message="binary-to-source failed: worker timeout",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item])
+
+        status, payload = asyncio.run(self.manager._stage_entry_analysis(db, task, stage_run, token=None))
+
+        self.assertEqual("failed", status)
+        self.assertEqual("binary-to-source failed: worker timeout", payload["error"])
 
     def test_source_system_analysis_inputs_use_workspace_input(self):
         with tempfile.TemporaryDirectory() as tmp:
