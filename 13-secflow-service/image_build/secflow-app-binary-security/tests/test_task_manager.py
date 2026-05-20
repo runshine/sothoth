@@ -2728,6 +2728,53 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertIsNone(task.dispatch_started_at)
 
+    def test_refresh_task_status_after_sync_clears_latest_abnormal_reason_when_stage_is_running(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="binary_to_source",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.latest_abnormal_reason = {
+            "is_abnormal": True,
+            "category": "downstream",
+            "code": "downstream_cancelled",
+            "title": "旧异常",
+            "message": "旧异常",
+            "terminal": True,
+            "source_layer": "task",
+            "status": "failed",
+            "service": "binary_to_source",
+            "stage_name": "binary_to_source",
+            "evidence": [],
+            "related_event_ids": [],
+        }
+        db = _ModelAwareDb(
+            tasks=[task],
+            stage_runs=[
+                BinarySecurityStageRun(
+                    id="sr1",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_name="binary_to_source",
+                    sequence_no=1,
+                    status="running",
+                ),
+            ],
+        )
+
+        self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual("running", task.status)
+        self.assertIsNone(task.last_error)
+        self.assertIsNone(task.latest_abnormal_reason)
+
     def test_refresh_task_status_after_sync_requeues_next_stage_for_task_retry_mode(self):
         task = BinarySecurityTask(
             id="t1",
@@ -2866,6 +2913,42 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("worker-a", task.dispatcher_instance_id)
         self.assertIsNotNone(task.dispatch_started_at)
         self.assertIsNotNone(task.lease_expires_at)
+
+    def test_mark_task_waiting_for_archive_retry_clears_latest_abnormal_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="binary",
+                status="failed",
+                current_stage="binary_to_source",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(Path(tmp) / "output"),
+                workspace_root=tmp,
+            )
+            task.latest_abnormal_reason = {
+                "is_abnormal": True,
+                "category": "archive",
+                "code": "archive_failed",
+                "title": "归档失败",
+                "message": "归档失败",
+                "terminal": True,
+                "source_layer": "task",
+                "status": "failed",
+                "service": "binary-security",
+                "stage_name": "binary_to_source",
+                "evidence": [],
+                "related_event_ids": [],
+            }
+            db = _ModelAwareDb(tasks=[task])
+
+            self.manager._mark_task_waiting_for_archive_retry(db, task, "binary_to_source")
+
+            self.assertEqual("running", task.status)
+            self.assertEqual("binary_to_source", task.current_stage)
+            self.assertIsNone(task.latest_abnormal_reason)
 
     def test_continue_task_starts_after_last_successful_stage(self):
         workspace = Path(tempfile.mkdtemp())
@@ -7193,7 +7276,22 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             workspace_root="/w",
             dispatcher_instance_id=self.manager.instance_id,
         )
+        task.latest_abnormal_reason = {
+            "is_abnormal": True,
+            "category": "downstream",
+            "code": "downstream_cancelled",
+            "title": "旧异常",
+            "message": "旧异常",
+            "terminal": True,
+            "source_layer": "task",
+            "status": "failed",
+            "service": "binary_to_source",
+            "stage_name": "binary_to_source",
+            "evidence": [],
+            "related_event_ids": [],
+        }
         task.dispatch_started_at = _now()
+        task.lease_expires_at = task.dispatch_started_at + timedelta(seconds=30)
         original_token = task.dispatch_started_at
 
         class _RunTaskDb(_ModelAwareDb):
@@ -7227,6 +7325,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("running", task.status)
         self.assertIsNone(task.last_error)
+        self.assertIsNone(task.latest_abnormal_reason)
         self.assertTrue(db.closed)
 
     def test_execute_task_failed_stage_does_not_requeue_same_stage(self):

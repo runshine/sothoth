@@ -3090,6 +3090,7 @@ class TaskManager:
         task.execution_mode = None
         task.target_stage_name = None
         task.last_error = None
+        self._clear_task_abnormal_reason_snapshot(db, task)
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
         task.lease_expires_at = None
@@ -3660,6 +3661,7 @@ class TaskManager:
             task.pending_action = None
             task.current_stage = target_stage
             task.last_error = None
+            self._clear_task_abnormal_reason_snapshot(db, task)
             task.finished_at = None
             self._invalidate_task_execution(task)
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
@@ -5289,6 +5291,7 @@ class TaskManager:
             task.lease_expires_at = self._next_lease_expiry(db, now_value=started_at)
             execution_token = task.dispatch_started_at.isoformat() if task.dispatch_started_at else None
             task.status = "running"
+            self._clear_task_abnormal_reason_snapshot(db, task)
             self._bind_execution_token(task)
             observe_task_lifecycle("started", status=task.status, task_type=self._task_type(task))
             self._record_event(
@@ -7545,6 +7548,9 @@ class TaskManager:
             payload={"reason": next_payload},
         )
 
+    def _clear_task_abnormal_reason_snapshot(self, db: Session, task: BinarySecurityTask) -> None:
+        self._sync_task_abnormal_reason_snapshot(db, task, None)
+
     def _build_stage_summaries(
         self,
         db: Session,
@@ -8885,6 +8891,7 @@ class TaskManager:
             task.status = "running"
             task.finished_at = None
             task.last_error = None
+            self._clear_task_abnormal_reason_snapshot(db, task)
             return
         stage_retry_mode = task.execution_mode in {"stage_retry", "stage_retry_failed_items", "stage_retry_full"} and bool(task.target_stage_name)
         task_retry_mode = task.execution_mode in {"task_retry", "task_retry_failed_items"} and bool(task.target_stage_name)
