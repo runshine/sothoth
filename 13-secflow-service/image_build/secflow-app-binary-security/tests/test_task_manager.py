@@ -8408,6 +8408,130 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("success", item.status)
         self.assertIsNone(item.error_message)
 
+    def test_compact_result_for_storage_keeps_entry_preview_small(self):
+        entries = []
+        for index in range(12):
+            entries.append(
+                {
+                    "entry_key": f"e-{index}",
+                    "firmware_key": "source_project",
+                    "firmware_name": "src",
+                    "module_key": "m1",
+                    "module_name": "mod",
+                    "file_name": "main.go",
+                    "function_name": f"fn_{index}",
+                    "raw_function_name": f"fn_{index}(ctx context.Context, req *Request, verbose bool)",
+                    "line_no": str(index + 1),
+                    "definition_file": "main.go",
+                    "definition_line": str(index + 1),
+                    "is_definition_found": True,
+                    "tag": "P",
+                    "taint_params": ["ctx", "req", "verbose"],
+                    "function_description": "x" * 400,
+                    "function_description_source": "llm",
+                    "entry_reason": "y" * 400,
+                    "entry_reason_source": "llm",
+                    "taint_details": [{"name": "ctx", "reason": "z" * 400}],
+                    "signature_params": ["ctx", "req", "verbose"],
+                    "entry_file": "/tmp/entry-details.json",
+                    "source_dir": "/tmp/src",
+                }
+            )
+
+        result = self.manager._compact_result_for_storage(
+            "entry_analysis",
+            {
+                "module_key": "m1",
+                "module_name": "mod",
+                "artifact_root": "/tmp/out",
+                "entries": entries,
+            },
+        )
+
+        self.assertEqual(12, result["entry_count"])
+        self.assertEqual(5, len(result["entries_preview"]))
+        self.assertNotIn("entries", result)
+        first = result["entries_preview"][0]
+        self.assertIn("function_name", first)
+        self.assertIn("taint_params", first)
+        self.assertNotIn("function_description", first)
+        self.assertNotIn("entry_reason", first)
+        self.assertNotIn("taint_details", first)
+        self.assertNotIn("entry_file", first)
+
+    def test_run_entry_item_rolls_back_before_marking_failure(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="source-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="mod",
+            parent_key="fw-1",
+            downstream_service="entry_analyse",
+            downstream_task_id="ea-old",
+            status="queued",
+            output_ref={},
+        )
+        module = {
+            "module_key": "module-1",
+            "module_name": "mod",
+            "firmware_key": "fw-1",
+            "source_dir": "/tmp/src",
+        }
+
+        class _SessionWithFailingCommit(_ModelAwareDb):
+            def __init__(self):
+                super().__init__()
+                self.rollback_calls = 0
+                self.commit_calls = 0
+
+            def commit(self):
+                self.commit_calls += 1
+                if self.commit_calls == 3:
+                    raise RuntimeError("result_json too large")
+
+            def rollback(self):
+                self.rollback_calls += 1
+
+        fake_session = _SessionWithFailingCommit()
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(task_manager_module, "get_entry_analyse_client") as client_factory,
+            patch.object(self.manager, "_poll_until_terminal", return_value=("success", {"task_id": "ea-new", "status": "passed"})),
+            patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
+            patch.object(self.manager, "_parse_entries", return_value=[]),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+            patch.object(self.manager, "_compact_result_for_storage", return_value={"entry_count": 0, "entries_preview": []}),
+        ):
+            client_factory.return_value.create_task = unittest.mock.AsyncMock(return_value={"task_id": "ea-new"})
+            client_factory.return_value.get_task = unittest.mock.AsyncMock(return_value={"task_id": "ea-new", "status": "passed"})
+            result = asyncio.run(self.manager._run_entry_item(task, stage_run, module, token="tok", retrying=False))
+
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("failed", item.status)
+        self.assertEqual("result_json too large", item.error_message)
+        self.assertGreaterEqual(fake_session.rollback_calls, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

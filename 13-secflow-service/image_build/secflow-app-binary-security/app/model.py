@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from sqlalchemy import Column, DateTime, Integer, String, Text, UniqueConstraint, create_engine, inspect, text
+from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import get_config
@@ -269,7 +270,7 @@ class BinarySecurityStageItem(Base, JsonMixin):
     input_ref_json = Column(Text, nullable=True)
     output_ref_json = Column(Text, nullable=True)
     payload_json = Column(Text, nullable=True)
-    result_json = Column(Text, nullable=True)
+    result_json = Column(MEDIUMTEXT, nullable=True)
     error_message = Column(Text, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
@@ -560,11 +561,17 @@ def _ensure_compat_columns(engine) -> None:
                 conn.execute(text(statement))
     stage_item_table = BinarySecurityStageItem.__tablename__
     if inspector.has_table(stage_item_table):
-        columns = {column["name"] for column in inspector.get_columns(stage_item_table)}
+        column_defs = {column["name"]: column for column in inspector.get_columns(stage_item_table)}
+        columns = set(column_defs)
         statements = []
         if "item_identity_key" not in columns:
             statements.append(
                 f"ALTER TABLE {stage_item_table} ADD COLUMN item_identity_key VARCHAR(255) NULL"
+            )
+        result_json_type = str(column_defs.get("result_json", {}).get("type") or "").lower()
+        if "result_json" in columns and "mediumtext" not in result_json_type:
+            statements.append(
+                f"ALTER TABLE {stage_item_table} MODIFY COLUMN result_json MEDIUMTEXT NULL"
             )
         with engine.begin() as conn:
             for statement in statements:

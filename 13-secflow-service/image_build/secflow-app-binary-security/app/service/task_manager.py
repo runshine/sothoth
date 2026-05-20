@@ -10446,6 +10446,7 @@ class TaskManager:
             session.rollback()
             raise
         except Exception as exc:
+            session.rollback()
             if "item" in locals():
                 item.status = "failed"
                 item.error_message = str(exc)
@@ -10968,7 +10969,7 @@ class TaskManager:
         if stage_name == "entry_analysis":
             entries = [dict(row) for row in result.get("entries") or [] if isinstance(row, dict)]
             result["entry_count"] = len(entries)
-            result["entries_preview"] = self._compact_entry_rows(entries[:DB_ENTRY_PREVIEW_LIMIT])
+            result["entries_preview"] = self._compact_entry_rows(entries[: min(DB_ENTRY_PREVIEW_LIMIT, 5)], summary_only=True)
             result.pop("entries", None)
         elif stage_name == "vuln_scan":
             artifact_files = result.get("artifact_files") or []
@@ -11744,6 +11745,7 @@ class TaskManager:
             session.rollback()
             raise
         except Exception as exc:
+            session.rollback()
             if "item" in locals():
                 item.status = "failed"
                 item.error_message = str(exc)
@@ -11936,6 +11938,7 @@ class TaskManager:
             session.rollback()
             raise
         except Exception as exc:
+            session.rollback()
             if "item" in locals():
                 item.status = "failed"
                 item.error_message = str(exc)
@@ -12544,7 +12547,7 @@ class TaskManager:
             "entries": self._compact_entry_rows(item.get("entries") or []),
         }
 
-    def _compact_entry_rows(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _compact_entry_rows(self, entries: list[dict[str, Any]], *, summary_only: bool = False) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for entry in entries:
             if not isinstance(entry, dict):
@@ -12555,32 +12558,36 @@ class TaskManager:
                 for value in (entry.get("taint_params") or [])
                 if str(value).strip()
             ] or signature_params
-            rows.append(
-                {
-                    "entry_key": entry.get("entry_key"),
-                    "firmware_key": entry.get("firmware_key"),
-                    "firmware_name": entry.get("firmware_name"),
-                    "module_key": entry.get("module_key"),
-                    "module_name": entry.get("module_name"),
-                    "file_name": entry.get("file_name"),
-                    "function_name": entry.get("function_name"),
-                    "raw_function_name": entry.get("raw_function_name"),
-                    "line_no": entry.get("line_no"),
-                    "definition_file": entry.get("definition_file") or entry.get("file_name"),
-                    "definition_line": entry.get("definition_line") or entry.get("line_no"),
-                    "is_definition_found": entry.get("is_definition_found", True),
-                    "tag": entry.get("tag") or "P",
-                    "taint_params": taint_params,
-                    "function_description": entry.get("function_description") or _default_entry_function_description(str(entry.get("function_name") or "")),
-                    "function_description_source": entry.get("function_description_source") or _entry_description_source(entry.get("function_description")),
-                    "entry_reason": entry.get("entry_reason") or _default_entry_reason(entry.get("tag"), str(entry.get("function_name") or "")),
-                    "entry_reason_source": entry.get("entry_reason_source") or _entry_description_source(entry.get("entry_reason")),
-                    "taint_details": _normalize_entry_taint_details(entry, taint_params),
-                    "signature_params": signature_params,
-                    "entry_file": entry.get("entry_file"),
-                    "source_dir": entry.get("source_dir"),
-                }
-            )
+            row = {
+                "entry_key": entry.get("entry_key"),
+                "firmware_key": entry.get("firmware_key"),
+                "firmware_name": entry.get("firmware_name"),
+                "module_key": entry.get("module_key"),
+                "module_name": entry.get("module_name"),
+                "file_name": entry.get("file_name"),
+                "function_name": entry.get("function_name"),
+                "raw_function_name": entry.get("raw_function_name"),
+                "line_no": entry.get("line_no"),
+                "definition_file": entry.get("definition_file") or entry.get("file_name"),
+                "definition_line": entry.get("definition_line") or entry.get("line_no"),
+                "is_definition_found": entry.get("is_definition_found", True),
+                "tag": entry.get("tag") or "P",
+                "taint_params": taint_params,
+            }
+            if not summary_only:
+                row.update(
+                    {
+                        "function_description": entry.get("function_description") or _default_entry_function_description(str(entry.get("function_name") or "")),
+                        "function_description_source": entry.get("function_description_source") or _entry_description_source(entry.get("function_description")),
+                        "entry_reason": entry.get("entry_reason") or _default_entry_reason(entry.get("tag"), str(entry.get("function_name") or "")),
+                        "entry_reason_source": entry.get("entry_reason_source") or _entry_description_source(entry.get("entry_reason")),
+                        "taint_details": _normalize_entry_taint_details(entry, taint_params),
+                        "signature_params": signature_params,
+                        "entry_file": entry.get("entry_file"),
+                        "source_dir": entry.get("source_dir"),
+                    }
+                )
+            rows.append(row)
         return rows
 
     def _compact_entry_summary_item_for_db(self, item: dict[str, Any]) -> dict[str, Any]:
