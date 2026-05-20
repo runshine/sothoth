@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -25,6 +26,21 @@ class PiWorkerSnapshot:
     queued_jobs: int = 0
     source: str = "fallback"
     error: str | None = None
+
+
+@dataclass
+class PiWorkerActiveJobSnapshot:
+    pi_job_id: str
+    status: str
+    phase: str | None = None
+    worker_id: str | None = None
+    elf_path: str | None = None
+    elf_name: str | None = None
+    current_batch: int | None = None
+    current_attempt: int | None = None
+    current_function: str | None = None
+    started_at: str | None = None
+    updated_at: str | None = None
 
 
 @dataclass
@@ -182,6 +198,51 @@ def _snapshot_from_capacity(url: str, payload: dict[str, Any]) -> PiWorkerSnapsh
         queued_jobs=int(payload.get("queued_jobs") or payload.get("queued") or 0),
         source="capacity",
     )
+
+
+async def fetch_worker_active_jobs(worker: PiWorkerSnapshot) -> list[PiWorkerActiveJobSnapshot]:
+    client = get_pi_client(worker.url)
+    jobs = await client.list_jobs(active=True, worker_id=worker.worker_id)
+    running_jobs = [
+        job for job in jobs
+        if str(job.get("status") or "").strip().lower() == "running"
+    ]
+    if not running_jobs:
+        return []
+
+    details = await asyncio.gather(
+        *(client.get_job(str(job.get("id") or "").strip()) for job in running_jobs),
+        return_exceptions=True,
+    )
+    snapshots: list[PiWorkerActiveJobSnapshot] = []
+    for summary, detail in zip(running_jobs, details):
+        if isinstance(detail, Exception):
+            detail = None
+        payload = detail if isinstance(detail, dict) else summary
+        progress = payload.get("progress") if isinstance(payload.get("progress"), dict) else {}
+        elf_path = str(payload.get("target") or summary.get("target") or "").strip() or None
+        snapshots.append(PiWorkerActiveJobSnapshot(
+            pi_job_id=str(payload.get("id") or summary.get("id") or "").strip(),
+            status=str(payload.get("status") or summary.get("status") or "").strip() or "running",
+            phase=str(payload.get("phase") or summary.get("phase") or "").strip() or None,
+            worker_id=str(payload.get("worker_id") or summary.get("worker_id") or worker.worker_id).strip() or worker.worker_id,
+            elf_path=elf_path,
+            elf_name=Path(elf_path).name if elf_path else None,
+            current_batch=_int_or_none(progress.get("current_batch")),
+            current_attempt=_int_or_none(progress.get("current_attempt")),
+            current_function=str(progress.get("current_function") or "").strip() or None,
+            started_at=str(payload.get("created_at") or summary.get("created_at") or "").strip() or None,
+            updated_at=str(payload.get("updated_at") or summary.get("updated_at") or "").strip() or None,
+        ))
+    return snapshots
+
+
+def _int_or_none(value: object) -> int | None:
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except Exception:
+        return None
+    return parsed
 
 
 _monitor = PiClusterMonitor()

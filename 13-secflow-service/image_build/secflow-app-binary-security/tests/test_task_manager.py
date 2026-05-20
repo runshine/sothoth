@@ -2489,7 +2489,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.manager._finalize_task(db, task)
 
-        self.assertEqual("partial_success", task.status)
+        self.assertEqual("failed", task.status)
         self.assertEqual("binary_to_source", task.current_stage)
 
     def test_finalize_task_preserves_retry_preparing_when_pending_action_exists(self):
@@ -2751,7 +2751,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("partial_success", task.status)
+        self.assertEqual("failed", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertIsNotNone(task.finished_at)
 

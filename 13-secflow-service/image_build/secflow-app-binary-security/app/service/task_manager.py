@@ -5939,33 +5939,36 @@ class TaskManager:
             task.finished_at = _now()
             self._last_task_heartbeat_at.pop(task.id, None)
             return
+        stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+        vuln_run = next((run for run in stage_runs if run.stage_name == "vuln_scan"), None)
         next_stage = self._next_incomplete_stage(db, task)
         if next_stage:
-            task.status = "partial_success"
-            task.current_stage = next_stage
-            task.dispatcher_instance_id = None
-            task.dispatch_started_at = None
-            task.lease_expires_at = None
-            task.finished_at = _now()
-            self._last_task_heartbeat_at.pop(task.id, None)
-            self._record_event(
-                db,
-                task,
-                "task_finalize_blocked_by_incomplete_stage",
-                f"任务仍有未完成阶段，拒绝收口为终态: {next_stage}",
-                level="warning",
-                stage_name=next_stage,
-            )
-            return
-        stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+            if vuln_run and vuln_run.status in {"success", "partial_success"}:
+                next_stage = None
+            else:
+                task.status = "failed"
+                task.current_stage = next_stage
+                task.dispatcher_instance_id = None
+                task.dispatch_started_at = None
+                task.lease_expires_at = None
+                task.finished_at = _now()
+                self._last_task_heartbeat_at.pop(task.id, None)
+                self._record_event(
+                    db,
+                    task,
+                    "task_finalize_blocked_by_incomplete_stage",
+                    f"任务仍有未完成阶段，拒绝收口为终态: {next_stage}",
+                    level="warning",
+                    stage_name=next_stage,
+                )
+                return
         statuses = [run.status for run in stage_runs]
-        vuln_run = next((run for run in stage_runs if run.stage_name == "vuln_scan"), None)
         if statuses and all(status == "success" for status in statuses):
             task.status = "success"
         elif vuln_run and vuln_run.status in {"success", "partial_success"}:
             task.status = "partial_success" if any(status in {"failed", "partial_success", "downstream_missing"} for status in statuses) else "success"
         elif any(status in {"failed", "partial_success", "downstream_missing"} for status in statuses):
-            task.status = "partial_success" if any(status == "success" for status in statuses) else "failed"
+            task.status = "failed"
         else:
             task.status = "success"
         stale_stages = list((task.summary or {}).get("stale_stages") or [])

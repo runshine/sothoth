@@ -2,21 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.exception import NotFoundError, UnauthorizedError, ValidationError
-from app.model import B2STask, get_db
+from app.model import B2STask, B2STaskItem, get_db
 from app.schemas import ActionResponse, B2SArtifactContentResponse, B2SCacheBatchDeleteRequest, B2SCacheBatchDeleteResponse, B2SCacheDeleteResponse, B2SCacheDetailResponse, B2SCacheListResponse, B2SServiceConfig, B2STaskTimelineResponse, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, SessionFileResponse, SessionIndexResponse, TaskBatchDeleteItemResult, TaskBatchDeleteRequest, TaskBatchDeleteResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskListResponse, TaskObservabilitySummary, TaskPrepareResponse, TaskRelationshipResponse, TaskResponse, TaskResultSummary, TokenUser
 from app.service.auth import get_auth_service
 from app.service.cache_service import get_cache_service
 from app.service.configcenter import get_configcenter_client
 from app.service.config_service import get_config_service
 from app.service.project import get_project_service
-from app.service.pi_cluster import get_pi_cluster_monitor
+from app.service.pi_cluster import PiWorkerActiveJobSnapshot, PiWorkerSnapshot, fetch_worker_active_jobs, get_pi_cluster_monitor
 from app.service.security import validate_project_id
 from app.service.task_service import (
     build_task_detail,
@@ -63,6 +65,29 @@ class PiWorkerCapacityResponse(BaseModel):
     available_slots: int = 0
     source: str = "capacity"
     error: str | None = None
+    active_jobs: list["PiWorkerActiveJobResponse"] = Field(default_factory=list)
+
+
+class PiWorkerActiveJobResponse(BaseModel):
+    pi_job_id: str
+    status: str
+    phase: str | None = None
+    worker_id: str | None = None
+    elf_path: str | None = None
+    elf_name: str | None = None
+    task_id: str | None = None
+    task_name: str | None = None
+    task_origin_type: str | None = None
+    parent_task_id: str | None = None
+    sequence_no: int | None = None
+    item_id: str | None = None
+    current_batch: int | None = None
+    current_attempt: int | None = None
+    current_function: str | None = None
+    started_at: str | None = None
+    updated_at: str | None = None
+    mapped: bool = False
+    mapping_reason: str = "orphan_pi_job"
 
 
 class PiClusterCapacityResponse(BaseModel):
@@ -283,11 +308,28 @@ async def list_tasks(
 async def get_pi_cluster_capacity(
     project_id: str,
     _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
 ):
-    del project_id
     snapshot = await get_pi_cluster_monitor().refresh()
-    workers = [
-        PiWorkerCapacityResponse(
+    active_jobs_by_worker, worker_job_errors = await _load_worker_active_jobs(snapshot.workers)
+    item_by_job_id, task_by_id = _load_pi_job_item_mapping(
+        db,
+        project_id=project_id,
+        pi_job_ids=[
+            job.pi_job_id
+            for jobs in active_jobs_by_worker.values()
+            for job in jobs
+            if job.pi_job_id
+        ],
+    )
+    workers = []
+    for worker in snapshot.workers:
+        detail_error = worker_job_errors.get(worker.worker_id)
+        active_jobs = [
+            _build_active_job_response(job, item_by_job_id=item_by_job_id, task_by_id=task_by_id)
+            for job in active_jobs_by_worker.get(worker.worker_id, [])
+        ] if worker.healthy and not detail_error else []
+        workers.append(PiWorkerCapacityResponse(
             worker_id=worker.worker_id,
             url=worker.url,
             healthy=worker.healthy,
@@ -296,10 +338,9 @@ async def get_pi_cluster_capacity(
             queued_jobs=worker.queued_jobs,
             available_slots=max(0, worker.max_concurrent_jobs - worker.running_jobs) if worker.healthy else 0,
             source=worker.source,
-            error=worker.error,
-        )
-        for worker in snapshot.workers
-    ]
+            error=_merge_worker_error(worker.error, detail_error),
+            active_jobs=active_jobs,
+        ))
     return PiClusterCapacityResponse(
         worker_count=snapshot.worker_count,
         total_capacity=snapshot.total_capacity,
@@ -309,6 +350,80 @@ async def get_pi_cluster_capacity(
         updated_at=snapshot.updated_at,
         workers=workers,
     )
+
+
+async def _load_worker_active_jobs(workers: list[PiWorkerSnapshot]) -> tuple[dict[str, list[PiWorkerActiveJobSnapshot]], dict[str, str]]:
+    healthy_workers = [worker for worker in workers if worker.healthy]
+    results = await asyncio.gather(*(fetch_worker_active_jobs(worker) for worker in healthy_workers), return_exceptions=True)
+    active_jobs_by_worker: dict[str, list[PiWorkerActiveJobSnapshot]] = {worker.worker_id: [] for worker in workers}
+    worker_errors: dict[str, str] = {}
+    for worker, result in zip(healthy_workers, results):
+        if isinstance(result, Exception):
+            worker_errors[worker.worker_id] = str(result)
+            active_jobs_by_worker[worker.worker_id] = []
+        else:
+            active_jobs_by_worker[worker.worker_id] = result
+    return active_jobs_by_worker, worker_errors
+
+
+def _load_pi_job_item_mapping(db: Session, *, project_id: str, pi_job_ids: list[str]) -> tuple[dict[str, B2STaskItem], dict[str, B2STask]]:
+    normalized_job_ids = sorted({str(job_id or "").strip() for job_id in pi_job_ids if str(job_id or "").strip()})
+    if not normalized_job_ids:
+        return {}, {}
+    items = db.query(B2STaskItem).filter(
+        B2STaskItem.project_id == project_id,
+        B2STaskItem.pi_job_id.in_(normalized_job_ids),
+    ).all()
+    item_by_job_id = {
+        str(item.pi_job_id or "").strip(): item
+        for item in items
+        if str(item.pi_job_id or "").strip()
+    }
+    task_ids = sorted({str(item.task_id or "").strip() for item in items if str(item.task_id or "").strip()})
+    tasks = db.query(B2STask).filter(B2STask.id.in_(task_ids)).all() if task_ids else []
+    task_by_id = {task.id: task for task in tasks}
+    return item_by_job_id, task_by_id
+
+
+def _build_active_job_response(
+    job: PiWorkerActiveJobSnapshot,
+    *,
+    item_by_job_id: dict[str, B2STaskItem],
+    task_by_id: dict[str, B2STask],
+) -> PiWorkerActiveJobResponse:
+    item = item_by_job_id.get(job.pi_job_id)
+    task = task_by_id.get(item.task_id) if item is not None and str(item.task_id or "").strip() else None
+    elf_path = item.elf_path if item is not None else job.elf_path
+    elf_name = Path(str(elf_path or job.elf_name or "")).name or job.elf_name
+    return PiWorkerActiveJobResponse(
+        pi_job_id=job.pi_job_id,
+        status=job.status,
+        phase=job.phase,
+        worker_id=job.worker_id,
+        elf_path=elf_path,
+        elf_name=elf_name or None,
+        task_id=task.id if task is not None else None,
+        task_name=(str(task.name or "").strip() or task.id) if task is not None else None,
+        task_origin_type=task.task_origin_type if task is not None else None,
+        parent_task_id=task.parent_task_id if task is not None else None,
+        sequence_no=item.sequence_no if item is not None else None,
+        item_id=item.id if item is not None else None,
+        current_batch=job.current_batch,
+        current_attempt=job.current_attempt,
+        current_function=job.current_function,
+        started_at=job.started_at,
+        updated_at=job.updated_at,
+        mapped=item is not None and task is not None,
+        mapping_reason="matched_item" if item is not None and task is not None else "orphan_pi_job",
+    )
+
+
+def _merge_worker_error(worker_error: str | None, detail_error: str | None) -> str | None:
+    left = str(worker_error or "").strip()
+    right = str(detail_error or "").strip()
+    if left and right:
+        return f"{left}; active_jobs={right}"
+    return left or right or None
 
 
 @router.post("/projects/{project_id}/tasks/prepare", response_model=TaskPrepareResponse)
