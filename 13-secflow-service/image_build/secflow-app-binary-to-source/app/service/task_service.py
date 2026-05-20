@@ -87,7 +87,7 @@ TERMINAL = {"success", "failed", "cancelled"}
 PI_STATUS_MAP = {
     "queued": "queued",
     "running": "running",
-    "cancelling": "running",
+    "cancelling": "cancelling",
     "completed": "success",
     "failed": "failed",
     "cancelled": "cancelled",
@@ -111,6 +111,7 @@ PHASE_LABELS = {
     "header": "头文件恢复",
     "body": "函数体恢复",
     "merge": "结果合并",
+    "cancelling": "取消中",
     "completed": "已完成",
     "failed": "失败",
     "cancelled": "已取消",
@@ -130,6 +131,7 @@ FUNCTION_STATS_METADATA_KEY = "function_stats"
 FUNCTION_STATS_FIELDS = ("total_functions", "completed_functions", "failed_functions", "uncompleted_functions")
 TASK_EVENT_SOURCE_B2S = "b2s"
 TASK_EVENT_SOURCE_PI = "pi_re_agent"
+TASK_EVENT_DEDUPE_KEY_MAX_LEN = 255
 AGENT_SESSION_STALE_SECONDS = 10 * 60
 AGENT_SESSION_ACTIVE_STATUSES = {"pending", "dispatched", "streaming", "waiting_review", "waiting_execution", "stale"}
 AGENT_SESSION_STATUS_TITLES = {
@@ -221,7 +223,13 @@ def _item_metadata_event_snapshot(item: B2STaskItem) -> dict[str, Any]:
 
 def _event_dedupe_key(*parts: object) -> str:
     normalized = [str(part or "").strip() for part in parts]
-    return "|".join(normalized)
+    raw = "|".join(normalized)
+    if len(raw) <= TASK_EVENT_DEDUPE_KEY_MAX_LEN:
+        return raw
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
+    prefix_len = max(0, TASK_EVENT_DEDUPE_KEY_MAX_LEN - len(digest) - 1)
+    prefix = raw[:prefix_len].rstrip("|")
+    return f"{prefix}|{digest}" if prefix else digest
 
 
 def _create_task_event(
@@ -243,7 +251,7 @@ def _create_task_event(
     payload: dict[str, Any] | None = None,
     dedupe_key: str | None = None,
 ) -> None:
-    key = str(dedupe_key or "").strip() or _event_dedupe_key(
+    raw_key = str(dedupe_key or "").strip() or _event_dedupe_key(
         task_id,
         item.id if item else "",
         event_type,
@@ -255,6 +263,7 @@ def _create_task_event(
         status,
         pi_job_id or (item.pi_job_id if item else ""),
     )
+    key = _event_dedupe_key(raw_key)
     if db.query(B2STaskEventModel.id).filter(B2STaskEventModel.dedupe_key == key).first():
         return
     event = B2STaskEventModel(
@@ -321,7 +330,7 @@ def _build_abnormal_reason(
 
 def _task_abnormal_reason(task: B2STask, items: list[B2STaskItem]) -> B2SAbnormalReason | None:
     status = str(task.status or "")
-    if status in {"pending", "queued", "running", "completed", "success"}:
+    if status in {"pending", "queued", "running", "cancelling", "completed", "success"}:
         return None
     latest_item = next((item for item in reversed(items) if item.status in {"failed", "cancelled"}), None)
     latest_error = str((latest_item.error_reason if latest_item else "") or "").strip()
@@ -1001,12 +1010,12 @@ async def choose_pi_worker(db: Session, task_id: str, sequence_no: int) -> str:
         for worker in workers:
             try:
                 jobs = await get_pi_client(worker).list_jobs()
-                counts[worker] += sum(1 for job in jobs if job.get("status") in {"queued", "running"})
+                counts[worker] += sum(1 for job in jobs if job.get("status") in {"queued", "running", "cancelling"})
             except Exception:
                 # Avoid placing new work on an unreachable worker.
                 counts[worker] += 1_000_000
 
-    active_items = db.query(B2STaskItem).filter(B2STaskItem.status.in_(["queued", "running"])).all()
+    active_items = db.query(B2STaskItem).filter(B2STaskItem.status.in_(["queued", "running", "cancelling"])).all()
     for active_item in active_items:
         worker_url = str((active_item.extra_metadata or {}).get("pi_worker_url") or "").rstrip("/")
         if worker_url in counts:
@@ -1078,6 +1087,9 @@ def _record_pi_metadata(item: B2STaskItem, **updates: object) -> None:
 def _record_pi_runtime_metrics(item: B2STaskItem, job: dict) -> bool:
     progress = job.get("progress") if isinstance(job, dict) else None
     metrics = progress.get("runtime_metrics") if isinstance(progress, dict) else None
+    normalized_status = map_pi_status(job.get("status"))
+    if normalized_status in TERMINAL:
+        metrics = _normalize_terminal_runtime_metrics(job, metrics)
     metadata = dict(item.extra_metadata or {})
     if not isinstance(metrics, dict):
         reason = _pi_runtime_metric_missing_reason(item, job)
@@ -1099,6 +1111,25 @@ def _record_pi_runtime_metrics(item: B2STaskItem, job: dict) -> bool:
     return True
 
 
+def _normalize_terminal_runtime_metrics(job: dict, metrics: dict[str, Any] | None) -> dict[str, Any]:
+    normalized = dict(metrics or {})
+    normalized_status = map_pi_status(job.get("status"))
+    finished_at = (
+        _parse_pi_timestamp(job.get("finished_at"))
+        or _parse_pi_timestamp(job.get("cancelled_at"))
+        or _parse_pi_timestamp(job.get("completed_at"))
+        or _parse_pi_timestamp(job.get("failed_at"))
+        or _parse_pi_timestamp(job.get("updated_at"))
+        or now_local()
+    )
+    normalized["status"] = normalized_status
+    normalized["finished_at"] = isoformat_local(finished_at)
+    started_at = normalized.get("started_at") or job.get("started_at") or job.get("created_at")
+    if started_at:
+        normalized["started_at"] = isoformat_local(_parse_pi_timestamp(started_at)) or str(started_at)
+    return normalized
+
+
 def _pi_runtime_metric_missing_reason(item: B2STaskItem, job: dict | None = None) -> str:
     status = str((job or {}).get("status") or item.status or "").strip().lower()
     pi_job_id = str(item.pi_job_id or "").strip()
@@ -1106,7 +1137,7 @@ def _pi_runtime_metric_missing_reason(item: B2STaskItem, job: dict | None = None
         return "pi_job_missing"
     if status in {"queued", "pending"}:
         return "queued_or_pending"
-    if status in {"running", "cancelling"} or str(item.status or "").lower() == "running":
+    if status in {"running", "cancelling"} or str(item.status or "").lower() in {"running", "cancelling"}:
         return "running_not_reported"
     if item.failure_type == "upstream_lost":
         return "upstream_missing"
@@ -1713,10 +1744,6 @@ async def sync_task(db: Session, task: B2STask) -> None:
         if not item.pi_job_id:
             continue
         terminal_metrics_backfill_only = item.status in TERMINAL
-        if terminal_metrics_backfill_only:
-            metadata = item.extra_metadata if isinstance(item.extra_metadata, dict) else {}
-            if isinstance(metadata.get("pi_runtime_metrics"), dict):
-                continue
         try:
             job = await get_pi_client(item_pi_worker_url(item)).get_job(item.pi_job_id)
         except UpstreamError as exc:
@@ -1888,7 +1915,7 @@ async def sync_task(db: Session, task: B2STask) -> None:
         if refresh_item_function_stats(item, inspect_files=False):
             changed = True
         started_now = False
-        if new_status == "running" and item.started_at is None:
+        if new_status in {"running", "cancelling"} and item.started_at is None:
             item.started_at = now_local()
             started_now = True
         if new_status == "success":
@@ -1911,7 +1938,7 @@ async def sync_task(db: Session, task: B2STask) -> None:
         elif new_status == "success":
             item.failure_type = None
             item.error_reason = None
-        if started_now:
+        if started_now and new_status == "running":
             get_observability().record_item_submit(item, item_pi_worker_url(item) or "unknown")
         if new_status in TERMINAL and item.finished_at is None:
             item.finished_at = now_local()
@@ -1967,12 +1994,9 @@ async def terminate_task(db: Session, task: B2STask) -> None:
         )
         if item.pi_job_id:
             await get_pi_client(item_pi_worker_url(item)).cancel_job(item.pi_job_id)
-        item.status = "cancelled"
-        item.phase = "cancelled"
-        item.progress = build_item_progress(item, {"status": "cancelled", "phase": "cancelled", "progress": item.progress})
-        refresh_item_function_stats(item, inspect_files=True)
-        item.finished_at = now_local()
-        get_observability().record_item_finished(item)
+        item.status = "cancelling"
+        item.phase = "cancelling"
+        item.progress = build_item_progress(item, {"status": "cancelling", "phase": "cancelling", "progress": item.progress})
         _record_item_snapshot_events(db, task=task, item=item, previous=previous, source=TASK_EVENT_SOURCE_B2S)
     recompute_task_status(db, task)
     _record_task_status_event(db, task, previous_status)
@@ -2188,6 +2212,8 @@ def map_pi_phase(raw_phase: str | None, status: str | None = None) -> str:
     mapped_status = map_pi_status(status)
     if mapped_status in {"success", "failed", "cancelled"}:
         return {"success": "completed", "failed": "failed", "cancelled": "cancelled"}[mapped_status]
+    if mapped_status == "cancelling":
+        return "cancelling"
     if mapped_status == "queued":
         return "queued"
     return PI_PHASE_MAP.get(raw_phase or "", "body" if mapped_status == "running" else "queued")
@@ -2326,7 +2352,7 @@ def recompute_task_status(db: Session, task: B2STask) -> None:
         + counts["cancelled_items"]
         + counts["partial_items"]
     )
-    active_total = counts["queued_items"] + counts["running_items"]
+    active_total = counts["queued_items"] + counts["running_items"] + counts["cancelling_items"]
     waiting_total = counts["pending_items"]
     if total == 0:
         task.status = "pending"
@@ -2334,6 +2360,8 @@ def recompute_task_status(db: Session, task: B2STask) -> None:
         task.status = "completed"
     elif counts["cancelled_items"] == total:
         task.status = "cancelled"
+    elif counts["cancelling_items"] > 0:
+        task.status = "cancelling"
     elif counts["failed_items"] == total:
         task.status = "failed"
     elif terminal_total == total:
@@ -2360,6 +2388,7 @@ def count_status(items: list[B2STaskItem]) -> dict[str, int]:
         "pending_items": sum(1 for i in items if i.status == "pending"),
         "queued_items": sum(1 for i in items if i.status == "queued"),
         "running_items": sum(1 for i in items if i.status == "running"),
+        "cancelling_items": sum(1 for i in items if i.status == "cancelling"),
         "success_items": sum(1 for i in items if i.status == "success"),
         "partial_items": sum(1 for i in items if i.status == "partial"),
         "failed_items": sum(1 for i in items if i.status == "failed"),

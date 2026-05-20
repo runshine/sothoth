@@ -95,7 +95,7 @@ class B2SObservability:
         self.prom.set_gauge("last_task_item_count", item_count)
 
     def record_item_submit(self, item: B2STaskItem, selected_worker: str) -> None:
-        if item.status == "running":
+        if item.status in {"running", "cancelling"}:
             self.prom.inc("tasks_started", entity="item")
         if item.created_at and item.started_at:
             self.prom.observe("queue_wait_duration", max(0.0, (item.started_at - item.created_at).total_seconds()))
@@ -181,7 +181,7 @@ def _snapshot_lines(db: Session) -> list[str]:
         worker_url = item_pi_worker_url(item)
         if worker_url:
             worker_loads.setdefault(worker_url, 0)
-            if item.status in {"queued", "running"}:
+            if item.status in {"queued", "running", "cancelling"}:
                 worker_loads[worker_url] += 1
     cache_rows = db.query(B2SAnalysisCache).filter(B2SAnalysisCache.status == "ready").all()
     for row in cache_rows:

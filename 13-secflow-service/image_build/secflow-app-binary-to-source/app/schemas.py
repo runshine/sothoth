@@ -491,6 +491,7 @@ class TaskResponse(BaseModel):
     pending_items: int
     queued_items: int
     running_items: int
+    cancelling_items: int = 0
     success_items: int
     partial_items: int
     failed_items: int

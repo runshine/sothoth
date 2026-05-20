@@ -30,6 +30,28 @@ def _item(sequence_no: int, status: str) -> B2STaskItem:
 
 
 class RecomputeTaskStatusTests(unittest.TestCase):
+    def test_event_dedupe_key_caps_length_for_long_error_messages(self) -> None:
+        long_message = "400 litellm.BadRequestError: " + ("Hosted_vllmException|" * 40)
+
+        key = task_service._event_dedupe_key(
+            "task-1",
+            "",
+            "abnormal_reason_recorded",
+            "downstream_failed",
+            "failed",
+            long_message,
+        )
+
+        self.assertLessEqual(len(key), 255)
+        self.assertEqual(key, task_service._event_dedupe_key(
+            "task-1",
+            "",
+            "abnormal_reason_recorded",
+            "downstream_failed",
+            "failed",
+            long_message,
+        ))
+
     def test_all_pending_items_stay_pending(self) -> None:
         task = _task()
         items = [_item(1, "pending"), _item(2, "pending")]
@@ -83,6 +105,15 @@ class RecomputeTaskStatusTests(unittest.TestCase):
             task_service.recompute_task_status(db=mock.Mock(), task=task)
 
         self.assertEqual("completed", task.status)
+
+    def test_cancelling_items_make_task_cancelling_until_all_cancelled(self) -> None:
+        task = _task(status="running")
+        items = [_item(1, "cancelling"), _item(2, "cancelled")]
+
+        with mock.patch.object(task_service, "query_items", return_value=items):
+            task_service.recompute_task_status(db=mock.Mock(), task=task)
+
+        self.assertEqual("cancelling", task.status)
 
 
 class OverallProgressTests(unittest.TestCase):
@@ -180,6 +211,89 @@ class SyncTaskStatusTests(unittest.TestCase):
         self.assertIn("unexpected error", str(item.error_reason))
         self.assertEqual(1, fake_db.committed)
         self.assertGreaterEqual(fake_db.refreshed, 1)
+
+    def test_sync_task_terminal_item_backfills_cancelled_runtime_metrics(self) -> None:
+        task = _task(status="cancelled")
+        item = _item(1, "cancelled")
+        item.pi_job_id = "job-1"
+        item.phase = "cancelled"
+        item.extra_metadata = {
+            "pi_worker_url": "http://worker",
+            "pi_runtime_metrics": {
+                "status": "running",
+                "started_at": "2026-05-20T12:00:00Z",
+                "finished_at": None,
+            },
+        }
+
+        class _FakeDb:
+            def __init__(self) -> None:
+                self.committed = 0
+                self.refreshed = 0
+
+            def commit(self) -> None:
+                self.committed += 1
+
+            def refresh(self, _obj) -> None:
+                self.refreshed += 1
+
+        class _PiClient:
+            async def get_job(self, _job_id):
+                return {
+                    "id": "job-1",
+                    "status": "cancelled",
+                    "phase": "processing",
+                    "updated_at": "2026-05-20T12:15:39Z",
+                    "progress": {
+                        "runtime_metrics": {
+                            "status": "running",
+                            "started_at": "2026-05-20T12:00:00Z",
+                            "finished_at": None,
+                        },
+                    },
+                }
+
+        fake_db = _FakeDb()
+        with (
+            mock.patch.object(task_service, "query_items", return_value=[item]),
+            mock.patch.object(task_service, "get_pi_client", return_value=_PiClient()),
+            mock.patch.object(task_service, "_sync_task_abnormal_reason", return_value=None),
+        ):
+            asyncio.run(task_service.sync_task(fake_db, task))
+
+        metrics = item.extra_metadata["pi_runtime_metrics"]
+        self.assertEqual("cancelled", metrics["status"])
+        self.assertIsNotNone(metrics["finished_at"])
+        self.assertEqual("cancelled", item.status)
+        self.assertEqual(1, fake_db.committed)
+
+    def test_terminate_task_marks_items_cancelling_before_upstream_confirms_cancel(self) -> None:
+        task = _task(status="running")
+        item = _item(1, "running")
+        item.pi_job_id = "job-1"
+        item.phase = "body"
+        item.progress = {"message": "running"}
+        item.extra_metadata = {"pi_worker_url": "http://worker"}
+
+        class _FakeDb:
+            def commit(self) -> None:
+                return None
+
+        class _PiClient:
+            async def cancel_job(self, _job_id):
+                return None
+
+        with (
+            mock.patch.object(task_service, "query_items", return_value=[item]),
+            mock.patch.object(task_service, "get_pi_client", return_value=_PiClient()),
+            mock.patch.object(task_service, "_record_task_status_event", return_value=None),
+        ):
+            asyncio.run(task_service.terminate_task(_FakeDb(), task))
+
+        self.assertEqual("cancelling", item.status)
+        self.assertEqual("cancelling", item.phase)
+        self.assertIsNone(item.finished_at)
+        self.assertEqual("cancelling", task.status)
 
     def test_recover_stale_pi_job_uses_defaults_when_config_lacks_threshold_fields(self) -> None:
         item = _item(1, "queued")
