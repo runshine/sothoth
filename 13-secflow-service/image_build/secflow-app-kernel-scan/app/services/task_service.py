@@ -177,6 +177,19 @@ class TaskService:
                 conn.execute("ROLLBACK")
                 return "busy"
 
+            orphan = conn.execute(
+                """
+                select attempt_id from kernel_scan_attempts
+                where task_id = ?
+                  and status in ('queued','claimed','running','cancel_requested')
+                limit 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if orphan:
+                conn.execute("ROLLBACK")
+                return "busy"
+
             effective_config_json = "{}"
             if row["latest_attempt_id"]:
                 prev = conn.execute(

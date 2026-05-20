@@ -18,7 +18,7 @@ execution:
   entry_model: ""
   audit_model: ""
   poc_model: ""
-  max_parallel_tasks: 1
+  max_parallel_tasks: 10
   # Default thread counts (can be overridden per-task via API)
   entry_threads: 4
   audit_threads: 4

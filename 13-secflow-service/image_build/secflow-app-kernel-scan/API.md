@@ -469,7 +469,7 @@ queued → running → succeeded / partial_success / failed
 | KERNEL_SCAN_WORKSPACE_ROOT | /workspace | Stage 产物输出根目录（各 stage 在此下按 `entry/` `audit/` `poc/` 分组） |
 | KERNEL_SCAN_EXECUTION_MODE | claude_cli | 执行模式 |
 | KERNEL_SCAN_CLAUDE_MODEL | zai-org/GLM-5 | 默认模型 |
-| KERNEL_SCAN_MAX_PARALLEL_TASKS | 1 | 最大并行任务数 |
+| KERNEL_SCAN_MAX_PARALLEL_TASKS | 10 | 最大并行任务数 |
 | KERNEL_SCAN_ENTRY_THREADS | 4 | entry 默认线程数 |
 | KERNEL_SCAN_AUDIT_THREADS | 4 | audit 默认线程数 |
 | KERNEL_SCAN_POC_THREADS | 2 | poc 默认线程数 |

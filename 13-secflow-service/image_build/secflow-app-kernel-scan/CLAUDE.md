@@ -133,7 +133,7 @@ Stage 之间的数据契约：
 - `lease_duration_seconds=30`
 - `heartbeat_interval_seconds=5`
 - `scheduler_tick_interval_seconds=1.0`
-- `KERNEL_SCAN_MAX_PARALLEL_TASKS=1`
+- `KERNEL_SCAN_MAX_PARALLEL_TASKS=10`
 - `KERNEL_SCAN_CLAUDE_MODEL=zai-org/GLM-5`
 - `KERNEL_SCAN_EXECUTION_MODE=claude_cli`
 

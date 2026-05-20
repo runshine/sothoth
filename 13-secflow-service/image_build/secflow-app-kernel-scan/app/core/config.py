@@ -21,7 +21,7 @@ class ExecutionConfig(BaseModel):
     entry_model: str = ""
     audit_model: str = ""
     poc_model: str = ""
-    max_parallel_tasks: int = 1
+    max_parallel_tasks: int = 10
     entry_threads: int = 4
     audit_threads: int = 4
     poc_threads: int = 2
