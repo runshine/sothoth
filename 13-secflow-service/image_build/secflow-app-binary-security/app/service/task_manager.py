@@ -1788,8 +1788,22 @@ class TaskManager:
             task = self._task_or_404(db, project_id, task_id)
             supported, reason, stage_name, items = self._task_retry_failed_items_support(db, task)
             if not supported or not stage_name:
-                observe_task_operation(TASK_ACTION_RETRY_FAILED_ITEMS, "rejected")
-                raise ValidationError(reason or "当前任务不支持重试失败项")
+                continue_supported, continue_reason, continue_stage = self._task_continue_support(db, task)
+                if not continue_supported or not continue_stage:
+                    observe_task_operation(TASK_ACTION_RETRY_FAILED_ITEMS, "rejected")
+                    raise ValidationError(reason or continue_reason or "当前任务不支持重试失败项")
+                self._accept_blocking_action(
+                    db,
+                    task,
+                    action="continue",
+                    preparing_status=TASK_STATUS_CONTINUE_PREPARING,
+                    target_stage=continue_stage,
+                    message=f"当前没有失败项，已自动转为继续推进，后台将从阶段 {continue_stage} 重新排队",
+                    event_type="task_retry_failed_items_continue_accepted",
+                    event_payload={"target_stage": continue_stage, "fallback_from": TASK_ACTION_RETRY_FAILED_ITEMS},
+                )
+                observe_task_operation(TASK_ACTION_RETRY_FAILED_ITEMS, "accepted")
+                return continue_stage
             item_keys = sorted({self._stage_item_identity(item.item_key, item.parent_key) for item in items})
             self._set_retry_plan(
                 task,
@@ -1853,8 +1867,6 @@ class TaskManager:
         ]
         if not retry_items:
             raise ValidationError("失败项重试未找到目标阶段子任务")
-        item_ids = [item.id for item in retry_items]
-        downstream_refs = self._collect_downstream_refs(task, retry_items)
         await self.sync_downstream_status(
             db,
             project_id=task.project_id,
@@ -1868,9 +1880,7 @@ class TaskManager:
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
         downstream_stages = stage_sequence[target_index + 1:]
-        all_downstream_refs = self._dedupe_downstream_refs(
-            downstream_refs + self._retry_downstream_refs_for_stages(db, task, downstream_stages)
-        )
+        all_downstream_refs = self._retry_downstream_refs_for_stages(db, task, downstream_stages)
         self._invalidate_task_execution(task)
         if all_downstream_refs:
             await self._cleanup_downstream_refs(db, task, all_downstream_refs, self._service_token())
@@ -1879,8 +1889,6 @@ class TaskManager:
             self._clear_stage_outputs_from(task, downstream_stages[0], mark_stale=False)
             self._delete_archive_children_for_stages(db, task, downstream_stages)
             self._delete_stage_items_for_stages(db, task.id, downstream_stages)
-        self._clear_archive_jobs_for_stage_items(db, task.id, target_stage, item_ids)
-        self._delete_stage_items_by_ids(db, item_ids)
         target_run = db.query(BinarySecurityStageRun).filter(
             BinarySecurityStageRun.task_id == task.id,
             BinarySecurityStageRun.stage_name == target_stage,
@@ -1898,8 +1906,8 @@ class TaskManager:
             task,
             {
                 **plan,
-                "cleared_business_stages": [target_stage, *downstream_stages],
-                "cleared_archive_stages": [target_stage, *downstream_stages],
+                "cleared_business_stages": downstream_stages,
+                "cleared_archive_stages": downstream_stages,
             },
         )
         return affected_stages
@@ -1944,7 +1952,20 @@ class TaskManager:
             task = self._task_or_404(db, project_id, task_id)
             supported, reason, items = self._stage_retry_failed_items_support(db, task, stage_name)
             if not supported:
-                raise ValidationError(reason or f"阶段 {stage_name} 不支持重试失败项")
+                continue_supported, continue_reason, continue_stage = self._task_continue_support(db, task)
+                if not continue_supported or not continue_stage:
+                    raise ValidationError(reason or continue_reason or f"阶段 {stage_name} 不支持重试失败项")
+                self._accept_blocking_action(
+                    db,
+                    task,
+                    action="continue",
+                    preparing_status=TASK_STATUS_CONTINUE_PREPARING,
+                    target_stage=continue_stage,
+                    message=f"阶段 {stage_name} 当前没有失败项，已自动转为继续推进，后台将从阶段 {continue_stage} 重新排队",
+                    event_type="stage_retry_failed_items_continue_accepted",
+                    event_payload={"target_stage": continue_stage, "requested_stage": stage_name},
+                )
+                return
             item_keys = sorted({self._stage_item_identity(item.item_key, item.parent_key) for item in items})
             self._set_retry_plan(
                 task,
