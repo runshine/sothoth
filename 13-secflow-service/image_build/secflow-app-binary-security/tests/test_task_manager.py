@@ -261,6 +261,29 @@ class _AsyncSystemAnalyseClientStub:
         return {"task_id": task_id}
 
 
+class _AsyncBinaryToSourceClientStub:
+    def __init__(self, *, listed=None, fetched=None, fail_on_create=False):
+        self.listed = listed or {"items": []}
+        self.fetched = fetched or {}
+        self.fail_on_create = fail_on_create
+        self.created = 0
+
+    async def list_tasks(self, *args, **kwargs):
+        del args, kwargs
+        return self.listed
+
+    async def get_task(self, project_id, task_id, token):
+        del project_id, token
+        return dict(self.fetched.get(task_id) or {"id": task_id, "status": "success", "items": []})
+
+    async def create_task(self, *args, **kwargs):
+        del args, kwargs
+        self.created += 1
+        if self.fail_on_create:
+            raise AssertionError("create_task should not be called")
+        return {"id": "b2s-created"}
+
+
 class TaskManagerTests(unittest.TestCase):
     def setUp(self):
         self.manager = TaskManager()
@@ -7925,6 +7948,190 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(payload)
         self.assertEqual("sat-running", payload["task_id"])
         self.assertEqual("sat-running", item.downstream_task_id)
+
+    def test_find_reusable_b2s_payload_prefers_active_duplicate_task(self):
+        task = BinarySecurityTask(id="t1", project_id="p1")
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            item_key="module-1",
+            downstream_service="binary_to_source",
+            downstream_task_id="b2s-old",
+            status="queued",
+        )
+        client = _AsyncBinaryToSourceClientStub(
+            listed={
+                "items": [
+                    {"id": "b2s-passed", "status": "success", "parent_stage_item_id": "si1", "updated_at": "2026-05-18T23:32:56"},
+                    {"id": "b2s-running", "status": "running", "parent_stage_item_id": "si1", "updated_at": "2026-05-18T23:34:41"},
+                    {"id": "b2s-other", "status": "running", "parent_stage_item_id": "si2", "updated_at": "2026-05-18T23:40:00"},
+                ]
+            }
+        )
+
+        with patch.object(task_manager_module, "get_binary_to_source_client", return_value=client):
+            payload = asyncio.run(self.manager._find_reusable_b2s_payload(task, item, "tok"))
+
+        self.assertIsNotNone(payload)
+        self.assertEqual("b2s-running", payload["id"])
+        self.assertEqual("b2s-running", item.downstream_task_id)
+
+    def test_run_b2s_item_reuses_active_downstream_task_instead_of_creating_new_one(self):
+        task = BinarySecurityTask(id="t1", name="source-task", project_id="p1", workspace_root="/tmp/ws")
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            item_key="module-1",
+            item_name="mod.so",
+            parent_key="fw-1",
+            downstream_service="binary_to_source",
+            downstream_task_id="b2s-live",
+            status="running",
+        )
+        module = {
+            "module_key": "module-1",
+            "module_name": "mod.so",
+            "firmware_key": "fw-1",
+        }
+        fake_session = _ModelAwareDb(stage_items=[item])
+        client = _AsyncBinaryToSourceClientStub(fail_on_create=True)
+
+        async def fake_poll(*args, **kwargs):
+            del args, kwargs
+            return "success", {"id": "b2s-live", "status": "success", "items": []}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(task_manager_module, "get_binary_to_source_client", return_value=client),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_build_module_elf_tasks", return_value=[{"elf_path": "/tmp/mod.so", "file_list": []}]),
+            patch.object(self.manager, "_active_downstream_payload", return_value={"id": "b2s-live", "status": "running"}),
+            patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+            patch.object(self.manager, "_lightweight_downstream_payload", side_effect=lambda payload: {"status": payload.get("status")}),
+            patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
+        ):
+            result = asyncio.run(self.manager._run_b2s_item(task, stage_run, module, token="tok", retrying=False))
+
+        self.assertEqual("b2s-live", item.downstream_task_id)
+        self.assertEqual(0, client.created)
+        self.assertEqual("success", result["status"])
+
+    def test_run_b2s_item_reuses_active_duplicate_before_creating_new_one(self):
+        task = BinarySecurityTask(id="t1", name="source-task", project_id="p1", workspace_root="/tmp/ws")
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            item_key="module-1",
+            item_name="mod.so",
+            parent_key="fw-1",
+            downstream_service="binary_to_source",
+            downstream_task_id="b2s-stale-ref",
+            status="running",
+        )
+        module = {
+            "module_key": "module-1",
+            "module_name": "mod.so",
+            "firmware_key": "fw-1",
+        }
+        fake_session = _ModelAwareDb(stage_items=[item])
+        client = _AsyncBinaryToSourceClientStub(fail_on_create=True)
+
+        async def fake_poll(*args, **kwargs):
+            del args, kwargs
+            return "success", {"id": "b2s-dup-live", "status": "success", "items": []}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(task_manager_module, "get_binary_to_source_client", return_value=client),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_build_module_elf_tasks", return_value=[{"elf_path": "/tmp/mod.so", "file_list": []}]),
+            patch.object(self.manager, "_active_downstream_payload", return_value=None),
+            patch.object(self.manager, "_find_reusable_b2s_payload", return_value={"id": "b2s-dup-live", "status": "running"}),
+            patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+            patch.object(self.manager, "_lightweight_downstream_payload", side_effect=lambda payload: {"status": payload.get("status")}),
+            patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
+        ):
+            result = asyncio.run(self.manager._run_b2s_item(task, stage_run, module, token="tok", retrying=False))
+
+        self.assertEqual(0, client.created)
+        self.assertEqual("success", result["status"])
+
+    def test_run_b2s_item_treats_completed_status_as_success(self):
+        task = BinarySecurityTask(id="t1", name="source-task", project_id="p1", workspace_root="/tmp/ws")
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            item_key="module-1",
+            item_name="mod.so",
+            parent_key="fw-1",
+            downstream_service="binary_to_source",
+            downstream_task_id="b2s-live",
+            status="running",
+        )
+        module = {
+            "module_key": "module-1",
+            "module_name": "mod.so",
+            "firmware_key": "fw-1",
+        }
+        fake_session = _ModelAwareDb(stage_items=[item])
+        client = _AsyncBinaryToSourceClientStub(fail_on_create=True)
+        poll_kwargs = {}
+
+        async def fake_poll(*args, **kwargs):
+            del args
+            poll_kwargs.update(kwargs)
+            return "success", {"id": "b2s-live", "status": "completed", "items": []}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(task_manager_module, "get_binary_to_source_client", return_value=client),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_build_module_elf_tasks", return_value=[{"elf_path": "/tmp/mod.so", "file_list": []}]),
+            patch.object(self.manager, "_active_downstream_payload", return_value={"id": "b2s-live", "status": "running"}),
+            patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+            patch.object(self.manager, "_lightweight_downstream_payload", side_effect=lambda payload: {"status": payload.get("status")}),
+            patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
+        ):
+            result = asyncio.run(self.manager._run_b2s_item(task, stage_run, module, token="tok", retrying=False))
+
+        self.assertIn("completed", poll_kwargs["success_statuses"])
+        self.assertEqual("success", result["status"])
+        self.assertEqual("success", item.status)
 
     def test_run_dataflow_item_retry_path_polls_after_restart(self):
         task = BinarySecurityTask(id="t1", name="source-task", project_id="p1", workspace_root="/tmp/ws")

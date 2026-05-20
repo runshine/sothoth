@@ -11,6 +11,7 @@ from app.model import B2SProjectConfig
 
 _DEFAULT_CONFIG: Dict[str, Any] = {
     "budget_exhausted_action": "treat_as_passed",
+    "concurrency": 8,
     "llm_provider_key": None,
 }
 
@@ -24,6 +25,14 @@ def normalize_budget_exhausted_action(value: str | None) -> str:
     return "treat_as_passed"
 
 
+def normalize_concurrency(value: Any) -> int:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return 8
+    return max(1, min(16, normalized))
+
+
 class ConfigService:
     def get_config(self, db: Session, project_id: str) -> dict:
         row = db.query(B2SProjectConfig).filter_by(project_id=project_id).first()
@@ -34,6 +43,7 @@ class ConfigService:
         data["budget_exhausted_action"] = normalize_budget_exhausted_action(
             data.get("budget_exhausted_action")
         )
+        data["concurrency"] = normalize_concurrency(data.get("concurrency"))
         data["llm_provider_key"] = _normalize_provider_key(data.get("llm_provider_key"))
         data["project_id"] = project_id
         data["updated_at"] = row.updated_at.isoformat() if (row and row.updated_at) else None
@@ -44,6 +54,7 @@ class ConfigService:
         blob["budget_exhausted_action"] = normalize_budget_exhausted_action(
             blob.get("budget_exhausted_action")
         )
+        blob["concurrency"] = normalize_concurrency(blob.get("concurrency"))
         blob["llm_provider_key"] = _normalize_provider_key(blob.get("llm_provider_key"))
         row = db.query(B2SProjectConfig).filter_by(project_id=project_id).first()
         if row:
@@ -58,6 +69,7 @@ class ConfigService:
         result["budget_exhausted_action"] = normalize_budget_exhausted_action(
             result.get("budget_exhausted_action")
         )
+        result["concurrency"] = normalize_concurrency(result.get("concurrency"))
         result["llm_provider_key"] = _normalize_provider_key(result.get("llm_provider_key"))
         result["project_id"] = project_id
         result["updated_at"] = row.updated_at.isoformat() if row.updated_at else None

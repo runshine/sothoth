@@ -76,7 +76,7 @@ from app.schemas import (
     TaskResultSummary,
 )
 from app.service.cache_service import get_cache_service
-from app.service.config_service import get_config_service, normalize_budget_exhausted_action
+from app.service.config_service import get_config_service, normalize_budget_exhausted_action, normalize_concurrency
 from app.service.llm_provider import materialize_llm_provider
 from app.service.pi_cluster import get_pi_cluster_monitor
 from app.service.pi_re_agent import get_pi_client
@@ -909,6 +909,11 @@ def _project_default_llm_provider_key(db: Session, project_id: str) -> str | Non
     return _normalize_llm_provider_key(cfg.get("llm_provider_key"))
 
 
+def _project_default_concurrency(db: Session, project_id: str) -> int:
+    cfg = get_config_service().get_config(db, project_id)
+    return normalize_concurrency(cfg.get("concurrency"))
+
+
 def _frozen_item_llm_provider_key(items: list[B2STaskItem]) -> str | None:
     for item in items:
         key = _normalize_llm_provider_key((item.extra_metadata or {}).get("llm_provider_key"))
@@ -1596,7 +1601,9 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
     job_model = _provider_model_name(provider) or pi_cfg.model
     frozen_provider_key = _normalize_llm_provider_key(provider.get("provider_key") if provider else effective_provider_key)
     frozen_provider_model = _normalize_llm_provider_key(provider.get("model") if provider else job_model)
-    job_concurrency = req.concurrency if req.concurrency and req.concurrency > 0 else pi_cfg.concurrency
+    request_concurrency = normalize_concurrency(req.concurrency) if req.concurrency is not None else None
+    project_concurrency = _project_default_concurrency(db, project_id)
+    job_concurrency = request_concurrency or project_concurrency or normalize_concurrency(pi_cfg.concurrency)
     job_timeout_seconds = req.agent_run_timeout_seconds if req.agent_run_timeout_seconds is not None else pi_cfg.agent_run_timeout_seconds
     job_timeout_retry_enabled = req.agent_timeout_retry_enabled if req.agent_timeout_retry_enabled is not None else pi_cfg.agent_timeout_retry_enabled
     job_timeout_max_retries = req.agent_timeout_max_retries if req.agent_timeout_max_retries is not None else pi_cfg.agent_timeout_max_retries
@@ -2311,14 +2318,10 @@ def build_item_progress(item: B2STaskItem, job: dict) -> dict:
         if total_functions is not None:
             completed_functions = total_functions
 
-    if completed_functions is None and total_functions and total_batches:
-        completed_functions = int(float(total_functions) * float(completed_batches) / float(total_batches))
     completed_bytes = raw_progress.get("completed_bytes")
     batch_percent = _safe_percent(completed_batches, total_batches)
     if status == "success" and total_bytes is not None:
         completed_bytes = total_bytes
-    elif completed_bytes is None and total_bytes and batch_percent is not None:
-        completed_bytes = int(float(total_bytes) * batch_percent / 100.0)
     percent = _safe_percent(completed_functions, total_functions) or batch_percent or _safe_percent(completed_bytes, total_bytes)
     if status == "success":
         percent = 100.0
@@ -4002,7 +4005,7 @@ def _row_last_event_at(
         candidates.append(_batch_mtime(session.path))
     if is_running:
         candidates.append(_ensure_local_datetime(item.updated_at))
-        candidates.append(runtime_updated_at)
+        candidates.append(_ensure_local_datetime(runtime_updated_at))
     available = [value for value in candidates if value is not None]
     return max(available) if available else None
 
@@ -4057,8 +4060,11 @@ def _build_batch_observability_row(
     total_size_bytes = _safe_int((manifest_row or {}).get("total_size")) or 0
     if total_size_bytes <= 0 and batch:
         total_size_bytes = max(int(batch.source.size if batch.source else 0), int(batch.disasm.size if batch.disasm else 0), 0)
+    active_runtime_statuses = {"running", "processing", "in_progress", "active"}
+    is_current_batch = _safe_int(progress.get("current_batch")) == batch_no
     is_running = item.status not in TERMINAL and (
-        (_safe_int(progress.get("current_batch")) == batch_no)
+        runtime_status in active_runtime_statuses
+        or is_current_batch
         or any("validator" in str(session.role or session.agent or "").lower() or "executor" in str(session.role or session.agent or "").lower() for session in sessions)
     )
     if is_running:
@@ -4075,9 +4081,14 @@ def _build_batch_observability_row(
         status = "unknown"
     if status == "unknown":
         warnings.append("缺少 manifest、results、review 和 session 信号。")
-    current_attempt_no = _safe_int(progress.get("current_attempt")) if is_running else None
+    current_attempt_no = None
+    if is_running:
+        if is_current_batch:
+            current_attempt_no = _safe_int(progress.get("current_attempt"))
+        else:
+            current_attempt_no = max(runtime_attempts, max(session_attempts) if session_attempts else 0) or None
     current_function = str(progress.get("current_function") or "").strip() or None
-    if not is_running:
+    if not is_running or not is_current_batch:
         current_function = None
     last_event_at = _row_last_event_at(item, batch, sessions, runtime_updated_at, is_running)
     duration_ms: int | None = None
@@ -4649,17 +4660,18 @@ def build_overall_progress(items: list[B2STaskItem]) -> B2SOverallProgress:
         phase = item.phase or (item.progress or {}).get("phase") or item.status
         phase_summary[phase] = phase_summary.get(phase, 0) + 1
         progress = item.progress or {}
-        if progress.get("total_functions") is not None:
+        function_stats = _item_function_stats(item)
+        if function_stats["total_functions"] is not None and function_stats["completed_functions"] is not None:
             has_functions = True
             function_coverage_items += 1
-            total_functions += int(progress.get("total_functions") or 0)
-            completed_functions += int(progress.get("completed_functions") or 0)
-        if progress.get("total_bytes") is not None:
+            total_functions += int(function_stats["total_functions"] or 0)
+            completed_functions += int(function_stats["completed_functions"] or 0)
+        if progress.get("total_bytes") is not None and progress.get("completed_bytes") is not None:
             has_bytes = True
             byte_coverage_items += 1
             total_bytes += int(progress.get("total_bytes") or 0)
             completed_bytes += int(progress.get("completed_bytes") or 0)
-        if progress.get("total_batches") is not None:
+        if progress.get("total_batches") is not None and progress.get("completed_batches") is not None:
             has_batches = True
             batch_coverage_items += 1
             total_batches += int(progress.get("total_batches") or 0)
@@ -4670,14 +4682,14 @@ def build_overall_progress(items: list[B2STaskItem]) -> B2SOverallProgress:
         percent = _safe_percent(completed_functions, total_functions)
         if percent is not None:
             percent_basis = "functions"
-    if percent is None and has_batches and batch_coverage_items == total_items:
-        percent = _safe_percent(completed_batches, total_batches)
-        if percent is not None:
-            percent_basis = "batches"
     if percent is None and has_bytes and byte_coverage_items == total_items:
         percent = _safe_percent(completed_bytes, total_bytes)
         if percent is not None:
             percent_basis = "bytes"
+    if percent is None and has_batches and batch_coverage_items == total_items:
+        percent = _safe_percent(completed_batches, total_batches)
+        if percent is not None:
+            percent_basis = "batches"
     if percent is None:
         percent = _safe_percent(completed_items, total_items)
         if percent is not None:

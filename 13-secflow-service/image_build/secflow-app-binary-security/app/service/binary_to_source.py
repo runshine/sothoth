@@ -37,6 +37,29 @@ class BinaryToSourceClient(JsonHttpClient):
     async def get_task(self, project_id: str, task_id: str, token: str) -> dict:
         return await self.get(f"/projects/{project_id}/tasks/{task_id}", token=token)
 
+    async def list_tasks(
+        self,
+        project_id: str,
+        token: str,
+        *,
+        parent_task_id: str | None = None,
+        parent_stage_item_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+        status: str | None = None,
+    ) -> dict:
+        params: dict[str, Any] = {
+            "limit": limit,
+            "offset": offset,
+        }
+        if parent_task_id:
+            params["parent_task_id"] = parent_task_id
+        if parent_stage_item_id:
+            params["parent_stage_item_id"] = parent_stage_item_id
+        if status:
+            params["status"] = status
+        return await self.get(f"/projects/{project_id}/tasks", token=token, params=params)
+
     async def cancel_task(self, project_id: str, task_id: str, token: str) -> dict:
         return await self.post(f"/projects/{project_id}/tasks/{task_id}/terminate", token=token)
 

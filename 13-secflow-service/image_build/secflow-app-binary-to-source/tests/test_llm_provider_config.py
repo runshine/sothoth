@@ -90,14 +90,32 @@ class ConfigServiceTests(unittest.TestCase):
         row = B2SProjectConfig(project_id="p1")
         row.config = {
             "budget_exhausted_action": "treat_as_failed",
+            "concurrency": 12,
             "llm_provider_key": "team_codex",
         }
         db = _FakeDb(project_configs=[row])
 
         result = service.get_config(db, "p1")
 
+        self.assertEqual(12, result["concurrency"])
         self.assertEqual("team_codex", result["llm_provider_key"])
         self.assertEqual("treat_as_failed", result["budget_exhausted_action"])
+
+    def test_get_config_defaults_concurrency_to_eight(self):
+        service = ConfigService()
+        db = _FakeDb()
+
+        result = service.get_config(db, "p1")
+
+        self.assertEqual(8, result["concurrency"])
+
+    def test_save_config_normalizes_concurrency_range(self):
+        service = ConfigService()
+        db = _FakeDb()
+
+        saved = service.save_config(db, "p1", {"concurrency": 99})
+
+        self.assertEqual(16, saved["concurrency"])
 
     def test_effective_provider_summary_prefers_selected_provider(self):
         async def _run():
@@ -195,9 +213,119 @@ class TaskProviderResolutionTests(unittest.TestCase):
         self.assertTrue(db.task_items[0].extra_metadata["pi_idempotency_key"].endswith(":/tmp/input/demo.elf"))
         self.assertEqual("team_codex", db.task_items[0].extra_metadata["llm_provider_key"])
         self.assertEqual("gpt-5.4", db.task_items[0].extra_metadata["llm_provider_model"])
+        self.assertEqual(8, db.task_items[0].extra_metadata["concurrency"])
         self.assertTrue(db.task_items[0].extra_metadata["reuse_cache"])
         cache_service.try_apply_cache_hit.assert_called_once()
         cache_service.prepare_cache_metadata.assert_not_called()
+
+    def test_create_task_uses_project_default_concurrency_when_request_missing(self):
+        row = B2SProjectConfig(project_id="p1")
+        row.config = {"concurrency": 10}
+        db = _FakeDb(project_configs=[row])
+        cache_service = SimpleNamespace(
+            try_apply_cache_hit=mock.Mock(return_value=SimpleNamespace(hit=False)),
+            prepare_cache_metadata=mock.Mock(),
+            store_success_cache=mock.Mock(return_value=False),
+            delete_caches_for_source_task=mock.Mock(),
+        )
+        req = TaskCreate(
+            task_id="task-project-concurrency",
+            name="demo-project-concurrency",
+            elf_tasks=[ElfTaskInput(elf_path="/tmp/demo.elf")],
+        )
+
+        with (
+            mock.patch.object(task_service, "ensure_path_in_project", return_value=Path("/tmp/demo.elf")),
+            mock.patch.object(task_service, "prepare_input_file", return_value=Path("/tmp/input/demo.elf")),
+            mock.patch.object(task_service, "safe_output_dir", return_value=Path("/tmp/output")),
+            mock.patch.object(task_service, "_project_default_llm_provider_key", return_value="team_codex"),
+            mock.patch.object(task_service, "get_cache_service", return_value=cache_service),
+            mock.patch.object(
+                task_service,
+                "get_config",
+                return_value=SimpleNamespace(
+                    pi_re_agent=SimpleNamespace(
+                        batch_size=8192,
+                        max_retries=3,
+                        concurrency=8,
+                        agent_run_timeout_seconds=3600,
+                        agent_timeout_retry_enabled=True,
+                        agent_timeout_max_retries=3,
+                        engine="hybrid",
+                        model=None,
+                    ),
+                    configcenter_service=SimpleNamespace(enabled=True),
+                ),
+            ),
+            mock.patch.object(
+                task_service,
+                "materialize_llm_provider",
+                return_value={
+                    "provider_key": "team_codex",
+                    "display_name": "Team Codex",
+                    "provider_type": "openai",
+                    "model": "gpt-5.4",
+                },
+            ),
+        ):
+            asyncio.run(task_service.create_task(db, "p1", req, "tester"))
+
+        self.assertEqual(10, db.task_items[0].extra_metadata["concurrency"])
+
+    def test_create_task_request_concurrency_overrides_project_default(self):
+        row = B2SProjectConfig(project_id="p1")
+        row.config = {"concurrency": 10}
+        db = _FakeDb(project_configs=[row])
+        cache_service = SimpleNamespace(
+            try_apply_cache_hit=mock.Mock(return_value=SimpleNamespace(hit=False)),
+            prepare_cache_metadata=mock.Mock(),
+            store_success_cache=mock.Mock(return_value=False),
+            delete_caches_for_source_task=mock.Mock(),
+        )
+        req = TaskCreate(
+            task_id="task-request-concurrency",
+            name="demo-request-concurrency",
+            concurrency=12,
+            elf_tasks=[ElfTaskInput(elf_path="/tmp/demo.elf")],
+        )
+
+        with (
+            mock.patch.object(task_service, "ensure_path_in_project", return_value=Path("/tmp/demo.elf")),
+            mock.patch.object(task_service, "prepare_input_file", return_value=Path("/tmp/input/demo.elf")),
+            mock.patch.object(task_service, "safe_output_dir", return_value=Path("/tmp/output")),
+            mock.patch.object(task_service, "_project_default_llm_provider_key", return_value="team_codex"),
+            mock.patch.object(task_service, "get_cache_service", return_value=cache_service),
+            mock.patch.object(
+                task_service,
+                "get_config",
+                return_value=SimpleNamespace(
+                    pi_re_agent=SimpleNamespace(
+                        batch_size=8192,
+                        max_retries=3,
+                        concurrency=8,
+                        agent_run_timeout_seconds=3600,
+                        agent_timeout_retry_enabled=True,
+                        agent_timeout_max_retries=3,
+                        engine="hybrid",
+                        model=None,
+                    ),
+                    configcenter_service=SimpleNamespace(enabled=True),
+                ),
+            ),
+            mock.patch.object(
+                task_service,
+                "materialize_llm_provider",
+                return_value={
+                    "provider_key": "team_codex",
+                    "display_name": "Team Codex",
+                    "provider_type": "openai",
+                    "model": "gpt-5.4",
+                },
+            ),
+        ):
+            asyncio.run(task_service.create_task(db, "p1", req, "tester"))
+
+        self.assertEqual(12, db.task_items[0].extra_metadata["concurrency"])
 
     def test_create_task_without_reuse_cache_skips_hit_lookup_and_freezes_flag(self):
         db = _FakeDb()

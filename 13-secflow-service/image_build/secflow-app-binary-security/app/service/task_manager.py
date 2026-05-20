@@ -9303,6 +9303,51 @@ class TaskManager:
             item.downstream_task_id = selected_task_id
         return selected
 
+    async def _find_reusable_b2s_payload(
+        self,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        token: str | None = None,
+    ) -> dict[str, Any] | None:
+        item_id = str(item.id or "").strip()
+        item_key = str(item.item_key or "").strip()
+        if not item_id and not item_key:
+            return None
+        try:
+            listed = await get_binary_to_source_client().list_tasks(
+                task.project_id,
+                token or "",
+                parent_task_id=task.id,
+                parent_stage_item_id=item_id or None,
+                limit=100,
+                offset=0,
+            )
+        except Exception:
+            return None
+        rows = listed.get("items") if isinstance(listed, dict) else None
+        if not isinstance(rows, list):
+            return None
+        candidates = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            origin_item_id = str(row.get("parent_stage_item_id") or "").strip()
+            origin_item_key = str(row.get("parent_stage_item_key") or "").strip()
+            if item_id and origin_item_id == item_id:
+                candidates.append(row)
+                continue
+            if item_key and origin_item_key == item_key:
+                candidates.append(row)
+        if not candidates:
+            return None
+        candidates.sort(key=self._sort_downstream_payload_priority)
+        selected = candidates[0]
+        selected_task_id = str(selected.get("task_id") or selected.get("id") or "").strip()
+        current_task_id = str(item.downstream_task_id or "").strip()
+        if selected_task_id and selected_task_id != current_task_id:
+            item.downstream_task_id = selected_task_id
+        return selected
+
     def _stage_retry_support(
         self,
         db: Session,
@@ -11328,26 +11373,75 @@ class TaskManager:
             )
             session.commit()
             elf_tasks = self._build_module_elf_tasks(module)
-            if retrying and self._has_retryable_downstream_task(item):
-                created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=token)
-            else:
-                created = await get_binary_to_source_client().create_task(
-                    task.project_id,
-                    f"{task.name}-{module['module_name']}",
-                    elf_tasks,
-                    token or "",
-                    _downstream_origin_payload(task, item),
+            active_payload = await self._active_downstream_payload(task, item, token)
+            if active_payload is not None:
+                item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or item.status
+                session.commit()
+                status, payload = await self._poll_until_terminal(
+                    lambda: get_binary_to_source_client().get_task(task.project_id, item.downstream_task_id, token or ""),
+                    success_statuses={"success", "partial_success", "completed"},
+                    failure_statuses={"failed", "cancelled"},
+                    task=task,
+                    item=item,
                 )
-            item.downstream_task_id = created.get("id") or item.downstream_task_id
-            item.result = {"project_id": task.project_id}
+            else:
+                reusable_payload = None if retrying else await self._find_reusable_b2s_payload(task, item, token)
+                if reusable_payload is not None:
+                    downstream_status = str(reusable_payload.get("status") or "").lower()
+                    mapped_reusable_status = self._map_downstream_status(downstream_status)
+                    if mapped_reusable_status in {"queued", "running"}:
+                        item.status = mapped_reusable_status
+                        session.commit()
+                        status, payload = await self._poll_until_terminal(
+                            lambda: get_binary_to_source_client().get_task(task.project_id, item.downstream_task_id, token or ""),
+                            success_statuses={"success", "partial_success", "completed"},
+                            failure_statuses={"failed", "cancelled"},
+                            task=task,
+                            item=item,
+                        )
+                    else:
+                        session.commit()
+                        payload = await get_binary_to_source_client().get_task(task.project_id, item.downstream_task_id, token or "")
+                        downstream_status = str(payload.get("status") or "").lower()
+                        if downstream_status in {"success", "partial_success", "completed"}:
+                            status = "success"
+                        elif downstream_status == "cancelled":
+                            status = "cancelled"
+                        elif downstream_status == "downstream_missing":
+                            status = "downstream_missing"
+                        else:
+                            status = "failed"
+                elif retrying and self._has_retryable_downstream_task(item):
+                    created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=token)
+                    item.downstream_task_id = created.get("id") or item.downstream_task_id
+                    session.commit()
+                    status, payload = await self._poll_until_terminal(
+                        lambda: get_binary_to_source_client().get_task(task.project_id, item.downstream_task_id, token or ""),
+                        success_statuses={"success", "partial_success", "completed"},
+                        failure_statuses={"failed", "cancelled"},
+                        task=task,
+                        item=item,
+                    )
+                else:
+                    created = await get_binary_to_source_client().create_task(
+                        task.project_id,
+                        f"{task.name}-{module['module_name']}",
+                        elf_tasks,
+                        token or "",
+                        _downstream_origin_payload(task, item),
+                    )
+                    item.downstream_task_id = created.get("id") or item.downstream_task_id
+                    item.result = {"project_id": task.project_id}
+                    session.commit()
+                    status, payload = await self._poll_until_terminal(
+                        lambda: get_binary_to_source_client().get_task(task.project_id, item.downstream_task_id, token or ""),
+                        success_statuses={"success", "partial_success", "completed"},
+                        failure_statuses={"failed", "cancelled"},
+                        task=task,
+                        item=item,
+                    )
+            item.result = {"project_id": task.project_id, **(item.result or {})}
             session.commit()
-            status, payload = await self._poll_until_terminal(
-                lambda: get_binary_to_source_client().get_task(task.project_id, item.downstream_task_id, token or ""),
-                success_statuses={"success", "partial_success"},
-                failure_statuses={"failed", "cancelled"},
-                task=task,
-                item=item,
-            )
             extra_paths: list[str] = []
             for child in payload.get("items", []):
                 if child.get("output_dir"):

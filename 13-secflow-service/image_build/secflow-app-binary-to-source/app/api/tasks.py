@@ -282,6 +282,8 @@ async def batch_delete_b2s_cache_entries(
 async def list_tasks(
     project_id: str,
     status: Optional[str] = Query(None),
+    parent_task_id: Optional[str] = Query(None),
+    parent_stage_item_id: Optional[str] = Query(None),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     _: TokenUser = Depends(get_current_context),
@@ -290,6 +292,10 @@ async def list_tasks(
     query = db.query(B2STask).filter(B2STask.project_id == project_id)
     if status:
         query = query.filter(B2STask.status == status)
+    if parent_task_id:
+        query = query.filter(B2STask.parent_task_id == parent_task_id)
+    if parent_stage_item_id:
+        query = query.filter(B2STask.parent_stage_item_id == parent_stage_item_id)
     total = query.count()
     tasks = query.order_by(B2STask.created_at.desc()).offset(offset).limit(limit).all()
     stats_changed = False

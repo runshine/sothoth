@@ -78,7 +78,7 @@ class PiReAgentConfig(BaseModel):
     agent_timeout_retry_enabled: bool = True
     agent_timeout_max_retries: int = 3
     engine: Literal["agent", "hybrid"] = "hybrid"
-    concurrency: int = 4
+    concurrency: int = 8
     model: Optional[str] = None
     llm_provider_key: Optional[str] = "share_codex"
     agent_config_dir: str = "/data/pi-re-agent-config"

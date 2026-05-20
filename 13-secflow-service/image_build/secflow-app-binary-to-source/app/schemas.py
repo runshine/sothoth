@@ -48,6 +48,7 @@ class TaskCreate(BaseModel):
 class B2SServiceConfig(BaseModel):
     project_id: str
     budget_exhausted_action: Literal["treat_as_passed", "treat_as_failed"] = "treat_as_passed"
+    concurrency: int = 8
     llm_provider_key: Optional[str] = None
     effective_llm_provider: Optional["LlmProviderSummary"] = None
     updated_at: Optional[str] = None

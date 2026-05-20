@@ -68,6 +68,7 @@ class BatchObservabilityTests(unittest.TestCase):
                     "updated_at": datetime.now().astimezone().isoformat(),
                     "batch_summary": {
                         "batches": [
+                            {"batch_id": 1, "status": "running", "attempts": 1, "function_count": 2, "duration_seconds": 5.0},
                             {"batch_id": 2, "status": "running", "attempts": 2, "function_count": 4, "duration_seconds": 12.5},
                         ]
                     },
@@ -139,20 +140,22 @@ class BatchObservabilityTests(unittest.TestCase):
 
         self.assertEqual(4, len(summary.batches))
         self.assertEqual(4, summary.batch_summary.total_batches)
-        self.assertEqual(1, summary.batch_summary.running_batches)
+        self.assertEqual(2, summary.batch_summary.running_batches)
         self.assertEqual(1, summary.batch_summary.passed_batches)
         self.assertEqual(1, summary.batch_summary.failed_batches)
-        self.assertEqual(1, summary.batch_summary.pending_batches)
+        self.assertEqual(0, summary.batch_summary.pending_batches)
+
+        runtime_running = next(row for row in summary.batches if row.item_id == item1.id and row.batch_no == 1)
+        self.assertEqual("running", runtime_running.status)
+        self.assertEqual(1, runtime_running.current_attempt_no)
+        self.assertIsNone(runtime_running.current_function)
 
         running = next(row for row in summary.batches if row.item_id == item1.id and row.batch_no == 2)
         self.assertEqual("running", running.status)
         self.assertEqual(2, running.current_attempt_no)
         self.assertEqual("sub_402000", running.current_function)
         self.assertEqual(1, running.session_count)
-
-        pending = next(row for row in summary.batches if row.item_id == item1.id and row.batch_no == 1)
-        self.assertEqual("pending", pending.status)
-        self.assertEqual(2, pending.function_count)
+        self.assertEqual(4, running.function_count)
 
         passed = next(row for row in summary.batches if row.item_id == item2.id and row.batch_no == 1)
         self.assertEqual("passed", passed.status)

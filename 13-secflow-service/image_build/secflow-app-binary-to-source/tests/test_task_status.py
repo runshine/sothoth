@@ -117,6 +117,45 @@ class RecomputeTaskStatusTests(unittest.TestCase):
 
 
 class OverallProgressTests(unittest.TestCase):
+    def test_item_progress_does_not_estimate_completed_functions_from_batches(self) -> None:
+        item = _item(1, "running")
+
+        progress = task_service.build_item_progress(
+            item,
+            {
+                "status": "running",
+                "phase": "body",
+                "progress": {
+                    "total_functions": 10,
+                    "total_batches": 2,
+                    "completed_batches": 1,
+                },
+            },
+        )
+
+        self.assertEqual(10, progress["total_functions"])
+        self.assertIsNone(progress["completed_functions"])
+        self.assertEqual(50.0, float(progress["batches_percent"] or 0.0))
+
+    def test_item_progress_does_not_estimate_completed_bytes_from_batches(self) -> None:
+        item = _item(1, "running")
+        with mock.patch.object(task_service, "_file_size", return_value=1000):
+            progress = task_service.build_item_progress(
+                item,
+                {
+                    "status": "running",
+                    "phase": "body",
+                    "progress": {
+                        "total_batches": 2,
+                        "completed_batches": 1,
+                    },
+                },
+            )
+
+        self.assertEqual(1000, progress["total_bytes"])
+        self.assertIsNone(progress["completed_bytes"])
+        self.assertEqual(50.0, float(progress["percent"] or 0.0))
+
     def test_progress_falls_back_to_bytes_when_function_coverage_is_partial(self) -> None:
         item1 = _item(1, "success")
         item1.progress = {
@@ -151,6 +190,68 @@ class OverallProgressTests(unittest.TestCase):
         self.assertEqual("items", overall.percent_basis)
         self.assertAlmostEqual(50.0, float(overall.percent or 0.0))
 
+    def test_progress_uses_cached_function_stats_instead_of_progress_estimates(self) -> None:
+        item1 = _item(1, "running")
+        item1.progress = {
+            "total_functions": 10,
+            "completed_functions": None,
+            "total_batches": 2,
+            "completed_batches": 1,
+        }
+        item1.extra_metadata = {
+            "function_stats": {
+                "total_functions": 10,
+                "completed_functions": 6,
+                "failed_functions": 1,
+                "uncompleted_functions": 4,
+                "source": "results",
+            }
+        }
+        item2 = _item(2, "success")
+        item2.progress = {
+            "total_functions": 5,
+            "completed_functions": 5,
+            "total_batches": 1,
+            "completed_batches": 1,
+        }
+        item2.extra_metadata = {
+            "function_stats": {
+                "total_functions": 5,
+                "completed_functions": 5,
+                "failed_functions": 0,
+                "uncompleted_functions": 0,
+                "source": "results",
+            }
+        }
+
+        overall = task_service.build_overall_progress([item1, item2])
+
+        self.assertEqual("functions", overall.percent_basis)
+        self.assertEqual(15, overall.total_functions)
+        self.assertEqual(11, overall.completed_functions)
+        self.assertAlmostEqual(round((11 / 15) * 100, 2), float(overall.percent or 0.0))
+
+    def test_progress_falls_back_to_batches_when_bytes_are_not_reliably_observed(self) -> None:
+        item1 = _item(1, "running")
+        item1.progress = {
+            "total_batches": 4,
+            "completed_batches": 2,
+            "total_bytes": 100,
+            "completed_bytes": None,
+        }
+        item2 = _item(2, "running")
+        item2.progress = {
+            "total_batches": 2,
+            "completed_batches": 1,
+            "total_bytes": 200,
+            "completed_bytes": None,
+        }
+
+        overall = task_service.build_overall_progress([item1, item2])
+
+        self.assertEqual("batches", overall.percent_basis)
+        self.assertAlmostEqual(50.0, float(overall.percent or 0.0))
+
 
 class BuildTaskResponseTests(unittest.TestCase):
     def test_build_task_response_ignores_stale_abnormal_reason_for_running_task(self) -> None:
@@ -173,6 +274,42 @@ class BuildTaskResponseTests(unittest.TestCase):
         self.assertIsNone(payload.abnormal_reason)
         self.assertIsNone(payload.abnormal_reason_title)
         self.assertIsNone(payload.abnormal_reason_code)
+
+    def test_task_response_and_overall_progress_share_same_function_totals(self) -> None:
+        task = _task(status="running")
+        item1 = _item(1, "running")
+        item1.progress = {"total_functions": 10, "completed_functions": None}
+        item1.extra_metadata = {
+            "function_stats": {
+                "total_functions": 10,
+                "completed_functions": 6,
+                "failed_functions": 2,
+                "uncompleted_functions": 4,
+                "source": "results",
+            }
+        }
+        item2 = _item(2, "success")
+        item2.progress = {"total_functions": 5, "completed_functions": 5}
+        item2.extra_metadata = {
+            "function_stats": {
+                "total_functions": 5,
+                "completed_functions": 5,
+                "failed_functions": 0,
+                "uncompleted_functions": 0,
+                "source": "results",
+            }
+        }
+        items = [item1, item2]
+
+        with mock.patch.object(task_service, "query_items", return_value=items):
+            payload = task_service.build_task_response(mock.Mock(), task)
+            overall = task_service.build_overall_progress(items)
+
+        self.assertEqual(15, payload.total_functions)
+        self.assertEqual(11, payload.completed_functions)
+        self.assertEqual(15, overall.total_functions)
+        self.assertEqual(11, overall.completed_functions)
+        self.assertEqual("functions", overall.percent_basis)
 
 
 class SyncTaskStatusTests(unittest.TestCase):
