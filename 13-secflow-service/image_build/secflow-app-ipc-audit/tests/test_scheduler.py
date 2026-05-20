@@ -14,6 +14,7 @@ from app.db.database import init_database
 from app.schemas import InputRef, TaskCreateRequest
 from app.services.task_service import get_task_service
 from app.workers.scheduler import get_scheduler_service
+from app.db.database import get_database
 
 
 class SchedulerParallelismTest(unittest.TestCase):
@@ -143,6 +144,55 @@ class SchedulerParallelismTest(unittest.TestCase):
         statuses = [get_task_service().get_task(item.task_id).status for item in tasks]
         self.assertEqual(statuses, ["succeeded", "succeeded", "succeeded"])
         self.assertLess(elapsed, 2.8)
+
+    def test_recover_expired_attempts_skips_scheduler_active_future(self) -> None:
+        task = get_task_service().create_task(
+            TaskCreateRequest(
+                title="foundation/demo/service_a",
+                workspace_id="oh61-main",
+                pipeline_mode="audit_only",
+                input_ref=InputRef(kind="custom_project", project_path="foundation/demo/service_a"),
+            ),
+            self.subject,
+        )
+        attempt_id = get_task_service().claim_next_attempt("tester-worker")
+        self.assertIsNotNone(attempt_id)
+
+        scheduler = get_scheduler_service()
+        scheduler._futures = {}  # type: ignore[attr-defined]  # noqa: SLF001
+
+        class _FakeFuture:
+            def done(self) -> bool:
+                return False
+
+        fake_future = _FakeFuture()
+        scheduler._futures_lock.acquire()  # type: ignore[attr-defined]  # noqa: SLF001
+        try:
+            scheduler._futures[fake_future] = str(attempt_id)  # type: ignore[index,attr-defined]  # noqa: SLF001
+        finally:
+            scheduler._futures_lock.release()  # type: ignore[attr-defined]  # noqa: SLF001
+
+        with get_database().connect() as conn:
+            conn.execute(
+                """
+                update ipc_audit_task_attempts
+                set status = 'running', heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+                where attempt_id = ?
+                """,
+                (
+                    "2026-05-20T01:00:00Z",
+                    "2026-05-20T01:00:00Z",
+                    "2026-05-20T01:00:00Z",
+                    str(attempt_id),
+                ),
+            )
+
+        recovered = get_task_service().recover_expired_attempts(
+            excluded_attempt_ids=scheduler._active_attempt_ids(),  # type: ignore[attr-defined]  # noqa: SLF001
+        )
+        self.assertEqual(recovered, 0)
+        attempt = get_task_service().get_attempt(task.task_id, str(attempt_id))
+        self.assertEqual(attempt.status, "running")
 
     def _wait_for_all_terminal(self, task_ids: list[str], *, timeout_seconds: float) -> None:
         deadline = time.monotonic() + timeout_seconds

@@ -73,7 +73,7 @@ class SchedulerService:
                 max_parallel = self._current_max_parallel_tasks()
                 self._ensure_executor_capacity(max_parallel)
                 self._reap_futures()
-                get_task_service().recover_expired_attempts()
+                get_task_service().recover_expired_attempts(excluded_attempt_ids=self._active_attempt_ids())
                 while self._active_future_count() < max_parallel and not self._stop_event.is_set():
                     attempt_id = get_task_service().claim_next_attempt(self._worker_id)
                     if not attempt_id:
@@ -111,6 +111,14 @@ class SchedulerService:
     def _active_future_count(self) -> int:
         with self._futures_lock:
             return sum(0 if future.done() else 1 for future in self._futures)
+
+    def _active_attempt_ids(self) -> set[str]:
+        with self._futures_lock:
+            return {
+                attempt_id
+                for future, attempt_id in self._futures.items()
+                if not future.done()
+            }
 
     @staticmethod
     def _current_max_parallel_tasks() -> int:
