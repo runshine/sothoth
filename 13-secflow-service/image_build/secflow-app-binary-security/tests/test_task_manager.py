@@ -7138,7 +7138,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(task.dispatch_started_at)
         self.assertIsNone(task.lease_expires_at)
 
-    def test_list_tasks_needing_downstream_sync_includes_failed_items_with_downstream_refs(self):
+    def test_list_tasks_needing_downstream_sync_includes_failed_items_in_running_stage(self):
         engine = create_engine("sqlite:///:memory:")
         TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
         Base.metadata.create_all(bind=engine)
@@ -7148,7 +7148,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 id="task1",
                 project_id="p1",
                 name="n",
-                status="failed",
+                status="running",
                 current_stage="binary_to_source",
                 task_type=TASK_TYPE_BINARY,
                 firmware_source="project_filesystem",
@@ -7171,12 +7171,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             db.add(item)
             db.commit()
 
-            original_needs_reconcile = self.manager._task_needs_downstream_reconcile
-            self.manager._task_needs_downstream_reconcile = lambda current_task: current_task.id == "task1"
-            try:
-                refs = self.manager._list_tasks_needing_downstream_sync(db)
-            finally:
-                self.manager._task_needs_downstream_reconcile = original_needs_reconcile
+            refs = self.manager._list_tasks_needing_downstream_sync(db)
         finally:
             db.close()
 
@@ -7221,7 +7216,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([], refs)
 
-    def test_list_tasks_needing_downstream_sync_uses_retry_target_stage(self):
+    def test_list_tasks_needing_downstream_sync_excludes_failed_tasks_even_with_retry_target_stage(self):
         engine = create_engine("sqlite:///:memory:")
         TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
         Base.metadata.create_all(bind=engine)
@@ -7260,7 +7255,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         finally:
             db.close()
 
-        self.assertEqual([{"project_id": "p1", "task_id": "task1"}], refs)
+        self.assertEqual([], refs)
 
     def test_run_task_ignores_stale_worker_failure_after_retry(self):
         task = BinarySecurityTask(

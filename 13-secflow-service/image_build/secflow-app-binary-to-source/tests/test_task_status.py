@@ -152,6 +152,29 @@ class OverallProgressTests(unittest.TestCase):
         self.assertAlmostEqual(50.0, float(overall.percent or 0.0))
 
 
+class BuildTaskResponseTests(unittest.TestCase):
+    def test_build_task_response_ignores_stale_abnormal_reason_for_running_task(self) -> None:
+        task = _task(status="running")
+        task.latest_abnormal_reason = {
+            "category": "downstream",
+            "code": "downstream_failed",
+            "title": "子任务失败",
+            "message": "stale reason",
+            "source_layer": "task",
+            "status": "failed",
+            "service": "binary-to-source",
+            "evidence": [],
+        }
+        item = _item(1, "running")
+
+        with mock.patch.object(task_service, "query_items", return_value=[item]):
+            payload = task_service.build_task_response(mock.Mock(), task)
+
+        self.assertIsNone(payload.abnormal_reason)
+        self.assertIsNone(payload.abnormal_reason_title)
+        self.assertIsNone(payload.abnormal_reason_code)
+
+
 class SyncTaskStatusTests(unittest.TestCase):
     def test_sync_task_recomputes_aggregate_status_even_without_item_changes(self) -> None:
         task = _task(status="pending")
@@ -174,6 +197,39 @@ class SyncTaskStatusTests(unittest.TestCase):
             asyncio_run(task_service.sync_task(fake_db, task))
 
         self.assertEqual("running", task.status)
+        self.assertEqual(1, fake_db.committed)
+        self.assertEqual(1, fake_db.refreshed)
+
+    def test_sync_task_commits_when_only_abnormal_reason_is_cleared(self) -> None:
+        task = _task(status="running")
+        task.latest_abnormal_reason = {
+            "category": "downstream",
+            "code": "downstream_failed",
+            "title": "子任务失败",
+            "message": "old reason",
+            "source_layer": "task",
+            "status": "failed",
+            "service": "binary-to-source",
+            "evidence": [],
+        }
+        item = _item(1, "running")
+
+        class _FakeDb:
+            def __init__(self) -> None:
+                self.committed = 0
+                self.refreshed = 0
+
+            def commit(self) -> None:
+                self.committed += 1
+
+            def refresh(self, _obj) -> None:
+                self.refreshed += 1
+
+        fake_db = _FakeDb()
+        with mock.patch.object(task_service, "query_items", return_value=[item]):
+            asyncio.run(task_service.sync_task(fake_db, task))
+
+        self.assertIsNone(task.latest_abnormal_reason)
         self.assertEqual(1, fake_db.committed)
         self.assertEqual(1, fake_db.refreshed)
 

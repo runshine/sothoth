@@ -1714,6 +1714,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
 async def sync_task(db: Session, task: B2STask) -> None:
     changed = False
     previous_status = str(task.status or "")
+    previous_abnormal_reason_json = task.latest_abnormal_reason_json
     items = query_items(db, task.id)
     for item in items:
         previous = _item_event_snapshot(item)
@@ -1955,7 +1956,8 @@ async def sync_task(db: Session, task: B2STask) -> None:
         changed = True
     recompute_task_status(db, task)
     _record_task_status_event(db, task, previous_status)
-    if changed or str(task.status or "") != previous_status:
+    abnormal_reason_changed = task.latest_abnormal_reason_json != previous_abnormal_reason_json
+    if changed or str(task.status or "") != previous_status or abnormal_reason_changed:
         db.commit()
         db.refresh(task)
 
@@ -2683,14 +2685,17 @@ def build_task_response(db: Session, task: B2STask) -> TaskResponse:
     mode, mode_label = task_mode_summary(items)
     function_stats = build_task_function_stats(items)
     timing_summary = build_task_timing_summary(items)
+    current_reason = _task_abnormal_reason(task, items)
     abnormal_reason = None
-    if isinstance(task.latest_abnormal_reason, dict):
+    if current_reason is None:
+        abnormal_reason = None
+    elif isinstance(task.latest_abnormal_reason, dict):
         try:
             abnormal_reason = B2SAbnormalReason(**task.latest_abnormal_reason)
         except Exception:
             abnormal_reason = None
     if abnormal_reason is None:
-        abnormal_reason = _task_abnormal_reason(task, items)
+        abnormal_reason = current_reason
     return TaskResponse(
         id=task.id,
         project_id=task.project_id,

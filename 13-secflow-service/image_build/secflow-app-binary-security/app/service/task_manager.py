@@ -4904,7 +4904,7 @@ class TaskManager:
             db.query(BinarySecurityTask)
             .join(BinarySecurityStageItem, BinarySecurityStageItem.task_id == BinarySecurityTask.id)
             .filter(
-                BinarySecurityTask.status.in_(["pending", "dispatching", "running", "failed"]),
+                BinarySecurityTask.status.in_(["pending", "dispatching", "running"]),
                 BinarySecurityStageItem.downstream_service.isnot(None),
                 BinarySecurityStageItem.downstream_task_id.isnot(None),
                 BinarySecurityStageItem.status.in_(["pending", "queued", "running", "dispatching", "failed"]),
@@ -5651,8 +5651,11 @@ class TaskManager:
         )
 
     def _task_needs_downstream_reconcile(self, task: BinarySecurityTask) -> bool:
-        if task.status in {"pending", "failed"}:
+        status = str(task.status or "").strip().lower()
+        if status == "pending":
             return True
+        if status not in {"dispatching", "running"}:
+            return False
         if not str(task.dispatcher_instance_id or "").strip():
             return True
         if not self._lease_is_active(task):
@@ -5688,7 +5691,12 @@ class TaskManager:
             return False
         if not str(item.downstream_service or "").strip() or not str(item.downstream_task_id or "").strip():
             return False
-        return str(item.status or "").strip().lower() in {"pending", "queued", "running", "dispatching", "failed"}
+        item_status = str(item.status or "").strip().lower()
+        if item_status in {"pending", "queued", "running", "dispatching"}:
+            return True
+        if item_status == "failed":
+            return str(task.status or "").strip().lower() in {"dispatching", "running"}
+        return False
 
     def _task_has_active_reconcile_items(self, db: Session, task: BinarySecurityTask) -> bool:
         active_stage_name = self._active_reconcile_stage_name(task)
