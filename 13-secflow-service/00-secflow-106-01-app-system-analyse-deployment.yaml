@@ -28,7 +28,7 @@ spec:
           - name: FILESERVER_ROOT
             value: /data/files
           - name: SECFLOW_SYSTEM_ANALYSE_DB_AUTO_MIGRATE
-            value: "false"
+            value: "true"
           - name: SECFLOW_SYSTEM_ANALYSE_DB_POOL_SIZE_API
             value: "5"
           - name: SECFLOW_SYSTEM_ANALYSE_DB_MAX_OVERFLOW_API
