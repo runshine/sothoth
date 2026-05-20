@@ -5873,6 +5873,64 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("ipsec", rows[0]["module_name"])
         self.assertEqual(rows, task.summary["b2s_results"])
 
+    def test_prepare_entry_module_descriptor_creates_files_list_for_binary_module(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_root = Path(tmp)
+            (artifact_root / "libipsec.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+            (artifact_root / "libipsec.h").write_text("#pragma once\n", encoding="utf-8")
+            work_dir = artifact_root / ".re_work_libipsec" / "runs" / "run-1"
+            work_dir.mkdir(parents=True)
+            (work_dir / "batch_001.chat.json").write_text("{}", encoding="utf-8")
+            descriptor = self.manager._prepare_entry_module_descriptor(
+                artifact_root,
+                {"module_name": "IPSEC"},
+            )
+
+            self.assertEqual("IPSEC", descriptor["entry_module_name"])
+            self.assertTrue(descriptor["entry_descriptor_ready"])
+            files_list = Path(descriptor["entry_files_list"])
+            self.assertTrue(files_list.is_file())
+            self.assertEqual(
+                ["libipsec.c", "libipsec.h"],
+                files_list.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_entry_analysis_inputs_normalize_binary_module_to_descriptor_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_root = Path(tmp)
+            (artifact_root / "libipsec.c").write_text("int f(void) { return 1; }\n", encoding="utf-8")
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="module-task",
+                task_type=TASK_TYPE_BINARY_MODULE,
+                status="failed",
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root="/o",
+                workspace_root="/w",
+            )
+            task.summary = {
+                "b2s_results": [
+                    {
+                        "module_key": "IPSEC",
+                        "module_name": "IPSEC",
+                        "firmware_key": "module-input",
+                        "firmware_name": "IPSEC",
+                        "source_dir": str(artifact_root),
+                    }
+                ]
+            }
+            db = _ModelAwareDb(tasks=[task])
+
+            rows = self.manager._entry_analysis_inputs(db, task)
+
+            self.assertEqual(1, len(rows))
+            self.assertTrue(rows[0]["entry_descriptor_ready"])
+            self.assertEqual("IPSEC", rows[0]["module_name"])
+            self.assertEqual(str(artifact_root), rows[0]["source_dir"])
+            self.assertTrue(rows[0]["entry_files_list"].endswith("modules/IPSEC/files.list"))
+
     def test_stage_entry_analysis_uses_binary_to_source_failure_reason_when_inputs_missing(self):
         task = BinarySecurityTask(
             id="t1",
@@ -5984,7 +6042,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ],
         }
 
-        rows = self.manager._entry_analysis_inputs(task)
+        rows = self.manager._entry_analysis_inputs(_ModelAwareDb(tasks=[task]), task)
 
         self.assertEqual(1, len(rows))
         self.assertEqual("m1", rows[0]["module_key"])
@@ -8407,6 +8465,82 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("success", result["status"])
         self.assertEqual("success", item.status)
         self.assertIsNone(item.error_message)
+
+    def test_run_entry_item_uses_descriptor_contract_for_binary_module(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="module-task",
+            project_id="p1",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="IPSEC",
+            parent_key="fw-1",
+            downstream_service="entry_analyse",
+            status="pending",
+            output_ref={},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_root = Path(tmp)
+            (artifact_root / "libipsec.c").write_text("int entry(void) { return 0; }\n", encoding="utf-8")
+            module = {
+                "module_key": "module-1",
+                "module_name": "IPSEC",
+                "firmware_key": "fw-1",
+                "source_dir": str(artifact_root),
+            }
+            fake_session = _ModelAwareDb()
+            create_calls: list[dict[str, str | None]] = []
+
+            async def fake_create_task(project_id, task_name, input_path, module_name, token=None, source_path=None, origin=None):
+                create_calls.append(
+                    {
+                        "project_id": project_id,
+                        "task_name": task_name,
+                        "input_path": input_path,
+                        "module_name": module_name,
+                        "token": token,
+                        "source_path": source_path,
+                        "entry_files_list": None if origin is None else origin.get("entry_files_list"),
+                    }
+                )
+                return {"task_id": "ea-new"}
+
+            with (
+                patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+                patch.object(self.manager, "_upsert_stage_item", return_value=item),
+                patch.object(task_manager_module, "get_entry_analyse_client", return_value=SimpleNamespace(create_task=fake_create_task, get_task=lambda *args, **kwargs: None)),
+                patch.object(self.manager, "_poll_until_terminal", return_value=("success", {"task_id": "ea-new", "status": "passed"})),
+                patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
+                patch.object(self.manager, "_parse_entries", return_value=[]),
+                patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+                patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
+            ):
+                result = asyncio.run(self.manager._run_entry_item(task, stage_run, module, token="tok", retrying=False))
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual(1, len(create_calls))
+        self.assertTrue(create_calls[0]["input_path"].endswith(str(Path("modules") / "IPSEC").replace("\\", "/")) or create_calls[0]["input_path"].endswith(str(artifact_root)))
+        self.assertEqual("IPSEC", create_calls[0]["module_name"])
+        self.assertEqual(str(artifact_root), create_calls[0]["source_path"])
+        self.assertTrue(str(create_calls[0]["entry_files_list"]).endswith("modules/IPSEC/files.list"))
 
     def test_compact_result_for_storage_keeps_entry_preview_small(self):
         entries = []

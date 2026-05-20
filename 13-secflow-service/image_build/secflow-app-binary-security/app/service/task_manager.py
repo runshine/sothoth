@@ -9661,6 +9661,11 @@ class TaskManager:
             summary = dict(task.summary or {})
         if stage_name == "entry_analysis" and self._task_type(task) != TASK_TYPE_SOURCE and not summary.get("b2s_results"):
             self._rebuild_summary_results_from_stage_items(db, task, "binary_to_source", "b2s_results")
+            summary = dict(task.summary or {})
+        if stage_name == "entry_analysis" and self._task_type(task) == TASK_TYPE_BINARY_MODULE and summary.get("b2s_results"):
+            normalized = [self._normalize_entry_analysis_module_input(task, module) for module in (summary.get("b2s_results") or []) if isinstance(module, dict)]
+            if normalized != list(summary.get("b2s_results") or []):
+                task.summary = {**summary, "b2s_results": normalized}
         if stage_name == "dataflow_analysis" and not summary.get("entry_results"):
             self._rebuild_entry_results_from_stage_items(db, task)
         if stage_name == "vuln_scan" and not summary.get("dataflow_results"):
@@ -9689,6 +9694,8 @@ class TaskManager:
                 for item in items
             ],
         )
+        if summary_key == "b2s_results" and self._task_type(task) == TASK_TYPE_BINARY_MODULE:
+            rebuilt = [self._normalize_entry_analysis_module_input(task, item) for item in rebuilt]
         if rebuilt:
             task.summary = {**(task.summary or {}), summary_key: rebuilt}
         return rebuilt
@@ -9707,6 +9714,16 @@ class TaskManager:
                 return "系统分析尚未产出可用模块，不能继续二进制逆向阶段"
             return None
         if stage_name == "entry_analysis":
+            if self._task_type(task) == TASK_TYPE_BINARY_MODULE:
+                inputs = [dict(item) for item in (summary.get("b2s_results") or []) if isinstance(item, dict)]
+                if not inputs:
+                    return "binary-to-source 尚未产出可用结果，不能继续入口分析阶段"
+                ready_inputs = [item for item in inputs if item.get("entry_descriptor_ready")]
+                if not ready_inputs:
+                    return "binary-to-source 已成功，但未生成入口分析所需模块描述文件"
+                if not any(str(item.get("entry_files_list") or "").strip() for item in ready_inputs):
+                    return "入口分析模块描述文件已生成但文件列表为空"
+                return None
             inputs = list(summary.get("selected_modules") or [])
             if not inputs:
                 return "系统分析尚未产出可用模块，不能继续入口分析阶段"
@@ -11438,9 +11455,23 @@ class TaskManager:
             return list(task.summary.get("selected_modules") or [])
         b2s_results = list(task.summary.get("b2s_results") or [])
         if b2s_results:
-            return b2s_results
+            normalized = [self._normalize_entry_analysis_module_input(task, module) for module in b2s_results if isinstance(module, dict)]
+            if normalized != b2s_results:
+                task.summary = {**(task.summary or {}), "b2s_results": normalized}
+            if self._task_type(task) == TASK_TYPE_BINARY_MODULE:
+                ready = [module for module in normalized if module.get("entry_descriptor_ready")]
+                if ready:
+                    return ready
+            return normalized
         rebuilt = self._rebuild_summary_results_from_stage_items(db, task, "binary_to_source", "b2s_results")
-        return list(rebuilt or [])
+        normalized = [self._normalize_entry_analysis_module_input(task, module) for module in (rebuilt or []) if isinstance(module, dict)]
+        if normalized and normalized != rebuilt:
+            task.summary = {**(task.summary or {}), "b2s_results": normalized}
+        if self._task_type(task) == TASK_TYPE_BINARY_MODULE:
+            ready = [module for module in normalized if module.get("entry_descriptor_ready")]
+            if ready:
+                return ready
+        return list(normalized or [])
 
     def _missing_entry_analysis_input_reason(self, db: Session, task: BinarySecurityTask) -> str:
         items = self._stage_items(db, task.id, "binary_to_source")
@@ -11452,6 +11483,8 @@ class TaskManager:
             return "binary-to-source 阶段仍在运行，尚未生成可用于入口分析的源码产物"
         success_items = [item for item in items if (self._normalize_downstream_status(item.status) or item.status) == "success"]
         if success_items:
+            if self._task_type(task) == TASK_TYPE_BINARY_MODULE:
+                return "binary-to-source 已成功，但未生成入口分析所需模块描述文件"
             return "binary-to-source 阶段已有成功条目，但未找到可用于入口分析的源码产物"
         failed_items = [
             item
@@ -11586,6 +11619,7 @@ class TaskManager:
     ) -> dict[str, Any]:
         session = get_session_factory()()
         try:
+            entry_input = self._normalize_entry_analysis_module_input(task, module)
             item = self._upsert_stage_item(
                 session,
                 task=task,
@@ -11727,17 +11761,29 @@ class TaskManager:
                 item.error_message = error
                 session.commit()
                 return {"status": "archive_blocked", "error": error, "item": module, "archive_blocked": True}
+            prepared_entry = {}
+            if self._task_type(task) == TASK_TYPE_BINARY_MODULE:
+                prepared_entry = self._prepare_entry_module_descriptor(archived_dir, module)
             result = {
                 **module,
                 "source_dir": str(archived_dir),
+                "source_root": str(archived_dir),
                 "generated_files": [],
                 "downstream": self._lightweight_downstream_payload(payload),
+                **prepared_entry,
             }
             item.result = self._compact_result_for_storage(stage_run.stage_name, result)
             item.output_ref = {
                 **(item.output_ref or {}),
                 "archive_root": str(archived_dir),
                 "source_dir": str(archived_dir),
+                **(
+                    {
+                        key: prepared_entry.get(key)
+                        for key in ("entry_descriptor_root", "entry_files_list", "entry_module_name", "entry_descriptor_ready")
+                        if prepared_entry.get(key) is not None
+                    }
+                ),
             }
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
@@ -11812,6 +11858,84 @@ class TaskManager:
             for index, path in enumerate(paths, start=1)
         ]
 
+    def _is_supported_entry_source_file(self, path: Path) -> bool:
+        lowered_parts = [part.lower() for part in path.parts]
+        if any(part.startswith(".re_work_") for part in lowered_parts):
+            return False
+        if "agent_sessions" in lowered_parts:
+            return False
+        lowered_name = path.name.lower()
+        if lowered_name.endswith(".chat.json") or lowered_name.endswith(".validate.json"):
+            return False
+        if lowered_name in {"functions.json", "imports.json", "metadata.json", "strings.json", "structural.json"}:
+            return False
+        return path.suffix.lower() in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh"}
+
+    def _collect_entry_source_files(self, artifact_root: Path) -> list[Path]:
+        if not artifact_root.is_dir():
+            return []
+        return [
+            path
+            for path in sorted(artifact_root.rglob("*"))
+            if path.is_file() and self._is_supported_entry_source_file(path)
+        ]
+
+    def _normalize_entry_module_name(self, raw_name: str) -> str:
+        cleaned = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(raw_name or "").strip())
+        cleaned = cleaned.strip("._-")
+        return cleaned or "module"
+
+    def _infer_entry_module_name(self, module: dict[str, Any], artifact_root: Path, source_files: list[Path]) -> str:
+        del artifact_root, source_files
+        return self._normalize_entry_module_name(str(module.get("module_name") or module.get("entry_module_name") or "module"))
+
+    def _prepare_entry_module_descriptor(self, artifact_root: Path, module: dict[str, Any]) -> dict[str, Any]:
+        source_files = self._collect_entry_source_files(artifact_root)
+        entry_module_name = self._infer_entry_module_name(module, artifact_root, source_files)
+        descriptor_root = artifact_root
+        module_dir = ensure_dir(descriptor_root / "modules" / entry_module_name)
+        files_list_path = module_dir / "files.list"
+        relative_paths = [
+            str(path.resolve().relative_to(artifact_root.resolve())).replace("\\", "/")
+            for path in source_files
+        ]
+        files_list_path.write_text("\n".join(relative_paths) + ("\n" if relative_paths else ""), encoding="utf-8")
+        return {
+            "entry_module_name": entry_module_name,
+            "entry_descriptor_root": str(descriptor_root),
+            "entry_files_list": str(files_list_path),
+            "entry_source_file_count": len(relative_paths),
+            "entry_source_files_preview": relative_paths[:20],
+            "entry_descriptor_ready": bool(relative_paths),
+            "module_dir": str(module_dir),
+            "files_list": str(files_list_path),
+            "source_root": str(descriptor_root),
+        }
+
+    def _normalize_entry_analysis_module_input(self, task: BinarySecurityTask, module: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(module)
+        if self._task_type(task) != TASK_TYPE_BINARY_MODULE:
+            return normalized
+        if normalized.get("entry_descriptor_ready") and normalized.get("entry_files_list") and normalized.get("entry_descriptor_root"):
+            normalized["module_name"] = str(normalized.get("entry_module_name") or normalized.get("module_name") or "")
+            normalized["source_dir"] = str(normalized.get("entry_descriptor_root") or normalized.get("source_dir") or "")
+            normalized["source_root"] = str(normalized.get("source_root") or normalized.get("entry_descriptor_root") or normalized.get("source_dir") or "")
+            normalized["module_dir"] = str(normalized.get("module_dir") or Path(str(normalized.get("entry_files_list") or "")).parent)
+            normalized["files_list"] = str(normalized.get("entry_files_list") or normalized.get("files_list") or "")
+            return normalized
+        artifact_root_value = normalized.get("source_dir") or normalized.get("archive_root") or normalized.get("artifact_root")
+        if not artifact_root_value:
+            return normalized
+        artifact_root = Path(str(artifact_root_value))
+        if not artifact_root.exists():
+            return normalized
+        prepared = self._prepare_entry_module_descriptor(artifact_root, normalized)
+        normalized.update(prepared)
+        normalized["module_name"] = str(prepared.get("entry_module_name") or normalized.get("module_name") or "")
+        normalized["source_dir"] = str(prepared.get("entry_descriptor_root") or normalized.get("source_dir") or "")
+        normalized["source_root"] = str(prepared.get("source_root") or normalized.get("source_root") or "")
+        return normalized
+
     async def _run_entry_item(
         self,
         task: BinarySecurityTask,
@@ -11822,6 +11946,7 @@ class TaskManager:
     ) -> dict[str, Any]:
         session = get_session_factory()()
         try:
+            entry_input = self._normalize_entry_analysis_module_input(task, module)
             item = self._upsert_stage_item(
                 session,
                 task=task,
@@ -11870,12 +11995,16 @@ class TaskManager:
             else:
                 created = await get_entry_analyse_client().create_task(
                     task.project_id,
-                    f"{task.name}-{module['module_name']}-entry",
-                    module["source_dir"],
-                    module["module_name"],
+                    f"{task.name}-{entry_input['module_name']}-entry",
+                    entry_input["source_dir"],
+                    entry_input["module_name"],
                     token or "",
-                    module.get("source_root") or module.get("unpacked_root") or module["source_dir"],
-                    _downstream_origin_payload(task, item),
+                    entry_input.get("source_root") or entry_input.get("unpacked_root") or entry_input["source_dir"],
+                    {
+                        **_downstream_origin_payload(task, item),
+                        "entry_descriptor_root": entry_input.get("entry_descriptor_root"),
+                        "entry_files_list": entry_input.get("entry_files_list"),
+                    },
                 )
             if created is not None:
                 created_task_id = str(created.get("task_id") or "").strip()
@@ -11899,7 +12028,7 @@ class TaskManager:
                 task=task,
                 item=item,
             )
-            entries = self._parse_entries(service_output, module)
+            entries = self._parse_entries(service_output, entry_input)
             mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "downstream_missing" if status == "downstream_missing" else "failed"
             item.status = mapped_status
             item.finished_at = _now()
@@ -11914,20 +12043,20 @@ class TaskManager:
             if mapped_status != "success":
                 item.error_message = payload.get("error") or payload.get("error_message")
                 session.commit()
-                return {"status": mapped_status, "error": item.error_message, "item": module}
+                return {"status": mapped_status, "error": item.error_message, "item": entry_input}
             if archived_dir is None:
                 error = archive_job.error_message if archive_job is not None else "总任务产物归档失败"
                 item.error_message = error
                 session.commit()
-                return {"status": "archive_blocked", "error": error, "item": module, "archive_blocked": True}
-            archived_entries = self._parse_entries(archived_dir, module)
+                return {"status": "archive_blocked", "error": error, "item": entry_input, "archive_blocked": True}
+            archived_entries = self._parse_entries(archived_dir, entry_input)
             if archived_entries:
                 entries = archived_entries
             result = {
-                **module,
+                **entry_input,
                 "artifact_root": str(archived_dir),
                 "entries": entries,
-                "source_dir": module["source_dir"],
+                "source_dir": entry_input["source_dir"],
                 "downstream": payload,
             }
             item.result = self._compact_result_for_storage(stage_run.stage_name, result)
@@ -11944,7 +12073,7 @@ class TaskManager:
                 item.error_message = str(exc)
                 item.finished_at = _now()
                 session.commit()
-            return {"status": "failed", "error": str(exc), "item": module}
+            return {"status": "failed", "error": str(exc), "item": entry_input if "entry_input" in locals() else module}
         finally:
             session.close()
 
@@ -12530,6 +12659,12 @@ class TaskManager:
             "source_dir": item.get("source_dir"),
             "module_report": item.get("module_report"),
             "files_list": item.get("files_list"),
+            "entry_module_name": item.get("entry_module_name"),
+            "entry_descriptor_root": item.get("entry_descriptor_root"),
+            "entry_files_list": item.get("entry_files_list"),
+            "entry_source_file_count": item.get("entry_source_file_count"),
+            "entry_source_files_preview": item.get("entry_source_files_preview"),
+            "entry_descriptor_ready": item.get("entry_descriptor_ready", False),
         }
 
     def _compact_entry_summary_item(self, item: dict[str, Any]) -> dict[str, Any]:
