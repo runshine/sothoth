@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 from app.logging_utils import log_event
 from app.preprocess import detect_format, run_preprocess
 from app.skill_store import DEFAULT_PROMOTION_THRESHOLD, save_candidate_skill
+from app.subprocess_utils import StreamingLineSink, run_streaming_process
 from app.tool_store import compute_family_id, match_python_tool
 from app.unpacker_engine_config import (
     AUTHOR_AGENT_DEF,
@@ -65,6 +66,359 @@ from app.unpacker_engine_session import build_session_artifacts, update_session_
 
 log = logging.getLogger("unpacker.engine")
 SKILL_GENERATION_CONTEXT_FILENAME = "stage5_skill_generation_context.json"
+RECURSIVE_EXPAND_MAX_ROUNDS = 2
+RECURSIVE_7Z_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _safe_relpath(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except Exception:
+        return str(path)
+
+
+def _eligible_recursive_format(path: Path) -> str | None:
+    info = detect_format(str(path))
+    fmt = str(info.get("fmt") or "").strip().lower()
+    if fmt in {
+        "tar",
+        "zip",
+        "gzip",
+        "bzip2",
+        "xz",
+        "zstd",
+        "lzop",
+        "lzma",
+        "squashfs",
+        "cpio",
+        "7zip",
+        "cab",
+        "cramfs",
+        "romfs",
+        "jffs2",
+        "ubi",
+        "ubifs",
+        "yaffs",
+    }:
+        return fmt
+    return None
+
+
+def _decompressed_output_name(path: Path, fmt: str) -> str:
+    name = path.name
+    if fmt == "gzip" and name.endswith(".gz"):
+        return name[:-3] or f"{name}.raw"
+    if fmt == "bzip2" and name.endswith(".bz2"):
+        return name[:-4] or f"{name}.raw"
+    if fmt == "xz" and name.endswith(".xz"):
+        return name[:-3] or f"{name}.raw"
+    if fmt == "zstd" and (name.endswith(".zst") or name.endswith(".zstd")):
+        return name.rsplit(".", 1)[0] or f"{name}.raw"
+    if fmt == "lzop" and (name.endswith(".lzo") or name.endswith(".lzop")):
+        return name.rsplit(".", 1)[0] or f"{name}.raw"
+    if fmt == "lzma" and name.endswith(".lzma"):
+        return name[:-5] or f"{name}.raw"
+    return f"{name}.out"
+
+
+def _count_tree_entries(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_file():
+        return 1
+    total = 0
+    for _root, dirs, files in os.walk(path, followlinks=False):
+        total += len(dirs) + len(files)
+    return total
+
+
+def _run_recursive_expand_command(
+    command: list[str],
+    *,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    register_cancel_hook: Optional[Callable[[Callable[[], None] | None], None]] = None,
+) -> subprocess.CompletedProcess[str]:
+    result = run_streaming_process(
+        command,
+        cancel_check=cancel_check,
+        register_cancel_hook=register_cancel_hook,
+        kill_process_tree=_kill_process_tree,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return subprocess.CompletedProcess(command, result.returncode, result.stdout, result.stderr)
+
+
+def _expand_one_recursive_file(
+    source_path: Path,
+    fmt: str,
+    *,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    register_cancel_hook: Optional[Callable[[Callable[[], None] | None], None]] = None,
+) -> dict[str, Any]:
+    if fmt == "7zip":
+        try:
+            source_size = source_path.stat().st_size
+        except Exception:
+            source_size = 0
+        if source_size >= RECURSIVE_7Z_MAX_BYTES:
+            return {
+                "handler": "7z x (skipped large candidate)",
+                "success": False,
+                "output_dir": None,
+                "error": f"skip large 7z candidate >= {RECURSIVE_7Z_MAX_BYTES} bytes",
+                "skipped": True,
+            }
+    output_dir = source_path.parent / f"{source_path.name}.extracted"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if fmt == "tar":
+        proc = _run_recursive_expand_command(
+            ["tar", "-xf", str(source_path), "-C", str(output_dir)],
+            cancel_check=cancel_check,
+            register_cancel_hook=register_cancel_hook,
+        )
+        return {"handler": "tar", "success": proc.returncode == 0, "output_dir": str(output_dir), "error": proc.stderr.strip() or None}
+    if fmt == "zip":
+        proc = _run_recursive_expand_command(
+            ["7z", "x", str(source_path), f"-o{output_dir}", "-y"],
+            cancel_check=cancel_check,
+            register_cancel_hook=register_cancel_hook,
+        )
+        return {"handler": "7z x", "success": proc.returncode == 0, "output_dir": str(output_dir), "error": proc.stderr.strip() or None}
+    if fmt in {"gzip", "bzip2", "xz", "zstd", "lzop", "lzma"}:
+        target_file = output_dir / _decompressed_output_name(source_path, fmt)
+        command_map = {
+            "gzip": ["gzip", "-dc", str(source_path)],
+            "bzip2": ["bzip2", "-dc", str(source_path)],
+            "xz": ["xz", "-dc", str(source_path)],
+            "zstd": ["zstd", "-dc", str(source_path)],
+            "lzop": ["lzop", "-dc", str(source_path)],
+            "lzma": ["lzma", "-dc", str(source_path)],
+        }
+        with target_file.open("wb") as handle:
+            result = run_streaming_process(
+                command_map[fmt],
+                cancel_check=cancel_check,
+                register_cancel_hook=register_cancel_hook,
+                kill_process_tree=_kill_process_tree,
+                stdout_file=handle,
+                stderr=subprocess.PIPE,
+                text=False,
+            )
+        stderr_text = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+        trailing_garbage_ignored = fmt == "gzip" and "trailing garbage ignored" in stderr_text.lower()
+        success = result.returncode == 0 or (trailing_garbage_ignored and target_file.exists() and target_file.stat().st_size > 0)
+        if not success and target_file.exists():
+            target_file.unlink(missing_ok=True)
+        return {
+            "handler": f"{fmt} -dc",
+            "success": success,
+            "output_dir": str(output_dir),
+            "error": stderr_text or None,
+        }
+    if fmt == "squashfs":
+        proc = _run_recursive_expand_command(
+            ["unsquashfs", "-no-xattrs", "-d", str(output_dir), str(source_path)],
+            cancel_check=cancel_check,
+            register_cancel_hook=register_cancel_hook,
+        )
+        return {"handler": "unsquashfs", "success": proc.returncode == 0, "output_dir": str(output_dir), "error": proc.stderr.strip() or None}
+    if fmt == "cpio":
+        proc = _run_recursive_expand_command(
+            ["sh", "-c", f"cd '{output_dir}' && cpio -idmv < '{source_path}'"],
+            cancel_check=cancel_check,
+            register_cancel_hook=register_cancel_hook,
+        )
+        return {"handler": "cpio", "success": proc.returncode == 0, "output_dir": str(output_dir), "error": proc.stderr.strip() or None}
+    if fmt in {"7zip", "cab", "cramfs", "romfs"}:
+        proc = _run_recursive_expand_command(
+            ["7z", "x", str(source_path), f"-o{output_dir}", "-y"],
+            cancel_check=cancel_check,
+            register_cancel_hook=register_cancel_hook,
+        )
+        return {"handler": "7z x", "success": proc.returncode == 0, "output_dir": str(output_dir), "error": proc.stderr.strip() or None}
+    if fmt == "jffs2":
+        proc = _run_recursive_expand_command(
+            ["jefferson", "--dest", str(output_dir), str(source_path)],
+            cancel_check=cancel_check,
+            register_cancel_hook=register_cancel_hook,
+        )
+        return {"handler": "jefferson", "success": proc.returncode == 0, "output_dir": str(output_dir), "error": proc.stderr.strip() or None}
+    if fmt in {"ubi", "ubifs"}:
+        proc = _run_recursive_expand_command(
+            ["ubireader_extract_images", "-o", str(output_dir), str(source_path)],
+            cancel_check=cancel_check,
+            register_cancel_hook=register_cancel_hook,
+        )
+        handler = "ubireader_extract_images"
+        if proc.returncode != 0:
+            proc = _run_recursive_expand_command(
+                ["ubireader_extract_files", "-o", str(output_dir), str(source_path)],
+                cancel_check=cancel_check,
+                register_cancel_hook=register_cancel_hook,
+            )
+            handler = "ubireader_extract_files"
+        return {"handler": handler, "success": proc.returncode == 0, "output_dir": str(output_dir), "error": proc.stderr.strip() or None}
+    if fmt == "yaffs":
+        proc = _run_recursive_expand_command(
+            ["sh", "-c", f"cd '{output_dir}' && unyaffs '{source_path}'"],
+            cancel_check=cancel_check,
+            register_cancel_hook=register_cancel_hook,
+        )
+        return {"handler": "unyaffs", "success": proc.returncode == 0, "output_dir": str(output_dir), "error": proc.stderr.strip() or None}
+    return {"handler": fmt, "success": False, "output_dir": str(output_dir), "error": f"unsupported recursive format: {fmt}"}
+
+
+def _write_recursive_expand_summary(round_dir: Path, *, output_root: Path, manifest: dict[str, Any]) -> None:
+    success_lines: list[str] = []
+    failure_lines: list[str] = []
+    for item in manifest.get("items") or []:
+        source_rel = _safe_relpath(Path(str(item.get("source_path") or "")), output_root)
+        output_dir = str(item.get("output_dir") or "").strip()
+        if item.get("success"):
+            success_lines.append(
+                f"- `{source_rel}` -> `{_safe_relpath(Path(output_dir), output_root) if output_dir else output_dir}` "
+                f"(`{item.get('handler')}`, {int(item.get('new_paths_count') or 0)} new paths)"
+            )
+        else:
+            failure_lines.append(
+                f"- `{source_rel}` (`{item.get('handler')}`): {str(item.get('error') or 'unknown error').strip()}"
+            )
+    summary_lines = [
+        "# Recursive Expand Summary",
+        "",
+        "## Success",
+        *(success_lines or ["- None"]),
+        "",
+        "## Attempted But Failed",
+        *(failure_lines or ["- None"]),
+        "",
+        "## Reviewer Notes",
+        "- Files listed in `Success` have already been recursively expanded and should not be treated as missed unpacking.",
+        "- Files listed in `Attempted But Failed` were already attempted deterministically; review them by value and failure reason, not by mere presence.",
+        "",
+    ]
+    (round_dir / "recursive_expand_summary.md").write_text("\n".join(summary_lines), encoding="utf-8")
+
+
+def _run_recursive_expand(
+    output_path: str,
+    round_dir: Path,
+    *,
+    max_rounds: int = RECURSIVE_EXPAND_MAX_ROUNDS,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    register_cancel_hook: Optional[Callable[[Callable[[], None] | None], None]] = None,
+    event_callback: Optional[Callable[..., None]] = None,
+    activity_callback: Optional[Callable[[str], None]] = None,
+) -> dict[str, Any]:
+    output_root = Path(output_path)
+    round_dir.mkdir(parents=True, exist_ok=True)
+    processed: set[str] = set()
+    manifest_items: list[dict[str, Any]] = []
+    completed_rounds = 0
+    stopped_reason = "no_new_files"
+    if event_callback:
+        event_callback(
+            "recursive_expand_started",
+            "开始递归展开确定性可识别文件",
+            stage_key="recursive_expand",
+            status="running",
+            detail={"max_rounds": max_rounds},
+        )
+    for round_index in range(1, max_rounds + 1):
+        if cancel_check and cancel_check():
+            raise RuntimeError("__CANCELLED__")
+        if activity_callback is not None:
+            activity_callback("recursive_expand")
+        before_snapshot: set[str] = set()
+        for root, dirs, files in os.walk(output_root, followlinks=False):
+            root_path = Path(root)
+            for directory in dirs:
+                before_snapshot.add(str(root_path / directory))
+            for filename in files:
+                before_snapshot.add(str(root_path / filename))
+        expanded_this_round = 0
+        for root, dirs, files in os.walk(output_root, followlinks=False):
+            dirs[:] = sorted([name for name in dirs if not (Path(root) / name).is_symlink()])
+            for filename in sorted(files):
+                candidate = Path(root) / filename
+                if candidate.is_symlink():
+                    continue
+                resolved = str(candidate.resolve())
+                if resolved in processed:
+                    continue
+                fmt = _eligible_recursive_format(candidate)
+                if not fmt:
+                    continue
+                processed.add(resolved)
+                result = _expand_one_recursive_file(
+                    candidate,
+                    fmt,
+                    cancel_check=cancel_check,
+                    register_cancel_hook=register_cancel_hook,
+                )
+                new_paths_count = _count_tree_entries(Path(str(result.get("output_dir") or ""))) if result.get("success") else 0
+                item = {
+                    "round": round_index,
+                    "source_path": str(candidate),
+                    "detected_format": fmt,
+                    "handler": result.get("handler"),
+                    "attempted": True,
+                    "success": bool(result.get("success")),
+                    "output_dir": result.get("output_dir"),
+                    "new_paths_count": int(new_paths_count),
+                    "retained_source": True,
+                    "error": result.get("error"),
+                }
+                manifest_items.append(item)
+                _append_stage_log(round_dir, "recursive_expand.log", "recursive expand item processed", **item)
+                if result.get("success") and new_paths_count > 0:
+                    expanded_this_round += 1
+        completed_rounds = round_index
+        after_snapshot: set[str] = set()
+        for root, dirs, files in os.walk(output_root, followlinks=False):
+            root_path = Path(root)
+            for directory in dirs:
+                after_snapshot.add(str(root_path / directory))
+            for filename in files:
+                after_snapshot.add(str(root_path / filename))
+        new_paths_total = len(after_snapshot - before_snapshot)
+        _append_stage_log(
+            round_dir,
+            "recursive_expand.log",
+            "recursive expand round completed",
+            round=round_index,
+            expanded_items=expanded_this_round,
+            new_paths_total=new_paths_total,
+        )
+        if expanded_this_round <= 0 or new_paths_total <= 0:
+            stopped_reason = "no_new_files"
+            break
+        if round_index == max_rounds:
+            stopped_reason = "round_limit_reached"
+    manifest = {
+        "version": 1,
+        "max_rounds": max_rounds,
+        "completed_rounds": completed_rounds,
+        "stopped_reason": stopped_reason,
+        "items": manifest_items,
+    }
+    _write_json_log(round_dir, "recursive_expand_manifest.json", manifest)
+    _write_recursive_expand_summary(round_dir, output_root=output_root, manifest=manifest)
+    if event_callback:
+        event_callback(
+            "recursive_expand_completed",
+            "递归展开阶段已完成",
+            stage_key="recursive_expand",
+            status="success",
+            detail={
+                "completed_rounds": completed_rounds,
+                "stopped_reason": stopped_reason,
+                "processed_items": len(manifest_items),
+            },
+        )
+    return manifest
 
 
 def _reviewer_session_name(suffix: str) -> tuple[str, int | None]:
@@ -146,23 +500,16 @@ def extract_firmware_features(
     except Exception:
         pass
     try:
-        proc = subprocess.Popen(
+        result = run_streaming_process(
             ["binwalk", "-B", firmware_path],
+            cancel_check=cancel_check,
+            register_cancel_hook=register_cancel_hook,
+            kill_process_tree=_kill_process_tree,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
-        if register_cancel_hook is not None:
-            register_cancel_hook(lambda: _kill_process_tree(proc))
-        while True:
-            if cancel_check and cancel_check():
-                _kill_process_tree(proc)
-                raise RuntimeError("__CANCELLED__")
-            if proc.poll() is not None:
-                stdout, _stderr = proc.communicate()
-                break
-            time.sleep(0.2)
+        stdout = result.stdout or ""
         for line in stdout.splitlines():
             line = line.strip()
             if line and not line.startswith("DECIMAL") and not line.startswith("-"):
@@ -171,9 +518,6 @@ def extract_firmware_features(
                     features["binwalk_sigs"].append(parts[2][:100].lower())
     except Exception:
         pass
-    finally:
-        if register_cancel_hook is not None:
-            register_cancel_hook(None)
     return features
 
 
@@ -240,8 +584,20 @@ def _run_reviewer(
 
         started_at = datetime.utcnow().isoformat()
         started_monotonic = time.perf_counter()
+        review_prompt = render_prompt(VAL_PROMPT_TMPL, firmware_path, output_path)
+        recursive_summary_path = round_dir / "recursive_expand_summary.md" if round_dir is not None else None
+        recursive_manifest_path = round_dir / "recursive_expand_manifest.json" if round_dir is not None else None
+        if recursive_summary_path is not None and recursive_summary_path.exists():
+            review_prompt += (
+                "\n\nRecursive expansion context:\n"
+                f"- Read `{recursive_summary_path}` before judging completeness.\n"
+            )
+        if recursive_manifest_path is not None and recursive_manifest_path.exists():
+            review_prompt += (
+                f"- Read `{recursive_manifest_path}` if you need machine-readable recursive expansion details.\n"
+            )
         verify_result = validator.prompt(
-            render_prompt(VAL_PROMPT_TMPL, firmware_path, output_path),
+            review_prompt,
             stream_callback=_stream_review_event,
         )
         token_stats = _save_agent_log(validator, log, round_dir, "reviewer")
@@ -414,46 +770,29 @@ def _run_python_tool_unpack(
         manifest_path=str(manifest_path),
         log_file_path=str(tool_log_path),
     )
-    proc = subprocess.Popen(
-        [sys.executable, str(tool_path), str(manifest_path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env=env,
-        start_new_session=True,
-    )
-    if register_cancel_hook is not None:
-        register_cancel_hook(lambda: _kill_process_tree(proc))
     output_lines: list[str] = []
+    line_sink = StreamingLineSink(
+        lambda text: (
+            output_lines.append(text),
+            _append_stage_log(global_round_dir, "skill_exec.log", text),
+        )
+    )
     try:
-        while True:
-            if cancel_check and cancel_check():
-                _kill_process_tree(proc)
-                raise RuntimeError("__CANCELLED__")
-            line = proc.stdout.readline() if proc.stdout is not None else ""
-            if line:
-                text = line.rstrip("\n")
-                output_lines.append(text)
-                _append_stage_log(
-                    global_round_dir,
-                    "skill_exec.log",
-                    text,
-                )
-                continue
-            if proc.poll() is not None:
-                break
-            time.sleep(0.2)
-        remaining = ""
-        if proc.stdout is not None:
-            remaining = proc.stdout.read() or ""
-        if remaining:
-            for line in remaining.splitlines():
-                output_lines.append(line)
-                _append_stage_log(global_round_dir, "skill_exec.log", line)
-        return_code = proc.wait()
+        result = run_streaming_process(
+            [sys.executable, str(tool_path), str(manifest_path)],
+            cancel_check=cancel_check,
+            register_cancel_hook=register_cancel_hook,
+            kill_process_tree=_kill_process_tree,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            text=True,
+            stdout_callback=line_sink.feed,
+        )
+        line_sink.flush()
+        return_code = result.returncode
     finally:
-        if register_cancel_hook is not None:
-            register_cancel_hook(None)
+        line_sink.flush()
 
     result = {
         "success": return_code == 0,
@@ -479,7 +818,9 @@ def _run_generic_unpack(
     firmware_path: str,
     output_path: str,
     log_dir: Path | None,
-    cancel_check: Callable[[PiRpcClient | None], None],
+    bind_cancel_client: Callable[[PiRpcClient | None], None],
+    should_cancel: Optional[Callable[[], bool]],
+    register_cancel_hook: Optional[Callable[[Callable[[], None] | None], None]],
     exec_def: dict[str, Any],
     val_def: dict[str, Any],
     exec_sp: str,
@@ -522,7 +863,7 @@ def _run_generic_unpack(
         session_skill_name=session_artifacts["skill_name"],
         task_id=task_id,
     )
-    cancel_check(executor)
+    bind_cancel_client(executor)
     passed = False
     final_round = 0
     last_reason = ""
@@ -555,7 +896,10 @@ def _run_generic_unpack(
     try:
         for attempt in range(1, max_retries + 1):
             round_dir = _get_round_dir(log_dir, attempt)
-            cancel_check(executor)
+            if should_cancel and should_cancel():
+                executor.close()
+                bind_cancel_client(None)
+                raise RuntimeError("__CANCELLED__")
             final_round = attempt
             if attempt > 1 and not reuse_executor_between_rounds:
                 round_artifacts = build_session_artifacts(
@@ -583,7 +927,7 @@ def _run_generic_unpack(
                     task_id=task_id,
                 )
                 session_artifacts = round_artifacts
-                cancel_check(executor)
+                bind_cancel_client(executor)
             exec_msg = render_prompt(
                 EXEC_FIRST_TMPL if attempt == 1 else EXEC_RETRY_TMPL,
                 firmware_path,
@@ -636,6 +980,14 @@ def _run_generic_unpack(
                         attempt=attempt,
                         transcript_file=transcript_path.name,
                     )
+            _run_recursive_expand(
+                output_path,
+                round_dir,
+                cancel_check=should_cancel,
+                register_cancel_hook=register_cancel_hook,
+                event_callback=event_callback,
+                activity_callback=activity_callback,
+            )
             passed, verify_result, reviewer_meta = _run_reviewer(
                 task_id,
                 firmware_path,
@@ -646,7 +998,7 @@ def _run_generic_unpack(
                 val_def,
                 val_sp,
                 llm_binding_snapshot=llm_binding_snapshot,
-                bind_cancel_client=cancel_check,
+                bind_cancel_client=bind_cancel_client,
                 activity_callback=activity_callback,
                 reviewer=reviewer,
                 session_artifacts_override=reviewer_session_artifacts,
@@ -789,7 +1141,7 @@ def _run_generic_unpack(
             last_reason = verify_result
         return passed, final_round, last_reason
     finally:
-        cancel_check(None)
+        bind_cancel_client(None)
         if reviewer is not None:
             reviewer.close()
         executor.close()
@@ -1266,6 +1618,14 @@ def run_unpack(
             )
             review_result = ""
             if skill_result.get("success"):
+                _run_recursive_expand(
+                    output_path,
+                    global_round_dir,
+                    cancel_check=cancel_check,
+                    register_cancel_hook=register_cancel_hook,
+                    event_callback=event_callback,
+                    activity_callback=_report_activity,
+                )
                 passed, review_result, _review_meta = _run_reviewer(
                     task_id,
                     firmware_path,
@@ -1322,7 +1682,9 @@ def run_unpack(
                 firmware_path,
                 output_path,
                 log_dir,
-                _check_cancel,
+                _bind_cancel_client,
+                cancel_check,
+                register_cancel_hook,
                 exec_def,
                 val_def,
                 exec_sp,

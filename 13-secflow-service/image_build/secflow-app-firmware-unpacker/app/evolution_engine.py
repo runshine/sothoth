@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from app.preprocess import detect_format
+from app.subprocess_utils import StreamingLineSink, run_streaming_process
 from app.tool_store import compute_family_id, parse_tool_metadata
 from app.unpacker_engine_config import (
     EVOLUTION_IMPROVER_AGENT_DEF,
@@ -780,45 +781,28 @@ def _run_working_tool(
         manifest_path=str(manifest_path),
         workspace_output=str(workspace_output),
     )
-    proc = subprocess.Popen(
-        [sys.executable, str(working_tool), str(manifest_path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env=env,
-        start_new_session=True,
-    )
     lines: list[str] = []
-    started_at = time.monotonic()
     timeout_seconds = 1800
+    line_sink = StreamingLineSink(
+        lambda text: (
+            lines.append(text),
+            _append_stage_log(round_dir, "evolution_executor.log", text),
+        )
+    )
     try:
-        while True:
-            if time.monotonic() - started_at > timeout_seconds:
-                try:
-                    os.killpg(proc.pid, 15)
-                except Exception:
-                    proc.kill()
-                raise RuntimeError(f"工具执行超时: {timeout_seconds}s")
-            line = proc.stdout.readline() if proc.stdout is not None else ""
-            if line:
-                text = line.rstrip("\n")
-                lines.append(text)
-                _append_stage_log(round_dir, "evolution_executor.log", text)
-                continue
-            if proc.poll() is not None:
-                break
-            time.sleep(0.2)
-        if proc.stdout is not None:
-            for line in (proc.stdout.read() or "").splitlines():
-                lines.append(line)
-                _append_stage_log(round_dir, "evolution_executor.log", line)
-        return_code = proc.wait()
+        result = run_streaming_process(
+            [sys.executable, str(working_tool), str(manifest_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            text=True,
+            stdout_callback=line_sink.feed,
+            timeout_seconds=timeout_seconds,
+        )
+        line_sink.flush()
+        return_code = result.returncode
     finally:
-        try:
-            if proc.poll() is None:
-                os.killpg(proc.pid, 15)
-        except Exception:
-            pass
+        line_sink.flush()
     response = "\n".join(lines).strip()
     _append_stage_log(
         round_dir,

@@ -8,11 +8,11 @@ import logging
 import os
 import signal
 import subprocess
-import time
 from pathlib import Path
 from typing import Callable, Optional
 
 from app.logging_utils import log_event
+from app.subprocess_utils import run_streaming_process
 from app.time_utils import isoformat_local, now_local
 
 log = logging.getLogger("unpacker.service")
@@ -225,33 +225,22 @@ def run_preprocess(
     )
 
     def _run(cmd, **kw):
-        proc = subprocess.Popen(
+        result = run_streaming_process(
             cmd,
+            cancel_check=cancel_check,
+            register_cancel_hook=register_cancel_hook,
+            kill_process_tree=_kill_process_tree,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
             **kw,
         )
-        if register_cancel_hook is not None:
-            register_cancel_hook(lambda: _kill_process_tree(proc))
-        try:
-            while True:
-                if cancel_check and cancel_check():
-                    _kill_process_tree(proc)
-                    raise RuntimeError("__CANCELLED__")
-                if proc.poll() is not None:
-                    stdout, stderr = proc.communicate()
-                    return subprocess.CompletedProcess(
-                        cmd,
-                        proc.returncode,
-                        stdout=stdout,
-                        stderr=stderr,
-                    )
-                time.sleep(0.5)
-        finally:
-            if register_cancel_hook is not None:
-                register_cancel_hook(None)
+        return subprocess.CompletedProcess(
+            cmd,
+            result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
 
     def _record(tool, proc=None, success=False, extra=None):
         entry = {"step": "tool_attempt", "tool": tool, "success": success}

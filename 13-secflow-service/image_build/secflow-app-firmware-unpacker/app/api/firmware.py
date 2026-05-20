@@ -252,6 +252,37 @@ def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _log_time_bounds(path: Path) -> tuple[Optional[datetime], Optional[datetime]]:
+    if not path.exists() or not path.is_file():
+        return None, None
+    first: Optional[datetime] = None
+    last: Optional[datetime] = None
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                if not line.startswith("["):
+                    continue
+                end = line.find("]")
+                if end <= 1:
+                    continue
+                ts = _parse_iso_datetime(line[1:end])
+                if ts is None:
+                    continue
+                if first is None:
+                    first = ts
+                last = ts
+    except Exception:
+        return None, None
+    return first, last
+
+
+def _log_duration_seconds(path: Path) -> Optional[int]:
+    started_at, completed_at = _log_time_bounds(path)
+    if started_at is None or completed_at is None:
+        return None
+    return max(0, int(round((completed_at - started_at).total_seconds())))
+
+
 def _derive_run_path(task: dict) -> Path:
     output_path = str(task.get("output_path") or "").strip()
     if not output_path:
@@ -319,6 +350,7 @@ def _get_task_progress(task_id: str) -> dict:
     else:
         task_events = all_task_events
     run_dir = _derive_run_path(task)
+    round_zero = _round_dir(run_dir, 0)
     stage1_path = _round_log_path(run_dir, 0, "preprocess.json")
     stage2_path = _round_log_path(run_dir, 0, "skill_match.json")
     stage3_path = _round_log_path(run_dir, 0, "skill_exec.json")
@@ -352,15 +384,20 @@ def _get_task_progress(task_id: str) -> dict:
     phase_start_times: dict[str, Optional[datetime]] = {
         "preprocess": _parse_iso_datetime(task.get("started_at")),
         "tool_match": None,
+        "recursive_expand_tool": None,
         "llm_unpack": None,
         "llm_review": None,
+        "llm_review_tool": None,
         "llm_cleanup": None,
     }
 
     def _remember_phase_start(phase_key: str, created_at: Optional[datetime]) -> None:
-        if phase_key not in phase_start_times or phase_start_times[phase_key] is not None or created_at is None:
+        if phase_key not in phase_start_times or created_at is None:
             return
-        phase_start_times[phase_key] = ensure_local(created_at)
+        created_at = ensure_local(created_at)
+        current = phase_start_times.get(phase_key)
+        if current is None or created_at >= ensure_local(current):
+            phase_start_times[phase_key] = created_at
 
     for event in task_events:
         event_type = str(getattr(event, "event_type", "") or "").strip().lower()
@@ -368,14 +405,19 @@ def _get_task_progress(task_id: str) -> dict:
         created_at = ensure_local(getattr(event, "created_at", None))
         if event_type == "task_started":
             _remember_phase_start("preprocess", created_at)
+        if event_type != "stage_changed":
+            continue
         if stage_key == "preprocess":
             _remember_phase_start("preprocess", created_at)
         elif stage_key in {"feature_extract", "skill_match", "tool_match"}:
             _remember_phase_start("tool_match", created_at)
+        elif stage_key == "recursive_expand":
+            _remember_phase_start("recursive_expand_tool", created_at)
         elif stage_key == "llm_unpack":
             _remember_phase_start("llm_unpack", created_at)
         elif stage_key in {"review", "llm_review"}:
             _remember_phase_start("llm_review", created_at)
+            _remember_phase_start("llm_review_tool", created_at)
         elif stage_key in {"cleanup", "llm_cleanup"}:
             _remember_phase_start("llm_cleanup", created_at)
 
@@ -394,6 +436,15 @@ def _get_task_progress(task_id: str) -> dict:
     def _running_review_round() -> Optional[int]:
         if task_current_stage != "review":
             return None
+        has_llm_round_evidence = bool(
+            executor_logs
+            or verifier_logs
+            or round_items
+            or final_round > 0
+            or fallback_to_llm
+        )
+        if not has_llm_round_evidence:
+            return None
         base = max(len(executor_logs), len(verifier_logs) + 1, final_round, 1)
         return _clamp_round(base)
 
@@ -409,10 +460,32 @@ def _get_task_progress(task_id: str) -> dict:
     phases = [
         _phase_payload("preprocess", "预处理", "pending"),
         _phase_payload("tool_match", "工具匹配执行", "pending"),
-        _phase_payload("llm_unpack", "LLM 解包", "pending"),
-        _phase_payload("llm_review", "LLM 评审", "pending"),
-        _phase_payload("llm_cleanup", "LLM 清理", "pending"),
+        _phase_payload("recursive_expand_tool", "递归解包（工具后）", "pending"),
     ]
+
+    if task_status == "retry_preparing":
+        phases[0]["status"] = "running"
+        phases[0]["detail"] = "正在后台重置工作目录并准备重试"
+        phases[1]["status"] = "pending"
+        phases[1]["detail"] = "等待重试准备完成后重新开始"
+        phases[2]["status"] = "pending"
+        phases[2]["detail"] = "等待重试准备完成后重新开始"
+        phases.extend(
+            [
+                _phase_payload("llm_unpack", "LLM 解包", "pending", "等待重试准备完成后重新开始"),
+                _phase_payload("recursive_expand_llm", "递归解包（LLM后）", "pending", "等待重试准备完成后重新开始"),
+                _phase_payload("llm_review", "LLM 评审", "pending", "等待重试准备完成后重新开始"),
+                _phase_payload("llm_cleanup", "LLM 清理", "pending", "等待重试准备完成后重新开始"),
+            ]
+        )
+        return {
+            "task_id": task_id,
+            "current_phase": "preprocess",
+            "summary": "任务正在重置工作目录并准备重试",
+            "current_round": None,
+            "total_rounds": total_llm_rounds,
+            "phases": phases,
+        }
 
     if task_status in {"claimed", "retry_preparing", "running", "cancelling", "success", "failed", "cancelled"}:
         phases[0]["status"] = "running"
@@ -449,11 +522,20 @@ def _get_task_progress(task_id: str) -> dict:
         phases[1]["detail"] = "预处理已直接完成解包，跳过"
         phases[2]["status"] = "skipped"
         phases[2]["detail"] = "预处理已直接完成解包，跳过"
-        phases[3]["status"] = "skipped"
-        phases[3]["detail"] = "预处理已直接完成解包，跳过"
-        phases[4]["status"] = "success" if cleaner_artifact_path.exists() else ("running" if task_status == "running" else "pending")
-        phases[4]["detail"] = "正在收尾清理输出目录" if phases[4]["status"] == "running" else "清理已完成"
-        phases[4]["updated_at"] = _mtime_iso_text(cleaner_artifact_path)
+        phases.extend(
+            [
+                _phase_payload("llm_unpack", "LLM 解包", "skipped", "预处理已直接完成解包，跳过"),
+                _phase_payload("recursive_expand_llm", "递归解包（LLM后）", "skipped", "预处理已直接完成解包，跳过"),
+                _phase_payload("llm_review", "LLM 评审", "skipped", "预处理已直接完成解包，跳过"),
+                _phase_payload(
+                    "llm_cleanup",
+                    "LLM 清理",
+                    "success" if cleaner_artifact_path.exists() else ("running" if task_status == "running" else "pending"),
+                    "正在收尾清理输出目录" if task_status == "running" and not cleaner_artifact_path.exists() else "清理已完成",
+                    _mtime_iso_text(cleaner_artifact_path),
+                ),
+            ]
+        )
     else:
         if stage2_path.exists():
             stage2_data = _read_json_file(stage2_path)
@@ -499,93 +581,220 @@ def _get_task_progress(task_id: str) -> dict:
                     _mtime_iso_text(stage2_path),
                 )
 
-        if executor_logs or fallback_to_llm or task_current_stage == "llm_unpack":
-            unpack_status = "running"
-            unpack_detail = "LLM 正在执行解包"
-            unpack_round = _running_unpack_round()
-            if executor_logs:
-                unpack_round = _clamp_round(max(len(executor_logs), final_round or 0, 1))
-                unpack_detail = f"已执行 {len(executor_logs)} 轮解包"
-                if verifier_logs or task_result in {"success", "max_retries_reached", "failed"}:
-                    unpack_status = "success"
-                elif task_current_stage in {"review", "cleanup"}:
-                    unpack_status = "success"
-                    unpack_detail = f"已执行 {len(executor_logs)} 轮解包"
-            elif task_current_stage != "llm_unpack":
-                unpack_status = "success" if task_current_stage in {"review", "cleanup"} else unpack_status
-                if unpack_status == "success":
-                    unpack_detail = "LLM 解包已完成，进入后续阶段"
-            if matched_tool and not fallback_to_llm and not executor_logs and task_status != "running":
-                unpack_status = "skipped"
-                unpack_detail = "工具执行成功，跳过 LLM 解包"
-            elif matched_tool and not fallback_to_llm and not executor_logs:
-                unpack_status = "skipped"
-                unpack_detail = "工具执行成功，跳过 LLM 解包"
-            if task_status == "failed" and not verifier_logs and executor_logs:
-                unpack_status = "failed"
-                unpack_detail = "LLM 解包阶段执行失败"
+        tool_recursive_manifest = round_zero / "recursive_expand_manifest.json"
+        tool_recursive_log = round_zero / "recursive_expand.log"
+        tool_recursive_duration = _log_duration_seconds(tool_recursive_log)
+        if tool_recursive_manifest.exists() or task_current_stage == "recursive_expand":
+            recursive_status = "running" if task_current_stage == "recursive_expand" and not executor_logs else "success"
+            recursive_detail = "正在递归展开可识别归档与文件系统"
+            if tool_recursive_manifest.exists() and recursive_status != "running":
+                manifest_payload = _read_json_file(tool_recursive_manifest)
+                completed_rounds = (
+                    int(manifest_payload.get("completed_rounds") or 0)
+                    if isinstance(manifest_payload, dict)
+                    else 0
+                )
+                recursive_detail = (
+                    f"已完成 {completed_rounds} 轮工具后递归解包"
+                    if completed_rounds > 0
+                    else "工具后递归解包已完成"
+                )
             phases[2] = _phase_payload(
-                "llm_unpack",
-                "LLM 解包",
-                unpack_status,
-                unpack_detail,
-                _mtime_iso_text(executor_logs[-1]) if executor_logs else (_mtime_iso_text(stage3_llm_unpack_log) or _mtime_iso_text(stage4_path)),
-                current_round=unpack_round if unpack_status not in {"skipped", "not_executed"} else None,
-                total_rounds=total_llm_rounds if unpack_status not in {"skipped", "not_executed"} else None,
+                "recursive_expand_tool",
+                "递归解包（工具后）",
+                recursive_status,
+                recursive_detail,
+                _mtime_iso_text(tool_recursive_manifest) or _mtime_iso_text(tool_recursive_log),
+                duration_seconds=tool_recursive_duration,
             )
-        elif matched_tool and not fallback_to_llm:
-            phases[2] = _phase_payload("llm_unpack", "LLM 解包", "skipped", "工具执行成功，跳过 LLM 解包")
+        elif matched_tool and not fallback_to_llm and not executor_logs:
+            phases[2] = _phase_payload("recursive_expand_tool", "递归解包（工具后）", "pending", "等待工具执行后进入递归展开")
+        elif executor_logs or fallback_to_llm or task_current_stage in {"llm_unpack", "review", "cleanup"}:
+            phases[2] = _phase_payload("recursive_expand_tool", "递归解包（工具后）", "skipped", "当前任务已进入 LLM 阶段")
 
-        if verifier_logs or has_tool_review or task_result in {"success", "max_retries_reached", "failed"} or task_current_stage in {"review", "cleanup"}:
-            review_status = "running"
-            review_detail = "LLM 正在评审当前解包结果"
-            review_round = _running_review_round()
-            if verifier_logs:
-                review_detail = f"已完成 {len(verifier_logs)} 轮评审"
-                if final_round_result_status in {"review_passed", "success", "completed"}:
-                    review_status = "success"
-                elif final_round_result_status in {"review_failed", "failed", "error"}:
-                    review_status = "failed"
-                elif task_result in {"success"}:
-                    review_status = "success"
-                elif task_result in {"max_retries_reached", "failed"}:
-                    review_status = "failed"
-                elif task_status == "success":
-                    review_status = "success"
-                elif task_status == "failed":
-                    review_status = "failed"
-                if review_status != "running":
-                    review_round = _completed_round()
-                else:
-                    review_round = _clamp_round(max(len(verifier_logs), len(executor_logs), 1))
-                if review_status == "success":
-                    review_detail = "最终轮评审已通过"
-                elif review_status == "failed":
-                    if task_result == "max_retries_reached" and task_status == "success":
-                        review_detail = "最终轮评审未通过，达到最大轮次后按配置判定通过"
-                    else:
-                        review_detail = "最终轮评审未通过，任务失败"
-            elif has_tool_review:
-                if task_current_stage == "review":
+        round_metrics = _read_round_metrics(run_dir)
+        round_items = {
+            int(item.get("round") or 0): item
+            for item in list((round_metrics or {}).get("items") or [])
+            if isinstance(item, dict) and int(item.get("round") or 0) > 0
+        }
+        started_rounds = max(
+            len(executor_logs),
+            len(verifier_logs),
+            max(round_items.keys(), default=0),
+            _running_unpack_round() or 0,
+            _running_review_round() or 0,
+            final_round,
+        )
+
+        llm_phases: list[dict[str, Any]] = []
+
+        def _round_metric_time(round_id: int, role: str, field: str) -> Optional[datetime]:
+            payload = round_items.get(round_id) or {}
+            role_payload = payload.get(role) if isinstance(payload.get(role), dict) else {}
+            return _parse_iso_datetime(role_payload.get(field))
+
+        def _round_metric_duration(round_id: int, role: str) -> Optional[int]:
+            payload = round_items.get(round_id) or {}
+            role_payload = payload.get(role) if isinstance(payload.get(role), dict) else {}
+            value = role_payload.get("duration_seconds")
+            if value is None:
+                return None
+            try:
+                return max(0, int(round(float(value))))
+            except Exception:
+                return None
+
+        if started_rounds > 0:
+            running_unpack_round = _running_unpack_round()
+            running_review_round = _running_review_round()
+            running_llm_recursive_round = None
+            if task_current_stage == "recursive_expand":
+                running_llm_recursive_round = max(
+                    len(executor_logs),
+                    max(round_items.keys(), default=0),
+                    1,
+                )
+            if has_tool_review and (fallback_to_llm or executor_logs or verifier_logs or round_items):
+                review_status = "success"
+                review_detail = "工具执行后的评审未通过，已回退到 LLM"
+                if task_current_stage == "review" and not (executor_logs or verifier_logs or round_items):
                     review_status = "running"
-                    review_detail = "LLM 正在评审当前解包结果"
-                elif task_result in {"success"} or task_status == "success" or task_current_stage == "cleanup":
-                    review_status = "success"
-                    review_detail = "工具执行后的评审已通过"
-                elif task_result in {"failed", "max_retries_reached"} or task_status == "failed":
+                    review_detail = "LLM 正在评审工具执行结果"
+                elif task_status == "failed" and not fallback_to_llm and not (executor_logs or verifier_logs or round_items):
                     review_status = "failed"
                     review_detail = "工具执行后的评审未通过"
-            phases[3] = _phase_payload(
-                "llm_review",
-                "LLM 评审",
-                review_status,
-                review_detail,
-                _mtime_iso_text(verifier_logs[-1]) if verifier_logs else (_mtime_iso_text(tool_reviewer_messages) or _mtime_iso_text(stage4_llm_review_log)),
-                current_round=review_round,
-                total_rounds=total_llm_rounds if review_round is not None else None,
-            )
+                llm_phases.append(
+                    _phase_payload(
+                        "llm_review_tool",
+                        "LLM 评审（工具阶段）",
+                        review_status,
+                        review_detail,
+                        _mtime_iso_text(tool_reviewer_messages) or _mtime_iso_text(stage4_llm_review_log),
+                    )
+                )
+            for round_id in range(1, started_rounds + 1):
+                round_dir = _round_dir(run_dir, round_id)
+                executor_path = round_dir / "executor_messages.json"
+                recursive_manifest_path = round_dir / "recursive_expand_manifest.json"
+                recursive_log_path = round_dir / "recursive_expand.log"
+                reviewer_path = round_dir / "reviewer_messages.json"
+                metric = round_items.get(round_id) or {}
+                metric_status = str(metric.get("status") or "").strip().lower()
+                executor_done = executor_path.exists() or bool(metric)
+                reviewer_done = reviewer_path.exists() or bool(metric.get("reviewer")) if isinstance(metric, dict) else reviewer_path.exists()
+
+                if executor_done or (task_current_stage == "llm_unpack" and running_unpack_round == round_id):
+                    unpack_status = "running" if task_current_stage == "llm_unpack" and running_unpack_round == round_id else "success"
+                    unpack_detail = "LLM 正在执行当前轮解包" if unpack_status == "running" else "当前轮解包已完成"
+                    if task_status == "failed" and round_id == started_rounds and not reviewer_done:
+                        unpack_status = "failed"
+                        unpack_detail = "当前轮解包执行失败"
+                    unpack_duration = _round_metric_duration(round_id, "executor")
+                    if unpack_status == "running" and unpack_duration is None:
+                        phase_start = phase_start_times.get("llm_unpack")
+                        if phase_start is not None:
+                            unpack_duration = max(0, int(round((now_local() - ensure_local(phase_start)).total_seconds())))
+                    llm_phases.append(
+                        _phase_payload(
+                            f"llm_unpack_round_{round_id}",
+                            f"LLM 解包（第{round_id}轮）",
+                            unpack_status,
+                            unpack_detail,
+                            _mtime_iso_text(executor_path) or _mtime_iso_text(stage3_llm_unpack_log),
+                            current_round=round_id,
+                            total_rounds=total_llm_rounds,
+                            duration_seconds=unpack_duration,
+                        )
+                    )
+
+                recursive_done = recursive_manifest_path.exists()
+                if recursive_done or (task_current_stage == "recursive_expand" and running_llm_recursive_round == round_id):
+                    recursive_status = "running" if task_current_stage == "recursive_expand" and running_llm_recursive_round == round_id else "success"
+                    recursive_detail = "正在递归展开当前轮 LLM 解包产物" if recursive_status == "running" else "当前轮 LLM 后递归解包已完成"
+                    if recursive_done and recursive_status != "running":
+                        recursive_manifest_payload = _read_json_file(recursive_manifest_path)
+                        completed_rounds = (
+                            int(recursive_manifest_payload.get("completed_rounds") or 0)
+                            if isinstance(recursive_manifest_payload, dict)
+                            else 0
+                        )
+                        if completed_rounds > 0:
+                            recursive_detail = f"已完成第{round_id}轮后的 {completed_rounds} 轮递归解包"
+                    llm_phases.append(
+                        _phase_payload(
+                            f"recursive_expand_llm_round_{round_id}",
+                            f"递归解包（第{round_id}轮后）",
+                            recursive_status,
+                            recursive_detail,
+                            _mtime_iso_text(recursive_manifest_path) or _mtime_iso_text(recursive_log_path),
+                            current_round=round_id,
+                            total_rounds=total_llm_rounds,
+                            duration_seconds=_log_duration_seconds(recursive_log_path),
+                        )
+                    )
+
+                if reviewer_done or (task_current_stage == "review" and running_review_round == round_id):
+                    review_status = "running" if task_current_stage == "review" and running_review_round == round_id and not metric_status else "success"
+                    review_detail = "LLM 正在评审当前轮解包结果" if review_status == "running" else "当前轮评审已通过"
+                    if metric_status in {"review_failed", "failed", "error"} or (task_status == "failed" and round_id == started_rounds):
+                        review_status = "failed"
+                        review_detail = "当前轮评审未通过"
+                    elif metric_status in {"review_passed", "success", "completed"}:
+                        review_status = "success"
+                        review_detail = "当前轮评审已通过"
+                    review_duration = _round_metric_duration(round_id, "reviewer")
+                    if review_status == "running" and review_duration is None:
+                        phase_start = phase_start_times.get("llm_review")
+                        if phase_start is not None:
+                            review_duration = max(0, int(round((now_local() - ensure_local(phase_start)).total_seconds())))
+                    llm_phases.append(
+                        _phase_payload(
+                            f"llm_review_round_{round_id}",
+                            f"LLM 评审（第{round_id}轮）",
+                            review_status,
+                            review_detail,
+                            _mtime_iso_text(reviewer_path) or _mtime_iso_text(stage4_llm_review_log),
+                            current_round=round_id,
+                            total_rounds=total_llm_rounds,
+                            duration_seconds=review_duration,
+                        )
+                    )
+                elif executor_done or recursive_done or (task_current_stage == "recursive_expand" and running_llm_recursive_round == round_id):
+                    llm_phases.append(
+                        _phase_payload(
+                            f"llm_review_round_{round_id}",
+                            f"LLM 评审（第{round_id}轮）",
+                            "pending",
+                            "等待当前轮递归解包完成后进入评审",
+                            None,
+                            current_round=round_id,
+                            total_rounds=total_llm_rounds,
+                        )
+                    )
+
         elif matched_tool and not fallback_to_llm:
-            phases[3] = _phase_payload("llm_review", "LLM 评审", "not_executed", "工具执行成功后，LLM 评审未执行")
+            llm_phases.append(_phase_payload("llm_unpack", "LLM 解包", "skipped", "工具执行成功，跳过 LLM 解包"))
+            llm_phases.append(_phase_payload("recursive_expand_llm", "递归解包（LLM后）", "skipped", "未进入 LLM 解包，跳过"))
+            if has_tool_review:
+                review_status = "running" if task_current_stage == "review" else "success"
+                review_detail = "LLM 正在评审当前解包结果" if review_status == "running" else "工具执行后的评审已通过"
+                if task_result in {"failed", "max_retries_reached"} or task_status == "failed":
+                    review_status = "failed"
+                    review_detail = "工具执行后的评审未通过"
+                llm_phases.append(
+                    _phase_payload(
+                        "llm_review_tool",
+                        "LLM 评审（工具阶段）",
+                        review_status,
+                        review_detail,
+                        _mtime_iso_text(tool_reviewer_messages) or _mtime_iso_text(stage4_llm_review_log),
+                    )
+                )
+            else:
+                llm_phases.append(_phase_payload("llm_review", "LLM 评审", "not_executed", "工具执行成功后，LLM 评审未执行"))
+
+        phases.extend(llm_phases)
 
         cleanup_status = "pending"
         cleanup_detail = None
@@ -601,13 +810,44 @@ def _get_task_progress(task_id: str) -> dict:
         elif task_status in {"failed", "cancelled"}:
             cleanup_status = "skipped"
             cleanup_detail = "任务未正常完成，未进入清理阶段"
-        phases[4] = _phase_payload(
+        phases.append(_phase_payload(
             "llm_cleanup",
             "LLM 清理",
             cleanup_status,
             cleanup_detail,
             _mtime_iso_text(cleaner_artifact_path),
+        ))
+
+    terminal_task_status = task_status if task_status in {"success", "failed", "cancelled"} else None
+    if terminal_task_status:
+        active_phase_index = next(
+            (index for index, phase in enumerate(phases) if str(phase.get("status") or "") == "running"),
+            None,
         )
+        if active_phase_index is not None:
+            active_phase = phases[active_phase_index]
+            if terminal_task_status == "success":
+                active_phase["status"] = "success"
+                if not active_phase.get("detail"):
+                    active_phase["detail"] = "阶段已完成"
+            else:
+                active_phase["status"] = terminal_task_status
+                if terminal_task_status == "failed":
+                    failure_reason = str(task.get("error_message") or task.get("result_message") or "").strip()
+                    active_phase["detail"] = failure_reason or "任务在当前阶段失败"
+                else:
+                    active_phase["detail"] = "任务已取消"
+        for index, phase in enumerate(phases):
+            if active_phase_index is not None and index <= active_phase_index:
+                continue
+            if str(phase.get("status") or "") in {"pending", "running"}:
+                phase["status"] = "skipped" if terminal_task_status != "cancelled" else "cancelled"
+                if not phase.get("detail"):
+                    phase["detail"] = (
+                        "任务已完成，后续阶段未执行"
+                        if terminal_task_status == "success"
+                        else ("任务失败，后续阶段未执行" if terminal_task_status == "failed" else "任务已取消")
+                    )
 
     current_phase = None
     for phase in phases:
@@ -632,7 +872,13 @@ def _get_task_progress(task_id: str) -> dict:
     overall_current_round = None
     overall_total_rounds = None
     for phase in phases:
-        if phase["key"] in {"llm_unpack", "llm_review"} and phase.get("current_round") is not None:
+        phase_key = str(phase.get("key") or "")
+        if (
+            phase_key in {"llm_unpack", "llm_review", "recursive_expand_llm"}
+            or phase_key.startswith("llm_unpack_round_")
+            or phase_key.startswith("recursive_expand_llm_round_")
+            or phase_key.startswith("llm_review_round_")
+        ) and phase.get("current_round") is not None:
             overall_current_round = phase.get("current_round")
             overall_total_rounds = phase.get("total_rounds")
             if phase["status"] == "running":
@@ -648,7 +894,23 @@ def _get_task_progress(task_id: str) -> dict:
         phase_key = str(phase.get("key") or "")
         phase_status = str(phase.get("status") or "")
         phase_start = phase_start_times.get(phase_key)
+        if phase_start is None:
+            if phase_key.startswith("llm_unpack_round_"):
+                phase_start = _round_metric_time(int(phase_key.rsplit("_", 1)[-1]), "executor", "started_at")
+                if phase_start is None:
+                    phase_start = phase_start_times.get("llm_unpack")
+            elif phase_key.startswith("llm_review_round_"):
+                phase_start = _round_metric_time(int(phase_key.rsplit("_", 1)[-1]), "reviewer", "started_at")
+                if phase_start is None:
+                    phase_start = phase_start_times.get("llm_review")
+            elif phase_key.startswith("recursive_expand_llm_round_"):
+                round_id = int(phase_key.rsplit("_", 1)[-1])
+                phase_start, _ = _log_time_bounds(_round_dir(run_dir, round_id) / "recursive_expand.log")
+            elif phase_key == "llm_review_tool":
+                phase_start, _ = _log_time_bounds(stage4_llm_review_log)
         if phase_start is None or phase_status in {"pending", "skipped", "not_executed"}:
+            continue
+        if phase.get("duration_seconds") is not None and phase_status != "running":
             continue
         if phase_status == "running":
             phase_end = now_local()
@@ -736,6 +998,14 @@ def _phase_log_files(run_dir: Path, phase: Optional[str]) -> list[Path]:
     mapping: dict[str, list[Path]] = {
         "preprocess": [round_zero / "preprocess.log", round_zero / "preprocess.json"],
         "tool_match": [round_zero / "skill_match.log", round_zero / "skill_match.json", round_zero / "skill_exec.log", round_zero / "skill_exec.json"],
+        "recursive_expand": [
+            round_zero / "recursive_expand.log",
+            round_zero / "recursive_expand_manifest.json",
+            round_zero / "recursive_expand_summary.md",
+            *[path / "recursive_expand.log" for path in llm_round_dirs],
+            *[path / "recursive_expand_manifest.json" for path in llm_round_dirs],
+            *[path / "recursive_expand_summary.md" for path in llm_round_dirs],
+        ],
         "llm_unpack": [
             round_zero / "stage3_llm_unpack.log",
             round_zero / "fallback.json",
@@ -759,6 +1029,40 @@ def _phase_log_files(run_dir: Path, phase: Optional[str]) -> list[Path]:
             round_zero / "skill_author_messages.json",
         ],
     }
+    if phase_key == "recursive_expand_tool":
+        return mapping.get("recursive_expand", [])[:3]
+    if phase_key == "recursive_expand_llm":
+        return mapping.get("recursive_expand", [])[3:]
+    if phase_key == "llm_review_tool":
+        return [round_zero / "stage4_llm_review.log", round_zero / "reviewer_messages.json", round_zero / "reason.md", round_zero / "summary.md"]
+    if phase_key.startswith("llm_unpack_round_"):
+        round_id = int(phase_key.rsplit("_", 1)[-1])
+        round_dir = _round_dir(run_dir, round_id)
+        return [
+            round_zero / "stage3_llm_unpack.log",
+            round_dir / "executor_transcript.log",
+            round_dir / "executor_messages.json",
+            round_dir / "results.json",
+        ]
+    if phase_key.startswith("recursive_expand_llm_round_"):
+        round_id = int(phase_key.rsplit("_", 1)[-1])
+        round_dir = _round_dir(run_dir, round_id)
+        return [
+            round_dir / "recursive_expand.log",
+            round_dir / "recursive_expand_manifest.json",
+            round_dir / "recursive_expand_summary.md",
+        ]
+    if phase_key.startswith("llm_review_round_"):
+        round_id = int(phase_key.rsplit("_", 1)[-1])
+        round_dir = _round_dir(run_dir, round_id)
+        return [
+            round_zero / "stage4_llm_review.log",
+            round_dir / "reviewer_transcript.log",
+            round_dir / "reviewer_messages.json",
+            round_dir / "reason.md",
+            round_dir / "summary.md",
+            round_dir / "results.json",
+        ]
     return mapping.get(phase_key, [])
 
 

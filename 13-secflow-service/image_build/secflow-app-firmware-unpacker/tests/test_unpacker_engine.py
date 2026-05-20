@@ -1,19 +1,22 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import patch
+import sys
 
 import yaml
 
 import app.model as model_module
 from app.config import reload_config
 from app.model import ServiceConfig, get_db_session, init_database
+from app.services.configcenter import build_models_json_from_provider
+from app.subprocess_utils import run_streaming_process
 from app.unpacker_engine import (
     PI_AGENT_DIR_ENV,
-    PI_MODELS_JSON_ENV,
     PiRpcClient,
-    _build_models_json,
-    _normalize_provider_env_bindings,
+    _run_python_tool_unpack,
+    _run_recursive_expand_command,
     _resolve_provider_model,
 )
 
@@ -23,42 +26,22 @@ class UnpackerEngineHelpersTests(unittest.TestCase):
         self.assertEqual("glm-5", _resolve_provider_model("share_codex", "glm-5", None))
         self.assertEqual("glm-4", _resolve_provider_model("share_codex", "glm-5", "glm-4"))
         self.assertEqual("glm-4", _resolve_provider_model("share_codex", "glm-5", "share_codex/glm-4"))
-        with self.assertRaisesRegex(ValueError, "不一致"):
-            _resolve_provider_model("share_codex", "glm-5", "other/glm-4")
+        self.assertEqual("glm-4", _resolve_provider_model("share_codex", "glm-5", "other/glm-4"))
 
-    def test_normalize_provider_env_bindings_prefers_custom_bindings(self):
-        env = _normalize_provider_env_bindings(
+    def test_build_models_json_uses_provider_specific_api(self):
+        payload = build_models_json_from_provider(
             {
+                "provider_key": "share_codex",
                 "provider_type": "openai-compatible",
                 "api_base": "http://llm.local/v1",
                 "api_key": "secret",
                 "model": "glm-5",
-                "env_bindings": {
-                    "OPENAI_API_KEY": "override-secret",
-                    "CUSTOM_TRACE_ID": "trace-1",
-                },
             }
         )
-        self.assertEqual("override-secret", env["OPENAI_API_KEY"])
-        self.assertEqual("http://llm.local/v1", env["OPENAI_BASE_URL"])
-        self.assertEqual("glm-5", env["OPENAI_MODEL"])
-        self.assertEqual("trace-1", env["CUSTOM_TRACE_ID"])
-
-    def test_build_models_json_uses_provider_specific_api_key_env_name(self):
-        payload = _build_models_json(
-            {
-                "provider_key": "anthropic-main",
-                "provider_type": "anthropic",
-                "api_base": "https://api.anthropic.com",
-                "model": "claude-sonnet",
-                "api_key": "secret",
-                "env_bindings": {"ANTHROPIC_AUTH_TOKEN": "secret"},
-            },
-            "claude-sonnet",
-        )
-        provider = payload["providers"]["anthropic-main"]
-        self.assertEqual("anthropic-messages", provider["api"])
-        self.assertEqual("ANTHROPIC_AUTH_TOKEN", provider["apiKey"])
+        provider = payload["providers"]["share_codex"]
+        self.assertEqual("openai-completions", provider["api"])
+        self.assertEqual("secret", provider["apiKey"])
+        self.assertEqual("glm-5", provider["models"][0]["id"])
 
 
 class _FakeProc:
@@ -121,8 +104,15 @@ class PiRpcClientRuntimeBindingTests(unittest.TestCase):
         init_database()
         db = get_db_session()
         try:
-            row = db.query(ServiceConfig).filter(ServiceConfig.key == "llm_provider_key_executor").first()
-            row.value = "share_codex"
+            for key, value in (
+                ("llm_config_file_key_executor", "share_codex"),
+                ("llm_model_executor", "glm-5"),
+            ):
+                row = db.query(ServiceConfig).filter(ServiceConfig.key == key).first()
+                if row is None:
+                    db.add(ServiceConfig(key=key, value=value))
+                else:
+                    row.value = value
             db.commit()
         finally:
             db.close()
@@ -146,27 +136,103 @@ class PiRpcClientRuntimeBindingTests(unittest.TestCase):
             "api_base": "http://llm.local/v1",
             "api_key": "secret",
             "model": "glm-5",
-            "env_bindings": {"OPENAI_API_KEY": "secret", "TRACE_FLAG": "enabled"},
+            "models_json": build_models_json_from_provider(
+                {
+                    "provider_key": "share_codex",
+                    "provider_type": "openai-compatible",
+                    "api_base": "http://llm.local/v1",
+                    "api_key": "secret",
+                    "model": "glm-5",
+                }
+            ),
             "max_tokens": 4096,
         }
 
         class _FakeClient:
-            def get_llm_provider(self, provider_key: str):
+            def get_llm_config_file(self, provider_key: str):
                 if provider_key != "share_codex":
                     raise AssertionError(provider_key)
                 return fake_provider
 
-        with patch("app.unpacker_engine.get_configcenter_client", return_value=_FakeClient()), \
-             patch("app.unpacker_engine.subprocess.Popen", side_effect=_fake_popen), \
-             patch("app.unpacker_engine.os.getpgid", return_value=123), \
-             patch("app.unpacker_engine.os.killpg"):
+        with patch("app.unpacker_engine_pi.get_configcenter_client", return_value=_FakeClient()), \
+             patch("app.unpacker_engine_pi.subprocess.Popen", side_effect=_fake_popen), \
+             patch("app.unpacker_engine_pi.os.getpgid", return_value=123), \
+             patch("app.unpacker_engine_pi.os.killpg"):
             client = PiRpcClient(provider_role="executor")
             agent_dir = Path(captured["env"][PI_AGENT_DIR_ENV])
             self.assertTrue((agent_dir / "models.json").is_file())
             self.assertTrue((agent_dir / "settings.json").is_file())
-            self.assertEqual(str(agent_dir / "models.json"), captured["env"][PI_MODELS_JSON_ENV])
-            self.assertEqual("secret", captured["env"]["OPENAI_API_KEY"])
-            self.assertEqual("glm-5", captured["env"]["SECFLOW_LLM_MODEL"])
-            self.assertEqual("enabled", captured["env"]["TRACE_FLAG"])
+            settings = json.loads((agent_dir / "settings.json").read_text(encoding="utf-8"))
+            self.assertEqual("share_codex", settings["defaultProvider"])
+            self.assertEqual("auto", settings["defaultModel"])
+            self.assertIn("--model", captured["args"])
+            self.assertIn("share_codex/glm-5", captured["args"])
             client.close()
             self.assertFalse(agent_dir.exists())
+
+
+class StreamingSubprocessTests(unittest.TestCase):
+    def test_run_streaming_process_drains_large_stdout_and_stderr(self):
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import os, sys; "
+                "os.write(sys.stdout.fileno(), b'A' * 262144); "
+                "os.write(sys.stderr.fileno(), b'B' * 262144)"
+            ),
+        ]
+        result = run_streaming_process(command, text=True)
+        self.assertEqual(0, result.returncode)
+        self.assertEqual(262144, len(result.stdout or ""))
+        self.assertEqual(262144, len(result.stderr or ""))
+        self.assertTrue((result.stdout or "").startswith("A"))
+        self.assertTrue((result.stderr or "").startswith("B"))
+
+    def test_recursive_expand_command_handles_large_output_without_deadlock(self):
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import os, sys; "
+                "os.write(sys.stdout.fileno(), (b'entry\\n' * 50000)); "
+                "os.write(sys.stderr.fileno(), (b'warn\\n' * 50000))"
+            ),
+        ]
+        result = _run_recursive_expand_command(command)
+        self.assertEqual(0, result.returncode)
+        self.assertIn("entry", result.stdout)
+        self.assertIn("warn", result.stderr)
+
+    def test_python_tool_unpack_handles_high_volume_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_dir = root / "output"
+            input_dir = root / "input"
+            run_dir = root / "run"
+            tool_path = root / "spam_tool.py"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            input_dir.mkdir(parents=True, exist_ok=True)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (input_dir / "task.json").write_text("{}", encoding="utf-8")
+            tool_path.write_text(
+                "\n".join(
+                    [
+                        "import sys",
+                        "for i in range(5000):",
+                        "    sys.stdout.write(f'line-{i}\\n')",
+                        "sys.stdout.flush()",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            result = _run_python_tool_unpack(
+                str(root / "firmware.bin"),
+                str(output_dir),
+                {"path": str(tool_path), "filename": tool_path.name},
+                run_dir,
+            )
+            self.assertTrue(result["success"])
+            self.assertEqual(0, result["return_code"])
+            self.assertIn("line-0", result["response"])
+            self.assertIn("line-4999", result["response"])
