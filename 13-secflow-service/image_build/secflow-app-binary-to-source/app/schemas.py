@@ -116,6 +116,39 @@ class TaskItemResponse(BaseModel):
     finished_at: Optional[datetime] = None
 
 
+class B2SAbnormalEvidence(BaseModel):
+    key: str
+    label: str
+    value: str
+
+
+class B2SAbnormalReason(BaseModel):
+    is_abnormal: bool = True
+    category: str
+    code: str
+    title: str
+    message: str
+    terminal: bool = True
+    source_layer: str
+    status: str
+    service: str
+    stage_name: Optional[str] = None
+    item_key: Optional[str] = None
+    downstream_task_id: Optional[str] = None
+    downstream_service: Optional[str] = None
+    first_seen_at: Optional[datetime] = None
+    last_seen_at: Optional[datetime] = None
+    evidence: list[B2SAbnormalEvidence] = Field(default_factory=list)
+    recommended_action: Optional[str] = None
+    related_event_ids: list[str] = Field(default_factory=list)
+
+
+class B2SAbnormalReasonEventSummary(BaseModel):
+    event_id: str
+    created_at: datetime
+    reason: B2SAbnormalReason
+
+
 class TaskConfigInputItem(BaseModel):
     item_id: str
     sequence_no: int
@@ -365,6 +398,10 @@ class TaskResponse(BaseModel):
     run_duration_ms: Optional[int] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    abnormal_reason_title: Optional[str] = None
+    abnormal_reason_code: Optional[str] = None
+    abnormal_reason_category: Optional[str] = None
+    abnormal_reason: Optional[B2SAbnormalReason] = None
 
 
 class TaskDetailResponse(TaskResponse):
@@ -376,6 +413,7 @@ class TaskDetailResponse(TaskResponse):
     result_summary: Optional[TaskResultSummary] = None
     observability_summary: Optional[TaskObservabilitySummary] = None
     event_summary: Optional["B2STaskEventSummary"] = None
+    abnormal_reason_history: list[B2SAbnormalReasonEventSummary] = Field(default_factory=list)
 
 
 class B2STaskEvent(BaseModel):

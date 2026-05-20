@@ -73,6 +73,9 @@ from app.observability import (
 )
 from app.schemas import (
     BinarySecurityActionResponse,
+    BinarySecurityAbnormalEvidence,
+    BinarySecurityAbnormalReason,
+    BinarySecurityAbnormalReasonEventSummary,
     BinarySecurityArchiveJobResponse,
     BinarySecurityArtifactsResponse,
     BinarySecurityInputFile,
@@ -1179,6 +1182,7 @@ class TaskManager:
         ).all()
         queue_info = self._build_queue_info(db, project_id=project_id)
         base = self._task_response(db, task, queue_info=queue_info).model_dump()
+        stage_summaries = [BinarySecurityStageSummary(**summary) if isinstance(summary, dict) else summary for summary in base.get("stage_summaries", [])]
         archive_job_responses: list[BinarySecurityArchiveJobResponse] = []
         for job in archive_jobs:
             retry_supported, retry_reason = self._archive_job_retry_support(db, task, job)
@@ -1193,6 +1197,7 @@ class TaskManager:
                     archive_status=job.archive_status,
                     archive_root=job.archive_root,
                     error_message=job.error_message,
+                    abnormal_reason=self._archive_job_abnormal_reason(job),
                     attempts=job.attempts or 0,
                     created_at=job.created_at,
                     started_at=job.started_at,
@@ -1205,6 +1210,15 @@ class TaskManager:
                     copy_stats=dict((job.payload or {}).get("archive_copy_stats") or {}),
                 )
             )
+        abnormal_reason = None
+        if isinstance(task.latest_abnormal_reason, dict):
+            try:
+                abnormal_reason = BinarySecurityAbnormalReason(**task.latest_abnormal_reason)
+            except Exception:
+                abnormal_reason = None
+        if abnormal_reason is None:
+            abnormal_reason = self._task_abnormal_reason(task, stage_summaries, items, archive_jobs)
+        base["abnormal_reason"] = abnormal_reason
         return BinarySecurityTaskDetailResponse(
             **base,
             description=task.description,
@@ -1217,10 +1231,11 @@ class TaskManager:
             item_stats=self._item_stats(items),
             stage_items=[self._stage_item_response(item) for item in items],
             archive_jobs=archive_job_responses,
+            abnormal_reason_history=self._abnormal_reason_history(db, task),
             overview_nodes=self._build_stage_overview_nodes(
                 db,
                 task,
-                [BinarySecurityStageSummary(**summary) if isinstance(summary, dict) else summary for summary in base.get("stage_summaries", [])],
+                stage_summaries,
                 archive_job_responses,
                 items,
             ),
@@ -5917,6 +5932,7 @@ class TaskManager:
 
     def _finalize_task(self, db: Session, task: BinarySecurityTask) -> None:
         if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
+            self._sync_task_abnormal_reason_snapshot(db, task, None)
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
             task.lease_expires_at = None
@@ -5924,6 +5940,7 @@ class TaskManager:
             return
         pending_action = str(task.pending_action or "").strip()
         if pending_action in TASK_PENDING_ACTIONS:
+            self._sync_task_abnormal_reason_snapshot(db, task, None)
             task.status = _preparing_status_for_action(pending_action)
             task.finished_at = None
             task.last_error = None
@@ -5933,6 +5950,11 @@ class TaskManager:
             self._last_task_heartbeat_at.pop(task.id, None)
             return
         if task.status == "cancelled":
+            stage_sequence = self._stage_sequence_for_task(task)
+            stage_summaries = self._build_stage_summaries(db, task, stage_sequence, db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all(), db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all())
+            items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
+            archive_jobs = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id).all()
+            self._sync_task_abnormal_reason_snapshot(db, task, self._task_abnormal_reason(task, stage_summaries, items, archive_jobs))
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
             task.lease_expires_at = None
@@ -5961,6 +5983,10 @@ class TaskManager:
                     level="warning",
                     stage_name=next_stage,
                 )
+                stage_summaries = self._build_stage_summaries(db, task, self._stage_sequence_for_task(task), stage_runs, db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all())
+                items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
+                archive_jobs = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id).all()
+                self._sync_task_abnormal_reason_snapshot(db, task, self._task_abnormal_reason(task, stage_summaries, items, archive_jobs))
                 return
         statuses = [run.status for run in stage_runs]
         if statuses and all(status == "success" for status in statuses):
@@ -5978,6 +6004,14 @@ class TaskManager:
         task.dispatch_started_at = None
         task.finished_at = _now()
         self._last_task_heartbeat_at.pop(task.id, None)
+        items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
+        archive_jobs = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id).all()
+        stage_summaries = self._build_stage_summaries(db, task, self._stage_sequence_for_task(task), stage_runs, items)
+        self._sync_task_abnormal_reason_snapshot(
+            db,
+            task,
+            None if task.status == "success" else self._task_abnormal_reason(task, stage_summaries, items, archive_jobs),
+        )
         observe_task_lifecycle("finished", status=task.status, task_type=self._task_type(task))
         observe_task_duration(
             phase="execution",
@@ -7029,6 +7063,323 @@ class TaskManager:
             "waiting_confirmation": "waiting_confirmation",
         }.get(status, status)
 
+    @staticmethod
+    def _abnormal_reason_evidence(key: str, label: str, value: Any) -> BinarySecurityAbnormalEvidence | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        return BinarySecurityAbnormalEvidence(key=key, label=label, value=text)
+
+    @staticmethod
+    def _abnormal_reason_message(raw: Any, fallback: str) -> str:
+        text = str(raw or "").strip()
+        return text or fallback
+
+    @staticmethod
+    def _abnormal_reason_code_from_message(message: str, *, fallback: str) -> str:
+        lowered = str(message or "").lower()
+        if "lease lost" in lowered or "租约" in lowered:
+            return "lease_lost"
+        if "cancel" in lowered or "取消" in lowered:
+            return "runtime_interrupted"
+        if any(token in lowered for token in ("auth", "dependency", "upstream", "503", "502", "connection refused", "timeout")):
+            return "dependency_unavailable"
+        if "dispatch" in lowered or "调度" in lowered:
+            return "dispatch_failed"
+        return fallback
+
+    def _build_abnormal_reason(
+        self,
+        *,
+        category: str,
+        code: str,
+        title: str,
+        message: str,
+        source_layer: str,
+        status: str,
+        service: str,
+        stage_name: str | None = None,
+        item_key: str | None = None,
+        downstream_task_id: str | None = None,
+        downstream_service: str | None = None,
+        first_seen_at: datetime | None = None,
+        last_seen_at: datetime | None = None,
+        evidence: list[BinarySecurityAbnormalEvidence | None] | None = None,
+        recommended_action: str | None = None,
+        related_event_ids: list[str] | None = None,
+        terminal: bool = True,
+    ) -> BinarySecurityAbnormalReason:
+        return BinarySecurityAbnormalReason(
+            is_abnormal=True,
+            category=category,
+            code=code,
+            title=title,
+            message=message,
+            terminal=terminal,
+            source_layer=source_layer,
+            status=status,
+            service=service,
+            stage_name=stage_name,
+            item_key=item_key,
+            downstream_task_id=downstream_task_id,
+            downstream_service=downstream_service,
+            first_seen_at=first_seen_at,
+            last_seen_at=last_seen_at,
+            evidence=[item for item in (evidence or []) if item is not None],
+            recommended_action=recommended_action,
+            related_event_ids=list(related_event_ids or []),
+        )
+
+    def _stage_item_abnormal_reason(self, item: BinarySecurityStageItem) -> BinarySecurityAbnormalReason | None:
+        status = self._normalize_downstream_status(item.status) or str(item.status or "")
+        if status not in {"failed", "cancelled", "downstream_missing", "partial_success"}:
+            return None
+        error_message = self._abnormal_reason_message(item.error_message, "阶段子任务异常结束")
+        if status == "downstream_missing":
+            code = "downstream_missing"
+            title = "下游任务不存在"
+            category = "downstream"
+            recommended_action = "检查下游任务是否被提前删除，必要时重新同步状态或重试当前阶段。"
+        elif status == "cancelled":
+            code = "downstream_cancelled"
+            title = "下游任务已取消"
+            category = "downstream"
+            recommended_action = "检查是否有人为取消、父任务取消或下游运行时中断。"
+        elif status == "partial_success":
+            code = "result_inconsistent"
+            title = "子任务部分成功"
+            category = "orchestration"
+            recommended_action = "结合时间线和下游详情检查未收敛的失败项。"
+        else:
+            code = "downstream_failed"
+            title = "下游任务失败"
+            category = "downstream"
+            recommended_action = "优先查看下游任务详情与原始错误信息。"
+        return self._build_abnormal_reason(
+            category=category,
+            code=code,
+            title=title,
+            message=error_message,
+            source_layer="item",
+            status=status,
+            service=str(item.downstream_service or "binary-security"),
+            stage_name=item.stage_name,
+            item_key=item.item_key,
+            downstream_task_id=item.downstream_task_id,
+            downstream_service=item.downstream_service,
+            first_seen_at=item.started_at,
+            last_seen_at=item.finished_at or item.updated_at,
+            evidence=[
+                self._abnormal_reason_evidence("stage_name", "阶段", item.stage_name),
+                self._abnormal_reason_evidence("item_key", "子任务 Key", item.item_key),
+                self._abnormal_reason_evidence("downstream_task_id", "下游任务 ID", item.downstream_task_id),
+                self._abnormal_reason_evidence("error_message", "原始错误", item.error_message),
+            ],
+            recommended_action=recommended_action,
+        )
+
+    def _archive_job_abnormal_reason(self, job: BinarySecurityArchiveJob) -> BinarySecurityAbnormalReason | None:
+        if str(job.archive_status or "") != "failed":
+            return None
+        return self._build_abnormal_reason(
+            category="archive",
+            code="archive_failed",
+            title="归档任务失败",
+            message=self._abnormal_reason_message(job.error_message, "阶段产物归档失败"),
+            source_layer="archive",
+            status=str(job.archive_status or "failed"),
+            service="binary-security",
+            stage_name=job.stage_name,
+            item_key=job.item_key,
+            downstream_task_id=job.downstream_task_id,
+            downstream_service=job.downstream_service,
+            first_seen_at=job.started_at or job.created_at,
+            last_seen_at=job.completed_at or job.updated_at,
+            evidence=[
+                self._abnormal_reason_evidence("stage_name", "阶段", job.stage_name),
+                self._abnormal_reason_evidence("item_key", "条目", job.item_key),
+                self._abnormal_reason_evidence("downstream_task_id", "下游任务 ID", job.downstream_task_id),
+                self._abnormal_reason_evidence("archive_root", "归档目录", job.archive_root),
+                self._abnormal_reason_evidence("error_message", "归档错误", job.error_message),
+            ],
+            recommended_action="检查归档目录、文件系统权限和下游产物是否完整。",
+        )
+
+    def _stage_abnormal_reason(
+        self,
+        stage_name: str,
+        summary: BinarySecurityStageSummary,
+        stage_items: list[BinarySecurityStageItem],
+    ) -> BinarySecurityAbnormalReason | None:
+        if summary.status not in {"failed", "cancelled", "partial_success", "downstream_missing"}:
+            return None
+        item_reason = next((self._stage_item_abnormal_reason(item) for item in reversed(stage_items) if self._stage_item_abnormal_reason(item)), None)
+        if item_reason is not None:
+            return item_reason.model_copy(update={"source_layer": "stage", "service": "binary-security", "stage_name": stage_name})
+        message = self._abnormal_reason_message(summary.last_error, f"阶段 {stage_name} 异常结束")
+        code = self._abnormal_reason_code_from_message(message, fallback="orchestration_failed")
+        category = "runtime" if code in {"lease_lost", "runtime_interrupted", "dispatch_failed", "dependency_unavailable"} else "orchestration"
+        return self._build_abnormal_reason(
+            category=category,
+            code=code if summary.status != "downstream_missing" else "downstream_missing",
+            title="阶段异常结束" if summary.status != "partial_success" else "阶段部分成功",
+            message=message,
+            source_layer="stage",
+            status=summary.status,
+            service="binary-security",
+            stage_name=stage_name,
+            first_seen_at=summary.started_at,
+            last_seen_at=summary.finished_at,
+            evidence=[
+                self._abnormal_reason_evidence("stage_name", "阶段", stage_name),
+                self._abnormal_reason_evidence("stage_status", "阶段状态", summary.status),
+                self._abnormal_reason_evidence("last_error", "原始错误", summary.last_error),
+            ],
+            recommended_action="查看阶段时间线、下游任务和归档节点，确认是哪一层先出现异常。",
+        )
+
+    def _task_abnormal_reason(
+        self,
+        task: BinarySecurityTask,
+        stage_summaries: list[BinarySecurityStageSummary],
+        items: list[BinarySecurityStageItem],
+        archive_jobs: list[BinarySecurityArchiveJob],
+    ) -> BinarySecurityAbnormalReason | None:
+        status = str(task.status or "")
+        if status in {"success", "pending", "queued", "running", "dispatching", "ready_to_start", "pending_upload", "uploading"}:
+            return None
+        if status == "cancelled":
+            return self._build_abnormal_reason(
+                category="cancel",
+                code="user_cancelled",
+                title="任务已取消",
+                message=self._abnormal_reason_message(task.last_error, "用户或编排器已取消当前任务。"),
+                source_layer="task",
+                status=status,
+                service="binary-security",
+                stage_name=task.current_stage,
+                first_seen_at=task.started_at,
+                last_seen_at=task.finished_at,
+                evidence=[
+                    self._abnormal_reason_evidence("current_stage", "当前阶段", task.current_stage),
+                    self._abnormal_reason_evidence("last_error", "原始错误", task.last_error),
+                ],
+                recommended_action="检查取消来源，必要时查看时间线中的取消与下游同步事件。",
+            )
+        failed_archive = next((job for job in reversed(archive_jobs) if str(job.archive_status or "") == "failed"), None)
+        if failed_archive is not None:
+            archive_reason = self._archive_job_abnormal_reason(failed_archive)
+            if archive_reason is not None:
+                return archive_reason.model_copy(update={"source_layer": "task", "status": status})
+        failed_item = next((item for item in reversed(items) if (self._normalize_downstream_status(item.status) or item.status) in {"failed", "cancelled", "downstream_missing"}), None)
+        if failed_item is not None:
+            item_reason = self._stage_item_abnormal_reason(failed_item)
+            if item_reason is not None:
+                return item_reason.model_copy(update={"source_layer": "task", "status": status})
+        failed_stage = next((summary for summary in reversed(stage_summaries) if summary.status in {"failed", "partial_success", "downstream_missing", "cancelled"}), None)
+        if failed_stage is not None:
+            stage_reason = self._stage_abnormal_reason(failed_stage.stage_name, failed_stage, [item for item in items if item.stage_name == failed_stage.stage_name])
+            if stage_reason is not None:
+                return stage_reason.model_copy(update={"source_layer": "task", "status": status})
+        next_stage = None
+        if status == "failed":
+            next_stage = next(
+                (
+                    summary.stage_name
+                    for summary in stage_summaries
+                    if summary.status not in {"success", "failed", "partial_success", "downstream_missing", "cancelled", "skipped"}
+                ),
+                None,
+            )
+        if next_stage:
+            return self._build_abnormal_reason(
+                category="orchestration",
+                code="stage_incomplete_terminated",
+                title="任务在最终阶段前终止",
+                message=f"任务在 {next_stage} 前终止，未完成所有已启用阶段。",
+                source_layer="task",
+                status=status,
+                service="binary-security",
+                stage_name=next_stage,
+                first_seen_at=task.started_at,
+                last_seen_at=task.finished_at,
+                evidence=[
+                    self._abnormal_reason_evidence("current_stage", "当前阶段", task.current_stage),
+                    self._abnormal_reason_evidence("next_stage", "未完成阶段", next_stage),
+                    self._abnormal_reason_evidence("last_error", "原始错误", task.last_error),
+                ],
+                recommended_action="优先查看最后失败阶段、异常时间线和下游子任务详情。",
+            )
+        return self._build_abnormal_reason(
+            category="orchestration",
+            code="unknown_abnormal" if status != "partial_success" else "result_inconsistent",
+            title="任务异常结束" if status != "partial_success" else "任务带异常完成",
+            message=self._abnormal_reason_message(task.last_error, "任务以非正常状态结束，但未提取到更具体的根因。"),
+            source_layer="task",
+            status=status,
+            service="binary-security",
+            stage_name=task.current_stage,
+            first_seen_at=task.started_at,
+            last_seen_at=task.finished_at,
+            evidence=[
+                self._abnormal_reason_evidence("current_stage", "当前阶段", task.current_stage),
+                self._abnormal_reason_evidence("last_error", "原始错误", task.last_error),
+            ],
+            recommended_action="查看时间线与编排观测，确认失败首先发生在哪个阶段或下游任务。",
+        )
+
+    def _abnormal_reason_history(self, db: Session, task: BinarySecurityTask) -> list[BinarySecurityAbnormalReasonEventSummary]:
+        rows = (
+            db.query(BinarySecurityEvent)
+            .filter(
+                BinarySecurityEvent.task_id == task.id,
+                BinarySecurityEvent.event_type == "abnormal_reason_recorded",
+            )
+            .order_by(BinarySecurityEvent.created_at.desc())
+            .limit(10)
+            .all()
+        )
+        history: list[BinarySecurityAbnormalReasonEventSummary] = []
+        for row in rows:
+            payload = dict(row.payload or {})
+            reason_payload = payload.get("reason") if isinstance(payload.get("reason"), dict) else payload
+            if not isinstance(reason_payload, dict):
+                continue
+            try:
+                history.append(
+                    BinarySecurityAbnormalReasonEventSummary(
+                        event_id=row.id,
+                        created_at=row.created_at,
+                        reason=BinarySecurityAbnormalReason(**reason_payload),
+                    )
+                )
+            except Exception:
+                continue
+        return history
+
+    def _sync_task_abnormal_reason_snapshot(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        reason: BinarySecurityAbnormalReason | None,
+    ) -> None:
+        previous = task.latest_abnormal_reason or None
+        next_payload = reason.model_dump(mode="json") if reason is not None else None
+        if previous == next_payload:
+            return
+        task.latest_abnormal_reason = next_payload
+        if reason is None:
+            return
+        self._record_event(
+            db,
+            task,
+            "abnormal_reason_recorded",
+            reason.title,
+            level="warning" if reason.status in {"partial_success", "cancelled"} else "error",
+            stage_name=reason.stage_name,
+            payload={"reason": next_payload},
+        )
+
     def _build_stage_summaries(
         self,
         db: Session,
@@ -7069,28 +7420,28 @@ class TaskManager:
                     ]
                 ),
             }
-            summaries.append(
-                BinarySecurityStageSummary(
-                    stage_name=stage_name,
-                    sequence_no=run.sequence_no if run else index,
-                    status=self._business_stage_status(task, stage_name, run, stage_items),
-                    retry_count=int(run.retry_count or 0) if run else 0,
-                    retry_supported=stage_retry_support.get(stage_name, (False, None))[0],
-                    retry_reason=stage_retry_support.get(stage_name, (False, None))[1],
-                    retry_failed_supported=stage_retry_failed_support.get(stage_name, (False, None, []))[0],
-                    retry_failed_reason=stage_retry_failed_support.get(stage_name, (False, None, []))[1],
-                    retry_full_supported=stage_retry_support.get(stage_name, (False, None))[0],
-                    retry_full_reason=stage_retry_support.get(stage_name, (False, None))[1],
-                    total_items=counts["total_items"],
-                    success_items=counts["success_items"],
-                    failed_items=counts["failed_items"],
-                    skipped_items=counts["skipped_items"],
-                    running_items=counts["running_items"],
-                    started_at=run.started_at if run else None,
-                    finished_at=run.finished_at if run else None,
-                    last_error=(run.last_error if run and run.last_error else next((item.error_message for item in stage_items if item.error_message), None)),
-                )
+            stage_summary = BinarySecurityStageSummary(
+                stage_name=stage_name,
+                sequence_no=run.sequence_no if run else index,
+                status=self._business_stage_status(task, stage_name, run, stage_items),
+                retry_count=int(run.retry_count or 0) if run else 0,
+                retry_supported=stage_retry_support.get(stage_name, (False, None))[0],
+                retry_reason=stage_retry_support.get(stage_name, (False, None))[1],
+                retry_failed_supported=stage_retry_failed_support.get(stage_name, (False, None, []))[0],
+                retry_failed_reason=stage_retry_failed_support.get(stage_name, (False, None, []))[1],
+                retry_full_supported=stage_retry_support.get(stage_name, (False, None))[0],
+                retry_full_reason=stage_retry_support.get(stage_name, (False, None))[1],
+                total_items=counts["total_items"],
+                success_items=counts["success_items"],
+                failed_items=counts["failed_items"],
+                skipped_items=counts["skipped_items"],
+                running_items=counts["running_items"],
+                started_at=run.started_at if run else None,
+                finished_at=run.finished_at if run else None,
+                last_error=(run.last_error if run and run.last_error else next((item.error_message for item in stage_items if item.error_message), None)),
             )
+            stage_summary.abnormal_reason = self._stage_abnormal_reason(stage_name, stage_summary, stage_items)
+            summaries.append(stage_summary)
         return summaries
 
     def _aggregate_archive_stage_status(self, statuses: list[str]) -> str:
@@ -7159,6 +7510,7 @@ class TaskManager:
                     finished_at=summary.finished_at,
                     updated_at=summary.finished_at or summary.started_at,
                     last_error=summary.last_error,
+                    abnormal_reason=summary.abnormal_reason or self._stage_abnormal_reason(stage_name, summary, current_stage_items),
                     retry_supported=summary.retry_supported,
                     retry_reason=summary.retry_reason,
                     retry_failed_supported=summary.retry_failed_supported,
@@ -7209,6 +7561,7 @@ class TaskManager:
                 archive_status = "pending"
             archive_retry_supported, archive_retry_reason, _ = self._archive_retry_support(db, task, stage_name)
             archive_retry_full_supported, archive_retry_full_reason, _, _ = self._archive_full_retry_support(db, task, stage_name)
+            archive_abnormal_reason = next((job.abnormal_reason for job in reversed(stage_jobs) if job.abnormal_reason), None)
             nodes.append(
                 BinarySecurityOverviewNode(
                     node_id=f"archive:{stage_name}",
@@ -7222,6 +7575,7 @@ class TaskManager:
                     finished_at=last_updated_at if archive_status == "success" else None,
                     updated_at=last_updated_at,
                     last_error=archive_detail.latest_error,
+                    abnormal_reason=archive_abnormal_reason,
                     retry_supported=archive_retry_supported,
                     retry_reason=archive_retry_reason,
                     retry_failed_supported=archive_retry_supported,
@@ -7344,6 +7698,7 @@ class TaskManager:
     def _task_response(self, db: Session, task: BinarySecurityTask, queue_info: dict[str, Any] | None = None) -> BinarySecurityTaskResponse:
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).order_by(BinarySecurityStageRun.sequence_no.asc()).all()
         items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
+        archive_jobs = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id).all()
         metrics = task.metrics or {}
         queue_info = queue_info or {"pending_positions": {}}
         queue_position = queue_info.get("pending_positions", {}).get(task.id)
@@ -7352,6 +7707,14 @@ class TaskManager:
         task_continue_supported, task_continue_reason, _ = self._task_continue_support(db, task)
         task_retry_failed_supported, task_retry_failed_reason, _, _ = self._task_retry_failed_items_support(db, task)
         stage_summaries = self._build_stage_summaries(db, task, stage_sequence, stage_runs, items)
+        abnormal_reason = None
+        if isinstance(task.latest_abnormal_reason, dict):
+            try:
+                abnormal_reason = BinarySecurityAbnormalReason(**task.latest_abnormal_reason)
+            except Exception:
+                abnormal_reason = None
+        if abnormal_reason is None:
+            abnormal_reason = self._task_abnormal_reason(task, stage_summaries, items, archive_jobs)
         manual_operation_state = self._build_manual_operation_state(
             db,
             task,
@@ -7371,6 +7734,7 @@ class TaskManager:
             status=task.status,
             current_stage=task.current_stage,
             pending_action=task.pending_action,
+            last_error=task.last_error,
             firmware_path=task.firmware_path,
             stage_sequence=stage_sequence,
             is_queued=task.status == "pending",
@@ -7399,6 +7763,10 @@ class TaskManager:
             task_continue_reason=task_continue_reason,
             task_retry_failed_items_supported=task_retry_failed_supported,
             task_retry_failed_items_reason=task_retry_failed_reason,
+            abnormal_reason_title=abnormal_reason.title if abnormal_reason else None,
+            abnormal_reason_code=abnormal_reason.code if abnormal_reason else None,
+            abnormal_reason_category=abnormal_reason.category if abnormal_reason else None,
+            abnormal_reason=abnormal_reason,
             stage_summaries=stage_summaries,
             manual_operation_state=manual_operation_state,
         )
@@ -7502,13 +7870,14 @@ class TaskManager:
             item_name=item.item_name,
             parent_key=item.parent_key,
             status=item.status,
-            retry_count=item.retry_count,
+            retry_count=int(item.retry_count or 0),
             downstream_service=item.downstream_service,
             downstream_task_id=item.downstream_task_id,
             input_ref=item.input_ref,
             output_ref=item.output_ref,
             result=item.result,
             error_message=item.error_message,
+            abnormal_reason=self._stage_item_abnormal_reason(item),
             started_at=item.started_at,
             finished_at=item.finished_at,
         )

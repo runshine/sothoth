@@ -94,8 +94,17 @@ class _FakeDb:
         self.added = []
         self.commits = 0
 
-    def query(self, *args, **kwargs):
-        return _FakeQuery(self.rows)
+    def query(self, model=None, *args, **kwargs):
+        del args, kwargs
+        if model is None:
+            return _FakeQuery(self.rows)
+        model_name = getattr(model, "__name__", "")
+        if not self.rows:
+            return _FakeQuery([])
+        first_name = getattr(self.rows[0].__class__, "__name__", "")
+        if first_name == "_StageRun" and model_name == "BinarySecurityStageRun":
+            return _FakeQuery(self.rows)
+        return _FakeQuery(self.rows if not model_name or model_name == first_name else [])
 
     def add(self, obj):
         self.added.append(obj)
@@ -108,11 +117,12 @@ class _FakeDb:
 
 
 class _ModelAwareDb:
-    def __init__(self, *, tasks=None, stage_runs=None, stage_items=None, archive_jobs=None):
+    def __init__(self, *, tasks=None, stage_runs=None, stage_items=None, archive_jobs=None, events=None):
         self.tasks = list(tasks or [])
         self.stage_runs = list(stage_runs or [])
         self.stage_items = list(stage_items or [])
         self.archive_jobs = list(archive_jobs or [])
+        self.events = list(events or [])
         self.added = []
 
     def query(self, model, *args, **kwargs):
@@ -125,6 +135,8 @@ class _ModelAwareDb:
             return _FakeQuery(self.stage_items)
         if model_name == "BinarySecurityArchiveJob":
             return _FakeQuery(self.archive_jobs)
+        if model_name == "BinarySecurityEvent":
+            return _FakeQuery(self.events)
         return _FakeQuery([])
 
     def add(self, obj):
@@ -190,6 +202,8 @@ class _AppendingModelAwareDb(_ModelAwareDb):
             self.stage_runs.append(obj)
         elif model_name == "BinarySecurityArchiveJob":
             self.archive_jobs.append(obj)
+        elif model_name == "BinarySecurityEvent":
+            self.events.append(obj)
         elif model_name == "BinarySecurityTask":
             self.tasks.append(obj)
 
@@ -2448,7 +2462,13 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
     def test_finalize_task_prefers_partial_success_after_vuln_stage(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
-        db = _FakeDb(rows=[_StageRun("binary_to_source", "failed"), _StageRun("vuln_scan", "partial_success")])
+        db = _ModelAwareDb(
+            tasks=[task],
+            stage_runs=[
+                BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="binary_to_source", sequence_no=3, status="failed"),
+                BinarySecurityStageRun(id="sr2", task_id="t1", project_id="p1", stage_name="vuln_scan", sequence_no=6, status="partial_success"),
+            ],
+        )
 
         self.manager._finalize_task(db, task)
 
@@ -2491,6 +2511,50 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("failed", task.status)
         self.assertEqual("binary_to_source", task.current_stage)
+        self.assertEqual("stage_incomplete_terminated", task.latest_abnormal_reason["code"])
+
+    def test_finalize_task_clears_latest_abnormal_reason_after_success(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.latest_abnormal_reason = {
+            "is_abnormal": True,
+            "category": "downstream",
+            "code": "downstream_failed",
+            "title": "旧异常",
+            "message": "旧异常",
+            "terminal": True,
+            "source_layer": "task",
+            "status": "failed",
+            "service": "binary-security",
+            "evidence": [],
+            "related_event_ids": [],
+        }
+        db = _ModelAwareDb(
+            tasks=[task],
+            stage_runs=[
+                BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="firmware_unpack", sequence_no=1, status="success"),
+                BinarySecurityStageRun(id="sr2", task_id="t1", project_id="p1", stage_name="system_analysis", sequence_no=2, status="success"),
+                BinarySecurityStageRun(id="sr3", task_id="t1", project_id="p1", stage_name="binary_to_source", sequence_no=3, status="success"),
+                BinarySecurityStageRun(id="sr4", task_id="t1", project_id="p1", stage_name="entry_analysis", sequence_no=4, status="success"),
+                BinarySecurityStageRun(id="sr5", task_id="t1", project_id="p1", stage_name="dataflow_analysis", sequence_no=5, status="success"),
+                BinarySecurityStageRun(id="sr6", task_id="t1", project_id="p1", stage_name="vuln_scan", sequence_no=6, status="success"),
+            ],
+        )
+
+        self.manager._finalize_task(db, task)
+
+        self.assertEqual("success", task.status)
+        self.assertIsNone(task.latest_abnormal_reason)
 
     def test_finalize_task_preserves_retry_preparing_when_pending_action_exists(self):
         task = BinarySecurityTask(
@@ -3184,6 +3248,164 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                     partial_success_stage_advancement={"binary_to_source": False}
                 ),
             )
+
+    def test_get_task_detail_returns_structured_abnormal_reason_for_failed_task(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="binary_to_source",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            last_error="下游任务执行失败",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            sequence_no=3,
+            status="failed",
+            last_error="逆向服务失败",
+        )
+        item = BinarySecurityStageItem(
+            id="i1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            item_key="module:openssl",
+            status="failed",
+            downstream_service="binary-to-source",
+            downstream_task_id="b2s-1",
+            error_message="worker exited with code 1",
+        )
+        archive_job = BinarySecurityArchiveJob(
+            id="a1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            item_id="i1",
+            item_key="module:openssl",
+            archive_status="failed",
+            error_message="copy failed",
+        )
+        event = BinarySecurityEvent(
+            id="e1",
+            task_id="t1",
+            project_id="p1",
+            event_type="abnormal_reason_recorded",
+            message="下游任务失败",
+            level="error",
+            created_at=_now(),
+        )
+        event.payload = {
+            "reason": {
+                "is_abnormal": True,
+                "category": "downstream",
+                "code": "downstream_failed",
+                "title": "下游任务失败",
+                "message": "worker exited with code 1",
+                "terminal": True,
+                "source_layer": "task",
+                "status": "failed",
+                "service": "binary-security",
+                "stage_name": "binary_to_source",
+                "item_key": "module:openssl",
+                "downstream_task_id": "b2s-1",
+                "downstream_service": "binary-to-source",
+                "evidence": [
+                    {"key": "downstream_task_id", "label": "下游任务 ID", "value": "b2s-1"},
+                    {"key": "error_message", "label": "原始错误", "value": "worker exited with code 1"},
+                ],
+                "related_event_ids": [],
+            }
+        }
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], archive_jobs=[archive_job], events=[event])
+
+        detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
+
+        self.assertEqual("archive_failed", detail.abnormal_reason.code)
+        self.assertEqual("archive_failed", detail.archive_jobs[0].abnormal_reason.code)
+        self.assertEqual("downstream_failed", detail.stage_items[0].abnormal_reason.code)
+        self.assertEqual("downstream_failed", detail.stage_summaries[2].abnormal_reason.code)
+        self.assertEqual(1, len(detail.abnormal_reason_history))
+
+    def test_task_response_exposes_abnormal_reason_summary_fields(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="binary_to_source",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="i1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            item_key="module:openssl",
+            status="downstream_missing",
+            downstream_service="binary-to-source",
+            downstream_task_id="b2s-1",
+            error_message="downstream task not found",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item])
+
+        response = self.manager._task_response(db, task)
+
+        self.assertEqual("downstream_missing", response.abnormal_reason_code)
+        self.assertEqual("downstream", response.abnormal_reason_category)
+        self.assertTrue(response.abnormal_reason_title)
+
+    def test_sync_task_abnormal_reason_snapshot_records_history_on_change(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        db = _ModelAwareDb(tasks=[task])
+        first = self.manager._build_abnormal_reason(
+            category="downstream",
+            code="downstream_failed",
+            title="下游任务失败",
+            message="worker failed",
+            source_layer="task",
+            status="failed",
+            service="binary-security",
+            evidence=[],
+        )
+        second = self.manager._build_abnormal_reason(
+            category="archive",
+            code="archive_failed",
+            title="归档任务失败",
+            message="archive failed",
+            source_layer="task",
+            status="failed",
+            service="binary-security",
+            evidence=[],
+        )
+
+        self.manager._sync_task_abnormal_reason_snapshot(db, task, first)
+        self.manager._sync_task_abnormal_reason_snapshot(db, task, second)
+
+        abnormal_events = [obj for obj in db.added if isinstance(obj, BinarySecurityEvent) and obj.event_type == "abnormal_reason_recorded"]
+        self.assertEqual(2, len(abnormal_events))
+        self.assertEqual("archive_failed", task.latest_abnormal_reason["code"])
 
     def test_update_task_policy_rejects_running_task(self):
         task = BinarySecurityTask(

@@ -231,6 +231,10 @@ class ScanTaskResponse(BaseModel):
     latest_run: Dict[str, Any] = Field(default_factory=dict)
     auto_report_vulnerabilities: bool = True
     vuln_report_status: Dict[str, Any] = Field(default_factory=dict)
+    abnormal_reason_title: Optional[str] = None
+    abnormal_reason_code: Optional[str] = None
+    abnormal_reason_category: Optional[str] = None
+    abnormal_reason: Optional[Dict[str, Any]] = None
 
 
 class ScanTaskAttemptResponse(BaseModel):
@@ -267,6 +271,7 @@ class ScanTaskDetailResponse(ScanTaskResponse):
     runtime_overrides: Dict[str, Any] = Field(default_factory=dict)
     task_metadata: Dict[str, Any] = Field(default_factory=dict)
     attempts: List[ScanTaskAttemptResponse] = Field(default_factory=list)
+    abnormal_reason_history: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class ProjectEffectiveConfigResponse(BaseModel):

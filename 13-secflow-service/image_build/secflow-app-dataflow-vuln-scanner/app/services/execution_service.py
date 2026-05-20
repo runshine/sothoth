@@ -87,6 +87,13 @@ _TASK_PURPOSE_LABELS = {
 }
 
 
+def _abnormal_evidence(key: str, label: str, value: object) -> dict | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return {"key": key, "label": label, "value": text}
+
+
 def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:20]}"
 
@@ -223,6 +230,116 @@ class ExecutionService:
             return {}
         first_task = manifest.tasks[0] if manifest.tasks else None
         return dict(first_task.metadata or {}) if first_task else {}
+
+    def _task_abnormal_reason(self, trigger: TriggerTask, execution: WorkflowExecution | None, run_summary: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        status_value = str(trigger.status or "").strip().lower()
+        if status_value not in {"failed", "cancelled", "interrupted", "error"}:
+            return None
+        if isinstance(trigger.latest_abnormal_reason_json, dict):
+            return dict(trigger.latest_abnormal_reason_json)
+        run_summary = run_summary or {}
+        run_status = str(run_summary.get("status") or "").strip()
+        run_error = str(run_summary.get("error") or "").strip()
+        message = str(
+            trigger.message
+            or (execution.message if execution is not None else "")
+            or (execution.dispatch_error if execution is not None else "")
+            or run_error
+            or ""
+        ).strip()
+        if status_value == "cancelled":
+            code, category, title = "user_cancelled", "cancel", "任务已取消"
+        elif execution is not None and str(execution.dispatch_status or "").strip().lower() == "failed":
+            code, category, title = "dispatch_failed", "runtime", "调度失败"
+        elif execution is not None and str(execution.process_status or "").strip().lower() in {"cancelled", "interrupted", "killed"}:
+            code, category, title = "runtime_interrupted", "runtime", "运行时中断"
+        elif run_status in {"failed", "error", "runtime_timeout", "provider_rate_limited", "blocked_quota"}:
+            code, category, title = "downstream_failed", "downstream", "扫描执行失败"
+        else:
+            code, category, title = "unknown_abnormal", "orchestration", "任务异常结束"
+        return {
+            "is_abnormal": True,
+            "category": category,
+            "code": code,
+            "title": title,
+            "message": message or "任务以非正常状态结束。",
+            "terminal": True,
+            "source_layer": "task",
+            "status": status_value,
+            "service": "dataflow-vuln-scanner",
+            "stage_name": str(execution.current_stage_id if execution is not None else "").strip() or None,
+            "item_key": None,
+            "downstream_task_id": execution.id if execution is not None else None,
+            "downstream_service": "workflow_execution" if execution is not None else None,
+            "first_seen_at": isoformat_local(trigger.started_at),
+            "last_seen_at": isoformat_local(trigger.finished_at or trigger.updated_at),
+            "evidence": [
+                item for item in [
+                    _abnormal_evidence("task_status", "任务状态", trigger.status),
+                    _abnormal_evidence("dispatch_status", "调度状态", execution.dispatch_status if execution is not None else None),
+                    _abnormal_evidence("process_status", "进程状态", execution.process_status if execution is not None else None),
+                    _abnormal_evidence("run_status", "运行摘要状态", run_status),
+                    _abnormal_evidence("error", "原始错误", message),
+                ] if item is not None
+            ],
+            "recommended_action": "查看最近一次 execution、run summary 和 dispatch_error，确认是调度失败、运行时中断还是扫描执行本身失败。",
+            "related_event_ids": [],
+        }
+
+    def _abnormal_reason_history(self, db: Session, trigger: TriggerTask) -> list[dict[str, Any]]:
+        execution_ids = [item.id for item in self._list_executions_for_trigger(db, trigger.id)]
+        if not execution_ids:
+            return []
+        rows = (
+            db.query(WorkflowExecutionEvent)
+            .filter(
+                WorkflowExecutionEvent.execution_id.in_(execution_ids),
+                WorkflowExecutionEvent.event_type == "abnormal_reason_recorded",
+            )
+            .order_by(WorkflowExecutionEvent.created_at.desc())
+            .limit(10)
+            .all()
+        )
+        history: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row.payload_json or {})
+            reason = payload.get("reason") if isinstance(payload.get("reason"), dict) else None
+            if not isinstance(reason, dict):
+                continue
+            history.append(
+                {
+                    "event_id": row.id,
+                    "created_at": row.created_at,
+                    "reason": reason,
+                }
+            )
+        return history
+
+    def _sync_trigger_abnormal_reason(
+        self,
+        db: Session,
+        *,
+        trigger: TriggerTask,
+        execution: WorkflowExecution | None,
+        run_summary: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        reason = self._task_abnormal_reason(trigger, execution, run_summary)
+        next_payload = dict(reason) if isinstance(reason, dict) else None
+        previous_payload = trigger.latest_abnormal_reason_json if isinstance(trigger.latest_abnormal_reason_json, dict) else None
+        trigger.latest_abnormal_reason_json = next_payload
+        if reason is None or previous_payload == next_payload or execution is None:
+            return next_payload
+        db.add(
+            WorkflowExecutionEvent(
+                id=_new_id("evt"),
+                execution_id=execution.id,
+                event_type="abnormal_reason_recorded",
+                level="warning" if reason.get("status") == "cancelled" else "error",
+                message=str(reason.get("title") or "任务异常结束"),
+                payload_json={"reason": next_payload},
+            )
+        )
+        return next_payload
 
     def _normalize_task_purpose(self, value: str | None) -> str:
         normalized = str(value or "").strip().lower()
@@ -724,6 +841,7 @@ class ExecutionService:
                 "linked_execution_id": latest_execution.id if latest_execution else None,
                 **run_summary,
             }
+        abnormal_reason = self._task_abnormal_reason(trigger, latest_execution, run_summary)
         return ScanTaskResponse(
             task_id=trigger.id,
             project_id=trigger.project_id,
@@ -776,6 +894,10 @@ class ExecutionService:
                 trigger,
                 latest_execution.id if latest_execution else None,
             ),
+            abnormal_reason_title=abnormal_reason.get("title") if abnormal_reason else None,
+            abnormal_reason_code=abnormal_reason.get("code") if abnormal_reason else None,
+            abnormal_reason_category=abnormal_reason.get("category") if abnormal_reason else None,
+            abnormal_reason=abnormal_reason,
         )
 
     def _scan_task_detail(self, db: Session, trigger: TriggerTask) -> ScanTaskDetailResponse:
@@ -833,6 +955,7 @@ class ExecutionService:
             runtime_overrides=runtime_overrides,
             task_metadata=task_metadata,
             attempts=attempts,
+            abnormal_reason_history=self._abnormal_reason_history(db, trigger),
         )
 
     def _attempt_response(self, execution: WorkflowExecution, run_id: str | None = None) -> ScanTaskAttemptResponse:
@@ -1974,6 +2097,8 @@ class ExecutionService:
         trigger.finished_at = now
         if trigger.started_at is None:
             trigger.started_at = execution.started_at or now
+        trigger.latest_abnormal_reason_json = None
+        self._sync_trigger_abnormal_reason(db, trigger=trigger, execution=execution)
         db.add(execution)
         db.add(trigger)
 
@@ -2042,6 +2167,7 @@ class ExecutionService:
         trigger.profile_id = definition.id
         trigger.finished_at = None
         trigger.message = "pending start" if not recovery_reason else f"pending start: {recovery_reason}"
+        trigger.latest_abnormal_reason_json = None
         execution = WorkflowExecution(
             id=execution_id,
             trigger_task_id=trigger.id,
@@ -2166,6 +2292,7 @@ class ExecutionService:
         trigger.profile_id = definition.id
         trigger.finished_at = None
         trigger.message = "pending start" if not recovery_reason else f"pending start: {recovery_reason}"
+        trigger.latest_abnormal_reason_json = None
         execution = WorkflowExecution(
             id=execution_id,
             trigger_task_id=trigger.id,
@@ -2826,6 +2953,7 @@ class ExecutionService:
                 recovery_reason="manual task retry requested",
             )
         trigger.retry_count = int(trigger.retry_count or 0) + 1
+        trigger.latest_abnormal_reason_json = None
         db.add(trigger)
         db.commit()
         self.record_event(
@@ -3200,6 +3328,7 @@ class ExecutionService:
             trigger.status = "failed"
             trigger.message = message
             trigger.finished_at = now
+            self._sync_trigger_abnormal_reason(db, trigger=trigger, execution=execution)
             db.add(trigger)
         db.flush()
 
@@ -3624,6 +3753,10 @@ class ExecutionService:
             trigger.started_at = started_at
             trigger.finished_at = finished_at
             trigger.message = adoption_message
+        if task_status in {"failed", "cancelled", "error", "interrupted"}:
+            self._sync_trigger_abnormal_reason(db, trigger=trigger, execution=execution)
+        else:
+            trigger.latest_abnormal_reason_json = None
         db.add(trigger)
         db.flush()
 
@@ -3931,9 +4064,11 @@ class ExecutionService:
                 latest_execution.finished_at = now
                 latest_execution.message = "cancelled before dispatch"
                 db.add(latest_execution)
+            self._sync_trigger_abnormal_reason(db, trigger=trigger, execution=latest_execution)
         elif trigger.status in {"running", "cancel_requested"}:
             trigger.status = "cancel_requested"
             trigger.message = "cancel requested"
+            trigger.latest_abnormal_reason_json = None
             if latest_execution is not None and latest_execution.status == "running":
                 latest_execution.status = "cancel_requested"
                 latest_execution.message = "cancel requested"

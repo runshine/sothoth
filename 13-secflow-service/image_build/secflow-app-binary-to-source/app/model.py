@@ -33,6 +33,7 @@ class B2STask(Base):
     priority = Column(Integer, nullable=False, default=5)
     tags_json = Column(Text, nullable=True)
     status = Column(String(32), nullable=False, default="pending", index=True)
+    latest_abnormal_reason_json = Column(Text, nullable=True)
     created_by = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=now_local, nullable=False)
     updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
@@ -44,6 +45,15 @@ class B2STask(Base):
     @tags.setter
     def tags(self, value: list[str] | None) -> None:
         self.tags_json = json.dumps(value or [], ensure_ascii=False)
+
+    @property
+    def latest_abnormal_reason(self) -> dict[str, Any] | None:
+        payload = _loads(self.latest_abnormal_reason_json, None)
+        return payload if isinstance(payload, dict) else None
+
+    @latest_abnormal_reason.setter
+    def latest_abnormal_reason(self, value: dict[str, Any] | None) -> None:
+        self.latest_abnormal_reason_json = json.dumps(value, ensure_ascii=False) if value else None
 
 
 class B2STaskItem(Base):
@@ -269,6 +279,8 @@ def _ensure_task_origin_columns(engine) -> None:
     table_name = B2STask.__tablename__
     columns = {column["name"] for column in inspect(engine).get_columns(table_name)}
     statements: list[str] = []
+    if "latest_abnormal_reason_json" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN latest_abnormal_reason_json TEXT NULL")
     if "task_origin_type" not in columns:
         statements.append(f"ALTER TABLE {table_name} ADD COLUMN task_origin_type VARCHAR(32) NULL")
     if "parent_project_id" not in columns:

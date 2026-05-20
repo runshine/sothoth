@@ -92,6 +92,40 @@ class BinarySecurityStageSummary(BaseModel):
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     last_error: Optional[str] = None
+    abnormal_reason: Optional["BinarySecurityAbnormalReason"] = None
+
+
+class BinarySecurityAbnormalEvidence(BaseModel):
+    key: str
+    label: str
+    value: str
+
+
+class BinarySecurityAbnormalReason(BaseModel):
+    is_abnormal: bool = True
+    category: str
+    code: str
+    title: str
+    message: str
+    terminal: bool = True
+    source_layer: str
+    status: str
+    service: str
+    stage_name: Optional[str] = None
+    item_key: Optional[str] = None
+    downstream_task_id: Optional[str] = None
+    downstream_service: Optional[str] = None
+    first_seen_at: Optional[datetime] = None
+    last_seen_at: Optional[datetime] = None
+    evidence: list[BinarySecurityAbnormalEvidence] = Field(default_factory=list)
+    recommended_action: Optional[str] = None
+    related_event_ids: list[str] = Field(default_factory=list)
+
+
+class BinarySecurityAbnormalReasonEventSummary(BaseModel):
+    event_id: str
+    created_at: datetime
+    reason: BinarySecurityAbnormalReason
 
 
 class BinarySecurityTaskResponse(BaseModel):
@@ -102,6 +136,7 @@ class BinarySecurityTaskResponse(BaseModel):
     status: str
     current_stage: Optional[str] = None
     pending_action: Optional[str] = None
+    last_error: Optional[str] = None
     firmware_path: str
     stage_sequence: list[str] = Field(default_factory=list)
     is_queued: bool = False
@@ -130,6 +165,10 @@ class BinarySecurityTaskResponse(BaseModel):
     task_continue_reason: Optional[str] = None
     task_retry_failed_items_supported: bool = False
     task_retry_failed_items_reason: Optional[str] = None
+    abnormal_reason_title: Optional[str] = None
+    abnormal_reason_code: Optional[str] = None
+    abnormal_reason_category: Optional[str] = None
+    abnormal_reason: Optional[BinarySecurityAbnormalReason] = None
     stage_summaries: list[BinarySecurityStageSummary] = Field(default_factory=list)
     manual_operation_state: dict[str, Any] = Field(default_factory=dict)
 
@@ -203,6 +242,7 @@ class BinarySecurityStageItemResponse(BaseModel):
     output_ref: dict[str, Any] = Field(default_factory=dict)
     result: dict[str, Any] = Field(default_factory=dict)
     error_message: Optional[str] = None
+    abnormal_reason: Optional[BinarySecurityAbnormalReason] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
 
@@ -217,6 +257,7 @@ class BinarySecurityArchiveJobResponse(BaseModel):
     archive_status: str
     archive_root: Optional[str] = None
     error_message: Optional[str] = None
+    abnormal_reason: Optional[BinarySecurityAbnormalReason] = None
     attempts: int = 0
     created_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
@@ -269,6 +310,7 @@ class BinarySecurityOverviewNode(BaseModel):
     finished_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     last_error: Optional[str] = None
+    abnormal_reason: Optional[BinarySecurityAbnormalReason] = None
     retry_supported: bool = False
     retry_reason: Optional[str] = None
     retry_failed_supported: bool = False
@@ -291,6 +333,7 @@ class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
     archive_jobs: list[BinarySecurityArchiveJobResponse] = Field(default_factory=list)
     overview_nodes: list[BinarySecurityOverviewNode] = Field(default_factory=list)
     orchestration_observability: dict[str, Any] = Field(default_factory=dict)
+    abnormal_reason_history: list[BinarySecurityAbnormalReasonEventSummary] = Field(default_factory=list)
 
 
 class BinarySecurityTaskEventResponse(BaseModel):
@@ -325,6 +368,9 @@ class BinarySecurityArtifactsResponse(BaseModel):
     offset: int = 0
     has_more: bool = False
     files: list[BinarySecurityArtifactEntry] = Field(default_factory=list)
+
+
+BinarySecurityTaskDetailResponse.model_rebuild()
 
 
 class BinarySecurityActionResponse(BaseModel):

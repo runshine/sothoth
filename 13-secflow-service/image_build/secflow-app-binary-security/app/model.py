@@ -102,6 +102,7 @@ class BinarySecurityTask(Base, JsonMixin):
     target_stage_name = Column(String(64), nullable=True, index=True)
     pending_action = Column(String(32), nullable=True, index=True)
     last_error = Column(Text, nullable=True)
+    latest_abnormal_reason_json = Column(Text, nullable=True)
     operation_lock_owner = Column(String(128), nullable=True, index=True)
     operation_lock_token = Column(String(64), nullable=True, index=True)
     operation_lock_type = Column(String(32), nullable=True, index=True)
@@ -185,6 +186,15 @@ class BinarySecurityTask(Base, JsonMixin):
     @stage_summary.setter
     def stage_summary(self, value: dict[str, Any] | None) -> None:
         self.stage_summary_json = self._dump_json(value or {})
+
+    @property
+    def latest_abnormal_reason(self) -> dict[str, Any] | None:
+        payload = self._load_json(self.latest_abnormal_reason_json, None)
+        return payload if isinstance(payload, dict) else None
+
+    @latest_abnormal_reason.setter
+    def latest_abnormal_reason(self, value: dict[str, Any] | None) -> None:
+        self.latest_abnormal_reason_json = self._dump_json(value or {}) if value else None
 
 
 class BinarySecurityStageRun(Base, JsonMixin):
@@ -523,6 +533,10 @@ def _ensure_compat_columns(engine) -> None:
         if "operation_lock_expires_at" not in columns:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN operation_lock_expires_at DATETIME NULL"
+            )
+        if "latest_abnormal_reason_json" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN latest_abnormal_reason_json TEXT NULL"
             )
         with engine.begin() as conn:
             for statement in statements:

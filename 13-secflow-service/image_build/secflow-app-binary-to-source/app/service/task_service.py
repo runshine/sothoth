@@ -26,6 +26,9 @@ from app.schemas import (
     AdvancedRun,
     AgentRuntimeEntry,
     AgentRuntimeSummary,
+    B2SAbnormalEvidence,
+    B2SAbnormalReason,
+    B2SAbnormalReasonEventSummary,
     B2SArtifact,
     B2SArtifactContentResponse,
     B2STaskEvent as B2STaskEventResponse,
@@ -118,6 +121,13 @@ FUNCTION_STATS_METADATA_KEY = "function_stats"
 FUNCTION_STATS_FIELDS = ("total_functions", "completed_functions", "failed_functions", "uncompleted_functions")
 TASK_EVENT_SOURCE_B2S = "b2s"
 TASK_EVENT_SOURCE_PI = "pi_re_agent"
+
+
+def _abnormal_evidence(key: str, label: str, value: Any) -> B2SAbnormalEvidence | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return B2SAbnormalEvidence(key=key, label=label, value=text)
 
 
 def _item_event_snapshot(item: B2STaskItem) -> dict[str, Any]:
@@ -222,6 +232,144 @@ def _safe_create_task_event(db: Session, **kwargs: Any) -> None:
         nested.commit()
     except IntegrityError:
         nested.rollback()
+
+
+def _build_abnormal_reason(
+    *,
+    category: str,
+    code: str,
+    title: str,
+    message: str,
+    status: str,
+    evidence: list[B2SAbnormalEvidence | None] | None = None,
+    recommended_action: str | None = None,
+    first_seen_at: datetime | None = None,
+    last_seen_at: datetime | None = None,
+) -> B2SAbnormalReason:
+    return B2SAbnormalReason(
+        category=category,
+        code=code,
+        title=title,
+        message=message,
+        source_layer="task",
+        status=status,
+        service="binary-to-source",
+        first_seen_at=first_seen_at,
+        last_seen_at=last_seen_at,
+        evidence=[item for item in (evidence or []) if item is not None],
+        recommended_action=recommended_action,
+    )
+
+
+def _task_abnormal_reason(task: B2STask, items: list[B2STaskItem]) -> B2SAbnormalReason | None:
+    status = str(task.status or "")
+    if status in {"pending", "queued", "running", "completed", "success"}:
+        return None
+    latest_item = next((item for item in reversed(items) if item.status in {"failed", "cancelled"}), None)
+    latest_error = str((latest_item.error_reason if latest_item else "") or "").strip()
+    first_seen_at = min((item.started_at for item in items if item.started_at), default=None)
+    last_seen_at = max((item.finished_at or item.updated_at for item in items if item.finished_at or item.updated_at), default=None)
+    if status == "cancelled":
+        return _build_abnormal_reason(
+            category="cancel",
+            code="user_cancelled",
+            title="任务已取消",
+            message=latest_error or "用户或调度流程已取消当前逆向任务。",
+            status=status,
+            evidence=[
+                _abnormal_evidence("item_id", "子任务", latest_item.id if latest_item else None),
+                _abnormal_evidence("error_reason", "原始错误", latest_error),
+            ],
+            recommended_action="检查取消来源和最近一次状态同步记录。",
+            first_seen_at=first_seen_at,
+            last_seen_at=last_seen_at,
+        )
+    if latest_item is not None:
+        return _build_abnormal_reason(
+            category="downstream",
+            code="downstream_cancelled" if latest_item.status == "cancelled" else "downstream_failed",
+            title="子任务已取消" if latest_item.status == "cancelled" else "子任务失败",
+            message=latest_error or ("逆向子任务已被取消。" if latest_item.status == "cancelled" else "逆向子任务执行失败。"),
+            status=status,
+            evidence=[
+                _abnormal_evidence("item_id", "子任务", latest_item.id),
+                _abnormal_evidence("sequence_no", "序号", latest_item.sequence_no),
+                _abnormal_evidence("phase", "阶段", latest_item.phase),
+                _abnormal_evidence("error_reason", "原始错误", latest_item.error_reason),
+            ],
+            recommended_action="优先查看失败条目和对应 timeline 事件，必要时重试失败项。",
+            first_seen_at=latest_item.started_at or first_seen_at,
+            last_seen_at=latest_item.finished_at or latest_item.updated_at or last_seen_at,
+        )
+    if status == "partial":
+        return _build_abnormal_reason(
+            category="orchestration",
+            code="result_inconsistent",
+            title="任务部分成功",
+            message="任务已完成最终收口，但仍有部分条目仅部分成功。",
+            status=status,
+            evidence=[
+                _abnormal_evidence("success_items", "成功项", sum(1 for item in items if item.status == "success")),
+                _abnormal_evidence("partial_items", "部分成功项", sum(1 for item in items if item.status == "partial")),
+            ],
+            recommended_action="检查部分成功条目，确认最终产物是否完整，必要时重试未完全收口的条目。",
+            first_seen_at=first_seen_at,
+            last_seen_at=last_seen_at,
+        )
+    return _build_abnormal_reason(
+        category="orchestration",
+        code="unknown_abnormal",
+        title="任务异常结束",
+        message="任务以非正常状态结束，但未提取到更具体的异常原因。",
+        status=status,
+        evidence=[_abnormal_evidence("status", "状态", status)],
+        recommended_action="查看 timeline、条目状态和原始错误信息进一步定位。",
+        first_seen_at=first_seen_at,
+        last_seen_at=last_seen_at,
+    )
+
+
+def _abnormal_reason_history(db: Session, task_id: str) -> list[B2SAbnormalReasonEventSummary]:
+    rows = (
+        db.query(B2STaskEventModel)
+        .filter(B2STaskEventModel.task_id == task_id, B2STaskEventModel.event_type == "abnormal_reason_recorded")
+        .order_by(B2STaskEventModel.created_at.desc())
+        .limit(10)
+        .all()
+    )
+    history: list[B2SAbnormalReasonEventSummary] = []
+    for row in rows:
+        payload = dict(row.payload or {})
+        reason_payload = payload.get("reason") if isinstance(payload.get("reason"), dict) else None
+        if not isinstance(reason_payload, dict):
+            continue
+        try:
+            history.append(B2SAbnormalReasonEventSummary(event_id=row.id, created_at=row.created_at, reason=B2SAbnormalReason(**reason_payload)))
+        except Exception:
+            continue
+    return history
+
+
+def _sync_task_abnormal_reason(db: Session, task: B2STask, items: list[B2STaskItem]) -> None:
+    reason = _task_abnormal_reason(task, items)
+    next_payload = reason.model_dump(mode="json") if reason is not None else None
+    if task.latest_abnormal_reason == next_payload:
+        return
+    task.latest_abnormal_reason = next_payload
+    if reason is None:
+        return
+    _create_task_event(
+        db,
+        task_id=task.id,
+        project_id=task.project_id,
+        event_type="abnormal_reason_recorded",
+        message=reason.title,
+        source=TASK_EVENT_SOURCE_B2S,
+        level="warning" if reason.status in {"partial", "cancelled"} else "error",
+        status=reason.status,
+        payload={"reason": next_payload},
+        dedupe_key=_event_dedupe_key(task.id, "", "abnormal_reason_recorded", reason.code, reason.status, reason.message),
+    )
 
 
 def _build_task_event_summary(db: Session, task_id: str) -> B2STaskEventSummary:
@@ -2131,7 +2279,7 @@ def recompute_task_status(db: Session, task: B2STask) -> None:
     elif counts["failed_items"] == total:
         task.status = "failed"
     elif terminal_total == total:
-        task.status = "partial" if counts["success_items"] > 0 or counts["partial_items"] > 0 else "failed"
+        task.status = "partial" if counts["partial_items"] > 0 and counts["failed_items"] == 0 and counts["cancelled_items"] == 0 else "failed"
     elif active_total > 0:
         task.status = "running"
     elif waiting_total == total:
@@ -2141,10 +2289,11 @@ def recompute_task_status(db: Session, task: B2STask) -> None:
         # started even if the remaining items are still waiting in the local
         # dispatch queue for downstream capacity.
         task.status = "running"
-    elif counts["success_items"] > 0 and counts["failed_items"] + counts["cancelled_items"] > 0:
+    elif counts["partial_items"] > 0 and counts["failed_items"] == 0 and counts["cancelled_items"] == 0:
         task.status = "partial"
     else:
         task.status = "pending"
+    _sync_task_abnormal_reason(db, task, items)
     task.updated_at = now_local()
 
 
@@ -2447,6 +2596,14 @@ def build_task_response(db: Session, task: B2STask) -> TaskResponse:
     mode, mode_label = task_mode_summary(items)
     function_stats = build_task_function_stats(items)
     timing_summary = build_task_timing_summary(items)
+    abnormal_reason = None
+    if isinstance(task.latest_abnormal_reason, dict):
+        try:
+            abnormal_reason = B2SAbnormalReason(**task.latest_abnormal_reason)
+        except Exception:
+            abnormal_reason = None
+    if abnormal_reason is None:
+        abnormal_reason = _task_abnormal_reason(task, items)
     return TaskResponse(
         id=task.id,
         project_id=task.project_id,
@@ -2466,6 +2623,10 @@ def build_task_response(db: Session, task: B2STask) -> TaskResponse:
         run_duration_ms=timing_summary["run_duration_ms"],
         created_at=task.created_at,
         updated_at=task.updated_at,
+        abnormal_reason_title=abnormal_reason.title if abnormal_reason else None,
+        abnormal_reason_code=abnormal_reason.code if abnormal_reason else None,
+        abnormal_reason_category=abnormal_reason.category if abnormal_reason else None,
+        abnormal_reason=abnormal_reason,
         **counts,
     )
 
@@ -2515,6 +2676,7 @@ def build_task_detail(db: Session, task: B2STask) -> TaskDetailResponse:
         result_summary=build_task_result_summary(raw_items),
         observability_summary=build_task_observability_summary(raw_items),
         event_summary=_build_task_event_summary(db, task.id),
+        abnormal_reason_history=_abnormal_reason_history(db, task.id),
     )
 
 

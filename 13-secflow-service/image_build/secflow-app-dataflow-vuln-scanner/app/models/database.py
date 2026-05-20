@@ -98,6 +98,7 @@ class TriggerTask(Base):
     retry_count = Column(Integer, nullable=False, default=0)
     max_retry_count = Column(Integer, nullable=False, default=0)
     latest_execution_id = Column(String(64), nullable=True)
+    latest_abnormal_reason_json = Column(JSON, nullable=True)
     started_at = Column(DateTime)
     finished_at = Column(DateTime)
     message = Column(Text)
@@ -866,6 +867,7 @@ def run_auto_migrations() -> None:
         (tables["trigger_task"], "retry_count", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"),
         (tables["trigger_task"], "max_retry_count", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN max_retry_count INTEGER NOT NULL DEFAULT 0"),
         (tables["trigger_task"], "latest_execution_id", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN latest_execution_id VARCHAR(64) NULL"),
+        (tables["trigger_task"], "latest_abnormal_reason_json", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN latest_abnormal_reason_json {_column_sql(dialect, 'JSON')} NULL"),
         (tables["workflow_execution"], "workflow_definition_version_id", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN workflow_definition_version_id VARCHAR(64) NULL"),
         (tables["workflow_execution"], "attempt_no", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN attempt_no INTEGER NOT NULL DEFAULT 1"),
         (tables["workflow_execution"], "recovery_reason", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN recovery_reason VARCHAR(255) NULL"),

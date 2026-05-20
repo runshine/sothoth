@@ -64,6 +64,15 @@ class RecomputeTaskStatusTests(unittest.TestCase):
         with mock.patch.object(task_service, "query_items", return_value=items):
             task_service.recompute_task_status(db=mock.Mock(), task=task)
 
+        self.assertEqual("failed", task.status)
+
+    def test_partial_status_requires_final_partial_items_without_failed_or_cancelled(self) -> None:
+        task = _task()
+        items = [_item(1, "success"), _item(2, "partial")]
+
+        with mock.patch.object(task_service, "query_items", return_value=items):
+            task_service.recompute_task_status(db=mock.Mock(), task=task)
+
         self.assertEqual("partial", task.status)
 
     def test_all_success_items_complete_task(self) -> None:
