@@ -23,7 +23,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
       - name: secflow-app-entry-analyse
-        image: ghcr.io/runshine/secflow-app-entry-analyse:20260519-ba99276
+        image: ghcr.io/runshine/secflow-app-entry-analyse:20260521
         imagePullPolicy: Always
         env:
           - name: TZ
@@ -119,7 +119,7 @@ spec:
                   name: secflow-app-entry-analyse-scheduler
       containers:
       - name: secflow-app-entry-analyse-scheduler
-        image: ghcr.io/runshine/secflow-app-entry-analyse:20260519-ba99276
+        image: ghcr.io/runshine/secflow-app-entry-analyse:20260521
         imagePullPolicy: Always
         env:
           - name: TZ
@@ -206,7 +206,7 @@ spec:
                   name: secflow-app-entry-analyse-worker
       containers:
       - name: secflow-app-entry-analyse-worker
-        image: ghcr.io/runshine/secflow-app-entry-analyse:20260519-ba99276
+        image: ghcr.io/runshine/secflow-app-entry-analyse:20260521
         imagePullPolicy: Always
         env:
           - name: TZ
