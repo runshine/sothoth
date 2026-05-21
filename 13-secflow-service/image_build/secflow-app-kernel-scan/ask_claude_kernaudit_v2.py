@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-
-MARK_DONE = "[DONE]"
-MARK_FAILED = "[FAILED]"
 
 file_lock = threading.Lock()
 
@@ -25,30 +23,28 @@ def run_claude(prompt: str, model: str) -> tuple[str, bool]:
     return proc.stdout, True
 
 
-def strip_mark(line: str) -> tuple[str, str]:
-    s = line.rstrip()
-    for m in (MARK_DONE, MARK_FAILED):
-        if s.endswith(m):
-            return s[: -len(m)].rstrip(), m
-    return s, ""
+def load_progress(path: Path) -> dict:
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"done": [], "failed": []}
 
 
-def save_devlist(path: Path, lines: list[str]):
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+def save_progress(path: Path, progress: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def process_task(
-    idx: int,
-    line: str,
-    lines: list[str],
-    devlist_path: Path,
+    func_name: str,
+    progress: dict,
+    progress_path: Path,
     kernel_dir: str,
     report_dir: str,
     model: str,
-) -> tuple[int, str, bool]:
-    base, _ = strip_mark(line)
-    func_name = base.split()[0]
-
+) -> tuple[str, bool]:
     print(f"processing {func_name}", flush=True)
     prompt = (
         '加载kernel-security-audit，从攻击入口%s开始分析，找出所有内核漏洞,源码目录在："%s"，'
@@ -58,11 +54,14 @@ def process_task(
     _, success = run_claude(prompt, model)
 
     with file_lock:
-        lines[idx] = f"{base} {MARK_DONE if success else MARK_FAILED}"
-        save_devlist(devlist_path, lines)
+        if success:
+            progress["done"].append(func_name)
+        else:
+            progress["failed"].append(func_name)
+        save_progress(progress_path, progress)
 
-    print(f"done: {func_name}", flush=True)
-    return idx, func_name, success
+    print(f"done: {func_name} ({'ok' if success else 'FAILED'})", flush=True)
+    return func_name, success
 
 
 def main() -> int:
@@ -80,29 +79,37 @@ def main() -> int:
     report_dir = Path(args.report_dir)
     report_dir.mkdir(parents=True, exist_ok=True)
 
+    progress_path = report_dir / "audit_progress.json"
+    progress = load_progress(progress_path)
+    done_set = set(progress["done"])
+    failed_set = set(progress["failed"])
+
     lines = devlist_path.read_text(encoding="utf-8", errors="replace").splitlines()
 
     tasks = []
     skip_count = 0
-    for idx, line in enumerate(lines):
+    for line in lines:
         if not line.strip():
             continue
-        base, mark = strip_mark(line)
-        parts = base.split()
+        parts = line.strip().split()
         if not parts:
             continue
+        func_name = parts[0]
         type_ = parts[-1]
 
         if args.method_filter and args.method_filter not in type_:
             continue
-        if mark == MARK_DONE:
+        if func_name in done_set:
+            skip_count += 1
+            continue
+        if func_name in failed_set:
             skip_count += 1
             continue
 
-        tasks.append((idx, line))
+        tasks.append(func_name)
 
     if skip_count:
-        print(f"Skipped {skip_count} done entries")
+        print(f"Skipped {skip_count} done/failed entries")
 
     if not tasks:
         print("No tasks to process")
@@ -112,23 +119,29 @@ def main() -> int:
           f"| kernel={args.kernel_dir} | reports={report_dir} | model={args.model}",
           flush=True)
 
+    completed = 0
+    failed = 0
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
         futures = {
             executor.submit(
-                process_task, idx, line, lines, devlist_path,
+                process_task, func_name, progress, progress_path,
                 args.kernel_dir, str(report_dir), args.model,
-            ): (idx, line)
-            for idx, line in tasks
+            ): func_name
+            for func_name in tasks
         }
         for future in as_completed(futures):
+            func_name = futures[future]
             try:
-                future.result()
+                _, success = future.result()
+                if success:
+                    completed += 1
+                else:
+                    failed += 1
             except Exception as e:
-                _, line = futures[future]
-                base, _ = strip_mark(line)
-                print(f"error processing {base.split()[0]}: {e}")
+                failed += 1
+                print(f"error processing {func_name}: {e}")
 
-    print(f"All {len(tasks)} tasks completed")
+    print(f"All done: {completed} succeeded, {failed} failed, {skip_count} skipped")
     return 0
 
 
