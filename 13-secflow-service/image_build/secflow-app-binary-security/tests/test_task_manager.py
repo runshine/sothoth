@@ -7598,6 +7598,48 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         refs = self.manager._list_tasks_needing_downstream_sync(db)
         self.assertEqual([{"project_id": "p1", "task_id": "task1"}], refs)
 
+    def test_poll_until_terminal_preserves_downstream_cancelled_status(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+
+        async def _fetch():
+            return {"status": "cancelled", "error": "任务已取消"}
+
+        async def _noop_async(*_args, **_kwargs):
+            return None
+
+        original_ensure = self.manager._ensure_task_execution_current_async
+        original_touch = self.manager._touch_task_heartbeat_async
+        original_cancelled = self.manager._is_task_cancelled_async
+        self.manager._ensure_task_execution_current_async = _noop_async
+        self.manager._touch_task_heartbeat_async = _noop_async
+        self.manager._is_task_cancelled_async = unittest.mock.AsyncMock(return_value=False)
+        try:
+            status, payload = asyncio.run(
+                self.manager._poll_until_terminal(
+                    _fetch,
+                    success_statuses={"passed", "success"},
+                    failure_statuses={"failed", "error", "cancelled"},
+                    task=task,
+                )
+            )
+        finally:
+            self.manager._ensure_task_execution_current_async = original_ensure
+            self.manager._touch_task_heartbeat_async = original_touch
+            self.manager._is_task_cancelled_async = original_cancelled
+
+        self.assertEqual("cancelled", status)
+        self.assertEqual("cancelled", payload["status"])
+
     def test_run_task_ignores_stale_worker_failure_after_retry(self):
         task = BinarySecurityTask(
             id="task1",

@@ -10757,6 +10757,11 @@ class TaskManager:
             if status in success_statuses:
                 return "success", payload
             if status in failure_statuses:
+                mapped_status = self._map_downstream_status(status)
+                if mapped_status == "cancelled":
+                    return "cancelled", payload
+                if mapped_status == "downstream_missing":
+                    return "downstream_missing", payload
                 return "failed", payload
             if await self._is_task_cancelled_async(task.id):
                 if item and item.downstream_task_id:
