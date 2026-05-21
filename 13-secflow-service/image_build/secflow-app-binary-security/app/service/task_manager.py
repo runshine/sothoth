@@ -119,6 +119,7 @@ DB_SUMMARY_ITEM_LIMIT = 50
 DB_FAILURE_ITEM_LIMIT = 20
 DB_ENTRY_PREVIEW_LIMIT = 50
 DB_ARTIFACT_PREVIEW_LIMIT = 50
+DB_EVENT_PAYLOAD_LIMIT_BYTES = 32768
 MODULE_TASK_INPUT_KEY = "module-input"
 
 
@@ -4218,10 +4219,13 @@ class TaskManager:
         payload = dict(event.payload or {})
         stage_name = str(event.stage_name or payload.get("stage_name") or "").strip()
         status = str(payload.get("status") or "").strip()
-        summary = dict(payload.get("summary") or {})
         task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == event.task_id).first()
         if task is None or not stage_name or not status:
             return
+        payload = self._load_externalized_event_payload(task, payload)
+        stage_name = str(event.stage_name or payload.get("stage_name") or stage_name).strip()
+        status = str(payload.get("status") or status).strip()
+        summary = dict(payload.get("summary") or {})
         if task.status == "cancelled":
             self._record_event(
                 db,
@@ -5409,6 +5413,7 @@ class TaskManager:
                     continue
                 start_event = self._enqueue_state_event(
                     db,
+                    task=task,
                     task_id=task.id,
                     project_id=task.project_id,
                     stage_name=stage_name,
@@ -5438,6 +5443,7 @@ class TaskManager:
                 status, summary = await handler(db, task, stage_run, token, retry_existing)
                 self._enqueue_state_event(
                     db,
+                    task=task,
                     task_id=task.id,
                     project_id=task.project_id,
                     stage_name=stage_name,
@@ -7060,7 +7066,15 @@ class TaskManager:
             event_type=event_type,
             message=message,
         )
-        event.payload = payload or {}
+        event.payload = self._prepare_event_payload_for_db(
+            db,
+            task=task,
+            event_id=event.id,
+            event_type=event_type,
+            stage_name=stage_name,
+            payload=payload or {},
+            state_event=False,
+        )
         db.add(event)
 
     def _enqueue_state_event(
@@ -7075,6 +7089,7 @@ class TaskManager:
         item_id: str | None = None,
         archive_job_id: str | None = None,
         payload: dict[str, Any] | None = None,
+        task: BinarySecurityTask | None = None,
     ) -> BinarySecurityStateEvent | None:
         event = BinarySecurityStateEvent(
             id=f"sev_{uuid.uuid4().hex[:24]}",
@@ -7089,7 +7104,17 @@ class TaskManager:
             available_at=_now(),
             updated_at=_now(),
         )
-        event.payload = payload or {}
+        event.payload = self._prepare_event_payload_for_db(
+            db,
+            task=task,
+            event_id=event.id,
+            event_type=event_type,
+            stage_name=stage_name,
+            payload=payload or {},
+            state_event=True,
+            task_id=task_id,
+            project_id=project_id,
+        )
         try:
             with self._savepoint(db):
                 db.add(event)
@@ -8313,6 +8338,218 @@ class TaskManager:
             if isinstance(fitted.get(verbose_key), str):
                 fitted[verbose_key] = str(fitted[verbose_key])[:1000]
         return fitted
+
+    @staticmethod
+    def _json_payload_size_bytes(value: Any) -> int:
+        return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
+
+    def _event_payload_path(self, task: BinarySecurityTask, *, event_id: str, event_type: str, state_event: bool) -> Path:
+        folder_name = "state-event-payloads" if state_event else "timeline-event-payloads"
+        return Path(task.workspace_root) / "run" / folder_name / f"{event_id}_{_slug(event_type)}.json"
+
+    def _event_payload_preview_value(self, value: Any, *, depth: int = 0) -> Any:
+        if depth >= 2:
+            if isinstance(value, dict):
+                return {"field_count": len(value)}
+            if isinstance(value, list):
+                return {"item_count": len(value)}
+            if isinstance(value, str):
+                return value[:200]
+            return value
+        if isinstance(value, dict):
+            preview: dict[str, Any] = {}
+            for index, (key, current) in enumerate(value.items()):
+                if index >= 8:
+                    preview["preview_truncated"] = True
+                    break
+                if isinstance(current, (dict, list)):
+                    preview[f"{key}_count"] = len(current)
+                    preview[f"{key}_preview"] = self._event_payload_preview_value(current, depth=depth + 1)
+                elif isinstance(current, str):
+                    preview[key] = current[:500]
+                else:
+                    preview[key] = current
+            return preview
+        if isinstance(value, list):
+            return [self._event_payload_preview_value(current, depth=depth + 1) for current in value[:3]]
+        if isinstance(value, str):
+            return value[:500]
+        return value
+
+    def _fit_event_payload_for_db(self, compact: dict[str, Any], *, max_bytes: int = DB_EVENT_PAYLOAD_LIMIT_BYTES) -> dict[str, Any]:
+        payload = dict(compact or {})
+        if self._json_payload_size_bytes(payload) <= max_bytes:
+            return payload
+        for key in list(payload.keys()):
+            value = payload.get(key)
+            if isinstance(value, list):
+                payload[f"{key}_count"] = len(value)
+                payload[key] = value[:1]
+            elif isinstance(value, dict) and key.endswith("_preview"):
+                payload[key] = self._event_payload_preview_value(value, depth=1)
+            elif isinstance(value, str) and len(value) > 1000:
+                payload[key] = value[:1000]
+        if self._json_payload_size_bytes(payload) <= max_bytes:
+            return payload
+        minimal = {
+            key: value
+            for key, value in payload.items()
+            if key in {
+                "payload_externalized",
+                "payload_file",
+                "summary_externalized",
+                "summary_file",
+                "stage_name",
+                "status",
+                "stage_retry_mode",
+                "task_retry_mode",
+                "target_stage_name",
+                "error",
+                "reason",
+            }
+        }
+        minimal["db_payload_truncated"] = True
+        return minimal
+
+    def _resolve_task_for_event_payload(
+        self,
+        db: Session,
+        *,
+        task: BinarySecurityTask | None,
+        task_id: str | None,
+        project_id: str | None,
+    ) -> BinarySecurityTask | None:
+        if task is not None:
+            return task
+        if not task_id or not project_id:
+            return None
+        return db.query(BinarySecurityTask).filter(
+            BinarySecurityTask.id == task_id,
+            BinarySecurityTask.project_id == project_id,
+        ).first()
+
+    def _compact_state_terminal_payload_for_db(
+        self,
+        db: Session,
+        *,
+        task: BinarySecurityTask,
+        stage_name: str | None,
+        payload: dict[str, Any],
+        payload_file: str | None,
+    ) -> dict[str, Any]:
+        compact = {
+            "stage_name": payload.get("stage_name") or stage_name,
+            "status": payload.get("status"),
+            "stage_retry_mode": bool(payload.get("stage_retry_mode")),
+            "task_retry_mode": bool(payload.get("task_retry_mode")),
+            "target_stage_name": payload.get("target_stage_name"),
+            "payload_externalized": bool(payload_file),
+        }
+        if payload_file:
+            compact["payload_file"] = payload_file
+        summary = dict(payload.get("summary") or {})
+        stage_run = None
+        effective_stage_name = str(compact.get("stage_name") or "").strip()
+        if effective_stage_name:
+            stage_run = db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == effective_stage_name,
+            ).first()
+        if stage_run is not None:
+            summary_compact = self._compact_stage_output_summary_for_db(
+                task,
+                stage_run,
+                summary,
+                summary_file=payload_file,
+            )
+        else:
+            summary_compact = self._fit_event_payload_for_db(
+                {
+                    "summary_externalized": bool(payload_file),
+                    "summary_file": payload_file,
+                    "summary_preview": self._event_payload_preview_value(summary),
+                }
+            )
+        compact["summary"] = summary_compact
+        return self._fit_event_payload_for_db(compact)
+
+    def _compact_generic_event_payload_for_db(self, payload: dict[str, Any], *, payload_file: str | None) -> dict[str, Any]:
+        compact: dict[str, Any] = {
+            "payload_externalized": bool(payload_file),
+        }
+        if payload_file:
+            compact["payload_file"] = payload_file
+        for key, value in (payload or {}).items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                compact[key] = value[:1000] if isinstance(value, str) else value
+            elif isinstance(value, list):
+                compact[f"{key}_count"] = len(value)
+                compact[f"{key}_preview"] = self._event_payload_preview_value(value)
+            elif isinstance(value, dict):
+                compact[f"{key}_preview"] = self._event_payload_preview_value(value)
+        return self._fit_event_payload_for_db(compact)
+
+    def _prepare_event_payload_for_db(
+        self,
+        db: Session,
+        *,
+        task: BinarySecurityTask | None,
+        event_id: str,
+        event_type: str,
+        stage_name: str | None,
+        payload: dict[str, Any],
+        state_event: bool,
+        task_id: str | None = None,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_payload = dict(payload or {})
+        if self._json_payload_size_bytes(normalized_payload) <= DB_EVENT_PAYLOAD_LIMIT_BYTES:
+            return normalized_payload
+        resolved_task = self._resolve_task_for_event_payload(
+            db,
+            task=task,
+            task_id=task_id,
+            project_id=project_id,
+        )
+        payload_file: str | None = None
+        if resolved_task is not None and str(resolved_task.workspace_root or "").strip():
+            try:
+                path = self._event_payload_path(
+                    resolved_task,
+                    event_id=event_id,
+                    event_type=event_type,
+                    state_event=state_event,
+                )
+                _write_json(path, normalized_payload)
+                payload_file = str(path)
+            except Exception:
+                payload_file = None
+        if state_event and event_type == "stage_worker_terminal_observed" and resolved_task is not None:
+            return self._compact_state_terminal_payload_for_db(
+                db,
+                task=resolved_task,
+                stage_name=stage_name,
+                payload=normalized_payload,
+                payload_file=payload_file,
+            )
+        return self._compact_generic_event_payload_for_db(normalized_payload, payload_file=payload_file)
+
+    def _load_externalized_event_payload(self, task: BinarySecurityTask, payload: dict[str, Any] | None) -> dict[str, Any]:
+        normalized_payload = dict(payload or {})
+        payload_file = str(normalized_payload.get("payload_file") or "").strip()
+        if not payload_file:
+            return normalized_payload
+        candidate = Path(payload_file)
+        if not candidate.is_absolute():
+            candidate = Path(task.workspace_root) / candidate
+        try:
+            if candidate.is_file():
+                loaded = json.loads(candidate.read_text(encoding="utf-8") or "{}")
+                if isinstance(loaded, dict):
+                    return loaded
+        except Exception:
+            return normalized_payload
+        return normalized_payload
 
     def _persist_stage_run_output_summary(
         self,

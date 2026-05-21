@@ -3272,6 +3272,154 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(20, compact["items_preview"][0]["entry_count"])
             self.assertLessEqual(len(compact["items_preview"][0]["entries_preview"]), 5)
 
+    def test_enqueue_state_event_externalizes_large_stage_terminal_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="demo",
+                status="running",
+                task_type=TASK_TYPE_SOURCE,
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            stage_run = BinarySecurityStageRun(
+                id="sr1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="running",
+            )
+            payload = {
+                "stage_name": "entry_analysis",
+                "status": "running",
+                "summary": {
+                    "items": [
+                        {
+                            "module_key": "m1",
+                            "module_name": "module-1",
+                            "source_dir": "/src/module-1",
+                            "artifact_root": "/out/module-1",
+                            "entries": [
+                                {
+                                    "entry_key": f"e{i}",
+                                    "function_name": f"fn{i}",
+                                    "file_name": "a.c",
+                                    "line_no": i,
+                                    "function_description": f"desc-{i}" * 8,
+                                    "entry_reason": f"reason-{i}" * 8,
+                                }
+                                for i in range(240)
+                            ],
+                        }
+                    ],
+                    "success_count": 1,
+                    "failed_count": 0,
+                    "entry_count": 240,
+                },
+                "stage_retry_mode": False,
+                "task_retry_mode": False,
+                "target_stage_name": None,
+            }
+            db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run])
+
+            event = self.manager._enqueue_state_event(
+                db,
+                task=task,
+                task_id=task.id,
+                project_id=task.project_id,
+                stage_name="entry_analysis",
+                event_type="stage_worker_terminal_observed",
+                idempotency_key="terminal:t1:entry_analysis:running",
+                payload=payload,
+            )
+
+            self.assertIsNotNone(event)
+            payload_file = workspace / "run" / "state-event-payloads" / f"{event.id}_stage_worker_terminal_observed.json"
+            self.assertTrue(payload_file.is_file())
+            self.assertTrue(event.payload["payload_externalized"])
+            self.assertEqual(str(payload_file), event.payload["payload_file"])
+            self.assertEqual(240, event.payload["summary"]["entry_count"])
+            self.assertLessEqual(self.manager._json_payload_size_bytes(event.payload), task_manager_module.DB_EVENT_PAYLOAD_LIMIT_BYTES)
+
+    def test_apply_stage_worker_terminal_event_loads_externalized_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="demo",
+                status="running",
+                current_stage="entry_analysis",
+                task_type=TASK_TYPE_SOURCE,
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+                started_at=_now(),
+            )
+            stage_run = BinarySecurityStageRun(
+                id="sr1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="running",
+                started_at=_now(),
+            )
+            payload = {
+                "stage_name": "entry_analysis",
+                "status": "running",
+                "summary": {
+                    "items": [
+                        {
+                            "module_key": "m1",
+                            "module_name": "module-1",
+                            "source_dir": "/src/module-1",
+                            "artifact_root": "/out/module-1",
+                            "entries": [
+                                {
+                                    "entry_key": f"e{i}",
+                                    "function_name": f"fn{i}",
+                                    "file_name": "a.c",
+                                    "line_no": i,
+                                    "function_description": f"desc-{i}" * 12,
+                                    "entry_reason": f"reason-{i}" * 12,
+                                }
+                                for i in range(240)
+                            ],
+                        }
+                    ],
+                    "success_count": 1,
+                    "failed_count": 0,
+                    "entry_count": 240,
+                },
+            }
+            db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], events=[])
+            event = self.manager._enqueue_state_event(
+                db,
+                task=task,
+                task_id=task.id,
+                project_id=task.project_id,
+                stage_name="entry_analysis",
+                event_type="stage_worker_terminal_observed",
+                idempotency_key="terminal:t1:entry_analysis:running",
+                payload=payload,
+            )
+
+            asyncio.run(self.manager._apply_stage_worker_terminal_event_locked(db, event))
+
+            summary_file = workspace / "run" / "stage-summaries" / "02_entry_analysis.json"
+            self.assertTrue(summary_file.is_file())
+            stored = json.loads(summary_file.read_text(encoding="utf-8"))
+            self.assertEqual(240, len(stored["items"][0]["entries"]))
+            self.assertEqual(240, task.metrics["entry_count"])
+            self.assertEqual("running", task.status)
+
     def test_update_task_concurrency_updates_binary_stage_parallelism(self):
         task = BinarySecurityTask(
             id="t1",
