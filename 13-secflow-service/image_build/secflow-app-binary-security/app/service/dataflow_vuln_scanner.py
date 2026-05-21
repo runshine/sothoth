@@ -50,6 +50,24 @@ class DataflowVulnScannerClient(JsonHttpClient):
     async def get_task(self, task_id: str, token: str) -> dict:
         return await self.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}", token=token)
 
+    async def list_tasks(
+        self,
+        project_id: str,
+        token: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        status: str | None = None,
+    ) -> list[dict]:
+        params: dict[str, Any] = {
+            "project_id": project_id,
+            "limit": limit,
+            "offset": offset,
+        }
+        if status:
+            params["status"] = status
+        return await self.get("/api/dataflow-vuln-scanner/tasks", token=token, params=params)
+
     async def get_artifacts(self, task_id: str, token: str) -> dict:
         return await self.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/artifacts", token=token)
 

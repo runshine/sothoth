@@ -55,6 +55,12 @@ class _FakeQuery:
     def group_by(self, *args, **kwargs):
         return self
 
+    def join(self, *args, **kwargs):
+        return self
+
+    def distinct(self, *args, **kwargs):
+        return self
+
     def options(self, *args, **kwargs):
         return self
 
@@ -282,6 +288,80 @@ class _AsyncBinaryToSourceClientStub:
         if self.fail_on_create:
             raise AssertionError("create_task should not be called")
         return {"id": "b2s-created"}
+
+
+class _AsyncEntryAnalyseClientStub:
+    def __init__(self, *, listed=None, fetched=None, fail_on_create=False):
+        self.listed = listed or {"items": []}
+        self.fetched = fetched or {}
+        self.fail_on_create = fail_on_create
+        self.created = 0
+
+    async def list_tasks(self, *args, **kwargs):
+        del args, kwargs
+        return self.listed
+
+    async def get_task(self, task_id, token=None):
+        del token
+        return dict(self.fetched.get(task_id) or {"task_id": task_id, "status": "passed"})
+
+    async def create_task(self, *args, **kwargs):
+        del args, kwargs
+        self.created += 1
+        if self.fail_on_create:
+            raise AssertionError("create_task should not be called")
+        return {"task_id": "eat-created"}
+
+
+class _AsyncFirmwareUnpackerClientStub:
+    def __init__(self, *, listed=None, fetched=None, fail_on_create=False):
+        self.listed = listed or {"items": []}
+        self.fetched = fetched or {}
+        self.fail_on_create = fail_on_create
+        self.created = 0
+
+    async def list_tasks(self, *args, **kwargs):
+        del args, kwargs
+        return self.listed
+
+    async def get_task(self, project_id, task_id, token):
+        del project_id, token
+        return dict(self.fetched.get(task_id) or {"task_id": task_id, "status": "success"})
+
+    async def create_task(self, *args, **kwargs):
+        del args, kwargs
+        self.created += 1
+        if self.fail_on_create:
+            raise AssertionError("create_task should not be called")
+        return {"task_id": "fu-created"}
+
+
+class _AsyncDataflowVulnScannerClientStub:
+    def __init__(self, *, listed=None, fetched=None, artifacts=None, fail_on_create=False):
+        self.listed = listed or []
+        self.fetched = fetched or {}
+        self.artifacts = artifacts or {"workspace_root": "/tmp"}
+        self.fail_on_create = fail_on_create
+        self.created = 0
+
+    async def list_tasks(self, *args, **kwargs):
+        del args, kwargs
+        return self.listed
+
+    async def get_task(self, task_id, token):
+        del token
+        return dict(self.fetched.get(task_id) or {"task_id": task_id, "status": "completed"})
+
+    async def get_artifacts(self, task_id, token):
+        del task_id, token
+        return dict(self.artifacts)
+
+    async def create_task(self, *args, **kwargs):
+        del args, kwargs
+        self.created += 1
+        if self.fail_on_create:
+            raise AssertionError("create_task should not be called")
+        return {"task_id": "dfvs-created"}
 
 
 class TaskManagerTests(unittest.TestCase):
@@ -761,6 +841,59 @@ class TaskManagerTests(unittest.TestCase):
                 self.assertTrue(any(row.event_type == "stage_worker_terminal_ignored" for row in db.query(BinarySecurityEvent).all()))
             finally:
                 db.close()
+
+    def test_stage_worker_terminal_event_keeps_task_active_when_waiting_downstream_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="source",
+                status="running",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="entry_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(Path(tmp) / "output"),
+                workspace_root=tmp,
+                started_at=_now(),
+                dispatcher_instance_id="pod-a",
+                dispatch_started_at=_now(),
+            )
+            stage_run = BinarySecurityStageRun(
+                id="sr1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="running",
+                started_at=_now(),
+            )
+            event = BinarySecurityStateEvent(
+                id="sev-active-terminal",
+                task_id="t1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                event_type="stage_worker_terminal_observed",
+                idempotency_key="sev-active-terminal",
+                status="processing",
+                available_at=_now(),
+            )
+            event.payload = {
+                "stage_name": "entry_analysis",
+                "status": "running",
+                "summary": {"running_count": 1, "failed_count": 0},
+            }
+            db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run])
+
+            asyncio.run(self.manager._apply_stage_worker_terminal_event_locked(db, event))
+
+            self.assertEqual("running", task.status)
+            self.assertEqual("entry_analysis", task.current_stage)
+            self.assertIsNone(task.dispatcher_instance_id)
+            self.assertIsNone(task.finished_at)
+            self.assertEqual("running", stage_run.status)
+            self.assertIsNone(stage_run.finished_at)
+            self.assertTrue(any(row.event_type == "stage_waiting_downstream_progress" for row in db.events))
 
     def test_refresh_task_status_after_sync_does_not_resurrect_cancelled_task(self):
         task = BinarySecurityTask(
@@ -7435,46 +7568,35 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([], refs)
 
-    def test_list_tasks_needing_downstream_sync_excludes_failed_tasks_even_with_retry_target_stage(self):
-        engine = create_engine("sqlite:///:memory:")
-        TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-        Base.metadata.create_all(bind=engine)
-        db = TestingSessionLocal()
-        try:
-            task = BinarySecurityTask(
-                id="task1",
-                project_id="p1",
-                name="n",
-                status="failed",
-                current_stage="entry_analysis",
-                execution_mode="stage_retry_full",
-                target_stage_name="system_analysis",
-                task_type=TASK_TYPE_BINARY,
-                firmware_source="project_filesystem",
-                firmware_path="/fw.bin",
-                output_root="/o",
-                workspace_root="/w",
-            )
-            retry_target_item = BinarySecurityStageItem(
-                id="si1",
-                task_id="task1",
-                project_id="p1",
-                stage_run_id="sr1",
-                stage_name="system_analysis",
-                item_key="k1",
-                status="failed",
-                downstream_service="system_analyse",
-                downstream_task_id="sat-1",
-            )
-            db.add(task)
-            db.add(retry_target_item)
-            db.commit()
-
-            refs = self.manager._list_tasks_needing_downstream_sync(db)
-        finally:
-            db.close()
-
-        self.assertEqual([], refs)
+    def test_list_tasks_needing_downstream_sync_includes_failed_tasks_when_retry_target_stage_is_active(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            current_stage="entry_analysis",
+            execution_mode="stage_retry_full",
+            target_stage_name="system_analysis",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw.bin",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        retry_target_item = BinarySecurityStageItem(
+            id="si1",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="system_analysis",
+            item_key="k1",
+            status="failed",
+            downstream_service="system_analyse",
+            downstream_task_id="sat-1",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[retry_target_item])
+        refs = self.manager._list_tasks_needing_downstream_sync(db)
+        self.assertEqual([{"project_id": "p1", "task_id": "task1"}], refs)
 
     def test_run_task_ignores_stale_worker_failure_after_retry(self):
         task = BinarySecurityTask(
@@ -8174,6 +8296,128 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("b2s-running", payload["id"])
         self.assertEqual("b2s-running", item.downstream_task_id)
 
+    def test_find_reusable_entry_payload_prefers_active_duplicate_task(self):
+        task = BinarySecurityTask(id="t1", project_id="p1")
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-old",
+            status="queued",
+        )
+        client = _AsyncEntryAnalyseClientStub(
+            listed={
+                "items": [
+                    {"task_id": "eat-passed", "status": "passed", "parent_stage_item_id": "si1", "updated_at": "2026-05-18T23:32:56"},
+                    {"task_id": "eat-running", "status": "running", "parent_stage_item_id": "si1", "updated_at": "2026-05-18T23:34:41"},
+                ]
+            }
+        )
+
+        with patch.object(task_manager_module, "get_entry_analyse_client", return_value=client):
+            payload = asyncio.run(self.manager._find_reusable_entry_payload(task, item, "tok"))
+
+        self.assertIsNotNone(payload)
+        self.assertEqual("eat-running", payload["task_id"])
+        self.assertEqual("eat-running", item.downstream_task_id)
+
+    def test_find_reusable_firmware_unpack_payload_prefers_active_duplicate_task(self):
+        task = BinarySecurityTask(id="t1", project_id="p1")
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            item_key="fw-1",
+            downstream_service="firmware_unpacker",
+            downstream_task_id="fu-old",
+            status="queued",
+        )
+        client = _AsyncFirmwareUnpackerClientStub(
+            listed={
+                "items": [
+                    {"task_id": "fu-passed", "status": "success", "parent_task_id": "t1", "parent_stage_item_id": "si1", "updated_at": "2026-05-18T23:32:56"},
+                    {"task_id": "fu-running", "status": "running", "parent_task_id": "t1", "parent_stage_item_id": "si1", "updated_at": "2026-05-18T23:34:41"},
+                ]
+            }
+        )
+
+        with patch.object(task_manager_module, "get_firmware_unpacker_client", return_value=client):
+            payload = asyncio.run(self.manager._find_reusable_firmware_unpack_payload(task, item, "tok"))
+
+        self.assertIsNotNone(payload)
+        self.assertEqual("fu-running", payload["task_id"])
+        self.assertEqual("fu-running", item.downstream_task_id)
+
+    def test_find_reusable_vuln_payload_prefers_active_duplicate_task(self):
+        task = BinarySecurityTask(id="t1", project_id="p1")
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="vuln_scan",
+            item_key="entry-1",
+            downstream_service="dataflow_vuln_scanner",
+            downstream_task_id="dfvs-old",
+            status="queued",
+        )
+        client = _AsyncDataflowVulnScannerClientStub(
+            listed=[
+                {"task_id": "dfvs-passed", "status": "completed", "parent_task_id": "t1", "parent_stage_item_id": "si1"},
+                {"task_id": "dfvs-running", "status": "running", "parent_task_id": "t1", "parent_stage_item_id": "si1"},
+            ]
+        )
+
+        with patch.object(task_manager_module, "get_dataflow_vuln_scanner_client", return_value=client):
+            payload = asyncio.run(self.manager._find_reusable_vuln_payload(task, item, "tok"))
+
+        self.assertIsNotNone(payload)
+        self.assertEqual("dfvs-running", payload["task_id"])
+        self.assertEqual("dfvs-running", item.downstream_task_id)
+
+    def test_duplicate_downstream_refs_for_item_skips_kept_task_id(self):
+        task = BinarySecurityTask(id="t1", project_id="p1")
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-keep",
+            status="running",
+        )
+        client = _AsyncEntryAnalyseClientStub(
+            listed={
+                "items": [
+                    {"task_id": "eat-keep", "status": "running", "parent_stage_item_id": "si1"},
+                    {"task_id": "eat-old-1", "status": "failed", "parent_stage_item_id": "si1"},
+                    {"task_id": "eat-old-2", "status": "cancelled", "parent_stage_item_id": "si1"},
+                ]
+            }
+        )
+
+        with patch.object(task_manager_module, "get_entry_analyse_client", return_value=client):
+            refs = asyncio.run(
+                self.manager._duplicate_downstream_refs_for_item(
+                    task,
+                    item,
+                    "tok",
+                    keep_task_ids={"eat-keep"},
+                )
+            )
+
+        self.assertEqual(
+            [
+                {"service": "entry_analyse", "task_id": "eat-old-1", "project_id": "p1", "stage_name": "entry_analysis"},
+                {"service": "entry_analyse", "task_id": "eat-old-2", "project_id": "p1", "stage_name": "entry_analysis"},
+            ],
+            refs,
+        )
+
     def test_run_b2s_item_reuses_active_downstream_task_instead_of_creating_new_one(self):
         task = BinarySecurityTask(
             id="t1",
@@ -8466,6 +8710,183 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("success", item.status)
         self.assertIsNone(item.error_message)
 
+    def test_run_entry_item_reuses_duplicate_downstream_task_before_create(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="source-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="mod",
+            parent_key="fw-1",
+            downstream_service="entry_analyse",
+            downstream_task_id="ea-old",
+            status="failed",
+            output_ref={},
+        )
+        module = {
+            "module_key": "module-1",
+            "module_name": "mod",
+            "firmware_key": "fw-1",
+            "source_dir": "/tmp/src",
+        }
+        fake_session = _ModelAwareDb()
+        client = _AsyncEntryAnalyseClientStub(fail_on_create=True)
+
+        async def fake_poll(*args, **kwargs):
+            del args, kwargs
+            return "success", {"task_id": "ea-live", "status": "passed"}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(task_manager_module, "get_entry_analyse_client", return_value=client),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_active_downstream_payload", return_value=None),
+            patch.object(self.manager, "_find_reusable_entry_payload", return_value={"task_id": "ea-live", "status": "running"}),
+            patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
+            patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
+            patch.object(self.manager, "_parse_entries", return_value=[]),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+            patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
+        ):
+            result = asyncio.run(self.manager._run_entry_item(task, stage_run, module, token="tok", retrying=False))
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual("ea-live", item.downstream_task_id)
+        self.assertEqual("success", item.status)
+
+    def test_run_firmware_item_reuses_duplicate_downstream_task_before_create(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="fw-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            sequence_no=1,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            item_key="fw-1",
+            item_name="a.bin",
+            parent_key="fw-1",
+            downstream_service="firmware_unpacker",
+            downstream_task_id="fu-old",
+            status="failed",
+            output_ref={"downstream_service": "firmware_unpacker"},
+        )
+        input_file = {"firmware_key": "fw-1", "filename": "a.bin"}
+        fake_session = _ModelAwareDb()
+        client = _AsyncFirmwareUnpackerClientStub(fail_on_create=True)
+
+        async def fake_poll(*args, **kwargs):
+            del args, kwargs
+            return "success", {"task_id": "fu-live", "status": "success"}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(task_manager_module, "get_firmware_unpacker_client", return_value=client),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_active_downstream_payload", return_value=None),
+            patch.object(self.manager, "_find_reusable_firmware_unpack_payload", return_value={"task_id": "fu-live", "status": "running"}),
+            patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+            patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
+        ):
+            result = asyncio.run(self.manager._run_firmware_item(task, stage_run, input_file, token="tok", retrying=False))
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual("fu-live", item.downstream_task_id)
+        self.assertEqual("success", item.status)
+
+    def test_run_vuln_item_reuses_duplicate_downstream_task_before_create(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="scan-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="vuln_scan",
+            sequence_no=4,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="vuln_scan",
+            item_key="entry-1",
+            item_name="main",
+            parent_key="module-1",
+            downstream_service="dataflow_vuln_scanner",
+            downstream_task_id="dfvs-old",
+            status="failed",
+            output_ref={},
+        )
+        dataflow_result = {
+            "entry_key": "entry-1",
+            "function_name": "main",
+            "module_key": "module-1",
+            "data_flow_file": "/tmp/flow.md",
+            "source_dir": "/tmp/src",
+        }
+        fake_session = _ModelAwareDb()
+        client = _AsyncDataflowVulnScannerClientStub(fail_on_create=True)
+
+        async def fake_poll(*args, **kwargs):
+            del args, kwargs
+            return "success", {"task_id": "dfvs-live", "status": "completed"}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(task_manager_module, "get_dataflow_vuln_scanner_client", return_value=client),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_active_downstream_payload", return_value=None),
+            patch.object(self.manager, "_find_reusable_vuln_payload", return_value={"task_id": "dfvs-live", "status": "running"}),
+            patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+        ):
+            result = asyncio.run(self.manager._run_vuln_item(task, stage_run, dataflow_result, token="tok", retrying=False))
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual("dfvs-live", item.downstream_task_id)
+        self.assertEqual("success", item.status)
+
     def test_run_entry_item_uses_descriptor_contract_for_binary_module(self):
         task = BinarySecurityTask(
             id="t1",
@@ -8665,6 +9086,64 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("failed", item.status)
         self.assertEqual("result_json too large", item.error_message)
         self.assertGreaterEqual(fake_session.rollback_calls, 1)
+
+    def test_run_entry_item_defers_transport_error_when_downstream_is_temporarily_unreachable(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="source-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="mod",
+            parent_key="fw-1",
+            downstream_service="entry_analyse",
+            downstream_task_id="ea-old",
+            status="running",
+            output_ref={},
+        )
+        module = {
+            "module_key": "module-1",
+            "module_name": "mod",
+            "firmware_key": "fw-1",
+            "source_dir": "/tmp/src",
+        }
+        fake_session = _AppendingModelAwareDb()
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(
+                self.manager,
+                "_control_existing_downstream_task",
+                return_value={"outcome": "already_running", "payload": {"task_id": "ea-old", "status": "running"}},
+            ),
+            patch.object(self.manager, "_poll_until_terminal", side_effect=UpstreamError("无法连接下游服务: All connection attempts failed")),
+        ):
+            result = asyncio.run(self.manager._run_entry_item(task, stage_run, module, token="tok", retrying=True))
+
+        deferred_events = [event for event in fake_session.events if event.event_type == "downstream_transport_deferred"]
+        self.assertEqual("running", result["status"])
+        self.assertEqual("running", item.status)
+        self.assertEqual("无法连接下游服务: All connection attempts failed", item.error_message)
+        self.assertTrue(deferred_events)
+        self.assertEqual("reconcile", deferred_events[-1].payload.get("deferred_mode"))
 
 
 if __name__ == "__main__":

@@ -27,6 +27,23 @@ class FirmwareUnpackerClient(JsonHttpClient):
     async def get_task(self, project_id: str, task_id: str, token: str) -> dict:
         return await self.get(f"/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}", token=token)
 
+    async def list_tasks(
+        self,
+        project_id: str,
+        token: str,
+        *,
+        origin_mode: str | None = "linked",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict:
+        params: dict[str, Any] = {
+            "limit": limit,
+            "offset": offset,
+        }
+        if origin_mode:
+            params["origin_mode"] = origin_mode
+        return await self.get(f"/api/app/firmware-unpacker/projects/{project_id}/tasks", token=token, params=params)
+
     async def cancel_task(self, task_id: str, token: str) -> dict:
         return await self.post(f"/api/app/firmware-unpacker/tasks/{task_id}/cancel", token=token)
 
