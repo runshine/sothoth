@@ -4,21 +4,19 @@ metadata:
   name: secflow-app-dataflow-analyse
   namespace: secflow-ns
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       name: secflow-app-dataflow-analyse
-      role: api
   template:
     metadata:
       labels:
         name: secflow-app-dataflow-analyse
-        role: api
     spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-app-dataflow-analyse
-        image: ghcr.io/runshine/secflow-app-dataflow-analyse:20260519-ba99276
+        image: 172.31.30.52:5000/secflow-app-dataflow-analyse:latest
         imagePullPolicy: Always
         env:
           - name: TZ
@@ -29,22 +27,6 @@ spec:
             value: /app/service.yaml
           - name: FILESERVER_ROOT
             value: /data/files
-          - name: DFA_AGENT_TIMEOUT_SECONDS
-            value: "900"
-          - name: DFA_ROLE
-            value: api
-          - name: DFA_ENABLE_PUBLIC_API
-            value: "true"
-          - name: DFA_ENABLE_DISPATCHER
-            value: "false"
-          - name: DFA_ENABLE_EXECUTOR
-            value: "false"
-          - name: DFA_ENABLE_REGISTRY
-            value: "true"
-          - name: DFA_CLUSTER_EXPECTED_WORKERS
-            value: "6"
-          - name: DFA_CLUSTER_EXPECTED_WORKER_CAPACITY
-            value: "4"
         ports:
         - containerPort: 8080
         volumeMounts:
@@ -55,33 +37,23 @@ spec:
           mountPath: /data
         resources:
           requests:
-            memory: "4Gi"
-            cpu: "2"
+            memory: "256Mi"
+            cpu: "200m"
           limits:
-            memory: "4Gi"
-            cpu: "2"
-        startupProbe:
-          httpGet:
-            path: /api/app/dataflow-analyse/health
-            port: 8080
-          periodSeconds: 10
-          failureThreshold: 18
+            memory: "1Gi"
+            cpu: "1000m"
         livenessProbe:
           httpGet:
             path: /api/app/dataflow-analyse/health
             port: 8080
-          initialDelaySeconds: 60
+          initialDelaySeconds: 30
           periodSeconds: 30
-          timeoutSeconds: 5
-          failureThreshold: 6
         readinessProbe:
           httpGet:
             path: /api/app/dataflow-analyse/health
             port: 8080
-          initialDelaySeconds: 20
+          initialDelaySeconds: 15
           periodSeconds: 15
-          timeoutSeconds: 5
-          failureThreshold: 6
       volumes:
       - name: secflow-app-dataflow-analyse-config
         configMap:
