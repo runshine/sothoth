@@ -518,7 +518,10 @@ def run_preprocess(
     if fmt in ("cramfs", "romfs"):
         for tool_cmd, method in (
             (["7z", "x", firmware_path, f"-o{output_path}", "-y"], "7z x"),
-            (["binwalk", "-eM", "--directory", output_path, firmware_path], "binwalk -eM"),
+            (
+                ["binwalk", "-eM", "--run-as=root", "--directory", output_path, firmware_path],
+                "binwalk -eM --run-as=root",
+            ),
         ):
             log_event(
                 log,
@@ -538,16 +541,16 @@ def run_preprocess(
         log_event(
             log,
             logging.DEBUG,
-            "[Stage1] trying: binwalk -eM",
+            "[Stage1] trying: binwalk -eM --run-as=root",
             event="preprocess_try_tool",
-            tool="binwalk -eM",
+            tool="binwalk -eM --run-as=root",
             firmware=firmware_name,
         )
-        proc = _run(["binwalk", "-eM", "--directory", output_path, firmware_path])
+        proc = _run(["binwalk", "-eM", "--run-as=root", "--directory", output_path, firmware_path])
         if proc.returncode == 0:
-            _record("binwalk -eM", proc, success=True)
-            return _success("binwalk -eM")
-        _record("binwalk -eM", proc)
+            _record("binwalk -eM --run-as=root", proc, success=True)
+            return _success("binwalk -eM --run-as=root")
+        _record("binwalk -eM --run-as=root", proc)
 
     log_event(
         log,

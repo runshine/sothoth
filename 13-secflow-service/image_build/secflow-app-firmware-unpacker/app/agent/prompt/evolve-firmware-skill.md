@@ -55,6 +55,7 @@ Rules:
 14. The tool must be efficient on large firmware:
    - Do not use full-file byte-by-byte gzip/signature scanning as the primary extraction strategy.
    - Prefer `binwalk` output, fixed offset tables, or bounded targeted signature checks.
+   - If the tool uses `binwalk` only for identification, prefer `binwalk -B`; if it uses `binwalk` for extraction, use `binwalk -e` or `binwalk -eM` with `--run-as=root`.
    - Do not load a large firmware entirely with `f.read()`; use `seek()` and bounded `read(size)` for each section.
    - If a broad scan is necessary, make it a bounded fallback with explicit size/time limits.
 15. For Huawei NE20E `.cc` firmware with `magic_hex: 00000002`, implement a format-family fast path based on validated header/table parsing or checked known offsets before heuristic scanning. Extract at least:

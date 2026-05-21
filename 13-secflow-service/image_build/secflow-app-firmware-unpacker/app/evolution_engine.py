@@ -16,12 +16,25 @@ from typing import Any, Callable, Optional
 
 from app.preprocess import detect_format
 from app.subprocess_utils import StreamingLineSink, run_streaming_process
+from app.tool_dispatcher import (
+    activate_tool_version,
+    build_versioned_tool_path as _repo_build_versioned_tool_path,
+    ensure_dispatcher_environment,
+    next_tool_version as _repo_next_tool_version,
+    parse_tool_version,
+    resolve_active_tool_target,
+    upsert_dispatcher_rule,
+)
 from app.tool_store import compute_family_id, parse_tool_metadata
 from app.unpacker_engine_config import (
+    DISPATCHER_RULES_PATH,
+    DISPATCHER_DIR,
     EVOLUTION_IMPROVER_AGENT_DEF,
     EVOLUTION_IMPROVER_PROMPT_TMPL,
     EVOLUTION_REVIEW_PROMPT_TMPL,
-    TOOLS_DIR,
+    TOOLS_ACTIVE_DIR,
+    TOOLS_ROOT_DIR,
+    TOOLS_STORE_DIR,
     VAL_AGENT_DEF,
     load_agent_def,
     render_template,
@@ -520,23 +533,13 @@ def _derive_family_id(firmware_path: str, final_tool_path: Path) -> str:
 
 
 def _next_generated_tool_version(tools_dir: Path, family_id: str) -> int:
-    family_id = _tool_family_slug(family_id)
-    new_pattern = re.compile(rf"^{re.escape(family_id)}-v(\d+)-\d{{14}}\.py$")
-    legacy_pattern = re.compile(rf"^{re.escape(family_id)}__v(\d+)(?:__|\.py$)")
-    max_version = 0
-    for tool_path in tools_dir.glob(f"{family_id}*.py"):
-        match = new_pattern.match(tool_path.name) or legacy_pattern.match(tool_path.name)
-        if not match:
-            continue
-        try:
-            max_version = max(max_version, int(match.group(1)))
-        except Exception:
-            continue
-    return max_version + 1
+    return _repo_next_tool_version(tools_dir, family_id)
 
 
 def _build_versioned_tool_path(directory: Path, family_id: str, version: int, *, suffix: str | None = None) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    if directory == TOOLS_STORE_DIR or directory.parent == TOOLS_STORE_DIR:
+        return _repo_build_versioned_tool_path(TOOLS_STORE_DIR, family_id, version, timestamp)
     family_id = _tool_family_slug(family_id)
     return directory / f"{family_id}-v{int(version)}-{timestamp}.py"
 
@@ -551,7 +554,7 @@ def _rename_working_tool_if_changed(
     if not tool_changed:
         return working_tool
     family_id = _derive_family_id(firmware_path, working_tool)
-    version = _next_generated_tool_version(TOOLS_DIR, family_id)
+    version = _next_generated_tool_version(TOOLS_STORE_DIR, family_id)
     renamed_path = _build_versioned_tool_path(
         working_tool.parent,
         family_id,
@@ -574,16 +577,13 @@ def _save_generated_tool_to_repo(
     source_tool: Path | None,
 ) -> tuple[str, str | None, bool]:
     _validate_working_tool_path(working_tool, working_tool.parent)
-    if source_tool is not None:
-        shutil.copy2(working_tool, source_tool)
-        return str(source_tool), str(source_tool), False
-
     family_id = _derive_family_id(firmware_path, working_tool)
-    version = _next_generated_tool_version(TOOLS_DIR, family_id)
-    target = _build_versioned_tool_path(TOOLS_DIR, family_id, version)
+    version = _next_generated_tool_version(TOOLS_STORE_DIR, family_id)
+    target = _build_versioned_tool_path(TOOLS_STORE_DIR, family_id, version)
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(working_tool, target)
-    return str(target), None, True
+    previous = str(resolve_active_tool_target(source_tool)) if source_tool is not None else None
+    return str(target), previous, source_tool is None
 
 
 def _save_generated_tool_to_run(
@@ -595,7 +595,7 @@ def _save_generated_tool_to_run(
 ) -> tuple[str, str | None, bool]:
     _validate_working_tool_path(working_tool, working_tool.parent)
     family_id = _derive_family_id(firmware_path, working_tool)
-    version = _next_generated_tool_version(TOOLS_DIR, family_id)
+    version = _next_generated_tool_version(TOOLS_STORE_DIR, family_id)
     generated_dir = job_root / "generated_tools"
     generated_dir.mkdir(parents=True, exist_ok=True)
     target = _build_versioned_tool_path(generated_dir, family_id, version, suffix="generated")
@@ -617,16 +617,32 @@ def _publish_tool_to_repo(
 ) -> str:
     _validate_working_tool_path(working_tool, working_tool.parent)
     if source_tool is not None and not tool_changed:
-        source_tool.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(working_tool, source_tool)
         return str(source_tool)
     family_id = _derive_family_id(firmware_path, working_tool)
-    version = _next_generated_tool_version(TOOLS_DIR, family_id)
-    suffix = "evolved" if source_tool is not None else "generated"
-    target = _build_versioned_tool_path(TOOLS_DIR, family_id, version, suffix=suffix)
+    version = _next_generated_tool_version(TOOLS_STORE_DIR, family_id)
+    target = _build_versioned_tool_path(TOOLS_STORE_DIR, family_id, version)
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(working_tool, target)
-    return str(target)
+    info = detect_format(firmware_path)
+    magic_hex = str((info.get("magic") or b"").hex())[:8].lower()
+    description = str(parse_tool_metadata(working_tool).get("description") or "").strip()
+    active_path = activate_tool_version(
+        tools_store_dir=TOOLS_STORE_DIR,
+        tools_active_dir=TOOLS_ACTIVE_DIR,
+        family_id=family_id,
+        target_path=target,
+        magic_hex=magic_hex,
+        source="evolution",
+    )
+    if magic_hex:
+        upsert_dispatcher_rule(
+            dispatcher_rules_path=DISPATCHER_RULES_PATH,
+            family_id=family_id,
+            magic_hex=magic_hex,
+            tool_path=active_path,
+            description=description,
+        )
+    return str(active_path)
 
 
 def _review_passed(review_result: str) -> bool:

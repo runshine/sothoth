@@ -26,6 +26,7 @@ Never assume or guess these paths. Always derive them from the task prompt.
 - Focus narrowly on this firmware family. Do not broaden the scope unnecessarily.
 - The tool must be generic for this firmware format family, not case-by-case for one task or one exact sample. Do not hard-code project IDs, task IDs, absolute input/output paths, file sizes, firmware version strings, or a single sample's offsets as the only path.
 - Prefer deriving section offsets and sizes from the firmware header/table, uImage headers, SquashFS superblocks, and/or bounded `binwalk` output. Known offsets may be used only as a validated fast path with magic/size checks and a fallback parser for nearby family variants.
+- When using `binwalk` only for identification, prefer `binwalk -B`. When using `binwalk` for extraction inside the generated tool, use `binwalk -e` or `binwalk -eM` with `--run-as=root`.
 - You may either:
   - modify the provided `$working_tool`, or
   - create a brand-new `.py` tool file under the same `working_tool/` directory

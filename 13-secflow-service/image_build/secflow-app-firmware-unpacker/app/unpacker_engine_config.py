@@ -32,7 +32,12 @@ EVOLUTION_EXEC_PROMPT_TMPL = AGENT_DIR / "prompt" / "execute-firmware-skill.md"
 EVOLUTION_REVIEW_PROMPT_TMPL = AGENT_DIR / "prompt" / "review-firmware-skill-execution.md"
 EVOLUTION_IMPROVER_PROMPT_TMPL = AGENT_DIR / "prompt" / "evolve-firmware-skill.md"
 
-TOOLS_DIR = Path(os.environ.get("UNPACKER_TOOLS_DIR", "/data/secflow-app-firmware-unpacker/tools"))
+TOOLS_ROOT_DIR = Path(os.environ.get("UNPACKER_TOOLS_ROOT_DIR", "/data/secflow-app-firmware-unpacker/tools"))
+TOOLS_STORE_DIR = Path(os.environ.get("UNPACKER_TOOLS_STORE_DIR", str(TOOLS_ROOT_DIR / "store")))
+TOOLS_ACTIVE_DIR = Path(os.environ.get("UNPACKER_TOOLS_ACTIVE_DIR", str(TOOLS_ROOT_DIR / "active")))
+DISPATCHER_DIR = Path(os.environ.get("UNPACKER_DISPATCHER_DIR", "/data/secflow-app-firmware-unpacker/dispatcher"))
+DISPATCHER_RULES_PATH = Path(os.environ.get("UNPACKER_DISPATCHER_RULES_PATH", str(DISPATCHER_DIR / "dispatcher_rules.json")))
+TOOLS_DIR = TOOLS_ACTIVE_DIR
 LOG_OUTPUT_DIR = Path(os.environ.get("UNPACKER_LOG_DIR", "/workspace/log_output"))
 PI_AGENT_DIR_ENV = "PI_CODING_AGENT_DIR"
 

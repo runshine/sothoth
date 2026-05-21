@@ -63,6 +63,7 @@ STAGE_LABELS = {
     "feature_extract": "特征提取",
     "skill_match": "工具匹配",
     "tool_match": "工具执行",
+    "recursive_expand": "递归解包",
     "llm_unpack": "LLM 解包",
     "review": "LLM 评审",
     "cleanup": "清理收尾",
@@ -1192,7 +1193,6 @@ def process_workspace_cleanup_jobs(limit: int = 2) -> int:
                     detail={"retry_mode": "inplace_async"},
                     created_by="task_manager",
                 )
-                _schedule_pending_tasks()
         processed += 1
     return processed
 

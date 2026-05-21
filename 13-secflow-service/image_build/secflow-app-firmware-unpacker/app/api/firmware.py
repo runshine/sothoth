@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import os
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy import or_
@@ -70,8 +71,9 @@ from app.services.task_manager import (
 )
 from app.services.worker import get_cluster_snapshot, get_worker_id
 from app.tool_store import list_python_tools
+from app.tool_dispatcher import parse_tool_version, read_family_manifest, resolve_active_tool_target
 from app.time_utils import ensure_local, now_local
-from app.unpacker_engine_config import get_max_retries
+from app.unpacker_engine_config import TOOLS_STORE_DIR, get_max_retries
 from app.unpacker_engine import TOOLS_DIR
 from app.unpacker_engine_logs import TASK_RESULT_CACHE_FILENAME, list_round_dirs as _list_round_dirs, read_text_tail
 
@@ -79,6 +81,8 @@ from app.unpacker_engine_logs import TASK_RESULT_CACHE_FILENAME, list_round_dirs
 router = APIRouter(tags=["Firmware Unpacker"])
 logger = logging.getLogger(__name__)
 MAX_LOG_RENDER_BYTES = 128 * 1024
+RUNTIME_ROOT_PATH = Path("/data/secflow-app-firmware-unpacker")
+RUNTIME_FILE_LIST_LIMIT = 2000
 
 
 @router.get("/metrics", include_in_schema=False)
@@ -132,6 +136,72 @@ def _normalize_runtime_config_value(key: str, value: str) -> str:
             raise ValidationError("max_retries_reached_action 仅支持 success 或 failed")
         return lowered
     return value
+
+
+def _list_runtime_root_files(limit: int = RUNTIME_FILE_LIST_LIMIT) -> dict:
+    root_path = RUNTIME_ROOT_PATH
+    items: list[dict[str, Any]] = []
+    if not root_path.exists():
+        return {"root": str(root_path), "total": 0, "truncated": False, "items": items}
+    normalized_limit = max(1, min(int(limit or RUNTIME_FILE_LIST_LIMIT), 10000))
+    for current_root, dirs, files in os.walk(root_path, followlinks=False):
+        dirs.sort()
+        files.sort()
+        root_dir = Path(current_root)
+        for name in dirs + files:
+            path = root_dir / name
+            try:
+                stat = path.lstat()
+            except Exception:
+                continue
+            kind = "symlink" if path.is_symlink() else ("dir" if path.is_dir() else "file")
+            rel_path = str(path.relative_to(root_path))
+            items.append(
+                {
+                    "path": rel_path,
+                    "kind": kind,
+                    "size_bytes": int(stat.st_size),
+                    "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                }
+            )
+            if len(items) >= normalized_limit:
+                return {
+                    "root": str(root_path),
+                    "total": len(items),
+                    "truncated": True,
+                    "items": items,
+                }
+    return {"root": str(root_path), "total": len(items), "truncated": False, "items": items}
+
+
+def _resolve_runtime_root_entry(relative_path: str) -> Path:
+    root_path = RUNTIME_ROOT_PATH.resolve()
+    normalized = str(relative_path or "").strip().lstrip("/")
+    target = (root_path / normalized).resolve()
+    try:
+        target.relative_to(root_path)
+    except Exception as exc:
+        raise ValidationError("非法 runtime 文件路径") from exc
+    if not target.exists():
+        raise NotFoundError("运行时文件", normalized or "/")
+    return target
+
+
+def _build_runtime_file_content_response(relative_path: str, max_bytes: int) -> Response:
+    target = _resolve_runtime_root_entry(relative_path)
+    if target.is_dir():
+        raise ValidationError("目录不支持内容预览")
+    if not target.is_file():
+        raise ValidationError("仅普通文件支持内容预览")
+    total_size = target.stat().st_size
+    with target.open("rb") as handle:
+        payload = handle.read(max_bytes)
+    media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    headers = {
+        "X-Runtime-Preview-Path": str(relative_path),
+        "X-Runtime-Preview-Truncated": "true" if total_size > len(payload) else "false",
+    }
+    return Response(content=payload, media_type=media_type, headers=headers)
 
 
 def _get_task_or_404(task_id: str) -> dict:
@@ -360,12 +430,27 @@ def _get_task_progress(task_id: str) -> dict:
     stage5_path = _round_log_path(run_dir, 0, "stage5_skill_generate.json")
     cleaner_path = _round_log_path(run_dir, 0, "cleaner_messages.json")
     cleaner_log_path = _round_log_path(run_dir, 0, "cleaner.log")
-    cleaner_artifact_path = cleaner_path if cleaner_path.exists() else cleaner_log_path
+    cleaner_log_artifact_path = cleaner_log_path if cleaner_log_path.exists() else cleaner_path
     tool_reviewer_messages = _round_log_path(run_dir, 0, "reviewer_messages.json")
     round_dirs = _llm_round_dirs(run_dir)
     executor_logs = [path / "executor_messages.json" for path in round_dirs if (path / "executor_messages.json").exists()]
     verifier_logs = [path / "reviewer_messages.json" for path in round_dirs if (path / "reviewer_messages.json").exists()]
     has_tool_review = tool_reviewer_messages.exists() or stage4_llm_review_log.exists()
+
+    def _cleaner_session_closed() -> bool:
+        session_index = _read_json_file(run_dir / "sessions" / "index.json")
+        items = session_index.get("items") if isinstance(session_index, dict) else []
+        if not isinstance(items, list):
+            return False
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip().lower()
+            phase = str(item.get("phase") or "").strip().lower()
+            status = str(item.get("status") or "").strip().lower()
+            if (role == "cleaner" or phase in {"cleanup", "llm_cleanup"}) and status == "closed":
+                return True
+        return False
 
     task_status = str(task.get("status") or "").lower()
     task_result = str(task.get("result_status") or "").lower()
@@ -429,9 +514,7 @@ def _get_task_progress(task_id: str) -> dict:
     def _running_unpack_round() -> Optional[int]:
         if task_current_stage != "llm_unpack":
             return None
-        if executor_logs:
-            return _clamp_round(len(executor_logs))
-        return 1
+        return _clamp_round(len(executor_logs) + 1)
 
     def _running_review_round() -> Optional[int]:
         if task_current_stage != "review":
@@ -530,9 +613,9 @@ def _get_task_progress(task_id: str) -> dict:
                 _phase_payload(
                     "llm_cleanup",
                     "LLM 清理",
-                    "success" if cleaner_artifact_path.exists() else ("running" if task_status == "running" else "pending"),
-                    "正在收尾清理输出目录" if task_status == "running" and not cleaner_artifact_path.exists() else "清理已完成",
-                    _mtime_iso_text(cleaner_artifact_path),
+                    "success" if cleaner_path.exists() or _cleaner_session_closed() else ("running" if task_status == "running" else "pending"),
+                    "正在收尾清理输出目录" if task_status == "running" and not (cleaner_path.exists() or _cleaner_session_closed()) else "清理已完成",
+                    _mtime_iso_text(cleaner_path) or _mtime_iso_text(cleaner_log_artifact_path),
                 ),
             ]
         )
@@ -798,10 +881,8 @@ def _get_task_progress(task_id: str) -> dict:
 
         cleanup_status = "pending"
         cleanup_detail = None
-        if cleaner_artifact_path.exists():
-            cleanup_status = "success"
-            cleanup_detail = "清理已完成"
-        elif task_status == "success":
+        cleaner_done = cleaner_path.exists() or _cleaner_session_closed()
+        if task_status == "success" or cleaner_done:
             cleanup_status = "success"
             cleanup_detail = "清理已完成"
         elif task_current_stage == "cleanup" and task_status == "running":
@@ -815,7 +896,7 @@ def _get_task_progress(task_id: str) -> dict:
             "LLM 清理",
             cleanup_status,
             cleanup_detail,
-            _mtime_iso_text(cleaner_artifact_path),
+            _mtime_iso_text(cleaner_path) or _mtime_iso_text(cleaner_log_artifact_path),
         ))
 
     terminal_task_status = task_status if task_status in {"success", "failed", "cancelled"} else None
@@ -2151,6 +2232,9 @@ def _batch_update_config_entries(items: list[ConfigBatchUpdateItem]) -> dict:
 def _list_tools() -> dict:
     items: list[dict] = []
     for meta in list_python_tools(TOOLS_DIR):
+        family_id = str(meta.get("format_id") or meta.get("name") or "").strip()
+        resolved_path = resolve_active_tool_target(Path(str(meta.get("path") or "")))
+        manifest = read_family_manifest(TOOLS_STORE_DIR, family_id) if family_id else {}
         items.append(
             {
                 "filename": str(meta.get("filename") or ""),
@@ -2163,10 +2247,12 @@ def _list_tools() -> dict:
                 "keywords": list(meta.get("keywords") or []),
                 "binwalk_sigs": list(meta.get("binwalk_sigs") or []),
                 "skill_status": "python",
-                "skill_version": 1,
-                "family_id": str(meta.get("format_id") or meta.get("name") or ""),
+                "skill_version": parse_tool_version(resolved_path) or 1,
+                "family_id": family_id,
                 "promotion_success_count": 0,
                 "promotion_threshold": 0,
+                "store_path": str(resolved_path),
+                "current_version": str(manifest.get("current_version") or "") or None,
             }
         )
     return {"total": len(items), "items": items}
@@ -2281,6 +2367,56 @@ async def get_unpacker_tools(
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
     return _list_tools()
+
+
+@router.get("/api/app/firmware-unpacker/projects/{project_id}/runtime-files")
+async def list_project_runtime_files(
+    project_id: str,
+    limit: int = Query(default=RUNTIME_FILE_LIST_LIMIT, ge=1, le=10000),
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    return _list_runtime_root_files(limit)
+
+
+@router.get("/api/app/firmware-unpacker/runtime-files")
+async def list_runtime_files_legacy(
+    project_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=RUNTIME_FILE_LIST_LIMIT, ge=1, le=10000),
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    normalized_project_id = _normalize_project_id(project_id)
+    if normalized_project_id:
+        await ensure_project_access(normalized_project_id, token)
+    return _list_runtime_root_files(limit)
+
+
+@router.get("/api/app/firmware-unpacker/projects/{project_id}/runtime-files/content")
+async def get_project_runtime_file_content(
+    project_id: str,
+    path: str = Query(...),
+    max_bytes: int = Query(default=262144, ge=1, le=1048576),
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    return _build_runtime_file_content_response(path, max_bytes)
+
+
+@router.get("/api/app/firmware-unpacker/runtime-files/content")
+async def get_runtime_file_content_legacy(
+    path: str = Query(...),
+    project_id: Optional[str] = Query(default=None),
+    max_bytes: int = Query(default=262144, ge=1, le=1048576),
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    normalized_project_id = _normalize_project_id(project_id)
+    if normalized_project_id:
+        await ensure_project_access(normalized_project_id, token)
+    return _build_runtime_file_content_response(path, max_bytes)
 
 
 @router.put(

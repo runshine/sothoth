@@ -18,12 +18,15 @@ from app.logging_utils import log_event
 from app.preprocess import detect_format, run_preprocess
 from app.skill_store import DEFAULT_PROMOTION_THRESHOLD, save_candidate_skill
 from app.subprocess_utils import StreamingLineSink, run_streaming_process
-from app.tool_store import compute_family_id, match_python_tool
+from app.tool_dispatcher import dispatch_tool_by_magic, ensure_dispatcher_environment
+from app.tool_store import compute_family_id
 from app.unpacker_engine_config import (
     AUTHOR_AGENT_DEF,
     AUTHOR_PROMPT_TMPL,
     CLEAN_AGENT_DEF,
     CLEAN_PROMPT_TMPL,
+    DISPATCHER_DIR,
+    DISPATCHER_RULES_PATH,
     EXEC_AGENT_DEF,
     EXEC_FIRST_TMPL,
     EXEC_RETRY_TMPL,
@@ -31,7 +34,10 @@ from app.unpacker_engine_config import (
     PI_AGENT_DIR_ENV,
     ROLE_CONFIG_FILE_KEYS,
     ROLE_MODEL_CONFIG_KEYS,
+    TOOLS_ACTIVE_DIR,
     TOOLS_DIR,
+    TOOLS_ROOT_DIR,
+    TOOLS_STORE_DIR,
     VAL_AGENT_DEF,
     VAL_PROMPT_TMPL,
     build_settings_json as _build_settings_json,
@@ -68,6 +74,18 @@ log = logging.getLogger("unpacker.engine")
 SKILL_GENERATION_CONTEXT_FILENAME = "stage5_skill_generation_context.json"
 RECURSIVE_EXPAND_MAX_ROUNDS = 2
 RECURSIVE_7Z_MAX_BYTES = 64 * 1024 * 1024
+RECURSIVE_ARCHIVE_FORMATS = {
+    "tar",
+    "zip",
+    "gzip",
+    "bzip2",
+    "xz",
+    "zstd",
+    "lzop",
+    "lzma",
+    "7zip",
+    "cab",
+}
 
 
 def _safe_relpath(path: Path, root: Path) -> str:
@@ -80,26 +98,7 @@ def _safe_relpath(path: Path, root: Path) -> str:
 def _eligible_recursive_format(path: Path) -> str | None:
     info = detect_format(str(path))
     fmt = str(info.get("fmt") or "").strip().lower()
-    if fmt in {
-        "tar",
-        "zip",
-        "gzip",
-        "bzip2",
-        "xz",
-        "zstd",
-        "lzop",
-        "lzma",
-        "squashfs",
-        "cpio",
-        "7zip",
-        "cab",
-        "cramfs",
-        "romfs",
-        "jffs2",
-        "ubi",
-        "ubifs",
-        "yaffs",
-    }:
+    if fmt in RECURSIVE_ARCHIVE_FORMATS:
         return fmt
     return None
 
@@ -217,56 +216,13 @@ def _expand_one_recursive_file(
             "output_dir": str(output_dir),
             "error": stderr_text or None,
         }
-    if fmt == "squashfs":
-        proc = _run_recursive_expand_command(
-            ["unsquashfs", "-no-xattrs", "-d", str(output_dir), str(source_path)],
-            cancel_check=cancel_check,
-            register_cancel_hook=register_cancel_hook,
-        )
-        return {"handler": "unsquashfs", "success": proc.returncode == 0, "output_dir": str(output_dir), "error": proc.stderr.strip() or None}
-    if fmt == "cpio":
-        proc = _run_recursive_expand_command(
-            ["sh", "-c", f"cd '{output_dir}' && cpio -idmv < '{source_path}'"],
-            cancel_check=cancel_check,
-            register_cancel_hook=register_cancel_hook,
-        )
-        return {"handler": "cpio", "success": proc.returncode == 0, "output_dir": str(output_dir), "error": proc.stderr.strip() or None}
-    if fmt in {"7zip", "cab", "cramfs", "romfs"}:
+    if fmt in {"7zip", "cab"}:
         proc = _run_recursive_expand_command(
             ["7z", "x", str(source_path), f"-o{output_dir}", "-y"],
             cancel_check=cancel_check,
             register_cancel_hook=register_cancel_hook,
         )
         return {"handler": "7z x", "success": proc.returncode == 0, "output_dir": str(output_dir), "error": proc.stderr.strip() or None}
-    if fmt == "jffs2":
-        proc = _run_recursive_expand_command(
-            ["jefferson", "--dest", str(output_dir), str(source_path)],
-            cancel_check=cancel_check,
-            register_cancel_hook=register_cancel_hook,
-        )
-        return {"handler": "jefferson", "success": proc.returncode == 0, "output_dir": str(output_dir), "error": proc.stderr.strip() or None}
-    if fmt in {"ubi", "ubifs"}:
-        proc = _run_recursive_expand_command(
-            ["ubireader_extract_images", "-o", str(output_dir), str(source_path)],
-            cancel_check=cancel_check,
-            register_cancel_hook=register_cancel_hook,
-        )
-        handler = "ubireader_extract_images"
-        if proc.returncode != 0:
-            proc = _run_recursive_expand_command(
-                ["ubireader_extract_files", "-o", str(output_dir), str(source_path)],
-                cancel_check=cancel_check,
-                register_cancel_hook=register_cancel_hook,
-            )
-            handler = "ubireader_extract_files"
-        return {"handler": handler, "success": proc.returncode == 0, "output_dir": str(output_dir), "error": proc.stderr.strip() or None}
-    if fmt == "yaffs":
-        proc = _run_recursive_expand_command(
-            ["sh", "-c", f"cd '{output_dir}' && unyaffs '{source_path}'"],
-            cancel_check=cancel_check,
-            register_cancel_hook=register_cancel_hook,
-        )
-        return {"handler": "unyaffs", "success": proc.returncode == 0, "output_dir": str(output_dir), "error": proc.stderr.strip() or None}
     return {"handler": fmt, "success": False, "output_dir": str(output_dir), "error": f"unsupported recursive format: {fmt}"}
 
 
@@ -1510,18 +1466,26 @@ def run_unpack(
 
     features: dict[str, Any] = {}
     try:
+        ensure_dispatcher_environment(
+            tools_root_dir=TOOLS_ROOT_DIR,
+            tools_store_dir=TOOLS_STORE_DIR,
+            tools_active_dir=TOOLS_ACTIVE_DIR,
+            dispatcher_dir=DISPATCHER_DIR,
+            dispatcher_rules_path=DISPATCHER_RULES_PATH,
+        )
         features = extract_firmware_features(
             firmware_path,
             cancel_check=cancel_check,
             register_cancel_hook=register_cancel_hook,
         )
         features["family_id"] = compute_family_id(features)
-        skill_meta, skill_score, skill_match = match_python_tool(features, TOOLS_DIR)
+        skill_meta, skill_match = dispatch_tool_by_magic(features, DISPATCHER_RULES_PATH)
+        skill_score = None
     except RuntimeError as exc:
         if str(exc) == "__CANCELLED__":
             raise
         skill_meta = None
-        skill_score = 0
+        skill_score = None
         skill_match = {"reasons": []}
         log_event(
             log,
@@ -1532,7 +1496,7 @@ def run_unpack(
         )
     except Exception as exc:
         skill_meta = None
-        skill_score = 0
+        skill_score = None
         skill_match = {"reasons": []}
         log_event(
             log,
@@ -1549,6 +1513,7 @@ def run_unpack(
         matched_tool=skill_meta.get("path") if skill_meta else None,
         matched_tool_score=skill_score,
         reasons=skill_match.get("reasons"),
+        dispatch_rule_id=skill_match.get("dispatch_rule_id"),
     )
 
     _write_json_log(
@@ -1559,6 +1524,7 @@ def run_unpack(
             "matched_tool": skill_meta.get("path") if skill_meta else None,
             "matched_tool_score": skill_score,
             "reasons": skill_match.get("reasons"),
+            "dispatch_rule_id": skill_match.get("dispatch_rule_id"),
         },
     )
 
@@ -1598,6 +1564,7 @@ def run_unpack(
                     detail={
                         "matched_tool": skill_meta.get("path"),
                         "matched_tool_score": skill_score,
+                        "dispatch_rule_id": skill_meta.get("dispatch_rule_id"),
                     },
                 )
             _check_cancel()
@@ -1737,7 +1704,7 @@ def run_unpack(
         ),
         "rounds": final_round,
         "matched_skill": matched_skill.get("path") if matched_skill else None,
-        "matched_skill_version": None,
+        "matched_skill_version": matched_skill.get("tool_version") if matched_skill else None,
         "matched_skill_score": skill_score if matched_skill else None,
         "fallback_to_llm": fallback_to_llm,
         "generated_skill_path": None,

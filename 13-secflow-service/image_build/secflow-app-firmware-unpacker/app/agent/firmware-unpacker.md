@@ -19,6 +19,7 @@ Never assume or guess these paths. Always derive them from the task prompt.
 - If the task prompt says a matched unpacking skill is already selected, follow that skill's constraints first and only deviate when the selected path clearly fails.
 - If a tool is unavailable, fall back to equivalent alternatives (e.g. `dd` + manual header parsing, `python3 -c`, `hexdump`) or try to install it.
 - If you must use `dd`, do NOT use `bs=1` unless there is no viable alternative. Prefer much larger block sizes and compute `skip`/`count` accordingly, or use faster equivalent file slicing methods.
+- When using `binwalk` only for identification, prefer `binwalk -B`. When using `binwalk` for extraction, use `binwalk -e` or `binwalk -eM` with `--run-as=root`.
 - When extraction produces nested archives or filesystems, recurse into them until no further extractable content remains.
 - Name output subdirectories clearly to reflect the source file and the extraction method (e.g. `firmware.bin_binwalk/`, `rootfs.squashfs/`, `uImage_kernel/`).
 - Log every action taken (tool used, input file, output location) so findings are reproducible.
