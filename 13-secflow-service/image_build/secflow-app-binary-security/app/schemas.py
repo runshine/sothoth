@@ -29,6 +29,7 @@ class StageOptions(BaseModel):
 
 
 class TaskPolicyOverrides(BaseModel):
+    pipeline_mode: Optional[str] = None
     max_stage_parallelism: Optional[int] = Field(default=None, ge=1, le=32)
     max_retries_per_item: Optional[int] = Field(default=None, ge=0, le=20)
     continue_on_item_failure: Optional[bool] = None
@@ -59,6 +60,7 @@ class BinarySecurityTaskConcurrencyUpdatePayload(BaseModel):
 
 
 class BinarySecurityTaskPolicyUpdatePayload(BaseModel):
+    pipeline_mode: Optional[str] = None
     stage_options: dict[str, StageOptions] = Field(default_factory=dict)
     max_retries_per_item: Optional[int] = Field(default=None, ge=0, le=20)
     continue_on_item_failure: Optional[bool] = None
@@ -329,11 +331,22 @@ class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
     summary: dict[str, Any] = Field(default_factory=dict)
     metrics: dict[str, Any] = Field(default_factory=dict)
     item_stats: dict[str, dict[str, int]] = Field(default_factory=dict)
+    stage_items_total: int = 0
+    stage_items_truncated: bool = False
     stage_items: list[BinarySecurityStageItemResponse] = Field(default_factory=list)
     archive_jobs: list[BinarySecurityArchiveJobResponse] = Field(default_factory=list)
     overview_nodes: list[BinarySecurityOverviewNode] = Field(default_factory=list)
     orchestration_observability: dict[str, Any] = Field(default_factory=dict)
     abnormal_reason_history: list[BinarySecurityAbnormalReasonEventSummary] = Field(default_factory=list)
+
+
+class BinarySecurityStageItemPageResponse(BaseModel):
+    task_id: str
+    stage_name: str
+    total: int = 0
+    page: int = 1
+    per_page: int = 100
+    items: list[BinarySecurityStageItemResponse] = Field(default_factory=list)
 
 
 class BinarySecurityTaskEventResponse(BaseModel):
@@ -410,6 +423,7 @@ class BinarySecurityModuleSelectionConfirmPayload(BaseModel):
 
 
 class BinarySecurityProjectConfigPayload(BaseModel):
+    pipeline_mode: str = Field(default="barrier")
     max_stage_parallelism: int = Field(default=4, ge=1, le=32)
     max_retries_per_item: int = Field(default=2, ge=0, le=20)
     continue_on_item_failure: bool = True

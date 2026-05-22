@@ -21,6 +21,7 @@ from app.schemas import (
     BinarySecurityProjectConfigResponse,
     BinarySecurityServiceConfigPayload,
     BinarySecurityServiceConfigResponse,
+    BinarySecurityStageItemPageResponse,
     BinarySecurityTaskConcurrencyUpdatePayload,
     BinarySecurityTaskCreate,
     BinarySecurityTaskPolicyUpdatePayload,
@@ -157,6 +158,26 @@ def get_task(
     db: Session = Depends(get_db),
 ):
     return get_task_manager().get_task_detail(db, project_id=project_id, task_id=task_id)
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/stage-items", response_model=BinarySecurityStageItemPageResponse)
+def get_task_stage_items(
+    project_id: str,
+    task_id: str,
+    stage_name: str = Query(..., min_length=1),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(100, ge=1, le=1000),
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().get_task_stage_items_page(
+        db,
+        project_id=project_id,
+        task_id=task_id,
+        stage_name=stage_name,
+        page=page,
+        per_page=per_page,
+    )
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/orchestration-observability")

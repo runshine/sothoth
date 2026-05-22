@@ -90,6 +90,7 @@ from app.schemas import (
     BinarySecurityServiceConfigPayload,
     BinarySecurityServiceConfigResponse,
     BinarySecurityStageItemResponse,
+    BinarySecurityStageItemPageResponse,
     BinarySecurityStageSummary,
     BinarySecurityTaskCreate,
     BinarySecurityTaskConcurrencyUpdatePayload,
@@ -120,6 +121,7 @@ DB_FAILURE_ITEM_LIMIT = 20
 DB_ENTRY_PREVIEW_LIMIT = 50
 DB_ARTIFACT_PREVIEW_LIMIT = 50
 DB_EVENT_PAYLOAD_LIMIT_BYTES = 32768
+DETAIL_STAGE_ITEMS_LIMIT = 100
 MODULE_TASK_INPUT_KEY = "module-input"
 
 
@@ -176,6 +178,13 @@ def _display_task_type(task_type: str) -> str:
     if task_type == TASK_TYPE_BINARY_MODULE:
         return "二进制模块扫描"
     return "二进制安全"
+
+
+def _normalize_pipeline_mode(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized == PIPELINE_MODE_MIXED_STREAMING:
+        return PIPELINE_MODE_MIXED_STREAMING
+    return PIPELINE_MODE_BARRIER
 
 
 def _normalize_entry_function_name(value: Any) -> str:
@@ -743,6 +752,10 @@ PARTIAL_SUCCESS_ADVANCEMENT_STAGES = (
 DEFAULT_PARTIAL_SUCCESS_STAGE_ADVANCEMENT = {
     stage_name: False for stage_name in PARTIAL_SUCCESS_ADVANCEMENT_STAGES
 }
+PIPELINE_MODE_BARRIER = "barrier"
+PIPELINE_MODE_MIXED_STREAMING = "mixed_streaming"
+STREAMING_TAIL_STAGES = ("entry_analysis", "dataflow_analysis", "vuln_scan")
+STREAMING_ACTIVE_ITEM_STATUSES = frozenset({"pending", "queued", "dispatching", "running"})
 
 
 class StaleTaskExecution(RuntimeError):
@@ -760,11 +773,14 @@ class TaskManager:
         self._action_loop_task: Optional[asyncio.Task] = None
         self._state_reducer_loop_task: Optional[asyncio.Task] = None
         self._reducer_metrics_snapshot_loop_task: Optional[asyncio.Task] = None
+        self._stage_item_loop_task: Optional[asyncio.Task] = None
         self._workers: dict[str, asyncio.Task] = {}
         self._action_workers: dict[str, asyncio.Task] = {}
+        self._stage_item_workers: dict[str, asyncio.Task] = {}
         self._archive_workers: set[asyncio.Task] = set()
         self._worker_lock = asyncio.Lock()
         self._action_worker_lock = asyncio.Lock()
+        self._stage_item_worker_lock = asyncio.Lock()
         self._archive_worker_lock = asyncio.Lock()
         self._last_task_heartbeat_at: dict[str, datetime] = {}
         self._last_queue_reconcile_at: datetime | None = None
@@ -783,6 +799,10 @@ class TaskManager:
             self._action_loop_task = asyncio.create_task(
                 self._blocking_action_dispatch_loop(),
                 name="binary-security-blocking-action-dispatcher",
+            )
+            self._stage_item_loop_task = asyncio.create_task(
+                self._stage_item_dispatch_loop(),
+                name="binary-security-stage-item-dispatcher",
             )
             self._downstream_reconcile_task = asyncio.create_task(
                 self._downstream_reconcile_loop(),
@@ -818,6 +838,12 @@ class TaskManager:
             self._action_loop_task.cancel()
             try:
                 await self._action_loop_task
+            except asyncio.CancelledError:
+                pass
+        if self._stage_item_loop_task:
+            self._stage_item_loop_task.cancel()
+            try:
+                await self._stage_item_loop_task
             except asyncio.CancelledError:
                 pass
         if self._downstream_reconcile_task:
@@ -1227,6 +1253,7 @@ class TaskManager:
         if abnormal_reason is None:
             abnormal_reason = self._task_abnormal_reason(task, stage_summaries, items, archive_jobs)
         base["abnormal_reason"] = abnormal_reason
+        stage_item_responses = [self._stage_item_response(item) for item in items[:DETAIL_STAGE_ITEMS_LIMIT]]
         return BinarySecurityTaskDetailResponse(
             **base,
             description=task.description,
@@ -1237,7 +1264,9 @@ class TaskManager:
             summary=task.summary,
             metrics=task.metrics,
             item_stats=self._item_stats(items),
-            stage_items=[self._stage_item_response(item) for item in items],
+            stage_items_total=len(items),
+            stage_items_truncated=len(items) > DETAIL_STAGE_ITEMS_LIMIT,
+            stage_items=stage_item_responses,
             archive_jobs=archive_job_responses,
             abnormal_reason_history=self._abnormal_reason_history(db, task),
             overview_nodes=self._build_stage_overview_nodes(
@@ -1248,6 +1277,37 @@ class TaskManager:
                 items,
             ),
             orchestration_observability=self._build_orchestration_observability(db, task),
+        )
+
+    def get_task_stage_items_page(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        stage_name: str,
+        page: int = 1,
+        per_page: int = 100,
+    ) -> BinarySecurityStageItemPageResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        normalized_stage_name = str(stage_name or "").strip()
+        query = (
+            db.query(BinarySecurityStageItem)
+            .filter(
+                BinarySecurityStageItem.task_id == task.id,
+                BinarySecurityStageItem.stage_name == normalized_stage_name,
+            )
+            .order_by(BinarySecurityStageItem.created_at.asc(), BinarySecurityStageItem.id.asc())
+        )
+        total = query.count()
+        rows = query.offset((page - 1) * per_page).limit(per_page).all()
+        return BinarySecurityStageItemPageResponse(
+            task_id=task.id,
+            stage_name=normalized_stage_name,
+            total=total,
+            page=page,
+            per_page=per_page,
+            items=[self._stage_item_response(item) for item in rows],
         )
 
     def get_orchestration_observability(self, db: Session, *, project_id: str, task_id: str) -> dict[str, Any]:
@@ -1470,6 +1530,8 @@ class TaskManager:
                 policy["max_retries_per_item"] = int(payload.max_retries_per_item)
             if payload.continue_on_item_failure is not None:
                 policy["continue_on_item_failure"] = bool(payload.continue_on_item_failure)
+            if payload.pipeline_mode is not None:
+                policy["pipeline_mode"] = _normalize_pipeline_mode(payload.pipeline_mode)
             if normalized_partial_success_advancement:
                 current_partial_success_advancement = policy.get("partial_success_stage_advancement")
                 if not isinstance(current_partial_success_advancement, dict):
@@ -1860,6 +1922,70 @@ class TaskManager:
                 self._reset_stage_run_for_retry(task, stage_run, increment_retry=True)
         return stage_sequence
 
+    def _streaming_retry_descendant_stage_names(self, stage_name: str) -> list[str]:
+        normalized = str(stage_name or "").strip()
+        if normalized not in STREAMING_TAIL_STAGES:
+            return []
+        return list(STREAMING_TAIL_STAGES[STREAMING_TAIL_STAGES.index(normalized) + 1:])
+
+    def _streaming_retry_descendant_items(
+        self,
+        db: Session,
+        task_id: str,
+        target_stage: str,
+        upstream_item_ids: list[str],
+    ) -> dict[str, list[BinarySecurityStageItem]]:
+        descendants: dict[str, list[BinarySecurityStageItem]] = {}
+        pending_upstream_ids = [str(item_id or "").strip() for item_id in upstream_item_ids if str(item_id or "").strip()]
+        for stage_name in self._streaming_retry_descendant_stage_names(target_stage):
+            if not pending_upstream_ids:
+                break
+            allowed = set(pending_upstream_ids)
+            matched = [
+                item
+                for item in self._stage_items(db, task_id, stage_name)
+                if str(dict(item.input_ref or {}).get("upstream_item_id") or "").strip() in allowed
+            ]
+            descendants[stage_name] = matched
+            pending_upstream_ids = [item.id for item in matched if str(item.id or "").strip()]
+        return descendants
+
+    async def _cleanup_streaming_retry_descendants(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        target_stage: str,
+        retry_items: list[BinarySecurityStageItem],
+    ) -> list[str]:
+        descendant_map = self._streaming_retry_descendant_items(
+            db,
+            task.id,
+            target_stage,
+            [item.id for item in retry_items if str(item.id or "").strip()],
+        )
+        descendant_items = [
+            item
+            for stage_name in self._streaming_retry_descendant_stage_names(target_stage)
+            for item in descendant_map.get(stage_name) or []
+        ]
+        downstream_refs = self._collect_downstream_refs(task, descendant_items)
+        if downstream_refs:
+            await self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token())
+
+        cleared_stages: list[str] = []
+        for stage_name in self._streaming_retry_descendant_stage_names(target_stage):
+            items = descendant_map.get(stage_name) or []
+            item_ids = [item.id for item in items if str(item.id or "").strip()]
+            if not item_ids:
+                continue
+            self._clear_archive_jobs_for_stage_items(db, task.id, stage_name, item_ids)
+            self._delete_stage_items_by_ids(db, item_ids)
+            cleared_stages.append(stage_name)
+
+        for stage_name in cleared_stages:
+            self._refresh_streaming_tail_stage_state(db, task, stage_name)
+        return cleared_stages
+
     async def _prepare_retry_failed_items(self, db: Session, task: BinarySecurityTask, target_stage: str) -> list[str]:
         stage_sequence = self._stage_sequence_for_task(task)
         if target_stage not in stage_sequence:
@@ -1890,32 +2016,42 @@ class TaskManager:
         downstream_stages = stage_sequence[target_index + 1:]
         all_downstream_refs = self._retry_downstream_refs_for_stages(db, task, downstream_stages)
         self._invalidate_task_execution(task)
-        if all_downstream_refs:
-            await self._cleanup_downstream_refs(db, task, all_downstream_refs, self._service_token())
         self._clear_single_stage_runtime_state(task, target_stage)
-        if downstream_stages:
-            self._clear_stage_outputs_from(task, downstream_stages[0], mark_stale=False)
-            self._delete_archive_children_for_stages(db, task, downstream_stages)
-            self._delete_stage_items_for_stages(db, task.id, downstream_stages)
+        cleared_business_stages: list[str] = []
+        cleared_archive_stages: list[str] = []
+        if self._streaming_mode_enabled(task) and target_stage in STREAMING_TAIL_STAGES:
+            cleared_business_stages = await self._cleanup_streaming_retry_descendants(db, task, target_stage, retry_items)
+            cleared_archive_stages = list(cleared_business_stages)
+            affected_stages = [target_stage, *cleared_business_stages]
+        else:
+            if all_downstream_refs:
+                await self._cleanup_downstream_refs(db, task, all_downstream_refs, self._service_token())
+            if downstream_stages:
+                self._clear_stage_outputs_from(task, downstream_stages[0], mark_stale=False)
+                self._delete_archive_children_for_stages(db, task, downstream_stages)
+                self._delete_stage_items_for_stages(db, task.id, downstream_stages)
+                cleared_business_stages = list(downstream_stages)
+                cleared_archive_stages = list(downstream_stages)
         target_run = db.query(BinarySecurityStageRun).filter(
             BinarySecurityStageRun.task_id == task.id,
             BinarySecurityStageRun.stage_name == target_stage,
         ).first()
         if target_run:
             self._reset_stage_run_for_retry(task, target_run, increment_retry=True)
-        for downstream_stage in downstream_stages:
-            downstream_run = db.query(BinarySecurityStageRun).filter(
-                BinarySecurityStageRun.task_id == task.id,
-                BinarySecurityStageRun.stage_name == downstream_stage,
-            ).first()
-            if downstream_run:
-                self._reset_stage_run_for_retry(task, downstream_run, increment_retry=False)
+        if not (self._streaming_mode_enabled(task) and target_stage in STREAMING_TAIL_STAGES):
+            for downstream_stage in downstream_stages:
+                downstream_run = db.query(BinarySecurityStageRun).filter(
+                    BinarySecurityStageRun.task_id == task.id,
+                    BinarySecurityStageRun.stage_name == downstream_stage,
+                ).first()
+                if downstream_run:
+                    self._reset_stage_run_for_retry(task, downstream_run, increment_retry=False)
         self._set_retry_plan(
             task,
             {
                 **plan,
-                "cleared_business_stages": downstream_stages,
-                "cleared_archive_stages": downstream_stages,
+                "cleared_business_stages": cleared_business_stages,
+                "cleared_archive_stages": cleared_archive_stages,
             },
         )
         return affected_stages
@@ -3329,6 +3465,7 @@ class TaskManager:
     def get_project_config(self, db: Session, project_id: str) -> BinarySecurityProjectConfigResponse:
         row = db.query(BinarySecurityProjectConfig).filter(BinarySecurityProjectConfig.project_id == project_id).first()
         config = BinarySecurityProjectConfigPayload(**(row.config if row else {}))
+        config.pipeline_mode = _normalize_pipeline_mode(config.pipeline_mode)
         config.partial_success_stage_advancement = self._normalized_partial_success_stage_advancement_map(
             config.partial_success_stage_advancement,
             allowed_stages=PARTIAL_SUCCESS_ADVANCEMENT_STAGES,
@@ -3338,6 +3475,7 @@ class TaskManager:
 
     def save_project_config(self, db: Session, project_id: str, payload: BinarySecurityProjectConfigPayload) -> BinarySecurityProjectConfigResponse:
         normalized_payload = payload.model_copy(deep=True)
+        normalized_payload.pipeline_mode = _normalize_pipeline_mode(payload.pipeline_mode)
         normalized_payload.partial_success_stage_advancement = self._normalized_partial_success_stage_advancement_map(
             payload.partial_success_stage_advancement,
             allowed_stages=PARTIAL_SUCCESS_ADVANCEMENT_STAGES,
@@ -3493,6 +3631,215 @@ class TaskManager:
                 await asyncio.sleep(1)
             finally:
                 db.close()
+
+    async def _stage_item_dispatch_loop(self) -> None:
+        session_factory = get_session_factory()
+        while self._running:
+            db = session_factory()
+            try:
+                with observe_scheduler_loop("stage_item_dispatch"):
+                    claimed_ids = self._claim_streaming_stage_items(db)
+                    if claimed_ids:
+                        async with self._stage_item_worker_lock:
+                            for item_id in claimed_ids:
+                                existing = self._stage_item_workers.get(item_id)
+                                if existing is not None and not existing.done():
+                                    continue
+                                self._stage_item_workers[item_id] = asyncio.create_task(
+                                    self._run_stage_item_by_id(item_id),
+                                    name=f"binary-security-stage-item-{item_id}",
+                                )
+                    await self._observe_runtime_metrics(db)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("binary-security stage item dispatch loop crashed and recovered")
+                await asyncio.sleep(1)
+            finally:
+                db.close()
+            await asyncio.sleep(max(1, int(self.cfg.scheduler.stage_poll_interval_seconds or 5)))
+
+    def _claim_streaming_stage_items(self, db: Session) -> list[str]:
+        claimed_ids: list[str] = []
+        pending_items = (
+            db.query(BinarySecurityStageItem)
+            .filter(BinarySecurityStageItem.status == "pending")
+            .order_by(BinarySecurityStageItem.created_at.asc(), BinarySecurityStageItem.id.asc())
+            .all()
+        )
+        for item in pending_items:
+            if item.stage_name not in STREAMING_TAIL_STAGES:
+                continue
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == item.task_id).first()
+            if task is None or not self._streaming_mode_enabled(task):
+                continue
+            if task.status in TASK_TERMINAL_STATUSES or task.status == "cancelled":
+                continue
+            if not self._is_streaming_tail_stage(task, item.stage_name):
+                continue
+            active_count = int(
+                db.query(func.count(BinarySecurityStageItem.id))
+                .filter(
+                    BinarySecurityStageItem.task_id == task.id,
+                    BinarySecurityStageItem.stage_name == item.stage_name,
+                    BinarySecurityStageItem.status.in_(["dispatching", "queued", "running"]),
+                )
+                .scalar()
+                or 0
+            )
+            if active_count >= self._stage_parallelism(task, item.stage_name):
+                continue
+            updated = (
+                db.query(BinarySecurityStageItem)
+                .filter(
+                    BinarySecurityStageItem.id == item.id,
+                    BinarySecurityStageItem.status == "pending",
+                )
+                .update(
+                    {
+                        BinarySecurityStageItem.status: "dispatching",
+                        BinarySecurityStageItem.started_at: _now(),
+                        BinarySecurityStageItem.updated_at: _now(),
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if updated:
+                claimed_ids.append(item.id)
+        if claimed_ids:
+            db.commit()
+        return claimed_ids
+
+    async def _run_stage_item_by_id(self, item_id: str) -> None:
+        db = get_session_factory()()
+        try:
+            item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == item_id).first()
+            if item is None:
+                return
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == item.task_id).first()
+            if task is None or not self._streaming_mode_enabled(task):
+                return
+            if task.status in TASK_TERMINAL_STATUSES or task.status == "cancelled":
+                return
+            stage_run = self._ensure_stage_run(db, task, item.stage_name)
+            db.commit()
+            payload = dict(item.input_ref or {})
+            token = self._service_token()
+            if item.stage_name == "entry_analysis":
+                await self._run_entry_item(task, stage_run, payload, token, False)
+            elif item.stage_name == "dataflow_analysis":
+                await self._run_dataflow_item(task, stage_run, payload, token, False)
+            elif item.stage_name == "vuln_scan":
+                await self._run_vuln_item(task, stage_run, payload, token, False)
+            await self._sync_streaming_task_tail_state(task.id)
+        finally:
+            db.close()
+            async with self._stage_item_worker_lock:
+                self._stage_item_workers.pop(item_id, None)
+
+    async def _sync_streaming_task_tail_state(self, task_id: str) -> None:
+        db = get_session_factory()()
+        try:
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
+            if task is None or not self._streaming_mode_enabled(task):
+                return
+            tail_stages = self._streaming_tail_stage_names(task)
+            if not tail_stages:
+                return
+            prior_tail_statuses = {
+                stage_name: str(
+                    (
+                        db.query(BinarySecurityStageRun)
+                        .filter(
+                            BinarySecurityStageRun.task_id == task.id,
+                            BinarySecurityStageRun.stage_name == stage_name,
+                        )
+                        .first()
+                        or BinarySecurityStageRun(stage_name=stage_name, task_id=task.id, project_id=task.project_id, sequence_no=0, status="pending")
+                    ).status
+                    or ""
+                ).strip()
+                for stage_name in tail_stages
+            }
+            for stage_name in tail_stages:
+                self._refresh_streaming_tail_stage_state(db, task, stage_name)
+            active_count = int(
+                db.query(func.count(BinarySecurityStageItem.id))
+                .filter(
+                    BinarySecurityStageItem.task_id == task.id,
+                    BinarySecurityStageItem.stage_name.in_(list(tail_stages)),
+                    BinarySecurityStageItem.status.in_(list(STREAMING_ACTIVE_ITEM_STATUSES)),
+                )
+                .scalar()
+                or 0
+            )
+            if active_count > 0:
+                next_active_stage = next(
+                    (
+                        stage_name
+                        for stage_name in tail_stages
+                        if any(
+                            self._is_streaming_active_item_status(item.status)
+                            for item in self._stage_items(db, task.id, stage_name)
+                        )
+                    ),
+                    tail_stages[0],
+                )
+                task.status = "running"
+                task.current_stage = next_active_stage
+                task.finished_at = None
+                task.dispatcher_instance_id = None
+                task.dispatch_started_at = None
+                task.lease_expires_at = None
+                db.commit()
+                return
+            tail_runs = {
+                stage_name: db.query(BinarySecurityStageRun)
+                .filter(
+                    BinarySecurityStageRun.task_id == task.id,
+                    BinarySecurityStageRun.stage_name == stage_name,
+                )
+                .first()
+                for stage_name in tail_stages
+            }
+            next_incomplete_tail = next(
+                (
+                    stage_name
+                    for stage_name in tail_stages
+                    if (
+                        str((tail_runs.get(stage_name).status if tail_runs.get(stage_name) else "pending") or "").strip()
+                        not in {"success", "partial_success", "cancelled"}
+                        or prior_tail_statuses.get(stage_name) in {"failed", "downstream_missing"}
+                    )
+                ),
+                None,
+            )
+            if next_incomplete_tail:
+                task.current_stage = next_incomplete_tail
+                next_status = str((tail_runs.get(next_incomplete_tail).status if tail_runs.get(next_incomplete_tail) else "pending") or "").strip()
+                prior_status = prior_tail_statuses.get(next_incomplete_tail) or next_status
+                if prior_status in {"failed", "downstream_missing"}:
+                    task.status = "failed"
+                    task.finished_at = _now()
+                elif next_status in {"pending", "queued"}:
+                    task.status = "pending"
+                    task.finished_at = None
+                elif next_status not in {"success", "partial_success", "cancelled"}:
+                    task.status = "running"
+                    task.finished_at = None
+                else:
+                    task.status = "running"
+                    task.finished_at = None
+                task.dispatcher_instance_id = None
+                task.dispatch_started_at = None
+                task.lease_expires_at = None
+                db.commit()
+                return
+            self._finalize_task(db, task)
+            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+            db.commit()
+        finally:
+            db.close()
 
     def _claim_preparing_tasks(self, db: Session) -> list[str]:
         lease_expires_at = self._next_lease_expiry(db)
@@ -4257,12 +4604,10 @@ class TaskManager:
         stage_run.counts = self._stage_counts(db, stage_run)
         if status in {"failed", "partial_success", "downstream_missing"}:
             stage_run.last_error = summary.get("error")
-        task.stage_summary = {
-            **task.stage_summary,
-            stage_name: {
-                "status": stage_run.status,
-                "counts": stage_run.counts,
-                "finished_at": stage_run.finished_at.isoformat() if stage_run.finished_at else None,
+        self._merge_task_stage_summary_entry(
+            task,
+            stage_run,
+            {
                 **(
                     {
                         "failure_code": summary.get("failure_code"),
@@ -4273,7 +4618,7 @@ class TaskManager:
                     else {}
                 ),
             },
-        }
+        )
         task.current_stage = stage_name
         if stage_name == "firmware_unpack":
             task.metrics = {
@@ -4397,6 +4742,30 @@ class TaskManager:
             task_summary.pop("retry_plan", None)
             task.summary = task_summary
         next_stage = self._next_incomplete_stage(db, task)
+        if (
+            task.status in {"running", "dispatching"}
+            and next_stage
+            and self._streaming_mode_enabled(task)
+            and self._is_streaming_tail_stage(task, next_stage)
+        ):
+            task.status = "running"
+            task.current_stage = next_stage
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.lease_expires_at = None
+            task.finished_at = None
+            task.last_error = None
+            self._invalidate_task_execution(task)
+            self._record_event(
+                db,
+                task,
+                "streaming_tail_activated",
+                f"阶段完成后切换为流式尾段推进: {next_stage}",
+                stage_name=next_stage,
+                payload={"state_event_id": event.id, "completed_stage": stage_name},
+            )
+            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+            return
         if task.status in {"running", "dispatching"} and next_stage:
             task.status = "pending"
             task.current_stage = next_stage
@@ -5482,12 +5851,10 @@ class TaskManager:
                 stage_run.counts = self._stage_counts(db, stage_run)
                 if status in {"failed", "partial_success", "downstream_missing"}:
                     stage_run.last_error = summary.get("error")
-                task.stage_summary = {
-                    **task.stage_summary,
-                    stage_name: {
-                        "status": stage_run.status,
-                        "counts": stage_run.counts,
-                        "finished_at": stage_run.finished_at.isoformat() if stage_run.finished_at else None,
+                self._merge_task_stage_summary_entry(
+                    task,
+                    stage_run,
+                    {
                         **(
                             {
                                 "failure_code": summary.get("failure_code"),
@@ -5498,7 +5865,7 @@ class TaskManager:
                             else {}
                         ),
                     },
-                }
+                )
                 task.current_stage = stage_name
                 if stage_name == "firmware_unpack":
                     task.metrics = {
@@ -5648,6 +6015,7 @@ class TaskManager:
         loop_task_alive = bool(self._loop_task and not self._loop_task.done())
         action_loop_alive = bool(self._action_loop_task and not self._action_loop_task.done())
         archive_loop_alive = bool(self._archive_loop_task and not self._archive_loop_task.done())
+        stage_item_loop_alive = bool(self._stage_item_loop_task and not self._stage_item_loop_task.done())
         reconcile_loop_alive = bool(self._downstream_reconcile_task and not self._downstream_reconcile_task.done())
         state_reducer_loop_alive = bool(self._state_reducer_loop_task and not self._state_reducer_loop_task.done())
         reducer_metrics_snapshot_loop_alive = bool(
@@ -5659,6 +6027,7 @@ class TaskManager:
                 "task_dispatch": loop_task_alive,
                 "action_dispatch": action_loop_alive,
                 "archive_dispatch": archive_loop_alive,
+                "stage_item_dispatch": stage_item_loop_alive,
                 "downstream_reconcile": reconcile_loop_alive,
                 "state_reducer": state_reducer_loop_alive,
                 "reducer_metrics_snapshot": reducer_metrics_snapshot_loop_alive,
@@ -5666,6 +6035,7 @@ class TaskManager:
             "workers": {
                 "task_workers": len([task for task in self._workers.values() if not task.done()]),
                 "action_workers": len([task for task in self._action_workers.values() if not task.done()]),
+                "stage_item_workers": len([task for task in self._stage_item_workers.values() if not task.done()]),
                 "archive_workers": len([task for task in self._archive_workers if not task.done()]),
             },
         }
@@ -5685,6 +6055,8 @@ class TaskManager:
         if status in {"pending", "failed"}:
             return True
         if status not in {"dispatching", "running"}:
+            return False
+        if self._streaming_mode_enabled(task) and self._is_streaming_tail_stage(task, task.current_stage):
             return False
         if not str(task.dispatcher_instance_id or "").strip():
             return True
@@ -6503,6 +6875,7 @@ class TaskManager:
     def _merge_policy(self, db: Session, project_id: str, overrides: dict[str, Any], stage_options: dict[str, Any]) -> dict[str, Any]:
         stage_parallelism = {stage: self.cfg.runtime_policy.max_stage_parallelism for stage in STAGE_SEQUENCE}
         base = BinarySecurityProjectConfigPayload(
+            pipeline_mode=_normalize_pipeline_mode(self.cfg.runtime_policy.pipeline_mode),
             max_stage_parallelism=self.cfg.runtime_policy.max_stage_parallelism,
             max_retries_per_item=self.cfg.runtime_policy.max_retries_per_item,
             continue_on_item_failure=self.cfg.runtime_policy.continue_on_item_failure,
@@ -6512,6 +6885,7 @@ class TaskManager:
         row = db.query(BinarySecurityProjectConfig).filter(BinarySecurityProjectConfig.project_id == project_id).first()
         if row:
             base.update(row.config)
+        base["pipeline_mode"] = _normalize_pipeline_mode(base.get("pipeline_mode"))
         base["partial_success_stage_advancement"] = self._normalized_partial_success_stage_advancement_map(
             base.get("partial_success_stage_advancement"),
             allowed_stages=PARTIAL_SUCCESS_ADVANCEMENT_STAGES,
@@ -6526,6 +6900,8 @@ class TaskManager:
             stage_value = int(overrides["max_stage_parallelism"])
             base["max_stage_parallelism"] = stage_value
             base["stage_parallelism"] = {stage: stage_value for stage in STAGE_SEQUENCE}
+        if overrides.get("pipeline_mode") is not None:
+            base["pipeline_mode"] = _normalize_pipeline_mode(overrides["pipeline_mode"])
         if overrides.get("stage_parallelism"):
             merged = {**base.get("stage_parallelism", {})}
             for stage_name, value in (overrides.get("stage_parallelism") or {}).items():
@@ -6965,6 +7341,34 @@ class TaskManager:
             return True
         return bool(option.get("enabled", True))
 
+    def _pipeline_mode(self, task: BinarySecurityTask | dict[str, Any] | None) -> str:
+        if isinstance(task, dict):
+            policy = task
+        else:
+            policy = (task.policy if task is not None else {}) or {}
+        value = policy.get("pipeline_mode")
+        if value is None:
+            value = getattr(self.cfg.runtime_policy, "pipeline_mode", PIPELINE_MODE_BARRIER)
+        return _normalize_pipeline_mode(value)
+
+    def _streaming_mode_enabled(self, task: BinarySecurityTask | dict[str, Any] | None) -> bool:
+        return self._pipeline_mode(task) == PIPELINE_MODE_MIXED_STREAMING
+
+    def _streaming_tail_stage_names(self, task: BinarySecurityTask) -> tuple[str, ...]:
+        return tuple(
+            stage_name
+            for stage_name in STREAMING_TAIL_STAGES
+            if stage_name in self._stage_sequence_for_task(task) and self._stage_enabled(task, stage_name)
+        )
+
+    def _is_streaming_tail_stage(self, task: BinarySecurityTask, stage_name: str | None) -> bool:
+        normalized = str(stage_name or "").strip()
+        return bool(normalized) and normalized in self._streaming_tail_stage_names(task)
+
+    def _is_streaming_active_item_status(self, status: str | None) -> bool:
+        normalized = self._normalize_downstream_status(status) or str(status or "").strip()
+        return normalized in STREAMING_ACTIVE_ITEM_STATUSES
+
     def _stage_parallelism(self, task: BinarySecurityTask, stage_name: str) -> int:
         policy = task.policy or {}
         stage_parallelism = policy.get("stage_parallelism") or {}
@@ -7272,10 +7676,16 @@ class TaskManager:
         statuses = [self._normalize_downstream_status(item.status) or item.status for item in items]
         if statuses:
             return self._aggregate_item_statuses(statuses)
+        if stage_run and self._streaming_mode_enabled(task) and self._is_streaming_tail_stage(task, stage_name):
+            normalized_run_status = self._normalize_downstream_status(stage_run.status) or str(stage_run.status or "")
+            if normalized_run_status in {"success", "partial_success", "failed", "downstream_missing", "cancelled", "running", "queued", "pending"}:
+                return normalized_run_status
         if task.current_stage == stage_name and task.status in {"running", "dispatching", TASK_STATUS_PENDING_MODULE_CONFIRMATION}:
             return "queued"
-        if stage_run and stage_run.status in {"success", "partial_success", "failed", "cancelled", "waiting_confirmation"}:
-            return stage_run.status
+        if stage_run:
+            normalized_run_status = self._normalize_downstream_status(stage_run.status) or str(stage_run.status or "")
+            if normalized_run_status in {"success", "partial_success", "failed", "downstream_missing", "cancelled", "waiting_confirmation"}:
+                return normalized_run_status
         return "pending"
 
     def _status_label(self, status: str) -> str:
@@ -8024,7 +8434,8 @@ class TaskManager:
         has_stage_retry = any(bool(summary.retry_full_supported) for summary in stage_summaries)
         has_stage_retry_failed = any(bool(summary.retry_failed_supported) for summary in stage_summaries)
         preparing = task.status in TASK_PREPARING_STATUSES
-        running = task.status in {"dispatching", "running"}
+        streaming_auto_progressing = self._streaming_tail_auto_progressing(db, task)
+        running = task.status in {"dispatching", "running"} or streaming_auto_progressing
         waiting_modules = task.status in {TASK_STATUS_PENDING_MODULE_CONFIRMATION, "waiting_confirmation"}
         can_retry_archive = not preparing and not running and not lock_active and any(
             self._archive_retry_support(db, task, summary.stage_name)[0] or self._archive_full_retry_support(db, task, summary.stage_name)[0]
@@ -8061,7 +8472,11 @@ class TaskManager:
             summary = blocking_reason
         elif running:
             blocking_code = "task_running"
-            blocking_reason = f"当前任务正在执行中，当前状态 {task.status} 下仅支持取消或同步状态"
+            blocking_reason = (
+                "当前任务处于 streaming tail 自动推进中，当前仅建议等待系统继续收敛或执行取消/同步状态"
+                if streaming_auto_progressing and task.status == "pending"
+                else f"当前任务正在执行中，当前状态 {task.status} 下仅支持取消或同步状态"
+            )
             overall = "blocked"
             summary = blocking_reason
         elif not any([can_cancel, can_continue, can_retry, can_retry_failed_items, can_retry_stage, can_retry_archive, can_delete, can_edit_policy, can_confirm_modules]):
@@ -8569,6 +8984,32 @@ class TaskManager:
         stage_run.output_summary = compact
         return compact
 
+    def _update_task_stage_summary_entry(self, task: BinarySecurityTask, stage_run: BinarySecurityStageRun) -> None:
+        task.stage_summary = {
+            **(task.stage_summary or {}),
+            stage_run.stage_name: {
+                "status": stage_run.status,
+                "counts": dict(stage_run.counts or {}),
+                "finished_at": stage_run.finished_at.isoformat() if stage_run.finished_at else None,
+                "last_error": stage_run.last_error,
+            },
+        }
+
+    def _merge_task_stage_summary_entry(
+        self,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        self._update_task_stage_summary_entry(task, stage_run)
+        task.stage_summary = {
+            **(task.stage_summary or {}),
+            stage_run.stage_name: {
+                **dict((task.stage_summary or {}).get(stage_run.stage_name) or {}),
+                **dict(extra or {}),
+            },
+        }
+
     async def _persist_stage_run_output_summary_async(
         self,
         task: BinarySecurityTask,
@@ -8913,6 +9354,35 @@ class TaskManager:
             return "downstream_missing"
         return statuses[0]
 
+    def _empty_streaming_stage_run_status(self, task: BinarySecurityTask, stage_run: BinarySecurityStageRun) -> str:
+        if not self._streaming_mode_enabled(task) or not self._is_streaming_tail_stage(task, stage_run.stage_name):
+            return "pending"
+        current = str(stage_run.status or "").strip()
+        if current in {"failed", "downstream_missing", "cancelled", "partial_success", "success"}:
+            return current
+        if current in {"running", "dispatching"}:
+            return "running"
+        if current in {"queued", "pending"}:
+            return "pending"
+        return "pending"
+
+    def _empty_streaming_stage_run_last_error(self, task: BinarySecurityTask, stage_run: BinarySecurityStageRun) -> str | None:
+        if not self._streaming_mode_enabled(task) or not self._is_streaming_tail_stage(task, stage_run.stage_name):
+            return None
+        current_status = str(stage_run.status or "").strip()
+        if current_status in {"failed", "downstream_missing", "partial_success"}:
+            return stage_run.last_error
+        return None
+
+    def _refresh_streaming_tail_stage_state(self, db: Session, task: BinarySecurityTask, stage_name: str) -> None:
+        self._refresh_stage_run_from_items(db, task, stage_name)
+        if stage_name == "entry_analysis":
+            self._rebuild_entry_results_from_stage_items(db, task)
+        elif stage_name == "dataflow_analysis":
+            self._rebuild_summary_results_from_stage_items(db, task, "dataflow_analysis", "dataflow_results")
+        elif stage_name == "vuln_scan":
+            self._rebuild_summary_results_from_stage_items(db, task, "vuln_scan", "vuln_results")
+
     def _refresh_stage_run_from_items(self, db: Session, task: BinarySecurityTask, stage_name: str) -> None:
         stage_run = db.query(BinarySecurityStageRun).filter(
             BinarySecurityStageRun.task_id == task.id,
@@ -8921,16 +9391,23 @@ class TaskManager:
         if not stage_run:
             return
         items = self._stage_items(db, task.id, stage_name)
-        status = self._aggregate_item_statuses([item.status for item in items])
+        if items:
+            status = self._aggregate_item_statuses([item.status for item in items])
+        else:
+            status = self._empty_streaming_stage_run_status(task, stage_run)
         stage_run.status = status
         stage_run.counts = self._stage_counts(db, stage_run)
-        stage_run.last_error = next(
-            (
-                item.error_message
-                for item in items
-                if item.status in {"failed", "downstream_missing"} and item.error_message
-            ),
-            None,
+        stage_run.last_error = (
+            next(
+                (
+                    item.error_message
+                    for item in items
+                    if item.status in {"failed", "downstream_missing"} and item.error_message
+                ),
+                None,
+            )
+            if items
+            else self._empty_streaming_stage_run_last_error(task, stage_run)
         )
         self._merge_stage_run_output_summary(
             task,
@@ -8957,6 +9434,7 @@ class TaskManager:
             }
         elif stage_name == "entry_analysis":
             self._rebuild_entry_results_from_stage_items(db, task, stage_run)
+        self._update_task_stage_summary_entry(task, stage_run)
 
     def _rebuild_entry_results_from_stage_items(
         self,
@@ -9006,9 +9484,6 @@ class TaskManager:
             if not entries:
                 continue
             rebuilt.append(self._compact_entry_summary_item({**module, "entries": entries}))
-
-        if not rebuilt:
-            return []
 
         summary = {**(task.summary or {}), "entry_results": rebuilt}
         task.summary = summary
@@ -9220,6 +9695,9 @@ class TaskManager:
     def _stage_item_identity(self, item_key: str, parent_key: str | None) -> str:
         return build_stage_item_identity_key(item_key, parent_key)
 
+    def _stage_item_started_at(self, status: str) -> datetime | None:
+        return None if status in {"pending", "queued"} else _now()
+
     def _find_stage_item(
         self,
         db: Session,
@@ -9283,7 +9761,7 @@ class TaskManager:
                 item_identity_key=identity_key,
                 status=running_status,
                 downstream_service=downstream_service,
-                started_at=_now(),
+                started_at=self._stage_item_started_at(running_status),
             )
             if retrying:
                 item.retry_count = 1
@@ -9296,7 +9774,7 @@ class TaskManager:
             item.downstream_service = downstream_service
             item.error_message = None
             item.finished_at = None
-            item.started_at = _now()
+            item.started_at = self._stage_item_started_at(running_status)
             item.payload = {}
             item.result = {}
             if retrying:
@@ -9326,15 +9804,214 @@ class TaskManager:
             existing.downstream_service = downstream_service
             existing.error_message = None
             existing.finished_at = None
-            existing.started_at = _now()
+            existing.started_at = self._stage_item_started_at(running_status)
             existing.payload = {}
             existing.result = {}
             if retrying:
                 existing.retry_count = int(existing.retry_count or 0) + 1
-            existing.input_ref = input_ref
-            if output_ref is not None:
-                existing.output_ref = output_ref
-            item = existing
+                existing.input_ref = input_ref
+                if output_ref is not None:
+                    existing.output_ref = output_ref
+                item = existing
+        return item
+
+    def _trigger_entry_items_from_b2s_result(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        b2s_result: dict[str, Any],
+        *,
+        upstream_item: BinarySecurityStageItem,
+    ) -> BinarySecurityStageItem | None:
+        if not self._streaming_mode_enabled(task):
+            return None
+        if "entry_analysis" not in self._streaming_tail_stage_names(task):
+            return None
+        module_key = str(b2s_result.get("module_key") or "").strip()
+        if not module_key:
+            return None
+        normalized_input = self._normalize_entry_analysis_module_input(
+            task,
+            {
+                **b2s_result,
+                "upstream_item_id": upstream_item.id,
+                "triggered_by_stage": upstream_item.stage_name,
+            },
+        )
+        stage_run = self._ensure_stage_run(db, task, "entry_analysis")
+        existing = self._find_stage_item(
+            db,
+            task_id=task.id,
+            stage_name="entry_analysis",
+            item_key=module_key,
+            parent_key=str(b2s_result.get("firmware_key") or "").strip() or None,
+        )
+        item = self._upsert_stage_item(
+            db,
+            task=task,
+            stage_run=stage_run,
+            stage_name="entry_analysis",
+            item_key=module_key,
+            item_name=str(normalized_input.get("module_name") or b2s_result.get("module_name") or "").strip() or None,
+            parent_key=str(b2s_result.get("firmware_key") or "").strip() or None,
+            downstream_service="entry_analyse",
+            input_ref=normalized_input,
+            output_ref={},
+            retrying=False,
+            running_status="pending",
+        )
+        self._record_event(
+            db,
+            task,
+            "streaming_entry_item_seeded" if existing is None else "streaming_entry_item_refreshed",
+            (
+                f"binary-to-source 成功后已创建入口分析待执行条目: {module_key}"
+                if existing is None
+                else f"binary-to-source 成功后已刷新入口分析待执行条目: {module_key}"
+            ),
+            stage_name="entry_analysis",
+            item=item,
+            payload={
+                "upstream_item_id": upstream_item.id,
+                "module_key": module_key,
+                "pipeline_mode": self._pipeline_mode(task),
+            },
+        )
+        return item
+
+    def _trigger_dataflow_items_from_entry_result(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        entry_result: dict[str, Any],
+        *,
+        upstream_item: BinarySecurityStageItem,
+    ) -> list[BinarySecurityStageItem]:
+        if not self._streaming_mode_enabled(task):
+            return []
+        if "dataflow_analysis" not in self._streaming_tail_stage_names(task):
+            return []
+        entries = _deduplicate_entry_keys(
+            [dict(entry) for entry in (entry_result.get("entries") or []) if isinstance(entry, dict)]
+        )
+        if not entries:
+            return []
+        stage_run = self._ensure_stage_run(db, task, "dataflow_analysis")
+        created_items: list[BinarySecurityStageItem] = []
+        created_count = 0
+        refreshed_count = 0
+        for entry in entries:
+            entry_key = str(entry.get("entry_key") or "").strip()
+            if not entry_key:
+                continue
+            normalized_entry = {
+                **entry,
+                "upstream_item_id": upstream_item.id,
+                "triggered_by_stage": upstream_item.stage_name,
+            }
+            existing = self._find_stage_item(
+                db,
+                task_id=task.id,
+                stage_name="dataflow_analysis",
+                item_key=entry_key,
+                parent_key=str(entry.get("module_key") or "").strip() or None,
+            )
+            item = self._upsert_stage_item(
+                db,
+                task=task,
+                stage_run=stage_run,
+                stage_name="dataflow_analysis",
+                item_key=entry_key,
+                item_name=str(entry.get("function_name") or "").strip() or None,
+                parent_key=str(entry.get("module_key") or "").strip() or None,
+                downstream_service="dataflow_analyse",
+                input_ref=normalized_entry,
+                output_ref={},
+                retrying=False,
+                running_status="pending",
+            )
+            created_items.append(item)
+            if existing is None:
+                created_count += 1
+            else:
+                refreshed_count += 1
+        if created_items:
+            self._record_event(
+                db,
+                task,
+                "streaming_dataflow_items_seeded",
+                f"入口分析成功后已生成数据流待执行条目: 新增 {created_count}，刷新 {refreshed_count}",
+                stage_name="dataflow_analysis",
+                item=upstream_item,
+                payload={
+                    "upstream_item_id": upstream_item.id,
+                    "created_count": created_count,
+                    "refreshed_count": refreshed_count,
+                    "entry_count": len(created_items),
+                    "pipeline_mode": self._pipeline_mode(task),
+                },
+            )
+        return created_items
+
+    def _trigger_vuln_items_from_dataflow_result(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        dataflow_result: dict[str, Any],
+        *,
+        upstream_item: BinarySecurityStageItem,
+    ) -> BinarySecurityStageItem | None:
+        if not self._streaming_mode_enabled(task):
+            return None
+        if "vuln_scan" not in self._streaming_tail_stage_names(task):
+            return None
+        entry_key = str(dataflow_result.get("entry_key") or "").strip()
+        if not entry_key:
+            return None
+        stage_run = self._ensure_stage_run(db, task, "vuln_scan")
+        normalized_result = {
+            **dataflow_result,
+            "upstream_item_id": upstream_item.id,
+            "triggered_by_stage": upstream_item.stage_name,
+        }
+        existing = self._find_stage_item(
+            db,
+            task_id=task.id,
+            stage_name="vuln_scan",
+            item_key=entry_key,
+            parent_key=str(dataflow_result.get("module_key") or "").strip() or None,
+        )
+        item = self._upsert_stage_item(
+            db,
+            task=task,
+            stage_run=stage_run,
+            stage_name="vuln_scan",
+            item_key=entry_key,
+            item_name=str(dataflow_result.get("function_name") or "").strip() or None,
+            parent_key=str(dataflow_result.get("module_key") or "").strip() or None,
+            downstream_service="dataflow_vuln_scanner",
+            input_ref=normalized_result,
+            output_ref={},
+            retrying=False,
+            running_status="pending",
+        )
+        self._record_event(
+            db,
+            task,
+            "streaming_vuln_item_seeded" if existing is None else "streaming_vuln_item_refreshed",
+            (
+                f"数据流分析成功后已创建漏洞扫描待执行条目: {entry_key}"
+                if existing is None
+                else f"数据流分析成功后已刷新漏洞扫描待执行条目: {entry_key}"
+            ),
+            stage_name="vuln_scan",
+            item=item,
+            payload={
+                "upstream_item_id": upstream_item.id,
+                "entry_key": entry_key,
+                "pipeline_mode": self._pipeline_mode(task),
+            },
+        )
         return item
 
     def _prepare_stage_items_for_execution(
@@ -10263,6 +10940,8 @@ class TaskManager:
         return None
 
     def _task_retry_support(self, db: Session, task: BinarySecurityTask) -> tuple[bool, str | None, str | None]:
+        if self._streaming_tail_auto_progressing(db, task):
+            return False, "当前任务处于 streaming tail 自动推进中，暂不支持任务重试", None
         if task.status in {"pending_upload", "uploading", "ready_to_start"}:
             return False, "当前任务尚未完成输入准备，不能重试", None
         if task.status in {"pending", "dispatching", "running"} | TASK_PREPARING_STATUSES:
@@ -10279,6 +10958,8 @@ class TaskManager:
         db: Session,
         task: BinarySecurityTask,
     ) -> tuple[bool, str | None, str | None, list[BinarySecurityStageItem]]:
+        if self._streaming_tail_auto_progressing(db, task):
+            return False, "当前任务处于 streaming tail 自动推进中，暂不支持失败项重试", None, []
         if task.status in {"pending_upload", "uploading", "ready_to_start"}:
             return False, "当前任务尚未完成输入准备，不能重试失败项", None, []
         if task.status in {"pending", "dispatching", "running"} | TASK_PREPARING_STATUSES:
@@ -10319,6 +11000,8 @@ class TaskManager:
         return True, None, items
 
     def _task_continue_support(self, db: Session, task: BinarySecurityTask) -> tuple[bool, str | None, str | None]:
+        if self._streaming_tail_auto_progressing(db, task):
+            return False, "当前任务处于 streaming tail 自动推进中，无需手动继续", None
         if task.status in {"pending_upload", "uploading", "ready_to_start"}:
             return False, f"当前任务状态不允许继续: {task.status}", None
         if task.status in {"pending", "dispatching", "running"} | TASK_PREPARING_STATUSES:
@@ -10384,8 +11067,42 @@ class TaskManager:
         )
         if summary_key == "b2s_results" and self._task_type(task) == TASK_TYPE_BINARY_MODULE:
             rebuilt = [self._normalize_entry_analysis_module_input(task, item) for item in rebuilt]
-        if rebuilt:
-            task.summary = {**(task.summary or {}), summary_key: rebuilt}
+        task.summary = {**(task.summary or {}), summary_key: rebuilt}
+        if summary_key == "vuln_results":
+            task.metrics = {**(task.metrics or {}), "vuln_result_count": len(rebuilt)}
+        stage_run = db.query(BinarySecurityStageRun).filter(
+            BinarySecurityStageRun.task_id == task.id,
+            BinarySecurityStageRun.stage_name == stage_name,
+        ).first()
+        if stage_run is not None:
+            failed_items = [
+                self._lightweight_stage_failure({"item": dict(item.input_ref or item.result or {}), "error": item.error_message})
+                for item in self._stage_items(db, task.id, stage_name)
+                if item.status in {"failed", "downstream_missing"}
+            ]
+            cancelled_items = [
+                self._lightweight_stage_failure({"item": dict(item.input_ref or item.result or {}), "error": item.error_message})
+                for item in self._stage_items(db, task.id, stage_name)
+                if item.status == "cancelled"
+            ]
+            self._persist_stage_run_output_summary(
+                task,
+                stage_run,
+                {
+                    "items": self._compact_stage_success_items_for_db(summary_key, rebuilt),
+                    "failed_items": failed_items[:DB_FAILURE_ITEM_LIMIT],
+                    "cancelled_items": cancelled_items[:DB_FAILURE_ITEM_LIMIT],
+                    "success_count": len(rebuilt),
+                    "failed_count": int((stage_run.counts or {}).get("failed_items") or 0),
+                    "cancelled_count": int((stage_run.counts or {}).get("cancelled_items") or 0),
+                    "running_count": int((stage_run.counts or {}).get("running_items") or 0),
+                    "entry_count": self._entry_count_for_summary(summary_key, rebuilt),
+                    "vuln_result_count": len(rebuilt) if summary_key == "vuln_results" else 0,
+                    "status_synced": True,
+                    "sync_status": stage_run.status,
+                    **(stage_run.counts or {}),
+                },
+            )
         return rebuilt
 
     def _continue_stage_input_error(self, db: Session, task: BinarySecurityTask, stage_name: str) -> str | None:
@@ -10427,6 +11144,20 @@ class TaskManager:
                 return "数据流分析尚未产出可用结果，不能继续漏洞扫描阶段"
             return None
         return None
+
+    def _streaming_tail_auto_progressing(self, db: Session, task: BinarySecurityTask) -> bool:
+        if not self._streaming_mode_enabled(task):
+            return False
+        if str(task.status or "").strip() not in {"pending", "running", "dispatching"}:
+            return False
+        tail_stages = self._streaming_tail_stage_names(task)
+        if not tail_stages:
+            return False
+        for stage_name in tail_stages:
+            for item in self._stage_items(db, task.id, stage_name):
+                if self._is_streaming_active_item_status(item.status):
+                    return True
+        return False
 
     def _clear_stage_outputs_from(self, task: BinarySecurityTask, stage_name: str, *, mark_stale: bool = True) -> None:
         summary = dict(task.summary or {})
@@ -12604,6 +13335,8 @@ class TaskManager:
                     }
                 ),
             }
+            if self._streaming_mode_enabled(task):
+                self._trigger_entry_items_from_b2s_result(session, task, result, upstream_item=item)
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
         except StaleTaskExecution:
@@ -12933,6 +13666,8 @@ class TaskManager:
             }
             item.result = self._compact_result_for_storage(stage_run.stage_name, result)
             item.output_ref = {**(item.output_ref or {}), "artifact_root": str(archived_dir), "archive_root": str(archived_dir)}
+            if self._streaming_mode_enabled(task):
+                self._trigger_dataflow_items_from_entry_result(session, task, result, upstream_item=item)
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
         except StaleTaskExecution:
@@ -13297,6 +14032,8 @@ class TaskManager:
                 "archive_root": str(archived_dir),
                 "data_flow_file": result["data_flow_file"],
             }
+            if self._streaming_mode_enabled(task):
+                self._trigger_vuln_items_from_dataflow_result(session, task, result, upstream_item=item)
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
         except StaleTaskExecution:

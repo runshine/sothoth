@@ -114,6 +114,7 @@ class QueueConfig(BaseModel):
 
 
 class RuntimePolicyConfig(BaseModel):
+    pipeline_mode: str = "barrier"
     max_stage_parallelism: int = 4
     max_retries_per_item: int = 2
     continue_on_item_failure: bool = True

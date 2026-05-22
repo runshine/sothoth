@@ -21,6 +21,7 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
         self.manager._loop_task = _Task(False)
         self.manager._action_loop_task = _Task(False)
         self.manager._archive_loop_task = _Task(True)
+        self.manager._stage_item_loop_task = _Task(False)
         self.manager._downstream_reconcile_task = _Task(False)
         self.manager._state_reducer_loop_task = _Task(False)
         self.manager._reducer_metrics_snapshot_loop_task = _Task(False)
@@ -33,12 +34,14 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
                 "task_dispatch": True,
                 "action_dispatch": True,
                 "archive_dispatch": False,
+                "stage_item_dispatch": True,
                 "downstream_reconcile": True,
                 "state_reducer": True,
                 "reducer_metrics_snapshot": True,
             },
             status["loops"],
         )
+        self.assertEqual(0, status["workers"]["stage_item_workers"])
 
 
 class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
