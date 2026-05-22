@@ -163,8 +163,15 @@ def maybe_create_observer(path: str, queue: asyncio.Queue):
     if Observer is None:
         return None
     watch_dir = os.path.dirname(path) or "."
+    if not os.path.isdir(watch_dir):
+        return None
     handler = _PathEventHandler(path, queue)
     observer = Observer()
-    observer.schedule(handler, watch_dir, recursive=False)
-    observer.start()
+    try:
+        observer.schedule(handler, watch_dir, recursive=False)
+        observer.start()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
     return observer

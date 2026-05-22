@@ -97,6 +97,17 @@ async def run_io(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
+async def _safe_ws_send_json(websocket: WebSocket, payload: dict[str, Any]) -> bool:
+    try:
+        await websocket.send_json(payload)
+        return True
+    except (WebSocketDisconnect, RuntimeError):
+        return False
+    except Exception as exc:
+        logger.info("watch websocket send aborted: %s", exc)
+        return False
+
+
 @router.get("/health")
 async def health_check():
     return {"status": "ok", "service": "secflow-platform-fileserver"}
@@ -193,7 +204,7 @@ async def watch_file_ws(websocket: WebSocket):
                     _, line_offset, _ = await build_line_delta(target_path, 0)
                 except UnicodeDecodeError:
                     line_offset = 0
-        await websocket.send_json({
+        if not await _safe_ws_send_json(websocket, {
             "type": "snapshot",
             "request_id": request_id,
             "project_id": project_id,
@@ -205,7 +216,8 @@ async def watch_file_ws(websocket: WebSocket):
             "start_byte": byte_offset if read_mode == "byte" else None,
             "queue_class": "STREAM",
             "ts": utc_now_iso(),
-        })
+        }):
+            return
 
         async def _session_loop():
             nonlocal read_mode, line_offset, byte_offset, initial
@@ -218,7 +230,7 @@ async def watch_file_ws(websocket: WebSocket):
                     msg = await asyncio.wait_for(websocket.receive_json(), timeout=poll_interval)
                     action = (msg.get("action") or "").strip().lower()
                     if action in {"unsubscribe", "close"}:
-                        await websocket.send_json({"type": "file_event", "event": "closed", "request_id": request_id, "project_id": project_id, "path": normalized_path, "ts": utc_now_iso()})
+                        await _safe_ws_send_json(websocket, {"type": "file_event", "event": "closed", "request_id": request_id, "project_id": project_id, "path": normalized_path, "ts": utc_now_iso()})
                         break
                     if action == "seek":
                         if read_mode == "line":
@@ -258,7 +270,7 @@ async def watch_file_ws(websocket: WebSocket):
 
                 if fs_event:
                     await limiter.inc_events()
-                    await websocket.send_json({
+                    if not await _safe_ws_send_json(websocket, {
                         "type": "file_event",
                         "event": fs_event,
                         "request_id": request_id,
@@ -268,7 +280,8 @@ async def watch_file_ws(websocket: WebSocket):
                         "mtime": current.mtime if current.exists else 0,
                         "inode": current.inode if current.exists else 0,
                         "ts": utc_now_iso(),
-                    })
+                    }):
+                        break
                     if fs_event == "deleted":
                         break
                     if fs_event == "truncated":
@@ -280,13 +293,14 @@ async def watch_file_ws(websocket: WebSocket):
                         try:
                             from_line, to_line, lines = await build_line_delta(target_path, line_offset)
                         except UnicodeDecodeError:
-                            await websocket.send_json({"type": "error", "request_id": request_id, "project_id": project_id, "path": normalized_path, "message": "文件非UTF-8文本，line模式不可用", "ts": utc_now_iso()})
+                            if not await _safe_ws_send_json(websocket, {"type": "error", "request_id": request_id, "project_id": project_id, "path": normalized_path, "message": "文件非UTF-8文本，line模式不可用", "ts": utc_now_iso()}):
+                                break
                             lines = []
                             from_line = line_offset
                             to_line = line_offset
                         if lines:
                             await limiter.inc_events()
-                            await websocket.send_json({
+                            if not await _safe_ws_send_json(websocket, {
                                 "type": "delta",
                                 "read_mode": "line",
                                 "from_line": from_line,
@@ -296,14 +310,15 @@ async def watch_file_ws(websocket: WebSocket):
                                 "project_id": project_id,
                                 "path": normalized_path,
                                 "ts": utc_now_iso(),
-                            })
+                            }):
+                                break
                             line_offset = to_line
                     else:
                         from_byte, to_byte, chunk = await build_byte_delta(target_path, byte_offset, max_buffer)
                         if chunk:
                             await limiter.inc_events()
                             await limiter.inc_bytes(len(chunk))
-                            await websocket.send_json({
+                            if not await _safe_ws_send_json(websocket, {
                                 "type": "delta",
                                 "read_mode": "byte",
                                 "from_byte": from_byte,
@@ -314,7 +329,8 @@ async def watch_file_ws(websocket: WebSocket):
                                 "project_id": project_id,
                                 "path": normalized_path,
                                 "ts": utc_now_iso(),
-                            })
+                            }):
+                                break
                             byte_offset = to_byte
 
                 # consume watchdog hints (not mandatory for logic correctness)
@@ -322,7 +338,7 @@ async def watch_file_ws(websocket: WebSocket):
                     _ = observer_queue.get_nowait()
 
                 if now - last_heartbeat >= heartbeat_seconds:
-                    await websocket.send_json({
+                    if not await _safe_ws_send_json(websocket, {
                         "type": "heartbeat",
                         "request_id": request_id,
                         "project_id": project_id,
@@ -331,7 +347,8 @@ async def watch_file_ws(websocket: WebSocket):
                         "line_offset": line_offset if read_mode == "line" else None,
                         "byte_offset": byte_offset if read_mode == "byte" else None,
                         "ts": utc_now_iso(),
-                    })
+                    }):
+                        break
                     last_heartbeat = now
 
                 if now - last_auth_check >= auth_recheck_seconds:
@@ -339,7 +356,7 @@ async def watch_file_ws(websocket: WebSocket):
                         await verify_project_access_by_token(project_id, bearer_token)
                     except Exception as exc:
                         await limiter.inc_auth_failures()
-                        await websocket.send_json({"type": "error", "request_id": request_id, "project_id": project_id, "path": normalized_path, "message": f"鉴权失效: {exc}", "ts": utc_now_iso()})
+                        await _safe_ws_send_json(websocket, {"type": "error", "request_id": request_id, "project_id": project_id, "path": normalized_path, "message": f"鉴权失效: {exc}", "ts": utc_now_iso()})
                         break
                     last_auth_check = now
 
