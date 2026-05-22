@@ -46,11 +46,11 @@ class SchedulerService:
 
     @property
     def is_worker_role(self) -> bool:
-        return self.role in {"standalone", "worker"} and self.capacity > 0
+        return self.role in {"standalone", "worker"}
 
     @property
     def is_http_worker_role(self) -> bool:
-        return self.role in {"worker", "standalone"} and self.capacity > 0
+        return self.role in {"worker", "standalone"}
 
     @property
     def is_manager_role(self) -> bool:
@@ -75,6 +75,13 @@ class SchedulerService:
     @property
     def capacity(self) -> int:
         return get_config().scheduler.worker_capacity
+
+    @property
+    def has_unlimited_capacity(self) -> bool:
+        return self.capacity <= 0
+
+    def has_available_capacity(self) -> bool:
+        return self.has_unlimited_capacity or self.local_running_count() < self.capacity
 
     async def start(self) -> None:
         if self._started or not get_config().scheduler.enabled:
@@ -221,7 +228,7 @@ class SchedulerService:
                 continue
             if self._worker_status != "active":
                 continue
-            while self.local_running_count() < self.capacity:
+            while self.has_available_capacity():
                 execution_id = await asyncio.to_thread(self._claim_next_execution)
                 if not execution_id:
                     break
@@ -248,10 +255,10 @@ class SchedulerService:
             except Exception:
                 logger.exception("manager failed to dispatch pending execution %s", execution_id)
 
-    def _pending_worker_dispatch_execution_ids(self, limit: int = 32) -> list[str]:
+    def _pending_worker_dispatch_execution_ids(self, limit: int | None = None) -> list[str]:
         db = get_db_session()
         try:
-            rows = (
+            query = (
                 db.query(WorkflowExecution.id)
                 .join(TriggerTask, WorkflowExecution.trigger_task_id == TriggerTask.id)
                 .join(WorkflowDefinition, WorkflowExecution.workflow_definition_id == WorkflowDefinition.id)
@@ -264,9 +271,10 @@ class SchedulerService:
                     WorkflowDefinition.enabled.is_(True),
                 )
                 .order_by(TriggerTask.priority.desc(), TriggerTask.created_at.asc())
-                .limit(limit)
-                .all()
             )
+            if limit is not None and limit > 0:
+                query = query.limit(limit)
+            rows = query.all()
             return [str(row[0]) for row in rows]
         finally:
             db.close()
@@ -274,7 +282,7 @@ class SchedulerService:
     def _start_assigned_jobs(self) -> None:
         if self.role != "worker" or self._worker_status != "active":
             return
-        while self.local_running_count() < self.capacity:
+        while self.has_available_capacity():
             execution_id = self._claim_next_assigned_execution()
             if not execution_id:
                 break
@@ -467,7 +475,7 @@ class SchedulerService:
             return False
         if not self.is_worker_role:
             return False
-        if self._worker_status != "active" or self.local_running_count() >= self.capacity:
+        if self._worker_status != "active" or not self.has_available_capacity():
             return False
         claimed_execution_id = self._claim_execution_now(execution_id)
         if not claimed_execution_id:

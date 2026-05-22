@@ -149,7 +149,8 @@ class SchedulerConfig(BaseModel):
     role: str = Field(default_factory=lambda: os.getenv("SECFLOW_DATAFLOW_ROLE") or os.getenv("ROLE") or "standalone")
     pod_id: str = Field(default_factory=lambda: os.getenv("POD_ID") or os.getenv("HOSTNAME") or "local-pod")
     host_name: str = Field(default_factory=lambda: os.getenv("HOSTNAME") or "localhost")
-    worker_capacity: int = 1
+    # worker_capacity <= 0 means no scheduler-side concurrency limit.
+    worker_capacity: int = 0
     poll_interval_seconds: int = 2
     heartbeat_interval_seconds: int = 5
     worker_timeout_seconds: int = 300

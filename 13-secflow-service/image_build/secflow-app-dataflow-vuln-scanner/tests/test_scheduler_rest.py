@@ -20,6 +20,7 @@ def _create_pending_execution(
     worker_url: str | None = None,
     worker_job_id: str | None = None,
     owner_pod_id: str | None = None,
+    dispatch_status: str | None = None,
 ) -> str:
     definition = WorkflowDefinition(
         id=f"wfd-sched-{suffix}",
@@ -62,6 +63,7 @@ def _create_pending_execution(
         worker_url=worker_url,
         worker_job_id=worker_job_id,
         owner_pod_id=owner_pod_id,
+        dispatch_status=dispatch_status,
     )
     trigger.latest_execution_id = execution.id
     db.add_all([definition, trigger, execution])
@@ -198,6 +200,88 @@ def test_worker_role_registers_single_capacity_worker(service_config_path: Path)
         assert worker is not None
         assert worker.capacity == 1
         assert worker.metadata_json["role"] == "worker"
+    finally:
+        db.close()
+
+
+def test_start_execution_now_allows_unlimited_worker_capacity(
+    service_config_path: Path,
+    framework_config_payload: dict,
+    monkeypatch,
+):
+    config = get_config()
+    config.scheduler.enabled = True
+    config.scheduler.role = "standalone"
+    config.scheduler.pod_id = "standalone-pod"
+    config.scheduler.worker_capacity = 0
+
+    db = get_db_session()
+    try:
+        execution_id = _create_pending_execution(db, framework_config_payload, suffix="unlimited-now")
+    finally:
+        db.close()
+
+    started: list[str] = []
+    monkeypatch.setattr(SchedulerService, "_schedule_execution_thread", lambda self, execution_id: started.append(execution_id))
+
+    scheduler = SchedulerService()
+    assert scheduler.start_execution_now(execution_id) is True
+    assert started == [execution_id]
+
+    db = get_db_session()
+    try:
+        execution = db.get(WorkflowExecution, execution_id)
+        trigger = db.get(TriggerTask, "tt-sched-unlimited-now")
+        assert execution is not None
+        assert trigger is not None
+        assert execution.status == "running"
+        assert trigger.status == "running"
+        assert execution.owner_pod_id == "standalone-pod"
+    finally:
+        db.close()
+
+
+def test_worker_capacity_zero_starts_all_assigned_jobs(
+    service_config_path: Path,
+    framework_config_payload: dict,
+    monkeypatch,
+):
+    config = get_config()
+    config.scheduler.enabled = True
+    config.scheduler.role = "worker"
+    config.scheduler.pod_id = "worker-pod"
+    config.scheduler.worker_capacity = 0
+
+    db = get_db_session()
+    try:
+        execution_ids = [
+            _create_pending_execution(
+                db,
+                framework_config_payload,
+                suffix=f"unlimited-assigned-{idx}",
+                worker_url="http://worker-pod",
+                worker_job_id=f"job-unlimited-assigned-{idx}",
+                owner_pod_id="worker-pod",
+                dispatch_status="queued",
+            )
+            for idx in range(3)
+        ]
+    finally:
+        db.close()
+
+    started: list[str] = []
+    monkeypatch.setattr(SchedulerService, "_schedule_execution_thread", lambda self, execution_id: started.append(execution_id))
+
+    SchedulerService()._start_assigned_jobs()
+    assert started == execution_ids
+
+    db = get_db_session()
+    try:
+        executions = db.query(WorkflowExecution).filter(WorkflowExecution.id.in_(execution_ids)).all()
+        triggers = db.query(TriggerTask).filter(TriggerTask.id.in_([f"tt-sched-unlimited-assigned-{idx}" for idx in range(3)])).all()
+        assert {item.status for item in executions} == {"running"}
+        assert {item.status for item in triggers} == {"running"}
+        assert {item.dispatch_status for item in executions} == {"running"}
     finally:
         db.close()
 

@@ -82,7 +82,7 @@ service:
 
 scheduler:
   enabled: true
-  worker_capacity: 1
+  worker_capacity: 0
   poll_interval_seconds: 1
   heartbeat_interval_seconds: 2
   worker_timeout_seconds: 300
