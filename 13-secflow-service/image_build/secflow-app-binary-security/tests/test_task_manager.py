@@ -8680,6 +8680,54 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(str(artifact_root), rows[0]["source_dir"])
             self.assertTrue(rows[0]["entry_files_list"].endswith("modules/IPSEC/files.list"))
 
+    def test_rebuild_entry_results_restores_source_dir_from_definition_file(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="module-task",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            status="running",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            summary={},
+        )
+        stage_item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="IPSEC",
+            status="success",
+            input_ref={"module_key": "module-1", "module_name": "IPSEC", "source_dir": None},
+            result={
+                "module_key": "module-1",
+                "module_name": "IPSEC",
+                "entries_preview": [
+                    {
+                        "entry_key": "entry-1",
+                        "module_key": "module-1",
+                        "module_name": "IPSEC",
+                        "function_name": "IPSEC_CFG_VRDestory",
+                        "file_name": "libipsec.c",
+                        "definition_file": "/tmp/repo/src/libipsec.c",
+                        "definition_line": "1572",
+                        "taint_params": ["argv"],
+                    }
+                ],
+            },
+            output_ref={},
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[stage_item])
+
+        rebuilt = self.manager._rebuild_entry_results_from_stage_items(db, task)
+
+        self.assertEqual(1, len(rebuilt))
+        self.assertEqual("/tmp/repo/src", rebuilt[0]["source_dir"])
+        self.assertEqual("/tmp/repo/src", rebuilt[0]["entries"][0]["source_dir"])
+
     def test_stage_entry_analysis_uses_binary_to_source_failure_reason_when_inputs_missing(self):
         task = BinarySecurityTask(
             id="t1",
@@ -11499,6 +11547,72 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("entry-1", call_args.args[2]["entry_key"])
         self.assertTrue(call_args.args[2]["data_flow_file"].endswith("dataflow.md"))
         self.assertIs(item, call_args.kwargs["upstream_item"])
+
+    def test_run_dataflow_item_falls_back_to_definition_parent_when_source_dir_missing(self):
+        task = BinarySecurityTask(id="t1", name="source-task", project_id="p1", workspace_root="/tmp/ws")
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            sequence_no=3,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            item_key="entry-1",
+            item_name="main",
+            parent_key="module-1",
+            downstream_service="dataflow_analyse",
+            status="pending",
+            output_ref={},
+        )
+        entry = {
+            "entry_key": "entry-1",
+            "function_name": "main",
+            "source_dir": None,
+            "file_name": "main.c",
+            "module_key": "module-1",
+            "is_definition_found": True,
+            "definition_file": "/tmp/repo/src/main.c",
+            "definition_line": "10",
+            "taint_params": ["argv"],
+        }
+        fake_session = _ModelAwareDb()
+        create_calls: list[dict[str, str]] = []
+
+        async def fake_create_task(project_id, task_name, input_path, prompt, origin, **kwargs):
+            create_calls.append(
+                {
+                    "project_id": project_id,
+                    "task_name": task_name,
+                    "input_path": input_path,
+                    "source_file": str(kwargs.get("source_file") or ""),
+                }
+            )
+            return {"task_id": "dfa-live"}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_find_reusable_dataflow_payload", return_value=None),
+            patch.object(task_manager_module, "get_dataflow_analyse_client", return_value=SimpleNamespace(create_task=fake_create_task, get_task=lambda *args, **kwargs: None)),
+            patch.object(self.manager, "_poll_until_terminal", return_value=("success", {"task_id": "dfa-live", "status": "passed"})),
+            patch.object(self.manager, "_service_output_dir", return_value=Path("/tmp")),
+            patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
+            patch.object(self.manager, "_find_first", return_value=Path("/tmp/dataflow.md")),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+            patch.object(self.manager, "_lightweight_downstream_payload", side_effect=lambda payload: {"status": payload.get("status")}),
+            patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
+        ):
+            result = asyncio.run(self.manager._run_dataflow_item(task, stage_run, entry, token=None, retrying=False))
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual(1, len(create_calls))
+        self.assertEqual("/tmp/repo/src", create_calls[0]["input_path"])
 
     def test_run_entry_item_retry_running_conflict_polls_existing_downstream(self):
         task = BinarySecurityTask(

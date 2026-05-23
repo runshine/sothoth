@@ -9462,7 +9462,7 @@ class TaskManager:
                 **result,
                 "module_key": str(result.get("module_key") or input_ref.get("module_key") or item.item_key or ""),
                 "module_name": str(result.get("module_name") or input_ref.get("module_name") or item.item_name or ""),
-                "source_dir": str(result.get("source_dir") or input_ref.get("source_dir") or task.firmware_path or ""),
+                "source_dir": self._resolve_entry_source_dir({**input_ref, **result}) or str(task.firmware_path or ""),
             }
             if not module["module_key"] or not module["module_name"]:
                 continue
@@ -9483,7 +9483,12 @@ class TaskManager:
                 entries = [dict(entry) for entry in result.get("entries_preview") or [] if isinstance(entry, dict)]
             if not entries:
                 continue
-            rebuilt.append(self._compact_entry_summary_item({**module, "entries": entries}))
+            normalized_entries = []
+            for entry in entries:
+                row = dict(entry)
+                row["source_dir"] = self._resolve_entry_source_dir({**module, **row}) or module["source_dir"]
+                normalized_entries.append(row)
+            rebuilt.append(self._compact_entry_summary_item({**module, "entries": normalized_entries}))
 
         summary = {**(task.summary or {}), "entry_results": rebuilt}
         task.summary = summary
@@ -13696,7 +13701,42 @@ class TaskManager:
         finally:
             session.close()
 
+    def _resolve_entry_source_dir(self, entry: dict[str, Any]) -> str:
+        if not isinstance(entry, dict):
+            return ""
+
+        nested_entries = entry.get("entries") or entry.get("entries_preview") or []
+        if isinstance(nested_entries, list):
+            for nested in nested_entries:
+                if isinstance(nested, dict):
+                    nested_value = self._resolve_entry_source_dir({k: v for k, v in nested.items() if k not in {"entries", "entries_preview"}})
+                    if nested_value:
+                        return nested_value
+
+        preferred = [
+            entry.get("source_dir"),
+            entry.get("source_root") if entry.get("task_type") == TASK_TYPE_SOURCE else None,
+            entry.get("source_root"),
+            entry.get("entry_descriptor_root"),
+            entry.get("module_dir"),
+            entry.get("artifact_root"),
+            entry.get("archive_root"),
+            entry.get("unpacked_root"),
+        ]
+        for candidate in preferred:
+            value = str(candidate or "").strip()
+            if value:
+                return value
+
+        definition_file = str(entry.get("definition_file") or entry.get("file_name") or "").strip()
+        if definition_file:
+            definition_path = Path(definition_file)
+            return str(definition_path.parent if definition_path.suffix else definition_path)
+        return ""
+
     def _parse_entries(self, artifact_root: Path, module: dict[str, Any]) -> list[dict[str, Any]]:
+        resolved_source_dir = self._resolve_entry_source_dir(module)
+
         def _rows_from_payload(payload: Any, source: Path) -> list[dict[str, Any]]:
             if isinstance(payload, dict):
                 raw_entries = payload.get("entries") or payload.get("items") or []
@@ -13745,7 +13785,7 @@ class TaskManager:
                         "taint_details": _normalize_entry_taint_details(entry, taint_params),
                         "signature_params": _entry_signature_params({**entry, "raw_function_name": raw_function_name}),
                         "entry_file": str(source),
-                        "source_dir": (module.get("source_root") if module.get("task_type") == TASK_TYPE_SOURCE else None) or module["source_dir"],
+                        "source_dir": resolved_source_dir,
                     }
                 )
             return _deduplicate_entry_keys(rows)
@@ -13814,7 +13854,7 @@ class TaskManager:
                             "entry_reason_source": "default",
                             "taint_details": _normalize_entry_taint_details({"taint_details": []}, taint_params),
                             "entry_file": str(entry_file),
-                            "source_dir": (module.get("source_root") if module.get("task_type") == TASK_TYPE_SOURCE else None) or module["source_dir"],
+                            "source_dir": resolved_source_dir,
                         }
                     )
         return _deduplicate_entry_keys(rows)
@@ -13853,6 +13893,7 @@ class TaskManager:
             definition_found = bool(entry.get("is_definition_found", True))
             definition_file = str(entry.get("definition_file") or entry.get("file_name") or "").strip()
             definition_line = str(entry.get("definition_line") or entry.get("line_no") or "").strip()
+            source_dir = self._resolve_entry_source_dir(entry)
             if not definition_found:
                 item.status = "failed"
                 item.finished_at = _now()
@@ -13871,6 +13912,20 @@ class TaskManager:
                 item.status = "failed"
                 item.finished_at = _now()
                 item.error_message = "未识别到明确污点参数，无法执行数据流分析"
+                item.result = self._compact_result_for_storage(
+                    stage_run.stage_name,
+                    {
+                        **entry,
+                        "failed": True,
+                        "failure_reason": item.error_message,
+                    },
+                )
+                session.commit()
+                return {"status": "failed", "error": item.error_message, "item": entry}
+            if not source_dir:
+                item.status = "failed"
+                item.finished_at = _now()
+                item.error_message = "未找到可用于数据流分析的源码目录"
                 item.result = self._compact_result_for_storage(
                     stage_run.stage_name,
                     {
@@ -13963,7 +14018,7 @@ class TaskManager:
                 created = await get_dataflow_analyse_client().create_task(
                     task.project_id,
                     f"{task.name}-{entry['function_name']}-dfa",
-                    entry["source_dir"],
+                    source_dir,
                     prompt,
                     _downstream_origin_payload(task, item),
                     source_file=definition_file or entry["file_name"],
