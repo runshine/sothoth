@@ -3658,6 +3658,16 @@ class TaskManager:
     ) -> None:
         if action not in TASK_PENDING_ACTIONS:
             raise ValidationError(f"不支持的任务阻塞动作: {action}")
+        try:
+            db.refresh(task)
+        except Exception:
+            refreshed = (
+                db.query(BinarySecurityTask)
+                .filter(BinarySecurityTask.id == task.id)
+                .first()
+            )
+            if refreshed is not None:
+                task = refreshed
         operation_token = str(task.operation_lock_token or "").strip()
         self._enqueue_state_event(
             db,

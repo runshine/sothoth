@@ -5694,6 +5694,42 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(task.operation_lock_heartbeat_at)
             self.assertIsNotNone(task.operation_lock_expires_at)
 
+    def test_accept_blocking_action_refreshes_operation_lock_token_before_enqueuing_state_event(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+
+        class _RefreshDb(_ModelAwareDb):
+            def refresh(self, obj):
+                obj.operation_lock_token = "op-fresh-1"
+                obj.operation_lock_type = "retry_stage_full"
+
+        db = _RefreshDb(tasks=[task])
+
+        self.manager._accept_blocking_action(
+            db,
+            task,
+            action="retry_stage_full",
+            preparing_status="retry_preparing",
+            target_stage="entry_analysis",
+            message="accepted",
+            event_type="stage_retry_full_accepted",
+            event_payload={"target_stage": "entry_analysis"},
+        )
+
+        state_events = [event for event in db.added if isinstance(event, BinarySecurityStateEvent)]
+        self.assertEqual(1, len(state_events))
+        self.assertEqual("op-fresh-1", state_events[0].payload.get("operation_token"))
+
     def test_retry_task_clears_stage_output_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
