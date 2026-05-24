@@ -1693,6 +1693,7 @@ class TaskManager:
     ) -> BinarySecurityArtifactsResponse:
         task = self._task_or_404(db, project_id, task_id)
         page = self._list_artifact_page(Path(task.workspace_root), limit=max(1, limit), offset=max(0, offset))
+        artifact_groups = self._artifact_groups_from_b2s_results(task)
         return BinarySecurityArtifactsResponse(
             task_id=task.id,
             workspace_root=task.workspace_root,
@@ -1703,7 +1704,53 @@ class TaskManager:
             offset=page["offset"],
             has_more=page["has_more"],
             files=page["files"],
+            grouped_by_index=bool(artifact_groups),
+            artifact_groups=artifact_groups,
         )
+
+    def _artifact_groups_from_b2s_results(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        summary = task.summary if isinstance(task.summary, dict) else {}
+        rows = summary.get("b2s_results") if isinstance(summary.get("b2s_results"), list) else []
+        groups: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            artifact_index_path = str(row.get("artifact_index_path") or "").strip()
+            if not artifact_index_path:
+                continue
+            try:
+                payload = json.loads(Path(artifact_index_path).read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            raw_artifacts = payload.get("artifacts") if isinstance(payload.get("artifacts"), list) else []
+            artifacts = [
+                {
+                    "relative_path": str(entry.get("relative_path") or "").strip(),
+                    "kind": str(entry.get("kind") or "other").strip() or "other",
+                    "size": int(entry.get("size") or 0),
+                    "stage": entry.get("stage"),
+                    "section": entry.get("section"),
+                    "batch_no": entry.get("batch_no"),
+                    "attempt_no": entry.get("attempt_no"),
+                }
+                for entry in raw_artifacts
+                if isinstance(entry, dict) and str(entry.get("relative_path") or "").strip()
+            ]
+            groups.append(
+                {
+                    "module_key": str(row.get("module_key") or "").strip() or str(row.get("module_name") or "").strip() or "module",
+                    "module_name": row.get("module_name"),
+                    "source_root": row.get("source_root") or row.get("source_dir"),
+                    "primary_result_kind": row.get("primary_result_kind"),
+                    "result_kinds": [str(kind).strip() for kind in (row.get("result_kinds") or []) if str(kind).strip()],
+                    "artifact_kind_summary": dict(row.get("artifact_kind_summary") or {}),
+                    "result_kind_summary": dict(row.get("result_kind_summary") or {}),
+                    "artifact_index_path": artifact_index_path,
+                    "result_summary_version": int(row.get("result_summary_version") or payload.get("version") or 1),
+                    "artifacts": artifacts,
+                }
+            )
+        return groups
 
     async def cancel_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityActionResponse:
         operation_token = self._acquire_task_operation_lease(db, task_id, operation="cancel", ttl_seconds=TASK_OPERATION_LOCK_TTL_SECONDS)
@@ -13319,12 +13366,34 @@ class TaskManager:
             prepared_entry = {}
             if self._task_type(task) == TASK_TYPE_BINARY_MODULE:
                 prepared_entry = self._prepare_entry_module_descriptor(archived_dir, module)
+            artifact_index_path = None
+            artifact_kind_summary: dict[str, int] = {}
+            result_kind_summary: dict[str, int] = {}
+            result_kinds: list[str] = []
+            primary_result_kind = None
+            b2s_result_summary_version = None
+            downstream_result_summary = payload.get("result_summary") if isinstance(payload.get("result_summary"), dict) else {}
+            item_summaries = downstream_result_summary.get("items") if isinstance(downstream_result_summary.get("items"), list) else []
+            if item_summaries:
+                summary_row = next((row for row in item_summaries if isinstance(row, dict)), {})
+                artifact_index_path = summary_row.get("artifact_index_path")
+                artifact_kind_summary = dict(summary_row.get("artifact_summary") or {})
+                result_kind_summary = dict(summary_row.get("result_kind_summary") or {})
+                result_kinds = [str(kind).strip() for kind in (summary_row.get("result_kinds") or []) if str(kind).strip()]
+                primary_result_kind = str(summary_row.get("primary_result_kind") or "").strip() or None
+                b2s_result_summary_version = summary_row.get("result_summary_version")
             result = {
                 **module,
                 "source_dir": str(archived_dir),
                 "source_root": str(archived_dir),
                 "generated_files": [],
                 "downstream": self._lightweight_downstream_payload(payload),
+                "artifact_kind_summary": artifact_kind_summary,
+                "result_kind_summary": result_kind_summary,
+                "result_kinds": result_kinds,
+                "primary_result_kind": primary_result_kind,
+                "artifact_index_path": artifact_index_path,
+                "result_summary_version": b2s_result_summary_version or 1,
                 **prepared_entry,
             }
             item.result = self._compact_result_for_storage(stage_run.stage_name, result)
@@ -14427,6 +14496,12 @@ class TaskManager:
             "entry_source_file_count": item.get("entry_source_file_count"),
             "entry_source_files_preview": item.get("entry_source_files_preview"),
             "entry_descriptor_ready": item.get("entry_descriptor_ready", False),
+            "primary_result_kind": item.get("primary_result_kind"),
+            "result_kinds": [str(kind).strip() for kind in (item.get("result_kinds") or []) if str(kind).strip()],
+            "artifact_kind_summary": dict(item.get("artifact_kind_summary") or item.get("artifact_summary") or {}),
+            "result_kind_summary": dict(item.get("result_kind_summary") or {}),
+            "artifact_index_path": item.get("artifact_index_path"),
+            "result_summary_version": item.get("result_summary_version") or 1,
         }
 
     def _compact_entry_summary_item(self, item: dict[str, Any]) -> dict[str, Any]:

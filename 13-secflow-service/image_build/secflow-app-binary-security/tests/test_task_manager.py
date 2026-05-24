@@ -3442,6 +3442,18 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                     "source_dir": "/tmp/archive/openssl",
                     "module_report": None,
                     "files_list": None,
+                    "entry_module_name": None,
+                    "entry_descriptor_root": None,
+                    "entry_files_list": None,
+                    "entry_source_file_count": None,
+                    "entry_source_files_preview": None,
+                    "entry_descriptor_ready": False,
+                    "primary_result_kind": None,
+                    "result_kinds": [],
+                    "artifact_kind_summary": {},
+                    "result_kind_summary": {},
+                    "artifact_index_path": None,
+                    "result_summary_version": 1,
                 }
             ],
             task.summary["b2s_results"],
@@ -3471,6 +3483,12 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                         "source_dir": "/tmp/archive/openssl",
                         "module_report": "/tmp/archive/openssl/report.md",
                         "files_list": "/tmp/archive/openssl/files.list",
+                        "primary_result_kind": "recovered_source",
+                        "result_kinds": ["recovered_source", "recovered_header"],
+                        "artifact_kind_summary": {"source": 10, "header": 2},
+                        "result_kind_summary": {"recovered_source": 10, "recovered_header": 2},
+                        "artifact_index_path": "/tmp/archive/openssl/artifacts/index.json",
+                        "result_summary_version": 1,
                         "generated_files": [f"/tmp/archive/openssl/{idx}.c" for idx in range(100)],
                         "downstream": {"items": [{"huge": "x" * 1000} for _ in range(100)]},
                     },
@@ -3483,6 +3501,10 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         stored = task.summary["b2s_results"][0]
         self.assertEqual("m1", stored["module_key"])
         self.assertEqual("/tmp/archive/openssl", stored["source_dir"])
+        self.assertEqual("recovered_source", stored["primary_result_kind"])
+        self.assertEqual(["recovered_source", "recovered_header"], stored["result_kinds"])
+        self.assertEqual({"source": 10, "header": 2}, stored["artifact_kind_summary"])
+        self.assertEqual("/tmp/archive/openssl/artifacts/index.json", stored["artifact_index_path"])
         self.assertNotIn("generated_files", stored)
         self.assertNotIn("downstream", stored)
         self.assertEqual(stored, summary["items"][0])
@@ -10763,6 +10785,65 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ["dir-1/file-1.txt", "dir-2/file-2.txt"],
             [entry["path"] for entry in page["files"]],
         )
+
+    def test_get_artifacts_prefers_b2s_artifact_index_groups_when_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            artifact_index = workspace / "output" / "binary_to_source" / "openssl" / "artifacts" / "index.json"
+            artifact_index.parent.mkdir(parents=True, exist_ok=True)
+            artifact_index.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "artifacts": [
+                            {
+                                "relative_path": "main.c",
+                                "kind": "c",
+                                "size": 123,
+                                "stage": "输出产物",
+                                "section": "文件",
+                                "batch_no": None,
+                                "attempt_no": None,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="n",
+                status="running",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+                summary={
+                    "b2s_results": [
+                        {
+                            "module_key": "openssl",
+                            "module_name": "OpenSSL",
+                            "source_root": str(workspace / "output" / "binary_to_source" / "openssl"),
+                            "primary_result_kind": "recovered_source",
+                            "result_kinds": ["recovered_source"],
+                            "artifact_kind_summary": {"c": 1},
+                            "result_kind_summary": {"recovered_source": 1},
+                            "artifact_index_path": str(artifact_index),
+                            "result_summary_version": 1,
+                        }
+                    ]
+                },
+            )
+            db = _ModelAwareDb(tasks=[task])
+
+            response = self.manager.get_artifacts(db, project_id="p1", task_id="t1")
+
+        self.assertTrue(response.grouped_by_index)
+        self.assertEqual(1, len(response.artifact_groups))
+        self.assertEqual("openssl", response.artifact_groups[0].module_key)
+        self.assertEqual("main.c", response.artifact_groups[0].artifacts[0].relative_path)
 
     def test_safe_extract_archive_rejects_excessive_file_count(self):
         with tempfile.TemporaryDirectory() as tmp:

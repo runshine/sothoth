@@ -371,6 +371,29 @@ class BinarySecurityArtifactEntry(BaseModel):
     size: int
 
 
+class BinarySecurityArtifactIndexedEntry(BaseModel):
+    relative_path: str
+    kind: str
+    size: int = 0
+    stage: Optional[str] = None
+    section: Optional[str] = None
+    batch_no: Optional[int] = None
+    attempt_no: Optional[int] = None
+
+
+class BinarySecurityArtifactGroup(BaseModel):
+    module_key: str
+    module_name: Optional[str] = None
+    source_root: Optional[str] = None
+    primary_result_kind: Optional[str] = None
+    result_kinds: list[str] = Field(default_factory=list)
+    artifact_kind_summary: dict[str, int] = Field(default_factory=dict)
+    result_kind_summary: dict[str, int] = Field(default_factory=dict)
+    artifact_index_path: Optional[str] = None
+    result_summary_version: int = 1
+    artifacts: list[BinarySecurityArtifactIndexedEntry] = Field(default_factory=list)
+
+
 class BinarySecurityArtifactsResponse(BaseModel):
     task_id: str
     workspace_root: str
@@ -381,6 +404,8 @@ class BinarySecurityArtifactsResponse(BaseModel):
     offset: int = 0
     has_more: bool = False
     files: list[BinarySecurityArtifactEntry] = Field(default_factory=list)
+    grouped_by_index: bool = False
+    artifact_groups: list[BinarySecurityArtifactGroup] = Field(default_factory=list)
 
 
 BinarySecurityTaskDetailResponse.model_rebuild()

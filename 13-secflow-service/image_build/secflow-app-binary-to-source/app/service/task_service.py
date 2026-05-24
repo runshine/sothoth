@@ -3347,11 +3347,143 @@ def _iter_advanced_files(advanced: TaskItemAdvancedResponse) -> list[AdvancedFil
     return files
 
 
+def _root_artifact_meta(path: Path) -> dict[str, Any]:
+    return {
+        "stage": "输出产物",
+        "stage_order": 5500,
+        "section": "文件",
+        "section_order": 0,
+        "round": "产物",
+        "round_order": 0,
+    }
+
+
+def _iter_root_artifact_paths(output_dir: Path) -> list[Path]:
+    if not output_dir.exists():
+        return []
+    allowed_suffixes = {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".json", ".jsonl", ".md", ".txt", ".log", ".yaml", ".yml", ".list"}
+    paths: list[Path] = []
+    for path in sorted(output_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        relative_parts = [part.lower() for part in path.relative_to(output_dir).parts]
+        if any(part.startswith(".re_work_") for part in relative_parts):
+            continue
+        if path.suffix.lower() not in allowed_suffixes and path.name.lower() != "files.list":
+            continue
+        paths.append(path)
+    return paths
+
+
+B2S_RESULT_SUMMARY_VERSION = 1
+_RESULT_KIND_PRIORITY = [
+    "recovered_source",
+    "entry_descriptor",
+    "analysis_metadata",
+    "final_report",
+    "recovered_header",
+    "agent_session",
+    "review_record",
+    "batch_intermediate",
+    "other",
+]
+
+
+def _normalize_artifact_kind(kind: str | None) -> str:
+    normalized = str(kind or "").strip().lower()
+    return normalized or "other"
+
+
+def _artifact_result_kind(artifact: B2SArtifact) -> str:
+    relative_path = str(getattr(artifact, "relative_path", "") or "").replace("\\", "/").lower()
+    name = str(getattr(artifact, "name", "") or "").lower()
+    suffix = Path(name).suffix.lower()
+    artifact_kind = _normalize_artifact_kind(getattr(artifact, "kind", None))
+
+    if suffix in {".c", ".cc", ".cpp", ".cxx"}:
+        return "recovered_source"
+    if suffix in {".h", ".hpp", ".hh"}:
+        return "recovered_header"
+    if name == "files.list" or "/modules/" in relative_path and relative_path.endswith("/files.list"):
+        return "entry_descriptor"
+    if name in {"functions.json", "imports.json", "metadata.json", "strings.json", "structural.json"}:
+        return "analysis_metadata"
+    if artifact_kind == "agent_session":
+        return "agent_session"
+    if artifact_kind in {"review", "review_snapshot"}:
+        return "review_record"
+    if artifact_kind in {"batch_source", "batch_disasm", "disassembly"}:
+        return "batch_intermediate"
+    if name in {"results.json", "result.json", "summary.json", "report.md"} or suffix == ".md":
+        return "final_report"
+    return "other"
+
+
+def _select_primary_result_kind(result_kind_summary: dict[str, int]) -> str | None:
+    for kind in _RESULT_KIND_PRIORITY:
+        if int(result_kind_summary.get(kind) or 0) > 0:
+            return kind
+    return None
+
+
+def _build_item_artifact_index(item: B2STaskItem, artifacts: list[B2SArtifact]) -> tuple[dict[str, int], dict[str, int], list[str], str | None, str | None]:
+    artifact_summary: dict[str, int] = {}
+    result_kind_summary: dict[str, int] = {}
+    artifact_rows: list[dict[str, Any]] = []
+    for artifact in artifacts:
+        artifact_kind = _normalize_artifact_kind(artifact.kind)
+        artifact_summary[artifact_kind] = artifact_summary.get(artifact_kind, 0) + 1
+        result_kind = _artifact_result_kind(artifact)
+        result_kind_summary[result_kind] = result_kind_summary.get(result_kind, 0) + 1
+        artifact_rows.append(
+            {
+                "relative_path": artifact.relative_path,
+                "kind": artifact_kind,
+                "size": int(artifact.size or 0),
+                "stage": artifact.stage,
+                "section": artifact.section,
+                "batch_no": artifact.batch_no,
+                "attempt_no": artifact.attempt_no,
+            }
+        )
+
+    result_kinds = [kind for kind in _RESULT_KIND_PRIORITY if int(result_kind_summary.get(kind) or 0) > 0]
+    other_kinds = sorted(kind for kind in result_kind_summary if kind not in _RESULT_KIND_PRIORITY and int(result_kind_summary.get(kind) or 0) > 0)
+    result_kinds.extend(other_kinds)
+    primary_result_kind = _select_primary_result_kind(result_kind_summary)
+
+    index_path: str | None = None
+    if item.output_dir:
+        index_dir = Path(item.output_dir) / "artifacts"
+        index_dir.mkdir(parents=True, exist_ok=True)
+        index_file = index_dir / "index.json"
+        index_payload = {
+            "version": B2S_RESULT_SUMMARY_VERSION,
+            "task_id": item.task_id,
+            "item_id": item.id,
+            "generated_at": isoformat_local(now_local()),
+            "artifact_summary": artifact_summary,
+            "result_kind_summary": result_kind_summary,
+            "result_kinds": result_kinds,
+            "primary_result_kind": primary_result_kind,
+            "artifacts": artifact_rows,
+        }
+        index_file.write_text(json.dumps(index_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        index_path = str(index_file)
+
+    return artifact_summary, result_kind_summary, result_kinds, primary_result_kind, index_path
+
+
 def build_task_item_artifacts(item: B2STaskItem) -> TaskItemArtifactsResponse:
     advanced = build_task_item_advanced(item, include_content=False)
     base = Path(advanced.output_dir).resolve()
     artifacts: list[B2SArtifact] = []
+    seen_paths: set[str] = set()
     for file in _iter_advanced_files(advanced):
+        resolved_path = str(Path(file.path).resolve())
+        if resolved_path in seen_paths:
+            continue
+        seen_paths.add(resolved_path)
         try:
             relative_path = str(Path(file.path).resolve().relative_to(base))
         except Exception:
@@ -3364,19 +3496,47 @@ def build_task_item_artifacts(item: B2STaskItem) -> TaskItemArtifactsResponse:
             round=file.round, round_order=file.round_order, agent=file.agent, role=file.role, batch_no=file.batch_no,
             attempt_no=file.attempt_no, content_url=content_url,
         ))
+    for path in _iter_root_artifact_paths(base):
+        resolved_path = str(path.resolve())
+        if resolved_path in seen_paths:
+            continue
+        seen_paths.add(resolved_path)
+        file = _safe_read_advanced_file(path, base, False, _root_artifact_meta(path))
+        if not file:
+            continue
+        try:
+            relative_path = str(path.resolve().relative_to(base))
+        except Exception:
+            relative_path = file.name
+        artifact_id = _artifact_id(file.path)
+        content_url = f"/api/app/binary-to-source/projects/{item.project_id}/tasks/{item.task_id}/items/{item.id}/artifacts/{artifact_id}/content"
+        artifacts.append(B2SArtifact(
+            id=artifact_id, name=file.name, path=file.path, relative_path=relative_path, kind=file.kind, size=file.size,
+            stage=file.stage, stage_order=file.stage_order, section=file.section, section_order=file.section_order,
+            round=file.round, round_order=file.round_order, agent=file.agent, role=file.role, batch_no=file.batch_no,
+            attempt_no=file.attempt_no, content_url=content_url,
+        ))
+    sorted_artifacts = sorted(artifacts, key=lambda file: ((file.stage_order or 0), (file.section_order or 0), (file.round_order or 0), file.relative_path))
+    artifact_summary, result_kind_summary, result_kinds, primary_result_kind, artifact_index_path = _build_item_artifact_index(item, sorted_artifacts)
     return TaskItemArtifactsResponse(
         task_id=item.task_id,
         item_id=item.id,
         output_dir=advanced.output_dir,
         work_dir=advanced.work_dir,
-        artifacts=sorted(artifacts, key=lambda file: ((file.stage_order or 0), (file.section_order or 0), (file.round_order or 0), file.relative_path)),
+        artifacts=sorted_artifacts,
         counts={
-            "artifacts": len(artifacts),
+            "artifacts": len(sorted_artifacts),
             "batches": sum(len(run.batches) for run in advanced.runs),
             "reviews": sum(len(batch.reviews) + len(batch.review_snapshots) for run in advanced.runs for batch in run.batches),
             "sessions": sum(len(run.agent_sessions) for run in advanced.runs),
             "ida_files": len(advanced.ida_files),
         },
+        artifact_summary=artifact_summary,
+        result_kind_summary=result_kind_summary,
+        result_kinds=result_kinds,
+        primary_result_kind=primary_result_kind,
+        artifact_index_path=artifact_index_path,
+        result_summary_version=B2S_RESULT_SUMMARY_VERSION,
     )
 
 
@@ -4207,6 +4367,7 @@ def build_task_result_summary(items: list[B2STaskItem]) -> TaskResultSummary:
     for item in items:
         advanced = build_task_item_advanced(item, include_content=False)
         analytics = _task_level_review_analytics(item)
+        artifacts_response = build_task_item_artifacts(item)
         artifact_paths = normalize_generated_files(item)
         result_file_count = len(artifact_paths)
         total_result_files += result_file_count
@@ -4233,6 +4394,12 @@ def build_task_result_summary(items: list[B2STaskItem]) -> TaskResultSummary:
             key_result_files=artifact_paths[:6],
             session_file_count=session_count,
             review_round_count=review_round_count,
+            artifact_summary=dict(artifacts_response.artifact_summary or {}),
+            result_kind_summary=dict(artifacts_response.result_kind_summary or {}),
+            result_kinds=list(artifacts_response.result_kinds or []),
+            primary_result_kind=artifacts_response.primary_result_kind,
+            artifact_index_path=artifacts_response.artifact_index_path,
+            result_summary_version=B2S_RESULT_SUMMARY_VERSION,
             final_verdict=analytics.summary.final_verdict,
             final_verdict_label=analytics.summary.final_verdict_label,
         ))

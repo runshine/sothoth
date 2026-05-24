@@ -229,6 +229,12 @@ class TaskResultItemSummary(BaseModel):
     key_result_files: list[str] = Field(default_factory=list)
     session_file_count: int = 0
     review_round_count: int = 0
+    artifact_summary: dict[str, int] = Field(default_factory=dict)
+    result_kind_summary: dict[str, int] = Field(default_factory=dict)
+    result_kinds: list[str] = Field(default_factory=list)
+    primary_result_kind: Optional[str] = None
+    artifact_index_path: Optional[str] = None
+    result_summary_version: int = 1
     final_verdict: Optional[str] = None
     final_verdict_label: Optional[str] = None
 
@@ -634,6 +640,12 @@ class TaskItemArtifactsResponse(BaseModel):
     work_dir: Optional[str] = None
     artifacts: list[B2SArtifact] = Field(default_factory=list)
     counts: dict[str, int] = Field(default_factory=dict)
+    artifact_summary: dict[str, int] = Field(default_factory=dict)
+    result_kind_summary: dict[str, int] = Field(default_factory=dict)
+    result_kinds: list[str] = Field(default_factory=list)
+    primary_result_kind: Optional[str] = None
+    artifact_index_path: Optional[str] = None
+    result_summary_version: int = 1
 
 
 class B2SArtifactContentResponse(BaseModel):
