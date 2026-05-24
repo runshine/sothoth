@@ -75,6 +75,8 @@ class _RouteManagerStub:
                     downstream_service="dataflow_analyse",
                     downstream_task_id="dfa-1",
                     input_ref={"upstream_item_id": "i-entry-1"},
+                    sync_status="pending",
+                    last_synced_at=None,
                 )
             ],
         )

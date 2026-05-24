@@ -245,6 +245,8 @@ class BinarySecurityStageItemResponse(BaseModel):
     result: dict[str, Any] = Field(default_factory=dict)
     error_message: Optional[str] = None
     abnormal_reason: Optional[BinarySecurityAbnormalReason] = None
+    sync_status: Optional[str] = None
+    last_synced_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
 
