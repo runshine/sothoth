@@ -8493,6 +8493,46 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(normalized["entry_descriptor_ready"])
             self.assertEqual(1, normalized["entry_source_file_count"])
 
+    def test_normalize_entry_analysis_module_input_aligns_source_root_with_descriptor_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            descriptor_root = root / "archive"
+            module_dir = descriptor_root / "modules" / "IPSEC"
+            module_dir.mkdir(parents=True)
+            source_file = descriptor_root / "src" / "ipsec.c"
+            source_file.parent.mkdir(parents=True)
+            source_file.write_text("int ipsec(void) { return 0; }\n", encoding="utf-8")
+            files_list = module_dir / "files.list"
+            files_list.write_text("src/ipsec.c\n", encoding="utf-8")
+
+            normalized = self.manager._normalize_entry_analysis_module_input(
+                BinarySecurityTask(
+                    id="t1",
+                    project_id="p1",
+                    name="module-task",
+                    task_type=TASK_TYPE_BINARY_MODULE,
+                    firmware_source="project_filesystem",
+                    firmware_path="/fw",
+                    output_root="/o",
+                    workspace_root="/w",
+                ),
+                {
+                    "module_key": "IPSEC",
+                    "module_name": "IPSEC",
+                    "entry_module_name": "IPSEC",
+                    "entry_descriptor_root": str(descriptor_root),
+                    "entry_files_list": str(files_list),
+                    "entry_descriptor_ready": True,
+                    "source_root": "/wrong/upstream/source/root",
+                    "archive_root": str(descriptor_root),
+                },
+            )
+
+            self.assertEqual(str(descriptor_root), normalized["source_dir"])
+            self.assertEqual(str(descriptor_root), normalized["source_root"])
+            self.assertEqual(str(module_dir), normalized["module_dir"])
+            self.assertEqual(str(files_list), normalized["files_list"])
+
     def test_rebuild_entry_results_restores_source_dir_from_definition_file(self):
         task = BinarySecurityTask(
             id="t1",

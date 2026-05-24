@@ -13969,7 +13969,9 @@ class TaskManager:
             if normalized.get("entry_descriptor_ready") and self._is_entry_descriptor_usable(descriptor_root_path, files_list_path):
                 normalized["module_name"] = str(normalized.get("entry_module_name") or normalized.get("module_name") or "")
                 normalized["source_dir"] = str(descriptor_root_path)
-                normalized["source_root"] = str(normalized.get("source_root") or descriptor_root_path)
+                # For binary-module -> entry-analysis, files.list is built relative to the
+                # archived B2S module root, so source_root must align with that descriptor root.
+                normalized["source_root"] = str(descriptor_root_path)
                 normalized["module_dir"] = str(Path(entry_files_list).parent)
                 normalized["files_list"] = str(files_list_path)
                 return normalized
@@ -13985,7 +13987,7 @@ class TaskManager:
             normalized.update(prepared)
             normalized["module_name"] = str(prepared.get("entry_module_name") or normalized.get("module_name") or "")
             normalized["source_dir"] = str(prepared.get("entry_descriptor_root") or normalized.get("source_dir") or "")
-            normalized["source_root"] = str(prepared.get("source_root") or normalized.get("source_root") or "")
+            normalized["source_root"] = str(prepared.get("entry_descriptor_root") or prepared.get("source_root") or normalized.get("source_root") or "")
             normalized["module_dir"] = str(prepared.get("module_dir") or normalized.get("module_dir") or "")
             normalized["files_list"] = str(prepared.get("files_list") or normalized.get("files_list") or "")
             break
