@@ -578,6 +578,12 @@ def _phase_metric_payloads(item: B2STaskItem, phase: str) -> list[dict[str, Any]
 
 def build_item_phase_observability_from_progress(item: B2STaskItem, phase: str) -> list[B2SPhaseObservabilityMetric]:
     progress = item.progress if isinstance(item.progress, dict) else {}
+    active_batches = progress.get("active_batches") if isinstance(progress.get("active_batches"), list) else []
+    active_batch_ids = [
+        str(batch.get("batch_id"))
+        for batch in active_batches
+        if isinstance(batch, dict) and batch.get("batch_id") is not None
+    ]
     by_phase: dict[str, list[B2SPhaseObservabilityMetric]] = {
         "queued": [
             B2SPhaseObservabilityMetric(key="status", label="任务项状态", value=str(item.status or "-"), tone="slate"),
@@ -605,6 +611,7 @@ def build_item_phase_observability_from_progress(item: B2STaskItem, phase: str) 
         ],
         "body": [
             B2SPhaseObservabilityMetric(key="current_batch", label="当前 Batch", value=str(progress.get("current_batch") or "-"), tone="blue"),
+            B2SPhaseObservabilityMetric(key="active_batches", label="运行中 Batch", value=", ".join(active_batch_ids) if active_batch_ids else "-", tone="violet"),
             B2SPhaseObservabilityMetric(key="current_attempt", label="当前 Attempt", value=str(progress.get("current_attempt") or "-"), tone="amber"),
             B2SPhaseObservabilityMetric(key="current_function", label="当前函数", value=str(progress.get("current_function") or "-"), tone="blue"),
             B2SPhaseObservabilityMetric(key="message", label="阶段说明", value=str(progress.get("message") or "正在进行函数体还原"), tone="slate"),
@@ -783,6 +790,19 @@ def _close_running_batches_for_item(
         )
 
 
+def _active_batch_map(progress: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    raw = progress.get("active_batches") if isinstance(progress.get("active_batches"), list) else []
+    result: dict[int, dict[str, Any]] = {}
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        batch_no = _safe_int(row.get("batch_id"))
+        if batch_no is None:
+            continue
+        result[batch_no] = row
+    return result
+
+
 def sync_batch_records_from_progress(
     db: Session,
     *,
@@ -806,8 +826,34 @@ def sync_batch_records_from_progress(
     batch_changed = prev_batch != current_batch
     attempt_changed = prev_attempt != current_attempt
     item_status = str(item.status or "").strip().lower()
+    prev_active_batches = _active_batch_map(prev_progress)
+    current_active_batches = _active_batch_map(current_progress)
 
-    if was_in_body and prev_batch is not None and batch_changed:
+    if current_active_batches:
+        inactive_batches = sorted(set(prev_active_batches.keys()) - set(current_active_batches.keys()))
+        for batch_no in inactive_batches:
+            _close_running_batches_for_item(
+                db,
+                item=item,
+                status=_body_batch_exit_status(item_status, current_phase),
+                event_type="body_batch_switched",
+                event_at=event_at,
+                only_batch_no=batch_no,
+                completed_progress_count=current_completed,
+            )
+        for batch_no, payload in current_active_batches.items():
+            batch_attempt = _safe_int(payload.get("attempt"))
+            batch_function = str(payload.get("current_function") or "").strip() or None
+            _upsert_running_batch(
+                db,
+                item=item,
+                batch_no=batch_no,
+                attempt_no=batch_attempt,
+                function_name=batch_function,
+                event_type="body_batch_started" if batch_no not in prev_active_batches else "function_progress",
+                event_at=event_at,
+            )
+    elif was_in_body and prev_batch is not None and batch_changed:
         _close_running_batches_for_item(
             db,
             item=item,
@@ -828,7 +874,7 @@ def sync_batch_records_from_progress(
             completed_progress_count=current_completed,
         )
 
-    should_start_or_refresh = (
+    should_start_or_refresh = not current_active_batches and (
         current_batch is not None and is_in_body and (
             (not was_in_body)
             or batch_changed
@@ -2779,6 +2825,7 @@ def build_item_progress(item: B2STaskItem, job: dict) -> dict:
     if status == "success":
         percent = 100.0
     message = raw_progress.get("message") or job.get("error") or phase_label(phase)
+    active_batches = raw_progress.get("active_batches") if isinstance(raw_progress.get("active_batches"), list) else []
     return {
         "phase": phase,
         "raw_phase": raw_phase,
@@ -2793,6 +2840,7 @@ def build_item_progress(item: B2STaskItem, job: dict) -> dict:
         "current_batch": raw_progress.get("current_batch"),
         "current_attempt": raw_progress.get("current_attempt"),
         "current_function": raw_progress.get("current_function"),
+        "active_batches": active_batches,
         "percent": percent,
         "bytes_percent": _safe_percent(completed_bytes, total_bytes),
         "batches_percent": batch_percent,
@@ -4662,6 +4710,7 @@ def _item_duration_ms(item: B2STaskItem) -> int | None:
 def _batch_status_label(status: str) -> str:
     labels = {
         "pending": "待执行",
+        "not_started": "未开始",
         "running": "运行中",
         "passed": "已通过",
         "failed": "失败",
@@ -4713,6 +4762,41 @@ def _parse_batch_manifest(run_dir: Path | None) -> dict[int, dict[str, Any]]:
             continue
         batches[batch_no] = row
     return batches
+
+
+def _planned_batch_total_for_item(
+    item: B2STaskItem,
+    *,
+    run_dir: Path | None,
+    manifest_batches: dict[int, dict[str, Any]] | None = None,
+    runtime_batches: dict[int, dict[str, Any]] | None = None,
+) -> int:
+    progress = item.progress if isinstance(item.progress, dict) else {}
+    progress_total = _safe_int(progress.get("total_batches"))
+    if progress_total and progress_total > 0:
+        return int(progress_total)
+
+    manifest = _json_file(run_dir / "batch_manifest.json") if run_dir else None
+    manifest_total = _safe_int((manifest or {}).get("batch_count")) if isinstance(manifest, dict) else None
+    if manifest_total and manifest_total > 0:
+        return int(manifest_total)
+
+    metadata = item.extra_metadata if isinstance(item.extra_metadata, dict) else {}
+    metrics = metadata.get("pi_runtime_metrics") if isinstance(metadata.get("pi_runtime_metrics"), dict) else {}
+    batch_summary = metrics.get("batch_summary") if isinstance(metrics.get("batch_summary"), dict) else {}
+    runtime_total = _safe_int(batch_summary.get("batch_count"))
+    if runtime_total and runtime_total > 0:
+        return int(runtime_total)
+
+    if manifest_batches:
+        manifest_max = max((int(batch_no) for batch_no in manifest_batches.keys() if int(batch_no) > 0), default=0)
+        if manifest_max > 0:
+            return manifest_max
+    if runtime_batches:
+        runtime_max = max((int(batch_no) for batch_no in runtime_batches.keys() if int(batch_no) > 0), default=0)
+        if runtime_max > 0:
+            return runtime_max
+    return 0
 
 
 def _parse_results_manifest(run_dir: Path | None) -> dict[int, dict[str, Any]]:
@@ -4870,6 +4954,7 @@ def _build_batch_observability_row(
         or runtime_function_count
         or 0
     )
+    evidence_present = bool(manifest_row or result_row or runtime_row or batch or sessions)
     total_size_bytes = _safe_int((manifest_row or {}).get("total_size")) or 0
     if total_size_bytes <= 0 and batch:
         total_size_bytes = max(int(batch.source.size if batch.source else 0), int(batch.disasm.size if batch.disasm else 0), 0)
@@ -4888,11 +4973,15 @@ def _build_batch_observability_row(
         status = "failed"
     elif has_source_output or review_count > 0 or session_count > 0:
         status = "partial"
-    elif manifest_row or result_row or runtime_row or has_disasm_context:
+    elif evidence_present or has_disasm_context:
         status = "pending"
+    elif batch_no > 0:
+        status = "not_started"
     else:
         status = "unknown"
-    if status == "unknown":
+    if status == "not_started":
+        warnings.append("该 batch 已纳入规划，但尚未开始执行。")
+    elif status == "unknown":
         warnings.append("缺少 manifest、results、review 和 session 信号。")
     current_attempt_no = None
     if is_running:
@@ -4957,6 +5046,8 @@ def _build_batch_observability_summary(rows: list[BatchObservabilityRow]) -> Bat
         status_counts[key] += 1
     return BatchObservabilitySummary(
         total_batches=len(rows),
+        planned_total_batches=len(rows),
+        materialized_total_batches=len(rows),
         running_batches=status_counts["running"],
         passed_batches=status_counts["passed"],
         failed_batches=status_counts["failed"],
@@ -5251,6 +5342,7 @@ def build_task_observability_summary(items: list[B2STaskItem]) -> TaskObservabil
     batch_rows: list[BatchObservabilityRow] = []
     durations: list[int] = []
     total_batches = total_sessions = total_attempts = 0
+    planned_total_batches = 0
     passed_items = issue_total = issue_resolved = issue_remaining = 0
     confidence_scores: list[int] = []
     quality_scores: list[int] = []
@@ -5276,10 +5368,8 @@ def build_task_observability_summary(items: list[B2STaskItem]) -> TaskObservabil
         if duration_ms is not None:
             durations.append(duration_ms)
         persisted_for_item = persisted_by_item.get(item.id, {})
-        batch_count = len(persisted_for_item)
         session_count = _count_item_sessions(advanced)
         attempt_count = int(analytics.summary.attempt_count or analytics.summary.attempts or 0)
-        total_batches += batch_count
         total_sessions += session_count
         total_attempts += attempt_count
         if str(analytics.summary.final_verdict or "").upper() == "PASS":
@@ -5295,6 +5385,28 @@ def build_task_observability_summary(items: list[B2STaskItem]) -> TaskObservabil
         run_dir = _latest_run_dir(item)
         manifest_batches = _parse_batch_manifest(run_dir)
         result_batches = _parse_results_manifest(run_dir)
+        runtime_batches, runtime_updated_at = _parse_runtime_batch_summary(item)
+        planned_count = _planned_batch_total_for_item(
+            item,
+            run_dir=run_dir,
+            manifest_batches=manifest_batches,
+            runtime_batches=runtime_batches,
+        )
+        known_batch_numbers = {
+            int(batch_no)
+            for batch_no in (
+                set(persisted_for_item.keys())
+                | set(manifest_batches.keys())
+                | set(result_batches.keys())
+                | set(runtime_batches.keys())
+            )
+            if int(batch_no) > 0
+        }
+        if planned_count > 0:
+            known_batch_numbers.update(range(1, planned_count + 1))
+        batch_count = max(len(known_batch_numbers), planned_count, len(persisted_for_item))
+        total_batches += batch_count
+        planned_total_batches += planned_count or batch_count
         session_map: dict[int, list[AdvancedFile]] = {}
         batch_map: dict[int, AdvancedBatch] = {}
         for run in advanced.runs:
@@ -5305,14 +5417,27 @@ def build_task_observability_summary(items: list[B2STaskItem]) -> TaskObservabil
                 if session.batch_no is None:
                     continue
                 session_map.setdefault(int(session.batch_no), []).append(session)
-        for batch_no in sorted(no for no in persisted_for_item.keys() if no > 0):
-            persisted_row = persisted_for_item[batch_no]
-            materialized = _batch_row_from_model(persisted_row).model_copy(update={
-                "item_name": item_name,
-                "sequence_no": item.sequence_no,
-            })
+        for batch_no in sorted(known_batch_numbers):
+            persisted_row = persisted_for_item.get(batch_no)
+            if persisted_row is not None:
+                row = _batch_row_from_model(persisted_row).model_copy(update={
+                    "item_name": item_name,
+                    "sequence_no": item.sequence_no,
+                })
+            else:
+                row = _build_batch_observability_row(
+                    item,
+                    item_name=item_name,
+                    advanced=advanced,
+                    batch_no=batch_no,
+                    manifest_row=manifest_batches.get(batch_no),
+                    result_row=result_batches.get(batch_no),
+                    runtime_row=runtime_batches.get(batch_no),
+                    runtime_updated_at=runtime_updated_at,
+                    sessions=session_map.get(batch_no, []),
+                )
             batch_rows.append(_merge_batch_row_display_fields(
-                materialized,
+                row,
                 manifest_row=manifest_batches.get(batch_no),
                 result_row=result_batches.get(batch_no),
                 batch=batch_map.get(batch_no),
@@ -5338,12 +5463,17 @@ def build_task_observability_summary(items: list[B2STaskItem]) -> TaskObservabil
     total_duration_ms = sum(durations) if durations else None
     sorted_batch_rows = sorted(batch_rows, key=lambda entry: (entry.sequence_no, entry.batch_no))
     batch_summary = _build_batch_observability_summary(sorted_batch_rows)
+    batch_summary.planned_total_batches = planned_total_batches or total_batches
+    batch_summary.materialized_total_batches = len(sorted_batch_rows)
+    batch_summary.total_batches = batch_summary.planned_total_batches
     return TaskObservabilitySummary(
         task_id=items[0].task_id if items else "",
         total_duration_ms=total_duration_ms,
         avg_item_duration_ms=round(mean(durations)) if durations else None,
-        total_batches=total_batches,
-        avg_batches_per_item=round(total_batches / len(items), 2) if items else 0,
+        total_batches=planned_total_batches or total_batches,
+        planned_total_batches=planned_total_batches or total_batches,
+        materialized_total_batches=len(sorted_batch_rows),
+        avg_batches_per_item=round((planned_total_batches or total_batches) / len(items), 2) if items else 0,
         total_sessions=total_sessions,
         active_agent_count=sum(1 for item in items if item.status not in TERMINAL),
         total_review_attempts=total_attempts,

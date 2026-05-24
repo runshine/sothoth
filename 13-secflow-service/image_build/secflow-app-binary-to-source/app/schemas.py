@@ -329,6 +329,8 @@ class BatchObservabilityRow(BaseModel):
 
 class BatchObservabilitySummary(BaseModel):
     total_batches: int = 0
+    planned_total_batches: int = 0
+    materialized_total_batches: int = 0
     running_batches: int = 0
     passed_batches: int = 0
     failed_batches: int = 0
@@ -345,6 +347,8 @@ class TaskObservabilitySummary(BaseModel):
     total_duration_ms: Optional[int] = None
     avg_item_duration_ms: Optional[int] = None
     total_batches: int = 0
+    planned_total_batches: int = 0
+    materialized_total_batches: int = 0
     avg_batches_per_item: float = 0
     total_sessions: int = 0
     active_agent_count: int = 0
