@@ -26,6 +26,7 @@ from app.service.task_service import (
     build_task_item_artifact_content,
     build_task_item_artifacts,
     build_task_item_review_analytics,
+    build_task_item_observability_summary,
     build_task_observability_summary,
     build_task_agent_session_runtime,
     build_task_relationship,
@@ -585,6 +586,20 @@ async def get_b2s_task_observability(
     await sync_task(db, task)
     items = query_items(db, task.id)
     return build_task_observability_summary(items)
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/items/{item_id}/observability", response_model=TaskObservabilitySummary)
+async def get_b2s_task_item_observability(
+    project_id: str,
+    task_id: str,
+    item_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    await sync_task(db, task)
+    item = get_task_item_or_404(db, task, item_id)
+    return build_task_item_observability_summary(item)
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/items/{item_id}/advanced", response_model=TaskItemAdvancedResponse)

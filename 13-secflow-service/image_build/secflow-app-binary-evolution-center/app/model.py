@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, Text, create_engine
+from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, Text, create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import get_config
@@ -45,6 +45,7 @@ class EvolutionTask(Base):
     owner_pod_id = Column(String(128), index=True)
     created_by = Column(String(128), nullable=False)
     message = Column(Text)
+    last_error = Column(Text)
     created_at = Column(DateTime, default=now_utc)
     started_at = Column(DateTime)
     finished_at = Column(DateTime)
@@ -154,7 +155,14 @@ def get_session_factory():
 
 
 def init_database() -> None:
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(bind=engine)
+    with engine.connect() as conn:
+        try:
+            conn.execute(text(f"ALTER TABLE {_prefix('task')} ADD COLUMN last_error TEXT NULL"))
+            conn.commit()
+        except Exception:
+            conn.rollback()
 
 
 def get_db():

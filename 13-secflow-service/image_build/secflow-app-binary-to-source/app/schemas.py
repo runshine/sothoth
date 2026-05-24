@@ -98,6 +98,26 @@ class B2SOverallProgress(BaseModel):
     phase_summary: dict[str, int] = Field(default_factory=dict)
 
 
+class B2SPhaseObservabilityMetric(BaseModel):
+    key: str
+    label: str
+    value: str
+    tone: str = "slate"
+
+
+class B2SItemPhaseObservability(BaseModel):
+    phase: str
+    phase_label: str
+    current_items: int = 0
+    completed_items: int = 0
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    duration_ms: Optional[int] = None
+    is_active: bool = False
+    is_completed: bool = False
+    metrics: list[B2SPhaseObservabilityMetric] = Field(default_factory=list)
+
+
 class TaskItemResponse(BaseModel):
     id: str
     sequence_no: int
@@ -115,6 +135,19 @@ class TaskItemResponse(BaseModel):
     generated_files: list[str] = Field(default_factory=list)
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
+    phase_observability: list[B2SItemPhaseObservability] = Field(default_factory=list)
+
+
+class B2SPhaseTiming(BaseModel):
+    phase: str
+    phase_label: str
+    current_items: int = 0
+    completed_items: int = 0
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    duration_ms: Optional[int] = None
+    is_active: bool = False
+    is_completed: bool = False
 
 
 class B2SAbnormalEvidence(BaseModel):
@@ -266,6 +299,7 @@ class TaskObservabilityItem(BaseModel):
     issue_total: int = 0
     issue_resolved: int = 0
     issue_remaining: int = 0
+    phase_observability: list[B2SItemPhaseObservability] = Field(default_factory=list)
 
 
 class BatchObservabilityRow(BaseModel):
@@ -520,13 +554,13 @@ class TaskResponse(BaseModel):
 
 class TaskDetailResponse(TaskResponse):
     overall_progress: Optional[B2SOverallProgress] = None
+    phase_timings: list[B2SPhaseTiming] = Field(default_factory=list)
     items: list[TaskItemResponse] = Field(default_factory=list)
     task_config_snapshot: Optional[TaskConfigSnapshot] = None
     effective_llm_provider: Optional["LlmProviderSummary"] = None
     agent_runtime_summary: Optional[AgentRuntimeSummary] = None
     agent_session_runtime_summary: Optional[B2SAgentSessionRuntimeSummary] = None
     result_summary: Optional[TaskResultSummary] = None
-    observability_summary: Optional[TaskObservabilitySummary] = None
     event_summary: Optional["B2STaskEventSummary"] = None
     abnormal_reason_history: list[B2SAbnormalReasonEventSummary] = Field(default_factory=list)
 

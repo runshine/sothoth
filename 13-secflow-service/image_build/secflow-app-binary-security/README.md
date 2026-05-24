@@ -37,6 +37,33 @@
 - 下游任务输入来自上游 item 结果及其聚合产物，不需要等待同阶段全部模块完成。
 - 并发控制仍然只服从总阶段并发上限；下层排队由下游服务自身负责。
 
+## DFA 路径契约
+
+为了避免 `entry-analyse`、`system-analyse`、`dataflow-analyse` 之间混用“模块目录”和“源码根目录”，编排器统一遵守下面的定义：
+
+- `module_input_path`
+  - 含义：模块描述目录
+  - 来源：`system-analyse/modules/<module>`、B2S 模块目录、或其他包含 `files.list` 的模块输入目录
+  - 用途：供入口分析、人工排障、前端展示模块范围
+- `source_root_path`
+  - 含义：真实源码根目录
+  - 来源：
+    - `source` 任务：原始源码输入根
+    - `binary_module / B2S` 任务：智能体逆向优化后的源码产物根
+  - 用途：供 DFA 提取函数体、定位 `source_file`
+- `source_file`
+  - 含义：相对于 `source_root_path` 的规范化相对路径
+  - 约束：不得是绝对路径，不得越界到 `source_root_path` 外
+- `definition_kind`
+  - `definition` 才允许创建 DFA 子任务
+  - `declaration/unknown` 默认只保留在 entry 结果中，不派生 DFA
+
+这意味着：
+
+- `entry-analyse` 允许 `input_path != source_path`
+- `dataflow-analyse` 不再允许只靠 `input_path` 猜源码根
+- Binary Security 在创建 DFA 子任务时，必须显式同时传 `module_input_path` 和 `source_root_path`
+
 ## 状态语义
 
 - 混合流式尾部阶段激活后，任务会在 `entry-analyse / dataflow-analyse / dataflow-vuln-scanner` 之间自动推进。

@@ -528,7 +528,7 @@ def _append_ai_snapshot_lines(
         summary = _load_token_summary(output_dir)
         for key, value in summary.items():
             token_totals[key] += value
-        session_total += _count_session_files(output_dir / "agent_sessions")
+        session_total += _count_session_files(output_dir / "run" / "runs")
 
     total_tokens = (
         token_totals["input"]

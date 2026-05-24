@@ -35,7 +35,7 @@ def _advanced(item: B2STaskItem, *, batches: list[AdvancedBatch], sessions: list
         item_id=item.id,
         sequence_no=item.sequence_no,
         output_dir=item.output_dir,
-        runs=[AdvancedRun(name="run-1", path=f"{item.output_dir}/.re_work_latest/runs/run-1", batches=batches, agent_sessions=sessions)],
+        runs=[AdvancedRun(name="run-1", path=f"{item.output_dir}/run/runs/run-1", batches=batches, agent_sessions=sessions)],
         ida_files=[],
     )
 
@@ -132,8 +132,8 @@ class BatchObservabilityTests(unittest.TestCase):
             ])
             db.commit()
 
-            run_dir1 = Path(item1.output_dir) / ".re_work_latest" / "runs" / "run-1"
-            run_dir2 = Path(item2.output_dir) / ".re_work_latest" / "runs" / "run-1"
+            run_dir1 = Path(item1.output_dir) / "run" / "runs" / "run-1"
+            run_dir2 = Path(item2.output_dir) / "run" / "runs" / "run-1"
             review_dir2 = run_dir2 / "review_snapshots"
             session_dir1 = run_dir1 / "agent_sessions"
             review_dir2.mkdir(parents=True)

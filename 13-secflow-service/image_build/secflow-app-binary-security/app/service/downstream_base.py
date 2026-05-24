@@ -59,6 +59,16 @@ class JsonHttpClient:
             )
             observe_task_error("downstream_error", stage=self._service_name(), result="GET")
             raise UpstreamError(f"无法连接下游服务: {exc}")
+        except httpx.RequestError as exc:
+            observe_downstream_request(
+                service=self._service_name(),
+                method="GET",
+                operation=self._operation_name(path),
+                status="request_error",
+                duration_seconds=time.perf_counter() - started,
+            )
+            observe_task_error("downstream_error", stage=self._service_name(), result="GET")
+            raise UpstreamError(f"下游服务 GET 请求失败: {exc}")
         return self._handle(resp, method="GET", path=path, duration_seconds=time.perf_counter() - started)
 
     async def post(self, path: str, *, token: str | None = None, json_body: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -86,6 +96,16 @@ class JsonHttpClient:
             )
             observe_task_error("downstream_error", stage=self._service_name(), result="POST")
             raise UpstreamError(f"无法连接下游服务: {exc}")
+        except httpx.RequestError as exc:
+            observe_downstream_request(
+                service=self._service_name(),
+                method="POST",
+                operation=self._operation_name(path),
+                status="request_error",
+                duration_seconds=time.perf_counter() - started,
+            )
+            observe_task_error("downstream_error", stage=self._service_name(), result="POST")
+            raise UpstreamError(f"下游服务 POST 请求失败: {exc}")
         return self._handle(resp, method="POST", path=path, duration_seconds=time.perf_counter() - started)
 
     async def delete(self, path: str, *, token: str | None = None) -> dict[str, Any]:
@@ -113,6 +133,16 @@ class JsonHttpClient:
             )
             observe_task_error("downstream_error", stage=self._service_name(), result="DELETE")
             raise UpstreamError(f"无法连接下游服务: {exc}")
+        except httpx.RequestError as exc:
+            observe_downstream_request(
+                service=self._service_name(),
+                method="DELETE",
+                operation=self._operation_name(path),
+                status="request_error",
+                duration_seconds=time.perf_counter() - started,
+            )
+            observe_task_error("downstream_error", stage=self._service_name(), result="DELETE")
+            raise UpstreamError(f"下游服务 DELETE 请求失败: {exc}")
         return self._handle(resp, method="DELETE", path=path, duration_seconds=time.perf_counter() - started)
 
     def _handle(self, resp: httpx.Response, *, method: str, path: str, duration_seconds: float) -> dict[str, Any]:

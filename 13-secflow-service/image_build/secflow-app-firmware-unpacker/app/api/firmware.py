@@ -211,6 +211,37 @@ def _get_task_or_404(task_id: str) -> dict:
         if not task:
             raise NotFoundError("任务", task_id)
         payload = task.to_dict()
+        output_path = str(payload.get("output_path") or "").strip()
+        firmware_path = str(payload.get("firmware_path") or "").strip()
+        run_path = str(Path(output_path).parent / "run") if output_path.endswith("/output") else ""
+        task_root = str(Path(output_path).parent) if output_path else ""
+        input_dir = str(Path(task_root) / "input") if task_root else ""
+        workspace_root = str(Path(run_path) / "workspace") if run_path else ""
+        payload["input_path"] = input_dir or None
+        payload["run_path"] = run_path or None
+        payload["task_root"] = task_root or None
+        payload["run_root"] = run_path or None
+        payload["workspace_root"] = workspace_root or None
+        payload["input_summary"] = {
+            "firmware_path": firmware_path or None,
+            "input_dir": input_dir or None,
+        }
+        payload["output_summary"] = {
+            "task_root": task_root or None,
+            "output_root": output_path or None,
+            "run_root": run_path or None,
+            "workspace_root": workspace_root or None,
+            "archive_root": payload.get("archive_root"),
+            "runtime_root": payload.get("runtime_root"),
+        }
+        payload["task_metadata"] = {
+            "status": payload.get("status"),
+            "result_status": payload.get("result_status"),
+            "current_stage": payload.get("current_stage"),
+            "matched_skill": payload.get("matched_skill"),
+            "generated_skill_path": payload.get("generated_skill_path"),
+            "generated_skill_status": payload.get("generated_skill_status"),
+        }
         latest = (
             db.query(FirmwareEvolutionJob)
             .filter(FirmwareEvolutionJob.task_id == task.id)

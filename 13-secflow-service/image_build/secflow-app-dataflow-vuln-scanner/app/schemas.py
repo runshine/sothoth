@@ -270,6 +270,12 @@ class ScanTaskDetailResponse(ScanTaskResponse):
     artifact_refs: List[ArtifactRef] = Field(default_factory=list)
     runtime_overrides: Dict[str, Any] = Field(default_factory=dict)
     task_metadata: Dict[str, Any] = Field(default_factory=dict)
+    input_summary: Dict[str, Any] = Field(default_factory=dict)
+    output_summary: Dict[str, Any] = Field(default_factory=dict)
+    effective_config_summary: Dict[str, Any] = Field(default_factory=dict)
+    task_root: Optional[str] = None
+    run_root: Optional[str] = None
+    workspace_root: Optional[str] = None
     attempts: List[ScanTaskAttemptResponse] = Field(default_factory=list)
     abnormal_reason_history: List[Dict[str, Any]] = Field(default_factory=list)
 

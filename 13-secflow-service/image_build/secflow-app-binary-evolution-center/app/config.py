@@ -142,6 +142,7 @@ class SchedulerConfig(BaseModel):
     heartbeat_interval_seconds: int = 5
     worker_timeout_seconds: int = 300
     cleanup_interval_seconds: int = 10
+    retry_delay_seconds: int = 15
 
 
 class LoggingConfig(BaseModel):

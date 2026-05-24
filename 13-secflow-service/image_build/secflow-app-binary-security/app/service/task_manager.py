@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import hashlib
+import httpx
 import json
 import logging
 import os
@@ -6183,6 +6184,15 @@ class TaskManager:
             return "unexpected_response"
         return exc.__class__.__name__
 
+    def _is_retryable_downstream_transport_error(self, exc: Exception) -> bool:
+        if isinstance(exc, UpstreamError):
+            return True
+        if isinstance(exc, (NotFoundError, ValidationError, ConflictError)):
+            return False
+        if isinstance(exc, httpx.RequestError):
+            return True
+        return self._classify_downstream_sync_error(exc) in {"timeout", "connection_error", "http_5xx"}
+
     def _active_dispatch_count(self, db: Session) -> int:
         now_value = _now()
         return int(
@@ -10259,12 +10269,19 @@ class TaskManager:
             }
         except UpstreamError as exc:
             return {
-                "outcome": "fatal_error",
+                "outcome": "transport_error",
                 "payload": None,
                 "error_message": self._extract_downstream_error_text(exc) or str(exc),
                 "http_status": getattr(exc, "status_code", 502),
             }
         except Exception as exc:
+            if self._is_retryable_downstream_transport_error(exc):
+                return {
+                    "outcome": "transport_error",
+                    "payload": None,
+                    "error_message": self._extract_downstream_error_text(exc) or str(exc),
+                    "http_status": self._extract_http_status_from_exception(exc),
+                }
             return {
                 "outcome": "fatal_error",
                 "payload": None,
@@ -10374,6 +10391,17 @@ class TaskManager:
                 item,
                 event_type="downstream_retry_target_missing",
                 message=f"下游重试目标不存在: {item.downstream_service}:{item.downstream_task_id or '-'}",
+                level="warning",
+                payload=payload,
+            )
+            return
+        if outcome == "transport_error":
+            self._record_downstream_item_disposition(
+                db,
+                task,
+                item,
+                event_type="downstream_retry_deferred",
+                message=f"下游重试通信异常，保留当前子任务等待后续自动对账: {item.downstream_service}:{item.downstream_task_id or '-'}",
                 level="warning",
                 payload=payload,
             )
@@ -11976,6 +12004,15 @@ class TaskManager:
                         item.finished_at = _now()
                         session.commit()
                         return {"status": "downstream_missing", "error": item.error_message, "item": input_file}
+                    elif outcome == "transport_error":
+                        return self._defer_item_after_downstream_transport_error(
+                            session,
+                            task,
+                            item,
+                            operation="firmware_unpack",
+                            exc=UpstreamError(str(control.get("error_message") or "下游通信异常")),
+                            response_item=input_file,
+                        )
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
@@ -12051,6 +12088,16 @@ class TaskManager:
                 )
             return {"status": "pending", "error": str(exc), "item": input_file, "deferred_mode": "redispatch"}
         except Exception as exc:
+            if "item" in locals() and self._is_retryable_downstream_transport_error(exc):
+                session.rollback()
+                return self._defer_item_after_downstream_transport_error(
+                    session,
+                    task,
+                    item,
+                    operation="firmware_unpack",
+                    exc=exc,
+                    response_item=input_file,
+                )
             session.rollback()
             if "item" in locals():
                 item.status = "failed"
@@ -12375,6 +12422,15 @@ class TaskManager:
                             "item": self._lightweight_system_analysis_input(firmware),
                             "error": item.error_message,
                         }
+                    elif outcome == "transport_error":
+                        return self._defer_item_after_downstream_transport_error(
+                            session,
+                            task,
+                            item,
+                            operation="system_analysis",
+                            exc=UpstreamError(str(control.get("error_message") or "下游通信异常")),
+                            response_item=firmware,
+                        )
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
@@ -12457,6 +12513,16 @@ class TaskManager:
                 )
             return {"status": "pending", "error": str(exc), "item": firmware, "deferred_mode": "redispatch"}
         except Exception as exc:
+            if "item" in locals() and self._is_retryable_downstream_transport_error(exc):
+                session.rollback()
+                return self._defer_item_after_downstream_transport_error(
+                    session,
+                    task,
+                    item,
+                    operation="system_analysis",
+                    exc=exc,
+                    response_item=firmware,
+                )
             if "item" in locals():
                 session.rollback()
                 item = session.merge(item)
@@ -13312,6 +13378,15 @@ class TaskManager:
                         item.finished_at = _now()
                         session.commit()
                         return {"status": "downstream_missing", "error": item.error_message, "item": module}
+                    elif outcome == "transport_error":
+                        return self._defer_item_after_downstream_transport_error(
+                            session,
+                            task,
+                            item,
+                            operation="binary_to_source",
+                            exc=UpstreamError(str(control.get("error_message") or "下游通信异常")),
+                            response_item=module,
+                        )
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
@@ -13429,6 +13504,16 @@ class TaskManager:
                 )
             return {"status": "pending", "error": str(exc), "item": module, "deferred_mode": "redispatch"}
         except Exception as exc:
+            if "item" in locals() and self._is_retryable_downstream_transport_error(exc):
+                session.rollback()
+                return self._defer_item_after_downstream_transport_error(
+                    session,
+                    task,
+                    item,
+                    operation="binary_to_source",
+                    exc=exc,
+                    response_item=module,
+                )
             session.rollback()
             if "item" in locals():
                 item.status = "failed"
@@ -13498,7 +13583,7 @@ class TaskManager:
 
     def _is_supported_entry_source_file(self, path: Path) -> bool:
         lowered_parts = [part.lower() for part in path.parts]
-        if any(part.startswith(".re_work_") for part in lowered_parts):
+        if "run" in lowered_parts:
             return False
         if "agent_sessions" in lowered_parts:
             return False
@@ -13552,28 +13637,75 @@ class TaskManager:
             "source_root": str(descriptor_root),
         }
 
+    def _is_entry_descriptor_usable(self, descriptor_root: Path, files_list_path: Path) -> bool:
+        try:
+            resolved_root = descriptor_root.resolve()
+            resolved_files_list = files_list_path.resolve()
+            resolved_files_list.relative_to(resolved_root)
+        except Exception:
+            return False
+        if not resolved_root.is_dir() or not resolved_files_list.is_file():
+            return False
+        try:
+            rows = [line.strip() for line in resolved_files_list.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except Exception:
+            return False
+        if not rows:
+            return False
+        for relative_path in rows:
+            candidate = resolved_root / relative_path
+            if not candidate.is_file():
+                return False
+        return True
+
+    def _entry_descriptor_candidates(self, module: dict[str, Any]) -> list[Path]:
+        candidates: list[Path] = []
+        for value in (
+            module.get("entry_descriptor_root"),
+            module.get("archive_root"),
+            module.get("artifact_root"),
+            module.get("source_dir"),
+            module.get("source_root"),
+            module.get("module_dir"),
+        ):
+            raw = str(value or "").strip()
+            if not raw:
+                continue
+            candidates.append(Path(raw))
+        return _dedupe_paths(candidates)
+
     def _normalize_entry_analysis_module_input(self, task: BinarySecurityTask, module: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(module)
         if self._task_type(task) != TASK_TYPE_BINARY_MODULE:
             return normalized
-        if normalized.get("entry_descriptor_ready") and normalized.get("entry_files_list") and normalized.get("entry_descriptor_root"):
-            normalized["module_name"] = str(normalized.get("entry_module_name") or normalized.get("module_name") or "")
-            normalized["source_dir"] = str(normalized.get("entry_descriptor_root") or normalized.get("source_dir") or "")
-            normalized["source_root"] = str(normalized.get("source_root") or normalized.get("entry_descriptor_root") or normalized.get("source_dir") or "")
-            normalized["module_dir"] = str(normalized.get("module_dir") or Path(str(normalized.get("entry_files_list") or "")).parent)
-            normalized["files_list"] = str(normalized.get("entry_files_list") or normalized.get("files_list") or "")
-            return normalized
-        artifact_root_value = normalized.get("source_dir") or normalized.get("archive_root") or normalized.get("artifact_root")
-        if not artifact_root_value:
-            return normalized
-        artifact_root = Path(str(artifact_root_value))
-        if not artifact_root.exists():
-            return normalized
-        prepared = self._prepare_entry_module_descriptor(artifact_root, normalized)
-        normalized.update(prepared)
-        normalized["module_name"] = str(prepared.get("entry_module_name") or normalized.get("module_name") or "")
-        normalized["source_dir"] = str(prepared.get("entry_descriptor_root") or normalized.get("source_dir") or "")
-        normalized["source_root"] = str(prepared.get("source_root") or normalized.get("source_root") or "")
+        entry_descriptor_root = str(normalized.get("entry_descriptor_root") or "").strip()
+        entry_files_list = str(normalized.get("entry_files_list") or "").strip()
+        if entry_descriptor_root and entry_files_list:
+            descriptor_root_path = Path(entry_descriptor_root)
+            files_list_path = Path(entry_files_list)
+            if normalized.get("entry_descriptor_ready") and self._is_entry_descriptor_usable(descriptor_root_path, files_list_path):
+                normalized["module_name"] = str(normalized.get("entry_module_name") or normalized.get("module_name") or "")
+                normalized["source_dir"] = str(descriptor_root_path)
+                normalized["source_root"] = str(normalized.get("source_root") or descriptor_root_path)
+                normalized["module_dir"] = str(Path(entry_files_list).parent)
+                normalized["files_list"] = str(files_list_path)
+                return normalized
+        for artifact_root in self._entry_descriptor_candidates(normalized):
+            if not artifact_root.exists():
+                continue
+            prepared = self._prepare_entry_module_descriptor(artifact_root, normalized)
+            if not prepared.get("entry_descriptor_ready"):
+                continue
+            files_list_path = Path(str(prepared.get("entry_files_list") or ""))
+            if not self._is_entry_descriptor_usable(artifact_root, files_list_path):
+                continue
+            normalized.update(prepared)
+            normalized["module_name"] = str(prepared.get("entry_module_name") or normalized.get("module_name") or "")
+            normalized["source_dir"] = str(prepared.get("entry_descriptor_root") or normalized.get("source_dir") or "")
+            normalized["source_root"] = str(prepared.get("source_root") or normalized.get("source_root") or "")
+            normalized["module_dir"] = str(prepared.get("module_dir") or normalized.get("module_dir") or "")
+            normalized["files_list"] = str(prepared.get("files_list") or normalized.get("files_list") or "")
+            break
         return normalized
 
     async def _run_entry_item(
@@ -13671,6 +13803,15 @@ class TaskManager:
                         item.finished_at = _now()
                         session.commit()
                         return {"status": "downstream_missing", "error": item.error_message, "item": module}
+                    elif outcome == "transport_error":
+                        return self._defer_item_after_downstream_transport_error(
+                            session,
+                            task,
+                            item,
+                            operation="entry_analysis",
+                            exc=UpstreamError(str(control.get("error_message") or "下游通信异常")),
+                            response_item=entry_input if "entry_input" in locals() else module,
+                        )
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
@@ -13762,6 +13903,16 @@ class TaskManager:
                 )
             return {"status": "pending", "error": str(exc), "item": entry_input if "entry_input" in locals() else module, "deferred_mode": "redispatch"}
         except Exception as exc:
+            if "item" in locals() and self._is_retryable_downstream_transport_error(exc):
+                session.rollback()
+                return self._defer_item_after_downstream_transport_error(
+                    session,
+                    task,
+                    item,
+                    operation="entry_analysis",
+                    exc=exc,
+                    response_item=entry_input if "entry_input" in locals() else module,
+                )
             session.rollback()
             if "item" in locals():
                 item.status = "failed"
@@ -13776,6 +13927,8 @@ class TaskManager:
         if not isinstance(entry, dict):
             return ""
 
+        task_type = self._task_type(entry.get("task_type"))
+
         nested_entries = entry.get("entries") or entry.get("entries_preview") or []
         if isinstance(nested_entries, list):
             for nested in nested_entries:
@@ -13784,16 +13937,26 @@ class TaskManager:
                     if nested_value:
                         return nested_value
 
-        preferred = [
-            entry.get("source_dir"),
-            entry.get("source_root") if entry.get("task_type") == TASK_TYPE_SOURCE else None,
-            entry.get("source_root"),
-            entry.get("entry_descriptor_root"),
-            entry.get("module_dir"),
-            entry.get("artifact_root"),
-            entry.get("archive_root"),
-            entry.get("unpacked_root"),
-        ]
+        if task_type == TASK_TYPE_SOURCE:
+            preferred = [
+                entry.get("source_root"),
+                entry.get("unpacked_root"),
+                entry.get("source_dir"),
+                entry.get("entry_descriptor_root"),
+                entry.get("module_dir"),
+                entry.get("artifact_root"),
+                entry.get("archive_root"),
+            ]
+        else:
+            preferred = [
+                entry.get("source_dir"),
+                entry.get("source_root"),
+                entry.get("entry_descriptor_root"),
+                entry.get("module_dir"),
+                entry.get("artifact_root"),
+                entry.get("archive_root"),
+                entry.get("unpacked_root"),
+            ]
         for candidate in preferred:
             value = str(candidate or "").strip()
             if value:
@@ -13805,8 +13968,70 @@ class TaskManager:
             return str(definition_path.parent if definition_path.suffix else definition_path)
         return ""
 
+    def _resolve_dfa_module_input_path(self, entry: dict[str, Any]) -> str:
+        if not isinstance(entry, dict):
+            return ""
+        for candidate in (
+            entry.get("module_input_path"),
+            entry.get("module_dir"),
+            entry.get("entry_descriptor_root"),
+            entry.get("source_dir"),
+            entry.get("artifact_root"),
+            entry.get("archive_root"),
+        ):
+            value = str(candidate or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _resolve_dfa_source_root_path(self, entry: dict[str, Any]) -> str:
+        if not isinstance(entry, dict):
+            return ""
+        for candidate in (
+            entry.get("source_root_path"),
+            entry.get("source_root"),
+            entry.get("unpacked_root"),
+            entry.get("source_dir"),
+            entry.get("entry_descriptor_root"),
+            entry.get("module_dir"),
+        ):
+            value = str(candidate or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _normalize_dfa_source_file(self, source_root_path: str, entry: dict[str, Any]) -> str:
+        root = Path(str(source_root_path or "").strip()).resolve()
+        if not str(root):
+            raise ValidationError("未找到 DFA source_root_path")
+        raw = str(entry.get("definition_file") or entry.get("file_name") or "").strip().replace("\\", "/")
+        if not raw:
+            raise ValidationError("未找到 DFA source_file")
+        marker = "/data/files/"
+        embedded_absolute = raw[raw.index(marker):] if marker in raw else None
+        candidate = Path(embedded_absolute or raw)
+        resolved = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+        if not _is_within_path(root, resolved):
+            raise ValidationError(f"DFA source_file 超出 source_root_path: {raw}")
+        if not resolved.is_file():
+            raise ValidationError(f"DFA source_file 不存在: {raw}")
+        return resolved.relative_to(root).as_posix()
+
+    def _resolve_entry_definition_kind(self, entry: dict[str, Any]) -> str:
+        raw = str(entry.get("definition_kind") or "").strip().lower()
+        if raw in {"definition", "declaration", "unknown"}:
+            return raw
+        body_lines = entry.get("body_lines")
+        if isinstance(body_lines, int):
+            return "definition" if body_lines > 0 else "declaration"
+        if entry.get("is_definition_found") is False:
+            return "unknown"
+        return "definition"
+
     def _parse_entries(self, artifact_root: Path, module: dict[str, Any]) -> list[dict[str, Any]]:
         resolved_source_dir = self._resolve_entry_source_dir(module)
+        resolved_module_input_path = self._resolve_dfa_module_input_path(module)
+        resolved_source_root_path = self._resolve_dfa_source_root_path(module) or resolved_source_dir
 
         def _rows_from_payload(payload: Any, source: Path) -> list[dict[str, Any]]:
             if isinstance(payload, dict):
@@ -13847,6 +14072,7 @@ class TaskManager:
                         "definition_file": str(entry.get("definition_file") or entry.get("file_name") or entry.get("file") or file_name or "").strip(),
                         "definition_line": str(entry.get("definition_line") or entry.get("line_no") or entry.get("line") or line_no),
                         "is_definition_found": bool(entry.get("is_definition_found", True)),
+                        "definition_kind": self._resolve_entry_definition_kind(entry),
                         "tag": tag or "P",
                         "taint_params": taint_params,
                         "function_description": raw_function_description or _default_entry_function_description(function_name),
@@ -13856,6 +14082,8 @@ class TaskManager:
                         "taint_details": _normalize_entry_taint_details(entry, taint_params),
                         "signature_params": _entry_signature_params({**entry, "raw_function_name": raw_function_name}),
                         "entry_file": str(source),
+                        "module_input_path": resolved_module_input_path,
+                        "source_root_path": resolved_source_root_path,
                         "source_dir": resolved_source_dir,
                     }
                 )
@@ -13918,6 +14146,7 @@ class TaskManager:
                             "raw_function_name": parts[3],
                             "line_no": line_no,
                             "tag": "P",
+                            "definition_kind": "definition",
                             "taint_params": taint_params,
                             "function_description": _default_entry_function_description(function_name),
                             "function_description_source": "default",
@@ -13925,6 +14154,8 @@ class TaskManager:
                             "entry_reason_source": "default",
                             "taint_details": _normalize_entry_taint_details({"taint_details": []}, taint_params),
                             "entry_file": str(entry_file),
+                            "module_input_path": resolved_module_input_path,
+                            "source_root_path": resolved_source_root_path,
                             "source_dir": resolved_source_dir,
                         }
                     )
@@ -13962,9 +14193,11 @@ class TaskManager:
             if not taint_params:
                 taint_params = _entry_signature_params(entry)
             definition_found = bool(entry.get("is_definition_found", True))
+            definition_kind = self._resolve_entry_definition_kind(entry)
             definition_file = str(entry.get("definition_file") or entry.get("file_name") or "").strip()
             definition_line = str(entry.get("definition_line") or entry.get("line_no") or "").strip()
-            source_dir = self._resolve_entry_source_dir(entry)
+            module_input_path = self._resolve_dfa_module_input_path(entry)
+            source_root_path = self._resolve_dfa_source_root_path(entry)
             if not definition_found:
                 item.status = "failed"
                 item.finished_at = _now()
@@ -13975,6 +14208,21 @@ class TaskManager:
                         **entry,
                         "failed": True,
                         "failure_reason": item.error_message,
+                    },
+                )
+                session.commit()
+                return {"status": "failed", "error": item.error_message, "item": entry}
+            if definition_kind != "definition":
+                item.status = "failed"
+                item.finished_at = _now()
+                item.error_message = "入口仅定位到声明，无法执行数据流分析"
+                item.result = self._compact_result_for_storage(
+                    stage_run.stage_name,
+                    {
+                        **entry,
+                        "failed": True,
+                        "failure_reason": item.error_message,
+                        "definition_kind": definition_kind,
                     },
                 )
                 session.commit()
@@ -13993,10 +14241,10 @@ class TaskManager:
                 )
                 session.commit()
                 return {"status": "failed", "error": item.error_message, "item": entry}
-            if not source_dir:
+            if not module_input_path:
                 item.status = "failed"
                 item.finished_at = _now()
-                item.error_message = "未找到可用于数据流分析的源码目录"
+                item.error_message = "未找到可用于数据流分析的模块输入目录"
                 item.result = self._compact_result_for_storage(
                     stage_run.stage_name,
                     {
@@ -14007,6 +14255,21 @@ class TaskManager:
                 )
                 session.commit()
                 return {"status": "failed", "error": item.error_message, "item": entry}
+            if not source_root_path:
+                item.status = "failed"
+                item.finished_at = _now()
+                item.error_message = "未找到可用于数据流分析的源码根目录"
+                item.result = self._compact_result_for_storage(
+                    stage_run.stage_name,
+                    {
+                        **entry,
+                        "failed": True,
+                        "failure_reason": item.error_message,
+                    },
+                )
+                session.commit()
+                return {"status": "failed", "error": item.error_message, "item": entry}
+            normalized_source_file = self._normalize_dfa_source_file(source_root_path, entry)
             prompt = f"分析文件 {definition_file or entry['file_name']} 中函数 {entry['function_name']} 的外部输入数据流"
             line_hint = ""
             if definition_line:
@@ -14083,18 +14346,29 @@ class TaskManager:
                     item.finished_at = _now()
                     session.commit()
                     return {"status": "downstream_missing", "error": item.error_message, "item": entry}
+                elif outcome == "transport_error":
+                    return self._defer_item_after_downstream_transport_error(
+                        session,
+                        task,
+                        item,
+                        operation="dataflow_analysis",
+                        exc=UpstreamError(str(control.get("error_message") or "下游通信异常")),
+                        response_item=entry,
+                    )
                 else:
                     raise ValidationError(str(control.get("error_message") or "下游重试失败"))
             else:
                 created = await get_dataflow_analyse_client().create_task(
                     task.project_id,
                     f"{task.name}-{entry['function_name']}-dfa",
-                    source_dir,
+                    module_input_path,
+                    source_root_path,
                     prompt,
                     _downstream_origin_payload(task, item),
-                    source_file=definition_file or entry["file_name"],
+                    source_file=normalized_source_file,
                     function_name=entry["function_name"],
                     line_hint=line_hint,
+                    definition_kind=definition_kind,
                     taint_params=taint_params,
                     function_description=str(entry.get("function_description") or ""),
                     function_description_source=str(entry.get("function_description_source") or ""),
@@ -14178,7 +14452,18 @@ class TaskManager:
                 )
             return {"status": "pending", "error": str(exc), "item": entry, "deferred_mode": "redispatch"}
         except Exception as exc:
+            if "item" in locals() and self._is_retryable_downstream_transport_error(exc):
+                session.rollback()
+                return self._defer_item_after_downstream_transport_error(
+                    session,
+                    task,
+                    item,
+                    operation="dataflow_analysis",
+                    exc=exc,
+                    response_item=entry,
+                )
             if "item" in locals():
+                session.rollback()
                 item.status = "failed"
                 item.error_message = str(exc)
                 item.finished_at = _now()
@@ -14281,6 +14566,15 @@ class TaskManager:
                         item.finished_at = _now()
                         session.commit()
                         return {"status": "downstream_missing", "error": item.error_message, "item": dataflow_result}
+                    elif outcome == "transport_error":
+                        return self._defer_item_after_downstream_transport_error(
+                            session,
+                            task,
+                            item,
+                            operation="vuln_scan",
+                            exc=UpstreamError(str(control.get("error_message") or "下游通信异常")),
+                            response_item=dataflow_result,
+                        )
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
@@ -14361,7 +14655,18 @@ class TaskManager:
                 )
             return {"status": "pending", "error": str(exc), "item": dataflow_result, "deferred_mode": "redispatch"}
         except Exception as exc:
+            if "item" in locals() and self._is_retryable_downstream_transport_error(exc):
+                session.rollback()
+                return self._defer_item_after_downstream_transport_error(
+                    session,
+                    task,
+                    item,
+                    operation="vuln_scan",
+                    exc=exc,
+                    response_item=dataflow_result,
+                )
             if "item" in locals():
+                session.rollback()
                 item.status = "failed"
                 item.error_message = str(exc)
                 item.finished_at = _now()

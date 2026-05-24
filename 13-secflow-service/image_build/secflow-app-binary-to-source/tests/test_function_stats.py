@@ -25,7 +25,7 @@ class FunctionStatsTests(unittest.TestCase):
     def test_results_json_populates_total_completed_failed_and_uncompleted(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            run_dir = root / ".re_work_001" / "runs" / "20260516010101"
+            run_dir = root / "run" / "runs" / "20260516010101"
             run_dir.mkdir(parents=True)
             (run_dir / "batch_manifest.json").write_text(json.dumps({"function_count": 10}), "utf-8")
             (run_dir / "results.json").write_text(

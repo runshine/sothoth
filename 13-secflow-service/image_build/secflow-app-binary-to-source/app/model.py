@@ -152,6 +152,38 @@ class B2STaskBatch(Base):
         self.warnings_json = json.dumps(value or [], ensure_ascii=False)
 
 
+class B2STaskPhase(Base):
+    __tablename__ = "secflow_b2s_task_phase"
+    __table_args__ = (
+        UniqueConstraint("task_id", "item_id", "phase", name="uq_secflow_b2s_task_phase_task_item_phase"),
+    )
+
+    id = Column(String(32), primary_key=True)
+    task_id = Column(String(32), nullable=False, index=True)
+    project_id = Column(String(64), nullable=False, index=True)
+    item_id = Column(String(32), nullable=False, index=True)
+    sequence_no = Column(Integer, nullable=False, index=True)
+    phase = Column(String(32), nullable=False, index=True)
+    status = Column(String(32), nullable=False, default="pending", index=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    duration_ms = Column(Integer, nullable=True)
+    last_event_at = Column(DateTime, nullable=True, index=True)
+    latest_event_type = Column(String(64), nullable=True, index=True)
+    metrics_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=now_local, nullable=False)
+    updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
+
+    @property
+    def metrics(self) -> list[dict[str, Any]]:
+        payload = _loads(self.metrics_json, [])
+        return payload if isinstance(payload, list) else []
+
+    @metrics.setter
+    def metrics(self, value: list[dict[str, Any]] | None) -> None:
+        self.metrics_json = json.dumps(value or [], ensure_ascii=False)
+
+
 class B2SDispatchLease(Base):
     __tablename__ = "secflow_b2s_dispatch_lease"
 
@@ -278,6 +310,7 @@ def init_database() -> None:
     _ensure_task_origin_columns(engine)
     _ensure_analysis_cache_columns(engine)
     _ensure_task_batch_table(engine)
+    _ensure_task_phase_table(engine)
 
 
 def _ensure_task_item_progress_columns(engine) -> None:
@@ -405,6 +438,28 @@ def _ensure_task_batch_table(engine) -> None:
         )
     with engine.begin() as conn:
         for statement in index_statements:
+            conn.exec_driver_sql(statement)
+
+
+def _ensure_task_phase_table(engine) -> None:
+    table_name = B2STaskPhase.__tablename__
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    if table_name not in tables:
+        B2STaskPhase.__table__.create(bind=engine, checkfirst=True)
+        inspector = inspect(engine)
+    indexes = {index["name"] for index in inspector.get_indexes(table_name)}
+    statements: list[str] = []
+    if "ix_b2s_task_phase_task_sequence_phase" not in indexes:
+        statements.append(
+            f"CREATE INDEX ix_b2s_task_phase_task_sequence_phase ON {table_name} (task_id, sequence_no, phase)"
+        )
+    if "ix_b2s_task_phase_project_task_status" not in indexes:
+        statements.append(
+            f"CREATE INDEX ix_b2s_task_phase_project_task_status ON {table_name} (project_id, task_id, status)"
+        )
+    with engine.begin() as conn:
+        for statement in statements:
             conn.exec_driver_sql(statement)
 
 

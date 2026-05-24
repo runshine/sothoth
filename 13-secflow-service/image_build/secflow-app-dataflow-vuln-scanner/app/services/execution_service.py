@@ -908,10 +908,17 @@ class ExecutionService:
         artifact_refs: list[ArtifactRef] = []
         runtime_overrides: dict[str, Any] = {}
         task_metadata: dict[str, Any] = {}
+        input_summary: dict[str, Any] = {}
+        output_summary: dict[str, Any] = {}
+        effective_config_summary: dict[str, Any] = {}
+        task_root: str | None = None
+        run_root: str | None = None
+        workspace_root: str | None = None
         title = first_task.title if first_task else trigger.id
         if first_task:
             task_metadata = dict(first_task.metadata or {})
             dataflow_cli = task_metadata.get("dataflow_cli") if isinstance(task_metadata.get("dataflow_cli"), dict) else {}
+            request_payload = task_metadata.get("dataflow_scan_request") if isinstance(task_metadata.get("dataflow_scan_request"), dict) else {}
             candidate_task_paths = [
                 str(first_task.task_md_path or "").strip(),
                 str(dataflow_cli.get("task_md_path") or "").strip(),
@@ -929,6 +936,15 @@ class ExecutionService:
                 if isinstance(item, dict):
                     artifact_refs.append(ArtifactRef.model_validate(item))
             runtime_overrides = dict(task_metadata.get("runtime_overrides") or {})
+            input_summary = {
+                "workspace_dir": request_payload.get("workspace_dir"),
+                "data_flow": request_payload.get("data_flow"),
+                "source_dir": request_payload.get("source_dir"),
+                "output_dir": request_payload.get("output_dir"),
+                "task_markdown_path": dataflow_cli.get("task_md_path"),
+                "data_flow_dir": dataflow_cli.get("data_flow_dir"),
+                "data_flow_files": dataflow_cli.get("data_flow_files") or [],
+            }
         attempts = []
         run_service = get_run_index_service()
         for item in self._list_executions_for_trigger(db, trigger.id):
@@ -945,7 +961,26 @@ class ExecutionService:
                     task_markdown = task_path.read_text(encoding="utf-8")
                 except (FileNotFoundError, TypeError):
                     task_markdown = ""
+            if run_index is not None:
+                task_root = str(Path(run_index.run_root_path))
+                run_root = str(Path(run_index.run_root_path) / "run")
+                workspace_root = str(item.workspace_root or "") or str(Path(run_index.run_root_path) / "workspace")
+                output_summary = {
+                    "run_root": run_root,
+                    "workspace_root": workspace_root,
+                    "output_root": str(Path(run_index.run_root_path) / "output"),
+                    "atomic_work_path": str(run_index.atomic_work_path or ""),
+                    "run_name": str(run_index.run_name or ""),
+                }
             attempts.append(self._attempt_response(item, run_id=run_index.id if run_index else None))
+        if not effective_config_summary:
+            effective_config_summary = {
+                "profile_id": response.profile_id,
+                "profile_version": response.profile_version,
+                "runtime_overrides": runtime_overrides,
+                "review_profile": task_metadata.get("dataflow_scan_request", {}).get("review_profile") if isinstance(task_metadata.get("dataflow_scan_request"), dict) else None,
+                "compiled_profile": task_metadata.get("compiled_profile") if isinstance(task_metadata.get("compiled_profile"), dict) else {},
+            }
         payload = response.model_dump()
         payload["title"] = title
         return ScanTaskDetailResponse(
@@ -954,6 +989,12 @@ class ExecutionService:
             artifact_refs=artifact_refs,
             runtime_overrides=runtime_overrides,
             task_metadata=task_metadata,
+            input_summary=input_summary,
+            output_summary=output_summary,
+            effective_config_summary=effective_config_summary,
+            task_root=task_root,
+            run_root=run_root,
+            workspace_root=workspace_root,
             attempts=attempts,
             abnormal_reason_history=self._abnormal_reason_history(db, trigger),
         )
@@ -3301,11 +3342,13 @@ class ExecutionService:
         enriched["retry_command_display"] = retry_command or None
         if trigger is not None:
             task_payload = self._scan_task_response(db, trigger, include_run_summary=False)
+            task_detail_payload = self._scan_task_detail(db, trigger)
             enriched["linked_task_purpose"] = task_payload.task_purpose
             enriched["linked_task_agent_state_dirs"] = {
                 key: value.model_dump(mode="json")
                 for key, value in task_payload.agent_state_dirs.items()
             }
+            enriched["linked_task_detail"] = task_detail_payload.model_dump(mode="json")
         return enriched
 
     def _mark_stale_runtime_exited(

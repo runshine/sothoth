@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -64,6 +65,14 @@ def _as_int(value: Any, fallback: int) -> int:
         return int(value)
     except Exception:
         return fallback
+
+
+def _is_downstream_transport_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.TimeoutException | httpx.ConnectError | httpx.RequestError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return int(exc.response.status_code or 0) >= 500
+    return False
 
 
 class TaskService:
@@ -671,6 +680,7 @@ class TaskService:
         task.status = "running"
         task.started_at = task.started_at or now_local()
         task.message = "开始执行进化轮次"
+        task.last_error = None
         db.add(
             EvolutionTaskEvent(
                 id=_new_id("evt"),
@@ -775,9 +785,26 @@ class TaskService:
             db.commit()
         except Exception as exc:
             logger.exception("binary evolution task failed: %s", exc)
+            if _is_downstream_transport_error(exc):
+                task.status = "pending"
+                task.message = f"下游通信异常，等待调度器自动重试: {exc}"
+                task.last_error = str(exc)
+                task.owner_pod_id = None
+                db.add(
+                    EvolutionTaskEvent(
+                        id=_new_id("evt"),
+                        task_id=task.id,
+                        event_type="task_deferred_transport_error",
+                        summary="下游通信异常，任务回退到待调度",
+                        payload_json={"error": str(exc)},
+                    )
+                )
+                db.commit()
+                return
             task.status = "failed"
             task.finished_at = now_local()
             task.message = str(exc)
+            task.last_error = str(exc)
             error_type = "timeout" if "timed out" in str(exc).lower() else type(exc).__name__
             if "timed out" in str(exc).lower():
                 get_observability().record_timeout("task")

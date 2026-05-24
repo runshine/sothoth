@@ -79,11 +79,11 @@ def _advanced_response() -> TaskItemAdvancedResponse:
         mode="deep",
         mode_label="深度模式",
         output_dir="/tmp/b2s/output",
-        work_dir="/tmp/b2s/output/.re_work_latest",
+        work_dir="/tmp/b2s/output/run",
         runs=[
             AdvancedRun(
                 name="run-1",
-                path="/tmp/b2s/output/.re_work_latest/runs/run-1",
+                path="/tmp/b2s/output/run/runs/run-1",
                 batches=[
                     AdvancedBatch(
                         name="batch_001",

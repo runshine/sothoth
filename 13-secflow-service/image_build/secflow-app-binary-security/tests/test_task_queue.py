@@ -8,6 +8,7 @@ class _FakeRedis:
     def __init__(self):
         self.sets = {}
         self.lists = {}
+        self.sorted_sets = {}
 
     async def sadd(self, key, value):
         bucket = self.sets.setdefault(key, set())
@@ -17,6 +18,21 @@ class _FakeRedis:
 
     async def rpush(self, key, value):
         self.lists.setdefault(key, []).append(value)
+
+    async def zadd(self, key, mapping):
+        bucket = self.sorted_sets.setdefault(key, {})
+        bucket.update(mapping)
+
+    async def zrem(self, key, value):
+        bucket = self.sorted_sets.setdefault(key, {})
+        bucket.pop(value, None)
+
+    async def lpos(self, key, value):
+        values = self.lists.get(key) or []
+        try:
+            return values.index(value)
+        except ValueError:
+            return None
 
     async def blpop(self, key, timeout=0):
         del timeout

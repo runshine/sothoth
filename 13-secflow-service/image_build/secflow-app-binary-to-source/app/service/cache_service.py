@@ -420,13 +420,24 @@ class B2SCacheService:
                 result.append(raw)
         return result
 
+    @staticmethod
+    def _normalize_legacy_cached_path(base_output: Path, path: Path) -> Path:
+        try:
+            rel = path.relative_to(base_output)
+        except Exception:
+            return path
+        parts = list(rel.parts)
+        if parts and parts[0].startswith(".re_work_"):
+            return base_output / "run" / Path(*parts[1:])
+        return path
+
     def _remap_generated_files(self, cache: B2SAnalysisCache, item: B2STaskItem) -> list[str]:
         canonical_output = Path(cache.canonical_output_dir).resolve()
         item_output = Path(item.output_dir).resolve()
         result: list[str] = []
         for raw in self._loads(cache.generated_files_json, []):
             try:
-                path = Path(str(raw)).resolve()
+                path = self._normalize_legacy_cached_path(canonical_output, Path(str(raw)).resolve())
                 if path.is_relative_to(canonical_output):
                     result.append(str(item_output / path.relative_to(canonical_output)))
                 else:

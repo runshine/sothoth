@@ -26,7 +26,7 @@ class ResultKindSummaryTests(unittest.TestCase):
     def test_artifacts_capture_source_header_metadata_sessions_and_reviews(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            work = root / ".re_work_sample" / "runs" / "run-1"
+            work = root / "run" / "runs" / "run-1"
             review_dir = work / "review_snapshots"
             session_dir = work / "agent_sessions" / "executor"
             work.mkdir(parents=True)

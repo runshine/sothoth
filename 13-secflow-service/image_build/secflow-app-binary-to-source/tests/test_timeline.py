@@ -12,7 +12,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.api import tasks as tasks_api
 from app.model import Base, B2STask, B2STaskEvent, B2STaskItem
-from app.schemas import TaskBatchDeleteRequest, TokenUser
+from app.schemas import B2SAgentSessionRuntimeSummary, TaskBatchDeleteRequest, TokenUser
 from app.service import task_service
 from app.time_utils import now_local
 
@@ -85,6 +85,135 @@ class TimelineServiceTests(unittest.TestCase):
 
         self.assertEqual(1, deleted_one)
         self.assertEqual(1, deleted_all)
+
+    def test_build_task_detail_exposes_phase_timings(self) -> None:
+        started_at = now_local() - timedelta(minutes=15)
+        finished_at = now_local() - timedelta(minutes=1)
+        self.item.phase = "body"
+        self.item.status = "running"
+        self.item.started_at = started_at
+        self.item.finished_at = None
+        completed = B2STaskItem(
+            id="item-2",
+            task_id=self.task.id,
+            project_id=self.task.project_id,
+            sequence_no=2,
+            elf_path="/tmp/demo2.elf",
+            output_dir="/tmp/out2",
+            status="success",
+            phase="header",
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+        self.db.add(completed)
+        self.db.commit()
+
+        with (
+            mock.patch.object(
+                task_service,
+                "build_task_agent_session_runtime",
+                return_value=mock.Mock(summary=B2SAgentSessionRuntimeSummary(task_id=self.task.id)),
+            ),
+            mock.patch.object(task_service, "build_task_config_snapshot", return_value=None),
+            mock.patch.object(task_service, "build_effective_llm_provider", return_value=None),
+            mock.patch.object(task_service, "build_agent_runtime_summary", return_value=None),
+            mock.patch.object(task_service, "build_task_result_summary", return_value=None),
+        ):
+            detail = task_service.build_task_detail(self.db, self.task)
+
+        header = next(row for row in detail.phase_timings if row.phase == "header")
+        body = next(row for row in detail.phase_timings if row.phase == "body")
+        self.assertEqual(1, header.current_items)
+        self.assertIsNotNone(header.started_at)
+        self.assertIsNotNone(header.finished_at)
+        self.assertGreaterEqual(int(header.duration_ms or 0), 0)
+        self.assertEqual(1, body.current_items)
+        self.assertTrue(body.is_active)
+        self.assertIsNotNone(body.started_at)
+
+    def test_build_task_detail_exposes_item_phase_observability_from_events(self) -> None:
+        base = now_local()
+        self.item.status = "success"
+        self.item.phase = "completed"
+        self.item.started_at = base
+        self.item.finished_at = base + timedelta(minutes=6)
+        self.db.add(self._event("evt-q", "phase_changed", 0))
+        queued = self.db.query(B2STaskEvent).filter_by(id="evt-q").one()
+        queued.phase = "queued"
+        self.db.add(self._event("evt-ida", "phase_changed", 60))
+        ida = self.db.query(B2STaskEvent).filter_by(id="evt-ida").one()
+        ida.phase = "ida"
+        self.db.add(self._event("evt-body", "phase_changed", 180))
+        body = self.db.query(B2STaskEvent).filter_by(id="evt-body").one()
+        body.phase = "body"
+        self.db.add(self._event("evt-merge", "phase_changed", 300))
+        merge = self.db.query(B2STaskEvent).filter_by(id="evt-merge").one()
+        merge.phase = "merge"
+        self.db.add(self._event("evt-done", "job_completed", 360))
+        done = self.db.query(B2STaskEvent).filter_by(id="evt-done").one()
+        done.phase = "completed"
+        self.db.commit()
+
+        with (
+            mock.patch.object(
+                task_service,
+                "build_task_agent_session_runtime",
+                return_value=mock.Mock(summary=B2SAgentSessionRuntimeSummary(task_id=self.task.id)),
+            ),
+            mock.patch.object(task_service, "build_task_config_snapshot", return_value=None),
+            mock.patch.object(task_service, "build_effective_llm_provider", return_value=None),
+            mock.patch.object(task_service, "build_agent_runtime_summary", return_value=None),
+            mock.patch.object(task_service, "build_task_result_summary", return_value=None),
+        ):
+            detail = task_service.build_task_detail(self.db, self.task)
+
+        item = detail.items[0]
+        queued_phase = next(row for row in item.phase_observability if row.phase == "queued")
+        ida_phase = next(row for row in item.phase_observability if row.phase == "ida")
+        merge_phase = next(row for row in item.phase_observability if row.phase == "merge")
+        self.assertIsNotNone(queued_phase.started_at)
+        self.assertIsNotNone(queued_phase.finished_at)
+        self.assertGreaterEqual(int(queued_phase.duration_ms or 0), 0)
+        self.assertIsNotNone(ida_phase.started_at)
+        self.assertIsNotNone(merge_phase.finished_at)
+
+    def test_record_item_snapshot_events_uses_body_phase_batch_events(self) -> None:
+        previous = {
+            "progress": {
+                "phase": "header",
+                "current_batch": None,
+                "current_attempt": None,
+                "current_function": None,
+                "completed_batches": 0,
+            }
+        }
+        self.item.phase = "body"
+        self.item.status = "running"
+        self.item.progress = {
+            "phase": "body",
+            "current_batch": 2,
+            "current_attempt": 1,
+            "current_function": "sub_401000",
+            "completed_batches": 0,
+            "completed_functions": 1,
+        }
+        self.item.updated_at = now_local()
+
+        task_service._record_item_snapshot_events(
+            self.db,
+            task=self.task,
+            item=self.item,
+            previous=previous,
+            source="b2s",
+        )
+        self.db.commit()
+
+        event_types = [row.event_type for row in self.db.query(B2STaskEvent).order_by(B2STaskEvent.created_at.asc()).all()]
+        self.assertIn("body_batch_started", event_types)
+        self.assertIn("batch_attempt_started", event_types)
+        self.assertIn("function_progress", event_types)
+        self.assertNotIn("batch_started", event_types)
+        self.assertNotIn("batch_completed", event_types)
 
     def test_delete_task_returns_deleted_event_count(self) -> None:
         self.db.add(self._event("evt-1", "task_created"))

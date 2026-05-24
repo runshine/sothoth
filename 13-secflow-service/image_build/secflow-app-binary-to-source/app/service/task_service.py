@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_config
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
-from app.model import B2STask, B2STaskBatch, B2STaskEvent as B2STaskEventModel, B2STaskItem, get_db_session
+from app.model import B2STask, B2STaskBatch, B2STaskEvent as B2STaskEventModel, B2STaskItem, B2STaskPhase, get_db_session
 from app.observability import get_observability
 from app.schemas import (
     AdvancedBatch,
@@ -40,6 +40,9 @@ from app.schemas import (
     B2SAbnormalReasonEventSummary,
     B2SArtifact,
     B2SArtifactContentResponse,
+    B2SItemPhaseObservability,
+    B2SPhaseTiming,
+    B2SPhaseObservabilityMetric,
     B2STaskEvent as B2STaskEventResponse,
     B2STaskEventSummary,
     B2STaskTimelineResponse,
@@ -116,6 +119,7 @@ PHASE_LABELS = {
     "failed": "失败",
     "cancelled": "已取消",
 }
+PHASE_ORDER = ["queued", "ida", "batching", "header", "body", "merge", "completed"]
 
 _BUDGET_EXHAUSTED_MARKERS = (
     "max_rounds_exceeded",
@@ -539,6 +543,142 @@ def _get_task_batch_row(db: Session, *, item: B2STaskItem, batch_no: int) -> B2S
     return row
 
 
+def _get_task_phase_row(db: Session, *, item: B2STaskItem, phase: str) -> B2STaskPhase:
+    row = (
+        db.query(B2STaskPhase)
+        .filter(
+            B2STaskPhase.task_id == item.task_id,
+            B2STaskPhase.item_id == item.id,
+            B2STaskPhase.phase == phase,
+        )
+        .first()
+    )
+    if row:
+        return row
+    row = B2STaskPhase(
+        id=uuid4().hex[:32],
+        task_id=item.task_id,
+        project_id=item.project_id,
+        item_id=item.id,
+        sequence_no=item.sequence_no,
+        phase=phase,
+        status="pending",
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _phase_metric_payloads(item: B2STaskItem, phase: str) -> list[dict[str, Any]]:
+    payloads = []
+    for metric in build_item_phase_observability_from_progress(item, phase):
+        payloads.append(metric.model_dump(mode="json"))
+    return payloads
+
+
+def build_item_phase_observability_from_progress(item: B2STaskItem, phase: str) -> list[B2SPhaseObservabilityMetric]:
+    progress = item.progress if isinstance(item.progress, dict) else {}
+    by_phase: dict[str, list[B2SPhaseObservabilityMetric]] = {
+        "queued": [
+            B2SPhaseObservabilityMetric(key="status", label="任务项状态", value=str(item.status or "-"), tone="slate"),
+            B2SPhaseObservabilityMetric(key="pi_job_id", label="Pi Job", value=str(item.pi_job_id or "未绑定"), tone="blue"),
+            B2SPhaseObservabilityMetric(key="worker", label="Worker", value=str((item.extra_metadata or {}).get("pi_worker_url") or (item.extra_metadata or {}).get("pi_endpoint_url") or "未分配"), tone="blue"),
+            B2SPhaseObservabilityMetric(key="message", label="排队说明", value=str(progress.get("message") or "等待派发或恢复中"), tone="slate"),
+        ],
+        "ida": [
+            B2SPhaseObservabilityMetric(key="completed_functions", label="函数完成", value=f"{int(progress.get('completed_functions') or 0)}/{int(progress.get('total_functions') or 0)}", tone="blue"),
+            B2SPhaseObservabilityMetric(key="bytes", label="字节进度", value=f"{int(progress.get('completed_bytes') or 0)}/{int(progress.get('total_bytes') or 0)}", tone="blue"),
+            B2SPhaseObservabilityMetric(key="pi_job_id", label="Pi Job", value=str(item.pi_job_id or "-"), tone="violet"),
+            B2SPhaseObservabilityMetric(key="message", label="阶段说明", value=str(progress.get("message") or "正在进行静态分析"), tone="slate"),
+        ],
+        "batching": [
+            B2SPhaseObservabilityMetric(key="batches", label="Batch 进度", value=f"{int(progress.get('completed_batches') or 0)}/{int(progress.get('total_batches') or 0)}", tone="violet"),
+            B2SPhaseObservabilityMetric(key="current_batch", label="当前 Batch", value=str(progress.get("current_batch") or "-"), tone="blue"),
+            B2SPhaseObservabilityMetric(key="total_functions", label="函数总量", value=str(int(progress.get("total_functions") or 0)), tone="blue"),
+            B2SPhaseObservabilityMetric(key="message", label="阶段说明", value=str(progress.get("message") or "正在规划函数分批"), tone="slate"),
+        ],
+        "header": [
+            B2SPhaseObservabilityMetric(key="pi_job_id", label="Pi Job", value=str(item.pi_job_id or "-"), tone="violet"),
+            B2SPhaseObservabilityMetric(key="worker", label="Worker", value=str((item.extra_metadata or {}).get("pi_worker_url") or (item.extra_metadata or {}).get("pi_endpoint_url") or "-"), tone="blue"),
+            B2SPhaseObservabilityMetric(key="current_function", label="当前函数", value=str(progress.get("current_function") or "-"), tone="emerald"),
+            B2SPhaseObservabilityMetric(key="message", label="阶段说明", value=str(progress.get("message") or "正在生成头文件与声明"), tone="slate"),
+        ],
+        "body": [
+            B2SPhaseObservabilityMetric(key="current_batch", label="当前 Batch", value=str(progress.get("current_batch") or "-"), tone="blue"),
+            B2SPhaseObservabilityMetric(key="current_attempt", label="当前 Attempt", value=str(progress.get("current_attempt") or "-"), tone="amber"),
+            B2SPhaseObservabilityMetric(key="current_function", label="当前函数", value=str(progress.get("current_function") or "-"), tone="blue"),
+            B2SPhaseObservabilityMetric(key="message", label="阶段说明", value=str(progress.get("message") or "正在进行函数体还原"), tone="slate"),
+        ],
+        "merge": [
+            B2SPhaseObservabilityMetric(key="batches", label="Batch 收口", value=f"{int(progress.get('completed_batches') or 0)}/{int(progress.get('total_batches') or 0)}", tone="violet"),
+            B2SPhaseObservabilityMetric(key="generated_files", label="产物文件数", value=str(len(normalize_generated_files(item))), tone="blue"),
+            B2SPhaseObservabilityMetric(key="worker", label="Worker", value=str((item.extra_metadata or {}).get("pi_worker_url") or (item.extra_metadata or {}).get("pi_endpoint_url") or "-"), tone="slate"),
+            B2SPhaseObservabilityMetric(key="message", label="阶段说明", value=str(progress.get("message") or "正在合并源码输出"), tone="slate"),
+        ],
+        "completed": [
+            B2SPhaseObservabilityMetric(key="status", label="任务项状态", value=str(item.status or "-"), tone="emerald"),
+            B2SPhaseObservabilityMetric(key="failure_type", label="失败类型", value=str(item.failure_type or "-"), tone="rose" if item.failure_type else "slate"),
+            B2SPhaseObservabilityMetric(key="error_reason", label="失败原因", value=str(item.error_reason or "-"), tone="rose" if item.error_reason else "slate"),
+            B2SPhaseObservabilityMetric(key="generated_files", label="产物文件数", value=str(len(normalize_generated_files(item))), tone="blue"),
+        ],
+    }
+    return by_phase.get(phase, [])
+
+
+def sync_phase_records_from_item(
+    db: Session,
+    *,
+    item: B2STaskItem,
+    previous: dict[str, Any] | None,
+) -> None:
+    prev = previous or {}
+    prev_phase = str(prev.get("phase") or "").strip().lower()
+    current_phase = str(item.phase or "").strip().lower()
+    event_at = _ensure_local_datetime(item.updated_at) or now_local()
+    item_status = str(item.status or "").strip().lower()
+
+    if current_phase in PHASE_ORDER:
+        row = _get_task_phase_row(db, item=item, phase=current_phase)
+        row.sequence_no = item.sequence_no
+        row.status = "running" if item_status not in TERMINAL else item_status
+        row.started_at = row.started_at or event_at
+        row.finished_at = None if item_status not in TERMINAL else row.finished_at
+        row.last_event_at = event_at
+        row.latest_event_type = "phase_active"
+        row.metrics = _phase_metric_payloads(item, current_phase)
+
+    if prev_phase in PHASE_ORDER and prev_phase != current_phase:
+        row = _get_task_phase_row(db, item=item, phase=prev_phase)
+        row.status = "passed" if current_phase in PHASE_ORDER[PHASE_ORDER.index(prev_phase) + 1:] else row.status
+        row.finished_at = row.finished_at or event_at
+        row.last_event_at = event_at
+        row.latest_event_type = "phase_exited"
+        if row.started_at and row.finished_at:
+            row.duration_ms = max(0, int((row.finished_at - row.started_at).total_seconds() * 1000))
+
+    if item_status in TERMINAL:
+        for phase in PHASE_ORDER:
+            row = (
+                db.query(B2STaskPhase)
+                .filter(B2STaskPhase.task_id == item.task_id, B2STaskPhase.item_id == item.id, B2STaskPhase.phase == phase)
+                .first()
+            )
+            if row is None:
+                continue
+            if row.finished_at is None:
+                row.finished_at = event_at
+            row.last_event_at = event_at
+            row.latest_event_type = f"item_{item_status}"
+            if row.phase == "completed":
+                row.status = item_status
+                row.started_at = row.started_at or event_at
+                row.metrics = _phase_metric_payloads(item, row.phase)
+            elif row.status == "running":
+                row.status = "passed" if item_status == "success" else item_status
+            if row.started_at and row.finished_at:
+                row.duration_ms = max(0, int((row.finished_at - row.started_at).total_seconds() * 1000))
+
+
 def _upsert_running_batch(
     db: Session,
     *,
@@ -595,6 +735,27 @@ def _terminal_batch_status(item_status: str | None, *, default: str = "partial")
     return default
 
 
+def _normalized_progress_phase(item: B2STaskItem, progress: dict[str, Any]) -> str:
+    raw_phase = str(progress.get("phase") or item.phase or "").strip().lower()
+    if raw_phase in PHASE_ORDER:
+        return raw_phase
+    mapped = map_pi_phase(raw_phase, item.status)
+    return mapped if mapped in PHASE_ORDER else "queued"
+
+
+def _body_batch_exit_status(item_status: str | None, next_phase: str | None = None) -> str:
+    normalized_status = str(item_status or "").strip().lower()
+    if normalized_status == "success":
+        return "passed"
+    if normalized_status == "failed":
+        return "failed"
+    if normalized_status in {"cancelled", "cancelling"}:
+        return "cancelled"
+    if str(next_phase or "").strip().lower() == "merge":
+        return "passed"
+    return "partial"
+
+
 def _close_running_batches_for_item(
     db: Session,
     *,
@@ -632,31 +793,57 @@ def sync_batch_records_from_progress(
     prev_progress = prev.get("progress") if isinstance(prev.get("progress"), dict) else {}
     current_progress = item.progress if isinstance(item.progress, dict) else {}
     event_at = _ensure_local_datetime(item.updated_at) or now_local()
+    prev_phase = _normalized_progress_phase(item, prev_progress)
+    current_phase = _normalized_progress_phase(item, current_progress)
+    was_in_body = prev_phase == "body"
+    is_in_body = current_phase == "body"
     current_batch = _safe_int(current_progress.get("current_batch"))
     current_attempt = _safe_int(current_progress.get("current_attempt"))
     current_function = str(current_progress.get("current_function") or "").strip() or None
     prev_batch = _safe_int(prev_progress.get("current_batch"))
     prev_attempt = _safe_int(prev_progress.get("current_attempt"))
-    prev_completed = _safe_int(prev_progress.get("completed_batches"))
     current_completed = _safe_int(current_progress.get("completed_batches"))
     batch_changed = prev_batch != current_batch
     attempt_changed = prev_attempt != current_attempt
-    completed_changed = prev_completed != current_completed
     item_status = str(item.status or "").strip().lower()
 
-    if completed_changed and prev_batch is not None:
+    if was_in_body and prev_batch is not None and batch_changed:
         _close_running_batches_for_item(
             db,
             item=item,
-            status=_terminal_batch_status(item_status, default="partial"),
-            event_type="batch_completed",
+            status=_body_batch_exit_status(item_status, current_phase),
+            event_type="body_batch_switched",
             event_at=event_at,
             only_batch_no=prev_batch,
             completed_progress_count=current_completed,
         )
 
-    if current_batch is not None and (batch_changed or attempt_changed or current_function is not None):
-        event_type = "function_progress" if current_function is not None else "batch_attempt_started" if attempt_changed else "batch_started"
+    if was_in_body and not is_in_body:
+        _close_running_batches_for_item(
+            db,
+            item=item,
+            status=_body_batch_exit_status(item_status, current_phase),
+            event_type=f"body_phase_exited:{current_phase}",
+            event_at=event_at,
+            completed_progress_count=current_completed,
+        )
+
+    should_start_or_refresh = (
+        current_batch is not None and is_in_body and (
+            (not was_in_body)
+            or batch_changed
+            or attempt_changed
+            or current_function is not None
+        )
+    )
+    if should_start_or_refresh:
+        event_type = (
+            "function_progress"
+            if current_function is not None
+            else "batch_attempt_started"
+            if attempt_changed
+            else "body_batch_started"
+        )
         _upsert_running_batch(
             db,
             item=item,
@@ -671,7 +858,7 @@ def sync_batch_records_from_progress(
         _close_running_batches_for_item(
             db,
             item=item,
-            status=_terminal_batch_status(item_status),
+            status=_body_batch_exit_status(item_status, current_phase),
             event_type=f"item_{item_status}",
             event_at=event_at,
             completed_progress_count=current_completed,
@@ -688,6 +875,7 @@ def _record_item_snapshot_events(
     payload: dict[str, Any] | None = None,
 ) -> None:
     sync_batch_records_from_progress(db, item=item, previous=previous)
+    sync_phase_records_from_item(db, item=item, previous=previous)
     prev = previous or {}
     prev_progress = prev.get("progress") if isinstance(prev.get("progress"), dict) else {}
     prev_metrics = prev.get("runtime_metrics")
@@ -792,27 +980,110 @@ def _record_item_snapshot_events(
     function_changed = prev_progress.get("current_function") != current_progress.get("current_function")
     completed_batches_changed = prev_progress.get("completed_batches") != current_progress.get("completed_batches")
     completed_functions_changed = prev_progress.get("completed_functions") != current_progress.get("completed_functions")
+    prev_normalized_phase = _normalized_progress_phase(item, prev_progress)
+    current_normalized_phase = _normalized_progress_phase(item, current_progress)
+    was_in_body = prev_normalized_phase == "body"
+    is_in_body = current_normalized_phase == "body"
     progress_changed = any([batch_changed, attempt_changed, function_changed, completed_batches_changed, completed_functions_changed])
 
-    if batch_changed and batch_id is not None:
+    previous_batch_id = _safe_int(prev_progress.get("current_batch"))
+    body_finish_status = _body_batch_exit_status(current_status, current_normalized_phase)
+    body_finish_emitted = False
+
+    if was_in_body and previous_batch_id is not None and batch_changed:
         _safe_create_task_event(
             db,
             task_id=task.id,
             project_id=task.project_id,
             item=item,
             source=source,
-            event_type="batch_started",
+            event_type="body_batch_finished",
+            phase=current_phase,
+            batch_id=int(previous_batch_id),
+            attempt=_safe_int(prev_progress.get("current_attempt")),
+            function_name=str(prev_progress.get("current_function") or "").strip() or None,
+            status=current_status,
+            message=f"Batch {previous_batch_id} 函数体结束，切换到 Batch {batch_id}",
+            payload={
+                **base_payload,
+                "previous_progress": prev_progress,
+                "progress": current_progress,
+                "exit_reason": "batch_switched",
+                "body_batch_status": body_finish_status,
+            },
+            dedupe_key=_event_dedupe_key(task.id, item.id, "body_batch_finished", previous_batch_id, "batch_switched", item.pi_job_id),
+        )
+        body_finish_emitted = True
+
+    if was_in_body and not is_in_body and previous_batch_id is not None:
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=source,
+            event_type="body_batch_finished",
+            phase=current_phase,
+            batch_id=int(previous_batch_id),
+            attempt=_safe_int(prev_progress.get("current_attempt")),
+            function_name=str(prev_progress.get("current_function") or "").strip() or None,
+            status=current_status,
+            message=f"Batch {previous_batch_id} 函数体结束，离开函数体恢复阶段",
+            payload={
+                **base_payload,
+                "previous_progress": prev_progress,
+                "progress": current_progress,
+                "exit_reason": f"phase_exited:{current_normalized_phase}",
+                "body_batch_status": body_finish_status,
+            },
+            dedupe_key=_event_dedupe_key(task.id, item.id, "body_batch_finished", previous_batch_id, f"phase_exited:{current_normalized_phase}", item.pi_job_id),
+        )
+        body_finish_emitted = True
+
+    if not body_finish_emitted and is_in_body and current_status in TERMINAL.union({"cancelling"}) and batch_id is not None:
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=source,
+            event_type="body_batch_finished",
             phase=current_phase,
             batch_id=int(batch_id),
             attempt=int(attempt) if attempt is not None else None,
             function_name=function_name,
             status=current_status,
-            message=f"任务项 #{item.sequence_no} 进入 batch {batch_id}",
+            message=f"Batch {batch_id} 函数体结束，任务项进入 {current_status}",
+            payload={
+                **base_payload,
+                "previous_progress": prev_progress,
+                "progress": current_progress,
+                "exit_reason": f"item_{current_status}",
+                "body_batch_status": body_finish_status,
+            },
+            dedupe_key=_event_dedupe_key(task.id, item.id, "body_batch_finished", batch_id, f"item_{current_status}", item.pi_job_id),
+        )
+        body_finish_emitted = True
+
+    if is_in_body and batch_changed and batch_id is not None:
+        _safe_create_task_event(
+            db,
+            task_id=task.id,
+            project_id=task.project_id,
+            item=item,
+            source=source,
+            event_type="body_batch_started",
+            phase=current_phase,
+            batch_id=int(batch_id),
+            attempt=int(attempt) if attempt is not None else None,
+            function_name=function_name,
+            status=current_status,
+            message=f"Batch {batch_id} 函数体开始",
             payload={**base_payload, "progress": current_progress},
-            dedupe_key=_event_dedupe_key(task.id, item.id, "batch_started", batch_id, item.pi_job_id),
+            dedupe_key=_event_dedupe_key(task.id, item.id, "body_batch_started", batch_id, item.pi_job_id),
         )
 
-    if (batch_changed or attempt_changed) and batch_id is not None:
+    if is_in_body and (batch_changed or attempt_changed) and batch_id is not None:
         _safe_create_task_event(
             db,
             task_id=task.id,
@@ -825,12 +1096,12 @@ def _record_item_snapshot_events(
             attempt=int(attempt) if attempt is not None else None,
             function_name=function_name,
             status=current_status,
-            message=f"任务项 #{item.sequence_no} 开始 batch {batch_id} attempt {attempt or 1}",
+            message=f"Batch {batch_id} Attempt {attempt or 1} 开始",
             payload={**base_payload, "progress": current_progress},
             dedupe_key=_event_dedupe_key(task.id, item.id, "batch_attempt_started", batch_id, attempt, item.pi_job_id),
         )
 
-    if function_changed and function_name:
+    if is_in_body and function_changed and function_name:
         _safe_create_task_event(
             db,
             task_id=task.id,
@@ -843,7 +1114,7 @@ def _record_item_snapshot_events(
             attempt=int(attempt) if attempt is not None else None,
             function_name=function_name,
             status=current_status,
-            message=f"任务项 #{item.sequence_no} 正在处理函数 {function_name}",
+            message=f"函数 {function_name}",
             payload={**base_payload, "progress": current_progress},
             dedupe_key=_event_dedupe_key(task.id, item.id, "function_progress", batch_id, attempt, function_name, item.pi_job_id),
         )
@@ -855,15 +1126,15 @@ def _record_item_snapshot_events(
             project_id=task.project_id,
             item=item,
             source=source,
-            event_type="batch_completed",
+            event_type="batch_progress_updated",
             phase=current_phase,
             batch_id=int(batch_id) if batch_id is not None else None,
             attempt=int(attempt) if attempt is not None else None,
             function_name=function_name,
             status=current_status,
-            message=f"任务项 #{item.sequence_no} 已完成 {current_progress.get('completed_batches')} / {current_progress.get('total_batches') or '?'} 个 batch",
+            message=f"批次累计进度 {current_progress.get('completed_batches')} / {current_progress.get('total_batches') or '?'}",
             payload={**base_payload, "progress": current_progress},
-            dedupe_key=_event_dedupe_key(task.id, item.id, "batch_completed", current_progress.get("completed_batches"), item.pi_job_id),
+            dedupe_key=_event_dedupe_key(task.id, item.id, "batch_progress_updated", current_progress.get("completed_batches"), item.pi_job_id),
         )
 
     if progress_changed:
@@ -2256,6 +2527,7 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
         dedupe_key=_event_dedupe_key(task.id, "task_rerun_requested", task.updated_at),
     )
     db.query(B2STaskBatch).filter(B2STaskBatch.task_id == task.id).delete(synchronize_session=False)
+    db.query(B2STaskPhase).filter(B2STaskPhase.task_id == task.id).delete(synchronize_session=False)
 
     for item in items:
         previous = _item_event_snapshot(item)
@@ -2412,20 +2684,34 @@ def _safe_existing_file(path: Path, root: Path) -> str | None:
     return str(resolved)
 
 
+def _item_run_root(output_root: Path) -> Path:
+    return output_root / "run"
+
+
+def _item_ida_cache_dir(output_root: Path) -> Path:
+    return _item_run_root(output_root) / "ida_cache"
+
+
+def _item_runs_root(output_root: Path) -> Path:
+    return _item_run_root(output_root) / "runs"
+
+
 def ida_decompiled_c_path(item: B2STaskItem, reference_path: str | None = None) -> str | None:
     """Return IDA's direct decompiled C output for an item if present."""
     output_root = Path(item.output_dir)
-    stems: list[str] = []
+    candidates: list[Path] = [
+        _item_ida_cache_dir(output_root) / "ida_export" / "decompiled.c",
+    ]
     if reference_path:
-        stems.append(Path(reference_path).stem)
+        candidates.append(_item_ida_cache_dir(output_root) / Path(reference_path).stem / "ida_export" / "decompiled.c")
     if item.elf_path:
-        stems.append(Path(item.elf_path).stem)
+        candidates.append(_item_ida_cache_dir(output_root) / Path(item.elf_path).stem / "ida_export" / "decompiled.c")
     seen: set[str] = set()
-    for stem in stems:
-        if not stem or stem in seen:
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
             continue
-        seen.add(stem)
-        candidate = output_root / f".re_work_{stem}" / "ida_cache" / "ida_export" / "decompiled.c"
+        seen.add(key)
         existing = _safe_existing_file(candidate, output_root)
         if existing:
             return existing
@@ -2629,10 +2915,8 @@ def _json_file(path: Path) -> dict[str, Any] | None:
 
 def _latest_run_dir(item: B2STaskItem) -> Path | None:
     output_dir = Path(item.output_dir)
-    work_dirs = sorted([p for p in output_dir.glob(".re_work_*") if p.is_dir()], key=lambda p: p.name)
-    work_dir = work_dirs[-1] if work_dirs else None
-    runs_root = work_dir / "runs" if work_dir else None
-    if not runs_root or not runs_root.exists():
+    runs_root = _item_runs_root(output_dir)
+    if not runs_root.exists():
         return None
     run_dirs = sorted([p for p in runs_root.iterdir() if p.is_dir()], key=lambda p: p.name)
     return run_dirs[-1] if run_dirs else None
@@ -2849,6 +3133,136 @@ def build_task_timing_summary(items: list[B2STaskItem]) -> dict[str, datetime | 
     }
 
 
+def build_phase_timings(items: list[B2STaskItem]) -> list[B2SPhaseTiming]:
+    rows: list[B2SPhaseTiming] = []
+    for phase_index, phase in enumerate(PHASE_ORDER):
+        current_items = 0
+        completed_items = 0
+        phase_started: list[datetime] = []
+        phase_finished: list[datetime] = []
+        active = False
+        for item in items:
+            current_phase = item.phase if item.phase in PHASE_ORDER else "queued"
+            item_phase_index = PHASE_ORDER.index(current_phase)
+            if item_phase_index == phase_index:
+                current_items += 1
+                if item.started_at is not None:
+                    phase_started.append(item.started_at)
+                if item.finished_at is not None and item.status in TERMINAL:
+                    phase_finished.append(item.finished_at)
+                if item.status not in TERMINAL:
+                    active = True
+            if item_phase_index > phase_index or item.status == "success":
+                completed_items += 1
+        started_at = min(phase_started) if phase_started else None
+        finished_at = max(phase_finished) if phase_finished and not active and current_items > 0 else None
+        duration_ms = None
+        if started_at is not None:
+            end_at = now_local() if active else finished_at
+            if end_at is not None:
+                duration_ms = max(0, int((end_at - started_at).total_seconds() * 1000))
+        rows.append(B2SPhaseTiming(
+            phase=phase,
+            phase_label=PHASE_LABELS.get(phase, phase),
+            current_items=current_items,
+            completed_items=completed_items,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_ms=duration_ms,
+            is_active=active and current_items > 0,
+            is_completed=completed_items > 0 and current_items == 0,
+        ))
+    return rows
+
+
+def _item_phase_progress_state(item: B2STaskItem, phase: str) -> tuple[int, int, bool, bool]:
+    if phase == "completed":
+        passed = 1 if str(item.status or "").strip().lower() in TERMINAL else 0
+        return 0, passed, False, passed == 1
+    current_phase = item.phase if item.phase in PHASE_ORDER else "queued"
+    phase_index = PHASE_ORDER.index(phase)
+    current_index = PHASE_ORDER.index(current_phase)
+    is_current = str(item.status or "").strip().lower() == "running" and current_phase == phase
+    is_passed = current_index > phase_index
+    return (1 if is_current else 0), (1 if is_passed else 0), is_current, is_passed
+
+
+def _build_item_phase_time_index(db: Session, item: B2STaskItem) -> dict[str, dict[str, datetime | None]]:
+    rows = (
+        db.query(B2STaskEventModel)
+        .filter(B2STaskEventModel.task_id == item.task_id, B2STaskEventModel.item_id == item.id)
+        .order_by(B2STaskEventModel.created_at.asc())
+        .all()
+    )
+    phase_times: dict[str, dict[str, datetime | None]] = {
+        phase: {"started_at": None, "finished_at": None} for phase in PHASE_ORDER
+    }
+    terminal_at: datetime | None = None
+    for row in rows:
+        event_type = str(row.event_type or "").strip()
+        phase = str(row.phase or "").strip()
+        if event_type == "phase_changed" and phase in phase_times:
+            if phase_times[phase]["started_at"] is None:
+                phase_times[phase]["started_at"] = row.created_at
+        if event_type in {"job_completed", "job_failed", "job_cancelled"}:
+            terminal_at = row.created_at
+    for idx, phase in enumerate(PHASE_ORDER):
+        started_at = phase_times[phase]["started_at"]
+        if started_at is None:
+            continue
+        next_started = None
+        for next_phase in PHASE_ORDER[idx + 1:]:
+            candidate = phase_times[next_phase]["started_at"]
+            if candidate is not None:
+                next_started = candidate
+                break
+        phase_times[phase]["finished_at"] = next_started or (terminal_at if phase == "completed" else terminal_at)
+    return phase_times
+
+
+def build_item_phase_observability(db: Session, item: B2STaskItem) -> list[B2SItemPhaseObservability]:
+    persisted_rows = (
+        db.query(B2STaskPhase)
+        .filter(B2STaskPhase.task_id == item.task_id, B2STaskPhase.item_id == item.id)
+        .all()
+    )
+    persisted_by_phase = {row.phase: row for row in persisted_rows}
+    phase_times = _build_item_phase_time_index(db, item)
+    rows: list[B2SItemPhaseObservability] = []
+    for phase in PHASE_ORDER:
+        current_items, completed_items, is_active, is_completed = _item_phase_progress_state(item, phase)
+        persisted = persisted_by_phase.get(phase)
+        started_at = _ensure_local_datetime(persisted.started_at) if persisted else phase_times.get(phase, {}).get("started_at")
+        finished_at = _ensure_local_datetime(persisted.finished_at) if persisted else phase_times.get(phase, {}).get("finished_at")
+        duration_ms = persisted.duration_ms if persisted and persisted.duration_ms is not None else None
+        if duration_ms is None and started_at is not None:
+            end_at = now_local() if is_active and finished_at is None else finished_at
+            if end_at is not None:
+                duration_ms = max(0, int((end_at - started_at).total_seconds() * 1000))
+        metrics = []
+        if persisted and persisted.metrics:
+            for payload in persisted.metrics:
+                try:
+                    metrics.append(B2SPhaseObservabilityMetric(**payload))
+                except Exception:
+                    continue
+        if not metrics:
+            metrics = build_item_phase_observability_from_progress(item, phase)
+        rows.append(B2SItemPhaseObservability(
+            phase=phase,
+            phase_label=PHASE_LABELS.get(phase, phase),
+            current_items=current_items,
+            completed_items=completed_items,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_ms=duration_ms,
+            is_active=is_active,
+            is_completed=is_completed,
+            metrics=metrics,
+        ))
+    return rows
+
+
 def build_task_response(db: Session, task: B2STask) -> TaskResponse:
     items = query_items(db, task.id)
     counts = count_status(items)
@@ -2926,19 +3340,20 @@ def build_task_detail(db: Session, task: B2STask) -> TaskDetailResponse:
             generated_files=normalize_generated_files(i),
             started_at=i.started_at,
             finished_at=i.finished_at,
+            phase_observability=build_item_phase_observability(db, i),
         )
         for i in raw_items
     ]
     return TaskDetailResponse(
         **base,
         overall_progress=build_overall_progress(raw_items),
+        phase_timings=build_phase_timings(raw_items),
         items=items,
         task_config_snapshot=build_task_config_snapshot(task, raw_items),
         effective_llm_provider=build_effective_llm_provider(raw_items),
         agent_runtime_summary=build_agent_runtime_summary(raw_items),
         agent_session_runtime_summary=agent_session_runtime.summary,
         result_summary=build_task_result_summary(raw_items),
-        observability_summary=build_task_observability_summary(raw_items),
         event_summary=_build_task_event_summary(db, task.id),
         abnormal_reason_history=_abnormal_reason_history(db, task.id),
     )
@@ -3419,16 +3834,15 @@ def build_task_item_review_analytics(item: B2STaskItem) -> ReviewAnalyticsRespon
 def build_task_item_advanced(item: B2STaskItem, include_content: bool = True) -> TaskItemAdvancedResponse:
     output_dir = Path(item.output_dir)
     base = output_dir.resolve()
-    work_dirs = sorted([p for p in output_dir.glob(".re_work_*") if p.is_dir()], key=lambda p: p.name)
-    work_dir = work_dirs[-1] if work_dirs else None
+    work_dir = _item_run_root(output_dir)
     runs: list[AdvancedRun] = []
     ida_files: list[AdvancedFile] = []
-    if work_dir:
-        ida_root = work_dir / "ida_cache"
+    if work_dir.exists():
+        ida_root = _item_ida_cache_dir(output_dir)
         if ida_root.exists():
             ida_paths = [p for p in ida_root.rglob("*") if p.is_file() and p.suffix.lower() in ADVANCED_TEXT_EXTENSIONS]
             ida_files = [file for path in sorted(ida_paths) if (file := _safe_read_advanced_file(path, base, include_content, _ida_file_meta(path)))]
-        runs_root = work_dir / "runs"
+        runs_root = _item_runs_root(output_dir)
         run_dirs = sorted([p for p in runs_root.iterdir() if p.is_dir()], key=lambda p: p.name) if runs_root.exists() else []
         for run_dir in run_dirs:
             batch_map: dict[int, AdvancedBatch] = {}
@@ -3477,7 +3891,7 @@ def build_task_item_advanced(item: B2STaskItem, include_content: bool = True) ->
         mode=mode,
         mode_label=mode_label,
         output_dir=item.output_dir,
-        work_dir=str(work_dir) if work_dir else None,
+        work_dir=str(work_dir) if work_dir.exists() else None,
         runs=runs,
         ida_files=ida_files,
     )
@@ -3538,7 +3952,7 @@ def _iter_root_artifact_paths(output_dir: Path) -> list[Path]:
         if not path.is_file():
             continue
         relative_parts = [part.lower() for part in path.relative_to(output_dir).parts]
-        if any(part.startswith(".re_work_") for part in relative_parts):
+        if relative_parts and relative_parts[0] == "run":
             continue
         if path.suffix.lower() not in allowed_suffixes and path.name.lower() != "files.list":
             continue
@@ -4919,6 +5333,7 @@ def build_task_observability_summary(items: list[B2STaskItem]) -> TaskObservabil
             issue_total=int(analytics.summary.issue_total or 0),
             issue_resolved=int(analytics.summary.issue_resolved or 0),
             issue_remaining=int(analytics.summary.issue_remaining or 0),
+            phase_observability=build_item_phase_observability(db, item),
         ))
     total_duration_ms = sum(durations) if durations else None
     sorted_batch_rows = sorted(batch_rows, key=lambda entry: (entry.sequence_no, entry.batch_no))
@@ -4951,6 +5366,10 @@ def build_task_observability_summary(items: list[B2STaskItem]) -> TaskObservabil
         batches=sorted_batch_rows,
         items=sorted(rows, key=lambda entry: entry.sequence_no),
     )
+
+
+def build_task_item_observability_summary(item: B2STaskItem) -> TaskObservabilitySummary:
+    return build_task_observability_summary([item])
 
 
 def build_task_relationship(items: list[B2STaskItem]) -> TaskRelationshipResponse:

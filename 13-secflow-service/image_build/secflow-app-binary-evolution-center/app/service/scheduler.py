@@ -148,7 +148,7 @@ class SchedulerService:
                     {
                         EvolutionTask.status: "running",
                         EvolutionTask.owner_pod_id: self.pod_id,
-                        EvolutionTask.started_at: now_local(),
+                        EvolutionTask.started_at: candidate.started_at or now_local(),
                         EvolutionTask.message: f"started by {self.pod_id}",
                     },
                     synchronize_session=False,
