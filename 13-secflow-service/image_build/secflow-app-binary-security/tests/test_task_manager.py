@@ -8666,6 +8666,24 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 files_list.read_text(encoding="utf-8").splitlines(),
             )
 
+    def test_prepare_entry_module_descriptor_excludes_ida_intermediate_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_root = Path(tmp)
+            (artifact_root / "libipsec.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+            (artifact_root / "libipsec_ida.c").write_text("int ida_main(void) { return 0; }\n", encoding="utf-8")
+            (artifact_root / "libipsec_ida.h").write_text("#pragma once\n", encoding="utf-8")
+
+            descriptor = self.manager._prepare_entry_module_descriptor(
+                artifact_root,
+                {"module_name": "IPSEC"},
+            )
+
+            files_list = Path(descriptor["entry_files_list"])
+            self.assertEqual(
+                ["libipsec.c"],
+                files_list.read_text(encoding="utf-8").splitlines(),
+            )
+
     def test_entry_analysis_inputs_normalize_binary_module_to_descriptor_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact_root = Path(tmp)

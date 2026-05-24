@@ -7,7 +7,10 @@ from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
-from app.model import B2STaskItem
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.model import Base, B2STaskBatch, B2STaskItem
 from app.schemas import AdvancedBatch, AdvancedFile, AdvancedRun, TaskItemAdvancedResponse
 from app.service import task_service
 
@@ -59,24 +62,75 @@ def _review(path: Path, verdict: str, attempt_no: int) -> AdvancedFile:
 class BatchObservabilityTests(unittest.TestCase):
     def test_builds_task_level_batch_rows_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
+            engine = create_engine("sqlite:///:memory:")
+            Base.metadata.create_all(bind=engine)
+            SessionLocal = sessionmaker(bind=engine)
+            db = SessionLocal()
             item1 = _item(1, status="running")
             item1.output_dir = str(Path(tmpdir) / "item1")
             item1.updated_at = datetime.now().astimezone()
             item1.progress = {"current_batch": 2, "current_attempt": 2, "current_function": "sub_402000"}
-            item1.extra_metadata = {
-                "pi_runtime_metrics": {
-                    "updated_at": datetime.now().astimezone().isoformat(),
-                    "batch_summary": {
-                        "batches": [
-                            {"batch_id": 1, "status": "running", "attempts": 1, "function_count": 2, "duration_seconds": 5.0},
-                            {"batch_id": 2, "status": "running", "attempts": 2, "function_count": 4, "duration_seconds": 12.5},
-                        ]
-                    },
-                }
-            }
             item2 = _item(2, status="success")
             item2.output_dir = str(Path(tmpdir) / "item2")
             item2.updated_at = datetime.now().astimezone()
+            db.add_all([
+                B2STaskBatch(
+                    id="b1",
+                    task_id=item1.task_id,
+                    project_id=item1.project_id,
+                    item_id=item1.id,
+                    sequence_no=item1.sequence_no,
+                    batch_no=1,
+                    status="running",
+                    attempt_count=1,
+                    current_attempt_no=1,
+                    function_count=2,
+                    duration_ms=5000,
+                    last_event_at=item1.updated_at,
+                ),
+                B2STaskBatch(
+                    id="b2",
+                    task_id=item1.task_id,
+                    project_id=item1.project_id,
+                    item_id=item1.id,
+                    sequence_no=item1.sequence_no,
+                    batch_no=2,
+                    status="running",
+                    attempt_count=2,
+                    current_attempt_no=2,
+                    current_function="sub_402000",
+                    function_count=4,
+                    duration_ms=12500,
+                    last_event_at=item1.updated_at,
+                ),
+                B2STaskBatch(
+                    id="b3",
+                    task_id=item2.task_id,
+                    project_id=item2.project_id,
+                    item_id=item2.id,
+                    sequence_no=item2.sequence_no,
+                    batch_no=1,
+                    status="passed",
+                    attempt_count=2,
+                    latest_verdict="PASS",
+                    latest_verdict_label="通过",
+                    last_event_at=item2.updated_at,
+                ),
+                B2STaskBatch(
+                    id="b4",
+                    task_id=item2.task_id,
+                    project_id=item2.project_id,
+                    item_id=item2.id,
+                    sequence_no=item2.sequence_no,
+                    batch_no=2,
+                    status="failed",
+                    attempt_count=1,
+                    latest_verdict="FAIL",
+                    latest_verdict_label="失败",
+                    last_event_at=item2.updated_at,
+                ),
+            ])
+            db.commit()
 
             run_dir1 = Path(item1.output_dir) / ".re_work_latest" / "runs" / "run-1"
             run_dir2 = Path(item2.output_dir) / ".re_work_latest" / "runs" / "run-1"
@@ -135,8 +189,10 @@ class BatchObservabilityTests(unittest.TestCase):
             def fake_advanced(item: B2STaskItem, include_content: bool = False) -> TaskItemAdvancedResponse:
                 return advanced1 if item.id == item1.id else advanced2
 
-            with mock.patch.object(task_service, "build_task_item_advanced", side_effect=fake_advanced):
+            with mock.patch.object(task_service, "build_task_item_advanced", side_effect=fake_advanced), \
+                mock.patch.object(task_service, "get_db_session", return_value=db):
                 summary = task_service.build_task_observability_summary([item1, item2])
+            db.close()
 
         self.assertEqual(4, len(summary.batches))
         self.assertEqual(4, summary.batch_summary.total_batches)

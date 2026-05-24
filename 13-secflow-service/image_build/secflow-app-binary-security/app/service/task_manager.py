@@ -13503,6 +13503,8 @@ class TaskManager:
         if "agent_sessions" in lowered_parts:
             return False
         lowered_name = path.name.lower()
+        if "_ida." in lowered_name or lowered_name.endswith("_ida.c") or lowered_name.endswith("_ida.h"):
+            return False
         if lowered_name.endswith(".chat.json") or lowered_name.endswith(".validate.json"):
             return False
         if lowered_name in {"functions.json", "imports.json", "metadata.json", "strings.json", "structural.json"}:

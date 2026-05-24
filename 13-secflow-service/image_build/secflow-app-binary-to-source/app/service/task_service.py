@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_config
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
-from app.model import B2STask, B2STaskEvent as B2STaskEventModel, B2STaskItem
+from app.model import B2STask, B2STaskBatch, B2STaskEvent as B2STaskEventModel, B2STaskItem, get_db_session
 from app.observability import get_observability
 from app.schemas import (
     AdvancedBatch,
@@ -513,6 +513,171 @@ def delete_task_timeline_event(db: Session, task: B2STask, event_id: str) -> int
     return int(deleted or 0)
 
 
+def _get_task_batch_row(db: Session, *, item: B2STaskItem, batch_no: int) -> B2STaskBatch:
+    row = (
+        db.query(B2STaskBatch)
+        .filter(
+            B2STaskBatch.task_id == item.task_id,
+            B2STaskBatch.item_id == item.id,
+            B2STaskBatch.batch_no == batch_no,
+        )
+        .first()
+    )
+    if row:
+        return row
+    row = B2STaskBatch(
+        id=uuid4().hex[:32],
+        task_id=item.task_id,
+        project_id=item.project_id,
+        item_id=item.id,
+        sequence_no=item.sequence_no,
+        batch_no=batch_no,
+        status="pending",
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _upsert_running_batch(
+    db: Session,
+    *,
+    item: B2STaskItem,
+    batch_no: int,
+    attempt_no: int | None,
+    function_name: str | None,
+    event_type: str,
+    event_at: datetime,
+) -> B2STaskBatch:
+    row = _get_task_batch_row(db, item=item, batch_no=batch_no)
+    row.sequence_no = item.sequence_no
+    row.status = "running"
+    row.started_at = row.started_at or event_at
+    row.finished_at = None
+    row.duration_ms = None
+    row.last_event_at = event_at
+    row.latest_event_type = event_type
+    if attempt_no is not None:
+        row.current_attempt_no = attempt_no
+        row.attempt_count = max(int(row.attempt_count or 0), int(attempt_no))
+    if function_name is not None:
+        row.current_function = function_name
+    return row
+
+
+def _finalize_batch_row(
+    row: B2STaskBatch,
+    *,
+    status: str,
+    event_type: str,
+    event_at: datetime,
+    completed_progress_count: int | None = None,
+) -> None:
+    row.status = status
+    row.finished_at = row.finished_at or event_at
+    row.last_event_at = event_at
+    row.latest_event_type = event_type
+    row.current_function = None
+    if completed_progress_count is not None:
+        row.completed_at_progress_count = completed_progress_count
+    if row.started_at and row.finished_at:
+        row.duration_ms = max(0, int((row.finished_at - row.started_at).total_seconds() * 1000))
+
+
+def _terminal_batch_status(item_status: str | None, *, default: str = "partial") -> str:
+    normalized = str(item_status or "").strip().lower()
+    if normalized == "success":
+        return "passed"
+    if normalized == "failed":
+        return "failed"
+    if normalized in {"cancelled", "cancelling"}:
+        return "cancelled"
+    return default
+
+
+def _close_running_batches_for_item(
+    db: Session,
+    *,
+    item: B2STaskItem,
+    status: str,
+    event_type: str,
+    event_at: datetime,
+    only_batch_no: int | None = None,
+    completed_progress_count: int | None = None,
+) -> None:
+    query = db.query(B2STaskBatch).filter(
+        B2STaskBatch.task_id == item.task_id,
+        B2STaskBatch.item_id == item.id,
+        B2STaskBatch.status == "running",
+    )
+    if only_batch_no is not None:
+        query = query.filter(B2STaskBatch.batch_no == only_batch_no)
+    for row in query.all():
+        _finalize_batch_row(
+            row,
+            status=status,
+            event_type=event_type,
+            event_at=event_at,
+            completed_progress_count=completed_progress_count,
+        )
+
+
+def sync_batch_records_from_progress(
+    db: Session,
+    *,
+    item: B2STaskItem,
+    previous: dict[str, Any] | None,
+) -> None:
+    prev = previous or {}
+    prev_progress = prev.get("progress") if isinstance(prev.get("progress"), dict) else {}
+    current_progress = item.progress if isinstance(item.progress, dict) else {}
+    event_at = _ensure_local_datetime(item.updated_at) or now_local()
+    current_batch = _safe_int(current_progress.get("current_batch"))
+    current_attempt = _safe_int(current_progress.get("current_attempt"))
+    current_function = str(current_progress.get("current_function") or "").strip() or None
+    prev_batch = _safe_int(prev_progress.get("current_batch"))
+    prev_attempt = _safe_int(prev_progress.get("current_attempt"))
+    prev_completed = _safe_int(prev_progress.get("completed_batches"))
+    current_completed = _safe_int(current_progress.get("completed_batches"))
+    batch_changed = prev_batch != current_batch
+    attempt_changed = prev_attempt != current_attempt
+    completed_changed = prev_completed != current_completed
+    item_status = str(item.status or "").strip().lower()
+
+    if completed_changed and prev_batch is not None:
+        _close_running_batches_for_item(
+            db,
+            item=item,
+            status=_terminal_batch_status(item_status, default="partial"),
+            event_type="batch_completed",
+            event_at=event_at,
+            only_batch_no=prev_batch,
+            completed_progress_count=current_completed,
+        )
+
+    if current_batch is not None and (batch_changed or attempt_changed or current_function is not None):
+        event_type = "function_progress" if current_function is not None else "batch_attempt_started" if attempt_changed else "batch_started"
+        _upsert_running_batch(
+            db,
+            item=item,
+            batch_no=current_batch,
+            attempt_no=current_attempt,
+            function_name=current_function,
+            event_type=event_type,
+            event_at=event_at,
+        )
+
+    if item_status in TERMINAL or item_status == "cancelling":
+        _close_running_batches_for_item(
+            db,
+            item=item,
+            status=_terminal_batch_status(item_status),
+            event_type=f"item_{item_status}",
+            event_at=event_at,
+            completed_progress_count=current_completed,
+        )
+
+
 def _record_item_snapshot_events(
     db: Session,
     *,
@@ -522,6 +687,7 @@ def _record_item_snapshot_events(
     source: str,
     payload: dict[str, Any] | None = None,
 ) -> None:
+    sync_batch_records_from_progress(db, item=item, previous=previous)
     prev = previous or {}
     prev_progress = prev.get("progress") if isinstance(prev.get("progress"), dict) else {}
     prev_metrics = prev.get("runtime_metrics")
@@ -2089,6 +2255,7 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
         payload={"clean_output": clean_output, "cancel_running": cancel_running},
         dedupe_key=_event_dedupe_key(task.id, "task_rerun_requested", task.updated_at),
     )
+    db.query(B2STaskBatch).filter(B2STaskBatch.task_id == task.id).delete(synchronize_session=False)
 
     for item in items:
         previous = _item_event_snapshot(item)
@@ -2881,6 +3048,7 @@ def _safe_read_advanced_file(path: Path, base: Path, include_content: bool, meta
         size = resolved.stat().st_size
         content = None
         truncated = False
+        extra = dict(metadata or {})
         if include_content and resolved.suffix.lower() in ADVANCED_TEXT_EXTENSIONS:
             raw = resolved.read_bytes()[:ADVANCED_MAX_BYTES + 1]
             truncated = len(raw) > ADVANCED_MAX_BYTES
@@ -2888,11 +3056,11 @@ def _safe_read_advanced_file(path: Path, base: Path, include_content: bool, meta
         return AdvancedFile(
             name=resolved.name,
             path=str(resolved),
-            kind=_advanced_kind(resolved),
+            kind=str(extra.pop("kind", None) or _advanced_kind(resolved)),
             size=size,
             content=content,
             truncated=truncated,
-            **(metadata or {}),
+            **extra,
         )
     except Exception:
         return None
@@ -3348,6 +3516,8 @@ def _iter_advanced_files(advanced: TaskItemAdvancedResponse) -> list[AdvancedFil
 
 
 def _root_artifact_meta(path: Path) -> dict[str, Any]:
+    lowered_name = path.name.lower()
+    kind = "ida_intermediate" if "_ida." in lowered_name or lowered_name.endswith("_ida.c") or lowered_name.endswith("_ida.h") else None
     return {
         "stage": "输出产物",
         "stage_order": 5500,
@@ -3355,6 +3525,7 @@ def _root_artifact_meta(path: Path) -> dict[str, Any]:
         "section_order": 0,
         "round": "产物",
         "round_order": 0,
+        **({"kind": kind} if kind else {}),
     }
 
 
@@ -3400,6 +3571,8 @@ def _artifact_result_kind(artifact: B2SArtifact) -> str:
     suffix = Path(name).suffix.lower()
     artifact_kind = _normalize_artifact_kind(getattr(artifact, "kind", None))
 
+    if artifact_kind == "ida_intermediate" or "_ida." in name or name.endswith("_ida.c") or name.endswith("_ida.h"):
+        return "batch_intermediate"
     if suffix in {".c", ".cc", ".cpp", ".cxx"}:
         return "recovered_source"
     if suffix in {".h", ".hpp", ".hh"}:
@@ -3434,7 +3607,8 @@ def _build_item_artifact_index(item: B2STaskItem, artifacts: list[B2SArtifact]) 
         artifact_kind = _normalize_artifact_kind(artifact.kind)
         artifact_summary[artifact_kind] = artifact_summary.get(artifact_kind, 0) + 1
         result_kind = _artifact_result_kind(artifact)
-        result_kind_summary[result_kind] = result_kind_summary.get(result_kind, 0) + 1
+        if artifact_kind != "ida_intermediate":
+            result_kind_summary[result_kind] = result_kind_summary.get(result_kind, 0) + 1
         artifact_rows.append(
             {
                 "relative_path": artifact.relative_path,
@@ -4150,6 +4324,71 @@ def _parse_review_verdict(file: AdvancedFile | None) -> tuple[str | None, str | 
     return verdict, _verdict_label(verdict or "UNKNOWN") if verdict else None
 
 
+def _merge_batch_row_display_fields(
+    row: BatchObservabilityRow,
+    *,
+    manifest_row: dict[str, Any] | None,
+    result_row: dict[str, Any] | None,
+    batch: AdvancedBatch | None,
+    sessions: list[AdvancedFile],
+) -> BatchObservabilityRow:
+    warnings = list(row.warnings or [])
+    has_source_output = bool(row.has_source_output) or bool(batch and batch.source) or bool(str((manifest_row or {}).get("output_file") or "").strip())
+    has_disasm_context = bool(row.has_disasm_context) or bool(batch and batch.disasm) or bool(str((manifest_row or {}).get("disasm_file") or "").strip())
+    review_count = max(int(row.review_count or 0), len(batch.reviews) if batch else 0)
+    session_count = max(int(row.session_count or 0), len(sessions))
+    verdict = row.latest_verdict
+    verdict_label = row.latest_verdict_label
+    if not verdict:
+        parsed_verdict, parsed_label = _parse_review_verdict(batch.reviews[-1] if batch and batch.reviews else None)
+        if parsed_verdict:
+            verdict = parsed_verdict
+            verdict_label = parsed_label
+        else:
+            candidate = str((result_row or {}).get("verdict") or "").upper()
+            if candidate in {"PASS", "FAIL"}:
+                verdict = candidate
+                verdict_label = _verdict_label(candidate)
+    if row.status == "unknown" and not warnings:
+        warnings.append("缺少 batch 过程记录。")
+    return row.model_copy(update={
+        "has_source_output": has_source_output,
+        "has_disasm_context": has_disasm_context,
+        "review_count": review_count,
+        "session_count": session_count,
+        "latest_verdict": verdict,
+        "latest_verdict_label": verdict_label,
+        "warnings": warnings,
+    })
+
+
+def _batch_row_from_model(row: B2STaskBatch) -> BatchObservabilityRow:
+    return BatchObservabilityRow(
+        item_id=row.item_id,
+        sequence_no=int(row.sequence_no or 0),
+        item_name="",
+        batch_no=int(row.batch_no or 0),
+        status=str(row.status or "unknown"),
+        status_label=_batch_status_label(str(row.status or "unknown")),
+        function_count=max(0, int(row.function_count or 0)),
+        total_size_bytes=max(0, int(row.total_size_bytes or 0)),
+        attempt_count=max(0, int(row.attempt_count or 0)),
+        current_attempt_no=row.current_attempt_no,
+        current_function=row.current_function,
+        review_count=max(0, int(row.review_count or 0)),
+        session_count=max(0, int(row.session_count or 0)),
+        has_source_output=bool(row.has_source_output),
+        has_disasm_context=bool(row.has_disasm_context),
+        latest_verdict=row.latest_verdict,
+        latest_verdict_label=row.latest_verdict_label,
+        started_at=_safe_iso(_ensure_local_datetime(row.started_at)),
+        finished_at=_safe_iso(_ensure_local_datetime(row.finished_at)),
+        duration_ms=row.duration_ms,
+        last_event_at=_safe_iso(_ensure_local_datetime(row.last_event_at)),
+        warnings=list(row.warnings or []),
+    )
+
+
 def _row_last_event_at(
     item: B2STaskItem,
     batch: AdvancedBatch | None,
@@ -4603,13 +4842,27 @@ def build_task_observability_summary(items: list[B2STaskItem]) -> TaskObservabil
     quality_scores: list[int] = []
     risk_distribution: dict[str, int] = {}
     overall_progress = build_overall_progress(items)
+    db = get_db_session()
+    try:
+        persisted_rows = (
+            db.query(B2STaskBatch)
+            .filter(B2STaskBatch.task_id == items[0].task_id if items else "")
+            .order_by(B2STaskBatch.sequence_no.asc(), B2STaskBatch.batch_no.asc())
+            .all()
+        ) if items else []
+    finally:
+        db.close()
+    persisted_by_item: dict[str, dict[int, B2STaskBatch]] = {}
+    for persisted in persisted_rows:
+        persisted_by_item.setdefault(persisted.item_id, {})[int(persisted.batch_no or 0)] = persisted
     for item in items:
         advanced = build_task_item_advanced(item, include_content=False)
         analytics = _task_level_review_analytics(item, advanced)
         duration_ms = _item_duration_ms(item)
         if duration_ms is not None:
             durations.append(duration_ms)
-        batch_count = _count_item_batches(advanced)
+        persisted_for_item = persisted_by_item.get(item.id, {})
+        batch_count = len(persisted_for_item)
         session_count = _count_item_sessions(advanced)
         attempt_count = int(analytics.summary.attempt_count or analytics.summary.attempts or 0)
         total_batches += batch_count
@@ -4628,33 +4881,27 @@ def build_task_observability_summary(items: list[B2STaskItem]) -> TaskObservabil
         run_dir = _latest_run_dir(item)
         manifest_batches = _parse_batch_manifest(run_dir)
         result_batches = _parse_results_manifest(run_dir)
-        runtime_batches, runtime_updated_at = _parse_runtime_batch_summary(item)
         session_map: dict[int, list[AdvancedFile]] = {}
+        batch_map: dict[int, AdvancedBatch] = {}
         for run in advanced.runs:
+            for batch in run.batches:
+                if batch.batch_no is not None:
+                    batch_map[int(batch.batch_no)] = batch
             for session in run.agent_sessions:
                 if session.batch_no is None:
                     continue
                 session_map.setdefault(int(session.batch_no), []).append(session)
-        batch_nos = {
-            *(int(batch.batch_no or 0) for run in advanced.runs for batch in run.batches if batch.batch_no is not None),
-            *manifest_batches.keys(),
-            *result_batches.keys(),
-            *runtime_batches.keys(),
-            *session_map.keys(),
-        }
-        current_batch = _safe_int((item.progress or {}).get("current_batch"))
-        if current_batch is not None:
-            batch_nos.add(current_batch)
-        for batch_no in sorted(no for no in batch_nos if no > 0):
-            batch_rows.append(_build_batch_observability_row(
-                item,
-                item_name=item_name,
-                advanced=advanced,
-                batch_no=batch_no,
+        for batch_no in sorted(no for no in persisted_for_item.keys() if no > 0):
+            persisted_row = persisted_for_item[batch_no]
+            materialized = _batch_row_from_model(persisted_row).model_copy(update={
+                "item_name": item_name,
+                "sequence_no": item.sequence_no,
+            })
+            batch_rows.append(_merge_batch_row_display_fields(
+                materialized,
                 manifest_row=manifest_batches.get(batch_no),
                 result_row=result_batches.get(batch_no),
-                runtime_row=runtime_batches.get(batch_no),
-                runtime_updated_at=runtime_updated_at,
+                batch=batch_map.get(batch_no),
                 sessions=session_map.get(batch_no, []),
             ))
         rows.append(TaskObservabilityItem(

@@ -109,6 +109,49 @@ class B2STaskItem(Base):
         self.progress_json = json.dumps(value or {}, ensure_ascii=False)
 
 
+class B2STaskBatch(Base):
+    __tablename__ = "secflow_b2s_task_batch"
+    __table_args__ = (
+        UniqueConstraint("task_id", "item_id", "batch_no", name="uq_secflow_b2s_task_batch_task_item_batch"),
+    )
+
+    id = Column(String(32), primary_key=True)
+    task_id = Column(String(32), nullable=False, index=True)
+    project_id = Column(String(64), nullable=False, index=True)
+    item_id = Column(String(32), nullable=False, index=True)
+    sequence_no = Column(Integer, nullable=False, index=True)
+    batch_no = Column(Integer, nullable=False, index=True)
+    status = Column(String(32), nullable=False, default="pending", index=True)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    current_attempt_no = Column(Integer, nullable=True)
+    current_function = Column(String(255), nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    last_event_at = Column(DateTime, nullable=True, index=True)
+    duration_ms = Column(Integer, nullable=True)
+    function_count = Column(Integer, nullable=False, default=0)
+    total_size_bytes = Column(BigInteger, nullable=False, default=0)
+    completed_at_progress_count = Column(Integer, nullable=True)
+    latest_event_type = Column(String(64), nullable=True, index=True)
+    latest_verdict = Column(String(16), nullable=True)
+    latest_verdict_label = Column(String(32), nullable=True)
+    has_source_output = Column(Integer, nullable=False, default=0)
+    has_disasm_context = Column(Integer, nullable=False, default=0)
+    review_count = Column(Integer, nullable=False, default=0)
+    session_count = Column(Integer, nullable=False, default=0)
+    warnings_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=now_local, nullable=False)
+    updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
+
+    @property
+    def warnings(self) -> list[str]:
+        return _loads(self.warnings_json, [])
+
+    @warnings.setter
+    def warnings(self, value: list[str] | None) -> None:
+        self.warnings_json = json.dumps(value or [], ensure_ascii=False)
+
+
 class B2SDispatchLease(Base):
     __tablename__ = "secflow_b2s_dispatch_lease"
 
@@ -234,6 +277,7 @@ def init_database() -> None:
     _ensure_task_item_progress_columns(engine)
     _ensure_task_origin_columns(engine)
     _ensure_analysis_cache_columns(engine)
+    _ensure_task_batch_table(engine)
 
 
 def _ensure_task_item_progress_columns(engine) -> None:
@@ -316,6 +360,51 @@ def _ensure_analysis_cache_columns(engine) -> None:
             statements.append(f"ALTER TABLE {table_name} MODIFY COLUMN cache_key VARCHAR(80) NOT NULL")
     with engine.begin() as conn:
         for statement in statements:
+            conn.exec_driver_sql(statement)
+
+
+def _ensure_task_batch_table(engine) -> None:
+    table_name = B2STaskBatch.__tablename__
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    if table_name not in tables:
+        B2STaskBatch.__table__.create(bind=engine, checkfirst=True)
+        inspector = inspect(engine)
+    columns = {column["name"] for column in inspector.get_columns(table_name)}
+    statements: list[str] = []
+    if "completed_at_progress_count" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN completed_at_progress_count INTEGER NULL")
+    if "latest_event_type" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN latest_event_type VARCHAR(64) NULL")
+    if "latest_verdict" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN latest_verdict VARCHAR(16) NULL")
+    if "latest_verdict_label" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN latest_verdict_label VARCHAR(32) NULL")
+    if "has_source_output" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN has_source_output INTEGER NOT NULL DEFAULT 0")
+    if "has_disasm_context" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN has_disasm_context INTEGER NOT NULL DEFAULT 0")
+    if "review_count" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN review_count INTEGER NOT NULL DEFAULT 0")
+    if "session_count" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN session_count INTEGER NOT NULL DEFAULT 0")
+    if "warnings_json" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN warnings_json TEXT NULL")
+    with engine.begin() as conn:
+        for statement in statements:
+            conn.exec_driver_sql(statement)
+    indexes = {index["name"] for index in inspect(engine).get_indexes(table_name)}
+    index_statements: list[str] = []
+    if "ix_b2s_task_batch_task_sequence_batch" not in indexes:
+        index_statements.append(
+            f"CREATE INDEX ix_b2s_task_batch_task_sequence_batch ON {table_name} (task_id, sequence_no, batch_no)"
+        )
+    if "ix_b2s_task_batch_project_task_status" not in indexes:
+        index_statements.append(
+            f"CREATE INDEX ix_b2s_task_batch_project_task_status ON {table_name} (project_id, task_id, status)"
+        )
+    with engine.begin() as conn:
+        for statement in index_statements:
             conn.exec_driver_sql(statement)
 
 

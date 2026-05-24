@@ -87,6 +87,22 @@ class ResultKindSummaryTests(unittest.TestCase):
             self.assertTrue(row.artifact_index_path)
             self.assertEqual(1, row.result_summary_version)
 
+    def test_ida_outputs_are_intermediate_not_final_results(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "main_ida.c").write_text("int ida_main(void){return 0;}\n", encoding="utf-8")
+            (root / "main.c").write_text("int main(void){return 0;}\n", encoding="utf-8")
+
+            artifacts = build_task_item_artifacts(_item(item_id="item-4", output_dir=str(root)))
+
+            self.assertEqual("recovered_source", artifacts.primary_result_kind)
+            self.assertEqual(1, artifacts.result_kind_summary["recovered_source"])
+            self.assertNotIn("batch_intermediate", artifacts.result_kinds)
+            self.assertEqual(1, artifacts.artifact_summary["ida_intermediate"])
+            index_payload = json.loads(Path(artifacts.artifact_index_path).read_text(encoding="utf-8"))
+            ida_rows = [row for row in index_payload["artifacts"] if row.get("kind") == "ida_intermediate"]
+            self.assertEqual(1, len(ida_rows))
+
 
 if __name__ == "__main__":
     unittest.main()
