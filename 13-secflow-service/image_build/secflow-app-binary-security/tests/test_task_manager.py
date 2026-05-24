@@ -8332,6 +8332,96 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("ipsec", rows[0]["module_name"])
         self.assertEqual(rows, task.summary["b2s_results"])
 
+    def test_entry_analysis_inputs_for_binary_module_prefers_stage_item_rebuild_over_stale_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive_root = Path(tmp) / "archive"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            (archive_root / "libipsec.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+            (archive_root / "libipsec.h").write_text("#pragma once\n", encoding="utf-8")
+            module_dir = archive_root / "modules" / "IPSEC"
+            module_dir.mkdir(parents=True, exist_ok=True)
+            files_list = module_dir / "files.list"
+            files_list.write_text("libipsec.c\nlibipsec.h\n", encoding="utf-8")
+
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="module-task",
+                task_type=TASK_TYPE_BINARY_MODULE,
+                status="running",
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root="/o",
+                workspace_root="/w",
+            )
+            task.summary = {
+                "b2s_results": [
+                    {
+                        "module_key": "IPSEC",
+                        "module_name": "IPSEC",
+                        "firmware_key": "module-input",
+                        "source_dir": "/stale/input",
+                        "source_root": "/stale/input",
+                        "module_dir": "/stale/input",
+                        "files_list": "/stale/input/module-files.list",
+                        "entry_descriptor_root": None,
+                        "entry_files_list": None,
+                        "entry_descriptor_ready": False,
+                    }
+                ]
+            }
+            item = BinarySecurityStageItem(
+                id="si1",
+                task_id="t1",
+                project_id="p1",
+                stage_run_id="sr1",
+                stage_name="binary_to_source",
+                item_key="IPSEC",
+                item_name="IPSEC",
+                parent_key="module-input",
+                status="success",
+            )
+            item.input_ref = {
+                "module_key": "IPSEC",
+                "module_name": "IPSEC",
+                "firmware_key": "module-input",
+                "source_dir": "/stale/input",
+                "source_root": "/stale/input",
+                "module_dir": "/stale/input",
+                "files_list": "/stale/input/module-files.list",
+            }
+            item.output_ref = {
+                "archive_root": str(archive_root),
+                "source_dir": str(archive_root),
+                "entry_descriptor_root": str(archive_root),
+                "entry_files_list": str(files_list),
+                "entry_module_name": "IPSEC",
+                "entry_descriptor_ready": True,
+            }
+            item.result = {
+                "module_key": "IPSEC",
+                "module_name": "IPSEC",
+                "firmware_key": "module-input",
+                "source_dir": str(archive_root),
+                "source_root": str(archive_root),
+                "module_dir": str(module_dir),
+                "files_list": str(files_list),
+                "entry_descriptor_root": str(archive_root),
+                "entry_files_list": str(files_list),
+                "entry_module_name": "IPSEC",
+                "entry_descriptor_ready": True,
+            }
+            db = _ModelAwareDb(tasks=[task], stage_items=[item])
+
+            rows = self.manager._entry_analysis_inputs(db, task)
+
+            self.assertEqual(1, len(rows))
+            self.assertEqual(str(archive_root), rows[0]["source_dir"])
+            self.assertEqual(str(archive_root), rows[0]["source_root"])
+            self.assertEqual(str(files_list), rows[0]["entry_files_list"])
+            self.assertTrue(rows[0]["entry_descriptor_ready"])
+            self.assertEqual(rows, task.summary["b2s_results"])
+
     def test_prepare_entry_module_descriptor_creates_files_list_for_binary_module(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact_root = Path(tmp)

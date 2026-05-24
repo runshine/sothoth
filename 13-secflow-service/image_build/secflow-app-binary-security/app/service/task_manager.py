@@ -13403,7 +13403,20 @@ class TaskManager:
     def _entry_analysis_inputs(self, db: Session, task: BinarySecurityTask) -> list[dict[str, Any]]:
         if self._task_type(task) == TASK_TYPE_SOURCE:
             return list(task.summary.get("selected_modules") or [])
+        summary_b2s_results = list(task.summary.get("b2s_results") or [])
+        if self._task_type(task) == TASK_TYPE_BINARY_MODULE:
+            rebuilt = self._rebuild_summary_results_from_stage_items(db, task, "binary_to_source", "b2s_results")
+            normalized = [self._normalize_entry_analysis_module_input(task, module) for module in (rebuilt or []) if isinstance(module, dict)]
+            if normalized and normalized != rebuilt:
+                task.summary = {**(task.summary or {}), "b2s_results": normalized}
+            ready = [module for module in normalized if module.get("entry_descriptor_ready")]
+            if ready:
+                return ready
+            if normalized:
+                return normalized
         b2s_results = list(task.summary.get("b2s_results") or [])
+        if not b2s_results and summary_b2s_results:
+            b2s_results = summary_b2s_results
         if b2s_results:
             normalized = [self._normalize_entry_analysis_module_input(task, module) for module in b2s_results if isinstance(module, dict)]
             if normalized != b2s_results:
