@@ -53,7 +53,7 @@ spec:
           value: '5'
         - name: WORKER_ISOLATION_MODE
           value: none
-        image: ghcr.io/runshine/secflow-app-entry-analyse:latest
+        image: ghcr.io/runshine/secflow-app-entry-analyse:20260524-6f0cb90
         imagePullPolicy: Always
         name: secflow-app-entry-analyse-scheduler
         resources:
@@ -84,4 +84,3 @@ spec:
       - name: secflow-platform-fileserver-data-nfs-pvc
         persistentVolumeClaim:
           claimName: secflow-platform-fileserver-data-nfs-pvc
-

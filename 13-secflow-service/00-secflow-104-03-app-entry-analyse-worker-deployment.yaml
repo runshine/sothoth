@@ -58,7 +58,7 @@ spec:
             fieldRef:
               apiVersion: v1
               fieldPath: status.podIP
-        image: ghcr.io/runshine/secflow-app-entry-analyse:latest
+        image: ghcr.io/runshine/secflow-app-entry-analyse:20260524-6f0cb90
         imagePullPolicy: Always
         name: secflow-app-entry-analyse-worker
         resources:
@@ -96,4 +96,3 @@ spec:
       - name: secflow-platform-fileserver-data-nfs-pvc
         persistentVolumeClaim:
           claimName: secflow-platform-fileserver-data-nfs-pvc
-
