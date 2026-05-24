@@ -3704,6 +3704,14 @@ class TaskManager:
                 payload={"action": action, "target_stage": target_stage, "state_event_id": event.id},
             )
             return
+        if expected_operation_token:
+            now_value = _now()
+            task.operation_lock_owner = task.operation_lock_owner or self.instance_id
+            task.operation_lock_token = expected_operation_token
+            task.operation_lock_type = action
+            task.operation_lock_acquired_at = task.operation_lock_acquired_at or now_value
+            task.operation_lock_heartbeat_at = now_value
+            task.operation_lock_expires_at = self._task_operation_lock_expires_at(now_value=now_value)
         self._invalidate_task_execution(task)
         task.status = preparing_status
         task.pending_action = action

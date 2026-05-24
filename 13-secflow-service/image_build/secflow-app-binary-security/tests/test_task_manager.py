@@ -5651,6 +5651,49 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("retry_stage_full", task.pending_action)
             enqueue_action.assert_not_called()
 
+    def test_apply_blocking_action_request_restores_operation_lock_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="binary",
+                status="failed",
+                task_type=TASK_TYPE_BINARY,
+                current_stage="binary_to_source",
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            event = BinarySecurityStateEvent(
+                id="evt1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="binary_to_source",
+                event_type="manual_blocking_action_requested",
+                status="leased",
+                payload={
+                    "action": "retry_stage_full",
+                    "preparing_status": "retry_preparing",
+                    "target_stage": "binary_to_source",
+                    "message": "accepted",
+                    "operation_token": "op-restore-1",
+                },
+            )
+            db = _ModelAwareDb(tasks=[task])
+
+            self.manager._apply_blocking_action_request_locked(db, event)
+
+            self.assertEqual("retry_preparing", task.status)
+            self.assertEqual("retry_stage_full", task.pending_action)
+            self.assertEqual("op-restore-1", task.operation_lock_token)
+            self.assertEqual("retry_stage_full", task.operation_lock_type)
+            self.assertEqual(self.manager.instance_id, task.operation_lock_owner)
+            self.assertIsNotNone(task.operation_lock_acquired_at)
+            self.assertIsNotNone(task.operation_lock_heartbeat_at)
+            self.assertIsNotNone(task.operation_lock_expires_at)
+
     def test_retry_task_clears_stage_output_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
