@@ -8702,6 +8702,115 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(str(module_dir), normalized["module_dir"])
             self.assertEqual(str(files_list), normalized["files_list"])
 
+    def test_run_entry_item_retry_uses_normalized_descriptor_input_ref(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            archive_root = root / "archive"
+            module_dir = archive_root / "modules" / "IPSEC"
+            module_dir.mkdir(parents=True)
+            source_file = archive_root / "src" / "ipsec.c"
+            source_file.parent.mkdir(parents=True)
+            source_file.write_text("int ipsec(void) { return 0; }\n", encoding="utf-8")
+            files_list = module_dir / "files.list"
+            files_list.write_text("src/ipsec.c\n", encoding="utf-8")
+
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="module-task",
+                task_type=TASK_TYPE_BINARY_MODULE,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(root / "output"),
+                workspace_root=str(root / "workspace"),
+                status="running",
+            )
+            task.policy = {}
+            stage_run = BinarySecurityStageRun(
+                id="sr-entry",
+                task_id="t1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="running",
+            )
+            existing = BinarySecurityStageItem(
+                id="si-entry",
+                task_id="t1",
+                project_id="p1",
+                stage_run_id="sr-entry",
+                stage_name="entry_analysis",
+                item_key="IPSEC",
+                item_name="IPSEC",
+                parent_key="module-input",
+                item_identity_key="IPSEC::module-input",
+                status="failed",
+                downstream_service="entry_analyse",
+                downstream_task_id="eat-old",
+            )
+            existing.input_ref = {
+                "module_key": "IPSEC",
+                "module_name": "IPSEC",
+                "firmware_key": "module-input",
+                "firmware_name": "IPSEC",
+                "source_dir": str(input_root),
+                "source_root": str(input_root),
+                "module_dir": str(input_root),
+                "entry_descriptor_root": str(input_root),
+                "entry_files_list": str(input_root / "modules" / "IPSEC" / "files.list"),
+                "entry_descriptor_ready": False,
+            }
+            db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[existing])
+
+            module = {
+                "module_key": "IPSEC",
+                "module_name": "IPSEC",
+                "firmware_key": "module-input",
+                "firmware_name": "IPSEC",
+                "source_dir": str(input_root),
+                "source_root": str(input_root),
+                "module_dir": str(input_root),
+                "archive_root": str(archive_root),
+                "entry_descriptor_root": str(input_root),
+                "entry_files_list": str(input_root / "modules" / "IPSEC" / "files.list"),
+                "entry_descriptor_ready": False,
+            }
+
+            captured: dict[str, object] = {}
+
+            def fake_upsert_stage_item(*args, **kwargs):
+                captured["input_ref"] = dict(kwargs.get("input_ref") or {})
+                return existing
+
+            async def fake_active_payload(*args, **kwargs):
+                raise RuntimeError("stop after capture")
+
+            original_upsert_stage_item = self.manager._upsert_stage_item
+            original_active_payload = self.manager._active_downstream_payload
+            try:
+                self.manager._upsert_stage_item = fake_upsert_stage_item
+                self.manager._active_downstream_payload = fake_active_payload
+
+                asyncio.run(
+                    self.manager._run_entry_item(
+                        task,
+                        stage_run,
+                        module,
+                        token=None,
+                        retrying=True,
+                    )
+                )
+            finally:
+                self.manager._upsert_stage_item = original_upsert_stage_item
+                self.manager._active_downstream_payload = original_active_payload
+
+            self.assertEqual(str(archive_root), captured["input_ref"]["entry_descriptor_root"])
+            self.assertEqual(str(archive_root), captured["input_ref"]["source_dir"])
+            self.assertEqual(str(archive_root), captured["input_ref"]["source_root"])
+            self.assertEqual(str(files_list), captured["input_ref"]["entry_files_list"])
+            self.assertTrue(captured["input_ref"]["entry_descriptor_ready"])
+
     def test_rebuild_entry_results_restores_source_dir_from_definition_file(self):
         task = BinarySecurityTask(
             id="t1",

@@ -14044,7 +14044,7 @@ class TaskManager:
                 item_name=module["module_name"],
                 parent_key=module["firmware_key"],
                 downstream_service="entry_analyse",
-                input_ref=module,
+                input_ref=entry_input,
                 retrying=retrying,
             )
             session.commit()
