@@ -690,6 +690,63 @@ class TaskManagerTests(unittest.TestCase):
         self.assertTrue(any(run.stage_name == "entry_analysis" for run in db.stage_runs))
         self.assertTrue(any(event.event_type == "streaming_entry_item_seeded" for event in db.events))
 
+    def test_trigger_entry_items_from_b2s_result_rebuilds_descriptor_for_binary_task(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_root = Path(tmp)
+            (artifact_root / "libvnfcadapt_ppc_rtos.c").write_text("int a(void) { return 0; }\n", encoding="utf-8")
+            (artifact_root / "libvnfcadapt_ppc_rtos.h").write_text("#pragma once\n", encoding="utf-8")
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="demo",
+                status="running",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root="/o",
+                workspace_root="/tmp/ws",
+                policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+            )
+            upstream_item = BinarySecurityStageItem(
+                id="si-b2s",
+                task_id="t1",
+                project_id="p1",
+                stage_run_id="sr-b2s",
+                stage_name="binary_to_source",
+                item_key="module-1",
+                item_name="sdn_nfv",
+                parent_key="fw-1",
+                item_identity_key="module-1::fw-1",
+                status="success",
+                downstream_service="binary_to_source",
+            )
+            db = _AppendingModelAwareDb(tasks=[task], stage_items=[])
+
+            seeded = self.manager._trigger_entry_items_from_b2s_result(
+                db,
+                task,
+                {
+                    "module_key": "module-1",
+                    "module_name": "sdn_nfv",
+                    "firmware_key": "fw-1",
+                    "source_dir": str(artifact_root),
+                    "source_root": str(artifact_root),
+                    "files_list": "/tmp/original-module/files.list",
+                },
+                upstream_item=upstream_item,
+            )
+
+            self.assertIsNotNone(seeded)
+            self.assertEqual(str(artifact_root), seeded.input_ref["source_dir"])
+            self.assertEqual(str(artifact_root), seeded.input_ref["source_root"])
+            files_list = Path(seeded.input_ref["entry_files_list"])
+            self.assertTrue(files_list.is_file())
+            self.assertEqual(
+                ["libvnfcadapt_ppc_rtos.c", "libvnfcadapt_ppc_rtos.h"],
+                files_list.read_text(encoding="utf-8").splitlines(),
+            )
+
     def test_trigger_dataflow_items_from_entry_result_creates_pending_dataflow_items_in_streaming_mode(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         task = BinarySecurityTask(
@@ -3518,6 +3575,44 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("partial_success", task.status)
         self.assertIsNotNone(task.finished_at)
         self.assertTrue(any(isinstance(obj, BinarySecurityEvent) for obj in db.added))
+
+    def test_finalize_task_defers_failure_when_streaming_upstream_still_active(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        db = _ModelAwareDb(
+            tasks=[task],
+            stage_runs=[
+                BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="firmware_unpack", sequence_no=1, status="success"),
+                BinarySecurityStageRun(id="sr2", task_id="t1", project_id="p1", stage_name="system_analysis", sequence_no=2, status="success"),
+                BinarySecurityStageRun(id="sr3", task_id="t1", project_id="p1", stage_name="binary_to_source", sequence_no=3, status="running"),
+                BinarySecurityStageRun(id="sr4", task_id="t1", project_id="p1", stage_name="entry_analysis", sequence_no=4, status="failed"),
+            ],
+        )
+
+        self.manager._finalize_task(db, task)
+
+        self.assertEqual("running", task.status)
+        self.assertEqual("binary_to_source", task.current_stage)
+        self.assertIsNone(task.finished_at)
+        self.assertIsNone(task.latest_abnormal_reason)
+        self.assertTrue(
+            any(
+                isinstance(obj, BinarySecurityEvent) and obj.event_type == "task_finalize_deferred_for_streaming_upstream"
+                for obj in db.added
+            )
+        )
 
     def test_finalize_task_does_not_mark_success_when_enabled_stage_missing(self):
         task = BinarySecurityTask(

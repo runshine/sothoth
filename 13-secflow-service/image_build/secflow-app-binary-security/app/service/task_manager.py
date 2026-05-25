@@ -7039,6 +7039,27 @@ class TaskManager:
             return
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
         vuln_run = next((run for run in stage_runs if run.stage_name == "vuln_scan"), None)
+        has_active_streaming_upstream, active_streaming_stage, active_streaming_status = self._streaming_has_active_upstream_stage(task, stage_runs)
+        if has_active_streaming_upstream:
+            task.status = "running" if active_streaming_status in {"running", "dispatching", "applying"} else "pending"
+            task.current_stage = active_streaming_stage
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.lease_expires_at = None
+            task.finished_at = None
+            task.last_error = None
+            self._last_task_heartbeat_at.pop(task.id, None)
+            self._record_event(
+                db,
+                task,
+                "task_finalize_deferred_for_streaming_upstream",
+                f"深度模式下仍有上游阶段活跃，延迟任务收口: {active_streaming_stage}",
+                level="info",
+                stage_name=active_streaming_stage,
+                payload={"stage_status": active_streaming_status},
+            )
+            self._sync_task_abnormal_reason_snapshot(db, task, None)
+            return
         next_stage = self._next_incomplete_stage(db, task)
         if next_stage:
             if vuln_run and vuln_run.status in {"success", "partial_success"}:
@@ -7889,6 +7910,28 @@ class TaskManager:
     def _is_streaming_tail_stage(self, task: BinarySecurityTask, stage_name: str | None) -> bool:
         normalized = str(stage_name or "").strip()
         return bool(normalized) and normalized in self._streaming_tail_stage_names(task)
+
+    def _streaming_has_active_upstream_stage(
+        self,
+        task: BinarySecurityTask,
+        stage_runs: list[BinarySecurityStageRun],
+    ) -> tuple[bool, str | None, str | None]:
+        if not self._streaming_mode_enabled(task):
+            return False, None, None
+        active_statuses = {"pending", "queued", "running", "dispatching", "applying"}
+        runs_by_stage = {run.stage_name: run for run in stage_runs}
+        for stage_name in self._stage_sequence_for_task(task):
+            if not self._stage_enabled(task, stage_name):
+                continue
+            if self._is_streaming_tail_stage(task, stage_name):
+                continue
+            run = runs_by_stage.get(stage_name)
+            if run is None:
+                return True, stage_name, "pending"
+            normalized_status = self._normalize_downstream_status(run.status) or str(run.status or "").strip()
+            if normalized_status in active_statuses:
+                return True, stage_name, normalized_status
+        return False, None, None
 
     def _is_streaming_active_item_status(self, status: str | None) -> bool:
         normalized = self._normalize_downstream_status(status) or str(status or "").strip()
@@ -14597,7 +14640,7 @@ class TaskManager:
 
     def _normalize_entry_analysis_module_input(self, task: BinarySecurityTask, module: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(module)
-        if self._task_type(task) != TASK_TYPE_BINARY_MODULE:
+        if self._task_type(task) not in {TASK_TYPE_BINARY_MODULE, TASK_TYPE_BINARY}:
             return normalized
         entry_descriptor_root = str(normalized.get("entry_descriptor_root") or "").strip()
         entry_files_list = str(normalized.get("entry_files_list") or "").strip()
