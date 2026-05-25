@@ -8908,6 +8908,65 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(str(files_list), captured["input_ref"]["entry_files_list"])
             self.assertTrue(captured["input_ref"]["entry_descriptor_ready"])
 
+    def test_compact_b2s_summary_item_keeps_binary_module_archive_contract(self):
+        row = self.manager._compact_b2s_summary_item(
+            {
+                "firmware_key": "module-input",
+                "firmware_name": "IPSEC",
+                "task_type": TASK_TYPE_BINARY_MODULE,
+                "module_key": "IPSEC",
+                "module_name": "IPSEC",
+                "module_dir": "/task/input",
+                "source_dir": "/task/output/binary-to-source/IPSEC__task-1",
+                "source_root": "/task/output/binary-to-source/IPSEC__task-1",
+                "artifact_root": "/task/output/binary-to-source/IPSEC__task-1",
+                "archive_root": "/task/output/binary-to-source/IPSEC__task-1",
+                "descriptor_root": "/task/output/binary-to-source/IPSEC__task-1",
+                "files_list_path": "/task/output/binary-to-source/IPSEC__task-1/modules/IPSEC/files.list",
+                "entry_module_name": "IPSEC",
+                "entry_descriptor_root": "/task/output/binary-to-source/IPSEC__task-1",
+                "entry_files_list": "/task/output/binary-to-source/IPSEC__task-1/modules/IPSEC/files.list",
+                "entry_descriptor_ready": True,
+                "artifact_index_path": "/task/output/binary-to-source/IPSEC__task-1/artifacts/index.json",
+                "result_summary_version": 1,
+            }
+        )
+
+        self.assertEqual("/task/output/binary-to-source/IPSEC__task-1", row["artifact_root"])
+        self.assertEqual("/task/output/binary-to-source/IPSEC__task-1", row["archive_root"])
+        self.assertEqual("/task/output/binary-to-source/IPSEC__task-1", row["descriptor_root"])
+        self.assertEqual(
+            "/task/output/binary-to-source/IPSEC__task-1/modules/IPSEC/files.list",
+            row["files_list_path"],
+        )
+        self.assertEqual(
+            "/task/output/binary-to-source/IPSEC__task-1/modules/IPSEC/files.list",
+            row["entry_files_list"],
+        )
+
+    def test_compact_b2s_summary_item_for_source_task_contract_remains_unchanged(self):
+        row = self.manager._compact_b2s_summary_item(
+            {
+                "firmware_key": "source_project",
+                "firmware_name": "source-project",
+                "task_type": TASK_TYPE_SOURCE,
+                "module_key": "network",
+                "module_name": "network",
+                "module_dir": "/task/system-analysis/modules/network",
+                "source_dir": "/task/input",
+                "source_root": "/task/input",
+                "files_list": "/task/system-analysis/modules/network/files.list",
+            }
+        )
+
+        self.assertEqual(TASK_TYPE_SOURCE, row["task_type"])
+        self.assertEqual("/task/input", row["source_dir"])
+        self.assertEqual("/task/input", row["source_root"])
+        self.assertIsNone(row["artifact_root"])
+        self.assertIsNone(row["archive_root"])
+        self.assertIsNone(row["descriptor_root"])
+        self.assertIsNone(row["entry_descriptor_root"])
+
     def test_rebuild_entry_results_restores_source_dir_from_definition_file(self):
         task = BinarySecurityTask(
             id="t1",
