@@ -27,6 +27,8 @@ spec:
             value: /data/files
           - name: WORKER_ISOLATION_MODE
             value: "none"
+          - name: EA_SESSION_INDEX_REFRESH_SECONDS
+            value: "60"
         ports:
         - containerPort: 8080
         volumeMounts:
@@ -37,11 +39,11 @@ spec:
           mountPath: /data
         resources:
           requests:
-            memory: "256Mi"
+            memory: "512Mi"
             cpu: "200m"
           limits:
-            memory: "1Gi"
-            cpu: "1000m"
+            memory: "4Gi"
+            cpu: "2000m"
         livenessProbe:
           httpGet:
             path: /api/app/entry-analyse/health
