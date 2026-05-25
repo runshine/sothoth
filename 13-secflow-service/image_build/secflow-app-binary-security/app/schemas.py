@@ -239,6 +239,7 @@ class BinarySecurityStageItemResponse(BaseModel):
     parent_key: Optional[str] = None
     status: str
     retry_count: int = 0
+    rerun_count: int = 0
     downstream_service: Optional[str] = None
     downstream_task_id: Optional[str] = None
     input_ref: dict[str, Any] = Field(default_factory=dict)

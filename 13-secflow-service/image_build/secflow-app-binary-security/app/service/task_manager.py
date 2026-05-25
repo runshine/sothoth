@@ -9209,6 +9209,7 @@ class TaskManager:
             parent_key=item.parent_key,
             status=item.status,
             retry_count=int(item.retry_count or 0),
+            rerun_count=int(item.retry_count or 0),
             downstream_service=item.downstream_service,
             downstream_task_id=item.downstream_task_id,
             input_ref=item.input_ref,
