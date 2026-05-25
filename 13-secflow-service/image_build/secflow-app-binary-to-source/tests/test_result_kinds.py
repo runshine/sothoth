@@ -143,16 +143,26 @@ class ResultKindSummaryTests(unittest.TestCase):
             (root / "main.c").write_text("int main(void){return 0;}\n", encoding="utf-8")
             ida_root = root / "main_ida.c"
             ida_root.write_text("int ida_main(void){return 0;}\n", encoding="utf-8")
+            legacy_work = root / ".re_work_libipsec"
+            legacy_work.mkdir(parents=True)
+            legacy_payload = legacy_work / "transient.c"
+            legacy_payload.write_text("int transient(void){return 0;}\n", encoding="utf-8")
             run_ida = root / "run" / "ida_cache" / "ida_export"
             run_ida.mkdir(parents=True)
             run_ida_file = run_ida / "decompiled.c"
             run_ida_file.write_text("int ida_cached(void){return 0;}\n", encoding="utf-8")
+            run_legacy = root / "run" / ".re_work_libipsec"
+            run_legacy.mkdir(parents=True)
+            run_legacy_file = run_legacy / "keep.txt"
+            run_legacy_file.write_text("keep\n", encoding="utf-8")
 
             removed = remove_ida_intermediate_outputs(root)
 
-            self.assertEqual([str(ida_root)], removed)
+            self.assertEqual(sorted([str(ida_root), str(legacy_work)]), sorted(removed))
             self.assertFalse(ida_root.exists())
+            self.assertFalse(legacy_work.exists())
             self.assertTrue(run_ida_file.exists())
+            self.assertTrue(run_legacy_file.exists())
 
 
 if __name__ == "__main__":

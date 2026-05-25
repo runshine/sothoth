@@ -118,6 +118,9 @@ def test_cache_hit_materialize_removes_ida_intermediates_and_filters_generated_f
     row = _make_cache_row(tmp_path, cache_key=cache_key, project_id="p1", task_id="t1", item_id="i1", hit_count=0)
     output_dir = Path(row.canonical_output_dir)
     (output_dir / "result_ida.c").write_text("int ida(void){return 0;}\n", encoding="utf-8")
+    legacy_dir = output_dir / ".re_work_libipsec"
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    (legacy_dir / "legacy.txt").write_text("legacy\n", encoding="utf-8")
     row.generated_files_json = json.dumps(["result.c", "result_ida.c"])
     session.add(row)
     session.commit()
@@ -141,6 +144,7 @@ def test_cache_hit_materialize_removes_ida_intermediates_and_filters_generated_f
     assert hit.hit is True
     assert item.generated_files == ["result.c"]
     assert not (item_output / "result_ida.c").exists()
+    assert not (item_output / ".re_work_libipsec").exists()
     assert "removed_ida_intermediate_outputs" in (item.extra_metadata or {})
 
 
@@ -156,8 +160,12 @@ def test_canonical_generated_files_excludes_ida_intermediates(db_session, monkey
     output_dir.mkdir(parents=True, exist_ok=True)
     result_c = output_dir / "result.c"
     ida_c = output_dir / "result_ida.c"
+    legacy_dir = output_dir / ".re_work_libipsec"
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    legacy_output = legacy_dir / "legacy.c"
     result_c.write_text("ok\n", encoding="utf-8")
     ida_c.write_text("ida\n", encoding="utf-8")
+    legacy_output.write_text("legacy\n", encoding="utf-8")
 
     item = B2STaskItem(
         id="item-store",
@@ -167,11 +175,46 @@ def test_canonical_generated_files_excludes_ida_intermediates(db_session, monkey
         elf_path="/tmp/a.elf",
         output_dir=str(output_dir),
         status="success",
-        generated_files=[str(result_c), str(ida_c)],
+        generated_files=[str(result_c), str(ida_c), str(legacy_output)],
     )
 
     mapped = service._canonical_generated_files(item, tmp_path / "cache" / "output")
     assert mapped == [str(tmp_path / "cache" / "output" / "result.c")]
+
+
+def test_remap_generated_files_ignores_legacy_re_work_entries(db_session, monkeypatch):
+    session, tmp_path = db_session
+    service = B2SCacheService()
+    monkeypatch.setattr(
+        "app.service.cache_service.get_config",
+        lambda: SimpleNamespace(cache=SimpleNamespace(enabled=True, root_dir=str(tmp_path), materialize_mode="copy")),
+    )
+
+    cache_key = f"{'f' * 64}_fast"
+    row = _make_cache_row(tmp_path, cache_key=cache_key, project_id="p1", task_id="t1", item_id="i1", hit_count=0)
+    row.generated_files_json = json.dumps(
+        [
+            str(Path(row.canonical_output_dir) / "result.c"),
+            str(Path(row.canonical_output_dir) / ".re_work_libipsec" / "legacy.c"),
+        ]
+    )
+    session.add(row)
+    session.commit()
+
+    item_output = tmp_path / "materialized-2" / "output"
+    item = B2STaskItem(
+        id="item-remap",
+        task_id="task-remap",
+        project_id="p1",
+        sequence_no=1,
+        elf_path="/tmp/a.elf",
+        output_dir=str(item_output),
+        status="success",
+        generated_files=[],
+    )
+
+    remapped = service._remap_generated_files(row, item)
+    assert remapped == [str(item_output / "result.c")]
 
 
 def test_delete_cache_entry_removes_directory_and_db_record(db_session, monkeypatch):

@@ -2776,27 +2776,43 @@ def _is_ida_intermediate_path(path: str | Path | None) -> bool:
     return "_ida." in name or name.endswith("_ida.c") or name.endswith("_ida.h")
 
 
+def _is_legacy_re_work_dir(path: str | Path | None) -> bool:
+    if not path:
+        return False
+    try:
+        name = Path(str(path)).name
+    except Exception:
+        return False
+    return name.startswith(".re_work_")
+
+
 def remove_ida_intermediate_outputs(output_dir: str | Path | None) -> list[str]:
     root = Path(str(output_dir or "")).expanduser()
     if not root.exists():
         return []
     removed: list[str] = []
     for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
         try:
             relative_parts = [part.lower() for part in path.relative_to(root).parts]
         except Exception:
             relative_parts = [part.lower() for part in path.parts]
         if "run" in relative_parts:
             continue
-        if not _is_ida_intermediate_path(path):
+        if path.is_dir():
+            if not _is_legacy_re_work_dir(path):
+                continue
+            try:
+                shutil.rmtree(path)
+                removed.append(str(path))
+            except FileNotFoundError:
+                continue
             continue
-        try:
-            path.unlink()
-            removed.append(str(path))
-        except FileNotFoundError:
-            continue
+        if path.is_file() and _is_ida_intermediate_path(path):
+            try:
+                path.unlink()
+                removed.append(str(path))
+            except FileNotFoundError:
+                continue
     return removed
 
 

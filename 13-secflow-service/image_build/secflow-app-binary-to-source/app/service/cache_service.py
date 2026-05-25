@@ -31,27 +31,43 @@ def _is_ida_intermediate_path(path: str | Path | None) -> bool:
     return "_ida." in name or name.endswith("_ida.c") or name.endswith("_ida.h")
 
 
+def _is_legacy_re_work_dir(path: str | Path | None) -> bool:
+    if not path:
+        return False
+    try:
+        name = Path(str(path)).name
+    except Exception:
+        return False
+    return name.startswith(".re_work_")
+
+
 def _remove_ida_intermediate_outputs(output_dir: str | Path | None) -> list[str]:
     root = Path(str(output_dir or "")).expanduser()
     if not root.exists():
         return []
     removed: list[str] = []
     for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
         try:
             relative_parts = [part.lower() for part in path.relative_to(root).parts]
         except Exception:
             relative_parts = [part.lower() for part in path.parts]
         if "run" in relative_parts:
             continue
-        if not _is_ida_intermediate_path(path):
+        if path.is_dir():
+            if not _is_legacy_re_work_dir(path):
+                continue
+            try:
+                shutil.rmtree(path)
+                removed.append(str(path))
+            except FileNotFoundError:
+                continue
             continue
-        try:
-            path.unlink()
-            removed.append(str(path))
-        except FileNotFoundError:
-            continue
+        if path.is_file() and _is_ida_intermediate_path(path):
+            try:
+                path.unlink()
+                removed.append(str(path))
+            except FileNotFoundError:
+                continue
     return removed
 
 
@@ -448,12 +464,15 @@ class B2SCacheService:
                 path = Path(raw).resolve()
                 if _is_ida_intermediate_path(path):
                     continue
+                if _is_legacy_re_work_dir(path.parent):
+                    continue
                 if path.is_relative_to(output_dir):
                     result.append(str(canonical_output / path.relative_to(output_dir)))
                 else:
                     result.append(raw)
             except Exception:
-                if not _is_ida_intermediate_path(raw):
+                raw_path = Path(str(raw))
+                if not _is_ida_intermediate_path(raw) and not _is_legacy_re_work_dir(raw_path.parent):
                     result.append(raw)
         return result
 
@@ -474,15 +493,25 @@ class B2SCacheService:
         result: list[str] = []
         for raw in self._loads(cache.generated_files_json, []):
             try:
-                path = self._normalize_legacy_cached_path(canonical_output, Path(str(raw)).resolve())
+                raw_path = Path(str(raw)).resolve()
+                try:
+                    raw_rel = raw_path.relative_to(canonical_output)
+                except Exception:
+                    raw_rel = None
+                if raw_rel and raw_rel.parts and raw_rel.parts[0].startswith(".re_work_"):
+                    continue
+                path = self._normalize_legacy_cached_path(canonical_output, raw_path)
                 if _is_ida_intermediate_path(path):
+                    continue
+                if _is_legacy_re_work_dir(path.parent):
                     continue
                 if path.is_relative_to(canonical_output):
                     result.append(str(item_output / path.relative_to(canonical_output)))
                 else:
                     result.append(str(raw))
             except Exception:
-                if not _is_ida_intermediate_path(raw):
+                raw_path = Path(str(raw))
+                if not _is_ida_intermediate_path(raw) and not _is_legacy_re_work_dir(raw_path.parent):
                     result.append(str(raw))
         return result
 
