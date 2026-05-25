@@ -99,9 +99,11 @@ class BinarySecurityTask(Base, JsonMixin):
     summary_json = Column(Text, nullable=True)
     metrics_json = Column(Text, nullable=True)
     stage_summary_json = Column(Text, nullable=True)
+    execution_epoch = Column(Integer, nullable=False, default=0)
     execution_mode = Column(String(32), nullable=True, index=True)
     target_stage_name = Column(String(64), nullable=True, index=True)
     pending_action = Column(String(32), nullable=True, index=True)
+    cleanup_snapshot_json = Column(Text, nullable=True)
     last_error = Column(Text, nullable=True)
     latest_abnormal_reason_json = Column(Text, nullable=True)
     operation_lock_owner = Column(String(128), nullable=True, index=True)
@@ -187,6 +189,14 @@ class BinarySecurityTask(Base, JsonMixin):
     @stage_summary.setter
     def stage_summary(self, value: dict[str, Any] | None) -> None:
         self.stage_summary_json = self._dump_json(value or {})
+
+    @property
+    def cleanup_snapshot(self) -> dict[str, Any]:
+        return self._load_json(self.cleanup_snapshot_json, {})
+
+    @cleanup_snapshot.setter
+    def cleanup_snapshot(self, value: dict[str, Any] | None) -> None:
+        self.cleanup_snapshot_json = self._dump_json(value or {})
 
     @property
     def latest_abnormal_reason(self) -> dict[str, Any] | None:
@@ -510,6 +520,14 @@ def _ensure_compat_columns(engine) -> None:
         if "pending_action" not in columns:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN pending_action VARCHAR(32) NULL"
+            )
+        if "execution_epoch" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN execution_epoch INTEGER NOT NULL DEFAULT 0"
+            )
+        if "cleanup_snapshot_json" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN cleanup_snapshot_json TEXT NULL"
             )
         if "operation_lock_owner" not in columns:
             statements.append(

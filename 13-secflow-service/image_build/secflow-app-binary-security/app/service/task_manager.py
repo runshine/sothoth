@@ -629,6 +629,7 @@ STAGE_RETRY_BLOCKED_TASK_STATUSES = {"pending", "dispatching", "running", "pendi
 TASK_STATUS_PENDING_MODULE_CONFIRMATION = "pending_module_confirmation"
 TASK_STATUS_CONTINUE_PREPARING = "continue_preparing"
 TASK_STATUS_RETRY_PREPARING = "retry_preparing"
+TASK_STATUS_HARD_RESTART_FAILED = "hard_restart_failed"
 TASK_PREPARING_STATUSES = {TASK_STATUS_CONTINUE_PREPARING, TASK_STATUS_RETRY_PREPARING}
 TASK_ACTION_CONTINUE = "continue"
 TASK_ACTION_RETRY = "retry"
@@ -955,6 +956,7 @@ class TaskManager:
             firmware_path=str(input_dir),
             output_root=str(output_root),
             workspace_root=str(workspace_root),
+            execution_epoch=0,
         )
         task.policy = policy
         task.summary = {
@@ -999,6 +1001,7 @@ class TaskManager:
             "failed_firmware_count": 0,
         }
         task.stage_summary = {}
+        task.cleanup_snapshot = {}
         db.add(task)
         db.commit()
         await self._write_task_metadata_async(task, metadata_path, status="pending_upload")
@@ -1217,6 +1220,7 @@ class TaskManager:
         ).all()
         queue_info = self._build_queue_info(db, project_id=project_id)
         base = self._task_response(db, task, queue_info=queue_info).model_dump()
+        base.pop("execution_epoch", None)
         stage_summaries = [BinarySecurityStageSummary(**summary) if isinstance(summary, dict) else summary for summary in base.get("stage_summaries", [])]
         archive_job_responses: list[BinarySecurityArchiveJobResponse] = []
         for job in archive_jobs:
@@ -1257,6 +1261,7 @@ class TaskManager:
         stage_item_responses = [self._stage_item_response(item) for item in items[:DETAIL_STAGE_ITEMS_LIMIT]]
         return BinarySecurityTaskDetailResponse(
             **base,
+            execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
             description=task.description,
             output_root=task.output_root,
             workspace_root=task.workspace_root,
@@ -1278,6 +1283,7 @@ class TaskManager:
                 items,
             ),
             orchestration_observability=self._build_orchestration_observability(db, task),
+            cleanup_snapshot=dict(task.cleanup_snapshot or {}),
         )
 
     def get_task_stage_items_page(
@@ -1952,23 +1958,8 @@ class TaskManager:
             raise
 
     async def _prepare_retry_task(self, db: Session, task: BinarySecurityTask) -> list[str]:
-        stage_sequence = self._stage_sequence_for_task(task)
-        first_stage = stage_sequence[0]
-        self._invalidate_task_execution(task)
-        downstream_refs = self._retry_downstream_refs_for_stages(db, task, stage_sequence)
-        if downstream_refs:
-            await self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token())
-        self._clear_stage_outputs_from(task, first_stage, mark_stale=False)
-        self._delete_archive_children_for_stages(db, task, stage_sequence)
-        self._delete_stage_items_for_stages(db, task.id, stage_sequence)
-        for current_stage in stage_sequence:
-            stage_run = db.query(BinarySecurityStageRun).filter(
-                BinarySecurityStageRun.task_id == task.id,
-                BinarySecurityStageRun.stage_name == current_stage,
-            ).first()
-            if stage_run:
-                self._reset_stage_run_for_retry(task, stage_run, increment_retry=True)
-        return stage_sequence
+        cleanup_snapshot = await self._prepare_hard_restart_task(db, task)
+        return list(cleanup_snapshot.get("stage_sequence") or self._stage_sequence_for_task(task))
 
     def _streaming_retry_descendant_stage_names(self, stage_name: str) -> list[str]:
         normalized = str(stage_name or "").strip()
@@ -2372,6 +2363,123 @@ class TaskManager:
         await self._cancel_downstream_refs(db, task, refs, token)
         await self._ensure_downstream_refs_inactive(db, task, refs, token)
         await self._delete_downstream_refs(db, task, refs, token)
+
+    def _delete_task_event_payload_dirs(self, task: BinarySecurityTask) -> None:
+        root = Path(task.workspace_root)
+        for folder_name in ("state-event-payloads", "timeline-event-payloads"):
+            target = root / folder_name
+            if not target.exists():
+                continue
+            try:
+                shutil.rmtree(target, ignore_errors=True)
+            except OSError as exc:
+                if exc.errno != errno.ESTALE:
+                    raise
+
+    def _delete_stage_run_rows(self, db: Session, task_id: str) -> int:
+        deleted = int(
+            db.query(BinarySecurityStageRun)
+            .filter(BinarySecurityStageRun.task_id == task_id)
+            .delete(synchronize_session=False)
+            or 0
+        )
+        if hasattr(db, "stage_runs") and isinstance(getattr(db, "stage_runs"), list):
+            db.stage_runs = [row for row in db.stage_runs if str(getattr(row, "task_id", "") or "").strip() != task_id]
+        return deleted
+
+    def _delete_task_timeline_rows(self, db: Session, task_id: str) -> int:
+        deleted = int(
+            db.query(BinarySecurityEvent)
+            .filter(BinarySecurityEvent.task_id == task_id)
+            .delete(synchronize_session=False)
+            or 0
+        )
+        if hasattr(db, "events") and isinstance(getattr(db, "events"), list):
+            db.events = [row for row in db.events if str(getattr(row, "task_id", "") or "").strip() != task_id]
+        return deleted
+
+    def _delete_task_state_event_rows(self, db: Session, task_id: str) -> int:
+        deleted = int(
+            db.query(BinarySecurityStateEvent)
+            .filter(BinarySecurityStateEvent.task_id == task_id)
+            .delete(synchronize_session=False)
+            or 0
+        )
+        if hasattr(db, "state_events") and isinstance(getattr(db, "state_events"), list):
+            db.state_events = [row for row in db.state_events if str(getattr(row, "task_id", "") or "").strip() != task_id]
+        return deleted
+
+    def _delete_workspace_runtime_children(self, task: BinarySecurityTask) -> None:
+        workspace_root = Path(task.workspace_root)
+        input_dir = workspace_root / "input"
+        keep_files = {"task-metadata.json"}
+        if input_dir.exists():
+            for child in input_dir.iterdir():
+                if child.name in keep_files:
+                    continue
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+        for folder_name in ("output", "run", "logs"):
+            target = workspace_root / folder_name
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=True)
+            ensure_dir(target)
+        ensure_dir(workspace_root / "run" / "upload-tmp")
+
+    def _validate_hard_restart_cleanup(self, db: Session, task: BinarySecurityTask) -> dict[str, int]:
+        if hasattr(db, "stage_items") and hasattr(db, "stage_runs") and hasattr(db, "archive_jobs") and hasattr(db, "events") and hasattr(db, "state_events"):
+            checks = {
+                "stage_item_count": len([row for row in db.stage_items if str(getattr(row, "task_id", "") or "").strip() == task.id]),
+                "stage_run_count": len([row for row in db.stage_runs if str(getattr(row, "task_id", "") or "").strip() == task.id]),
+                "archive_job_count": len([row for row in db.archive_jobs if str(getattr(row, "task_id", "") or "").strip() == task.id]),
+                "timeline_event_count": len([row for row in db.events if str(getattr(row, "task_id", "") or "").strip() == task.id]),
+                "state_event_count": len([row for row in db.state_events if str(getattr(row, "task_id", "") or "").strip() == task.id]),
+            }
+        else:
+            checks = {
+                "stage_item_count": int(db.query(func.count(BinarySecurityStageItem.id)).filter(BinarySecurityStageItem.task_id == task.id).scalar() or 0),
+                "stage_run_count": int(db.query(func.count(BinarySecurityStageRun.id)).filter(BinarySecurityStageRun.task_id == task.id).scalar() or 0),
+                "archive_job_count": int(db.query(func.count(BinarySecurityArchiveJob.id)).filter(BinarySecurityArchiveJob.task_id == task.id).scalar() or 0),
+                "timeline_event_count": int(db.query(func.count(BinarySecurityEvent.id)).filter(BinarySecurityEvent.task_id == task.id).scalar() or 0),
+                "state_event_count": int(db.query(func.count(BinarySecurityStateEvent.id)).filter(BinarySecurityStateEvent.task_id == task.id).scalar() or 0),
+            }
+        non_zero = {key: value for key, value in checks.items() if int(value or 0) > 0}
+        if non_zero:
+            raise ValidationError(f"硬重启清理未完成，仍有残留: {non_zero}")
+        return checks
+
+    async def _prepare_hard_restart_task(self, db: Session, task: BinarySecurityTask) -> dict[str, Any]:
+        stage_sequence = self._stage_sequence_for_task(task)
+        cleanup_snapshot: dict[str, Any] = {
+            "requested_at": _isoformat_or_none(_now()),
+            "previous_epoch": int(getattr(task, "execution_epoch", 0) or 0),
+            "stage_sequence": stage_sequence,
+            "downstream_refs": [],
+            "cleanup_counts": {},
+        }
+        self._invalidate_task_execution(task)
+        refs = self._dedupe_downstream_refs(
+            self._retry_downstream_refs_for_stages(db, task, stage_sequence)
+            + self._discover_parent_linked_downstream_refs(db, task)
+        )
+        cleanup_snapshot["downstream_refs"] = refs
+        if refs:
+            await self._cleanup_downstream_refs(db, task, refs, self._service_token())
+        self._clear_stage_outputs_from(task, stage_sequence[0], mark_stale=False)
+        cleanup_snapshot["cleanup_counts"]["archive_jobs_deleted"] = self._delete_archive_children_for_stages(db, task, stage_sequence)
+        cleanup_snapshot["cleanup_counts"]["stage_items_deleted"] = self._delete_stage_items_for_stages(db, task.id, stage_sequence)
+        cleanup_snapshot["cleanup_counts"]["stage_runs_deleted"] = self._delete_stage_run_rows(db, task.id)
+        self._delete_task_event_payload_dirs(task)
+        self._delete_workspace_runtime_children(task)
+        self._delete_task_summary_file(task)
+        cleanup_snapshot["cleanup_counts"]["timeline_events_deleted"] = self._delete_task_timeline_rows(db, task.id)
+        cleanup_snapshot["cleanup_counts"]["state_events_deleted"] = self._delete_task_state_event_rows(db, task.id)
+        task.cleanup_snapshot = cleanup_snapshot
+        self._validate_hard_restart_cleanup(db, task)
+        self._reset_task_for_hard_restart(task)
+        return cleanup_snapshot
 
     async def _seed_work_queues(self) -> None:
         session_factory = get_session_factory()
@@ -2974,6 +3082,16 @@ class TaskManager:
                     if attempt >= 2 or not self._is_retryable_lock_error(exc):
                         raise
                     db.rollback()
+        if hasattr(db, "archive_jobs") and isinstance(getattr(db, "archive_jobs"), list):
+            blocked_ids = set(normalized_item_ids)
+            db.archive_jobs = [
+                row for row in db.archive_jobs
+                if not (
+                    str(getattr(row, "task_id", "") or "").strip() == task_id
+                    and str(getattr(row, "stage_name", "") or "").strip() == stage_name
+                    and str(getattr(row, "item_id", "") or "").strip() in blocked_ids
+                )
+            ]
         return deleted
 
     def _clear_archive_jobs_for_stages(
@@ -3002,6 +3120,15 @@ class TaskManager:
                 .all()
             ]
             if not job_ids:
+                if hasattr(db, "archive_jobs") and isinstance(getattr(db, "archive_jobs"), list):
+                    allowed_stage_names = set(normalized)
+                    db.archive_jobs = [
+                        row for row in db.archive_jobs
+                        if not (
+                            str(getattr(row, "task_id", "") or "").strip() == task_id
+                            and str(getattr(row, "stage_name", "") or "").strip() in allowed_stage_names
+                        )
+                    ]
                 return deleted
             for attempt in range(max(1, int(max_retries))):
                 try:
@@ -4127,8 +4254,8 @@ class TaskManager:
                 affected_stages = stage_sequence
                 task.execution_mode = None
                 task.target_stage_name = None
-                requeued_message = f"任务已完成清理，将从第一阶段 {target_stage} 重新排队"
-                retry_semantics = "full_restart"
+                requeued_message = f"任务已完成严格清理，将从第一阶段 {target_stage} 重新排队"
+                retry_semantics = "hard_restart"
             elif action in {TASK_ACTION_RETRY_FAILED_ITEMS, TASK_ACTION_RETRY_STAGE_FAILED_ITEMS}:
                 if not target_stage:
                     raise ValidationError("失败项重试缺少目标阶段")
@@ -4187,12 +4314,12 @@ class TaskManager:
             if task is not None:
                 action = str(task.pending_action or "").strip()
                 target_stage = str(task.current_stage or "").strip() or None
-                task.status = "failed"
+                task.status = TASK_STATUS_HARD_RESTART_FAILED if action == TASK_ACTION_RETRY else "failed"
                 task.pending_action = None
                 task.last_error = str(exc)
                 task.finished_at = _now()
                 self._invalidate_task_execution(task)
-                await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="failed")
+                await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
                 self._record_event(
                     db,
                     task,
@@ -7612,6 +7739,15 @@ class TaskManager:
                 .all()
             ]
             if not item_ids:
+                if hasattr(db, "stage_items") and isinstance(getattr(db, "stage_items"), list):
+                    allowed_stage_names = set(normalized)
+                    db.stage_items = [
+                        row for row in db.stage_items
+                        if not (
+                            str(getattr(row, "task_id", "") or "").strip() == task_id
+                            and str(getattr(row, "stage_name", "") or "").strip() in allowed_stage_names
+                        )
+                    ]
                 return deleted
             for attempt in range(max(1, int(max_retries))):
                 try:
@@ -7628,7 +7764,6 @@ class TaskManager:
                     if not self._is_retryable_lock_error(exc) or attempt >= max(1, int(max_retries)) - 1:
                         raise
                     time.sleep(0.2 * (attempt + 1))
-
     def _delete_stage_items_by_ids(self, db: Session, item_ids: list[str]) -> int:
         normalized = [str(item_id or "").strip() for item_id in item_ids if str(item_id or "").strip()]
         if not normalized:
@@ -8812,6 +8947,7 @@ class TaskManager:
             task_type=self._task_type(task),
             name=task.name,
             status=task.status,
+            execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
             current_stage=task.current_stage,
             pending_action=task.pending_action,
             last_error=task.last_error,
@@ -11696,6 +11832,102 @@ class TaskManager:
         task.summary = summary
         task.metrics = metrics
         task.stage_summary = stage_summary
+
+    def _base_task_summary(
+        self,
+        task: BinarySecurityTask,
+        *,
+        input_files: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        existing_summary = dict(task.summary or {})
+        normalized_inputs = [dict(item) for item in (input_files if input_files is not None else existing_summary.get("input_files") or [])]
+        input_dir = Path(task.workspace_root) / "input"
+        run_dir = Path(task.workspace_root) / "run"
+        output_root = Path(task.output_root)
+        task_type = self._task_type(task)
+        summary = {
+            "fileserver_project_path": str(task.workspace_root),
+            "task_root_path": str(task.workspace_root),
+            "input_dir": str(input_dir),
+            "output_dir": str(output_root),
+            "run_dir": str(run_dir),
+            "temp_upload_dir": str(run_dir / "upload-tmp") if task_type == TASK_TYPE_SOURCE else None,
+            "input_manifest_path": str(input_dir / "task-metadata.json"),
+            "input_files": normalized_inputs,
+            "input_kind": (
+                "source_archives"
+                if task_type == TASK_TYPE_SOURCE
+                else "module_elf_files"
+                if task_type == TASK_TYPE_BINARY_MODULE
+                else "firmware_files"
+            ),
+            "module_input": (
+                {
+                    "module_name": str(existing_summary.get("module_input", {}).get("module_name") or task.name or "").strip(),
+                    "file_count": len(normalized_inputs),
+                }
+                if task_type == TASK_TYPE_BINARY_MODULE
+                else None
+            ),
+            "system_analysis_bypassed": task_type == TASK_TYPE_BINARY_MODULE,
+            "downstream_task_ids": {},
+            "system_analysis_modules": [],
+            "candidate_modules": [],
+            "selected_modules": [],
+            "execution_epoch": int(getattr(task, "execution_epoch", 0) or 0),
+        }
+        if task_type == TASK_TYPE_BINARY_MODULE:
+            module_input = existing_summary.get("module_input") or {}
+            module_name = str(module_input.get("module_name") or "").strip()
+            if module_name:
+                summary["module_input"] = {
+                    "module_name": module_name,
+                    "file_count": len(normalized_inputs),
+                }
+        return summary
+
+    def _base_task_metrics(self, task: BinarySecurityTask, *, input_files: list[dict[str, Any]]) -> dict[str, Any]:
+        task_type = self._task_type(task)
+        total_bytes = int(sum(int(item.get("size") or 0) for item in input_files))
+        return {
+            "high_risk_module_count": 0,
+            "medium_risk_module_count": 0,
+            "low_risk_module_count": 0,
+            "candidate_module_count": 1 if task_type == TASK_TYPE_BINARY_MODULE else 0,
+            "selected_module_count": 1 if task_type == TASK_TYPE_BINARY_MODULE else 0,
+            "entry_count": 0,
+            "vuln_result_count": 0,
+            "input_file_count": len(input_files),
+            "uploaded_file_count": len(input_files),
+            "input_total_bytes": total_bytes,
+            "firmware_item_count": len(input_files),
+            "unpacked_firmware_count": 0,
+            "failed_firmware_count": 0,
+        }
+
+    def _reset_task_for_hard_restart(self, task: BinarySecurityTask) -> None:
+        input_files = [dict(item) for item in (task.summary or {}).get("input_files") or []]
+        task.execution_epoch = int(getattr(task, "execution_epoch", 0) or 0) + 1
+        task.execution_mode = None
+        task.target_stage_name = None
+        task.pending_action = None
+        task.last_error = None
+        task.finished_at = None
+        task.started_at = None
+        task.current_stage = self._stage_sequence_for_task(task)[0]
+        self._invalidate_task_execution(task)
+        task.summary = self._base_task_summary(task, input_files=input_files)
+        task.metrics = self._base_task_metrics(task, input_files=input_files)
+        task.stage_summary = {}
+        task.cleanup_snapshot = {}
+
+    def _delete_task_summary_file(self, task: BinarySecurityTask) -> None:
+        summary_path = Path(task.workspace_root) / BinarySecurityTask.SUMMARY_FILENAME
+        try:
+            if summary_path.exists():
+                summary_path.unlink()
+        except Exception:
+            pass
 
     def _clear_stage_output_artifacts(self, task: BinarySecurityTask, stage_names: list[str]) -> None:
         output_root = Path(str(task.output_root or "")).resolve()
@@ -14858,6 +15090,10 @@ class TaskManager:
             result = {
                 **entry,
                 "artifact_root": str(archived_dir),
+                "archive_root": str(archived_dir),
+                "module_input_path": module_input_path,
+                "source_root_path": source_root_path,
+                "source_file": normalized_source_file,
                 "data_flow_file": str(archived_data_flow_file or data_flow_file) if (archived_data_flow_file or data_flow_file) else "",
                 "downstream": self._lightweight_downstream_payload(payload),
             }
@@ -14866,6 +15102,9 @@ class TaskManager:
                 **(item.output_ref or {}),
                 "artifact_root": str(archived_dir),
                 "archive_root": str(archived_dir),
+                "module_input_path": module_input_path,
+                "source_root_path": source_root_path,
+                "source_file": normalized_source_file,
                 "data_flow_file": result["data_flow_file"],
             }
             if self._streaming_mode_enabled(task):
@@ -15333,7 +15572,11 @@ class TaskManager:
             "line_no": item.get("line_no"),
             "entry_file": item.get("entry_file"),
             "source_dir": item.get("source_dir"),
+            "module_input_path": item.get("module_input_path"),
+            "source_root_path": item.get("source_root_path"),
+            "source_file": item.get("source_file") or item.get("definition_file") or item.get("file_name"),
             "artifact_root": item.get("artifact_root"),
+            "archive_root": item.get("archive_root"),
             "data_flow_file": item.get("data_flow_file"),
         }
 
