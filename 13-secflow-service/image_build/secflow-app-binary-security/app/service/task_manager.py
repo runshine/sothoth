@@ -11508,8 +11508,6 @@ class TaskManager:
         if not mapping:
             return False, f"阶段 {stage_name} 未配置安全重试接口"
         self._normalize_cancelled_task_active_children(db, task)
-        if task.status == "cancelled":
-            return False, "当前任务已取消，暂不支持阶段重试；请使用任务重试/重头开始重新排队"
         if task.status in STAGE_RETRY_BLOCKED_TASK_STATUSES:
             return False, f"当前任务状态不允许重试: {task.status}"
         stage_run = db.query(BinarySecurityStageRun).filter(
