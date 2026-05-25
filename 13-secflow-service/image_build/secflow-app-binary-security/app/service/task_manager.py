@@ -9209,7 +9209,8 @@ class TaskManager:
             parent_key=item.parent_key,
             status=item.status,
             retry_count=int(item.retry_count or 0),
-            rerun_count=int(item.retry_count or 0),
+            rerun_count=int(item.rerun_count or 0),
+            auto_retry_count=int(item.retry_count or 0),
             downstream_service=item.downstream_service,
             downstream_task_id=item.downstream_task_id,
             input_ref=item.input_ref,
@@ -10450,6 +10451,7 @@ class TaskManager:
         input_ref: dict[str, Any],
         output_ref: dict[str, Any] | None = None,
         retrying: bool,
+        auto_retrying: bool = False,
         running_status: str = "running",
     ) -> BinarySecurityStageItem:
         identity_key = build_stage_item_identity_key(item_key, parent_key)
@@ -10476,6 +10478,8 @@ class TaskManager:
                 started_at=self._stage_item_started_at(running_status),
             )
             if retrying:
+                item.rerun_count = 1
+            if auto_retrying:
                 item.retry_count = 1
         else:
             item.stage_run_id = stage_run.id
@@ -10490,6 +10494,8 @@ class TaskManager:
             item.payload = {}
             item.result = {}
             if retrying:
+                item.rerun_count = int(item.rerun_count or 0) + 1
+            if auto_retrying:
                 item.retry_count = int(item.retry_count or 0) + 1
         item.input_ref = input_ref
         if output_ref is not None:
@@ -10526,6 +10532,8 @@ class TaskManager:
                 if output_ref is not None:
                     existing.output_ref = output_ref
                 if retrying:
+                    existing.rerun_count = int(existing.rerun_count or 0) + 1
+                if auto_retrying:
                     existing.retry_count = int(existing.retry_count or 0) + 1
                 item = existing
                 break
@@ -10754,6 +10762,7 @@ class TaskManager:
             )
             if existing is not None and str(existing.status or "").strip().lower() in STREAMING_ACTIVE_ITEM_STATUSES:
                 item.retry_count = existing.retry_count
+                item.rerun_count = existing.rerun_count
             created_items.append(item)
             if existing is None:
                 created_count += 1
@@ -12784,7 +12793,9 @@ class TaskManager:
             task,
             executable_inputs,
             self._stage_parallelism(task, stage_run.stage_name),
-            lambda input_file, retrying=False: self._run_firmware_item(task, stage_run, input_file, token, retrying),
+            lambda input_file, retrying=False, auto_retrying=False: self._run_firmware_item(
+                task, stage_run, input_file, token, retrying, auto_retrying
+            ),
             retries=int(task.policy.get("max_retries_per_item") or 0),
             initial_retry=retry_existing,
         )
@@ -12798,6 +12809,7 @@ class TaskManager:
         input_file: dict[str, Any],
         token: str | None,
         retrying: bool = False,
+        auto_retrying: bool = False,
     ) -> dict[str, Any]:
         session = get_session_factory()()
         try:
@@ -12815,6 +12827,7 @@ class TaskManager:
                 input_ref={"filename": input_file["filename"], "path": str(input_path)},
                 output_ref={"downstream_service": "firmware_unpacker"},
                 retrying=retrying,
+                auto_retrying=auto_retrying,
                 running_status="queued",
             )
             session.commit()
@@ -13033,7 +13046,9 @@ class TaskManager:
             task,
             executable_inputs,
             self._stage_parallelism(task, stage_run.stage_name),
-            lambda analysis_input, retrying=False: self._run_system_analysis_item(task, stage_run, analysis_input, retrying),
+            lambda analysis_input, retrying=False, auto_retrying=False: self._run_system_analysis_item(
+                task, stage_run, analysis_input, retrying, auto_retrying
+            ),
             retries=int(task.policy.get("max_retries_per_item") or 0),
             initial_retry=retry_existing,
         )
@@ -13216,6 +13231,7 @@ class TaskManager:
         stage_run: BinarySecurityStageRun,
         firmware: dict[str, Any],
         retrying: bool = False,
+        auto_retrying: bool = False,
     ) -> dict[str, Any]:
         session = get_session_factory()()
         try:
@@ -13235,6 +13251,7 @@ class TaskManager:
                     "analysis_mode": self._task_type(task),
                 },
                 retrying=retrying,
+                auto_retrying=auto_retrying,
             )
             session.commit()
             active_payload = await self._active_downstream_payload(task, item)
@@ -13968,7 +13985,9 @@ class TaskManager:
             task,
             executable_inputs,
             self._stage_parallelism(task, stage_run.stage_name),
-            lambda module, retrying=False: self._run_b2s_item(task, stage_run, module, token, retrying),
+            lambda module, retrying=False, auto_retrying=False: self._run_b2s_item(
+                task, stage_run, module, token, retrying, auto_retrying
+            ),
             retries=int(task.policy.get("max_retries_per_item") or 0),
             initial_retry=retry_existing,
         )
@@ -14005,7 +14024,9 @@ class TaskManager:
             task,
             executable_inputs,
             self._stage_parallelism(task, stage_run.stage_name),
-            lambda module, retrying=False: self._run_entry_item(task, stage_run, module, token, retrying),
+            lambda module, retrying=False, auto_retrying=False: self._run_entry_item(
+                task, stage_run, module, token, retrying, auto_retrying
+            ),
             retries=int(task.policy.get("max_retries_per_item") or 0),
             initial_retry=retry_existing,
         )
@@ -14097,7 +14118,9 @@ class TaskManager:
             task,
             executable_inputs,
             self._stage_parallelism(task, stage_run.stage_name),
-            lambda entry, retrying=False: self._run_dataflow_item(task, stage_run, entry, token, retrying),
+            lambda entry, retrying=False, auto_retrying=False: self._run_dataflow_item(
+                task, stage_run, entry, token, retrying, auto_retrying
+            ),
             retries=int(task.policy.get("max_retries_per_item") or 0),
             initial_retry=retry_existing,
         )
@@ -14134,7 +14157,9 @@ class TaskManager:
             task,
             executable_inputs,
             self._stage_parallelism(task, stage_run.stage_name),
-            lambda result, retrying=False: self._run_vuln_item(task, stage_run, result, token, retrying),
+            lambda result, retrying=False, auto_retrying=False: self._run_vuln_item(
+                task, stage_run, result, token, retrying, auto_retrying
+            ),
             retries=int(task.policy.get("max_retries_per_item") or 0),
             initial_retry=retry_existing,
         )
@@ -14163,7 +14188,7 @@ class TaskManager:
                 while result.get("status") == "failed" and attempts < max(0, retries):
                     attempts += 1
                     await self._ensure_task_execution_current_async(task)
-                    result = await runner(item, True)
+                    result = await runner(item, True, auto_retrying=True)
                     await self._ensure_task_execution_current_async(task)
                     result["attempts"] = attempts + 1
                 return result
@@ -14177,6 +14202,7 @@ class TaskManager:
         module: dict[str, Any],
         token: str | None,
         retrying: bool = False,
+        auto_retrying: bool = False,
     ) -> dict[str, Any]:
         session = get_session_factory()()
         try:
@@ -14192,6 +14218,7 @@ class TaskManager:
                 downstream_service="binary_to_source",
                 input_ref=module,
                 retrying=retrying,
+                auto_retrying=auto_retrying,
             )
             session.commit()
             elf_tasks = self._build_module_elf_tasks(module)
@@ -14665,6 +14692,7 @@ class TaskManager:
         module: dict[str, Any],
         token: str | None,
         retrying: bool = False,
+        auto_retrying: bool = False,
     ) -> dict[str, Any]:
         session = get_session_factory()()
         try:
@@ -14680,6 +14708,7 @@ class TaskManager:
                 downstream_service="entry_analyse",
                 input_ref=module,
                 retrying=retrying,
+                auto_retrying=auto_retrying,
             )
             session.commit()
             active_payload = await self._active_downstream_payload(task, item, token)
@@ -15224,6 +15253,7 @@ class TaskManager:
         entry: dict[str, Any],
         token: str | None,
         retrying: bool = False,
+        auto_retrying: bool = False,
     ) -> dict[str, Any]:
         session = get_session_factory()()
         try:
@@ -15246,6 +15276,7 @@ class TaskManager:
                 downstream_service="dataflow_analyse",
                 input_ref=entry,
                 retrying=retrying,
+                auto_retrying=auto_retrying,
             )
             session.commit()
             taint_params = [
@@ -15551,6 +15582,7 @@ class TaskManager:
         dataflow_result: dict[str, Any],
         token: str | None,
         retrying: bool = False,
+        auto_retrying: bool = False,
     ) -> dict[str, Any]:
         session = get_session_factory()()
         try:
@@ -15566,6 +15598,7 @@ class TaskManager:
                 downstream_service="dataflow_vuln_scanner",
                 input_ref=dataflow_result,
                 retrying=retrying,
+                auto_retrying=auto_retrying,
             )
             session.commit()
             active_payload = await self._active_downstream_payload(task, item, token)

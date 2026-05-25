@@ -8666,9 +8666,64 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual("m1", item.item_key)
-        self.assertEqual(1, item.retry_count)
+        self.assertEqual(0, item.retry_count)
+        self.assertEqual(1, item.rerun_count)
         self.assertEqual("running", item.status)
         self.assertEqual(1, len(db.added))
+
+    def test_upsert_stage_item_increments_auto_retry_count_only_for_auto_retry(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        existing = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr0",
+            stage_name="entry_analysis",
+            item_key="m1",
+            item_name="module1",
+            parent_key="source_project",
+            status="failed",
+            retry_count=1,
+            rerun_count=2,
+            downstream_service="entry_analyse",
+        )
+        db = _ModelAwareDb(stage_runs=[run], stage_items=[existing])
+
+        item = self.manager._upsert_stage_item(
+            db,
+            task=task,
+            stage_run=run,
+            stage_name="entry_analysis",
+            item_key="m1",
+            item_name="module1",
+            parent_key="source_project",
+            downstream_service="entry_analyse",
+            input_ref={"module_key": "m1"},
+            retrying=True,
+            auto_retrying=True,
+        )
+
+        self.assertEqual(2, item.retry_count)
+        self.assertEqual(3, item.rerun_count)
 
     def test_stage_enabled_uses_policy_override(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
@@ -9594,7 +9649,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("transport_error", response.sync_status)
         self.assertIsNotNone(response.last_synced_at)
 
-    def test_stage_item_response_exposes_rerun_count_alias(self):
+    def test_stage_item_response_exposes_retry_and_rerun_counts(self):
         item = BinarySecurityStageItem(
             id="si1",
             task_id="t1",
@@ -9603,13 +9658,15 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             stage_name="dataflow_analysis",
             item_key="entry1",
             status="failed",
-            retry_count=11,
+            retry_count=1,
+            rerun_count=11,
         )
 
         response = self.manager._stage_item_response(item)
 
-        self.assertEqual(11, response.retry_count)
+        self.assertEqual(1, response.retry_count)
         self.assertEqual(11, response.rerun_count)
+        self.assertEqual(1, response.auto_retry_count)
 
     def test_stage_worker_terminal_event_rebuilds_system_analysis_from_items(self):
         with tempfile.TemporaryDirectory() as tmp:

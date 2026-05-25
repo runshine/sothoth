@@ -275,6 +275,7 @@ class BinarySecurityStageItem(Base, JsonMixin):
     item_identity_key = Column(String(255), nullable=True, index=True)
     status = Column(String(32), nullable=False, default="pending", index=True)
     retry_count = Column(Integer, nullable=False, default=0)
+    rerun_count = Column(Integer, nullable=False, default=0)
     downstream_service = Column(String(64), nullable=True)
     downstream_task_id = Column(String(128), nullable=True, index=True)
     input_ref_json = Column(Text, nullable=True)
@@ -585,6 +586,13 @@ def _ensure_compat_columns(engine) -> None:
         if "item_identity_key" not in columns:
             statements.append(
                 f"ALTER TABLE {stage_item_table} ADD COLUMN item_identity_key VARCHAR(255) NULL"
+            )
+        if "rerun_count" not in columns:
+            statements.append(
+                f"ALTER TABLE {stage_item_table} ADD COLUMN rerun_count INTEGER NOT NULL DEFAULT 0"
+            )
+            statements.append(
+                f"UPDATE {stage_item_table} SET rerun_count = retry_count WHERE rerun_count = 0 AND retry_count > 0"
             )
         result_json_type = str(column_defs.get("result_json", {}).get("type") or "").lower()
         if "result_json" in columns and "mediumtext" not in result_json_type:
