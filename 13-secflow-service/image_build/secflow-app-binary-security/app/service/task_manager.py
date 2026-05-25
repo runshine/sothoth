@@ -8183,8 +8183,6 @@ class TaskManager:
         running_tasks = db.query(BinarySecurityTask).filter(BinarySecurityTask.status == "running").all()
         for task in running_tasks:
             execution_token = task.dispatch_started_at.isoformat() if task.dispatch_started_at else ""
-            if not execution_token:
-                continue
             stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
             for stage_run in stage_runs:
                 stage_name = str(stage_run.stage_name or "").strip()
@@ -8216,7 +8214,7 @@ class TaskManager:
                     task,
                     stage_name=stage_name,
                     status=stage_status,
-                    reason="dispatch_loop_recovery",
+                    reason="dispatch_loop_recovery_missing_execution_token" if not execution_token else "dispatch_loop_recovery",
                     summary=summary,
                     execution_token=execution_token,
                 )
@@ -14508,8 +14506,10 @@ class TaskManager:
                 # For binary-module -> entry-analysis, files.list is built relative to the
                 # archived B2S module root, so source_root must align with that descriptor root.
                 normalized["source_root"] = str(descriptor_root_path)
+                normalized["source_root_path"] = str(descriptor_root_path)
                 normalized["module_dir"] = str(Path(entry_files_list).parent)
                 normalized["files_list"] = str(files_list_path)
+                normalized["files_list_path"] = str(files_list_path)
                 return normalized
         for artifact_root in self._entry_descriptor_candidates(normalized):
             if not artifact_root.exists():
@@ -14517,17 +14517,69 @@ class TaskManager:
             prepared = self._prepare_entry_module_descriptor(artifact_root, normalized)
             if not prepared.get("entry_descriptor_ready"):
                 continue
+            prepared_descriptor_root = Path(str(prepared.get("entry_descriptor_root") or ""))
             files_list_path = Path(str(prepared.get("entry_files_list") or ""))
-            if not self._is_entry_descriptor_usable(artifact_root, files_list_path):
+            if not self._is_entry_descriptor_usable(prepared_descriptor_root, files_list_path):
                 continue
             normalized.update(prepared)
             normalized["module_name"] = str(prepared.get("entry_module_name") or normalized.get("module_name") or "")
             normalized["source_dir"] = str(prepared.get("entry_descriptor_root") or normalized.get("source_dir") or "")
             normalized["source_root"] = str(prepared.get("entry_descriptor_root") or prepared.get("source_root") or normalized.get("source_root") or "")
+            normalized["source_root_path"] = str(
+                prepared.get("source_root_path")
+                or prepared.get("entry_descriptor_root")
+                or prepared.get("source_root")
+                or normalized.get("source_root_path")
+                or normalized.get("source_root")
+                or ""
+            )
             normalized["module_dir"] = str(prepared.get("module_dir") or normalized.get("module_dir") or "")
             normalized["files_list"] = str(prepared.get("files_list") or normalized.get("files_list") or "")
+            normalized["files_list_path"] = str(
+                prepared.get("files_list_path")
+                or prepared.get("entry_files_list")
+                or prepared.get("files_list")
+                or normalized.get("files_list_path")
+                or normalized.get("files_list")
+                or ""
+            )
             break
         return normalized
+
+    def _build_entry_analysis_input_contract(self, entry_input: dict[str, Any]) -> dict[str, Any]:
+        contract = {
+            "module_dir": str(entry_input.get("module_dir") or entry_input.get("source_dir") or "").strip(),
+            "files_list_path": str(
+                entry_input.get("files_list_path")
+                or entry_input.get("entry_files_list")
+                or entry_input.get("files_list")
+                or ""
+            ).strip(),
+            "source_root": str(
+                entry_input.get("source_root")
+                or entry_input.get("source_root_path")
+                or entry_input.get("entry_descriptor_root")
+                or entry_input.get("source_dir")
+                or ""
+            ).strip(),
+            "source_root_path": str(
+                entry_input.get("source_root_path")
+                or entry_input.get("source_root")
+                or entry_input.get("entry_descriptor_root")
+                or entry_input.get("source_dir")
+                or ""
+            ).strip(),
+            "source_dir": str(entry_input.get("source_dir") or "").strip(),
+            "files_list": str(entry_input.get("files_list") or "").strip(),
+            "entry_descriptor_root": str(entry_input.get("entry_descriptor_root") or "").strip(),
+            "entry_files_list": str(entry_input.get("entry_files_list") or "").strip(),
+        }
+        missing = [field for field in ("module_dir", "files_list_path", "source_root") if not contract.get(field)]
+        if missing:
+            raise ValidationError(
+                "binary_security 下发给 entry_analysis 的 input_contract 缺少: " + ", ".join(missing)
+            )
+        return contract
 
     async def _run_entry_item(
         self,
@@ -14636,39 +14688,17 @@ class TaskManager:
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
+                    input_contract = self._build_entry_analysis_input_contract(entry_input)
                     created = await get_entry_analyse_client().create_task(
                         task.project_id,
                         f"{task.name}-{entry_input['module_name']}-entry",
-                        entry_input.get("module_dir") or entry_input["source_dir"],
+                        input_contract["module_dir"],
                         entry_input["module_name"],
                         token or "",
-                        entry_input.get("source_root") or entry_input.get("unpacked_root") or entry_input["source_dir"],
+                        input_contract["source_root"],
                         {
                             **_downstream_origin_payload(task, item),
-                            "input_contract": {
-                                "module_dir": entry_input.get("module_dir") or entry_input.get("source_dir"),
-                                "files_list_path": (
-                                    entry_input.get("files_list_path")
-                                    or entry_input.get("entry_files_list")
-                                    or entry_input.get("files_list")
-                                ),
-                                "source_root": (
-                                    entry_input.get("source_root")
-                                    or entry_input.get("source_root_path")
-                                    or entry_input.get("entry_descriptor_root")
-                                    or entry_input.get("source_dir")
-                                ),
-                                "source_root_path": (
-                                    entry_input.get("source_root_path")
-                                    or entry_input.get("source_root")
-                                    or entry_input.get("entry_descriptor_root")
-                                    or entry_input.get("source_dir")
-                                ),
-                                "source_dir": entry_input.get("source_dir"),
-                                "files_list": entry_input.get("files_list"),
-                                "entry_descriptor_root": entry_input.get("entry_descriptor_root"),
-                                "entry_files_list": entry_input.get("entry_files_list"),
-                            },
+                            "input_contract": input_contract,
                             "entry_descriptor_root": entry_input.get("entry_descriptor_root"),
                             "entry_files_list": entry_input.get("entry_files_list"),
                         },

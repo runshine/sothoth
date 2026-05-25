@@ -10648,6 +10648,94 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(recovered)
             self.assertFalse(any(row.__class__.__name__ == "BinarySecurityEvent" and row.event_type == "stage_worker_terminal_event_missing" for row in db.added))
 
+    def test_recover_missing_stage_terminal_events_without_dispatch_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="running",
+                current_stage="entry_analysis",
+                task_type=TASK_TYPE_BINARY_MODULE,
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root="/o",
+                workspace_root=tmp,
+            )
+            stage_run = BinarySecurityStageRun(
+                id="sr1",
+                task_id="task1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="failed",
+            )
+            stage_run.output_summary = {"error": "missing input contract", "failed_count": 1}
+            db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], state_events=[], events=[])
+
+            recovered = self.manager._recover_missing_stage_terminal_events_locked(db)
+
+            self.assertTrue(recovered)
+            terminal_events = [row for row in db.added if row.__class__.__name__ == "BinarySecurityStateEvent"]
+            self.assertEqual(1, len(terminal_events))
+            self.assertEqual(
+                "stage_worker_terminal_observed:task1:entry_analysis::failed",
+                terminal_events[0].idempotency_key,
+            )
+            warnings = [row for row in db.added if row.__class__.__name__ == "BinarySecurityEvent"]
+            self.assertTrue(any(row.event_type == "stage_worker_terminal_event_missing" for row in warnings))
+            self.assertTrue(any("missing_execution_token" in str((row.payload_json or "")) for row in warnings))
+
+    def test_normalize_entry_analysis_module_input_prepares_binary_module_descriptor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_root = Path(tmp) / "artifact"
+            module_dir = artifact_root / "output" / "src"
+            module_dir.mkdir(parents=True)
+            source_file = module_dir / "main.c"
+            source_file.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="running",
+                current_stage="binary_to_source",
+                task_type=TASK_TYPE_BINARY_MODULE,
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root="/o",
+                workspace_root=tmp,
+            )
+
+            normalized = self.manager._normalize_entry_analysis_module_input(
+                task,
+                {
+                    "module_key": "m1",
+                    "module_name": "mod",
+                    "artifact_root": str(artifact_root),
+                    "archive_root": str(artifact_root),
+                },
+            )
+
+            self.assertTrue(normalized.get("entry_descriptor_ready"))
+            self.assertEqual(str(artifact_root), normalized.get("entry_descriptor_root"))
+            self.assertEqual(str(artifact_root), normalized.get("source_root"))
+            self.assertEqual(str(artifact_root), normalized.get("source_root_path"))
+            self.assertTrue(str(normalized.get("files_list_path") or "").endswith("files.list"))
+
+    def test_build_entry_analysis_input_contract_requires_explicit_fields(self):
+        contract = self.manager._build_entry_analysis_input_contract(
+            {
+                "module_dir": "/tmp/mod",
+                "files_list_path": "/tmp/mod/files.list",
+                "source_root": "/tmp/root",
+                "source_root_path": "/tmp/root",
+                "source_dir": "/tmp/root",
+            }
+        )
+        self.assertEqual("/tmp/mod", contract["module_dir"])
+        self.assertEqual("/tmp/mod/files.list", contract["files_list_path"])
+        self.assertEqual("/tmp/root", contract["source_root"])
+
     def test_list_tasks_needing_downstream_sync_includes_failed_tasks_when_retry_target_stage_is_active(self):
         task = BinarySecurityTask(
             id="task1",
