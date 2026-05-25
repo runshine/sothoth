@@ -5116,10 +5116,14 @@ class TaskManager:
             )
 
         if active_stage_status:
-            task.status = "pending" if status == "pending" else "running"
+            # Keep the parent task in the active execution context while the
+            # current stage still has live downstream work. A stage-level
+            # "pending" here means individual items need redispatch/reclaim,
+            # not that the whole task should be re-queued and start the same
+            # stage a second time.
+            task.status = "running"
             task.current_stage = stage_name
             task.last_error = None
-            self._invalidate_task_execution(task)
             task.finished_at = None
             self._record_event(
                 db,
@@ -5134,8 +5138,6 @@ class TaskManager:
                 },
             )
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
-            if status == "pending":
-                self._enqueue_task(task.id)
             return
         if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
             self._invalidate_task_execution(task)
@@ -11022,6 +11024,29 @@ class TaskManager:
         item: BinarySecurityStageItem,
         token: str | None,
     ) -> dict[str, Any]:
+        if stage_name == "dataflow_analysis" and self._has_retryable_downstream_task(item):
+            try:
+                payload = await self._fetch_downstream_task_payload(task, item, token or "")
+            except NotFoundError:
+                payload = None
+            except Exception as exc:
+                if self._is_retryable_downstream_transport_error(exc):
+                    return {
+                        "outcome": "transport_error",
+                        "payload": None,
+                        "error_message": self._extract_downstream_error_text(exc) or str(exc),
+                        "http_status": self._extract_http_status_from_exception(exc),
+                    }
+                payload = None
+            if isinstance(payload, dict):
+                mapped_status = self._map_downstream_status(str(payload.get("status") or ""))
+                if mapped_status in {"queued", "running"}:
+                    return {
+                        "outcome": "already_running",
+                        "payload": payload,
+                        "error_message": None,
+                        "http_status": 200,
+                    }
         try:
             payload = await self._invoke_existing_downstream_retry(stage_name, task=task, item=item, token=token)
             return {"outcome": "accepted", "payload": payload, "error_message": None, "http_status": 200}

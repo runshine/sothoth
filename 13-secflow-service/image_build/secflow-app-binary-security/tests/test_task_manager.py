@@ -216,6 +216,9 @@ class _ModelAwareDb:
     def flush(self):
         pass
 
+    def refresh(self, obj):
+        return obj
+
     def rollback(self):
         pass
 
@@ -1191,6 +1194,8 @@ class TaskManagerTests(unittest.TestCase):
                 asyncio.run(self.manager._apply_stage_worker_terminal_event_locked(db, terminal_event))
                 self.assertEqual("running", task.status)
                 self.assertEqual("dataflow_analysis", task.current_stage)
+                self.assertEqual(self.manager.instance_id, task.dispatcher_instance_id)
+                self.assertIsNotNone(task.dispatch_started_at)
 
                 asyncio.run(self.manager._apply_downstream_status_event_locked(db, downstream_event))
             finally:
@@ -1740,6 +1745,90 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("failed", task.status)
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertIsNotNone(task.finished_at)
+
+    def test_get_task_detail_reconciles_dispatching_task_to_running_when_stage_is_running(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="dispatching",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="system_analysis",
+            item_key="fw-1",
+            item_name="fw-1",
+            item_identity_key="fw-1::",
+            status="running",
+            downstream_service="system_analyse",
+            downstream_task_id="sat-1",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item])
+
+        detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
+
+        self.assertEqual("running", detail.status)
+        self.assertEqual("running", task.status)
+        self.assertEqual("running", next(summary.status for summary in detail.stage_summaries if summary.stage_name == "system_analysis"))
+
+    def test_list_tasks_reconciles_dispatching_task_to_running_when_stage_is_running(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="dispatching",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="system_analysis",
+            item_key="fw-1",
+            item_name="fw-1",
+            item_identity_key="fw-1::",
+            status="running",
+            downstream_service="system_analyse",
+            downstream_task_id="sat-1",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item])
+
+        response = self.manager.list_tasks(db, project_id="p1")
+
+        self.assertEqual(1, response.total)
+        self.assertEqual("running", response.items[0].status)
+        self.assertEqual("running", task.status)
 
     def test_stage_run_output_summary_db_payload_is_hard_capped(self):
         task = BinarySecurityTask(
@@ -6008,6 +6097,94 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("already_running", result["outcome"])
         self.assertEqual("ea-1", result["payload"]["task_id"])
+        self.assertEqual("running", result["payload"]["status"])
+
+    def test_control_existing_dataflow_task_reuses_running_downstream(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            current_stage="dataflow_analysis",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="item1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            item_key="entry1",
+            item_name="entry1",
+            parent_key="mod1",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa-1",
+            status="running",
+        )
+
+        async def fake_fetch(*args, **kwargs):
+            del args, kwargs
+            return {"task_id": "dfa-1", "status": "running"}
+
+        with patch.object(self.manager, "_fetch_downstream_task_payload", side_effect=fake_fetch):
+            result = asyncio.run(
+                self.manager._control_existing_downstream_task(
+                    "dataflow_analysis",
+                    task=task,
+                    item=item,
+                    token=None,
+                )
+            )
+
+        self.assertEqual("already_running", result["outcome"])
+        self.assertEqual("dfa-1", result["payload"]["task_id"])
+        self.assertEqual("running", result["payload"]["status"])
+
+    def test_control_existing_dataflow_running_task_reuses_without_restart(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            current_stage="dataflow_analysis",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="item1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            item_key="entry-1",
+            item_name="entry",
+            parent_key="mod-1",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa-1",
+            status="running",
+        )
+
+        async def fake_fetch(*args, **kwargs):
+            del args, kwargs
+            return {"task_id": "dfa-1", "status": "running"}
+
+        with patch.object(self.manager, "_fetch_downstream_task_payload", side_effect=fake_fetch):
+            result = asyncio.run(
+                self.manager._control_existing_downstream_task(
+                    "dataflow_analysis",
+                    task=task,
+                    item=item,
+                    token=None,
+                )
+            )
+
+        self.assertEqual("already_running", result["outcome"])
+        self.assertEqual("dfa-1", result["payload"]["task_id"])
         self.assertEqual("running", result["payload"]["status"])
 
     def test_control_existing_downstream_task_marks_transport_error_as_deferred(self):
