@@ -1200,6 +1200,7 @@ class TaskManager:
                 BinarySecurityTask.target_stage_name,
             )
         ).order_by(BinarySecurityTask.created_at.desc()).all()
+        self._reconcile_task_statuses_for_read(db, tasks)
         queue_info = self._build_queue_info(db, project_id=project_id)
         service_config = self._load_service_config(db)
         return BinarySecurityTaskListResponse(
@@ -1214,6 +1215,7 @@ class TaskManager:
 
     def get_task_detail(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskDetailResponse:
         task = self._task_or_404(db, project_id, task_id)
+        self._reconcile_task_statuses_for_read(db, [task])
         items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).order_by(
             BinarySecurityStageItem.created_at.asc()
         ).all()
@@ -7938,6 +7940,28 @@ class TaskManager:
         if not task:
             raise NotFoundError("任务不存在")
         return task
+
+    def _reconcile_task_statuses_for_read(self, db: Session, tasks: list[BinarySecurityTask]) -> None:
+        changed = False
+        for task in tasks:
+            if task is None:
+                continue
+            before_status = str(task.status or "").strip()
+            before_stage = str(task.current_stage or "").strip()
+            self._refresh_task_status_after_sync(db, task)
+            if str(task.status or "").strip() != before_status or str(task.current_stage or "").strip() != before_stage:
+                changed = True
+        if not changed:
+            return
+        db.flush()
+        if hasattr(db, "refresh"):
+            for task in tasks:
+                if task is None:
+                    continue
+                try:
+                    db.refresh(task)
+                except Exception:
+                    pass
 
     def _ensure_stage_run(self, db: Session, task: BinarySecurityTask, stage_name: str) -> BinarySecurityStageRun:
         stage_run = db.query(BinarySecurityStageRun).filter(
@@ -15175,7 +15199,6 @@ class TaskManager:
         token: str | None,
         retrying: bool = False,
     ) -> dict[str, Any]:
-        del token
         session = get_session_factory()()
         try:
             try:

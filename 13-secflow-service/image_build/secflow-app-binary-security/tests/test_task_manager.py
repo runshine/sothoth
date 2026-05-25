@@ -12126,6 +12126,74 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("/tmp/repo/src", item.output_ref["source_root_path"])
         self.assertEqual("main.c", item.output_ref["source_file"])
 
+    def test_run_dataflow_item_reusable_payload_keeps_token_available_for_cleanup(self):
+        task = BinarySecurityTask(id="t1", name="source-task", project_id="p1", workspace_root="/tmp/ws")
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            sequence_no=3,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            item_key="entry-1",
+            item_name="main",
+            parent_key="module-1",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa-live",
+            status="pending",
+            output_ref={},
+        )
+        entry = {
+            "entry_key": "entry-1",
+            "function_name": "main",
+            "module_name": "module-1",
+            "source_dir": "/tmp/src",
+            "source_file": "main.c",
+            "file_name": "main.c",
+            "module_key": "module-1",
+            "module_input_path": "/tmp/repo/modules/module-1",
+            "source_root_path": "/tmp/repo/src",
+            "is_definition_found": True,
+            "definition_kind": "definition",
+            "definition_file": "main.c",
+            "definition_line": "10",
+            "taint_params": ["argv"],
+        }
+        fake_session = _ModelAwareDb()
+        cleanup_calls: list[dict[str, object]] = []
+
+        async def fake_cleanup(*args, **kwargs):
+            cleanup_calls.append({
+                "args": args,
+                "kwargs": kwargs,
+            })
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_find_reusable_dataflow_payload", return_value={"task_id": "dfa-live", "status": "running"}),
+            patch.object(self.manager, "_cleanup_duplicate_downstream_refs_for_item", side_effect=fake_cleanup),
+            patch.object(self.manager, "_poll_until_terminal", return_value=("success", {"task_id": "dfa-live", "status": "passed"})),
+            patch.object(self.manager, "_service_output_dir", return_value=Path("/tmp")),
+            patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
+            patch.object(self.manager, "_find_first", return_value=Path("/tmp/dataflow.md")),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+            patch.object(self.manager, "_lightweight_downstream_payload", side_effect=lambda payload: {"status": payload.get("status")}),
+            patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
+            patch.object(self.manager, "_normalize_dfa_source_file", return_value="main.c"),
+        ):
+            result = asyncio.run(self.manager._run_dataflow_item(task, stage_run, entry, token="tok", retrying=False))
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual(1, len(cleanup_calls))
+        self.assertEqual("tok", cleanup_calls[0]["args"][3])
+
     def test_run_dataflow_item_falls_back_to_definition_parent_when_source_dir_missing(self):
         task = BinarySecurityTask(id="t1", name="source-task", project_id="p1", workspace_root="/tmp/ws")
         stage_run = BinarySecurityStageRun(
