@@ -47,6 +47,7 @@ from typing import Any, Optional
 
 from app.pi_vuln_core.agents.base import BaseAgentRuntime
 from app.pi_vuln_core.agents.models import AgentResponse
+from app.pi_vuln_core.agents.runtimes.agent_process import AgentProcessHandle, run_cancel_monitor
 from app.pi_vuln_core.agents.runtime_trace import RuntimeTraceContext, command_display, now_iso
 from app.pi_vuln_core.utils.file_ops import write_json
 from app.pi_vuln_core.utils.logger import get_logger
@@ -392,7 +393,15 @@ class PiAgentRuntime(BaseAgentRuntime):
         return env
 
     @staticmethod
-    async def _terminate_process(proc, *, grace_seconds: float = 5.0) -> None:
+    async def _terminate_process(
+        proc,
+        *,
+        grace_seconds: float = 5.0,
+        handle: AgentProcessHandle | None = None,
+    ) -> None:
+        if handle is not None:
+            await handle.terminate_tree(reason="runtime_close", grace_seconds=grace_seconds)
+            return
         if proc is None or getattr(proc, "returncode", None) is not None:
             return
         with contextlib.suppress(ProcessLookupError):
@@ -811,33 +820,28 @@ class PiAgentRuntime(BaseAgentRuntime):
         child_env = self._subprocess_env()
 
         # 启动子进程（异常向上抛，由 send_message 的 launch retry 处理）
-        if IS_WINDOWS:
-            proc = await asyncio.create_subprocess_shell(
-                command_display(cmd_args),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=working_dir,
-                env=child_env,
-            )
-        else:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd_args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=working_dir,
-                env=child_env,
-            )
+        handle = await AgentProcessHandle.spawn(
+            cmd_args=cmd_args,
+            working_dir=working_dir,
+            env=child_env,
+            is_windows=IS_WINDOWS,
+            logger=logger.info,
+            label=f"pi-agent-json:{session_id}",
+            with_stdin=False,
+        )
+        proc = handle.proc
 
         # Cancel monitor
         cancel_task: asyncio.Task | None = None
         if cancel_event:
-            async def _cancel_monitor():
-                await cancel_event.wait()
-                try:
-                    proc.terminate()
-                except ProcessLookupError:
-                    pass
-            cancel_task = asyncio.create_task(_cancel_monitor())
+            cancel_task = asyncio.create_task(
+                run_cancel_monitor(
+                    cancel_event,
+                    None,
+                    handle,
+                    reason="json_cancel_event",
+                )
+            )
 
         parsed = _ParsedJsonOutput(max_events=max_event_count)
         stdout_buffer = _BoundedBytesBuffer(max_stdout_bytes)
@@ -1031,9 +1035,7 @@ class PiAgentRuntime(BaseAgentRuntime):
 
         except _RuntimeOutputLimitError as exc:
             duration_ms = int((time.monotonic() - started_monotonic) * 1000)
-            with contextlib.suppress(Exception):
-                proc.kill()
-                await proc.wait()
+            await self._terminate_process(proc, handle=handle)
             return _AttemptResult(
                 stdout_text=stdout_buffer.text(),
                 stderr_text=stderr_buffer.text().strip(),
@@ -1052,9 +1054,7 @@ class PiAgentRuntime(BaseAgentRuntime):
             )
         except _RuntimeTurnLimitError as exc:
             duration_ms = int((time.monotonic() - started_monotonic) * 1000)
-            with contextlib.suppress(Exception):
-                proc.kill()
-                await proc.wait()
+            await self._terminate_process(proc, handle=handle)
             return _AttemptResult(
                 stdout_text=stdout_buffer.text(),
                 stderr_text=stderr_buffer.text().strip(),
@@ -1073,7 +1073,7 @@ class PiAgentRuntime(BaseAgentRuntime):
             )
         except _NoProgressTimeoutError as exc:
             duration_ms = int((time.monotonic() - started_monotonic) * 1000)
-            await self._terminate_process(proc)
+            await self._terminate_process(proc, handle=handle)
             return _AttemptResult(
                 stdout_text=stdout_buffer.text(),
                 stderr_text=stderr_buffer.text().strip(),
@@ -1120,6 +1120,7 @@ class PiAgentRuntime(BaseAgentRuntime):
 
     async def _close_rpc_process_for_session(self, session: dict) -> None:
         proc = session.get("rpc_proc")
+        handle = session.get("rpc_proc_handle")
         stderr_task = session.get("rpc_stderr_task")
         if stderr_task and not stderr_task.done():
             stderr_task.cancel()
@@ -1134,8 +1135,9 @@ class PiAgentRuntime(BaseAgentRuntime):
         session.pop("rpc_stdout_buffer", None)
 
         if proc is not None:
-            await self._terminate_process(proc)
+            await self._terminate_process(proc, handle=handle)
         session.pop("rpc_proc", None)
+        session.pop("rpc_proc_handle", None)
 
     @staticmethod
     async def _rpc_send(proc, command: dict[str, Any]) -> None:
@@ -1240,26 +1242,19 @@ class PiAgentRuntime(BaseAgentRuntime):
 
         await self._close_rpc_process_for_session(session)
         child_env = self._subprocess_env()
-        if IS_WINDOWS:
-            proc = await asyncio.create_subprocess_shell(
-                command_display(cmd_args),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=working_dir,
-                env=child_env,
-            )
-        else:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd_args,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=working_dir,
-                env=child_env,
-            )
+        handle = await AgentProcessHandle.spawn(
+            cmd_args=cmd_args,
+            working_dir=working_dir,
+            env=child_env,
+            is_windows=IS_WINDOWS,
+            logger=logger.info,
+            label=f"pi-agent-rpc:{session_id}",
+            with_stdin=True,
+        )
+        proc = handle.proc
 
         session["rpc_proc"] = proc
+        session["rpc_proc_handle"] = handle
         session["rpc_stderr_parts"] = []
         session["rpc_stdout_buffer"] = b""
         session["rpc_stderr_task"] = asyncio.create_task(self._drain_rpc_stderr(session, proc))
@@ -1336,13 +1331,16 @@ class PiAgentRuntime(BaseAgentRuntime):
 
             cancel_task: asyncio.Task | None = None
             if cancel_event:
-                async def _cancel_monitor():
-                    await cancel_event.wait()
-                    with contextlib.suppress(Exception):
-                        await self._rpc_send(proc, {"type": "abort"})
-                    with contextlib.suppress(Exception):
-                        proc.terminate()
-                cancel_task = asyncio.create_task(_cancel_monitor())
+                async def _abort_rpc() -> None:
+                    await self._rpc_send(proc, {"type": "abort"})
+                cancel_task = asyncio.create_task(
+                    run_cancel_monitor(
+                        cancel_event,
+                        _abort_rpc,
+                        session["rpc_proc_handle"],
+                        reason="rpc_cancel_event",
+                    )
+                )
 
             try:
                 await self._rpc_send(proc, {
