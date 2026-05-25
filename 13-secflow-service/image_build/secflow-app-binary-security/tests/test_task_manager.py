@@ -10185,7 +10185,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(supported)
         self.assertIn("重复历史 item", reason or "")
 
-    def test_stage_retry_support_rejects_cancelled_task(self):
+    def test_stage_retry_support_allows_cancelled_task(self):
         task = BinarySecurityTask(
             id="task1",
             project_id="p1",
@@ -10226,10 +10226,10 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             "firmware_unpack",
         )
 
-        self.assertFalse(supported)
-        self.assertIn("已取消", reason or "")
+        self.assertTrue(supported)
+        self.assertIsNone(reason)
 
-    def test_retry_stage_rejects_cancelled_task(self):
+    def test_retry_stage_accepts_cancelled_task(self):
         task = BinarySecurityTask(
             id="task1",
             project_id="p1",
@@ -10262,10 +10262,16 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         )
         db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[stage_item])
 
-        with self.assertRaises(ValidationError) as ctx:
-            self.manager.retry_stage(db, project_id="p1", task_id="task1", stage_name="firmware_unpack")
+        self.manager.retry_stage(db, project_id="p1", task_id="task1", stage_name="firmware_unpack")
 
-        self.assertIn("已取消", str(ctx.exception))
+        self.assertEqual("cancelled", task.status)
+        self.assertIsNone(task.pending_action)
+        state_events = [row for row in db.added if row.__class__.__name__ == "BinarySecurityStateEvent"]
+        self.assertTrue(state_events)
+        event = state_events[-1]
+        self.assertEqual("manual_blocking_action_requested", event.event_type)
+        self.assertEqual("firmware_unpack", event.stage_name)
+        self.assertEqual("retry_stage_full", event.payload.get("action"))
 
     def test_task_retry_support_targets_first_stage_for_full_restart(self):
         task = BinarySecurityTask(
