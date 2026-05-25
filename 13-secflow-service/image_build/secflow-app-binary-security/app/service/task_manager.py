@@ -5875,11 +5875,12 @@ class TaskManager:
         stale_reclaimed = self._reclaim_stale_dispatching_locked(db)
         stale_running_reclaimed = self._reclaim_stale_running_locked(db)
         released_running_requeued = self._requeue_released_running_locked(db)
+        recovered_missing_terminal_events = self._recover_missing_stage_terminal_events_locked(db)
         service_config = self._load_service_config(db)
         active_count = self._active_dispatch_count(db)
         slots = max(0, service_config.max_concurrent_tasks - active_count)
         claimed_ids = self._claim_pending_tasks(db, slots)
-        if stale_reclaimed or stale_running_reclaimed or released_running_requeued or claimed_ids:
+        if stale_reclaimed or stale_running_reclaimed or released_running_requeued or recovered_missing_terminal_events or claimed_ids:
             db.commit()
         return claimed_ids
 
@@ -5887,6 +5888,7 @@ class TaskManager:
         self._reclaim_stale_dispatching_locked(db)
         self._reclaim_stale_running_locked(db)
         self._requeue_released_running_locked(db)
+        self._recover_missing_stage_terminal_events_locked(db)
         service_config = self._load_service_config(db)
         active_count = self._active_dispatch_count(db)
         if active_count >= service_config.max_concurrent_tasks:
@@ -6058,25 +6060,17 @@ class TaskManager:
                 elif task_retry_mode and existing_stage_items:
                     retry_existing = True
                 status, summary = await handler(db, task, stage_run, token, retry_existing)
-                self._enqueue_state_event(
+                execution_token = task.dispatch_started_at.isoformat() if task.dispatch_started_at else None
+                self._emit_stage_terminal_event_safely(
                     db,
                     task=task,
-                    task_id=task.id,
-                    project_id=task.project_id,
                     stage_name=stage_name,
-                    event_type="stage_worker_terminal_observed",
-                    idempotency_key=(
-                        f"stage_worker_terminal_observed:{task.id}:{stage_name}:"
-                        f"{task.dispatch_started_at.isoformat() if task.dispatch_started_at else ''}:{status}"
-                    ),
-                    payload={
-                        "stage_name": stage_name,
-                        "status": status,
-                        "summary": summary,
-                        "stage_retry_mode": bool(stage_retry_mode),
-                        "task_retry_mode": bool(task_retry_mode),
-                        "target_stage_name": target_stage_name,
-                    },
+                    status=status,
+                    summary=summary,
+                    stage_retry_mode=bool(stage_retry_mode),
+                    task_retry_mode=bool(task_retry_mode),
+                    target_stage_name=target_stage_name,
+                    execution_token=execution_token,
                 )
                 self._record_event(
                     db,
@@ -6086,7 +6080,33 @@ class TaskManager:
                     stage_name=stage_name,
                     payload={"status": status},
                 )
-                db.commit()
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
+                    if task is not None:
+                        self._emit_stage_terminal_event_safely(
+                            db,
+                            task=task,
+                            stage_name=stage_name,
+                            status=status,
+                            summary=summary,
+                            stage_retry_mode=bool(stage_retry_mode),
+                            task_retry_mode=bool(task_retry_mode),
+                            target_stage_name=target_stage_name,
+                            execution_token=execution_token,
+                        )
+                        self._record_missing_stage_terminal_event(
+                            db,
+                            task,
+                            stage_name=stage_name,
+                            status=status,
+                            reason="worker_commit_retry_after_failure",
+                            summary=summary,
+                            execution_token=execution_token,
+                        )
+                        db.commit()
                 return
                 stage_run.status = "waiting_confirmation" if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION else status
                 stage_run.finished_at = _now()
@@ -7807,6 +7827,67 @@ class TaskManager:
                 db.rollback()
                 self._sleep_after_retryable_lock_error(attempt + 1)
 
+    def _record_missing_stage_terminal_event(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_name: str,
+        status: str,
+        reason: str,
+        summary: dict[str, Any] | None = None,
+        execution_token: str | None = None,
+    ) -> None:
+        self._record_event(
+            db,
+            task,
+            "stage_worker_terminal_event_missing",
+            f"检测到阶段终态事件漏信，已补投 reducer 事件: {stage_name}",
+            level="warning",
+            stage_name=stage_name,
+            payload={
+                "reason": reason,
+                "status": status,
+                "execution_token": execution_token,
+                "summary": self._fit_event_payload_for_db(dict(summary or {})),
+            },
+        )
+
+    def _emit_stage_terminal_event_safely(
+        self,
+        db: Session,
+        *,
+        task: BinarySecurityTask,
+        stage_name: str,
+        status: str,
+        summary: dict[str, Any],
+        stage_retry_mode: bool,
+        task_retry_mode: bool,
+        target_stage_name: str | None,
+        execution_token: str | None,
+    ) -> BinarySecurityStateEvent | None:
+        return self._enqueue_state_event(
+            db,
+            task=task,
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name=stage_name,
+            event_type="stage_worker_terminal_observed",
+            idempotency_key=(
+                f"stage_worker_terminal_observed:{task.id}:{stage_name}:"
+                f"{execution_token or ''}:{status}"
+            ),
+            payload={
+                "stage_name": stage_name,
+                "status": status,
+                "summary": summary,
+                "stage_retry_mode": bool(stage_retry_mode),
+                "task_retry_mode": bool(task_retry_mode),
+                "target_stage_name": target_stage_name,
+                "execution_token": execution_token,
+            },
+        )
+
     def _enqueue_downstream_status_event(
         self,
         db: Session,
@@ -7886,6 +7967,53 @@ class TaskManager:
             force=force,
             event_type="downstream_terminal_observed",
         )
+
+    def _recover_missing_stage_terminal_events_locked(self, db: Session) -> bool:
+        recovered = False
+        running_tasks = db.query(BinarySecurityTask).filter(BinarySecurityTask.status == "running").all()
+        for task in running_tasks:
+            execution_token = task.dispatch_started_at.isoformat() if task.dispatch_started_at else ""
+            if not execution_token:
+                continue
+            stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+            for stage_run in stage_runs:
+                stage_name = str(stage_run.stage_name or "").strip()
+                stage_status = str(stage_run.status or "").strip()
+                if stage_status not in {"success", "partial_success", "failed", "cancelled", "downstream_missing"}:
+                    continue
+                expected_key = f"stage_worker_terminal_observed:{task.id}:{stage_name}:{execution_token}:{stage_status}"
+                existing = db.query(BinarySecurityStateEvent).filter(
+                    BinarySecurityStateEvent.idempotency_key == expected_key
+                ).first()
+                if existing is not None:
+                    continue
+                summary = dict(stage_run.output_summary or {})
+                emitted = self._emit_stage_terminal_event_safely(
+                    db,
+                    task=task,
+                    stage_name=stage_name,
+                    status=stage_status,
+                    summary=summary,
+                    stage_retry_mode=False,
+                    task_retry_mode=False,
+                    target_stage_name=None,
+                    execution_token=execution_token,
+                )
+                if emitted is None:
+                    continue
+                self._record_missing_stage_terminal_event(
+                    db,
+                    task,
+                    stage_name=stage_name,
+                    status=stage_status,
+                    reason="dispatch_loop_recovery",
+                    summary=summary,
+                    execution_token=execution_token,
+                )
+                recovered = True
+        if recovered:
+            db.flush()
+        return recovered
 
     def _enqueue_archive_state_event_by_job_id(self, job_id: str, *, event_type: str, payload: dict[str, Any] | None = None) -> None:
         db = get_session_factory()()
