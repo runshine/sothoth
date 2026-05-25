@@ -24,6 +24,37 @@ from app.time_utils import isoformat_local, now_local
 CACHE_KEY_RE = re.compile(r"^[a-f0-9]{64}_(fast|deep)$")
 
 
+def _is_ida_intermediate_path(path: str | Path | None) -> bool:
+    if not path:
+        return False
+    name = Path(str(path)).name.lower()
+    return "_ida." in name or name.endswith("_ida.c") or name.endswith("_ida.h")
+
+
+def _remove_ida_intermediate_outputs(output_dir: str | Path | None) -> list[str]:
+    root = Path(str(output_dir or "")).expanduser()
+    if not root.exists():
+        return []
+    removed: list[str] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            relative_parts = [part.lower() for part in path.relative_to(root).parts]
+        except Exception:
+            relative_parts = [part.lower() for part in path.parts]
+        if "run" in relative_parts:
+            continue
+        if not _is_ida_intermediate_path(path):
+            continue
+        try:
+            path.unlink()
+            removed.append(str(path))
+        except FileNotFoundError:
+            continue
+    return removed
+
+
 @dataclass(frozen=True)
 class FileDigest:
     sha256: str
@@ -269,6 +300,7 @@ class B2SCacheService:
             return CacheLookupResult(hit=False, cache_key=cache_key, miss_reason="not_found")
 
         self._materialize_output(Path(cache.canonical_output_dir), Path(item.output_dir))
+        removed_intermediates = _remove_ida_intermediate_outputs(item.output_dir)
         item.status = "success"
         item.dispatch_status = "cache_hit"
         item.phase = "completed"
@@ -298,6 +330,8 @@ class B2SCacheService:
             "materialize_mode": get_config().cache.materialize_mode,
             "hit_at": isoformat_local(now_local()),
         })
+        if removed_intermediates:
+            metadata["removed_ida_intermediate_outputs"] = removed_intermediates
         cached_function_stats = self._loads(cache.function_stats_json, None)
         if cached_function_stats:
             metadata["function_stats"] = cached_function_stats
@@ -412,12 +446,15 @@ class B2SCacheService:
         for raw in item.generated_files:
             try:
                 path = Path(raw).resolve()
+                if _is_ida_intermediate_path(path):
+                    continue
                 if path.is_relative_to(output_dir):
                     result.append(str(canonical_output / path.relative_to(output_dir)))
                 else:
                     result.append(raw)
             except Exception:
-                result.append(raw)
+                if not _is_ida_intermediate_path(raw):
+                    result.append(raw)
         return result
 
     @staticmethod
@@ -438,12 +475,15 @@ class B2SCacheService:
         for raw in self._loads(cache.generated_files_json, []):
             try:
                 path = self._normalize_legacy_cached_path(canonical_output, Path(str(raw)).resolve())
+                if _is_ida_intermediate_path(path):
+                    continue
                 if path.is_relative_to(canonical_output):
                     result.append(str(item_output / path.relative_to(canonical_output)))
                 else:
                     result.append(str(raw))
             except Exception:
-                result.append(str(raw))
+                if not _is_ida_intermediate_path(raw):
+                    result.append(str(raw))
         return result
 
     def _write_manifest(self, canonical_dir: Path, item: B2STaskItem, cache_meta: dict[str, Any], *, replaced: bool) -> None:

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app.model import B2STaskItem
 from app.api import tasks as tasks_api
 from app.exception import NotFoundError
 from app.model import B2SAnalysisCache, Base
@@ -98,6 +101,77 @@ def test_get_cache_entry_detail_returns_manifest_and_flags(db_session, monkeypat
     assert detail["manifest_exists"] is True
     assert detail["output_dir_exists"] is True
     assert detail["generated_files"] == ["result.c"]
+
+
+def test_cache_hit_materialize_removes_ida_intermediates_and_filters_generated_files(db_session, monkeypatch):
+    session, tmp_path = db_session
+    service = B2SCacheService()
+    monkeypatch.setattr(
+        "app.service.cache_service.get_config",
+        lambda: SimpleNamespace(cache=SimpleNamespace(enabled=True, root_dir=str(tmp_path), materialize_mode="copy")),
+    )
+
+    input_elf = tmp_path / "input.elf"
+    input_elf.write_bytes(b"\x7fELF")
+    digest = service.compute_file_digest(input_elf)
+    cache_key = service.build_cache_key(digest.sha256, "fast")
+    row = _make_cache_row(tmp_path, cache_key=cache_key, project_id="p1", task_id="t1", item_id="i1", hit_count=0)
+    output_dir = Path(row.canonical_output_dir)
+    (output_dir / "result_ida.c").write_text("int ida(void){return 0;}\n", encoding="utf-8")
+    row.generated_files_json = json.dumps(["result.c", "result_ida.c"])
+    session.add(row)
+    session.commit()
+
+    item_output = tmp_path / "materialized" / "output"
+    item_output.parent.mkdir(parents=True, exist_ok=True)
+    item = B2STaskItem(
+        id="item-hit",
+        task_id="task-hit",
+        project_id="p1",
+        sequence_no=1,
+        elf_path=str(input_elf),
+        output_dir=str(item_output),
+        status="pending",
+        generated_files=[],
+    )
+    item.extra_metadata = {"reuse_cache": True}
+
+    hit = service.try_apply_cache_hit(session, item, input_elf)
+
+    assert hit.hit is True
+    assert item.generated_files == ["result.c"]
+    assert not (item_output / "result_ida.c").exists()
+    assert "removed_ida_intermediate_outputs" in (item.extra_metadata or {})
+
+
+def test_canonical_generated_files_excludes_ida_intermediates(db_session, monkeypatch):
+    session, tmp_path = db_session
+    service = B2SCacheService()
+    monkeypatch.setattr(
+        "app.service.cache_service.get_config",
+        lambda: SimpleNamespace(cache=SimpleNamespace(enabled=True, root_dir=str(tmp_path), materialize_mode="copy")),
+    )
+
+    output_dir = tmp_path / "task-output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    result_c = output_dir / "result.c"
+    ida_c = output_dir / "result_ida.c"
+    result_c.write_text("ok\n", encoding="utf-8")
+    ida_c.write_text("ida\n", encoding="utf-8")
+
+    item = B2STaskItem(
+        id="item-store",
+        task_id="task-store",
+        project_id="p1",
+        sequence_no=1,
+        elf_path="/tmp/a.elf",
+        output_dir=str(output_dir),
+        status="success",
+        generated_files=[str(result_c), str(ida_c)],
+    )
+
+    mapped = service._canonical_generated_files(item, tmp_path / "cache" / "output")
+    assert mapped == [str(tmp_path / "cache" / "output" / "result.c")]
 
 
 def test_delete_cache_entry_removes_directory_and_db_record(db_session, monkeypatch):
