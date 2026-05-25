@@ -2019,6 +2019,8 @@ class TaskManager:
                 continue
             self._clear_archive_jobs_for_stage_items(db, task.id, stage_name, item_ids)
             self._delete_stage_items_by_ids(db, item_ids)
+            self._delete_state_event_rows_for_stages(db, task.id, [stage_name])
+            self._delete_timeline_rows_for_stages(db, task.id, [stage_name])
             cleared_stages.append(stage_name)
 
         for stage_name in cleared_stages:
@@ -2108,6 +2110,8 @@ class TaskManager:
         self._clear_stage_outputs_from(task, target_stage, mark_stale=False)
         self._delete_archive_children_for_stages(db, task, affected_stages)
         self._delete_stage_items_for_stages(db, task.id, affected_stages)
+        self._delete_state_event_rows_for_stages(db, task.id, affected_stages)
+        self._delete_timeline_rows_for_stages(db, task.id, affected_stages)
         for stage_name in affected_stages:
             stage_run = db.query(BinarySecurityStageRun).filter(
                 BinarySecurityStageRun.task_id == task.id,
@@ -2398,6 +2402,30 @@ class TaskManager:
             db.events = [row for row in db.events if str(getattr(row, "task_id", "") or "").strip() != task_id]
         return deleted
 
+    def _delete_timeline_rows_for_stages(self, db: Session, task_id: str, stage_names: list[str]) -> int:
+        normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
+        if not normalized:
+            return 0
+        deleted = int(
+            db.query(BinarySecurityEvent)
+            .filter(
+                BinarySecurityEvent.task_id == task_id,
+                BinarySecurityEvent.stage_name.in_(normalized),
+            )
+            .delete(synchronize_session=False)
+            or 0
+        )
+        if hasattr(db, "events") and isinstance(getattr(db, "events"), list):
+            allowed = set(normalized)
+            db.events = [
+                row for row in db.events
+                if not (
+                    str(getattr(row, "task_id", "") or "").strip() == task_id
+                    and str(getattr(row, "stage_name", "") or "").strip() in allowed
+                )
+            ]
+        return deleted
+
     def _delete_task_state_event_rows(self, db: Session, task_id: str) -> int:
         deleted = int(
             db.query(BinarySecurityStateEvent)
@@ -2407,6 +2435,30 @@ class TaskManager:
         )
         if hasattr(db, "state_events") and isinstance(getattr(db, "state_events"), list):
             db.state_events = [row for row in db.state_events if str(getattr(row, "task_id", "") or "").strip() != task_id]
+        return deleted
+
+    def _delete_state_event_rows_for_stages(self, db: Session, task_id: str, stage_names: list[str]) -> int:
+        normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
+        if not normalized:
+            return 0
+        deleted = int(
+            db.query(BinarySecurityStateEvent)
+            .filter(
+                BinarySecurityStateEvent.task_id == task_id,
+                BinarySecurityStateEvent.stage_name.in_(normalized),
+            )
+            .delete(synchronize_session=False)
+            or 0
+        )
+        if hasattr(db, "state_events") and isinstance(getattr(db, "state_events"), list):
+            allowed = set(normalized)
+            db.state_events = [
+                row for row in db.state_events
+                if not (
+                    str(getattr(row, "task_id", "") or "").strip() == task_id
+                    and str(getattr(row, "stage_name", "") or "").strip() in allowed
+                )
+            ]
         return deleted
 
     def _delete_workspace_runtime_children(self, task: BinarySecurityTask) -> None:
@@ -10432,6 +10484,32 @@ class TaskManager:
                 self._sleep_after_retryable_lock_error(attempt + 1)
         return item
 
+    @staticmethod
+    def _entry_contract_fields(entry: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(entry, dict):
+            return {}
+        contract_fields = (
+            "module_dir",
+            "descriptor_root",
+            "source_dir",
+            "source_root",
+            "source_root_path",
+            "module_input_path",
+            "files_list_path",
+            "files_list",
+            "entry_descriptor_root",
+            "entry_files_list",
+            "entry_descriptor_ready",
+            "artifact_root",
+            "archive_root",
+            "task_type",
+            "module_key",
+            "module_name",
+            "firmware_key",
+            "firmware_name",
+        )
+        return {field: entry.get(field) for field in contract_fields if entry.get(field) is not None}
+
     def _trigger_entry_items_from_b2s_result(
         self,
         db: Session,
@@ -10521,11 +10599,6 @@ class TaskManager:
             entry_key = str(entry.get("entry_key") or "").strip()
             if not entry_key:
                 continue
-            normalized_entry = {
-                **entry,
-                "upstream_item_id": upstream_item.id,
-                "triggered_by_stage": upstream_item.stage_name,
-            }
             existing = self._find_stage_item(
                 db,
                 task_id=task.id,
@@ -10533,6 +10606,17 @@ class TaskManager:
                 item_key=entry_key,
                 parent_key=str(entry.get("module_key") or "").strip() or None,
             )
+            merged_entry = {
+                **self._entry_contract_fields(existing.input_ref if existing else None),
+                **self._entry_contract_fields(upstream_item.result if isinstance(upstream_item.result, dict) else None),
+                **self._entry_contract_fields(entry_result),
+                **entry,
+            }
+            normalized_entry = {
+                **merged_entry,
+                "upstream_item_id": upstream_item.id,
+                "triggered_by_stage": upstream_item.stage_name,
+            }
             item = self._upsert_stage_item(
                 db,
                 task=task,
@@ -10547,6 +10631,8 @@ class TaskManager:
                 retrying=False,
                 running_status="pending",
             )
+            if existing is not None and str(existing.status or "").strip().lower() in STREAMING_ACTIVE_ITEM_STATUSES:
+                item.retry_count = existing.retry_count
             created_items.append(item)
             if existing is None:
                 created_count += 1
@@ -14650,6 +14736,116 @@ class TaskManager:
                 return value
         return ""
 
+    def _build_entry_output_contract(self, module: dict[str, Any], entry: dict[str, Any], *, source_dir: str, module_input_path: str, source_root_path: str) -> dict[str, Any]:
+        taint_params = [
+            str(value).strip()
+            for value in (entry.get("taint_params") or [])
+            if str(value).strip()
+        ]
+        signature_params = _entry_signature_params(entry)
+        effective_taint_params = taint_params or signature_params
+        return {
+            "entry_key": entry.get("entry_key"),
+            "firmware_key": module.get("firmware_key") or "",
+            "firmware_name": module.get("firmware_name") or "",
+            "module_key": module.get("module_key") or "",
+            "module_name": module.get("module_name") or "",
+            "file_name": entry.get("file_name"),
+            "function_name": entry.get("function_name"),
+            "raw_function_name": entry.get("raw_function_name"),
+            "line_no": entry.get("line_no"),
+            "definition_file": entry.get("definition_file") or entry.get("file_name"),
+            "definition_line": entry.get("definition_line") or entry.get("line_no"),
+            "is_definition_found": entry.get("is_definition_found", True),
+            "definition_kind": self._resolve_entry_definition_kind(entry),
+            "tag": entry.get("tag") or "P",
+            "taint_params": effective_taint_params,
+            "function_description": entry.get("function_description") or _default_entry_function_description(str(entry.get("function_name") or "")),
+            "function_description_source": entry.get("function_description_source") or _entry_description_source(entry.get("function_description")),
+            "entry_reason": entry.get("entry_reason") or _default_entry_reason(entry.get("tag"), str(entry.get("function_name") or "")),
+            "entry_reason_source": entry.get("entry_reason_source") or _entry_description_source(entry.get("entry_reason")),
+            "taint_details": _normalize_entry_taint_details(entry, effective_taint_params),
+            "signature_params": signature_params,
+            "entry_file": entry.get("entry_file"),
+            "module_input_path": module_input_path,
+            "source_root_path": source_root_path,
+            "source_dir": source_dir,
+        }
+
+    def _validate_entry_output_contract(self, entry: dict[str, Any], *, allow_fallback: bool = False) -> dict[str, Any]:
+        if not isinstance(entry, dict):
+            raise ValidationError("入口分析输出 contract 非法")
+        normalized = dict(entry)
+        if allow_fallback:
+            normalized["module_input_path"] = normalized.get("module_input_path") or self._resolve_dfa_module_input_path(normalized)
+            normalized["source_root_path"] = normalized.get("source_root_path") or self._resolve_dfa_source_root_path(normalized)
+            normalized["source_dir"] = normalized.get("source_dir") or self._resolve_entry_source_dir(normalized)
+        for field, message in (
+            ("entry_key", "入口分析输出缺少 entry_key"),
+            ("module_key", "入口分析输出缺少 module_key"),
+            ("module_name", "入口分析输出缺少 module_name"),
+            ("function_name", "入口分析输出缺少 function_name"),
+            ("definition_file", "入口分析输出缺少 definition_file"),
+            ("definition_line", "入口分析输出缺少 definition_line"),
+            ("definition_kind", "入口分析输出缺少 definition_kind"),
+            ("module_input_path", "入口分析输出缺少 module_input_path"),
+            ("source_root_path", "入口分析输出缺少 source_root_path"),
+            ("source_dir", "入口分析输出缺少 source_dir"),
+        ):
+            if not str(normalized.get(field) or "").strip():
+                raise ValidationError(message)
+        if not isinstance(normalized.get("taint_params"), list):
+            normalized["taint_params"] = []
+        return normalized
+
+    def _build_dataflow_output_contract(
+        self,
+        entry: dict[str, Any],
+        *,
+        artifact_root: str,
+        archive_root: str,
+        module_input_path: str,
+        source_root_path: str,
+        source_file: str,
+        data_flow_file: str,
+    ) -> dict[str, Any]:
+        return {
+            **entry,
+            "artifact_root": artifact_root,
+            "archive_root": archive_root,
+            "module_input_path": module_input_path,
+            "source_root_path": source_root_path,
+            "source_file": source_file,
+            "data_flow_file": data_flow_file,
+            "data_flow_root": artifact_root,
+            "primary_report_path": data_flow_file,
+        }
+
+    def _validate_dataflow_output_contract(self, item: dict[str, Any], *, allow_fallback: bool = False) -> dict[str, Any]:
+        if not isinstance(item, dict):
+            raise ValidationError("数据流分析输出 contract 非法")
+        normalized = dict(item)
+        if allow_fallback:
+            normalized["source_dir"] = normalized.get("source_dir") or self._resolve_entry_source_dir(normalized)
+            normalized["module_input_path"] = normalized.get("module_input_path") or self._resolve_dfa_module_input_path(normalized)
+            normalized["source_root_path"] = normalized.get("source_root_path") or self._resolve_dfa_source_root_path(normalized)
+            normalized["primary_report_path"] = normalized.get("primary_report_path") or normalized.get("data_flow_file")
+            normalized["data_flow_root"] = normalized.get("data_flow_root") or normalized.get("artifact_root") or normalized.get("archive_root")
+        for field, message in (
+            ("entry_key", "数据流分析输出缺少 entry_key"),
+            ("module_key", "数据流分析输出缺少 module_key"),
+            ("module_name", "数据流分析输出缺少 module_name"),
+            ("function_name", "数据流分析输出缺少 function_name"),
+            ("source_dir", "数据流分析输出缺少 source_dir"),
+            ("module_input_path", "数据流分析输出缺少 module_input_path"),
+            ("source_root_path", "数据流分析输出缺少 source_root_path"),
+            ("source_file", "数据流分析输出缺少 source_file"),
+            ("data_flow_file", "数据流分析输出缺少 data_flow_file"),
+        ):
+            if not str(normalized.get(field) or "").strip():
+                raise ValidationError(message)
+        return normalized
+
     def _resolve_dfa_source_root_path(self, entry: dict[str, Any]) -> str:
         if not isinstance(entry, dict):
             return ""
@@ -14725,33 +14921,28 @@ class TaskManager:
                 raw_function_description = str(entry.get("function_description") or "").strip()
                 raw_entry_reason = str(entry.get("entry_reason") or "").strip()
                 rows.append(
-                    {
-                        "entry_key": _slug(f"{module['module_key']}-{function_name}-{line_no}"),
-                        "firmware_key": module.get("firmware_key") or "",
-                        "firmware_name": module.get("firmware_name") or "",
-                        "module_key": module["module_key"],
-                        "module_name": module["module_name"],
-                        "file_name": file_name,
-                        "function_name": function_name,
-                        "raw_function_name": str(raw_function_name or ""),
-                        "line_no": line_no,
-                        "definition_file": str(entry.get("definition_file") or entry.get("file_name") or entry.get("file") or file_name or "").strip(),
-                        "definition_line": str(entry.get("definition_line") or entry.get("line_no") or entry.get("line") or line_no),
-                        "is_definition_found": bool(entry.get("is_definition_found", True)),
-                        "definition_kind": self._resolve_entry_definition_kind(entry),
-                        "tag": tag or "P",
-                        "taint_params": taint_params,
-                        "function_description": raw_function_description or _default_entry_function_description(function_name),
-                        "function_description_source": _entry_description_source(raw_function_description),
-                        "entry_reason": raw_entry_reason or _default_entry_reason(tag, function_name),
-                        "entry_reason_source": _entry_description_source(raw_entry_reason),
-                        "taint_details": _normalize_entry_taint_details(entry, taint_params),
-                        "signature_params": _entry_signature_params({**entry, "raw_function_name": raw_function_name}),
-                        "entry_file": str(source),
-                        "module_input_path": resolved_module_input_path,
-                        "source_root_path": resolved_source_root_path,
-                        "source_dir": resolved_source_dir,
-                    }
+                    self._build_entry_output_contract(
+                        module,
+                        {
+                            **entry,
+                            "entry_key": _slug(f"{module['module_key']}-{function_name}-{line_no}"),
+                            "file_name": file_name,
+                            "function_name": function_name,
+                            "raw_function_name": str(raw_function_name or ""),
+                            "line_no": line_no,
+                            "definition_file": str(entry.get("definition_file") or entry.get("file_name") or entry.get("file") or file_name or "").strip(),
+                            "definition_line": str(entry.get("definition_line") or entry.get("line_no") or entry.get("line") or line_no),
+                            "is_definition_found": bool(entry.get("is_definition_found", True)),
+                            "tag": tag or "P",
+                            "taint_params": taint_params,
+                            "function_description": raw_function_description,
+                            "entry_reason": raw_entry_reason,
+                            "entry_file": str(source),
+                        },
+                        source_dir=resolved_source_dir,
+                        module_input_path=resolved_module_input_path,
+                        source_root_path=resolved_source_root_path,
+                    )
                 )
             return _deduplicate_entry_keys(rows)
 
@@ -14801,29 +14992,28 @@ class TaskManager:
                 if file_name and function_name:
                     taint_params = [part.strip() for part in parts[5].split(",") if part.strip()] if len(parts) > 5 else []
                     rows.append(
-                        {
-                            "entry_key": _slug(f"{module['module_key']}-{function_name}-{line_no}"),
-                            "firmware_key": module.get("firmware_key") or "",
-                            "firmware_name": module.get("firmware_name") or "",
-                            "module_key": module["module_key"],
-                            "module_name": module["module_name"],
-                            "file_name": file_name,
-                            "function_name": function_name,
-                            "raw_function_name": parts[3],
-                            "line_no": line_no,
-                            "tag": "P",
-                            "definition_kind": "definition",
-                            "taint_params": taint_params,
-                            "function_description": _default_entry_function_description(function_name),
-                            "function_description_source": "default",
-                            "entry_reason": _default_entry_reason("P", function_name),
-                            "entry_reason_source": "default",
-                            "taint_details": _normalize_entry_taint_details({"taint_details": []}, taint_params),
-                            "entry_file": str(entry_file),
-                            "module_input_path": resolved_module_input_path,
-                            "source_root_path": resolved_source_root_path,
-                            "source_dir": resolved_source_dir,
-                        }
+                        self._build_entry_output_contract(
+                            module,
+                            {
+                                "entry_key": _slug(f"{module['module_key']}-{function_name}-{line_no}"),
+                                "file_name": file_name,
+                                "function_name": function_name,
+                                "raw_function_name": parts[3],
+                                "line_no": line_no,
+                                "tag": "P",
+                                "definition_kind": "definition",
+                                "taint_params": taint_params,
+                                "function_description": _default_entry_function_description(function_name),
+                                "function_description_source": "default",
+                                "entry_reason": _default_entry_reason("P", function_name),
+                                "entry_reason_source": "default",
+                                "taint_details": _normalize_entry_taint_details({"taint_details": []}, taint_params),
+                                "entry_file": str(entry_file),
+                            },
+                            source_dir=resolved_source_dir,
+                            module_input_path=resolved_module_input_path,
+                            source_root_path=resolved_source_root_path,
+                        )
                     )
         return _deduplicate_entry_keys(rows)
 
@@ -14838,6 +15028,7 @@ class TaskManager:
         del token
         session = get_session_factory()()
         try:
+            entry = self._validate_entry_output_contract(entry)
             item = self._upsert_stage_item(
                 session,
                 task=task,
@@ -14862,8 +15053,8 @@ class TaskManager:
             definition_kind = self._resolve_entry_definition_kind(entry)
             definition_file = str(entry.get("definition_file") or entry.get("file_name") or "").strip()
             definition_line = str(entry.get("definition_line") or entry.get("line_no") or "").strip()
-            module_input_path = self._resolve_dfa_module_input_path(entry)
-            source_root_path = self._resolve_dfa_source_root_path(entry)
+            module_input_path = str(entry.get("module_input_path") or "").strip()
+            source_root_path = str(entry.get("source_root_path") or "").strip()
             if not definition_found:
                 item.status = "failed"
                 item.finished_at = _now()
@@ -15085,16 +15276,16 @@ class TaskManager:
                 session.commit()
                 return {"status": "archive_blocked", "error": error, "item": entry, "archive_blocked": True}
             archived_data_flow_file = self._find_first(archived_dir, [r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"])
-            result = {
-                **entry,
-                "artifact_root": str(archived_dir),
-                "archive_root": str(archived_dir),
-                "module_input_path": module_input_path,
-                "source_root_path": source_root_path,
-                "source_file": normalized_source_file,
-                "data_flow_file": str(archived_data_flow_file or data_flow_file) if (archived_data_flow_file or data_flow_file) else "",
-                "downstream": self._lightweight_downstream_payload(payload),
-            }
+            result = self._build_dataflow_output_contract(
+                entry,
+                artifact_root=str(archived_dir),
+                archive_root=str(archived_dir),
+                module_input_path=module_input_path,
+                source_root_path=source_root_path,
+                source_file=normalized_source_file,
+                data_flow_file=str(archived_data_flow_file or data_flow_file) if (archived_data_flow_file or data_flow_file) else "",
+            )
+            result["downstream"] = self._lightweight_downstream_payload(payload)
             item.result = self._compact_result_for_storage(stage_run.stage_name, result)
             item.output_ref = {
                 **(item.output_ref or {}),
@@ -15104,6 +15295,8 @@ class TaskManager:
                 "source_root_path": source_root_path,
                 "source_file": normalized_source_file,
                 "data_flow_file": result["data_flow_file"],
+                "data_flow_root": result["data_flow_root"],
+                "primary_report_path": result["primary_report_path"],
             }
             if self._streaming_mode_enabled(task):
                 self._trigger_vuln_items_from_dataflow_result(session, task, result, upstream_item=item)
@@ -15155,6 +15348,7 @@ class TaskManager:
     ) -> dict[str, Any]:
         session = get_session_factory()()
         try:
+            dataflow_result = self._validate_dataflow_output_contract(dataflow_result)
             item = self._upsert_stage_item(
                 session,
                 task=task,
@@ -15255,7 +15449,7 @@ class TaskManager:
                         task.project_id,
                         f"{task.name}-{dataflow_result['function_name']}-scan",
                         token or "",
-                        dataflow_result["data_flow_file"],
+                        str(dataflow_result.get("primary_report_path") or dataflow_result["data_flow_file"]),
                         dataflow_result["source_dir"],
                         _downstream_origin_payload(task, item),
                     )
@@ -15576,6 +15770,8 @@ class TaskManager:
             "artifact_root": item.get("artifact_root"),
             "archive_root": item.get("archive_root"),
             "data_flow_file": item.get("data_flow_file"),
+            "data_flow_root": item.get("data_flow_root") or item.get("artifact_root"),
+            "primary_report_path": item.get("primary_report_path") or item.get("data_flow_file"),
         }
 
     def _compact_vuln_summary_item(self, item: dict[str, Any]) -> dict[str, Any]:
