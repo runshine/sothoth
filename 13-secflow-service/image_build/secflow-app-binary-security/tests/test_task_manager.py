@@ -12491,6 +12491,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                         "token": token,
                         "source_path": source_path,
                         "entry_files_list": None if origin is None else origin.get("entry_files_list"),
+                        "input_contract": None if origin is None else origin.get("input_contract"),
                     }
                 )
                 return {"task_id": "ea-new"}
@@ -12513,6 +12514,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("IPSEC", create_calls[0]["module_name"])
         self.assertEqual(str(artifact_root), create_calls[0]["source_path"])
         self.assertTrue(str(create_calls[0]["entry_files_list"]).endswith("modules/IPSEC/files.list"))
+        self.assertEqual(create_calls[0]["input_path"], create_calls[0]["input_contract"]["module_dir"])
+        self.assertEqual(str(artifact_root), create_calls[0]["input_contract"]["source_root"])
+        self.assertTrue(str(create_calls[0]["input_contract"]["files_list_path"]).endswith("modules/IPSEC/files.list"))
 
     def test_run_entry_item_seeds_dataflow_items_when_streaming_mode_enabled(self):
         task = BinarySecurityTask(

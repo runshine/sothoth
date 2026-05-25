@@ -14639,12 +14639,36 @@ class TaskManager:
                     created = await get_entry_analyse_client().create_task(
                         task.project_id,
                         f"{task.name}-{entry_input['module_name']}-entry",
-                        entry_input["source_dir"],
+                        entry_input.get("module_dir") or entry_input["source_dir"],
                         entry_input["module_name"],
                         token or "",
                         entry_input.get("source_root") or entry_input.get("unpacked_root") or entry_input["source_dir"],
                         {
                             **_downstream_origin_payload(task, item),
+                            "input_contract": {
+                                "module_dir": entry_input.get("module_dir") or entry_input.get("source_dir"),
+                                "files_list_path": (
+                                    entry_input.get("files_list_path")
+                                    or entry_input.get("entry_files_list")
+                                    or entry_input.get("files_list")
+                                ),
+                                "source_root": (
+                                    entry_input.get("source_root")
+                                    or entry_input.get("source_root_path")
+                                    or entry_input.get("entry_descriptor_root")
+                                    or entry_input.get("source_dir")
+                                ),
+                                "source_root_path": (
+                                    entry_input.get("source_root_path")
+                                    or entry_input.get("source_root")
+                                    or entry_input.get("entry_descriptor_root")
+                                    or entry_input.get("source_dir")
+                                ),
+                                "source_dir": entry_input.get("source_dir"),
+                                "files_list": entry_input.get("files_list"),
+                                "entry_descriptor_root": entry_input.get("entry_descriptor_root"),
+                                "entry_files_list": entry_input.get("entry_files_list"),
+                            },
                             "entry_descriptor_root": entry_input.get("entry_descriptor_root"),
                             "entry_files_list": entry_input.get("entry_files_list"),
                         },
