@@ -14210,10 +14210,15 @@ class TaskManager:
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
+                    entry_module_dir = (
+                        entry_input.get("module_dir")
+                        or entry_input.get("source_dir")
+                        or ""
+                    )
                     created = await get_entry_analyse_client().create_task(
                         task.project_id,
                         f"{task.name}-{entry_input['module_name']}-entry",
-                        entry_input["source_dir"],
+                        entry_module_dir,
                         entry_input["module_name"],
                         token or "",
                         entry_input.get("source_root") or entry_input.get("unpacked_root") or entry_input["source_dir"],

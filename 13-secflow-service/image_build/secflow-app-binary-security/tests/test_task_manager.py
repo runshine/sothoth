@@ -12520,7 +12520,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("success", result["status"])
         self.assertEqual(1, len(create_calls))
-        self.assertTrue(create_calls[0]["input_path"].endswith(str(Path("modules") / "IPSEC").replace("\\", "/")) or create_calls[0]["input_path"].endswith(str(artifact_root)))
+        self.assertTrue(str(create_calls[0]["input_path"]).endswith(str(Path("modules") / "IPSEC").replace("\\", "/")))
         self.assertEqual("IPSEC", create_calls[0]["module_name"])
         self.assertEqual(str(artifact_root), create_calls[0]["source_path"])
         self.assertTrue(str(create_calls[0]["entry_files_list"]).endswith("modules/IPSEC/files.list"))
