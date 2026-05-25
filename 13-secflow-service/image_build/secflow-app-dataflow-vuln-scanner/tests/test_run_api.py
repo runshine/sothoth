@@ -924,6 +924,36 @@ def test_run_cancel_active_run_signals_bound_process(service_config_path):
         assert run_index is not None and run_index.status == "cancel_requested"
 
 
+def test_completed_run_reconcile_does_not_mark_active_task_failed(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_completed_reconcile_20260508_010203"
+    bound = _create_execution_bound_run(client, run_root)
+
+    with get_db_session() as db:
+        run_index = db.get(RunIndex, bound["run_id"])
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        trigger = db.get(TriggerTask, bound["task_id"])
+        assert run_index is not None and execution is not None and trigger is not None
+        run_index.status = "completed"
+        execution.status = "running"
+        execution.process_status = "exited"
+        execution.message = "run_vuln_scan.py running"
+        trigger.status = "running"
+        trigger.message = "run_vuln_scan.py running"
+        db.add_all([run_index, execution, trigger])
+        db.commit()
+
+        service = get_execution_service()
+        assert service._reconcile_stale_runtime(db, run_index=run_index, trigger=trigger, execution=execution) is True
+        db.flush()
+        db.refresh(execution)
+        db.refresh(trigger)
+        assert execution.status == "succeeded"
+        assert trigger.status == "succeeded"
+        assert "completed" in (trigger.message or "")
+
+
 def test_run_process_state_uses_startup_grace_before_marking_stale(service_config_path):
     app = create_app()
     client = TestClient(app)
@@ -1120,6 +1150,34 @@ def test_run_retry_execution_uses_resume_cli_argv(service_config_path, monkeypat
     assert "--model" in captured["argv"]
     assert "mock/override" in captured["argv"]
     assert "--thinking" not in captured["argv"]
+
+
+def test_task_list_surfaces_completed_run_when_task_has_stale_failure(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_task_list_stale_failed_completed_20260508_010203"
+    bound = _create_execution_bound_run(client, run_root)
+
+    with get_db_session() as db:
+        trigger = db.get(TriggerTask, bound["task_id"])
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        run_index = db.get(RunIndex, bound["run_id"])
+        assert trigger is not None and execution is not None and run_index is not None
+        trigger.status = "failed"
+        trigger.message = "stale active runtime assumed failed"
+        execution.status = "failed"
+        execution.message = "stale active runtime assumed failed"
+        execution.process_status = "exited"
+        run_index.status = "completed"
+        db.add_all([trigger, execution, run_index])
+        db.commit()
+
+    response = client.get("/api/dataflow-vuln-scanner/tasks?project_id=default")
+    assert response.status_code == 200
+    task_payload = next(item for item in response.json() if item["task_id"] == bound["task_id"])
+    assert task_payload["status"] == "succeeded"
+    assert "completed Run" in task_payload["message"]
+    assert task_payload.get("abnormal_reason") is None
 
 
 def test_run_status_prefers_active_run_meta_over_stale_terminal_state(service_config_path):
@@ -1583,3 +1641,94 @@ def test_run_detail_exposes_linked_task_purpose_and_agent_state_dirs(service_con
     assert payload["linked_task_agent_state_dirs"]["pi-worker"]["root_dir"] == str(worker_root.resolve())
     assert payload["linked_task_agent_state_dirs"]["pi-worker"]["skills_dir"] == f"{worker_root.resolve()}/skills"
     assert payload["linked_task_agent_state_dirs"]["pi-worker"]["memory_dir"] == f"{worker_root.resolve()}/memory"
+
+
+def test_normal_task_uses_promoted_evolution_memory_mode(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    profile_response = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload("memory mode profile"))
+    assert profile_response.status_code == 201
+    profile = profile_response.json()
+    project_root = Path(get_config().fileserver_service.data_mount_path) / "files" / "default"
+    promoted_root = project_root / "app" / "DATAFLOW_VULN_SCANNER" / "agent-state" / "promoted-evolution" / "evo-1" / "round-1" / "pi-worker"
+    (promoted_root / "memory").mkdir(parents=True, exist_ok=True)
+    mode_path = project_root / "app" / "DATAFLOW_VULN_SCANNER" / "agent-state" / "evolution-memory-mode.json"
+    mode_path.parent.mkdir(parents=True, exist_ok=True)
+    mode_path.write_text(
+        json.dumps(
+            {
+                "mode": "evolution",
+                "enabled_agents": ["pi-worker"],
+                "promoted_task_id": "evo-1",
+                "promoted_round": 1,
+                "agent_state_roots": {"pi-worker": str(promoted_root)},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    response = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile["profile_id"],
+            "title": "memory mode task",
+            "task_markdown": "# Demo\n",
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["task_purpose"] == "normal"
+    assert payload["agent_state_dirs"]["pi-worker"]["source"] == "task_override"
+    assert payload["agent_state_dirs"]["pi-worker"]["root_dir"] == str(promoted_root.resolve())
+    assert payload["agent_state_dirs"]["pi-advisor"]["source"] == "shared_default"
+
+
+def test_evolution_task_ignores_project_memory_mode(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    profile_response = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload("evolution ignores mode profile"))
+    assert profile_response.status_code == 201
+    profile = profile_response.json()
+    project_root = Path(get_config().fileserver_service.data_mount_path) / "files" / "default"
+    promoted_root = project_root / "app" / "DATAFLOW_VULN_SCANNER" / "agent-state" / "promoted-evolution" / "evo-1" / "round-1" / "pi-worker"
+    (promoted_root / "memory").mkdir(parents=True, exist_ok=True)
+    mode_path = project_root / "app" / "DATAFLOW_VULN_SCANNER" / "agent-state" / "evolution-memory-mode.json"
+    mode_path.parent.mkdir(parents=True, exist_ok=True)
+    mode_path.write_text(
+        json.dumps(
+            {
+                "mode": "evolution",
+                "enabled_agents": ["pi-worker"],
+                "agent_state_roots": {"pi-worker": str(promoted_root)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    explicit_root = project_root / "DATAFLOW_VULN_SCANNER" / "evolution" / "explicit-worker"
+    explicit_root.mkdir(parents=True, exist_ok=True)
+
+    response = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile["profile_id"],
+            "title": "evolution explicit task",
+            "task_markdown": "# Demo\n",
+            "task_purpose": "evolution",
+            "agent_state_roots": {
+                "pi-worker": {
+                    "root_dir": {
+                        "source": "project_filesystem",
+                        "path": "/DATAFLOW_VULN_SCANNER/evolution/explicit-worker",
+                    }
+                }
+            },
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["task_purpose"] == "evolution"
+    assert payload["agent_state_dirs"]["pi-worker"]["root_dir"] == str(explicit_root.resolve())

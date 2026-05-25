@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import shutil
@@ -23,9 +24,13 @@ from app.model import (
 )
 from app.observability import get_observability
 from app.schemas import (
+    DEFAULT_EVOLVE_AGENTS,
     EvolutionApplyResponse,
     EvolutionConfigPayload,
     EvolutionConfigResponse,
+    EvolutionExperimentCreateRequest,
+    EvolutionMemoryModePatchRequest,
+    EvolutionMemoryModeResponse,
     EvolutionPreviewRequest,
     EvolutionPreviewResponse,
     EvolutionPreviewSource,
@@ -42,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 TERMINAL_TASK_STATUSES = {"succeeded", "failed", "cancelled"}
 TERMINAL_DFVS_STATUSES = {"completed", "succeeded", "failed", "cancelled", "interrupted", "error"}
+ALLOWED_EVOLVE_AGENTS = set(DEFAULT_EVOLVE_AGENTS)
 
 
 def _new_id(prefix: str) -> str:
@@ -193,6 +199,26 @@ class TaskService:
                 seen.add(case_id)
         return deduped
 
+    def _normalize_evolve_agents(self, values: Any) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        raw_values = DEFAULT_EVOLVE_AGENTS if values is None else values
+        for raw in raw_values:
+            agent_id = _trimmed(raw)
+            if not agent_id:
+                continue
+            if agent_id not in ALLOWED_EVOLVE_AGENTS:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"unsupported evolve agent: {agent_id}",
+                )
+            if agent_id not in seen:
+                deduped.append(agent_id)
+                seen.add(agent_id)
+        if not deduped:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="evolve_agents is required")
+        return deduped
+
     def _case_block_reason(self, case: dict[str, Any]) -> str | None:
         metadata = _json_dict(case.get("metadata"))
         review = _json_dict(metadata.get("evolution_review"))
@@ -218,6 +244,25 @@ class TaskService:
 
     def _task_root(self, project_id: str, task_id: str) -> Path:
         return self._workspace_root(project_id) / "tasks" / task_id
+
+    def _dataflow_agent_state_root(self, project_id: str) -> Path:
+        return (
+            Path(get_config().fileserver_service.data_mount_path)
+            / get_config().fileserver_service.project_files_dirname
+            / project_id
+            / "app"
+            / get_config().fileserver_service.dataflow_subproject_name
+            / "agent-state"
+        )
+
+    def _candidate_round_root(self, project_id: str, task_id: str, round_no: int) -> Path:
+        return self._dataflow_agent_state_root(project_id) / "evolution" / task_id / "rounds" / f"round-{round_no}"
+
+    def _promoted_root(self, project_id: str, task_id: str, round_no: int) -> Path:
+        return self._dataflow_agent_state_root(project_id) / "promoted-evolution" / task_id / f"round-{round_no}"
+
+    def _memory_mode_config_path(self, project_id: str) -> Path:
+        return self._dataflow_agent_state_root(project_id) / "evolution-memory-mode.json"
 
     def _default_service_config(self) -> EvolutionConfigPayload:
         service_cfg = get_config().service
@@ -271,11 +316,13 @@ class TaskService:
         task_root = self._task_root(project_id, task_id)
         task_root.mkdir(parents=True, exist_ok=True)
         (task_root / "rounds").mkdir(parents=True, exist_ok=True)
+        evolve_agents = self._normalize_evolve_agents(payload.evolve_agents)
         agent_layout = await self._initialize_agent_layout(
             project_id=project_id,
             task_id=task_id,
             preview=preview,
             token=token,
+            evolve_agents=evolve_agents,
         )
 
         min_rounds = payload.min_rounds or service_config.default_min_rounds
@@ -293,13 +340,17 @@ class TaskService:
             "review_profile": payload.review_profile,
             "agent_run_timeout_seconds": payload.agent_run_timeout_seconds or service_config.evolution_agent_timeout_seconds,
             "evolution_agent_context_window": service_config.evolution_agent_context_window,
+            "evolve_agents": evolve_agents,
+            "candidate_memory_only": True,
+            "meta_evaluator_isolated": True,
+            "replay_auto_report_vulnerabilities": False,
         }
         created_by = _trimmed(principal.get("username") or principal.get("user_id") or principal.get("subject")) or "system"
         task = EvolutionTask(
             id=task_id,
             project_id=project_id,
             title=payload.title,
-            status="pending",
+            status="pending" if payload.auto_start else "created",
             objective=_trimmed(payload.objective) or None,
             metrics_json=dict(payload.metrics or {}),
             source_case_ids_json=preview.effective_case_ids,
@@ -309,7 +360,7 @@ class TaskService:
             default_agent_source_dirs_json=agent_layout["sources"],
             config_json=task_config,
             created_by=created_by,
-            message="等待 worker 执行",
+            message="等待 worker 执行" if payload.auto_start else "等待 start 启动",
         )
         db.add(task)
         for source in preview.sources:
@@ -332,7 +383,7 @@ class TaskService:
                 task_id=task_id,
                 event_type="task_created",
                 summary="进化任务已创建",
-                payload_json={"preview": preview.model_dump(mode="json"), "config": task_config},
+                payload_json={"preview": preview.model_dump(mode="json"), "config": task_config, "evolve_agents": evolve_agents},
             )
         )
         db.commit()
@@ -349,6 +400,40 @@ class TaskService:
         )
         return self._task_summary(task)
 
+    async def create_experiment(
+        self,
+        db: Session,
+        *,
+        payload: EvolutionExperimentCreateRequest,
+        principal: dict[str, Any],
+        token: str,
+    ) -> EvolutionTaskSummary:
+        direction = _trimmed(payload.direction)
+        title = _trimmed(payload.title) or (f"Evolution: {direction[:80]}" if direction else "Evolution Experiment")
+        task_payload = EvolutionTaskCreateRequest(
+            case_ids=payload.selected_results,
+            title=title,
+            objective=direction,
+            metrics=payload.metrics,
+            min_rounds=payload.min_rounds,
+            max_rounds=payload.max_rounds,
+            max_concurrent_source_tasks=payload.max_concurrent_source_tasks,
+            profile_id=payload.profile_id,
+            model=payload.model,
+            provider=payload.provider,
+            review_profile=payload.review_profile,
+            agent_run_timeout_seconds=payload.agent_run_timeout_seconds,
+            evolve_agents=payload.evolve_agents,
+            auto_start=False,
+        )
+        return await self.create_task(
+            db,
+            project_id=payload.project_id,
+            payload=task_payload,
+            principal=principal,
+            token=token,
+        )
+
     async def _initialize_agent_layout(
         self,
         *,
@@ -356,6 +441,7 @@ class TaskService:
         task_id: str,
         preview: EvolutionPreviewResponse,
         token: str,
+        evolve_agents: list[str],
     ) -> dict[str, dict[str, str]]:
         if not preview.sources:
             return {"roots": {}, "sources": {}}
@@ -369,25 +455,22 @@ class TaskService:
 
         roots: dict[str, str] = {}
         sources: dict[str, str] = {}
-        for agent_id, item in source_dirs.items():
+        for agent_id in evolve_agents:
+            item = _json_dict(source_dirs.get(agent_id))
             safe_agent_id = _trimmed(agent_id)
             if not safe_agent_id:
                 continue
             root_path = (
-                Path(get_config().fileserver_service.data_mount_path)
-                / get_config().fileserver_service.project_files_dirname
-                / project_id
-                / "app"
-                / get_config().fileserver_service.dataflow_subproject_name
-                / "agent-state"
+                self._dataflow_agent_state_root(project_id)
                 / "evolution"
                 / task_id
+                / "seed"
                 / safe_agent_id
-                / uuid.uuid4().hex[:8]
             )
             root_path.mkdir(parents=True, exist_ok=True)
-            source_root = Path(_trimmed(_json_dict(item).get("root_dir")))
-            if source_root.exists() and source_root.is_dir():
+            source_root_text = _trimmed(item.get("root_dir"))
+            source_root = Path(source_root_text) if source_root_text else Path()
+            if source_root_text and source_root.exists() and source_root.is_dir():
                 for child in source_root.iterdir():
                     target = root_path / child.name
                     if child.is_dir():
@@ -397,7 +480,7 @@ class TaskService:
             (root_path / "skills").mkdir(parents=True, exist_ok=True)
             (root_path / "memory").mkdir(parents=True, exist_ok=True)
             roots[safe_agent_id] = str(root_path)
-            sources[safe_agent_id] = str(source_root)
+            sources[safe_agent_id] = str(source_root) if source_root_text else ""
         return {"roots": roots, "sources": sources}
 
     def _default_agent_dirs_from_config(self, project_id: str, config_payload: dict[str, Any]) -> dict[str, dict[str, str]]:
@@ -463,6 +546,7 @@ class TaskService:
             preview=EvolutionPreviewResponse.model_validate(_json_dict(task.preview_payload_json)),
             agent_state_roots={key: str(value) for key, value in _json_dict(task.agent_state_roots_json).items()},
             default_agent_source_dirs={key: str(value) for key, value in _json_dict(task.default_agent_source_dirs_json).items()},
+            best_candidate_agent_state_roots=self._best_candidate_roots(db, task),
             sources=[
                 {
                     "source_task_id": row.source_task_id,
@@ -496,6 +580,22 @@ class TaskService:
             ],
         )
 
+    def _best_candidate_roots(self, db: Session, task: EvolutionTask) -> dict[str, str]:
+        best_round = task.best_round
+        if best_round is None:
+            return {}
+        row = (
+            db.query(EvolutionTaskRound)
+            .filter(EvolutionTaskRound.task_id == task.id, EvolutionTaskRound.round_no == best_round)
+            .first()
+        )
+        if row is None:
+            return {}
+        return {
+            key: str(value)
+            for key, value in _json_dict(_json_dict(row.diff_summary_json).get("candidate_agent_state_roots")).items()
+        }
+
     def list_rounds(self, db: Session, project_id: str, task_id: str) -> list[EvolutionTaskRoundResponse]:
         self._task_or_404(db, project_id, task_id)
         rows = (
@@ -506,56 +606,58 @@ class TaskService:
         )
         return [self._round_payload(item) for item in rows]
 
+    def start_task(self, db: Session, *, project_id: str, task_id: str) -> EvolutionTaskSummary:
+        task = self._task_or_404(db, project_id, task_id)
+        if task.status == "created":
+            task.status = "pending"
+            task.message = "等待 worker 执行"
+            db.add(
+                EvolutionTaskEvent(
+                    id=_new_id("evt"),
+                    task_id=task.id,
+                    event_type="task_start_requested",
+                    summary="进化任务已启动",
+                    payload_json={},
+                )
+            )
+            db.commit()
+            db.refresh(task)
+        elif task.status != "pending":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"task cannot start from status: {task.status}")
+        return self._task_summary(task)
+
     async def apply_task(self, db: Session, *, project_id: str, task_id: str, token: str) -> EvolutionApplyResponse:
         _ = token
         task = self._task_or_404(db, project_id, task_id)
         if task.status != "succeeded":
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="only succeeded task can be applied")
+        if task.best_round is None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="task has no promotable round")
 
-        timestamp = now_local().strftime("%Y%m%dT%H%M%SZ")
-        snapshot_root = (
-            Path(get_config().fileserver_service.data_mount_path)
-            / get_config().fileserver_service.project_files_dirname
-            / project_id
-            / "app"
-            / get_config().fileserver_service.dataflow_subproject_name
-            / "agent-state"
-            / "backups"
-            / f"{timestamp}-{task.id}"
+        promoted_roots = self._promote_round_roots(task, int(task.best_round))
+        memory_mode = self._save_memory_mode(
+            db,
+            project_id=project_id,
+            payload=EvolutionMemoryModePatchRequest(
+                mode="evolution",
+                enabled_agents=list(promoted_roots.keys()),
+                promoted_task_id=task.id,
+                promoted_round=int(task.best_round),
+            ),
+            agent_state_roots=promoted_roots,
         )
-        snapshot_root.mkdir(parents=True, exist_ok=True)
-        task_roots = _json_dict(task.agent_state_roots_json)
-        default_roots = _json_dict(task.default_agent_source_dirs_json)
-        for agent_id, destination_root in default_roots.items():
-            destination = Path(_trimmed(destination_root))
-            if destination.exists():
-                shutil.copytree(destination, snapshot_root / agent_id, dirs_exist_ok=True)
-                for child in destination.iterdir():
-                    if child.is_dir():
-                        shutil.rmtree(child, ignore_errors=True)
-                    else:
-                        child.unlink(missing_ok=True)
-            destination.mkdir(parents=True, exist_ok=True)
-            evolution_root = Path(_trimmed(task_roots.get(agent_id)))
-            if evolution_root.exists():
-                for child in evolution_root.iterdir():
-                    target = destination / child.name
-                    if child.is_dir():
-                        shutil.copytree(child, target, dirs_exist_ok=True)
-                    else:
-                        shutil.copy2(child, target)
 
         task.apply_status = "applied"
-        task.apply_snapshot_path = str(snapshot_root)
+        task.apply_snapshot_path = str(self._promoted_root(project_id, task.id, int(task.best_round)))
         task.message = "已应用进化产物"
         db.add(
             EvolutionTaskArtifact(
                 id=_new_id("art"),
                 task_id=task.id,
                 round_no=None,
-                artifact_type="apply_snapshot",
-                path=str(snapshot_root),
-                metadata_json={"applied_at": isoformat_local(now_local())},
+                artifact_type="promotion",
+                path=task.apply_snapshot_path,
+                metadata_json={"applied_at": isoformat_local(now_local()), "memory_mode": memory_mode.model_dump(mode="json")},
             )
         )
         db.add(
@@ -564,11 +666,136 @@ class TaskService:
                 task_id=task.id,
                 event_type="task_applied",
                 summary="已应用进化产物",
-                payload_json={"snapshot_path": str(snapshot_root)},
+                payload_json={"promoted_roots": promoted_roots, "memory_mode": memory_mode.model_dump(mode="json")},
             )
         )
         db.commit()
-        return EvolutionApplyResponse(status="ok", task_id=task.id, snapshot_path=str(snapshot_root), message="进化产物已应用")
+        return EvolutionApplyResponse(status="ok", task_id=task.id, snapshot_path=task.apply_snapshot_path, message="进化产物已晋级并启用")
+
+    async def promote_task(self, db: Session, *, project_id: str, task_id: str, token: str) -> EvolutionApplyResponse:
+        return await self.apply_task(db, project_id=project_id, task_id=task_id, token=token)
+
+    def _promote_round_roots(self, task: EvolutionTask, round_no: int) -> dict[str, str]:
+        candidate_roots = self._candidate_roots_for_round(task, round_no)
+        if not candidate_roots:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="best round has no candidate memory package")
+        promoted_root = self._promoted_root(task.project_id, task.id, round_no)
+        promoted_root.mkdir(parents=True, exist_ok=True)
+        promoted_roots: dict[str, str] = {}
+        for agent_id, source_root_raw in candidate_roots.items():
+            source_root = Path(_trimmed(source_root_raw))
+            destination = promoted_root / agent_id
+            if destination.exists():
+                shutil.rmtree(destination, ignore_errors=True)
+            destination.mkdir(parents=True, exist_ok=True)
+            memory_source = source_root / "memory"
+            if memory_source.exists() and memory_source.is_dir():
+                shutil.copytree(memory_source, destination / "memory", dirs_exist_ok=True)
+            else:
+                (destination / "memory").mkdir(parents=True, exist_ok=True)
+            promoted_roots[agent_id] = str(destination)
+        return promoted_roots
+
+    def get_memory_mode(self, db: Session, project_id: str) -> EvolutionMemoryModeResponse:
+        row = db.get(EvolutionServiceConfig, self._memory_mode_key(project_id))
+        config = _json_dict(row.config_json) if row else {}
+        return self._memory_mode_response(project_id, config, row.updated_at if row else None)
+
+    def save_memory_mode(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        payload: EvolutionMemoryModePatchRequest,
+    ) -> EvolutionMemoryModeResponse:
+        current = self.get_memory_mode(db, project_id).model_dump(mode="json")
+        roots = _json_dict(current.get("agent_state_roots"))
+        if payload.mode == "evolution":
+            task_id = _trimmed(payload.promoted_task_id or current.get("promoted_task_id"))
+            round_no = payload.promoted_round or current.get("promoted_round")
+            if task_id and round_no:
+                task = self._task_or_404(db, project_id, task_id)
+                roots = {
+                    agent_id: str(self._promoted_root(project_id, task.id, int(round_no)) / agent_id)
+                    for agent_id in self._normalize_evolve_agents(payload.enabled_agents)
+                    if (self._promoted_root(project_id, task.id, int(round_no)) / agent_id).exists()
+                }
+            if not roots:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="evolution memory mode requires promoted agent roots")
+        else:
+            roots = {}
+        return self._save_memory_mode(db, project_id=project_id, payload=payload, agent_state_roots=roots)
+
+    def _save_memory_mode(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        payload: EvolutionMemoryModePatchRequest,
+        agent_state_roots: dict[str, str],
+    ) -> EvolutionMemoryModeResponse:
+        requested_agents = self._normalize_evolve_agents(payload.enabled_agents) if payload.mode == "evolution" else []
+        enabled_agents = [agent_id for agent_id in requested_agents if _trimmed(agent_state_roots.get(agent_id))]
+        if payload.mode == "evolution" and not enabled_agents:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="evolution memory mode requires enabled promoted agent roots")
+        config = {
+            "project_id": project_id,
+            "mode": payload.mode,
+            "enabled_agents": enabled_agents,
+            "promoted_task_id": _trimmed(payload.promoted_task_id) or None,
+            "promoted_round": payload.promoted_round,
+            "agent_state_roots": {
+                agent_id: _trimmed(agent_state_roots.get(agent_id))
+                for agent_id in enabled_agents
+                if _trimmed(agent_state_roots.get(agent_id))
+            },
+            "updated_at": isoformat_local(now_local()),
+        }
+        row = db.get(EvolutionServiceConfig, self._memory_mode_key(project_id))
+        if row is None:
+            row = EvolutionServiceConfig(config_key=self._memory_mode_key(project_id), config_json=config)
+        else:
+            row.config_json = config
+        db.add(row)
+        db.flush()
+        self._write_memory_mode_file(project_id, config)
+        db.commit()
+        db.refresh(row)
+        return self._memory_mode_response(project_id, _json_dict(row.config_json), row.updated_at)
+
+    def _memory_mode_key(self, project_id: str) -> str:
+        digest = hashlib.sha256(project_id.encode("utf-8")).hexdigest()[:32]
+        return f"project-memory-mode:{digest}"
+
+    def _memory_mode_response(
+        self,
+        project_id: str,
+        config: dict[str, Any],
+        updated_at: Any = None,
+    ) -> EvolutionMemoryModeResponse:
+        mode = _trimmed(config.get("mode")) or "shared"
+        if mode not in {"shared", "evolution"}:
+            mode = "shared"
+        roots = {key: str(value) for key, value in _json_dict(config.get("agent_state_roots")).items()} if mode == "evolution" else {}
+        raw_enabled = _json_list(config.get("enabled_agents"))
+        enabled_agents = [agent_id for agent_id in raw_enabled if _trimmed(agent_id) in roots]
+        if mode == "evolution" and not enabled_agents:
+            enabled_agents = list(roots.keys())
+        return EvolutionMemoryModeResponse(
+            project_id=project_id,
+            mode=mode,  # type: ignore[arg-type]
+            enabled_agents=enabled_agents,
+            promoted_task_id=_trimmed(config.get("promoted_task_id")) or None,
+            promoted_round=config.get("promoted_round"),
+            agent_state_roots=roots,
+            config_path=str(self._memory_mode_config_path(project_id)),
+            updated_at=updated_at,
+        )
+
+    def _write_memory_mode_file(self, project_id: str, config: dict[str, Any]) -> None:
+        path = self._memory_mode_config_path(project_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
     async def delete_task(self, db: Session, *, project_id: str, task_id: str, token: str) -> None:
         task = self._task_or_404(db, project_id, task_id)
@@ -617,6 +844,7 @@ class TaskService:
             apply_status=row.apply_status or "not_applied",
             source_task_ids=_json_list(row.source_task_ids_json),
             source_case_ids=_json_list(row.source_case_ids_json),
+            evolve_agents=_json_list(_json_dict(row.config_json).get("evolve_agents")),
             config=_json_dict(row.config_json),
             message=row.message,
             created_by=row.created_by,
@@ -638,6 +866,11 @@ class TaskService:
             convergence_reason=row.convergence_reason,
             derived_tasks=_json_list(row.derived_tasks_json),
             diff_summary=_json_dict(row.diff_summary_json),
+            candidate_agent_state_roots={
+                key: str(value)
+                for key, value in _json_dict(_json_dict(row.diff_summary_json).get("candidate_agent_state_roots")).items()
+            },
+            meta_evaluation=_json_dict(_json_dict(row.diff_summary_json).get("meta_evaluation")),
             started_at=row.started_at,
             finished_at=row.finished_at,
             created_at=row.created_at,
@@ -653,6 +886,12 @@ class TaskService:
         if row is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="task not found")
         return row
+
+    def task_project_id_or_404(self, db: Session, task_id: str) -> str:
+        row = db.query(EvolutionTask).filter(EvolutionTask.id == task_id, EvolutionTask.deleted.is_(False)).first()
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="task not found")
+        return row.project_id
 
     def _service_authorization(self) -> str:
         token = _trimmed(get_config().auth_service.service_machine_token)
@@ -724,10 +963,38 @@ class TaskService:
                     evolution_round=round_no,
                     pool_type="evolution",
                 )
-                metrics = self._compute_round_metrics(preview, list(round_cases.get("items") or []))
+                metrics = self._compute_round_metrics(preview, list(round_cases.get("items") or []), derived_tasks=derived_tasks)
                 score, score_reason = self._score_metrics(metrics)
-                adjustment_summary = self._write_adjustment_files(task, round_no, metrics, score_reason)
-                converge = round_no >= min_rounds and self._should_converge(metrics, score, best_score, round_no, max_rounds)
+                candidate_roots = self._candidate_roots_for_round(task, round_no)
+                meta_evaluation = self._meta_evaluate_round(
+                    task=task,
+                    round_no=round_no,
+                    metrics=metrics,
+                    score=score,
+                    score_reason=score_reason,
+                    candidate_roots=candidate_roots,
+                )
+                adjustment_summary = self._write_adjustment_files(
+                    task,
+                    round_no,
+                    metrics,
+                    score_reason,
+                    candidate_roots=candidate_roots,
+                    meta_evaluation=meta_evaluation,
+                )
+                converge = round_no >= min_rounds and self._should_converge(
+                    metrics,
+                    score,
+                    best_score,
+                    round_no,
+                    max_rounds,
+                    meta_evaluation=meta_evaluation,
+                )
+                convergence_reason = self._round_convergence_reason(
+                    round_no=round_no,
+                    max_rounds=max_rounds,
+                    meta_evaluation=meta_evaluation,
+                ) if converge else None
 
                 round_row.status = "succeeded"
                 round_row.metrics_json = metrics
@@ -735,9 +1002,13 @@ class TaskService:
                 round_row.score_reason = score_reason
                 round_row.adjustment_summary = adjustment_summary
                 round_row.convergence_decision = converge
-                round_row.convergence_reason = "达到最小轮次后收益趋于收敛" if converge else None
+                round_row.convergence_reason = convergence_reason
                 round_row.derived_tasks_json = derived_tasks
-                round_row.diff_summary_json = {"agent_count": len(_json_dict(task.agent_state_roots_json))}
+                round_row.diff_summary_json = {
+                    "agent_count": len(candidate_roots),
+                    "candidate_agent_state_roots": candidate_roots,
+                    "meta_evaluation": meta_evaluation,
+                }
                 round_row.finished_at = now_local()
                 get_observability().record_round_metrics(round_no, metrics, score, derived_tasks)
 
@@ -769,7 +1040,7 @@ class TaskService:
                 if converge:
                     task.status = "succeeded"
                     task.finished_at = now_local()
-                    task.convergence_reason = "达到最小轮次后收敛"
+                    task.convergence_reason = convergence_reason
                     task.message = f"已在第 {round_no} 轮收敛"
                     get_observability().record_task_finished(task, task.status)
                     db.commit()
@@ -833,6 +1104,7 @@ class TaskService:
         semaphore = asyncio.Semaphore(concurrency)
         dataflow_client = get_dataflow_vuln_client()
         derived_results: list[dict[str, Any]] = []
+        candidate_roots = self._prepare_candidate_roots(task, round_no)
 
         async def _launch(source: EvolutionTaskSource) -> None:
             async with semaphore:
@@ -850,14 +1122,14 @@ class TaskService:
                                 "path": self._project_visible_path(task.project_id, Path(str(root_path))),
                             }
                         }
-                        for agent_id, root_path in _json_dict(task.agent_state_roots_json).items()
+                        for agent_id, root_path in candidate_roots.items()
                     },
                     "scan_options": {},
                     "evolution_task_id": task.id,
                     "evolution_round": round_no,
                     "evolution_source_task_id": source.source_task_id,
                     "evolution_source_execution_id": source.source_execution_id,
-                    "auto_report_vulnerabilities": True,
+                    "auto_report_vulnerabilities": False,
                 }
                 payload = {key: value for key, value in payload.items() if value not in (None, "", {}, [])}
 
@@ -880,6 +1152,10 @@ class TaskService:
                         current_status = _trimmed(detail.get("status")).lower()
                         result["status"] = current_status or detail.get("status")
                         result["latest_execution_id"] = detail.get("latest_execution_id")
+                        latest_run = detail.get("latest_run") or detail.get("run") or {}
+                        if isinstance(latest_run, dict):
+                            result["latest_run"] = latest_run
+                            result["result_count"] = latest_run.get("result_count")
                         if current_status in TERMINAL_DFVS_STATUSES:
                             break
                     if _trimmed(result.get("status")).lower() not in {"completed", "succeeded"}:
@@ -889,6 +1165,61 @@ class TaskService:
 
         await asyncio.gather(*[_launch(source) for source in sources])
         return derived_results
+
+    def _prepare_candidate_roots(self, task: EvolutionTask, round_no: int) -> dict[str, str]:
+        candidate_root = self._candidate_round_root(task.project_id, task.id, round_no)
+        seed_roots = self._candidate_roots_for_round(task, round_no - 1) if round_no > 1 else {}
+        if not seed_roots:
+            seed_roots = _json_dict(task.agent_state_roots_json)
+        roots: dict[str, str] = {}
+        for agent_id, seed_root_raw in seed_roots.items():
+            safe_agent_id = _trimmed(agent_id)
+            if not safe_agent_id:
+                continue
+            target_root = candidate_root / safe_agent_id
+            seed_root = Path(_trimmed(seed_root_raw))
+            if seed_root.exists() and seed_root.is_dir():
+                shutil.copytree(seed_root, target_root, dirs_exist_ok=True)
+            target_root.mkdir(parents=True, exist_ok=True)
+            (target_root / "memory").mkdir(parents=True, exist_ok=True)
+            roots[safe_agent_id] = str(target_root)
+        self._write_candidate_memory(task, round_no, roots)
+        return roots
+
+    def _write_candidate_memory(self, task: EvolutionTask, round_no: int, roots: dict[str, str]) -> None:
+        config = _json_dict(task.config_json)
+        summary = (
+            f"# Evolution Candidate Round {round_no}\n\n"
+            f"- objective: {_trimmed(task.objective) or 'not specified'}\n"
+            f"- evolved_agents: `{json.dumps(_json_list(config.get('evolve_agents')), ensure_ascii=False)}`\n"
+            "- scope: memory-only candidate generated before replay\n"
+            "- guardrail: do not suppress high-value real vulnerabilities unless the objective explicitly targets them\n"
+        )
+        for agent_id, root in roots.items():
+            memory_dir = Path(root) / "memory"
+            memory_dir.mkdir(parents=True, exist_ok=True)
+            advisor_guardrails = ""
+            if agent_id == "pi-advisor":
+                advisor_guardrails = (
+                    "\nAdvisor-specific guardrails:\n"
+                    "- Do not make the scanner appear better by relaxing review standards.\n"
+                    "- Do not mark real vulnerabilities false_positive without evidence.\n"
+                    "- Do not shorten global review coverage depth just to pass faster.\n"
+                )
+            (memory_dir / f"evolution-candidate-round-{round_no}.md").write_text(
+                summary + advisor_guardrails,
+                encoding="utf-8",
+            )
+
+    def _candidate_roots_for_round(self, task: EvolutionTask, round_no: int) -> dict[str, str]:
+        root = self._candidate_round_root(task.project_id, task.id, round_no)
+        config_agents = self._normalize_evolve_agents(_json_dict(task.config_json).get("evolve_agents"))
+        roots: dict[str, str] = {}
+        for agent_id in config_agents:
+            candidate = root / agent_id
+            if candidate.exists():
+                roots[agent_id] = str(candidate)
+        return roots
 
     def _project_visible_path(self, project_id: str, absolute_path: Path) -> str:
         project_root = (
@@ -908,6 +1239,8 @@ class TaskService:
         self,
         preview: EvolutionPreviewResponse,
         evolution_cases: list[dict[str, Any]],
+        *,
+        derived_tasks: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         expected_by_source = {item.source_task_id: len(item.all_case_ids) for item in preview.sources}
         actual_by_source: dict[str, int] = {}
@@ -931,6 +1264,17 @@ class TaskService:
             if reported_severity and current_severity and reported_severity != current_severity:
                 severity_shift_count += 1
 
+        if not evolution_cases:
+            for derived in derived_tasks or []:
+                source_task_id = _trimmed(derived.get("source_task_id"))
+                if not source_task_id:
+                    continue
+                result_count = _as_int(derived.get("result_count"), -1)
+                if result_count < 0:
+                    latest_run = _json_dict(derived.get("latest_run"))
+                    result_count = _as_int(latest_run.get("result_count"), 0)
+                actual_by_source[source_task_id] = actual_by_source.get(source_task_id, 0) + max(result_count, 0)
+
         false_negative_count = 0
         false_positive_count = 0
         for source_task_id, expected_count in expected_by_source.items():
@@ -942,11 +1286,15 @@ class TaskService:
         false_positive_count += unknown_cases
 
         expected_case_count = sum(expected_by_source.values())
-        reported_case_count = len(evolution_cases)
+        formal_case_count = len(evolution_cases)
+        derived_task_reported_count = sum(actual_by_source.values()) if not evolution_cases else None
+        reported_case_count = formal_case_count if formal_case_count else int(derived_task_reported_count or 0)
         avg_discovery_round = sum(review_cycles) / len(review_cycles) if review_cycles else 0.0
         return {
             "expected_case_count": expected_case_count,
             "reported_case_count": reported_case_count,
+            "derived_task_reported_count": derived_task_reported_count,
+            "formal_evolution_case_count": formal_case_count,
             "false_negative_count": false_negative_count,
             "false_positive_count": false_positive_count,
             "false_negative_rate": (false_negative_count / expected_case_count) if expected_case_count else 0.0,
@@ -965,33 +1313,87 @@ class TaskService:
         score = int(1000 - 500 * false_negative_rate - 300 * false_positive_rate - 20 * avg_discovery_round - 5 * severity_shift_count)
         return score, "规则评分：综合漏报率、误报率、漏洞发现轮次与等级漂移"
 
+    def _meta_evaluate_round(
+        self,
+        *,
+        task: EvolutionTask,
+        round_no: int,
+        metrics: dict[str, Any],
+        score: int,
+        score_reason: str,
+        candidate_roots: dict[str, str],
+    ) -> dict[str, Any]:
+        advisor_evolved = "pi-advisor" in candidate_roots
+        false_negative_rate = float(metrics.get("false_negative_rate") or 0.0)
+        false_positive_rate = float(metrics.get("false_positive_rate") or 0.0)
+        reported_count = _as_int(metrics.get("reported_case_count"), 0)
+        expected_count = _as_int(metrics.get("expected_case_count"), 0)
+        guardrails: list[str] = []
+        if advisor_evolved:
+            guardrails.extend(
+                [
+                    "candidate pi-advisor memory is not used by this meta evaluator",
+                    "晋级不能只依赖 scanner 内部 advisor 的通过结论",
+                    "需防止把真实漏洞错误标记为 false positive 或降低全局评审深度",
+                ]
+            )
+        risks: list[str] = []
+        if expected_count and reported_count < expected_count:
+            risks.append("candidate replay reported fewer results than baseline-selected source set; check high-value false suppression")
+        if false_negative_rate > 0:
+            risks.append("non-target/high-value result loss risk is non-zero")
+        if advisor_evolved and (false_negative_rate > 0 or reported_count == 0):
+            risks.append("advisor memory may be relaxing review acceptance instead of improving exploration")
+        passed = score >= 800 and false_negative_rate <= 0.05 and false_positive_rate <= 0.2 and not (advisor_evolved and reported_count == 0)
+        report = {
+            "evaluator": "secflow-binary-evolution-meta-evaluator",
+            "isolated_from_candidate_agent_memory": True,
+            "round_no": round_no,
+            "objective": task.objective,
+            "score": score,
+            "score_reason": score_reason,
+            "decision": "pass" if passed else "continue",
+            "passed": passed,
+            "advisor_memory_evolved": advisor_evolved,
+            "guardrails": guardrails,
+            "risks": risks,
+            "metrics": metrics,
+        }
+        round_root = self._task_root(task.project_id, task.id) / "rounds" / f"round-{round_no}"
+        round_root.mkdir(parents=True, exist_ok=True)
+        (round_root / "meta-evaluator-report.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return report
+
     def _write_adjustment_files(
         self,
         task: EvolutionTask,
         round_no: int,
         metrics: dict[str, Any],
         score_reason: str,
+        *,
+        candidate_roots: dict[str, str] | None = None,
+        meta_evaluation: dict[str, Any] | None = None,
     ) -> str:
         round_root = self._task_root(task.project_id, task.id) / "rounds" / f"round-{round_no}"
         round_root.mkdir(parents=True, exist_ok=True)
+        candidate_roots = dict(candidate_roots or self._candidate_roots_for_round(task, round_no))
+        meta_evaluation = dict(meta_evaluation or {})
         summary = (
             f"# Evolution Round {round_no}\n\n"
             f"- score_reason: {score_reason}\n"
             f"- metrics: `{json.dumps(metrics, ensure_ascii=False)}`\n"
+            f"- meta_evaluator: `{json.dumps(meta_evaluation, ensure_ascii=False)}`\n"
         )
         (round_root / "evolution-agent-report.md").write_text(summary, encoding="utf-8")
         (round_root / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
-        roots = _json_dict(task.agent_state_roots_json)
+        roots = candidate_roots
         for agent_id, root in roots.items():
             memory_dir = Path(str(root)) / "memory"
-            skills_dir = Path(str(root)) / "skills"
             memory_dir.mkdir(parents=True, exist_ok=True)
-            skills_dir.mkdir(parents=True, exist_ok=True)
             (memory_dir / f"evolution-round-{round_no}.md").write_text(summary, encoding="utf-8")
-            (skills_dir / f"evolution-hints-round-{round_no}.md").write_text(
-                "当前轮次请优先降低漏报率，其次控制误报率，并保持更早发现。\n\n" + summary,
-                encoding="utf-8",
-            )
         return summary
 
     def _should_converge(
@@ -1001,14 +1403,28 @@ class TaskService:
         best_score: int | None,
         round_no: int,
         max_rounds: int,
+        *,
+        meta_evaluation: dict[str, Any] | None = None,
     ) -> bool:
+        _ = metrics, score, best_score
         if round_no >= max_rounds:
             return True
-        if float(metrics.get("false_negative_rate") or 0.0) <= 0 and float(metrics.get("false_positive_rate") or 0.0) <= 0:
-            return True
-        if best_score is not None and score <= best_score and round_no > 1:
+        if bool(_json_dict(meta_evaluation).get("passed")):
             return True
         return False
+
+    def _round_convergence_reason(
+        self,
+        *,
+        round_no: int,
+        max_rounds: int,
+        meta_evaluation: dict[str, Any],
+    ) -> str:
+        if round_no >= max_rounds:
+            return "达到最大轮次"
+        if bool(_json_dict(meta_evaluation).get("passed")):
+            return "meta evaluator 评审通过"
+        return "达到收敛条件"
 
 
 _task_service: TaskService | None = None

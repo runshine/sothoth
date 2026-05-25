@@ -35,20 +35,8 @@ from app.pi_vuln_core.review.read_only_guard import (
     format_read_only_violations,
     take_read_only_snapshot,
 )
-from app.pi_vuln_core.review.previous_limitations import (
-    load_previous_limitations,
-)
-from app.pi_vuln_core.review.profile import (
-    format_review_profile_policy,
-)
 from app.pi_vuln_core.review.state import ReviewState, GlobalReviewRecord
 from app.pi_vuln_core.utils.file_ops import read_file, read_json, write_json
-from app.pi_vuln_core.utils.result_docs import (
-    classify_final_result_files,
-    list_result_report_files,
-    list_supporting_markdown_files,
-    results_manifest_path,
-)
 from app.pi_vuln_core.utils.template import render_string
 from app.pi_vuln_core.utils.logger import get_logger
 
@@ -117,17 +105,12 @@ class GlobalReviewExecutor:
         Returns:
             (passed: bool, feedback: str)
         """
-        review_profile = (
-            engine_config.review_profile if engine_config is not None else "fast"
-        )
-        prompt_context = self._build_review_context_text(
+        supporting_docs_dir = str(Path(work_dir) / "supporting_docs")
+        schema_repair_hint = self._build_schema_repair_hint(
             task_file=task_file,
             summary_file=summary_file,
             results_dir=results_dir,
-            work_dir=work_dir,
-            cycle=cycle,
-            review_state=review_state,
-            review_profile=review_profile,
+            supporting_docs_dir=supporting_docs_dir,
         )
 
         active_advisors = [
@@ -164,9 +147,11 @@ class GlobalReviewExecutor:
                 advisor_def=advisor_def,
                 index=index,
                 total_advisors=len(active_advisors),
-                prompt_context=prompt_context,
                 task_file=task_file,
+                summary_file=summary_file,
                 results_dir=results_dir,
+                supporting_docs_dir=supporting_docs_dir,
+                schema_repair_hint=schema_repair_hint,
                 work_dir=work_dir,
                 cycle=cycle,
                 review_state=review_state,
@@ -314,9 +299,11 @@ class GlobalReviewExecutor:
         advisor_def: AdvisorInstanceDef,
         index: int,
         total_advisors: int,
-        prompt_context: dict[str, str],
         task_file: str,
+        summary_file: str,
         results_dir: str,
+        supporting_docs_dir: str,
+        schema_repair_hint: str,
         work_dir: str,
         cycle: int,
         review_state: ReviewState,
@@ -324,7 +311,6 @@ class GlobalReviewExecutor:
     ) -> dict:
         """执行单个全局评审参谋，返回结构化结果。"""
         agent = self.agents.get(advisor_def.agent_id)
-        worker_system_prompt_file = self._infer_worker_system_prompt_file(advisor_def)
 
         system_prompt = (
             None
@@ -338,26 +324,12 @@ class GlobalReviewExecutor:
         user_prompt = render_string(
             user_prompt_tpl,
             strict=True,
-            cycle=str(cycle),
-            workflow_mode=review_state.workflow_mode,
-            current_issue_count=str(len(review_state.get_recent_issues(last_n=2))),
             task_file=task_file,
-            summary_file=prompt_context["summary_file"],
+            summary_file=summary_file,
             results_dir=results_dir,
-            supporting_docs_dir=prompt_context["supporting_docs_dir"],
-            previous_limitations_file=prompt_context["previous_limitations_file"],
-            result_relations_manifest_file=prompt_context["result_relations_manifest_file"],
-            results_manifest_file=prompt_context["results_manifest_file"],
-            review_context=prompt_context["context_text"],
+            supporting_docs_dir=supporting_docs_dir,
             advisor_instance_id=advisor_def.instance_id,
             advisor_role_name=advisor_def.role_name,
-            current_global_review_index=str(index),
-            total_global_review_advisors=str(total_advisors),
-            prior_global_findings="(本轮全局评审并行执行，各参谋独立评审)",
-            worker_system_prompt_file=worker_system_prompt_file,
-            score_thresholds=self._format_score_thresholds_for_advisor(advisor_def, cycle),
-            required_score_fields=self._format_required_score_fields_for_advisor(advisor_def),
-            closure_review_policy=self._format_closure_review_policy(review_state.workflow_mode),
         )
 
         session_key = advisor_def.instance_id
@@ -375,7 +347,7 @@ class GlobalReviewExecutor:
             "global_review_start",
             advisor=advisor_def.instance_id,
             cycle=cycle,
-            summary_file=prompt_context["summary_file"],
+            summary_file=summary_file,
         )
         response = None
         guard_before = None
@@ -526,7 +498,7 @@ class GlobalReviewExecutor:
                 session_id=session_id,
                 system_prompt=system_prompt,
                 working_dir=work_dir,
-                review_context_hint=prompt_context["repair_hint"],
+                review_context_hint=schema_repair_hint,
                 initial_response_content=response.content or "",
                 required_score_keys=required_score_keys,
             )
@@ -749,11 +721,6 @@ class GlobalReviewExecutor:
         return f"{advisor_id}:{issue_id}"
 
     @staticmethod
-    def _infer_worker_system_prompt_file(advisor_def: AdvisorInstanceDef) -> str:
-        candidate = Path(advisor_def.user_prompt_template).with_name("worker_system.md")
-        return str(candidate) if candidate.is_file() else ""
-
-    @staticmethod
     def _is_completeness_advisor(advisor_def: AdvisorInstanceDef) -> bool:
         advisor_id = str(advisor_def.instance_id or "").strip().lower()
         return advisor_id == "global_completeness" or "completeness" in advisor_id
@@ -813,122 +780,18 @@ class GlobalReviewExecutor:
             f"`{key}`" for key in cls._required_score_keys_for_advisor(advisor_def)
         )
 
-    def _build_review_context_text(
-        self,
+    @staticmethod
+    def _build_schema_repair_hint(
         *,
         task_file: str,
         summary_file: str,
         results_dir: str,
-        work_dir: str,
-        cycle: int,
-        review_state: ReviewState,
-        review_profile: str = "balanced",
-    ) -> dict[str, str]:
-        current_result_files = list_result_report_files(results_dir)
-        final_selection = classify_final_result_files(results_dir, summary_file)
-        passed_results = set(review_state.get_passed_result_filenames(current_result_files))
-        failed_results = set(review_state.get_failed_result_filenames(current_result_files))
-        pending_results = [
-            name for name in current_result_files
-            if name not in passed_results and name not in failed_results
-        ]
-        supporting_docs_dir = Path(work_dir) / "supporting_docs"
-        supporting_docs = list_supporting_markdown_files(supporting_docs_dir)
-        previous_limitations, previous_meta = self._load_previous_limitations(work_dir, cycle)
-        result_relations_manifest_file = Path(work_dir) / "_meta" / "result_relations_manifest.json"
-        results_manifest_file = results_manifest_path(work_dir)
-        recent_feedback = self._format_recent_review_feedback(review_state, cycle)
-        open_issue_backlog = review_state.format_open_issue_backlog(max_items=12)
-        final_results = final_selection.get("final_results") or []
-        excluded_results = final_selection.get("excluded_results") or []
-
-        lines = [
-            "## 当前评审对象",
-            f"- 当前轮次：{cycle}",
-            f"- 当前工作模式：{review_state.workflow_mode}",
-            f"- 任务文件: `{task_file}`",
-            f"- 总结报告: `{summary_file}`",
-            f"- 结果目录: `{results_dir}`",
-            f"- 辅助文档目录: `{supporting_docs_dir}`",
-            f"- 上一轮局限性来源: {previous_meta.get('kind', '')} (轮次={previous_meta.get('cycle', 0)})",
-            f"- 结果关系清单: `{result_relations_manifest_file}`",
-            f"- 结果生命周期清单: `{results_manifest_file}`",
-            "",
-            "## 开始前必须读取",
-            "- task、summary、results manifest（路径见上）",
-        ]
-        if previous_limitations.strip():
-            lines.append("- 上一轮局限性章节（已内联在下方）")
-        if final_results:
-            lines.append(
-                "- final result files: "
-                + ", ".join(f"`results/{name}`" for name in final_results)
-            )
-        else:
-            lines.append(f"- `{results_dir}` 下当前存在的所有 `result_NNN.md`")
-        if supporting_docs:
-            lines.append(
-                "- supporting docs: "
-                + ", ".join(f"`supporting_docs/{name}`" for name in supporting_docs)
-            )
-        lines.extend([
-            "",
-            "## 当前结果状态摘要（评审前快照）",
-            f"- 全部结果: {', '.join(current_result_files) if current_result_files else '(无)'}",
-            f"- 最终结果: {', '.join(final_results) if final_results else '(无)'}",
-            f"- 排除结果: {', '.join(excluded_results) if excluded_results else '(无)'}",
-            f"- 已通过: {', '.join(sorted(passed_results)) if passed_results else '(无)'}",
-            f"- 未通过: {', '.join(sorted(failed_results)) if failed_results else '(无)'}",
-            f"- 待评审: {', '.join(pending_results) if pending_results else '(无)'}",
-            f"- 辅助文档: {', '.join(supporting_docs) if supporting_docs else '(无)'}",
-            "",
-            format_review_profile_policy(review_profile, compact=True),
-        ])
-        if open_issue_backlog:
-            lines.extend([
-                "",
-                "## Active issue backlog（跨轮稳定阻塞项）",
-                open_issue_backlog,
-            ])
-        if review_state.workflow_mode == "closure":
-            lines.extend([
-                "",
-                "## Closure 评审模式",
-                "- 当前已进入 closure：优先验证 active issue backlog 是否被源码证据、漏洞报告、supporting_docs 或 accepted residual 处理。",
-                "- 不要把本轮评审重新展开成无限全量重扫；新 blocker 必须指向明确高严重度且可验证的新增遗漏。",
-                "- 若 Worker 已给出 source_closed/accepted_residual/not_applicable/external_blocked 且证据自洽，应接受 closure，不要反复要求无新增信息的继续分析。",
-            ])
-        if recent_feedback:
-            lines.extend([
-                "",
-                "## 近期评审反馈（供参考）",
-                recent_feedback,
-            ])
-        else:
-            lines.extend([
-                "",
-                "## 近期评审反馈",
-                "(无历史评审反馈)",
-            ])
-        if previous_limitations.strip():
-            lines.extend([
-                "",
-                "## 上一轮“局限性与未覆盖区域”章节（用于核对是否被静默删除）",
-                previous_limitations.strip(),
-            ])
-        repair_hint = (
+        supporting_docs_dir: str,
+    ) -> str:
+        return (
             f"task=`{task_file}`, summary=`{summary_file}`, results_dir=`{results_dir}`, "
-            f"supporting_docs_dir=`{supporting_docs_dir}`, previous_limitations_source={previous_meta.get('kind', '')}"
+            f"supporting_docs_dir=`{supporting_docs_dir}`"
         )
-        return {
-            "summary_file": summary_file,
-            "supporting_docs_dir": str(supporting_docs_dir),
-            "previous_limitations_file": str(previous_meta.get("path") or ""),
-            "result_relations_manifest_file": str(result_relations_manifest_file),
-            "results_manifest_file": str(results_manifest_file),
-            "context_text": "\n".join(lines),
-            "repair_hint": repair_hint,
-        }
 
     async def _parse_with_schema_repair(
         self,
@@ -1191,13 +1054,6 @@ class GlobalReviewExecutor:
             "- 若高价值问题已在 summary/supporting_docs/results 中以 source_closed、promoted_to_result、accepted_residual、not_applicable 或 external_blocked 自洽处理，应判定该项关闭。",
             "- 只有发现具体、可验证、且会影响最终结论的高严重遗漏时才新增 issue；不要用笼统的“继续深入/仍不够全面”阻断。",
         ])
-
-    def _load_previous_limitations(
-        self,
-        work_dir: str,
-        cycle: int,
-    ) -> tuple[str, dict[str, str | int | bool]]:
-        return load_previous_limitations(work_dir, cycle)
 
     @staticmethod
     def _format_recent_review_feedback(review_state: ReviewState, cycle: int) -> str:

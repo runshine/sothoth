@@ -13,13 +13,8 @@
 ## 失败评审给出的本轮方向
 {failed_review_guidance}
 
-{required_read_files}
-
 ## 本轮结果稳定性约束
 {numbering_rules}
-
-{convergence_requirements}
-
 
 ## 深挖方法
 1. 沿 `攻击者可控输入/状态 -> 传播 -> 校验 -> sink/危险操作 -> 影响` 重新审计。
