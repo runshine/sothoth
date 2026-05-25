@@ -921,6 +921,71 @@ class TaskManagerTests(unittest.TestCase):
             self.assertIsNone(stage_run.finished_at)
             self.assertTrue(any(row.event_type == "stage_waiting_downstream_progress" for row in db.events))
 
+    def test_stage_worker_terminal_failure_finalizes_streaming_tail_stage(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="source",
+                status="running",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="entry_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(Path(tmp) / "output"),
+                workspace_root=tmp,
+                started_at=_now(),
+                policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+            )
+            stage_run = BinarySecurityStageRun(
+                id="sr1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="running",
+                started_at=_now(),
+            )
+            item = BinarySecurityStageItem(
+                id="si1",
+                task_id="t1",
+                project_id="p1",
+                stage_run_id="sr1",
+                stage_name="entry_analysis",
+                item_key="module-1",
+                item_name="module-1",
+                parent_key="fw-1",
+                item_identity_key="module-1::fw-1",
+                status="running",
+                downstream_service="entry_analyse",
+            )
+            event = BinarySecurityStateEvent(
+                id="sev-fail-terminal",
+                task_id="t1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                event_type="stage_worker_terminal_observed",
+                idempotency_key="sev-fail-terminal",
+                status="processing",
+                available_at=_now(),
+            )
+            event.payload = {
+                "stage_name": "entry_analysis",
+                "status": "failed",
+                "summary": {"failed_count": 1, "error": "entry failed"},
+            }
+            db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], state_events=[event])
+
+            asyncio.run(self.manager._apply_stage_worker_terminal_event_locked(db, event))
+
+            self.assertEqual("failed", stage_run.status)
+            self.assertEqual("failed", task.status)
+            self.assertEqual("entry_analysis", task.current_stage)
+            self.assertIsNotNone(task.finished_at)
+            self.assertEqual("failed", item.status)
+            self.assertTrue(any(row.event_type == "stage_failed" for row in db.events))
+
     def test_streaming_lifecycle_transitions_from_stage_completion_into_tail_sync(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         with tempfile.TemporaryDirectory() as tmp:
