@@ -4774,6 +4774,7 @@ class TaskManager:
         payload = self._load_externalized_event_payload(task, payload)
         stage_name = str(event.stage_name or payload.get("stage_name") or stage_name).strip()
         status = str(payload.get("status") or status).strip()
+        observed_terminal_status = status
         summary = dict(payload.get("summary") or {})
         if task.status == "cancelled":
             self._record_event(
@@ -4883,6 +4884,28 @@ class TaskManager:
             task.metrics = {**task.metrics, "entry_count": int(summary.get("entry_count", 0))}
         elif stage_name == "vuln_scan":
             task.metrics = {**task.metrics, "vuln_result_count": int(summary.get("vuln_result_count", 0))}
+
+        terminal_failure_statuses = {"failed", "downstream_missing", "cancelled"}
+        if observed_terminal_status in terminal_failure_statuses:
+            status = observed_terminal_status
+            active_stage_status = False
+            for item in self._stage_items(db, task.id, stage_name):
+                if str(item.status or "").strip() not in {"pending", "queued", "running", "dispatching"}:
+                    continue
+                item.status = status
+                item.finished_at = item.finished_at or _now()
+                item.error_message = (
+                    summary.get("failure_message")
+                    or summary.get("error")
+                    or item.error_message
+                )
+            stage_run.status = status
+            stage_run.finished_at = stage_run.finished_at or _now()
+            stage_run.last_error = (
+                summary.get("failure_message")
+                or summary.get("error")
+                or stage_run.last_error
+            )
 
         if active_stage_status:
             task.status = "pending" if status == "pending" else "running"
