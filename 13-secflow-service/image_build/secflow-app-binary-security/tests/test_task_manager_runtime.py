@@ -84,6 +84,34 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(["called", "called"], reconcile_calls)
 
+    async def test_state_reducer_loop_recovers_from_observe_failure(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.cfg.scheduler.poll_interval_seconds = 1
+        observe_calls = []
+        sleep_calls = []
+
+        def _observe_state_runtime_metrics(_db):
+            observe_calls.append("called")
+            raise RuntimeError("boom")
+
+        async def _sleep(_seconds):
+            sleep_calls.append(_seconds)
+            manager._running = False
+
+        manager._observe_state_runtime_metrics = _observe_state_runtime_metrics
+
+        with (
+            patch("app.service.task_manager.asyncio.sleep", new=_sleep),
+            patch("app.service.task_manager.logger.exception") as logger_exception,
+        ):
+            await manager._state_reducer_loop()
+
+        self.assertEqual(["called"], observe_calls)
+        self.assertGreaterEqual(len(sleep_calls), 1)
+        self.assertTrue(all(seconds == 1 for seconds in sleep_calls))
+        logger_exception.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

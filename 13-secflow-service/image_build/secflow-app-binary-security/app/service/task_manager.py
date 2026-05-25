@@ -4467,6 +4467,11 @@ class TaskManager:
                     await self._observe_runtime_metrics(db)
                     if processed:
                         continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("binary-security state reducer loop crashed and recovered")
+                await asyncio.sleep(1)
             finally:
                 db.close()
             await asyncio.sleep(interval_seconds)
