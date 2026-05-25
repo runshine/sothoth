@@ -9795,6 +9795,41 @@ class TaskManager:
                 "module_key": str(result.get("module_key") or input_ref.get("module_key") or item.item_key or ""),
                 "module_name": str(result.get("module_name") or input_ref.get("module_name") or item.item_name or ""),
                 "source_dir": self._resolve_entry_source_dir({**input_ref, **result}) or str(task.firmware_path or ""),
+                "source_root": str(
+                    result.get("source_root")
+                    or input_ref.get("source_root")
+                    or output_ref.get("source_root")
+                    or self._resolve_entry_source_dir({**input_ref, **result})
+                    or task.firmware_path
+                    or ""
+                ),
+                "module_dir": str(
+                    result.get("module_dir")
+                    or input_ref.get("module_dir")
+                    or output_ref.get("module_dir")
+                    or ""
+                ),
+                "descriptor_root": str(
+                    result.get("descriptor_root")
+                    or result.get("entry_descriptor_root")
+                    or input_ref.get("descriptor_root")
+                    or input_ref.get("entry_descriptor_root")
+                    or output_ref.get("descriptor_root")
+                    or output_ref.get("entry_descriptor_root")
+                    or ""
+                ),
+                "files_list_path": str(
+                    result.get("files_list_path")
+                    or result.get("entry_files_list")
+                    or result.get("files_list")
+                    or input_ref.get("files_list_path")
+                    or input_ref.get("entry_files_list")
+                    or input_ref.get("files_list")
+                    or output_ref.get("files_list_path")
+                    or output_ref.get("entry_files_list")
+                    or output_ref.get("files_list")
+                    or ""
+                ),
             }
             if not module["module_key"] or not module["module_name"]:
                 continue
@@ -10317,11 +10352,13 @@ class TaskManager:
         if not entry_key:
             return None
         stage_run = self._ensure_stage_run(db, task, "vuln_scan")
-        normalized_result = {
-            **dataflow_result,
-            "upstream_item_id": upstream_item.id,
-            "triggered_by_stage": upstream_item.stage_name,
-        }
+        normalized_result = self._build_vuln_input_contract(
+            {
+                **dataflow_result,
+                "upstream_item_id": upstream_item.id,
+                "triggered_by_stage": upstream_item.stage_name,
+            }
+        )
         existing = self._find_stage_item(
             db,
             task_id=task.id,
@@ -13002,6 +13039,12 @@ class TaskManager:
                 {
                     "module_key": module.get("module_key"),
                     "module_name": module.get("module_name"),
+                    "module_dir": module.get("module_dir"),
+                    "source_dir": module.get("source_dir"),
+                    "source_root": module.get("source_root"),
+                    "descriptor_root": module.get("descriptor_root") or module.get("entry_descriptor_root"),
+                    "files_list_path": module.get("files_list_path") or module.get("entry_files_list") or module.get("files_list"),
+                    "files_list": module.get("files_list") or module.get("files_list_path") or module.get("entry_files_list"),
                     "rank": module.get("rank"),
                     "risk_level": module.get("risk_level"),
                     "risk_score": module.get("risk_score"),
@@ -13058,8 +13101,10 @@ class TaskManager:
                         "module_key": module_key,
                         "module_name": name,
                         "module_dir": str(module_dir),
+                        "descriptor_root": str(module_dir),
                         "source_dir": str(source_dir),
                         "module_report": str(module_report),
+                        "files_list_path": str(files_list),
                         "files_list": str(files_list),
                         "risk_level": str(module.get("risk_level") or "").strip(),
                         "risk_score": int(module.get("risk_score") or 0),
@@ -13091,8 +13136,10 @@ class TaskManager:
                     "module_key": module_key,
                     "module_name": name,
                     "module_dir": str(module_dir),
+                    "descriptor_root": str(module_dir),
                     "source_dir": str(source_dir),
                     "module_report": str(module_dir / "module_report.md"),
+                    "files_list_path": str(module_dir / "files.list"),
                     "files_list": str(module_dir / "files.list"),
                     "risk_level": "",
                     "risk_score": 0,
@@ -13990,6 +14037,24 @@ class TaskManager:
 
     def _normalize_entry_analysis_module_input(self, task: BinarySecurityTask, module: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(module)
+        files_list_path = str(
+            normalized.get("files_list_path")
+            or normalized.get("entry_files_list")
+            or normalized.get("files_list")
+            or ""
+        ).strip()
+        if files_list_path:
+            normalized["files_list_path"] = files_list_path
+            if not str(normalized.get("files_list") or "").strip():
+                normalized["files_list"] = files_list_path
+        descriptor_root = str(
+            normalized.get("descriptor_root")
+            or normalized.get("entry_descriptor_root")
+            or normalized.get("module_dir")
+            or ""
+        ).strip()
+        if descriptor_root:
+            normalized["descriptor_root"] = descriptor_root
         if self._task_type(task) != TASK_TYPE_BINARY_MODULE:
             return normalized
         entry_descriptor_root = str(normalized.get("entry_descriptor_root") or "").strip()
@@ -14004,6 +14069,8 @@ class TaskManager:
                 # archived B2S module root, so source_root must align with that descriptor root.
                 normalized["source_root"] = str(descriptor_root_path)
                 normalized["module_dir"] = str(Path(entry_files_list).parent)
+                normalized["descriptor_root"] = str(descriptor_root_path)
+                normalized["files_list_path"] = str(files_list_path)
                 normalized["files_list"] = str(files_list_path)
                 return normalized
         for artifact_root in self._entry_descriptor_candidates(normalized):
@@ -14020,6 +14087,8 @@ class TaskManager:
             normalized["source_dir"] = str(prepared.get("entry_descriptor_root") or normalized.get("source_dir") or "")
             normalized["source_root"] = str(prepared.get("entry_descriptor_root") or prepared.get("source_root") or normalized.get("source_root") or "")
             normalized["module_dir"] = str(prepared.get("module_dir") or normalized.get("module_dir") or "")
+            normalized["descriptor_root"] = str(prepared.get("entry_descriptor_root") or normalized.get("descriptor_root") or "")
+            normalized["files_list_path"] = str(prepared.get("entry_files_list") or prepared.get("files_list") or normalized.get("files_list_path") or "")
             normalized["files_list"] = str(prepared.get("files_list") or normalized.get("files_list") or "")
             break
         return normalized
@@ -14142,6 +14211,16 @@ class TaskManager:
                             **_downstream_origin_payload(task, item),
                             "entry_descriptor_root": entry_input.get("entry_descriptor_root"),
                             "entry_files_list": entry_input.get("entry_files_list"),
+                        },
+                        {
+                            "contract_version": 1,
+                            "input_kind": "module_descriptor",
+                            "module_key": entry_input.get("module_key"),
+                            "module_name": entry_input.get("module_name"),
+                            "module_dir": entry_input.get("module_dir") or entry_input.get("source_dir"),
+                            "files_list_path": entry_input.get("files_list_path") or entry_input.get("entry_files_list") or entry_input.get("files_list"),
+                            "descriptor_root": entry_input.get("descriptor_root") or entry_input.get("entry_descriptor_root") or entry_input.get("module_dir") or entry_input.get("source_dir"),
+                            "source_root": entry_input.get("source_root") or entry_input.get("unpacked_root") or entry_input.get("source_dir"),
                         },
                     )
             if created is not None:
@@ -14710,7 +14789,8 @@ class TaskManager:
                 task=task,
                 item=item,
             )
-            data_flow_file = self._find_first(materialized, [r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"])
+            data_flow_reports = self._collect_dataflow_report_files(materialized)
+            data_flow_file = data_flow_reports[0] if data_flow_reports else None
             downstream_status = str(payload.get("status") or "").lower()
             mapped_status = self._map_downstream_status(downstream_status) or (
                 "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
@@ -14734,11 +14814,24 @@ class TaskManager:
                 item.error_message = error
                 session.commit()
                 return {"status": "archive_blocked", "error": error, "item": entry, "archive_blocked": True}
-            archived_data_flow_file = self._find_first(archived_dir, [r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"])
+            archived_data_flow_reports = self._collect_dataflow_report_files(archived_dir)
+            archived_data_flow_file = archived_data_flow_reports[0] if archived_data_flow_reports else None
+            data_flow_root = str(archived_dir or materialized)
+            data_flow_files = [str(path) for path in (archived_data_flow_reports or data_flow_reports)]
+            primary_report_path = ""
+            for raw in data_flow_files:
+                if Path(raw).name == "final_report.md":
+                    primary_report_path = raw
+                    break
+            if not primary_report_path:
+                primary_report_path = str(archived_data_flow_file or data_flow_file) if (archived_data_flow_file or data_flow_file) else ""
             result = {
                 **entry,
                 "artifact_root": str(archived_dir),
-                "data_flow_file": str(archived_data_flow_file or data_flow_file) if (archived_data_flow_file or data_flow_file) else "",
+                "data_flow_root": data_flow_root,
+                "data_flow_files": data_flow_files,
+                "primary_report_path": primary_report_path,
+                "data_flow_file": primary_report_path,
                 "downstream": self._lightweight_downstream_payload(payload),
             }
             item.result = self._compact_result_for_storage(stage_run.stage_name, result)
@@ -14746,6 +14839,9 @@ class TaskManager:
                 **(item.output_ref or {}),
                 "artifact_root": str(archived_dir),
                 "archive_root": str(archived_dir),
+                "data_flow_root": data_flow_root,
+                "data_flow_files": data_flow_files,
+                "primary_report_path": primary_report_path,
                 "data_flow_file": result["data_flow_file"],
             }
             if self._streaming_mode_enabled(task):
@@ -14798,16 +14894,17 @@ class TaskManager:
     ) -> dict[str, Any]:
         session = get_session_factory()()
         try:
+            normalized_vuln_input = self._build_vuln_input_contract(dataflow_result)
             item = self._upsert_stage_item(
                 session,
                 task=task,
                 stage_run=stage_run,
                 stage_name=stage_run.stage_name,
-                item_key=dataflow_result["entry_key"],
-                item_name=dataflow_result["function_name"],
-                parent_key=dataflow_result["module_key"],
+                item_key=normalized_vuln_input["entry_key"],
+                item_name=normalized_vuln_input["function_name"],
+                parent_key=normalized_vuln_input["module_key"],
                 downstream_service="dataflow_vuln_scanner",
-                input_ref=dataflow_result,
+                input_ref=normalized_vuln_input,
                 retrying=retrying,
             )
             session.commit()
@@ -14894,12 +14991,13 @@ class TaskManager:
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
+                    data_flow_input_path = self._resolve_vuln_data_flow_input_path(normalized_vuln_input)
                     created = await get_dataflow_vuln_scanner_client().create_task(
                         task.project_id,
-                        f"{task.name}-{dataflow_result['function_name']}-scan",
+                        f"{task.name}-{normalized_vuln_input['function_name']}-scan",
                         token or "",
-                        dataflow_result["data_flow_file"],
-                        dataflow_result["source_dir"],
+                        data_flow_input_path,
+                        normalized_vuln_input["source_dir"],
                         _downstream_origin_payload(task, item),
                     )
             if created is not None:
@@ -14933,14 +15031,14 @@ class TaskManager:
             if mapped_status != "success":
                 item.error_message = payload.get("error") or payload.get("error_message")
                 session.commit()
-                return {"status": mapped_status, "error": item.error_message, "item": dataflow_result}
+                return {"status": mapped_status, "error": item.error_message, "item": normalized_vuln_input}
             if archived_dir is None:
                 error = archive_job.error_message if archive_job is not None else "总任务产物归档失败"
                 item.error_message = error
                 session.commit()
-                return {"status": "archive_blocked", "error": error, "item": dataflow_result, "archive_blocked": True}
+                return {"status": "archive_blocked", "error": error, "item": normalized_vuln_input, "archive_blocked": True}
             result = {
-                **dataflow_result,
+                **normalized_vuln_input,
                 "workspace_root": artifacts.get("workspace_root"),
                 "artifact_files": artifacts.get("files", []),
                 "archive_root": str(archived_dir),
@@ -14967,9 +15065,9 @@ class TaskManager:
                     item,
                     operation="vuln_scan",
                     exc=exc,
-                    response_item=dataflow_result,
+                    response_item=normalized_vuln_input,
                 )
-            return {"status": "pending", "error": str(exc), "item": dataflow_result, "deferred_mode": "redispatch"}
+            return {"status": "pending", "error": str(exc), "item": normalized_vuln_input, "deferred_mode": "redispatch"}
         except Exception as exc:
             if "item" in locals() and self._is_retryable_downstream_transport_error(exc):
                 session.rollback()
@@ -14979,7 +15077,7 @@ class TaskManager:
                     item,
                     operation="vuln_scan",
                     exc=exc,
-                    response_item=dataflow_result,
+                    response_item=normalized_vuln_input,
                 )
             if "item" in locals():
                 session.rollback()
@@ -14987,7 +15085,7 @@ class TaskManager:
                 item.error_message = str(exc)
                 item.finished_at = _now()
                 session.commit()
-            return {"status": "failed", "error": str(exc), "item": dataflow_result}
+            return {"status": "failed", "error": str(exc), "item": normalized_vuln_input}
         finally:
             session.close()
 
@@ -14999,6 +15097,97 @@ class TaskManager:
                 if re.fullmatch(pattern, path.name):
                     return path
         return None
+
+    def _collect_dataflow_report_files(self, root: Path) -> list[Path]:
+        if not root.exists():
+            return []
+        matched: list[Path] = []
+        for path in sorted(p for p in root.rglob("*") if p.is_file()):
+            name = path.name
+            rel = path.relative_to(root).as_posix()
+            if name == "final_report.md":
+                matched.append(path)
+                continue
+            if rel.startswith("dataflow/") and path.suffix.lower() == ".md":
+                matched.append(path)
+                continue
+            if re.fullmatch(r"dataflow-.*\.md", name):
+                matched.append(path)
+                continue
+            if re.fullmatch(r".*result.*\.md", name):
+                matched.append(path)
+                continue
+            if name == "report.md":
+                matched.append(path)
+        return matched
+
+    def _build_vuln_input_contract(self, dataflow_result: dict[str, Any]) -> dict[str, Any]:
+        contract = dict(dataflow_result)
+        artifact_root_raw = str(
+            dataflow_result.get("artifact_root")
+            or dataflow_result.get("archive_root")
+            or ""
+        ).strip()
+        artifact_root = Path(artifact_root_raw) if artifact_root_raw else None
+
+        data_flow_root = str(dataflow_result.get("data_flow_root") or "").strip()
+        if not data_flow_root and artifact_root and artifact_root.exists():
+            data_flow_root = str(artifact_root)
+
+        data_flow_files: list[str] = []
+        for value in dataflow_result.get("data_flow_files") or []:
+            raw = str(value or "").strip()
+            if raw and raw not in data_flow_files:
+                data_flow_files.append(raw)
+
+        if artifact_root and artifact_root.exists():
+            for path in self._collect_dataflow_report_files(artifact_root):
+                raw = str(path)
+                if raw not in data_flow_files:
+                    data_flow_files.append(raw)
+
+        primary_report_path = str(dataflow_result.get("primary_report_path") or "").strip()
+        if not primary_report_path:
+            for raw in data_flow_files:
+                if Path(raw).name == "final_report.md":
+                    primary_report_path = raw
+                    break
+        legacy_data_flow_file = str(dataflow_result.get("data_flow_file") or "").strip()
+        if legacy_data_flow_file and legacy_data_flow_file not in data_flow_files:
+            data_flow_files.append(legacy_data_flow_file)
+        if not primary_report_path and data_flow_files:
+            primary_report_path = data_flow_files[0]
+
+        data_flow_file = legacy_data_flow_file
+        if not data_flow_file:
+            data_flow_file = primary_report_path
+
+        contract.update(
+            {
+                "data_flow_root": data_flow_root,
+                "data_flow_files": data_flow_files,
+                "primary_report_path": primary_report_path,
+                "data_flow_file": data_flow_file,
+            }
+        )
+        return contract
+
+    def _resolve_vuln_data_flow_input_path(self, dataflow_result: dict[str, Any]) -> str:
+        for value in (
+            dataflow_result.get("data_flow_root"),
+            dataflow_result.get("artifact_root"),
+            dataflow_result.get("archive_root"),
+            dataflow_result.get("primary_report_path"),
+            dataflow_result.get("data_flow_file"),
+        ):
+            raw = str(value or "").strip()
+            if raw:
+                return raw
+        for value in dataflow_result.get("data_flow_files") or []:
+            raw = str(value or "").strip()
+            if raw:
+                return raw
+        raise ValidationError("漏洞扫描缺少有效的数据流输入目录或报告文件")
 
     def _aggregate_stage_items(self, db: Session, task: BinarySecurityTask, results: list[dict[str, Any]], summary_key: str) -> tuple[str, dict[str, Any]]:
         success = [result["item"] for result in results if result.get("status") == "success"]
@@ -15114,7 +15303,9 @@ class TaskManager:
             "module_key": item.get("module_key"),
             "module_name": item.get("module_name"),
             "module_dir": item.get("module_dir"),
+            "descriptor_root": item.get("descriptor_root"),
             "source_dir": item.get("source_dir"),
+            "files_list_path": item.get("files_list_path"),
             "module_report": item.get("module_report"),
             "files_list": item.get("files_list"),
             "entry_module_name": item.get("entry_module_name"),
@@ -15141,6 +15332,8 @@ class TaskManager:
             "module_key": item.get("module_key"),
             "module_name": item.get("module_name"),
             "module_dir": item.get("module_dir"),
+            "descriptor_root": item.get("descriptor_root") or item.get("entry_descriptor_root"),
+            "files_list_path": item.get("files_list_path") or item.get("entry_files_list") or item.get("files_list"),
             "source_dir": item.get("source_dir"),
             "artifact_root": item.get("artifact_root"),
             "entries": self._compact_entry_rows(item.get("entries") or []),
@@ -15210,6 +15403,9 @@ class TaskManager:
             "entry_file": item.get("entry_file"),
             "source_dir": item.get("source_dir"),
             "artifact_root": item.get("artifact_root"),
+            "data_flow_root": item.get("data_flow_root"),
+            "data_flow_files": list(item.get("data_flow_files") or []),
+            "primary_report_path": item.get("primary_report_path"),
             "data_flow_file": item.get("data_flow_file"),
         }
 
@@ -15225,6 +15421,9 @@ class TaskManager:
             "function_name": item.get("function_name"),
             "line_no": item.get("line_no"),
             "source_dir": item.get("source_dir"),
+            "data_flow_root": item.get("data_flow_root"),
+            "data_flow_files": list(item.get("data_flow_files") or []),
+            "primary_report_path": item.get("primary_report_path"),
             "data_flow_file": item.get("data_flow_file"),
             "workspace_root": item.get("workspace_root"),
             "archive_root": item.get("archive_root"),
