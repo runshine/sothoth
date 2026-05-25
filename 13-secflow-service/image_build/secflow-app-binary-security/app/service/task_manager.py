@@ -7060,6 +7060,27 @@ class TaskManager:
             )
             self._sync_task_abnormal_reason_snapshot(db, task, None)
             return
+        has_active_incomplete_stage, active_stage_name, active_stage_status = self._has_any_active_incomplete_stage(task, stage_runs)
+        if has_active_incomplete_stage:
+            task.status = "running" if active_stage_status in {"running", "dispatching", "applying"} else "pending"
+            task.current_stage = active_stage_name or task.current_stage
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.lease_expires_at = None
+            task.finished_at = None
+            task.last_error = None
+            self._last_task_heartbeat_at.pop(task.id, None)
+            self._record_event(
+                db,
+                task,
+                "task_finalize_deferred_for_active_stage",
+                f"仍有活跃未完成阶段，延迟任务收口: {active_stage_name}",
+                level="info",
+                stage_name=active_stage_name,
+                payload={"stage_status": active_stage_status},
+            )
+            self._sync_task_abnormal_reason_snapshot(db, task, None)
+            return
         next_stage = self._next_incomplete_stage(db, task)
         if next_stage:
             if vuln_run and vuln_run.status in {"success", "partial_success"}:
@@ -7924,6 +7945,24 @@ class TaskManager:
             if not self._stage_enabled(task, stage_name):
                 continue
             if self._is_streaming_tail_stage(task, stage_name):
+                continue
+            run = runs_by_stage.get(stage_name)
+            if run is None:
+                return True, stage_name, "pending"
+            normalized_status = self._normalize_downstream_status(run.status) or str(run.status or "").strip()
+            if normalized_status in active_statuses:
+                return True, stage_name, normalized_status
+        return False, None, None
+
+    def _has_any_active_incomplete_stage(
+        self,
+        task: BinarySecurityTask,
+        stage_runs: list[BinarySecurityStageRun],
+    ) -> tuple[bool, str | None, str | None]:
+        active_statuses = {"pending", "queued", "running", "dispatching", "applying"}
+        runs_by_stage = {run.stage_name: run for run in stage_runs}
+        for stage_name in self._stage_sequence_for_task(task):
+            if not self._stage_enabled(task, stage_name):
                 continue
             run = runs_by_stage.get(stage_name)
             if run is None:

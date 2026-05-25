@@ -3723,6 +3723,55 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    def test_finalize_task_defers_failure_when_any_enabled_stage_is_still_active(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[
+                BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="firmware_unpack", sequence_no=1, status="success"),
+                BinarySecurityStageRun(id="sr2", task_id="t1", project_id="p1", stage_name="system_analysis", sequence_no=2, status="success"),
+                BinarySecurityStageRun(id="sr3", task_id="t1", project_id="p1", stage_name="binary_to_source", sequence_no=3, status="running"),
+                BinarySecurityStageRun(id="sr4", task_id="t1", project_id="p1", stage_name="entry_analysis", sequence_no=4, status="failed"),
+            ],
+            stage_items=[
+                BinarySecurityStageItem(
+                    id="si1",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_run_id="sr4",
+                    stage_name="entry_analysis",
+                    item_key="m1",
+                    status="failed",
+                    downstream_service="entry_analyse",
+                    downstream_task_id="eat-1",
+                )
+            ],
+            events=[],
+        )
+
+        self.manager._finalize_task(db, task)
+
+        self.assertEqual("running", task.status)
+        self.assertEqual("binary_to_source", task.current_stage)
+        self.assertIsNone(task.finished_at)
+        self.assertTrue(
+            any(
+                isinstance(obj, BinarySecurityEvent) and obj.event_type == "task_finalize_deferred_for_active_stage"
+                for obj in db.added
+            )
+        )
+
     def test_finalize_task_does_not_mark_success_when_enabled_stage_missing(self):
         task = BinarySecurityTask(
             id="t1",
