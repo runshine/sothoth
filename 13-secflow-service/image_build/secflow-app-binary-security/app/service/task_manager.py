@@ -10510,6 +10510,75 @@ class TaskManager:
         )
         return {field: entry.get(field) for field in contract_fields if entry.get(field) is not None}
 
+    def _match_entry_identity(self, candidate: dict[str, Any], target: dict[str, Any]) -> bool:
+        if not isinstance(candidate, dict) or not isinstance(target, dict):
+            return False
+        candidate_key = str(candidate.get("entry_key") or "").strip()
+        target_key = str(target.get("entry_key") or "").strip()
+        if candidate_key and target_key:
+            return candidate_key == target_key
+        return (
+            str(candidate.get("module_key") or "").strip() == str(target.get("module_key") or "").strip()
+            and str(candidate.get("function_name") or "").strip() == str(target.get("function_name") or "").strip()
+            and str(candidate.get("definition_file") or candidate.get("file_name") or "").strip()
+            == str(target.get("definition_file") or target.get("file_name") or "").strip()
+            and str(candidate.get("definition_line") or candidate.get("line_no") or "").strip()
+            == str(target.get("definition_line") or target.get("line_no") or "").strip()
+        )
+
+    def _recover_entry_output_contract(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        entry: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(entry, dict):
+            return {}
+        module_key = str(entry.get("module_key") or "").strip()
+        entry_items = [
+            item
+            for item in self._stage_items(db, task.id, "entry_analysis")
+            if item.status == "success" and (not module_key or str(item.item_key or "").strip() == module_key)
+        ]
+        for item in entry_items:
+            input_ref = dict(item.input_ref or {})
+            result = dict(item.result or {})
+            output_ref = dict(item.output_ref or {})
+            module = {
+                **input_ref,
+                **result,
+                **self._entry_contract_fields(input_ref),
+                **self._entry_contract_fields(result),
+                **self._entry_contract_fields(output_ref),
+                "module_key": str(result.get("module_key") or input_ref.get("module_key") or item.item_key or ""),
+                "module_name": str(result.get("module_name") or input_ref.get("module_name") or item.item_name or ""),
+                "artifact_root": (
+                    output_ref.get("artifact_root")
+                    or output_ref.get("archive_root")
+                    or result.get("artifact_root")
+                    or result.get("archive_root")
+                ),
+                "source_dir": self._resolve_entry_source_dir({**input_ref, **result, **output_ref}) or str(task.firmware_path or ""),
+            }
+            entries = [dict(row) for row in result.get("entries") or [] if isinstance(row, dict)]
+            artifact_root_value = module.get("artifact_root")
+            if artifact_root_value:
+                parsed_entries = self._parse_entries(Path(str(artifact_root_value)), module)
+                if parsed_entries:
+                    entries = parsed_entries
+            if not entries:
+                entries = [dict(row) for row in result.get("entries_preview") or [] if isinstance(row, dict)]
+            for candidate in entries:
+                if not self._match_entry_identity(candidate, entry):
+                    continue
+                merged = {
+                    **candidate,
+                    **self._entry_contract_fields(module),
+                }
+                merged["source_dir"] = merged.get("source_dir") or module.get("source_dir")
+                return merged
+        return {}
+
     def _trigger_entry_items_from_b2s_result(
         self,
         db: Session,
@@ -15028,7 +15097,14 @@ class TaskManager:
         del token
         session = get_session_factory()()
         try:
-            entry = self._validate_entry_output_contract(entry)
+            try:
+                entry = self._validate_entry_output_contract(entry)
+            except ValidationError:
+                recovered_entry = self._recover_entry_output_contract(session, task, entry)
+                if recovered_entry:
+                    entry = self._validate_entry_output_contract({**entry, **recovered_entry}, allow_fallback=True)
+                else:
+                    entry = self._validate_entry_output_contract(entry)
             item = self._upsert_stage_item(
                 session,
                 task=task,

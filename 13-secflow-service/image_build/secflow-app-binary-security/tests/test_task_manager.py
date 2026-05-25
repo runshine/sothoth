@@ -12752,6 +12752,132 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(144, existing_item.retry_count)
 
+    def test_run_dataflow_item_recovers_missing_contract_from_entry_stage_result(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="module-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_path="/tmp/fw",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-dfa",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            sequence_no=3,
+            status="running",
+        )
+        entry_stage_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="IPSEC",
+            item_name="IPSEC",
+            parent_key="module-input",
+            downstream_service="entry_analyse",
+            status="success",
+            input_ref={
+                "module_key": "IPSEC",
+                "module_name": "IPSEC",
+                "module_input_path": "/archive/IPSEC/modules/IPSEC",
+                "source_root_path": "/archive/IPSEC",
+                "source_dir": "/archive/IPSEC",
+                "entry_descriptor_root": "/archive/IPSEC",
+                "entry_files_list": "/archive/IPSEC/modules/IPSEC/files.list",
+            },
+            result={
+                "module_key": "IPSEC",
+                "module_name": "IPSEC",
+                "artifact_root": "/artifact/IPSEC",
+                "entries_preview": [
+                    {
+                        "entry_key": "entry-1",
+                        "module_key": "IPSEC",
+                        "module_name": "IPSEC",
+                        "function_name": "handle",
+                        "file_name": "libipsec.c",
+                        "definition_file": "libipsec.c",
+                        "definition_line": "10",
+                        "line_no": "10",
+                        "definition_kind": "definition",
+                        "taint_params": ["ctx"],
+                    }
+                ],
+            },
+            output_ref={"artifact_root": "/artifact/IPSEC"},
+        )
+        dataflow_item = BinarySecurityStageItem(
+            id="si-dfa",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            item_key="entry-1",
+            item_name="handle",
+            parent_key="IPSEC",
+            downstream_service="dataflow_analyse",
+            status="running",
+            output_ref={},
+        )
+        stale_entry = {
+            "entry_key": "entry-1",
+            "module_key": "IPSEC",
+            "module_name": "IPSEC",
+            "function_name": "handle",
+            "file_name": "libipsec.c",
+            "definition_file": "libipsec.c",
+            "definition_line": "10",
+            "line_no": "10",
+            "definition_kind": "definition",
+            "taint_params": ["ctx"],
+            "source_dir": ".",
+        }
+        fake_session = _ModelAwareDb(stage_items=[entry_stage_item, dataflow_item])
+        create_calls: list[dict[str, str]] = []
+
+        async def fake_create_task(
+            project_id,
+            task_name,
+            module_input_path,
+            source_root_path,
+            prompt,
+            origin,
+            **kwargs,
+        ):
+            del task_name, prompt, origin
+            create_calls.append(
+                {
+                    "project_id": project_id,
+                    "module_input_path": module_input_path,
+                    "source_root_path": source_root_path,
+                    "source_file": kwargs.get("source_file"),
+                }
+            )
+            return {"task_id": "dfa-new"}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(task_manager_module, "get_dataflow_analyse_client", return_value=SimpleNamespace(create_task=fake_create_task)),
+            patch.object(self.manager, "_upsert_stage_item", return_value=dataflow_item),
+            patch.object(self.manager, "_normalize_dfa_source_file", return_value="libipsec.c"),
+            patch.object(self.manager, "_poll_until_terminal", return_value=("success", {"task_id": "dfa-new", "status": "passed"})),
+            patch.object(self.manager, "_service_output_dir", return_value=Path("/tmp")),
+            patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
+            patch.object(self.manager, "_find_first", return_value=Path("/tmp/dataflow.md")),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+            patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
+            patch.object(self.manager, "_lightweight_downstream_payload", side_effect=lambda payload: {"status": payload.get("status")}),
+        ):
+            result = asyncio.run(self.manager._run_dataflow_item(task, stage_run, stale_entry, token=None, retrying=False))
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual(1, len(create_calls))
+        self.assertEqual("/archive/IPSEC/modules/IPSEC", create_calls[0]["module_input_path"])
+        self.assertEqual("/archive/IPSEC", create_calls[0]["source_root_path"])
+        self.assertEqual("libipsec.c", create_calls[0]["source_file"])
+
     def test_compact_result_for_storage_keeps_entry_preview_small(self):
         entries = []
         for index in range(12):
