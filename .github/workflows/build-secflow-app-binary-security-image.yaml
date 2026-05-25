@@ -17,7 +17,12 @@ jobs:
     steps:
       - name: Generate date tag
         id: date
-        run: echo "date_tag=$(date +'%Y%m%d')-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+        env:
+          MAIN_REPO_SHA: ${{ github.sha }}
+        run: |
+          SHORT_SHA="${MAIN_REPO_SHA::7}"
+          echo "date_tag=$(date +'%Y%m%d')-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Using main repo sha: ${MAIN_REPO_SHA} (${SHORT_SHA})"
 
   build-amd64:
     needs: prepare
@@ -29,6 +34,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          submodules: true
           token: ${{ secrets.PRIVATE_REPO_PAT }}
 
       - name: Login to Docker Hub
@@ -69,6 +75,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          submodules: true
           token: ${{ secrets.PRIVATE_REPO_PAT }}
 
       - name: Login to Docker Hub
