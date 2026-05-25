@@ -2261,6 +2261,115 @@ class TaskManagerTests(unittest.TestCase):
         self.assertIsNone(reason)
         self.assertEqual(["m1"], [item.item_key for item in items])
 
+    def test_stage_retry_failed_items_requires_real_downstream_task(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="running",
+        )
+        task.summary = {"selected_modules": [{"module_key": "m1", "module_name": "module1"}]}
+        stage_runs = [
+            BinarySecurityStageRun(
+                id="sr2",
+                task_id="s1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="failed",
+            ),
+        ]
+        stage_items = [
+            BinarySecurityStageItem(
+                id="i1",
+                task_id="s1",
+                project_id="p1",
+                stage_run_id="sr2",
+                stage_name="entry_analysis",
+                item_key="m1",
+                item_name="module1",
+                parent_key="source_project",
+                item_identity_key="source_project::m1",
+                status="failed",
+                downstream_service="entry_analyse",
+                downstream_task_id=None,
+            ),
+        ]
+
+        supported, reason, items = self.manager._stage_retry_failed_items_support(
+            _ModelAwareDb(tasks=[task], stage_runs=stage_runs, stage_items=stage_items),
+            task,
+            "entry_analysis",
+        )
+
+        self.assertFalse(supported)
+        self.assertEqual("当前阶段没有可重试的失败项", reason)
+        self.assertEqual([], items)
+
+    def test_manual_operation_state_allows_stage_failed_item_retry_while_task_running(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=4,
+            status="failed",
+        )
+        failed_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-a",
+            parent_key="source_project",
+            item_identity_key="source_project::module-a",
+            status="failed",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-1",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[failed_item])
+
+        state = self.manager._build_manual_operation_state(
+            db,
+            task,
+            task_retry_supported=False,
+            task_retry_reason="当前任务正在执行或排队中，不能重试: running",
+            task_retry_failed_supported=False,
+            task_retry_failed_reason="当前任务正在执行或排队中，不能重试失败项: running",
+            task_continue_supported=False,
+            task_continue_reason="当前任务正在执行或排队中，不能手动继续: running",
+            stage_summaries=[
+                BinarySecurityStageSummary(
+                    stage_name="entry_analysis",
+                    sequence_no=4,
+                    status="failed",
+                    retry_failed_supported=True,
+                )
+            ],
+        )
+
+        self.assertEqual("ready", state["overall"])
+        self.assertIsNone(state["blocking_code"])
+        self.assertTrue(state["can_retry_stage_failed_items"])
+
     def test_upstream_stage_retried_blocks_items_created_before_upstream_retry_finished(self):
         upstream_finished_at = datetime(2026, 5, 15, 19, 3, 33)
         task = BinarySecurityTask(

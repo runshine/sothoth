@@ -9152,6 +9152,7 @@ class TaskManager:
         operation_owner = str(task.operation_lock_owner or "").strip() or None
         has_stage_retry = any(bool(summary.retry_full_supported) for summary in stage_summaries)
         has_stage_retry_failed = any(bool(summary.retry_failed_supported) for summary in stage_summaries)
+        has_item_level_stage_retry_failed = self._has_retryable_failed_stage_items(db, task)
         preparing = task.status in TASK_PREPARING_STATUSES
         streaming_auto_progressing = self._streaming_tail_auto_progressing(db, task)
         running = task.status in {"dispatching", "running"} or streaming_auto_progressing
@@ -9166,6 +9167,7 @@ class TaskManager:
         can_retry = bool(task_retry_supported) and not lock_active
         can_retry_failed_items = bool(task_retry_failed_supported) and not lock_active
         can_retry_stage = (has_stage_retry or has_stage_retry_failed) and not lock_active and not running and not preparing
+        can_retry_stage_failed_items = (has_stage_retry_failed or has_item_level_stage_retry_failed) and not lock_active and not preparing
         can_delete = not lock_active
         can_edit_policy = task.status not in {"dispatching", "running"} | TASK_PREPARING_STATUSES and not lock_active
         can_confirm_modules = waiting_modules and not lock_active
@@ -9189,7 +9191,7 @@ class TaskManager:
             blocking_reason = "当前任务等待模块确认，请先确认模块后再执行其他操作"
             overall = "blocked"
             summary = blocking_reason
-        elif running:
+        elif running and not can_retry_stage_failed_items:
             blocking_code = "task_running"
             blocking_reason = (
                 "当前任务处于 streaming tail 自动推进中，当前仅建议等待系统继续收敛或执行取消/同步状态"
@@ -9219,7 +9221,7 @@ class TaskManager:
             "can_retry": can_retry,
             "can_retry_failed_items": can_retry_failed_items,
             "can_retry_stage": can_retry_stage,
-            "can_retry_stage_failed_items": has_stage_retry_failed and not lock_active and not running and not preparing,
+            "can_retry_stage_failed_items": can_retry_stage_failed_items,
             "can_retry_stage_full": has_stage_retry and not lock_active and not running and not preparing,
             "can_retry_archive": can_retry_archive,
             "can_retry_archive_failed_items": can_retry_archive,
@@ -9838,8 +9840,14 @@ class TaskManager:
         return [
             item
             for item in self._stage_items(db, task.id, stage_name)
-            if self._is_failed_retry_candidate_status(item.status)
+            if self._is_failed_retry_candidate_status(item.status) and str(item.downstream_task_id or "").strip()
         ]
+
+    def _has_retryable_failed_stage_items(self, db: Session, task: BinarySecurityTask) -> bool:
+        for stage_name in self._stage_sequence_for_task(task):
+            if self._stage_retry_candidate_items(db, task, stage_name):
+                return True
+        return False
 
     @staticmethod
     def _comparable_datetime(value: datetime | None) -> datetime | None:
@@ -11914,12 +11922,19 @@ class TaskManager:
         task: BinarySecurityTask,
         stage_name: str,
     ) -> tuple[bool, str | None, list[BinarySecurityStageItem]]:
-        supported, reason = self._stage_retry_support(db, task, stage_name)
-        if not supported:
-            return False, reason, []
         items = self._stage_retry_candidate_items(db, task, stage_name)
         if not items:
             return False, "当前阶段没有可重试的失败项", []
+        supported, reason = self._stage_retry_support(db, task, stage_name)
+        if not supported:
+            stage_run = db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == stage_name,
+            ).first()
+            blocked_by_task_status = bool(task.status in STAGE_RETRY_BLOCKED_TASK_STATUSES)
+            blocked_by_stage_status = bool(stage_run and stage_run.status not in STAGE_RETRY_ALLOWED_STATUSES)
+            if not blocked_by_task_status and not blocked_by_stage_status:
+                return False, reason, []
         upstream_retried, upstream_stage = self._upstream_stage_retried(db, task, stage_name)
         if upstream_retried:
             return False, f"上游阶段 {STAGE_TITLES.get(upstream_stage or '', upstream_stage or '')} 已发生重试，当前阶段不能只重试失败项", []
