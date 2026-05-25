@@ -2956,7 +2956,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                     "module_key": "m1",
                     "module_name": "openssl",
                     "module_dir": "/tmp/unpacked/modules/openssl",
+                    "descriptor_root": None,
                     "source_dir": "/tmp/archive/openssl",
+                    "files_list_path": None,
                     "module_report": None,
                     "files_list": None,
                     "entry_module_name": None,
@@ -8544,6 +8546,33 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 files_list.read_text(encoding="utf-8").splitlines(),
             )
 
+    def test_prepare_entry_module_descriptor_excludes_re_work_and_generated_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_root = Path(tmp)
+            (artifact_root / "libipsec.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+            (artifact_root / "include").mkdir()
+            (artifact_root / "include" / "libipsec.h").write_text("#pragma once\n", encoding="utf-8")
+
+            re_work_root = artifact_root / ".re_work_libipsec"
+            (re_work_root / "runs" / "20260524T225753-pid1").mkdir(parents=True)
+            (re_work_root / "runs" / "20260524T225753-pid1" / "batch_001.c").write_text("int batch(void) { return 0; }\n", encoding="utf-8")
+            (re_work_root / "runs" / "20260524T225753-pid1" / "nested.c").write_text("int nested(void) { return 0; }\n", encoding="utf-8")
+            (re_work_root / "ida_cache" / "ida_export").mkdir(parents=True)
+            (re_work_root / "ida_cache" / "ida_export" / "decompiled.c").write_text("int ida(void) { return 0; }\n", encoding="utf-8")
+            (re_work_root / "agent_header").mkdir(parents=True)
+            (re_work_root / "agent_header" / "shim.h").write_text("#pragma once\n", encoding="utf-8")
+
+            descriptor = self.manager._prepare_entry_module_descriptor(
+                artifact_root,
+                {"module_name": "IPSEC"},
+            )
+
+            files_list = Path(descriptor["entry_files_list"])
+            self.assertEqual(
+                ["include/libipsec.h", "libipsec.c"],
+                files_list.read_text(encoding="utf-8").splitlines(),
+            )
+
     def test_entry_analysis_inputs_normalize_binary_module_to_descriptor_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact_root = Path(tmp)
@@ -11787,8 +11816,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_find_reusable_dataflow_payload", return_value=None),
-            patch.object(self.manager, "_invoke_existing_downstream_retry", side_effect=fake_retry),
+            patch.object(self.manager, "_control_existing_downstream_task", return_value={"outcome": "accepted", "payload": {"task_id": "dfa-retried"}}),
             patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
+            patch.object(self.manager, "_normalize_dfa_source_file", return_value="main.c"),
             patch.object(self.manager, "_service_output_dir", return_value=Path("/tmp")),
             patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
             patch.object(self.manager, "_find_first", return_value=None),
@@ -11800,6 +11830,51 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("dfa-retried", item.downstream_task_id)
         self.assertEqual("failed", result["status"])
         self.assertEqual("boom", result["error"])
+
+    def test_run_dataflow_item_rejects_incomplete_explicit_contract(self):
+        task = BinarySecurityTask(id="t1", name="source-task", project_id="p1", workspace_root="/tmp/ws")
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            sequence_no=3,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            item_key="entry-1",
+            item_name="entry-1",
+            parent_key="module-1",
+            downstream_service="dataflow_analyse",
+            status="pending",
+            output_ref={},
+        )
+        entry = {
+            "entry_key": "entry-1",
+            "function_name": "main",
+            "module_key": "module-1",
+            "module_dir": "/tmp/mod",
+            "files_list_path": "/tmp/mod/files.list",
+            "definition_file": "main.c",
+            "file_name": "main.c",
+            "definition_line": "10",
+            "is_definition_found": True,
+            "taint_params": ["argv"],
+        }
+        fake_session = _ModelAwareDb()
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+        ):
+            result = asyncio.run(self.manager._run_dataflow_item(task, stage_run, entry, token=None, retrying=False))
+
+        self.assertEqual("failed", result["status"])
+        self.assertIn("source_root", result["error"])
 
     def test_run_dataflow_item_seeds_vuln_item_when_streaming_mode_enabled(self):
         task = BinarySecurityTask(
@@ -12250,7 +12325,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("dfvs-live", item.downstream_task_id)
         self.assertEqual("success", item.status)
 
-    def test_run_vuln_item_prefers_data_flow_root_and_rejects_empty_contract(self):
+    def test_run_vuln_item_requires_explicit_data_flow_contract(self):
         task = BinarySecurityTask(
             id="t1",
             name="scan-task",
@@ -12321,6 +12396,32 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("success", result["status"])
         self.assertEqual([("/tmp/archive/dfa", "/tmp/src")], create_calls)
+
+        artifact_only_result = {
+            "entry_key": "entry-artifact",
+            "function_name": "artifact_only",
+            "module_key": "module-1",
+            "artifact_root": "/tmp/archive/dfa",
+            "archive_root": "/tmp/archive/dfa",
+            "source_dir": "/tmp/src",
+        }
+        create_calls.clear()
+        item.status = "pending"
+        item.error_message = None
+        item.finished_at = None
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(task_manager_module, "get_dataflow_vuln_scanner_client", return_value=client),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_active_downstream_payload", return_value=None),
+            patch.object(self.manager, "_find_reusable_vuln_payload", return_value=None),
+        ):
+            artifact_only_failed = asyncio.run(self.manager._run_vuln_item(task, stage_run, artifact_only_result, token="tok", retrying=False))
+
+        self.assertEqual("failed", artifact_only_failed["status"])
+        self.assertIn("漏洞扫描缺少有效的数据流输入目录或报告文件", artifact_only_failed["error"])
+        self.assertEqual([], create_calls)
 
         empty_result = {
             "entry_key": "entry-2",

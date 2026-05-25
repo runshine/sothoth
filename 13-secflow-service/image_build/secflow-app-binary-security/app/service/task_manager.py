@@ -13946,9 +13946,19 @@ class TaskManager:
         lowered_parts = [part.lower() for part in path.parts]
         if "run" in lowered_parts:
             return False
+        if "runs" in lowered_parts:
+            return False
         if "agent_sessions" in lowered_parts:
             return False
+        if "ida_cache" in lowered_parts:
+            return False
+        if "agent_header" in lowered_parts:
+            return False
+        if any(part.startswith(".re_work_") for part in lowered_parts):
+            return False
         lowered_name = path.name.lower()
+        if re.fullmatch(r"batch_\d+\.(c|cc|cpp|cxx|h|hpp|hh)", lowered_name):
+            return False
         if "_ida." in lowered_name or lowered_name.endswith("_ida.c") or lowered_name.endswith("_ida.h"):
             return False
         if lowered_name.endswith(".chat.json") or lowered_name.endswith(".validate.json"):
@@ -14363,8 +14373,46 @@ class TaskManager:
             return str(definition_path.parent if definition_path.suffix else definition_path)
         return ""
 
+    def _entry_looks_like_descriptor_contract(self, entry: dict[str, Any]) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        return any(
+            str(value or "").strip()
+            for value in (
+                entry.get("module_dir"),
+                entry.get("files_list_path"),
+                entry.get("entry_files_list"),
+                entry.get("files_list"),
+                entry.get("source_root"),
+                entry.get("source_root_path"),
+            )
+        )
+
+    def _entry_has_explicit_descriptor_contract(self, entry: dict[str, Any]) -> bool:
+        if not self._entry_looks_like_descriptor_contract(entry):
+            return False
+        return all(
+            str(value or "").strip()
+            for value in (
+                entry.get("module_dir"),
+                entry.get("files_list_path") or entry.get("entry_files_list") or entry.get("files_list"),
+                entry.get("source_root") or entry.get("source_root_path"),
+            )
+        )
+
     def _resolve_dfa_module_input_path(self, entry: dict[str, Any]) -> str:
         if not isinstance(entry, dict):
+            return ""
+        if self._entry_looks_like_descriptor_contract(entry):
+            for candidate in (
+                entry.get("module_input_path"),
+                entry.get("module_dir"),
+                entry.get("descriptor_root"),
+                entry.get("entry_descriptor_root"),
+            ):
+                value = str(candidate or "").strip()
+                if value:
+                    return value
             return ""
         for candidate in (
             entry.get("module_input_path"),
@@ -14381,6 +14429,15 @@ class TaskManager:
 
     def _resolve_dfa_source_root_path(self, entry: dict[str, Any]) -> str:
         if not isinstance(entry, dict):
+            return ""
+        if self._entry_looks_like_descriptor_contract(entry):
+            for candidate in (
+                entry.get("source_root_path"),
+                entry.get("source_root"),
+            ):
+                value = str(candidate or "").strip()
+                if value:
+                    return value
             return ""
         for candidate in (
             entry.get("source_root_path"),
@@ -14411,6 +14468,14 @@ class TaskManager:
         if not resolved.is_file():
             raise ValidationError(f"DFA source_file 不存在: {raw}")
         return resolved.relative_to(root).as_posix()
+
+    def _validate_explicit_dfa_contract(self, entry: dict[str, Any], *, module_input_path: str, source_root_path: str) -> None:
+        if not self._entry_looks_like_descriptor_contract(entry):
+            return
+        if not str(module_input_path or "").strip():
+            raise ValidationError("DFA 输入缺少显式 module_input_path/module_dir contract")
+        if not str(source_root_path or "").strip():
+            raise ValidationError("DFA 输入缺少显式 source_root contract")
 
     def _resolve_entry_definition_kind(self, entry: dict[str, Any]) -> str:
         raw = str(entry.get("definition_kind") or "").strip().lower()
@@ -14593,6 +14658,11 @@ class TaskManager:
             definition_line = str(entry.get("definition_line") or entry.get("line_no") or "").strip()
             module_input_path = self._resolve_dfa_module_input_path(entry)
             source_root_path = self._resolve_dfa_source_root_path(entry)
+            self._validate_explicit_dfa_contract(
+                entry,
+                module_input_path=module_input_path,
+                source_root_path=source_root_path,
+            )
             if not definition_found:
                 item.status = "failed"
                 item.finished_at = _now()
@@ -15123,44 +15193,18 @@ class TaskManager:
 
     def _build_vuln_input_contract(self, dataflow_result: dict[str, Any]) -> dict[str, Any]:
         contract = dict(dataflow_result)
-        artifact_root_raw = str(
-            dataflow_result.get("artifact_root")
-            or dataflow_result.get("archive_root")
-            or ""
-        ).strip()
-        artifact_root = Path(artifact_root_raw) if artifact_root_raw else None
-
         data_flow_root = str(dataflow_result.get("data_flow_root") or "").strip()
-        if not data_flow_root and artifact_root and artifact_root.exists():
-            data_flow_root = str(artifact_root)
-
         data_flow_files: list[str] = []
         for value in dataflow_result.get("data_flow_files") or []:
             raw = str(value or "").strip()
             if raw and raw not in data_flow_files:
                 data_flow_files.append(raw)
 
-        if artifact_root and artifact_root.exists():
-            for path in self._collect_dataflow_report_files(artifact_root):
-                raw = str(path)
-                if raw not in data_flow_files:
-                    data_flow_files.append(raw)
-
         primary_report_path = str(dataflow_result.get("primary_report_path") or "").strip()
-        if not primary_report_path:
-            for raw in data_flow_files:
-                if Path(raw).name == "final_report.md":
-                    primary_report_path = raw
-                    break
         legacy_data_flow_file = str(dataflow_result.get("data_flow_file") or "").strip()
-        if legacy_data_flow_file and legacy_data_flow_file not in data_flow_files:
-            data_flow_files.append(legacy_data_flow_file)
-        if not primary_report_path and data_flow_files:
-            primary_report_path = data_flow_files[0]
-
-        data_flow_file = legacy_data_flow_file
-        if not data_flow_file:
-            data_flow_file = primary_report_path
+        if legacy_data_flow_file and not primary_report_path:
+            primary_report_path = legacy_data_flow_file
+        data_flow_file = primary_report_path or legacy_data_flow_file
 
         contract.update(
             {
@@ -15175,15 +15219,9 @@ class TaskManager:
     def _resolve_vuln_data_flow_input_path(self, dataflow_result: dict[str, Any]) -> str:
         for value in (
             dataflow_result.get("data_flow_root"),
-            dataflow_result.get("artifact_root"),
-            dataflow_result.get("archive_root"),
             dataflow_result.get("primary_report_path"),
             dataflow_result.get("data_flow_file"),
         ):
-            raw = str(value or "").strip()
-            if raw:
-                return raw
-        for value in dataflow_result.get("data_flow_files") or []:
             raw = str(value or "").strip()
             if raw:
                 return raw
