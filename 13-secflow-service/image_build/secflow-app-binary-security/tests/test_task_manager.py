@@ -915,7 +915,8 @@ class TaskManagerTests(unittest.TestCase):
 
             self.assertEqual("running", task.status)
             self.assertEqual("entry_analysis", task.current_stage)
-            self.assertIsNone(task.dispatcher_instance_id)
+            self.assertEqual("pod-a", task.dispatcher_instance_id)
+            self.assertIsNotNone(task.dispatch_started_at)
             self.assertIsNone(task.finished_at)
             self.assertEqual("running", stage_run.status)
             self.assertIsNone(stage_run.finished_at)
@@ -9592,6 +9593,23 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("transport_error", response.sync_status)
         self.assertIsNotNone(response.last_synced_at)
+
+    def test_stage_item_response_exposes_rerun_count_alias(self):
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="dataflow_analysis",
+            item_key="entry1",
+            status="failed",
+            retry_count=11,
+        )
+
+        response = self.manager._stage_item_response(item)
+
+        self.assertEqual(11, response.retry_count)
+        self.assertEqual(11, response.rerun_count)
 
     def test_stage_worker_terminal_event_rebuilds_system_analysis_from_items(self):
         with tempfile.TemporaryDirectory() as tmp:
