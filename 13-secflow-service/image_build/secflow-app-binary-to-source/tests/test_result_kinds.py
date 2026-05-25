@@ -6,7 +6,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from app.model import B2STaskItem
-from app.service.task_service import build_task_item_artifacts, build_task_result_summary
+from app.service.task_service import (
+    build_generated_files,
+    build_task_item_artifacts,
+    build_task_result_summary,
+    normalize_generated_files,
+    remove_ida_intermediate_outputs,
+)
 
 
 def _item(*, item_id: str, output_dir: str, status: str = "success") -> B2STaskItem:
@@ -98,10 +104,55 @@ class ResultKindSummaryTests(unittest.TestCase):
             self.assertEqual("recovered_source", artifacts.primary_result_kind)
             self.assertEqual(1, artifacts.result_kind_summary["recovered_source"])
             self.assertNotIn("batch_intermediate", artifacts.result_kinds)
-            self.assertEqual(1, artifacts.artifact_summary["ida_intermediate"])
+            self.assertNotIn("ida_intermediate", artifacts.artifact_summary)
             index_payload = json.loads(Path(artifacts.artifact_index_path).read_text(encoding="utf-8"))
             ida_rows = [row for row in index_payload["artifacts"] if row.get("kind") == "ida_intermediate"]
-            self.assertEqual(1, len(ida_rows))
+            self.assertEqual(0, len(ida_rows))
+
+    def test_generated_files_excludes_ida_outputs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            item = _item(item_id="item-5", output_dir=str(root))
+            generated = build_generated_files(
+                item,
+                {
+                    "c": str(root / "main.c"),
+                    "h": str(root / "main.h"),
+                    "ida_c": str(root / "main_ida.c"),
+                },
+            )
+            self.assertEqual([str(root / "main.c"), str(root / "main.h")], generated)
+
+    def test_normalize_generated_files_drops_ida_outputs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            item = _item(item_id="item-6", output_dir=str(root))
+            item.generated_files = [
+                str(root / "main.c"),
+                str(root / "main_ida.c"),
+                str(root / "main.h"),
+            ]
+            self.assertEqual(
+                [str(root / "main.c"), str(root / "main.h")],
+                normalize_generated_files(item),
+            )
+
+    def test_remove_ida_intermediate_outputs_only_cleans_final_output_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "main.c").write_text("int main(void){return 0;}\n", encoding="utf-8")
+            ida_root = root / "main_ida.c"
+            ida_root.write_text("int ida_main(void){return 0;}\n", encoding="utf-8")
+            run_ida = root / "run" / "ida_cache" / "ida_export"
+            run_ida.mkdir(parents=True)
+            run_ida_file = run_ida / "decompiled.c"
+            run_ida_file.write_text("int ida_cached(void){return 0;}\n", encoding="utf-8")
+
+            removed = remove_ida_intermediate_outputs(root)
+
+            self.assertEqual([str(ida_root)], removed)
+            self.assertFalse(ida_root.exists())
+            self.assertTrue(run_ida_file.exists())
 
 
 if __name__ == "__main__":

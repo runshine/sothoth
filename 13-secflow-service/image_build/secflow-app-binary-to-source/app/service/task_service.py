@@ -2412,6 +2412,11 @@ async def sync_task(db: Session, task: B2STask) -> None:
         if new_status == "success":
             output = job.get("output") or {}
             item.generated_files = build_generated_files(item, output)
+            removed_intermediates = remove_ida_intermediate_outputs(item.output_dir)
+            if removed_intermediates:
+                metadata = item.extra_metadata or {}
+                metadata["removed_ida_intermediate_outputs"] = removed_intermediates
+                item.extra_metadata = metadata
             if refresh_item_function_stats(item, inspect_files=True):
                 changed = True
             if get_cache_service().store_success_cache(
@@ -2764,20 +2769,54 @@ def ida_decompiled_c_path(item: B2STaskItem, reference_path: str | None = None) 
     return None
 
 
+def _is_ida_intermediate_path(path: str | Path | None) -> bool:
+    if not path:
+        return False
+    name = Path(str(path)).name.lower()
+    return "_ida." in name or name.endswith("_ida.c") or name.endswith("_ida.h")
+
+
+def remove_ida_intermediate_outputs(output_dir: str | Path | None) -> list[str]:
+    root = Path(str(output_dir or "")).expanduser()
+    if not root.exists():
+        return []
+    removed: list[str] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            relative_parts = [part.lower() for part in path.relative_to(root).parts]
+        except Exception:
+            relative_parts = [part.lower() for part in path.parts]
+        if "run" in relative_parts:
+            continue
+        if not _is_ida_intermediate_path(path):
+            continue
+        try:
+            path.unlink()
+            removed.append(str(path))
+        except FileNotFoundError:
+            continue
+    return removed
+
+
 def build_generated_files(item: B2STaskItem, output: dict | None) -> list[str]:
     output = output or {}
-    ida_c = output.get("ida_c") or ida_decompiled_c_path(item, output.get("c"))
-    return [p for p in [output.get("c"), output.get("h"), ida_c] if p]
+    files: list[str] = []
+    for candidate in (output.get("c"), output.get("h")):
+        if not candidate or _is_ida_intermediate_path(candidate):
+            continue
+        files.append(candidate)
+    return files
 
 
 def normalize_generated_files(item: B2STaskItem) -> list[str]:
-    """Replace legacy .asm entries with IDA's direct decompiled.c for responses."""
+    """Return only final B2S outputs; never surface IDA intermediate files."""
     normalized: list[str] = []
     for path in item.generated_files:
+        if _is_ida_intermediate_path(path):
+            continue
         if Path(path).suffix.lower() == ".asm":
-            ida_c = ida_decompiled_c_path(item, path)
-            if ida_c:
-                normalized.append(ida_c)
             continue
         normalized.append(path)
     return normalized
@@ -4001,6 +4040,8 @@ def _iter_root_artifact_paths(output_dir: Path) -> list[Path]:
             continue
         relative_parts = [part.lower() for part in path.relative_to(output_dir).parts]
         if relative_parts and relative_parts[0] == "run":
+            continue
+        if _is_ida_intermediate_path(path):
             continue
         if path.suffix.lower() not in allowed_suffixes and path.name.lower() != "files.list":
             continue
