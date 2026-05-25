@@ -629,6 +629,7 @@ STAGE_RETRY_BLOCKED_TASK_STATUSES = {"pending", "dispatching", "running", "pendi
 TASK_STATUS_PENDING_MODULE_CONFIRMATION = "pending_module_confirmation"
 TASK_STATUS_CONTINUE_PREPARING = "continue_preparing"
 TASK_STATUS_RETRY_PREPARING = "retry_preparing"
+TASK_STATUS_HARD_RESTART_FAILED = "hard_restart_failed"
 TASK_PREPARING_STATUSES = {TASK_STATUS_CONTINUE_PREPARING, TASK_STATUS_RETRY_PREPARING}
 TASK_ACTION_CONTINUE = "continue"
 TASK_ACTION_RETRY = "retry"
@@ -955,6 +956,7 @@ class TaskManager:
             firmware_path=str(input_dir),
             output_root=str(output_root),
             workspace_root=str(workspace_root),
+            execution_epoch=0,
         )
         task.policy = policy
         task.summary = {
@@ -999,6 +1001,7 @@ class TaskManager:
             "failed_firmware_count": 0,
         }
         task.stage_summary = {}
+        task.cleanup_snapshot = {}
         db.add(task)
         db.commit()
         await self._write_task_metadata_async(task, metadata_path, status="pending_upload")
@@ -1217,6 +1220,7 @@ class TaskManager:
         ).all()
         queue_info = self._build_queue_info(db, project_id=project_id)
         base = self._task_response(db, task, queue_info=queue_info).model_dump()
+        base.pop("execution_epoch", None)
         stage_summaries = [BinarySecurityStageSummary(**summary) if isinstance(summary, dict) else summary for summary in base.get("stage_summaries", [])]
         archive_job_responses: list[BinarySecurityArchiveJobResponse] = []
         for job in archive_jobs:
@@ -1257,6 +1261,7 @@ class TaskManager:
         stage_item_responses = [self._stage_item_response(item) for item in items[:DETAIL_STAGE_ITEMS_LIMIT]]
         return BinarySecurityTaskDetailResponse(
             **base,
+            execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
             description=task.description,
             output_root=task.output_root,
             workspace_root=task.workspace_root,
@@ -1278,6 +1283,7 @@ class TaskManager:
                 items,
             ),
             orchestration_observability=self._build_orchestration_observability(db, task),
+            cleanup_snapshot=dict(task.cleanup_snapshot or {}),
         )
 
     def get_task_stage_items_page(
@@ -1952,23 +1958,8 @@ class TaskManager:
             raise
 
     async def _prepare_retry_task(self, db: Session, task: BinarySecurityTask) -> list[str]:
-        stage_sequence = self._stage_sequence_for_task(task)
-        first_stage = stage_sequence[0]
-        self._invalidate_task_execution(task)
-        downstream_refs = self._retry_downstream_refs_for_stages(db, task, stage_sequence)
-        if downstream_refs:
-            await self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token())
-        self._clear_stage_outputs_from(task, first_stage, mark_stale=False)
-        self._delete_archive_children_for_stages(db, task, stage_sequence)
-        self._delete_stage_items_for_stages(db, task.id, stage_sequence)
-        for current_stage in stage_sequence:
-            stage_run = db.query(BinarySecurityStageRun).filter(
-                BinarySecurityStageRun.task_id == task.id,
-                BinarySecurityStageRun.stage_name == current_stage,
-            ).first()
-            if stage_run:
-                self._reset_stage_run_for_retry(task, stage_run, increment_retry=True)
-        return stage_sequence
+        cleanup_snapshot = await self._prepare_hard_restart_task(db, task)
+        return list(cleanup_snapshot.get("stage_sequence") or self._stage_sequence_for_task(task))
 
     def _streaming_retry_descendant_stage_names(self, stage_name: str) -> list[str]:
         normalized = str(stage_name or "").strip()
@@ -2372,6 +2363,123 @@ class TaskManager:
         await self._cancel_downstream_refs(db, task, refs, token)
         await self._ensure_downstream_refs_inactive(db, task, refs, token)
         await self._delete_downstream_refs(db, task, refs, token)
+
+    def _delete_task_event_payload_dirs(self, task: BinarySecurityTask) -> None:
+        root = Path(task.workspace_root)
+        for folder_name in ("state-event-payloads", "timeline-event-payloads"):
+            target = root / folder_name
+            if not target.exists():
+                continue
+            try:
+                shutil.rmtree(target, ignore_errors=True)
+            except OSError as exc:
+                if exc.errno != errno.ESTALE:
+                    raise
+
+    def _delete_stage_run_rows(self, db: Session, task_id: str) -> int:
+        deleted = int(
+            db.query(BinarySecurityStageRun)
+            .filter(BinarySecurityStageRun.task_id == task_id)
+            .delete(synchronize_session=False)
+            or 0
+        )
+        if hasattr(db, "stage_runs") and isinstance(getattr(db, "stage_runs"), list):
+            db.stage_runs = [row for row in db.stage_runs if str(getattr(row, "task_id", "") or "").strip() != task_id]
+        return deleted
+
+    def _delete_task_timeline_rows(self, db: Session, task_id: str) -> int:
+        deleted = int(
+            db.query(BinarySecurityEvent)
+            .filter(BinarySecurityEvent.task_id == task_id)
+            .delete(synchronize_session=False)
+            or 0
+        )
+        if hasattr(db, "events") and isinstance(getattr(db, "events"), list):
+            db.events = [row for row in db.events if str(getattr(row, "task_id", "") or "").strip() != task_id]
+        return deleted
+
+    def _delete_task_state_event_rows(self, db: Session, task_id: str) -> int:
+        deleted = int(
+            db.query(BinarySecurityStateEvent)
+            .filter(BinarySecurityStateEvent.task_id == task_id)
+            .delete(synchronize_session=False)
+            or 0
+        )
+        if hasattr(db, "state_events") and isinstance(getattr(db, "state_events"), list):
+            db.state_events = [row for row in db.state_events if str(getattr(row, "task_id", "") or "").strip() != task_id]
+        return deleted
+
+    def _delete_workspace_runtime_children(self, task: BinarySecurityTask) -> None:
+        workspace_root = Path(task.workspace_root)
+        input_dir = workspace_root / "input"
+        keep_files = {"task-metadata.json"}
+        if input_dir.exists():
+            for child in input_dir.iterdir():
+                if child.name in keep_files:
+                    continue
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+        for folder_name in ("output", "run", "logs"):
+            target = workspace_root / folder_name
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=True)
+            ensure_dir(target)
+        ensure_dir(workspace_root / "run" / "upload-tmp")
+
+    def _validate_hard_restart_cleanup(self, db: Session, task: BinarySecurityTask) -> dict[str, int]:
+        if hasattr(db, "stage_items") and hasattr(db, "stage_runs") and hasattr(db, "archive_jobs") and hasattr(db, "events") and hasattr(db, "state_events"):
+            checks = {
+                "stage_item_count": len([row for row in db.stage_items if str(getattr(row, "task_id", "") or "").strip() == task.id]),
+                "stage_run_count": len([row for row in db.stage_runs if str(getattr(row, "task_id", "") or "").strip() == task.id]),
+                "archive_job_count": len([row for row in db.archive_jobs if str(getattr(row, "task_id", "") or "").strip() == task.id]),
+                "timeline_event_count": len([row for row in db.events if str(getattr(row, "task_id", "") or "").strip() == task.id]),
+                "state_event_count": len([row for row in db.state_events if str(getattr(row, "task_id", "") or "").strip() == task.id]),
+            }
+        else:
+            checks = {
+                "stage_item_count": int(db.query(func.count(BinarySecurityStageItem.id)).filter(BinarySecurityStageItem.task_id == task.id).scalar() or 0),
+                "stage_run_count": int(db.query(func.count(BinarySecurityStageRun.id)).filter(BinarySecurityStageRun.task_id == task.id).scalar() or 0),
+                "archive_job_count": int(db.query(func.count(BinarySecurityArchiveJob.id)).filter(BinarySecurityArchiveJob.task_id == task.id).scalar() or 0),
+                "timeline_event_count": int(db.query(func.count(BinarySecurityEvent.id)).filter(BinarySecurityEvent.task_id == task.id).scalar() or 0),
+                "state_event_count": int(db.query(func.count(BinarySecurityStateEvent.id)).filter(BinarySecurityStateEvent.task_id == task.id).scalar() or 0),
+            }
+        non_zero = {key: value for key, value in checks.items() if int(value or 0) > 0}
+        if non_zero:
+            raise ValidationError(f"硬重启清理未完成，仍有残留: {non_zero}")
+        return checks
+
+    async def _prepare_hard_restart_task(self, db: Session, task: BinarySecurityTask) -> dict[str, Any]:
+        stage_sequence = self._stage_sequence_for_task(task)
+        cleanup_snapshot: dict[str, Any] = {
+            "requested_at": _isoformat_or_none(_now()),
+            "previous_epoch": int(getattr(task, "execution_epoch", 0) or 0),
+            "stage_sequence": stage_sequence,
+            "downstream_refs": [],
+            "cleanup_counts": {},
+        }
+        self._invalidate_task_execution(task)
+        refs = self._dedupe_downstream_refs(
+            self._retry_downstream_refs_for_stages(db, task, stage_sequence)
+            + self._discover_parent_linked_downstream_refs(db, task)
+        )
+        cleanup_snapshot["downstream_refs"] = refs
+        if refs:
+            await self._cleanup_downstream_refs(db, task, refs, self._service_token())
+        self._clear_stage_outputs_from(task, stage_sequence[0], mark_stale=False)
+        cleanup_snapshot["cleanup_counts"]["archive_jobs_deleted"] = self._delete_archive_children_for_stages(db, task, stage_sequence)
+        cleanup_snapshot["cleanup_counts"]["stage_items_deleted"] = self._delete_stage_items_for_stages(db, task.id, stage_sequence)
+        cleanup_snapshot["cleanup_counts"]["stage_runs_deleted"] = self._delete_stage_run_rows(db, task.id)
+        self._delete_task_event_payload_dirs(task)
+        self._delete_workspace_runtime_children(task)
+        self._delete_task_summary_file(task)
+        cleanup_snapshot["cleanup_counts"]["timeline_events_deleted"] = self._delete_task_timeline_rows(db, task.id)
+        cleanup_snapshot["cleanup_counts"]["state_events_deleted"] = self._delete_task_state_event_rows(db, task.id)
+        task.cleanup_snapshot = cleanup_snapshot
+        self._validate_hard_restart_cleanup(db, task)
+        self._reset_task_for_hard_restart(task)
+        return cleanup_snapshot
 
     async def _seed_work_queues(self) -> None:
         session_factory = get_session_factory()
@@ -2974,6 +3082,16 @@ class TaskManager:
                     if attempt >= 2 or not self._is_retryable_lock_error(exc):
                         raise
                     db.rollback()
+        if hasattr(db, "archive_jobs") and isinstance(getattr(db, "archive_jobs"), list):
+            blocked_ids = set(normalized_item_ids)
+            db.archive_jobs = [
+                row for row in db.archive_jobs
+                if not (
+                    str(getattr(row, "task_id", "") or "").strip() == task_id
+                    and str(getattr(row, "stage_name", "") or "").strip() == stage_name
+                    and str(getattr(row, "item_id", "") or "").strip() in blocked_ids
+                )
+            ]
         return deleted
 
     def _clear_archive_jobs_for_stages(
@@ -3002,6 +3120,15 @@ class TaskManager:
                 .all()
             ]
             if not job_ids:
+                if hasattr(db, "archive_jobs") and isinstance(getattr(db, "archive_jobs"), list):
+                    allowed_stage_names = set(normalized)
+                    db.archive_jobs = [
+                        row for row in db.archive_jobs
+                        if not (
+                            str(getattr(row, "task_id", "") or "").strip() == task_id
+                            and str(getattr(row, "stage_name", "") or "").strip() in allowed_stage_names
+                        )
+                    ]
                 return deleted
             for attempt in range(max(1, int(max_retries))):
                 try:
@@ -3658,16 +3785,6 @@ class TaskManager:
     ) -> None:
         if action not in TASK_PENDING_ACTIONS:
             raise ValidationError(f"不支持的任务阻塞动作: {action}")
-        try:
-            db.refresh(task)
-        except Exception:
-            refreshed = (
-                db.query(BinarySecurityTask)
-                .filter(BinarySecurityTask.id == task.id)
-                .first()
-            )
-            if refreshed is not None:
-                task = refreshed
         operation_token = str(task.operation_lock_token or "").strip()
         self._enqueue_state_event(
             db,
@@ -3714,14 +3831,6 @@ class TaskManager:
                 payload={"action": action, "target_stage": target_stage, "state_event_id": event.id},
             )
             return
-        if expected_operation_token:
-            now_value = _now()
-            task.operation_lock_owner = task.operation_lock_owner or self.instance_id
-            task.operation_lock_token = expected_operation_token
-            task.operation_lock_type = action
-            task.operation_lock_acquired_at = task.operation_lock_acquired_at or now_value
-            task.operation_lock_heartbeat_at = now_value
-            task.operation_lock_expires_at = self._task_operation_lock_expires_at(now_value=now_value)
         self._invalidate_task_execution(task)
         task.status = preparing_status
         task.pending_action = action
@@ -4145,8 +4254,8 @@ class TaskManager:
                 affected_stages = stage_sequence
                 task.execution_mode = None
                 task.target_stage_name = None
-                requeued_message = f"任务已完成清理，将从第一阶段 {target_stage} 重新排队"
-                retry_semantics = "full_restart"
+                requeued_message = f"任务已完成严格清理，将从第一阶段 {target_stage} 重新排队"
+                retry_semantics = "hard_restart"
             elif action in {TASK_ACTION_RETRY_FAILED_ITEMS, TASK_ACTION_RETRY_STAGE_FAILED_ITEMS}:
                 if not target_stage:
                     raise ValidationError("失败项重试缺少目标阶段")
@@ -4205,12 +4314,12 @@ class TaskManager:
             if task is not None:
                 action = str(task.pending_action or "").strip()
                 target_stage = str(task.current_stage or "").strip() or None
-                task.status = "failed"
+                task.status = TASK_STATUS_HARD_RESTART_FAILED if action == TASK_ACTION_RETRY else "failed"
                 task.pending_action = None
                 task.last_error = str(exc)
                 task.finished_at = _now()
                 self._invalidate_task_execution(task)
-                await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="failed")
+                await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
                 self._record_event(
                     db,
                     task,
@@ -7630,6 +7739,15 @@ class TaskManager:
                 .all()
             ]
             if not item_ids:
+                if hasattr(db, "stage_items") and isinstance(getattr(db, "stage_items"), list):
+                    allowed_stage_names = set(normalized)
+                    db.stage_items = [
+                        row for row in db.stage_items
+                        if not (
+                            str(getattr(row, "task_id", "") or "").strip() == task_id
+                            and str(getattr(row, "stage_name", "") or "").strip() in allowed_stage_names
+                        )
+                    ]
                 return deleted
             for attempt in range(max(1, int(max_retries))):
                 try:
@@ -7646,7 +7764,6 @@ class TaskManager:
                     if not self._is_retryable_lock_error(exc) or attempt >= max(1, int(max_retries)) - 1:
                         raise
                     time.sleep(0.2 * (attempt + 1))
-
     def _delete_stage_items_by_ids(self, db: Session, item_ids: list[str]) -> int:
         normalized = [str(item_id or "").strip() for item_id in item_ids if str(item_id or "").strip()]
         if not normalized:
@@ -8830,6 +8947,7 @@ class TaskManager:
             task_type=self._task_type(task),
             name=task.name,
             status=task.status,
+            execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
             current_stage=task.current_stage,
             pending_action=task.pending_action,
             last_error=task.last_error,
@@ -9946,41 +10064,6 @@ class TaskManager:
                 "module_key": str(result.get("module_key") or input_ref.get("module_key") or item.item_key or ""),
                 "module_name": str(result.get("module_name") or input_ref.get("module_name") or item.item_name or ""),
                 "source_dir": self._resolve_entry_source_dir({**input_ref, **result}) or str(task.firmware_path or ""),
-                "source_root": str(
-                    result.get("source_root")
-                    or input_ref.get("source_root")
-                    or output_ref.get("source_root")
-                    or self._resolve_entry_source_dir({**input_ref, **result})
-                    or task.firmware_path
-                    or ""
-                ),
-                "module_dir": str(
-                    result.get("module_dir")
-                    or input_ref.get("module_dir")
-                    or output_ref.get("module_dir")
-                    or ""
-                ),
-                "descriptor_root": str(
-                    result.get("descriptor_root")
-                    or result.get("entry_descriptor_root")
-                    or input_ref.get("descriptor_root")
-                    or input_ref.get("entry_descriptor_root")
-                    or output_ref.get("descriptor_root")
-                    or output_ref.get("entry_descriptor_root")
-                    or ""
-                ),
-                "files_list_path": str(
-                    result.get("files_list_path")
-                    or result.get("entry_files_list")
-                    or result.get("files_list")
-                    or input_ref.get("files_list_path")
-                    or input_ref.get("entry_files_list")
-                    or input_ref.get("files_list")
-                    or output_ref.get("files_list_path")
-                    or output_ref.get("entry_files_list")
-                    or output_ref.get("files_list")
-                    or ""
-                ),
             }
             if not module["module_key"] or not module["module_name"]:
                 continue
@@ -10503,13 +10586,11 @@ class TaskManager:
         if not entry_key:
             return None
         stage_run = self._ensure_stage_run(db, task, "vuln_scan")
-        normalized_result = self._build_vuln_input_contract(
-            {
-                **dataflow_result,
-                "upstream_item_id": upstream_item.id,
-                "triggered_by_stage": upstream_item.stage_name,
-            }
-        )
+        normalized_result = {
+            **dataflow_result,
+            "upstream_item_id": upstream_item.id,
+            "triggered_by_stage": upstream_item.stage_name,
+        }
         existing = self._find_stage_item(
             db,
             task_id=task.id,
@@ -11751,6 +11832,102 @@ class TaskManager:
         task.summary = summary
         task.metrics = metrics
         task.stage_summary = stage_summary
+
+    def _base_task_summary(
+        self,
+        task: BinarySecurityTask,
+        *,
+        input_files: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        existing_summary = dict(task.summary or {})
+        normalized_inputs = [dict(item) for item in (input_files if input_files is not None else existing_summary.get("input_files") or [])]
+        input_dir = Path(task.workspace_root) / "input"
+        run_dir = Path(task.workspace_root) / "run"
+        output_root = Path(task.output_root)
+        task_type = self._task_type(task)
+        summary = {
+            "fileserver_project_path": str(task.workspace_root),
+            "task_root_path": str(task.workspace_root),
+            "input_dir": str(input_dir),
+            "output_dir": str(output_root),
+            "run_dir": str(run_dir),
+            "temp_upload_dir": str(run_dir / "upload-tmp") if task_type == TASK_TYPE_SOURCE else None,
+            "input_manifest_path": str(input_dir / "task-metadata.json"),
+            "input_files": normalized_inputs,
+            "input_kind": (
+                "source_archives"
+                if task_type == TASK_TYPE_SOURCE
+                else "module_elf_files"
+                if task_type == TASK_TYPE_BINARY_MODULE
+                else "firmware_files"
+            ),
+            "module_input": (
+                {
+                    "module_name": str(existing_summary.get("module_input", {}).get("module_name") or task.name or "").strip(),
+                    "file_count": len(normalized_inputs),
+                }
+                if task_type == TASK_TYPE_BINARY_MODULE
+                else None
+            ),
+            "system_analysis_bypassed": task_type == TASK_TYPE_BINARY_MODULE,
+            "downstream_task_ids": {},
+            "system_analysis_modules": [],
+            "candidate_modules": [],
+            "selected_modules": [],
+            "execution_epoch": int(getattr(task, "execution_epoch", 0) or 0),
+        }
+        if task_type == TASK_TYPE_BINARY_MODULE:
+            module_input = existing_summary.get("module_input") or {}
+            module_name = str(module_input.get("module_name") or "").strip()
+            if module_name:
+                summary["module_input"] = {
+                    "module_name": module_name,
+                    "file_count": len(normalized_inputs),
+                }
+        return summary
+
+    def _base_task_metrics(self, task: BinarySecurityTask, *, input_files: list[dict[str, Any]]) -> dict[str, Any]:
+        task_type = self._task_type(task)
+        total_bytes = int(sum(int(item.get("size") or 0) for item in input_files))
+        return {
+            "high_risk_module_count": 0,
+            "medium_risk_module_count": 0,
+            "low_risk_module_count": 0,
+            "candidate_module_count": 1 if task_type == TASK_TYPE_BINARY_MODULE else 0,
+            "selected_module_count": 1 if task_type == TASK_TYPE_BINARY_MODULE else 0,
+            "entry_count": 0,
+            "vuln_result_count": 0,
+            "input_file_count": len(input_files),
+            "uploaded_file_count": len(input_files),
+            "input_total_bytes": total_bytes,
+            "firmware_item_count": len(input_files),
+            "unpacked_firmware_count": 0,
+            "failed_firmware_count": 0,
+        }
+
+    def _reset_task_for_hard_restart(self, task: BinarySecurityTask) -> None:
+        input_files = [dict(item) for item in (task.summary or {}).get("input_files") or []]
+        task.execution_epoch = int(getattr(task, "execution_epoch", 0) or 0) + 1
+        task.execution_mode = None
+        task.target_stage_name = None
+        task.pending_action = None
+        task.last_error = None
+        task.finished_at = None
+        task.started_at = None
+        task.current_stage = self._stage_sequence_for_task(task)[0]
+        self._invalidate_task_execution(task)
+        task.summary = self._base_task_summary(task, input_files=input_files)
+        task.metrics = self._base_task_metrics(task, input_files=input_files)
+        task.stage_summary = {}
+        task.cleanup_snapshot = {}
+
+    def _delete_task_summary_file(self, task: BinarySecurityTask) -> None:
+        summary_path = Path(task.workspace_root) / BinarySecurityTask.SUMMARY_FILENAME
+        try:
+            if summary_path.exists():
+                summary_path.unlink()
+        except Exception:
+            pass
 
     def _clear_stage_output_artifacts(self, task: BinarySecurityTask, stage_names: list[str]) -> None:
         output_root = Path(str(task.output_root or "")).resolve()
@@ -13190,12 +13367,6 @@ class TaskManager:
                 {
                     "module_key": module.get("module_key"),
                     "module_name": module.get("module_name"),
-                    "module_dir": module.get("module_dir"),
-                    "source_dir": module.get("source_dir"),
-                    "source_root": module.get("source_root"),
-                    "descriptor_root": module.get("descriptor_root") or module.get("entry_descriptor_root"),
-                    "files_list_path": module.get("files_list_path") or module.get("entry_files_list") or module.get("files_list"),
-                    "files_list": module.get("files_list") or module.get("files_list_path") or module.get("entry_files_list"),
                     "rank": module.get("rank"),
                     "risk_level": module.get("risk_level"),
                     "risk_score": module.get("risk_score"),
@@ -13252,10 +13423,8 @@ class TaskManager:
                         "module_key": module_key,
                         "module_name": name,
                         "module_dir": str(module_dir),
-                        "descriptor_root": str(module_dir),
                         "source_dir": str(source_dir),
                         "module_report": str(module_report),
-                        "files_list_path": str(files_list),
                         "files_list": str(files_list),
                         "risk_level": str(module.get("risk_level") or "").strip(),
                         "risk_score": int(module.get("risk_score") or 0),
@@ -13287,10 +13456,8 @@ class TaskManager:
                     "module_key": module_key,
                     "module_name": name,
                     "module_dir": str(module_dir),
-                    "descriptor_root": str(module_dir),
                     "source_dir": str(source_dir),
                     "module_report": str(module_dir / "module_report.md"),
-                    "files_list_path": str(module_dir / "files.list"),
                     "files_list": str(module_dir / "files.list"),
                     "risk_level": "",
                     "risk_score": 0,
@@ -13619,20 +13786,7 @@ class TaskManager:
     def _entry_analysis_inputs(self, db: Session, task: BinarySecurityTask) -> list[dict[str, Any]]:
         if self._task_type(task) == TASK_TYPE_SOURCE:
             return list(task.summary.get("selected_modules") or [])
-        summary_b2s_results = list(task.summary.get("b2s_results") or [])
-        if self._task_type(task) == TASK_TYPE_BINARY_MODULE:
-            rebuilt = self._rebuild_summary_results_from_stage_items(db, task, "binary_to_source", "b2s_results")
-            normalized = [self._normalize_entry_analysis_module_input(task, module) for module in (rebuilt or []) if isinstance(module, dict)]
-            if normalized and normalized != rebuilt:
-                task.summary = {**(task.summary or {}), "b2s_results": normalized}
-            ready = [module for module in normalized if module.get("entry_descriptor_ready")]
-            if ready:
-                return ready
-            if normalized:
-                return normalized
         b2s_results = list(task.summary.get("b2s_results") or [])
-        if not b2s_results and summary_b2s_results:
-            b2s_results = summary_b2s_results
         if b2s_results:
             normalized = [self._normalize_entry_analysis_module_input(task, module) for module in b2s_results if isinstance(module, dict)]
             if normalized != b2s_results:
@@ -14097,19 +14251,9 @@ class TaskManager:
         lowered_parts = [part.lower() for part in path.parts]
         if "run" in lowered_parts:
             return False
-        if "runs" in lowered_parts:
-            return False
         if "agent_sessions" in lowered_parts:
             return False
-        if "ida_cache" in lowered_parts:
-            return False
-        if "agent_header" in lowered_parts:
-            return False
-        if any(part.startswith(".re_work_") for part in lowered_parts):
-            return False
         lowered_name = path.name.lower()
-        if re.fullmatch(r"batch_\d+\.(c|cc|cpp|cxx|h|hpp|hh)", lowered_name):
-            return False
         if "_ida." in lowered_name or lowered_name.endswith("_ida.c") or lowered_name.endswith("_ida.h"):
             return False
         if lowered_name.endswith(".chat.json") or lowered_name.endswith(".validate.json"):
@@ -14198,24 +14342,6 @@ class TaskManager:
 
     def _normalize_entry_analysis_module_input(self, task: BinarySecurityTask, module: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(module)
-        files_list_path = str(
-            normalized.get("files_list_path")
-            or normalized.get("entry_files_list")
-            or normalized.get("files_list")
-            or ""
-        ).strip()
-        if files_list_path:
-            normalized["files_list_path"] = files_list_path
-            if not str(normalized.get("files_list") or "").strip():
-                normalized["files_list"] = files_list_path
-        descriptor_root = str(
-            normalized.get("descriptor_root")
-            or normalized.get("entry_descriptor_root")
-            or normalized.get("module_dir")
-            or ""
-        ).strip()
-        if descriptor_root:
-            normalized["descriptor_root"] = descriptor_root
         if self._task_type(task) != TASK_TYPE_BINARY_MODULE:
             return normalized
         entry_descriptor_root = str(normalized.get("entry_descriptor_root") or "").strip()
@@ -14230,8 +14356,6 @@ class TaskManager:
                 # archived B2S module root, so source_root must align with that descriptor root.
                 normalized["source_root"] = str(descriptor_root_path)
                 normalized["module_dir"] = str(Path(entry_files_list).parent)
-                normalized["descriptor_root"] = str(descriptor_root_path)
-                normalized["files_list_path"] = str(files_list_path)
                 normalized["files_list"] = str(files_list_path)
                 return normalized
         for artifact_root in self._entry_descriptor_candidates(normalized):
@@ -14248,8 +14372,6 @@ class TaskManager:
             normalized["source_dir"] = str(prepared.get("entry_descriptor_root") or normalized.get("source_dir") or "")
             normalized["source_root"] = str(prepared.get("entry_descriptor_root") or prepared.get("source_root") or normalized.get("source_root") or "")
             normalized["module_dir"] = str(prepared.get("module_dir") or normalized.get("module_dir") or "")
-            normalized["descriptor_root"] = str(prepared.get("entry_descriptor_root") or normalized.get("descriptor_root") or "")
-            normalized["files_list_path"] = str(prepared.get("entry_files_list") or prepared.get("files_list") or normalized.get("files_list_path") or "")
             normalized["files_list"] = str(prepared.get("files_list") or normalized.get("files_list") or "")
             break
         return normalized
@@ -14274,7 +14396,7 @@ class TaskManager:
                 item_name=module["module_name"],
                 parent_key=module["firmware_key"],
                 downstream_service="entry_analyse",
-                input_ref=entry_input,
+                input_ref=module,
                 retrying=retrying,
             )
             session.commit()
@@ -14361,15 +14483,10 @@ class TaskManager:
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
-                    entry_module_dir = (
-                        entry_input.get("module_dir")
-                        or entry_input.get("source_dir")
-                        or ""
-                    )
                     created = await get_entry_analyse_client().create_task(
                         task.project_id,
                         f"{task.name}-{entry_input['module_name']}-entry",
-                        entry_module_dir,
+                        entry_input["source_dir"],
                         entry_input["module_name"],
                         token or "",
                         entry_input.get("source_root") or entry_input.get("unpacked_root") or entry_input["source_dir"],
@@ -14377,16 +14494,6 @@ class TaskManager:
                             **_downstream_origin_payload(task, item),
                             "entry_descriptor_root": entry_input.get("entry_descriptor_root"),
                             "entry_files_list": entry_input.get("entry_files_list"),
-                        },
-                        {
-                            "contract_version": 1,
-                            "input_kind": "module_descriptor",
-                            "module_key": entry_input.get("module_key"),
-                            "module_name": entry_input.get("module_name"),
-                            "module_dir": entry_input.get("module_dir") or entry_input.get("source_dir"),
-                            "files_list_path": entry_input.get("files_list_path") or entry_input.get("entry_files_list") or entry_input.get("files_list"),
-                            "descriptor_root": entry_input.get("descriptor_root") or entry_input.get("entry_descriptor_root") or entry_input.get("module_dir") or entry_input.get("source_dir"),
-                            "source_root": entry_input.get("source_root") or entry_input.get("unpacked_root") or entry_input.get("source_dir"),
                         },
                     )
             if created is not None:
@@ -14529,46 +14636,8 @@ class TaskManager:
             return str(definition_path.parent if definition_path.suffix else definition_path)
         return ""
 
-    def _entry_looks_like_descriptor_contract(self, entry: dict[str, Any]) -> bool:
-        if not isinstance(entry, dict):
-            return False
-        return any(
-            str(value or "").strip()
-            for value in (
-                entry.get("module_dir"),
-                entry.get("files_list_path"),
-                entry.get("entry_files_list"),
-                entry.get("files_list"),
-                entry.get("source_root"),
-                entry.get("source_root_path"),
-            )
-        )
-
-    def _entry_has_explicit_descriptor_contract(self, entry: dict[str, Any]) -> bool:
-        if not self._entry_looks_like_descriptor_contract(entry):
-            return False
-        return all(
-            str(value or "").strip()
-            for value in (
-                entry.get("module_dir"),
-                entry.get("files_list_path") or entry.get("entry_files_list") or entry.get("files_list"),
-                entry.get("source_root") or entry.get("source_root_path"),
-            )
-        )
-
     def _resolve_dfa_module_input_path(self, entry: dict[str, Any]) -> str:
         if not isinstance(entry, dict):
-            return ""
-        if self._entry_looks_like_descriptor_contract(entry):
-            for candidate in (
-                entry.get("module_input_path"),
-                entry.get("module_dir"),
-                entry.get("descriptor_root"),
-                entry.get("entry_descriptor_root"),
-            ):
-                value = str(candidate or "").strip()
-                if value:
-                    return value
             return ""
         for candidate in (
             entry.get("module_input_path"),
@@ -14585,15 +14654,6 @@ class TaskManager:
 
     def _resolve_dfa_source_root_path(self, entry: dict[str, Any]) -> str:
         if not isinstance(entry, dict):
-            return ""
-        if self._entry_looks_like_descriptor_contract(entry):
-            for candidate in (
-                entry.get("source_root_path"),
-                entry.get("source_root"),
-            ):
-                value = str(candidate or "").strip()
-                if value:
-                    return value
             return ""
         for candidate in (
             entry.get("source_root_path"),
@@ -14624,14 +14684,6 @@ class TaskManager:
         if not resolved.is_file():
             raise ValidationError(f"DFA source_file 不存在: {raw}")
         return resolved.relative_to(root).as_posix()
-
-    def _validate_explicit_dfa_contract(self, entry: dict[str, Any], *, module_input_path: str, source_root_path: str) -> None:
-        if not self._entry_looks_like_descriptor_contract(entry):
-            return
-        if not str(module_input_path or "").strip():
-            raise ValidationError("DFA 输入缺少显式 module_input_path/module_dir contract")
-        if not str(source_root_path or "").strip():
-            raise ValidationError("DFA 输入缺少显式 source_root contract")
 
     def _resolve_entry_definition_kind(self, entry: dict[str, Any]) -> str:
         raw = str(entry.get("definition_kind") or "").strip().lower()
@@ -14814,11 +14866,6 @@ class TaskManager:
             definition_line = str(entry.get("definition_line") or entry.get("line_no") or "").strip()
             module_input_path = self._resolve_dfa_module_input_path(entry)
             source_root_path = self._resolve_dfa_source_root_path(entry)
-            self._validate_explicit_dfa_contract(
-                entry,
-                module_input_path=module_input_path,
-                source_root_path=source_root_path,
-            )
             if not definition_found:
                 item.status = "failed"
                 item.finished_at = _now()
@@ -15015,8 +15062,7 @@ class TaskManager:
                 task=task,
                 item=item,
             )
-            data_flow_reports = self._collect_dataflow_report_files(materialized)
-            data_flow_file = data_flow_reports[0] if data_flow_reports else None
+            data_flow_file = self._find_first(materialized, [r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"])
             downstream_status = str(payload.get("status") or "").lower()
             mapped_status = self._map_downstream_status(downstream_status) or (
                 "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
@@ -15040,24 +15086,15 @@ class TaskManager:
                 item.error_message = error
                 session.commit()
                 return {"status": "archive_blocked", "error": error, "item": entry, "archive_blocked": True}
-            archived_data_flow_reports = self._collect_dataflow_report_files(archived_dir)
-            archived_data_flow_file = archived_data_flow_reports[0] if archived_data_flow_reports else None
-            data_flow_root = str(archived_dir or materialized)
-            data_flow_files = [str(path) for path in (archived_data_flow_reports or data_flow_reports)]
-            primary_report_path = ""
-            for raw in data_flow_files:
-                if Path(raw).name == "final_report.md":
-                    primary_report_path = raw
-                    break
-            if not primary_report_path:
-                primary_report_path = str(archived_data_flow_file or data_flow_file) if (archived_data_flow_file or data_flow_file) else ""
+            archived_data_flow_file = self._find_first(archived_dir, [r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"])
             result = {
                 **entry,
                 "artifact_root": str(archived_dir),
-                "data_flow_root": data_flow_root,
-                "data_flow_files": data_flow_files,
-                "primary_report_path": primary_report_path,
-                "data_flow_file": primary_report_path,
+                "archive_root": str(archived_dir),
+                "module_input_path": module_input_path,
+                "source_root_path": source_root_path,
+                "source_file": normalized_source_file,
+                "data_flow_file": str(archived_data_flow_file or data_flow_file) if (archived_data_flow_file or data_flow_file) else "",
                 "downstream": self._lightweight_downstream_payload(payload),
             }
             item.result = self._compact_result_for_storage(stage_run.stage_name, result)
@@ -15065,9 +15102,9 @@ class TaskManager:
                 **(item.output_ref or {}),
                 "artifact_root": str(archived_dir),
                 "archive_root": str(archived_dir),
-                "data_flow_root": data_flow_root,
-                "data_flow_files": data_flow_files,
-                "primary_report_path": primary_report_path,
+                "module_input_path": module_input_path,
+                "source_root_path": source_root_path,
+                "source_file": normalized_source_file,
                 "data_flow_file": result["data_flow_file"],
             }
             if self._streaming_mode_enabled(task):
@@ -15120,17 +15157,16 @@ class TaskManager:
     ) -> dict[str, Any]:
         session = get_session_factory()()
         try:
-            normalized_vuln_input = self._build_vuln_input_contract(dataflow_result)
             item = self._upsert_stage_item(
                 session,
                 task=task,
                 stage_run=stage_run,
                 stage_name=stage_run.stage_name,
-                item_key=normalized_vuln_input["entry_key"],
-                item_name=normalized_vuln_input["function_name"],
-                parent_key=normalized_vuln_input["module_key"],
+                item_key=dataflow_result["entry_key"],
+                item_name=dataflow_result["function_name"],
+                parent_key=dataflow_result["module_key"],
                 downstream_service="dataflow_vuln_scanner",
-                input_ref=normalized_vuln_input,
+                input_ref=dataflow_result,
                 retrying=retrying,
             )
             session.commit()
@@ -15217,13 +15253,12 @@ class TaskManager:
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
-                    data_flow_input_path = self._resolve_vuln_data_flow_input_path(normalized_vuln_input)
                     created = await get_dataflow_vuln_scanner_client().create_task(
                         task.project_id,
-                        f"{task.name}-{normalized_vuln_input['function_name']}-scan",
+                        f"{task.name}-{dataflow_result['function_name']}-scan",
                         token or "",
-                        data_flow_input_path,
-                        normalized_vuln_input["source_dir"],
+                        dataflow_result["data_flow_file"],
+                        dataflow_result["source_dir"],
                         _downstream_origin_payload(task, item),
                     )
             if created is not None:
@@ -15257,14 +15292,14 @@ class TaskManager:
             if mapped_status != "success":
                 item.error_message = payload.get("error") or payload.get("error_message")
                 session.commit()
-                return {"status": mapped_status, "error": item.error_message, "item": normalized_vuln_input}
+                return {"status": mapped_status, "error": item.error_message, "item": dataflow_result}
             if archived_dir is None:
                 error = archive_job.error_message if archive_job is not None else "总任务产物归档失败"
                 item.error_message = error
                 session.commit()
-                return {"status": "archive_blocked", "error": error, "item": normalized_vuln_input, "archive_blocked": True}
+                return {"status": "archive_blocked", "error": error, "item": dataflow_result, "archive_blocked": True}
             result = {
-                **normalized_vuln_input,
+                **dataflow_result,
                 "workspace_root": artifacts.get("workspace_root"),
                 "artifact_files": artifacts.get("files", []),
                 "archive_root": str(archived_dir),
@@ -15291,9 +15326,9 @@ class TaskManager:
                     item,
                     operation="vuln_scan",
                     exc=exc,
-                    response_item=normalized_vuln_input,
+                    response_item=dataflow_result,
                 )
-            return {"status": "pending", "error": str(exc), "item": normalized_vuln_input, "deferred_mode": "redispatch"}
+            return {"status": "pending", "error": str(exc), "item": dataflow_result, "deferred_mode": "redispatch"}
         except Exception as exc:
             if "item" in locals() and self._is_retryable_downstream_transport_error(exc):
                 session.rollback()
@@ -15303,7 +15338,7 @@ class TaskManager:
                     item,
                     operation="vuln_scan",
                     exc=exc,
-                    response_item=normalized_vuln_input,
+                    response_item=dataflow_result,
                 )
             if "item" in locals():
                 session.rollback()
@@ -15311,7 +15346,7 @@ class TaskManager:
                 item.error_message = str(exc)
                 item.finished_at = _now()
                 session.commit()
-            return {"status": "failed", "error": str(exc), "item": normalized_vuln_input}
+            return {"status": "failed", "error": str(exc), "item": dataflow_result}
         finally:
             session.close()
 
@@ -15323,65 +15358,6 @@ class TaskManager:
                 if re.fullmatch(pattern, path.name):
                     return path
         return None
-
-    def _collect_dataflow_report_files(self, root: Path) -> list[Path]:
-        if not root.exists():
-            return []
-        matched: list[Path] = []
-        for path in sorted(p for p in root.rglob("*") if p.is_file()):
-            name = path.name
-            rel = path.relative_to(root).as_posix()
-            if name == "final_report.md":
-                matched.append(path)
-                continue
-            if rel.startswith("dataflow/") and path.suffix.lower() == ".md":
-                matched.append(path)
-                continue
-            if re.fullmatch(r"dataflow-.*\.md", name):
-                matched.append(path)
-                continue
-            if re.fullmatch(r".*result.*\.md", name):
-                matched.append(path)
-                continue
-            if name == "report.md":
-                matched.append(path)
-        return matched
-
-    def _build_vuln_input_contract(self, dataflow_result: dict[str, Any]) -> dict[str, Any]:
-        contract = dict(dataflow_result)
-        data_flow_root = str(dataflow_result.get("data_flow_root") or "").strip()
-        data_flow_files: list[str] = []
-        for value in dataflow_result.get("data_flow_files") or []:
-            raw = str(value or "").strip()
-            if raw and raw not in data_flow_files:
-                data_flow_files.append(raw)
-
-        primary_report_path = str(dataflow_result.get("primary_report_path") or "").strip()
-        legacy_data_flow_file = str(dataflow_result.get("data_flow_file") or "").strip()
-        if legacy_data_flow_file and not primary_report_path:
-            primary_report_path = legacy_data_flow_file
-        data_flow_file = primary_report_path or legacy_data_flow_file
-
-        contract.update(
-            {
-                "data_flow_root": data_flow_root,
-                "data_flow_files": data_flow_files,
-                "primary_report_path": primary_report_path,
-                "data_flow_file": data_flow_file,
-            }
-        )
-        return contract
-
-    def _resolve_vuln_data_flow_input_path(self, dataflow_result: dict[str, Any]) -> str:
-        for value in (
-            dataflow_result.get("data_flow_root"),
-            dataflow_result.get("primary_report_path"),
-            dataflow_result.get("data_flow_file"),
-        ):
-            raw = str(value or "").strip()
-            if raw:
-                return raw
-        raise ValidationError("漏洞扫描缺少有效的数据流输入目录或报告文件")
 
     def _aggregate_stage_items(self, db: Session, task: BinarySecurityTask, results: list[dict[str, Any]], summary_key: str) -> tuple[str, dict[str, Any]]:
         success = [result["item"] for result in results if result.get("status") == "success"]
@@ -15497,7 +15473,6 @@ class TaskManager:
             "module_key": item.get("module_key"),
             "module_name": item.get("module_name"),
             "module_dir": item.get("module_dir"),
-            "descriptor_root": item.get("descriptor_root"),
             "source_dir": item.get("source_dir"),
             "artifact_root": item.get("artifact_root"),
             "archive_root": item.get("archive_root"),
@@ -15529,8 +15504,6 @@ class TaskManager:
             "module_key": item.get("module_key"),
             "module_name": item.get("module_name"),
             "module_dir": item.get("module_dir"),
-            "descriptor_root": item.get("descriptor_root") or item.get("entry_descriptor_root"),
-            "files_list_path": item.get("files_list_path") or item.get("entry_files_list") or item.get("files_list"),
             "source_dir": item.get("source_dir"),
             "artifact_root": item.get("artifact_root"),
             "entries": self._compact_entry_rows(item.get("entries") or []),
@@ -15599,10 +15572,11 @@ class TaskManager:
             "line_no": item.get("line_no"),
             "entry_file": item.get("entry_file"),
             "source_dir": item.get("source_dir"),
+            "module_input_path": item.get("module_input_path"),
+            "source_root_path": item.get("source_root_path"),
+            "source_file": item.get("source_file") or item.get("definition_file") or item.get("file_name"),
             "artifact_root": item.get("artifact_root"),
-            "data_flow_root": item.get("data_flow_root"),
-            "data_flow_files": list(item.get("data_flow_files") or []),
-            "primary_report_path": item.get("primary_report_path"),
+            "archive_root": item.get("archive_root"),
             "data_flow_file": item.get("data_flow_file"),
         }
 
@@ -15618,9 +15592,6 @@ class TaskManager:
             "function_name": item.get("function_name"),
             "line_no": item.get("line_no"),
             "source_dir": item.get("source_dir"),
-            "data_flow_root": item.get("data_flow_root"),
-            "data_flow_files": list(item.get("data_flow_files") or []),
-            "primary_report_path": item.get("primary_report_path"),
             "data_flow_file": item.get("data_flow_file"),
             "workspace_root": item.get("workspace_root"),
             "archive_root": item.get("archive_root"),

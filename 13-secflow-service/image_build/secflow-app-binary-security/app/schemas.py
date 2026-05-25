@@ -136,6 +136,7 @@ class BinarySecurityTaskResponse(BaseModel):
     task_type: str = TASK_TYPE_BINARY
     name: str
     status: str
+    execution_epoch: int = 0
     current_stage: Optional[str] = None
     pending_action: Optional[str] = None
     last_error: Optional[str] = None
@@ -339,6 +340,7 @@ class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
     archive_jobs: list[BinarySecurityArchiveJobResponse] = Field(default_factory=list)
     overview_nodes: list[BinarySecurityOverviewNode] = Field(default_factory=list)
     orchestration_observability: dict[str, Any] = Field(default_factory=dict)
+    cleanup_snapshot: dict[str, Any] = Field(default_factory=dict)
     abnormal_reason_history: list[BinarySecurityAbnormalReasonEventSummary] = Field(default_factory=list)
 
 
