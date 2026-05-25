@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
-
-
-DEFAULT_EVOLVE_AGENTS = ["pi-worker", "pi-advisor"]
 
 
 class EvolutionPreviewRequest(BaseModel):
@@ -26,25 +23,6 @@ class EvolutionTaskCreateRequest(BaseModel):
     provider: Optional[str] = None
     review_profile: Optional[str] = None
     agent_run_timeout_seconds: Optional[int] = Field(default=None, ge=1, le=86400)
-    evolve_agents: List[str] = Field(default_factory=lambda: list(DEFAULT_EVOLVE_AGENTS))
-    auto_start: bool = True
-
-
-class EvolutionExperimentCreateRequest(BaseModel):
-    project_id: str = Field(..., min_length=1)
-    direction: str = Field(default="", max_length=4000)
-    selected_results: List[str] = Field(default_factory=list, min_length=1)
-    max_rounds: Optional[int] = Field(default=None, ge=1, le=100)
-    min_rounds: Optional[int] = Field(default=None, ge=1, le=100)
-    title: Optional[str] = Field(default=None, max_length=255)
-    metrics: Dict[str, bool] = Field(default_factory=dict)
-    max_concurrent_source_tasks: Optional[int] = Field(default=None, ge=1, le=64)
-    profile_id: Optional[str] = None
-    model: Optional[str] = None
-    provider: Optional[str] = None
-    review_profile: Optional[str] = None
-    agent_run_timeout_seconds: Optional[int] = Field(default=None, ge=1, le=86400)
-    evolve_agents: List[str] = Field(default_factory=lambda: list(DEFAULT_EVOLVE_AGENTS))
 
 
 class EvolutionConfigPayload(BaseModel):
@@ -99,7 +77,6 @@ class EvolutionTaskSummary(BaseModel):
     apply_status: str = "not_applied"
     source_task_ids: List[str] = Field(default_factory=list)
     source_case_ids: List[str] = Field(default_factory=list)
-    evolve_agents: List[str] = Field(default_factory=list)
     config: Dict[str, Any] = Field(default_factory=dict)
     message: Optional[str] = None
     created_by: str
@@ -120,8 +97,6 @@ class EvolutionTaskRoundResponse(BaseModel):
     convergence_reason: Optional[str] = None
     derived_tasks: List[Dict[str, Any]] = Field(default_factory=list)
     diff_summary: Dict[str, Any] = Field(default_factory=dict)
-    candidate_agent_state_roots: Dict[str, str] = Field(default_factory=dict)
-    meta_evaluation: Dict[str, Any] = Field(default_factory=dict)
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     created_at: datetime
@@ -132,7 +107,6 @@ class EvolutionTaskDetail(EvolutionTaskSummary):
     preview: EvolutionPreviewResponse
     agent_state_roots: Dict[str, str] = Field(default_factory=dict)
     default_agent_source_dirs: Dict[str, str] = Field(default_factory=dict)
-    best_candidate_agent_state_roots: Dict[str, str] = Field(default_factory=dict)
     sources: List[Dict[str, Any]] = Field(default_factory=list)
     rounds: List[EvolutionTaskRoundResponse] = Field(default_factory=list)
     artifacts: List[Dict[str, Any]] = Field(default_factory=list)
@@ -144,24 +118,6 @@ class EvolutionApplyResponse(BaseModel):
     task_id: str
     snapshot_path: Optional[str] = None
     message: str
-
-
-class EvolutionMemoryModePatchRequest(BaseModel):
-    mode: Literal["shared", "evolution"] = "shared"
-    enabled_agents: List[str] = Field(default_factory=lambda: list(DEFAULT_EVOLVE_AGENTS))
-    promoted_task_id: Optional[str] = None
-    promoted_round: Optional[int] = Field(default=None, ge=1)
-
-
-class EvolutionMemoryModeResponse(BaseModel):
-    project_id: str
-    mode: Literal["shared", "evolution"] = "shared"
-    enabled_agents: List[str] = Field(default_factory=list)
-    promoted_task_id: Optional[str] = None
-    promoted_round: Optional[int] = None
-    agent_state_roots: Dict[str, str] = Field(default_factory=dict)
-    config_path: Optional[str] = None
-    updated_at: Optional[datetime] = None
 
 
 class SuccessResponse(BaseModel):

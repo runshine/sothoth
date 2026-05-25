@@ -670,19 +670,7 @@ class WorkerExecutor:
         review_state: ReviewState,
         prompt_file: str,
     ) -> str:
-        prompt_name = os.path.basename(str(prompt_file))
-        simplified_rework_prompts = {
-            "worker_profile_driven_exploration.md",
-            "worker_rework_missed_hunt.md",
-        }
-        include_required_read_files = prompt_name not in simplified_rework_prompts
-        include_convergence_requirements = prompt_name not in simplified_rework_prompts
-        sections = self._build_rework_prompt_sections(
-            ctx,
-            review_state,
-            include_required_read_files=include_required_read_files,
-            include_convergence_requirements=include_convergence_requirements,
-        )
+        sections = self._build_rework_prompt_sections(ctx, review_state)
         return render_string(read_file(prompt_file), strict=True, **sections)
 
     @staticmethod
@@ -1410,9 +1398,6 @@ class WorkerExecutor:
         self,
         ctx: WorkflowContext,
         review_state: ReviewState,
-        *,
-        include_required_read_files: bool = True,
-        include_convergence_requirements: bool = True,
     ) -> dict[str, Any]:
         """Build dynamic sections shared by file-based and fallback rework prompts."""
         is_closure = (ctx.review_mode == "closure" or review_state.workflow_mode == "closure")
@@ -1484,15 +1469,13 @@ class WorkerExecutor:
             failed_result_reasons = "\n".join(failed_lines).rstrip()
 
         numbering_rules = self._build_summary_rework_rules(ctx)
-        convergence_requirements = ""
-        if include_convergence_requirements:
-            convergence_requirements = self._build_rework_convergence_requirements(
-                ctx=ctx,
-                is_closure=is_closure,
-                summary_repair_only=summary_repair_only,
-                result_repair_only=result_repair_only,
-                repeated_issue_summary=repeated_issue_summary,
-            )
+        convergence_requirements = self._build_rework_convergence_requirements(
+            ctx=ctx,
+            is_closure=is_closure,
+            summary_repair_only=summary_repair_only,
+            result_repair_only=result_repair_only,
+            repeated_issue_summary=repeated_issue_summary,
+        )
 
         summary_file = ctx.summary_file or os.path.join(ctx.working_dir, "summary.md")
         results_dir = ctx.results_dir or os.path.join(ctx.working_dir, "results")
@@ -1521,15 +1504,11 @@ class WorkerExecutor:
             "supporting_docs_dir": supporting_docs_dir,
             "rework_session_context": self._build_rework_session_context(ctx, review_state),
             "rework_recovery_context": self._build_rework_recovery_context(ctx, review_state),
-            "required_read_files": (
-                self._build_rework_required_read_files(
-                    ctx=ctx,
-                    failed_files=failed_files,
-                    worker_issue_entries=worker_issue_entries,
-                    summary_handoff_entries=summary_handoff_entries,
-                )
-                if include_required_read_files else
-                ""
+            "required_read_files": self._build_rework_required_read_files(
+                ctx=ctx,
+                failed_files=failed_files,
+                worker_issue_entries=worker_issue_entries,
+                summary_handoff_entries=summary_handoff_entries,
             ),
             "failed_review_guidance": self._build_failed_review_guidance(
                 review_state=review_state,
@@ -1856,22 +1835,32 @@ class WorkerExecutor:
         review_state: ReviewState,
         profile_issue_entries: list[dict[str, Any]],
     ) -> str:
-        _ = review_state, profile_issue_entries
-        output_file = (
-            f"`supporting_docs/profile_exploration_cycle_{ctx.cycle}.md`"
-            if ctx.cycle else
-            "`supporting_docs/profile_exploration_cycle_{cycle}.md`"
-        )
+        policy = get_review_profile_policy(ctx.review_profile)
+        depth_lanes = list(policy.depth_lanes or ())
         lines = [
-            "- 上一轮可能已经通过，但当前审计配置要求至少再做一轮探索，所以这一轮不能马虎收尾。",
-            "- 不要修文档，也不要重复确认已经坐实的结论；重点是继续找那些还没看透、但可能藏着真漏洞的路径。",
-            "- 先读 task、summary、results、supporting_docs，分清哪些地方已经查实，哪些地方只是带过。",
-            "- **重点关注跨多个函数的复杂调用链**，深度分析其中是否隐藏着漏掉的深度/细节漏洞**。",
-            "- 也可以从已有漏洞的相邻路径、对称分支、边界值、错误路径、状态差异，以及 EXPORT / USED 的后续去向里，选 2 到 4 个方向继续深挖。",
-            "- 每条路径都要回到源码：谁能控制、数据怎么走、校验够不够、最后落到什么危险操作。",
-            "- 只有确认是新的独立漏洞，才新增更高编号的 result。",
-            f"- 如果没有新漏洞，就写 {output_file}，记清这轮看了什么、为什么没成漏洞，以及哪些边界暂时下不了结论。",
+            "## Profile-driven exploration 触发原因",
+            "- 触发类型：`profile_min_discovery_cycles` / `profile_depth_budget`。",
+            "- 这不是失败评审返工，也不是 missed hunt；上一轮业务评审可以已经通过。",
+            "- 本轮目标是按 review_profile 的执行预算继续做有边界的深度探索，避免高档位过早收敛。",
+            f"- review_profile: `{policy.name}`",
+            f"- execution_goal: {policy.execution_goal}",
         ]
+        if depth_lanes:
+            lines.extend(["", "## 本档探索 lanes"])
+            lines.extend(f"- {lane}" for lane in depth_lanes)
+        if profile_issue_entries:
+            lines.extend(["", "## 框架生成的 profile 探索任务"])
+            lines.extend(self._format_issue_entry_for_prompt(item) for item in profile_issue_entries[:4])
+            if len(profile_issue_entries) > 4:
+                lines.append(f"- ... 另有 {len(profile_issue_entries) - 4} 个 profile 探索任务，按同一原则处理。")
+        lines.extend([
+            "",
+            "## 执行边界",
+            "- 从 task、summary、results、supporting_docs 和上一轮局限性中选择尚未充分覆盖的高价值方向。",
+            "- 已确认 result 只作为去重和变体种子；不要覆盖、重命名或重写 protected result。",
+            "- 若发现真实独立漏洞，新增更高编号 `results/result_NNN.md`。",
+            f"- 若没有新漏洞，写 `supporting_docs/profile_exploration_cycle_{ctx.cycle}.md`，记录探索 lane、源码负证据、未成洞原因和 residual 边界。",
+        ])
         return "\n".join(lines)
 
     def _latest_matching_advisor_record(

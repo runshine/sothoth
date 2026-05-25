@@ -435,8 +435,6 @@ def test_missed_hunt_omits_pass_feedback_and_keeps_failed_issue_actions(tmp_path
     assert "完整内容保留在 review artifacts 中" not in prompt
     assert "关键路径已充分扫描" not in prompt
     assert "漏洞发现质量优秀" not in prompt
-    assert "本轮必须读取的增量文件" not in prompt
-    assert "收敛要求" not in prompt
 
 
 def test_staged_rework_sequence_uses_one_worker_session_and_checkpoints(tmp_path: Path) -> None:
@@ -705,16 +703,10 @@ def test_profile_min_cycle_uses_profile_exploration_stage_not_missed_hunt(tmp_pa
     assert response.metadata["rework_skipped_stages"] == ["missed_vuln_hunting"]
     assert len(agent.messages) == 1
     assert "Profile-Driven Exploration" in agent.messages[0]["message"]
-    assert "当前审计配置要求至少再做一轮探索" in agent.messages[0]["message"]
-    assert "重点是继续找那些还没看透、但可能藏着真漏洞的路径" in agent.messages[0]["message"]
+    assert "这不是失败评审返工，也不是 missed hunt" in agent.messages[0]["message"]
     assert "基于失败评审继续挖洞" not in agent.messages[0]["message"]
     assert "上游评审节点已经完成筛选" not in agent.messages[0]["message"]
     assert "profile_exploration_cycle_3.md" in agent.messages[0]["message"]
-    assert "本轮必须读取的增量文件" not in agent.messages[0]["message"]
-    assert "收敛要求" not in agent.messages[0]["message"]
-    assert "框架生成的 profile 探索任务" not in agent.messages[0]["message"]
-    assert "execution_goal" not in agent.messages[0]["message"]
-    assert "depth_lanes" not in agent.messages[0]["message"]
 
     profile_checkpoint = load_step_checkpoint(
         work_dir,

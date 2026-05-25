@@ -117,8 +117,6 @@ def _project_ids(principal: dict) -> set[str]:
 
 _ACTIVE_RUN_INDEX_STATUSES = {"pending", "queued", "running", "cancel_requested", "delete_requested"}
 _QUEUE_RUN_INDEX_STATUSES = {"pending", "queued"}
-_SUCCESS_RUN_INDEX_STATUSES = {"succeeded", "completed", "success", "passed"}
-_STALE_ACTIVE_RUNTIME_FAILED_MESSAGE = "stale active runtime assumed failed"
 _TERMINAL_RUN_INDEX_STATUSES = {
     "succeeded",
     "completed",
@@ -490,83 +488,6 @@ class ExecutionService:
             / sanitize_name(agent_id)
         )
 
-    def _evolution_memory_mode_path(self, project_id: str) -> Path:
-        config = get_config()
-        return (
-            self._project_files_root(project_id)
-            / "app"
-            / sanitize_name(config.fileserver_service.dataflow_subproject_name)
-            / "agent-state"
-            / "evolution-memory-mode.json"
-        )
-
-    def _load_project_evolution_memory_mode(self, project_id: str) -> dict[str, Any]:
-        path = self._evolution_memory_mode_path(project_id)
-        try:
-            if not path.is_file():
-                return {}
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            logger.warning("failed to read evolution memory mode: %s", path, exc_info=True)
-            return {}
-        if not isinstance(payload, dict):
-            return {}
-        if str(payload.get("mode") or "").strip().lower() != "evolution":
-            return {}
-        roots = payload.get("agent_state_roots")
-        if not isinstance(roots, dict):
-            return {}
-        enabled = payload.get("enabled_agents")
-        enabled_agents = {str(item).strip() for item in enabled if str(item or "").strip()} if isinstance(enabled, list) else set()
-        selected_roots: dict[str, str] = {}
-        for agent_id, root in roots.items():
-            agent_key = str(agent_id or "").strip()
-            root_text = str(root or "").strip()
-            if not agent_key or not root_text:
-                continue
-            if enabled_agents and agent_key not in enabled_agents:
-                continue
-            selected_roots[agent_key] = root_text
-        if not selected_roots:
-            return {}
-        return {**payload, "agent_state_roots": selected_roots}
-
-    def _project_relative_ref_for_absolute_path(self, *, project_id: str, path: str | Path) -> dict[str, str]:
-        project_root = self._project_files_root(project_id)
-        resolved = self._ensure_path_within(path=Path(path), root=project_root, label="evolution_memory_root")
-        return {
-            "source": "project_filesystem",
-            "path": "/" + resolved.relative_to(project_root).as_posix(),
-        }
-
-    def _memory_mode_agent_state_roots_payload(self, project_id: str) -> dict[str, dict[str, dict[str, str]]]:
-        mode = self._load_project_evolution_memory_mode(project_id)
-        roots = mode.get("agent_state_roots") if isinstance(mode.get("agent_state_roots"), dict) else {}
-        payload: dict[str, dict[str, dict[str, str]]] = {}
-        for agent_id, root in roots.items():
-            try:
-                payload[str(agent_id)] = {
-                    "root_dir": self._project_relative_ref_for_absolute_path(project_id=project_id, path=str(root))
-                }
-            except Exception:
-                logger.warning("skip invalid evolution memory root for agent %s: %s", agent_id, root, exc_info=True)
-        return payload
-
-    def _merge_project_memory_mode_agent_roots(
-        self,
-        *,
-        project_id: str,
-        task_purpose: str,
-        requested_roots: dict[str, Any],
-    ) -> dict[str, Any]:
-        merged = dict(requested_roots or {})
-        if task_purpose != "normal":
-            return merged
-        mode_roots = self._memory_mode_agent_state_roots_payload(project_id)
-        for agent_id, root_payload in mode_roots.items():
-            merged.setdefault(agent_id, root_payload)
-        return merged
-
     def _resolve_directory_ref(
         self,
         *,
@@ -920,16 +841,7 @@ class ExecutionService:
                 "linked_execution_id": latest_execution.id if latest_execution else None,
                 **run_summary,
             }
-        effective_task_status = self._task_status_from_run_summary(
-            trigger=trigger,
-            execution=latest_execution,
-            run_summary=run_summary,
-        )
-        effective_task_message = self._task_message_from_effective_status(
-            trigger=trigger,
-            effective_status=effective_task_status,
-        )
-        abnormal_reason = None if effective_task_status == "succeeded" else self._task_abnormal_reason(trigger, latest_execution, run_summary)
+        abnormal_reason = self._task_abnormal_reason(trigger, latest_execution, run_summary)
         return ScanTaskResponse(
             task_id=trigger.id,
             project_id=trigger.project_id,
@@ -958,7 +870,7 @@ class ExecutionService:
                 ).items()
             },
             title=self._trigger_title(trigger),
-            status=effective_task_status,
+            status=trigger.status,
             latest_attempt_no=latest_execution.attempt_no if latest_execution else 0,
             retry_count=trigger.retry_count,
             max_retry_count=trigger.max_retry_count,
@@ -967,7 +879,7 @@ class ExecutionService:
             created_at=trigger.created_at,
             started_at=trigger.started_at,
             finished_at=trigger.finished_at,
-            message=effective_task_message,
+            message=trigger.message,
             latest_execution_id=trigger.latest_execution_id,
             run_name=run_locator["run_name"],
             runs_root=run_locator["runs_root"],
@@ -2526,53 +2438,6 @@ class ExecutionService:
     def _run_index_status_is_active(self, status_text: str | None) -> bool:
         return str(status_text or "").strip().lower() in _ACTIVE_RUN_INDEX_STATUSES
 
-    def _run_index_status_is_success(self, status_text: str | None) -> bool:
-        return str(status_text or "").strip().lower() in _SUCCESS_RUN_INDEX_STATUSES
-
-    def _is_stale_active_runtime_failure(
-        self,
-        *,
-        trigger: TriggerTask | None,
-        execution: WorkflowExecution | None,
-    ) -> bool:
-        statuses = [
-            str(trigger.status or "").strip().lower() if trigger is not None else "",
-            str(execution.status or "").strip().lower() if execution is not None else "",
-        ]
-        if "failed" not in statuses:
-            return False
-        messages = [
-            str(trigger.message or "").strip() if trigger is not None else "",
-            str(execution.message or "").strip() if execution is not None else "",
-        ]
-        return any(message == _STALE_ACTIVE_RUNTIME_FAILED_MESSAGE for message in messages)
-
-    def _task_status_from_run_summary(
-        self,
-        *,
-        trigger: TriggerTask,
-        execution: WorkflowExecution | None,
-        run_summary: dict[str, Any] | None,
-    ) -> str:
-        task_status = str(trigger.status or "")
-        run_status = str((run_summary or {}).get("status") or "").strip().lower()
-        if self._run_index_status_is_success(run_status) and self._is_stale_active_runtime_failure(
-            trigger=trigger,
-            execution=execution,
-        ):
-            return "succeeded"
-        return task_status
-
-    def _task_message_from_effective_status(
-        self,
-        *,
-        trigger: TriggerTask,
-        effective_status: str,
-    ) -> str | None:
-        if effective_status == "succeeded" and str(trigger.status or "").strip().lower() == "failed":
-            return "run_vuln_scan.py completed (reconciled from completed Run)"
-        return trigger.message
-
     def _adopted_run_index_task_status(self, status_text: str | None) -> str:
         value = str(status_text or "").strip().lower()
         if value in {"pending", "queued", "running", "cancel_requested", "delete_requested", "failed", "cancelled"}:
@@ -2816,22 +2681,15 @@ class ExecutionService:
             config_payload_overrides={key: value for key, value in config_payload_overrides.items() if value is not None},
         )
         requested_title = str(payload.title or "").strip()
-        task_purpose = self._normalize_task_purpose(payload.task_purpose)
-        requested_agent_state_roots = {
-            agent_id: item.model_dump(mode="json")
-            for agent_id, item in (payload.agent_state_roots or {}).items()
-        }
-        agent_state_roots = self._merge_project_memory_mode_agent_roots(
-            project_id=payload.project_id,
-            task_purpose=task_purpose,
-            requested_roots=requested_agent_state_roots,
-        )
         metadata = {
             "artifact_refs": [item.model_dump(mode="json") for item in payload.artifact_refs],
             "task_input_uploads": self._artifact_uploads_from_refs(payload.artifact_refs),
             "runtime_overrides": payload.runtime_overrides,
-            "task_purpose": task_purpose,
-            "agent_state_roots": agent_state_roots,
+            "task_purpose": self._normalize_task_purpose(payload.task_purpose),
+            "agent_state_roots": {
+                agent_id: item.model_dump(mode="json")
+                for agent_id, item in (payload.agent_state_roots or {}).items()
+            },
             "task_title": requested_title,
             "task_origin_type": str(payload.task_origin_type or "").strip() or "manual",
             "parent_project_id": payload.parent_project_id,
@@ -3527,60 +3385,12 @@ class ExecutionService:
     ) -> bool:
         if run_index is None or (trigger is None and execution is None):
             return False
-
-        execution_status = str(execution.status or "").strip().lower() if execution is not None else ""
-        trigger_status = str(trigger.status or "").strip().lower() if trigger is not None else ""
-        if self._run_index_status_is_success(run_index.status) and (
-            execution_status in _ACTIVE_RUN_INDEX_STATUSES
-            or trigger_status in _ACTIVE_RUN_INDEX_STATUSES
-            or self._is_stale_active_runtime_failure(trigger=trigger, execution=execution)
-        ):
-            message = "run_vuln_scan.py completed (reconciled from completed Run)"
-            if execution is not None and trigger is not None:
-                self._set_terminal_state(
-                    db,
-                    execution=execution,
-                    trigger=trigger,
-                    execution_status="succeeded",
-                    message=message,
-                    output_manifest_path=execution.output_manifest_path or self._run_index_output_manifest_path(run_index),
-                    output_task_count=int(execution.output_task_count or run_index.result_count or 0),
-                )
-            else:
-                now = now_local()
-                if execution is not None:
-                    execution.status = "succeeded"
-                    execution.message = message
-                    execution.finished_at = execution.finished_at or run_index.finished_at or now
-                    if execution.process_status in {"running", "stop_requested", "delete_requested"}:
-                        execution.process_status = "exited"
-                        execution.process_finished_at = now
-                    db.add(execution)
-                if trigger is not None:
-                    trigger.status = "succeeded"
-                    trigger.message = message
-                    trigger.finished_at = trigger.finished_at or run_index.finished_at or now
-                    trigger.latest_abnormal_reason_json = None
-                    db.add(trigger)
-                db.flush()
-            self._write_run_control_state(run_index.run_root_path, status_text="completed", message=message)
-            get_run_index_service().sync_execution_run(db, execution)
-            db.flush()
-            if execution is not None:
-                self.record_event(
-                    db,
-                    execution_id=execution.id,
-                    event_type="execution_finished",
-                    message=message,
-                    level="info",
-                    payload_json={"reason": "completed_run_reconciled", "run_status": run_index.status},
-                )
-            return True
-
         process_state = self._run_process_state(db, run_index, trigger=trigger, execution=execution)
         if not bool(process_state.get("stale")):
             return False
 
+        execution_status = str(execution.status or "").strip().lower() if execution is not None else ""
+        trigger_status = str(trigger.status or "").strip().lower() if trigger is not None else ""
         if execution_status not in _ACTIVE_RUN_INDEX_STATUSES and trigger_status not in _ACTIVE_RUN_INDEX_STATUSES:
             return False
 

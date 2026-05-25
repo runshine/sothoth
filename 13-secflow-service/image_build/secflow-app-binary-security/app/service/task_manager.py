@@ -10484,6 +10484,32 @@ class TaskManager:
                 self._sleep_after_retryable_lock_error(attempt + 1)
         return item
 
+    @staticmethod
+    def _entry_contract_fields(entry: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(entry, dict):
+            return {}
+        contract_fields = (
+            "module_dir",
+            "descriptor_root",
+            "source_dir",
+            "source_root",
+            "source_root_path",
+            "module_input_path",
+            "files_list_path",
+            "files_list",
+            "entry_descriptor_root",
+            "entry_files_list",
+            "entry_descriptor_ready",
+            "artifact_root",
+            "archive_root",
+            "task_type",
+            "module_key",
+            "module_name",
+            "firmware_key",
+            "firmware_name",
+        )
+        return {field: entry.get(field) for field in contract_fields if entry.get(field) is not None}
+
     def _trigger_entry_items_from_b2s_result(
         self,
         db: Session,
@@ -10573,11 +10599,6 @@ class TaskManager:
             entry_key = str(entry.get("entry_key") or "").strip()
             if not entry_key:
                 continue
-            normalized_entry = {
-                **entry,
-                "upstream_item_id": upstream_item.id,
-                "triggered_by_stage": upstream_item.stage_name,
-            }
             existing = self._find_stage_item(
                 db,
                 task_id=task.id,
@@ -10585,6 +10606,17 @@ class TaskManager:
                 item_key=entry_key,
                 parent_key=str(entry.get("module_key") or "").strip() or None,
             )
+            merged_entry = {
+                **self._entry_contract_fields(existing.input_ref if existing else None),
+                **self._entry_contract_fields(upstream_item.result if isinstance(upstream_item.result, dict) else None),
+                **self._entry_contract_fields(entry_result),
+                **entry,
+            }
+            normalized_entry = {
+                **merged_entry,
+                "upstream_item_id": upstream_item.id,
+                "triggered_by_stage": upstream_item.stage_name,
+            }
             item = self._upsert_stage_item(
                 db,
                 task=task,
@@ -10599,6 +10631,8 @@ class TaskManager:
                 retrying=False,
                 running_status="pending",
             )
+            if existing is not None and str(existing.status or "").strip().lower() in STREAMING_ACTIVE_ITEM_STATUSES:
+                item.retry_count = existing.retry_count
             created_items.append(item)
             if existing is None:
                 created_count += 1

@@ -403,14 +403,19 @@ class ResultReviewExecutor:
         supporting_docs = list_supporting_markdown_files(supporting_docs_dir)
         lines = [
             "## 当前待验证对象",
-            f"- 任务文件（**开始前必读**）: `{task_file}`",
-            f"- 待验证报告（**开始前必读**）: `{result_path}`",
+            f"- 任务文件: `{task_file}`",
+            f"- 待验证报告: `{result_path}`",
+            f"- 辅助文档目录: `{supporting_docs_dir}`",
+            f"- 漏洞状态列表（只读，最终 verdict 由框架写回）: `{vulnerability_list_file}`",
             "",
+            "## 开始前必须读取",
+            f"- `{task_file}`",
+            f"- `{result_path}`",
         ]
         if supporting_docs:
             lines.extend([
                 "",
-                "## 辅助文档（可按需读取）",
+                "## 可按需读取的 supporting docs",
                 *[f"- `{supporting_docs_dir / name}`" for name in supporting_docs],
             ])
         return {

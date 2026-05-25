@@ -12577,6 +12577,181 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entries, call_args.args[2]["entries"])
         self.assertIs(item, call_args.kwargs["upstream_item"])
 
+    def test_trigger_dataflow_items_from_entry_result_preserves_explicit_contract(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="module-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-dfa",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            sequence_no=3,
+            status="running",
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="IPSEC",
+            item_name="IPSEC",
+            parent_key="module-input",
+            downstream_service="entry_analyse",
+            status="success",
+            result={
+                "source_dir": "/archive/IPSEC",
+                "source_root": "/archive/IPSEC",
+                "source_root_path": "/archive/IPSEC",
+                "module_input_path": "/archive/IPSEC/modules/IPSEC",
+                "files_list_path": "/archive/IPSEC/modules/IPSEC/files.list",
+                "entry_descriptor_root": "/archive/IPSEC",
+                "entry_files_list": "/archive/IPSEC/modules/IPSEC/files.list",
+                "descriptor_root": "/archive/IPSEC",
+            },
+        )
+        entry_result = {
+            "module_key": "IPSEC",
+            "module_name": "IPSEC",
+            "source_dir": ".",
+            "entries": [
+                {
+                    "entry_key": "entry-1",
+                    "module_key": "IPSEC",
+                    "function_name": "handle",
+                    "file_name": "libipsec.c",
+                    "definition_file": "libipsec.c",
+                    "definition_line": "10",
+                    "is_definition_found": True,
+                    "definition_kind": "definition",
+                    "taint_params": ["ctx"],
+                }
+            ],
+        }
+        fake_session = _ModelAwareDb()
+        seeded: list[dict[str, Any]] = []
+
+        def fake_upsert(*args, **kwargs):
+            seeded.append(dict(kwargs["input_ref"]))
+            return BinarySecurityStageItem(
+                id="si-dfa",
+                task_id="t1",
+                project_id="p1",
+                stage_name="dataflow_analysis",
+                item_key="entry-1",
+                item_name="handle",
+                parent_key="IPSEC",
+                downstream_service="dataflow_analyse",
+                status="pending",
+                retry_count=0,
+            )
+
+        with (
+            patch.object(self.manager, "_streaming_mode_enabled", return_value=True),
+            patch.object(self.manager, "_streaming_tail_stage_names", return_value=("dataflow_analysis",)),
+            patch.object(self.manager, "_ensure_stage_run", return_value=stage_run),
+            patch.object(self.manager, "_find_stage_item", return_value=None),
+            patch.object(self.manager, "_upsert_stage_item", side_effect=fake_upsert),
+            patch.object(self.manager, "_record_event"),
+        ):
+            items = self.manager._trigger_dataflow_items_from_entry_result(
+                fake_session,
+                task,
+                entry_result,
+                upstream_item=upstream_item,
+            )
+
+        self.assertEqual(1, len(items))
+        self.assertEqual("/archive/IPSEC/modules/IPSEC", seeded[0]["module_input_path"])
+        self.assertEqual("/archive/IPSEC", seeded[0]["source_root_path"])
+        self.assertEqual("/archive/IPSEC/modules/IPSEC/files.list", seeded[0]["files_list_path"])
+        self.assertEqual("/archive/IPSEC/modules/IPSEC/files.list", seeded[0]["entry_files_list"])
+        self.assertEqual("/archive/IPSEC", seeded[0]["entry_descriptor_root"])
+
+    def test_trigger_dataflow_items_from_entry_result_refresh_does_not_increment_retry_count(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="module-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-dfa",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            sequence_no=3,
+            status="running",
+        )
+        existing_item = BinarySecurityStageItem(
+            id="si-dfa",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            item_key="entry-1",
+            item_name="handle",
+            parent_key="IPSEC",
+            downstream_service="dataflow_analyse",
+            status="queued",
+            retry_count=144,
+            input_ref={"module_input_path": "/archive/IPSEC/modules/IPSEC", "source_root_path": "/archive/IPSEC"},
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="IPSEC",
+            item_name="IPSEC",
+            parent_key="module-input",
+            downstream_service="entry_analyse",
+            status="success",
+        )
+        entry_result = {
+            "entries": [
+                {
+                    "entry_key": "entry-1",
+                    "module_key": "IPSEC",
+                    "function_name": "handle",
+                    "file_name": "libipsec.c",
+                }
+            ]
+        }
+        fake_session = _ModelAwareDb(stage_items=[existing_item])
+
+        def fake_upsert(*args, **kwargs):
+            self.assertFalse(kwargs["retrying"])
+            return existing_item
+
+        with (
+            patch.object(self.manager, "_streaming_mode_enabled", return_value=True),
+            patch.object(self.manager, "_streaming_tail_stage_names", return_value=("dataflow_analysis",)),
+            patch.object(self.manager, "_ensure_stage_run", return_value=stage_run),
+            patch.object(self.manager, "_find_stage_item", return_value=existing_item),
+            patch.object(self.manager, "_upsert_stage_item", side_effect=fake_upsert),
+            patch.object(self.manager, "_record_event"),
+        ):
+            self.manager._trigger_dataflow_items_from_entry_result(
+                fake_session,
+                task,
+                entry_result,
+                upstream_item=upstream_item,
+            )
+
+        self.assertEqual(144, existing_item.retry_count)
+
     def test_compact_result_for_storage_keeps_entry_preview_small(self):
         entries = []
         for index in range(12):
