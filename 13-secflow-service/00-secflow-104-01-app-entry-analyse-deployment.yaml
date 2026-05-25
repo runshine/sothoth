@@ -21,6 +21,8 @@ spec:
         env:
           - name: TZ
             value: Asia/Shanghai
+          - name: EA_RUNTIME_ROLE
+            value: "api"
           - name: PORT
             value: "8080"
           - name: FILESERVER_ROOT
@@ -37,11 +39,11 @@ spec:
           mountPath: /data
         resources:
           requests:
-            memory: "256Mi"
-            cpu: "200m"
+            memory: "512Mi"
+            cpu: "500m"
           limits:
-            memory: "1Gi"
-            cpu: "1000m"
+            memory: "2Gi"
+            cpu: "2"
         livenessProbe:
           httpGet:
             path: /api/app/entry-analyse/health
