@@ -81,6 +81,21 @@ from app.time_utils import UTC_PLUS_8, isoformat_local, now_local
 
 logger = logging.getLogger("dataflow_vuln.execution")
 
+
+def _perf_elapsed_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000, 2)
+
+
+def _log_api_timing(endpoint: str, **fields: Any) -> None:
+    parts = []
+    for key, value in fields.items():
+        if isinstance(value, float):
+            parts.append(f"{key}={value:.2f}")
+        else:
+            parts.append(f"{key}={value}")
+    logger.info("api_timing endpoint=%s %s", endpoint, " ".join(parts))
+
+
 _TASK_PURPOSE_LABELS = {
     "normal": "正常任务",
     "evolution": "进化任务",
@@ -691,6 +706,8 @@ class ExecutionService:
         db: Session,
         execution: WorkflowExecution | None,
         trigger: TriggerTask | None = None,
+        *,
+        include_runtime_assets: bool = False,
     ) -> RunIndex | None:
         if execution is None:
             return None
@@ -723,6 +740,7 @@ class ExecutionService:
             linked_execution=execution,
             linked_task=trigger or db.get(TriggerTask, execution.trigger_task_id),
             profile_id=(trigger.profile_id if trigger else None),
+            include_runtime_assets=include_runtime_assets,
         )
 
     def _scan_task_response(self, db: Session, trigger: TriggerTask, *, include_run_summary: bool = True) -> ScanTaskResponse:
@@ -2890,14 +2908,44 @@ class ExecutionService:
         return [self._scan_task_response(db, item, include_run_summary=False) for item in query.offset(safe_offset).limit(safe_limit).all()]
 
     def get_scan_task(self, db: Session, task_id: str, principal: dict) -> ScanTaskDetailResponse:
+        request_started = time.perf_counter()
+        trigger_lookup_started = time.perf_counter()
         trigger = self._trigger_or_404(db, task_id)
+        trigger_lookup_ms = _perf_elapsed_ms(trigger_lookup_started)
         self._ensure_project_access(principal, trigger.project_id)
+
+        latest_execution_started = time.perf_counter()
         latest_execution = self._latest_execution_for_trigger(db, trigger.id)
-        run_index = self._ensure_run_index_for_execution(db, latest_execution, trigger) if latest_execution is not None else None
+        latest_execution_ms = _perf_elapsed_ms(latest_execution_started)
+
+        ensure_run_index_ms = 0.0
+        run_index = None
+        if latest_execution is not None:
+            ensure_run_index_started = time.perf_counter()
+            run_index = self._ensure_run_index_for_execution(db, latest_execution, trigger)
+            ensure_run_index_ms = _perf_elapsed_ms(ensure_run_index_started)
+
+        reconcile_started = time.perf_counter()
         if self._reconcile_stale_runtime(db, run_index=run_index, trigger=trigger, execution=latest_execution):
             db.commit()
             db.refresh(trigger)
-        return self._scan_task_detail(db, trigger)
+        reconcile_ms = _perf_elapsed_ms(reconcile_started)
+
+        build_detail_started = time.perf_counter()
+        payload = self._scan_task_detail(db, trigger)
+        build_detail_ms = _perf_elapsed_ms(build_detail_started)
+        _log_api_timing(
+            "GET /tasks/{task_id}",
+            task_id=task_id,
+            project_id=trigger.project_id,
+            trigger_lookup_ms=trigger_lookup_ms,
+            latest_execution_ms=latest_execution_ms,
+            ensure_run_index_ms=ensure_run_index_ms,
+            reconcile_ms=reconcile_ms,
+            build_detail_ms=build_detail_ms,
+            total_ms=_perf_elapsed_ms(request_started),
+        )
+        return payload
 
     def get_scan_task_summary(self, db: Session, task_id: str, principal: dict) -> ScanTaskResponse:
         trigger = self._trigger_or_404(db, task_id)
@@ -3045,11 +3093,17 @@ class ExecutionService:
         task_id: str,
         execution_id: str | None = None,
     ) -> dict[str, Any]:
+        request_started = time.perf_counter()
         self._ensure_project_access(principal, project_id)
+
+        trigger_lookup_started = time.perf_counter()
         trigger = db.get(TriggerTask, task_id)
+        trigger_lookup_ms = _perf_elapsed_ms(trigger_lookup_started)
         if trigger is None or trigger.project_id != project_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="task not found")
         execution: WorkflowExecution | None = None
+
+        execution_lookup_started = time.perf_counter()
         if execution_id:
             execution = db.get(WorkflowExecution, execution_id)
             if (
@@ -3060,7 +3114,9 @@ class ExecutionService:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="execution not found for task")
         else:
             execution = self._latest_execution_for_trigger(db, task_id)
-        get_run_index_service().sync_project_runs(db, project_id)
+        execution_lookup_ms = _perf_elapsed_ms(execution_lookup_started)
+
+        run_query_started = time.perf_counter()
         query = db.query(RunIndex).filter(
             RunIndex.project_id == project_id,
             RunIndex.source_type == "execution_workspace",
@@ -3069,21 +3125,113 @@ class ExecutionService:
         if execution_id:
             query = query.filter(RunIndex.linked_execution_id == execution_id)
         run_index = query.order_by(RunIndex.started_at.desc(), RunIndex.created_at.desc()).first()
+        run_index_query_ms = _perf_elapsed_ms(run_query_started)
         if run_index is not None and not Path(run_index.run_root_path).is_dir():
             run_index = None
-        if run_index is None:
-            run_index = self._ensure_run_index_for_execution(db, execution, trigger)
+
+        ensure_run_index_ms = 0.0
+        if run_index is None and execution is not None:
+            ensure_started = time.perf_counter()
+            run_index = self._ensure_run_index_for_execution(
+                db,
+                execution,
+                trigger,
+                include_runtime_assets=False,
+            )
+            ensure_run_index_ms = _perf_elapsed_ms(ensure_started)
             if run_index is not None:
                 db.commit()
+
+        fallback_sync_project_runs_ms = 0.0
+        fallback_query_ms = 0.0
+        if run_index is None:
+            fallback_sync_started = time.perf_counter()
+            get_run_index_service().sync_project_runs(db, project_id)
+            fallback_sync_project_runs_ms = _perf_elapsed_ms(fallback_sync_started)
+            fallback_query_started = time.perf_counter()
+            query = db.query(RunIndex).filter(
+                RunIndex.project_id == project_id,
+                RunIndex.source_type == "execution_workspace",
+                RunIndex.linked_task_id == task_id,
+            )
+            if execution_id:
+                query = query.filter(RunIndex.linked_execution_id == execution_id)
+            run_index = query.order_by(RunIndex.started_at.desc(), RunIndex.created_at.desc()).first()
+            fallback_query_ms = _perf_elapsed_ms(fallback_query_started)
+            if run_index is not None and not Path(run_index.run_root_path).is_dir():
+                run_index = None
+
         if run_index is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found for task")
-        return self._run_index_resolve_response(run_index)
+
+        payload = self._run_index_resolve_response(run_index)
+        _log_api_timing(
+            "GET /runs/by-task",
+            project_id=project_id,
+            task_id=task_id,
+            execution_id=execution_id or "",
+            trigger_lookup_ms=trigger_lookup_ms,
+            execution_lookup_ms=execution_lookup_ms,
+            run_index_query_ms=run_index_query_ms,
+            ensure_run_index_ms=ensure_run_index_ms,
+            fallback_sync_project_runs_ms=fallback_sync_project_runs_ms,
+            fallback_query_ms=fallback_query_ms,
+            total_ms=_perf_elapsed_ms(request_started),
+        )
+        return payload
+
+    def get_run_overview(self, db: Session, run_index_id: str, principal: dict) -> dict[str, Any]:
+        request_started = time.perf_counter()
+        lookup_started = time.perf_counter()
+        run_index = self._run_index_or_404(db, run_index_id, principal)
+        lookup_ms = _perf_elapsed_ms(lookup_started)
+        build_started = time.perf_counter()
+        payload = get_run_index_service().get_run_overview(db, run_index)
+        build_ms = _perf_elapsed_ms(build_started)
+        enrich_started = time.perf_counter()
+        enriched = self._enrich_run_payload(db, run_index, payload, include_linked_task_detail=False)
+        enrich_ms = _perf_elapsed_ms(enrich_started)
+        _log_api_timing(
+            "GET /runs/{run_id}/overview",
+            run_id=run_index_id,
+            project_id=run_index.project_id,
+            run_index_lookup_ms=lookup_ms,
+            build_overview_ms=build_ms,
+            enrich_ms=enrich_ms,
+            total_ms=_perf_elapsed_ms(request_started),
+        )
+        return enriched
 
     def get_run(self, db: Session, run_index_id: str, principal: dict) -> dict[str, Any]:
+        return self.get_run_overview(db, run_index_id, principal)
+
+    def get_run_detail_full(self, db: Session, run_index_id: str, principal: dict) -> dict[str, Any]:
+        request_started = time.perf_counter()
+        lookup_started = time.perf_counter()
         run_index = self._run_index_or_404(db, run_index_id, principal)
-        payload = get_run_index_service().get_run_detail(db, run_index)
+        lookup_ms = _perf_elapsed_ms(lookup_started)
+        build_started = time.perf_counter()
+        payload = get_run_index_service().get_run_detail(
+            db,
+            run_index,
+            include_runtime_assets=True,
+            force_runtime_assets=True,
+        )
+        build_ms = _perf_elapsed_ms(build_started)
+        enrich_started = time.perf_counter()
         db.refresh(run_index)
-        return self._enrich_run_payload(db, run_index, payload)
+        enriched = self._enrich_run_payload(db, run_index, payload, include_linked_task_detail=False)
+        enrich_ms = _perf_elapsed_ms(enrich_started)
+        _log_api_timing(
+            "GET /runs/{run_id}/detail",
+            run_id=run_index_id,
+            project_id=run_index.project_id,
+            run_index_lookup_ms=lookup_ms,
+            build_detail_ms=build_ms,
+            enrich_ms=enrich_ms,
+            total_ms=_perf_elapsed_ms(request_started),
+        )
+        return enriched
 
     def report_run_vulnerabilities(
         self,
@@ -3125,12 +3273,41 @@ class ExecutionService:
         return get_run_index_service().get_run_cycle(db, run_index, cycle)
 
     def list_run_sessions(self, db: Session, run_index_id: str, principal: dict) -> list[dict[str, Any]]:
+        request_started = time.perf_counter()
+        lookup_started = time.perf_counter()
         run_index = self._run_index_or_404(db, run_index_id, principal)
-        return get_run_index_service().list_run_sessions(db, run_index)
+        lookup_ms = _perf_elapsed_ms(lookup_started)
+        fetch_started = time.perf_counter()
+        payload = get_run_index_service().list_run_sessions(db, run_index)
+        fetch_ms = _perf_elapsed_ms(fetch_started)
+        _log_api_timing(
+            "GET /runs/{run_id}/sessions",
+            run_id=run_index_id,
+            project_id=run_index.project_id,
+            run_index_lookup_ms=lookup_ms,
+            fetch_sessions_ms=fetch_ms,
+            total_ms=_perf_elapsed_ms(request_started),
+        )
+        return payload
 
     def list_run_files(self, db: Session, run_index_id: str, principal: dict, limit: int = 1200) -> list[dict[str, Any]]:
+        request_started = time.perf_counter()
+        lookup_started = time.perf_counter()
         run_index = self._run_index_or_404(db, run_index_id, principal)
-        return get_run_index_service().list_run_files(db, run_index, limit=limit)
+        lookup_ms = _perf_elapsed_ms(lookup_started)
+        fetch_started = time.perf_counter()
+        payload = get_run_index_service().list_run_files(db, run_index, limit=limit)
+        fetch_ms = _perf_elapsed_ms(fetch_started)
+        _log_api_timing(
+            "GET /runs/{run_id}/files",
+            run_id=run_index_id,
+            project_id=run_index.project_id,
+            limit=limit,
+            run_index_lookup_ms=lookup_ms,
+            fetch_files_ms=fetch_ms,
+            total_ms=_perf_elapsed_ms(request_started),
+        )
+        return payload
 
     def get_run_file(self, db: Session, run_index_id: str, principal: dict, path: str) -> dict[str, Any]:
         run_index = self._run_index_or_404(db, run_index_id, principal)
@@ -3325,7 +3502,14 @@ class ExecutionService:
                 return "interrupted"
         return current or str(current_status or "")
 
-    def _enrich_run_payload(self, db: Session, run_index, payload: dict[str, Any]) -> dict[str, Any]:
+    def _enrich_run_payload(
+        self,
+        db: Session,
+        run_index,
+        payload: dict[str, Any],
+        *,
+        include_linked_task_detail: bool = False,
+    ) -> dict[str, Any]:
         trigger, execution = self._linked_run_index_runtime(db, run_index)
         enriched = dict(payload)
         process_state = self._run_process_state(db, run_index, trigger=trigger, execution=execution)
@@ -3342,13 +3526,14 @@ class ExecutionService:
         enriched["retry_command_display"] = retry_command or None
         if trigger is not None:
             task_payload = self._scan_task_response(db, trigger, include_run_summary=False)
-            task_detail_payload = self._scan_task_detail(db, trigger)
             enriched["linked_task_purpose"] = task_payload.task_purpose
             enriched["linked_task_agent_state_dirs"] = {
                 key: value.model_dump(mode="json")
                 for key, value in task_payload.agent_state_dirs.items()
             }
-            enriched["linked_task_detail"] = task_detail_payload.model_dump(mode="json")
+            if include_linked_task_detail:
+                task_detail_payload = self._scan_task_detail(db, trigger)
+                enriched["linked_task_detail"] = task_detail_payload.model_dump(mode="json")
         return enriched
 
     def _mark_stale_runtime_exited(

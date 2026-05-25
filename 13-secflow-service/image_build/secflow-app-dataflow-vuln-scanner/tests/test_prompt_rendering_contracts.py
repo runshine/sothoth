@@ -432,9 +432,65 @@ def test_missed_hunt_omits_pass_feedback_and_keeps_failed_issue_actions(tmp_path
     assert "acceptance=给出 source_closed 或 promoted_to_result 的源码证据" in prompt
     assert "failed issue / feedback 只是“攻击假设和方向”" in prompt
     assert "no_action: 该 advisor 本轮通过" not in prompt
-    assert "完整内容保留在 review artifacts 中" not in prompt
+    assert "[section clipped:" not in prompt
+    assert prompt.count("EXPORT followthrough failed because exact sink was not inspected.") == 30
     assert "关键路径已充分扫描" not in prompt
     assert "漏洞发现质量优秀" not in prompt
+
+
+def test_missed_hunt_includes_all_failed_review_issues_without_issue_cap(tmp_path: Path) -> None:
+    task_file = tmp_path / "task.md"
+    task_file.write_text("# scan task\n", encoding="utf-8")
+    work_dir = tmp_path / "work"
+    results_dir = work_dir / "results"
+    results_dir.mkdir(parents=True)
+    wf = _workflow_with_worker_prompt(
+        Path("prompts/vuln_scan/worker_user.md"),
+        Path("prompts/vuln_scan/summary.md"),
+    )
+    ctx = WorkflowContext(
+        workflow_id="wf",
+        task_id="task",
+        task_file=str(task_file),
+        working_dir=str(work_dir),
+        cycle=2,
+        review_mode="discovery",
+    )
+    state = ReviewState()
+    state.global_review_history.append(
+        GlobalReviewRecord(
+            cycle=1,
+            advisor_id="global_completeness",
+            role_name="全面性审计",
+            passed=False,
+            feedback="需要继续核查 5 条漏报方向。",
+            scores={"export_followthrough": 0.4},
+            issues=[
+                {
+                    "id": f"CMP-export-gap-{idx}",
+                    "category": "coverage_gap",
+                    "target": f"EXPORT_L{idx} -> dangerous_sink_{idx}",
+                    "required_action": f"跟入 EXPORT_L{idx} 到 dangerous_sink_{idx}",
+                    "acceptance_criteria": f"给出 path_{idx} 的源码证据",
+                    "actionable_by": "worker",
+                    "blocking_type": "security_gap",
+                }
+                for idx in range(1, 6)
+            ],
+        )
+    )
+
+    executor = WorkerExecutor(agent_registry=None, recorder=None)  # type: ignore[arg-type]
+    executor._prepare_rework_context(ctx, state)
+    prompt = executor._build_rework_stage_prompt(
+        ctx=ctx,
+        review_state=state,
+        prompt_file="prompts/vuln_scan/worker_rework_missed_hunt.md",
+    )
+
+    assert "CMP-export-gap-1" in prompt
+    assert "CMP-export-gap-5" in prompt
+    assert "... 另有" not in prompt
 
 
 def test_staged_rework_sequence_uses_one_worker_session_and_checkpoints(tmp_path: Path) -> None:

@@ -355,3 +355,54 @@ def test_direct_context_extracts_previous_limitations_section_with_nested_subhea
     assert "上一轮局限性来源: sidecar_snapshot" in context["context_text"]
     assert "### 7.1 未解决" in context["context_text"]
     assert "未跟入 EXPORT A" in context["context_text"]
+
+
+def test_global_review_execute_no_longer_calls_dead_profile_gate_hook(
+    tmp_path: Path,
+) -> None:
+    executor, _ = _make_executor(tmp_path)
+    task_file = tmp_path / "task.md"
+    summary_file = tmp_path / "summary.md"
+    results_dir = tmp_path / "results"
+    task_file.write_text("# task\n", encoding="utf-8")
+    summary_file.write_text("# summary\n", encoding="utf-8")
+    results_dir.mkdir()
+    (results_dir / "result_001.md").write_text("# result\n", encoding="utf-8")
+
+    async def _fake_run_single_advisor(**_: object) -> dict[str, object]:
+        return {
+            "advisor_id": "global_quality",
+            "role_name": "全局评审",
+            "passed": True,
+            "feedback": "PASS（通过）",
+            "detail_feedback": "PASS（通过）",
+            "scores": {"coverage": 1.0},
+            "issues": [],
+            "already_recorded": False,
+        }
+
+    called = {"profile_gate": False}
+
+    def _should_not_run(**_: object) -> list[dict[str, str]]:
+        called["profile_gate"] = True
+        raise AssertionError("dead profile gate hook should not be called")
+
+    executor._run_single_advisor = _fake_run_single_advisor  # type: ignore[method-assign]
+    executor._profile_gate_issues = _should_not_run  # type: ignore[method-assign]
+
+    passed, feedback = asyncio.run(
+        executor.execute(
+            advisors_cfg=[_global_advisor()],
+            task_file=str(task_file),
+            summary_file=str(summary_file),
+            results_dir=str(results_dir),
+            work_dir=str(tmp_path),
+            cycle=1,
+            review_state=ReviewState(),
+            advisor_sessions={},
+        )
+    )
+
+    assert passed is True
+    assert feedback == ""
+    assert called["profile_gate"] is False

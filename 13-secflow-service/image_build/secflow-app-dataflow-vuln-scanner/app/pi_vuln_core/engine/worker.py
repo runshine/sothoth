@@ -1893,35 +1893,33 @@ class WorkerExecutor:
 
         feedback = str(getattr(record, "feedback", "") or "").strip()
         if feedback:
-            lines.append(
-                f"- feedback: {self._clip_prompt_section(feedback, max_chars=320)}"
-            )
+            lines.append(f"- feedback: {feedback}")
 
         issues = [
             issue for issue in list(getattr(record, "issues", []) or [])
             if isinstance(issue, dict)
         ]
         if not issues:
-            lines.append("- issues: 无结构化 issue；按上面的 feedback 自行回到源码和数据流定位路径。")
+            lines.append("- issues: 无结构化 issue；按上面的完整 feedback 自行回到源码和数据流定位路径。")
             return lines
 
         lines.append("- issues:")
-        for issue in issues[:4]:
+        for issue in issues:
             issue_id = ReviewState.prompt_safe_issue_id(
                 issue.get("id") or issue.get("issue_id") or ""
             ) or "(no-id)"
-            target = str(issue.get("target") or issue.get("path") or "").strip()[:180]
+            target = str(issue.get("target") or issue.get("path") or "").strip()
             action = str(
                 issue.get("required_action")
                 or issue.get("detail")
                 or issue.get("description")
                 or ""
-            ).strip()[:260]
+            ).strip()
             acceptance = str(
                 issue.get("acceptance_criteria")
                 or issue.get("acceptance")
                 or ""
-            ).strip()[:180]
+            ).strip()
             line = f"  - `{issue_id}`"
             if target:
                 line += f": target={target}"
@@ -1930,8 +1928,6 @@ class WorkerExecutor:
             if acceptance:
                 line += f"; acceptance={acceptance}"
             lines.append(line)
-        if len(issues) > 4:
-            lines.append(f"  - ... 另有 {len(issues) - 4} 个 issue，请按同一方向继续深挖。")
         return lines
 
     def _build_result_repair_summary(

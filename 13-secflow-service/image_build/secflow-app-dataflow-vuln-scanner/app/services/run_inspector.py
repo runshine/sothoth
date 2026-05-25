@@ -712,34 +712,42 @@ def _normalize_run_status(raw_status: str, run_meta: dict[str, Any] | None = Non
     return text or "pending"
 
 
-def _find_last_activity(atomic: Path | None, run_dir: Path) -> str:
+def _find_last_activity(atomic: Path | None, run_dir: Path, *, include_session_events: bool = True) -> str:
     candidates: list[str] = []
     if atomic:
         state = _read_json(atomic / "_meta" / "state.json")
         if state.get("timestamp"):
             candidates.append(str(state["timestamp"]))
+        workflow_result = _read_json(atomic / "_meta" / "workflow_result.json")
+        if workflow_result.get("timestamp"):
+            candidates.append(str(workflow_result["timestamp"]))
+        current_step = _read_json(atomic / "_meta" / "checkpoints" / "current_step.json")
+        for key in ("finished_at", "started_at", "timestamp"):
+            if current_step.get(key):
+                candidates.append(str(current_step[key]))
         summaries = _sorted_json_files(atomic / "_meta" / "review_summaries")
         if summaries:
             latest = _read_json(summaries[-1])
             if latest.get("timestamp"):
                 candidates.append(str(latest["timestamp"]))
-        for jsonl in sorted(atomic.rglob("*.jsonl")):
-            try:
-                with jsonl.open("rb") as file:
-                    file.seek(0, 2)
-                    size = file.tell()
-                    file.seek(max(0, size - 4096))
-                    tail = file.read().decode("utf-8", errors="replace")
-                for line in reversed(tail.splitlines()):
-                    try:
-                        event = json.loads(line.strip())
-                    except json.JSONDecodeError:
-                        continue
-                    if event.get("timestamp"):
-                        candidates.append(str(event["timestamp"]))
-                        break
-            except Exception:
-                continue
+        if include_session_events:
+            for jsonl in sorted(atomic.rglob("*.jsonl")):
+                try:
+                    with jsonl.open("rb") as file:
+                        file.seek(0, 2)
+                        size = file.tell()
+                        file.seek(max(0, size - 4096))
+                        tail = file.read().decode("utf-8", errors="replace")
+                    for line in reversed(tail.splitlines()):
+                        try:
+                            event = json.loads(line.strip())
+                        except json.JSONDecodeError:
+                            continue
+                        if event.get("timestamp"):
+                            candidates.append(str(event["timestamp"]))
+                            break
+                except Exception:
+                    continue
     runtime = _runtime_dir(run_dir)
     log_path = runtime / "run.log"
     if not log_path.is_file():
@@ -766,7 +774,14 @@ def _find_run_start_epoch(run_dir: Path, run_meta: dict[str, Any] | None = None)
         return 0
 
 
-def _find_run_end_epoch(atomic: Path | None, run_dir: Path, status: str, run_meta: dict[str, Any] | None = None) -> float:
+def _find_run_end_epoch(
+    atomic: Path | None,
+    run_dir: Path,
+    status: str,
+    run_meta: dict[str, Any] | None = None,
+    *,
+    last_activity: str | None = None,
+) -> float:
     if status == "running":
         return datetime.now(tz=timezone.utc).timestamp()
     run_meta = run_meta or {}
@@ -782,15 +797,22 @@ def _find_run_end_epoch(atomic: Path | None, run_dir: Path, status: str, run_met
         state_timestamp = _parse_iso_timestamp(str(_read_json(atomic / "_meta" / "state.json").get("timestamp") or ""))
         if state_timestamp:
             candidates.append(state_timestamp)
-    last_activity = _parse_iso_timestamp(_find_last_activity(atomic, run_dir))
-    if last_activity:
-        candidates.append(last_activity)
+    last_activity_value = _parse_iso_timestamp(last_activity if last_activity is not None else _find_last_activity(atomic, run_dir))
+    if last_activity_value:
+        candidates.append(last_activity_value)
     return max(candidates) if candidates else 0
 
 
-def _compute_duration(run_dir: Path, atomic: Path | None, status: str, run_meta: dict[str, Any] | None = None) -> int:
+def _compute_duration(
+    run_dir: Path,
+    atomic: Path | None,
+    status: str,
+    run_meta: dict[str, Any] | None = None,
+    *,
+    last_activity: str | None = None,
+) -> int:
     start = _find_run_start_epoch(run_dir, run_meta)
-    end = _find_run_end_epoch(atomic, run_dir, status, run_meta)
+    end = _find_run_end_epoch(atomic, run_dir, status, run_meta, last_activity=last_activity)
     if not start or not end or end < start:
         return 0
     return int(end - start)
@@ -1218,6 +1240,152 @@ def inspect_run_summary(workspace_root: str | Path) -> dict[str, Any]:
         "passed_count": passed_count,
         "failed_count": failed_count,
         "workflow_mode": workflow_mode,
+    }
+
+
+def _latest_feedback_issues(atomic: Path) -> list[dict[str, Any]]:
+    feedback_files = _sorted_json_files(atomic / "_meta" / "review_feedback")
+    if not feedback_files:
+        return []
+    payload = _read_json(feedback_files[-1])
+    issues = payload.get("issues")
+    return list(issues) if isinstance(issues, list) else []
+
+
+def inspect_run_overview_light(workspace_root: str | Path) -> dict[str, Any]:
+    run_dir = Path(workspace_root)
+    if not run_dir.is_dir():
+        raise HTTPException(404, "run workspace not found")
+    runtime = _runtime_dir(run_dir)
+    config = _read_json(runtime / "config.json") or _read_json(run_dir / "config.json")
+    cfg_summary = _extract_config_summary(config)
+    atomic = _find_atomic_work_dir(run_dir)
+    run_meta = _read_run_timestamps(run_dir)
+    if not atomic:
+        status = _normalize_run_status("no_workspace", run_meta)
+        return {
+            "name": run_dir.name,
+            "config": cfg_summary,
+            "status": status,
+            "start_time": _parse_timestamp_from_name(run_dir.name),
+            "start_epoch": int(_find_run_start_epoch(run_dir, run_meta) or 0),
+            "duration_seconds": _compute_duration(run_dir, None, status, run_meta),
+            "last_activity": "",
+            "model": cfg_summary["model"],
+            "provider": cfg_summary["provider"],
+            "thinking": cfg_summary["thinking"],
+            "review_profile": cfg_summary["review_profile"],
+            "max_cycles": cfg_summary["max_review_cycles"],
+            "cycles_used": 0,
+            "result_count": 0,
+            "passed_count": 0,
+            "failed_count": 0,
+            "workflow_mode": "",
+            "error": None,
+            "cycles": [],
+            "results": [],
+            "removed_results": [],
+            "latest_issues": [],
+            "manifests": {},
+            "atomic_work_path": "",
+            "atomic_work_dir": "",
+            "current_step": {},
+            "step_history": [],
+            "cycle_timing": {},
+        }
+
+    workflow_result = _read_json(atomic / "_meta" / "workflow_result.json")
+    state = _read_json(atomic / "_meta" / "state.json")
+    status = _normalize_run_status(workflow_result.get("status", state.get("current_state", "running")), run_meta)
+    cycles: list[dict[str, Any]] = []
+    result_count = 0
+    passed_count = 0
+    failed_count = 0
+    workflow_mode = ""
+    for summary_file in _sorted_json_files(atomic / "_meta" / "review_summaries"):
+        summary = _read_json(summary_file)
+        cycle_num = int(summary.get("cycle", 0) or 0)
+        metrics = _read_json(atomic / "_meta" / "cycle_metrics" / f"cycle_{cycle_num:03d}.json")
+        issue_data = _read_json(atomic / "_meta" / "review_feedback" / f"cycle_{cycle_num:03d}.json")
+        global_review = summary.get("global_review", {})
+        result_review = summary.get("result_review", {})
+        issues = issue_data.get("issues") if isinstance(issue_data.get("issues"), list) else []
+        metrics_with_issues = dict(metrics)
+        metrics_with_issues["issues"] = issues
+        profile_gate = derive_profile_gate_summary(global_review, metrics_with_issues)
+        raw_new_results = summary.get("new_results") if isinstance(summary.get("new_results"), list) else []
+        cycles.append(
+            {
+                "cycle": cycle_num,
+                "timestamp": summary.get("timestamp", ""),
+                "outcome": summary.get("outcome", ""),
+                "workflow_mode": summary.get("workflow_mode", ""),
+                "global_passed": global_review.get("passed", False),
+                "global_feedback_preview": global_review.get("feedback_preview", ""),
+                "global_advisor_total": global_review.get("total_advisor_count", 0),
+                "global_advisor_passed": global_review.get("passed_advisor_count", 0),
+                "global_aggregate_status": global_review.get("aggregate_status", ""),
+                "profile_gate": profile_gate,
+                "failed_advisor_id": global_review.get("failed_advisor_id", ""),
+                "failed_role_name": global_review.get("failed_role_name", ""),
+                "result_total": result_review.get("total", 0),
+                "result_passed": result_review.get("passed_count", 0),
+                "result_failed": result_review.get("failed_count", 0),
+                "scores": metrics.get("scores", {}),
+                "global_failure_scope": metrics.get("global_failure_scope", ""),
+                "failed_result_count": metrics.get("failed_result_count", result_review.get("failed_count", 0)),
+                "current_failed_result_count": metrics.get("current_failed_result_count", result_review.get("failed_count", 0)),
+                "historical_removed_result_count": metrics.get("historical_removed_result_count", 0),
+                "unreviewed_new_result_count": metrics.get("unreviewed_new_result_count", 0),
+                "unreviewed_new_result_files": metrics.get("unreviewed_new_result_files", []),
+                "issue_count": metrics.get("issue_count", len(issues)),
+                "issue_ids": metrics.get("issue_ids", []),
+                "summary_size": metrics.get("summary_size", 0),
+                "plateau_status": summary.get("plateau_status", {}),
+                "issues": issues,
+                "new_result_count": _safe_int(summary.get("new_result_count"), _safe_int(metrics.get("new_result_count"), len(raw_new_results))),
+                "new_results": raw_new_results,
+            }
+        )
+        result_count = int(result_review.get("total", result_count) or result_count)
+        passed_count = int(result_review.get("passed_count", passed_count) or passed_count)
+        failed_count = int(result_review.get("failed_count", failed_count) or failed_count)
+        workflow_mode = str(summary.get("workflow_mode", workflow_mode) or workflow_mode)
+    result_manifest = _read_json(atomic / "_meta" / "results_manifest.json")
+    if result_manifest:
+        result_count = int(result_manifest.get("taskable_result_count", result_count) or result_count)
+    cycles_used = int(((workflow_result.get("detail") or {}).get("cycles_used", len(cycles))) or len(cycles))
+    last_activity = _find_last_activity(atomic, run_dir, include_session_events=False)
+    current_step = _load_current_step_checkpoint(atomic)
+    return {
+        "name": run_dir.name,
+        "config": cfg_summary,
+        "status": status,
+        "start_time": _parse_timestamp_from_name(run_dir.name),
+        "start_epoch": int(_find_run_start_epoch(run_dir, run_meta) or 0),
+        "duration_seconds": _compute_duration(run_dir, atomic, status, run_meta, last_activity=last_activity),
+        "last_activity": last_activity,
+        "model": cfg_summary["model"],
+        "provider": cfg_summary["provider"],
+        "thinking": cfg_summary["thinking"],
+        "review_profile": cfg_summary["review_profile"],
+        "max_cycles": cfg_summary["max_review_cycles"],
+        "cycles_used": cycles_used,
+        "result_count": result_count,
+        "passed_count": passed_count,
+        "failed_count": failed_count,
+        "workflow_mode": workflow_mode,
+        "error": (workflow_result.get("detail") or {}).get("error", workflow_result.get("error")),
+        "cycles": cycles,
+        "results": [],
+        "removed_results": [],
+        "latest_issues": _latest_feedback_issues(atomic),
+        "manifests": _load_manifest_summary(atomic),
+        "atomic_work_path": str(atomic),
+        "atomic_work_dir": str(atomic),
+        "current_step": current_step,
+        "step_history": [],
+        "cycle_timing": _collect_cycle_timing([], current_step if current_step else None),
     }
 
 

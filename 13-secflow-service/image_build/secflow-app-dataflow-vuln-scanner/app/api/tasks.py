@@ -15,6 +15,7 @@ from app.schemas import (
     ReplayReadyResponse,
     RunCycleResponse,
     RunDetailResponse,
+    RunOverviewResponse,
     RunFileContentResponse,
     RunFileResponse,
     RunLogResponse,
@@ -225,10 +226,22 @@ async def resolve_run_by_task(
     )
 
 
-@router.get("/runs/{run_id}", response_model=RunDetailResponse)
+@router.get("/runs/{run_id}", response_model=RunOverviewResponse)
 async def get_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().get_run(db, run_id, principal)
+
+
+@router.get("/runs/{run_id}/overview", response_model=RunOverviewResponse)
+async def get_run_overview(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+    principal, _ = subject
+    return get_execution_service().get_run_overview(db, run_id, principal)
+
+
+@router.get("/runs/{run_id}/detail", response_model=RunDetailResponse)
+async def get_run_detail(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+    principal, _ = subject
+    return get_execution_service().get_run_detail_full(db, run_id, principal)
 
 
 @router.post("/runs/{run_id}/report-vulnerabilities", response_model=RunVulnReportResponse)

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shlex
 import shutil
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -37,15 +39,24 @@ from app.services.run_inspector import (
     inspect_files,
     inspect_log,
     inspect_run_detail,
+    inspect_run_overview_light,
     inspect_run_summary,
     inspect_session_file,
     inspect_sessions,
 )
 from app.time_utils import UTC_PLUS_8, ensure_local, isoformat_local, now_local
 
+logger = logging.getLogger("dataflow_vuln.run_index")
+
 RUN_INDEX_LOG_SUMMARY_MAX_CHARS = 32768
 _ACTIVE_RUN_INDEX_STATUSES = {"running", "pending", "queued", "cancel_requested", "delete_requested"}
 _SOURCE_MTIME_COMPARE_EPSILON = 1e-6
+_RUN_INDEX_LIGHT_REFRESH_DEBOUNCE_SECONDS = 1.0
+_RUN_INDEX_RUNTIME_REFRESH_DEBOUNCE_SECONDS = 2.0
+
+
+def _perf_elapsed_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000, 2)
 
 
 def _new_id(prefix: str) -> str:
@@ -903,6 +914,7 @@ class RunIndexService:
         profile_id: str | None = None,
         include_runtime_assets: bool = True,
     ) -> RunIndex:
+        sync_started = time.perf_counter()
         run_root = run_root.resolve()
         if not run_root.is_dir():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"run root not found: {run_root}")
@@ -931,6 +943,12 @@ class RunIndexService:
                 record.source_hash = source_hash
                 db.add(record)
                 db.flush()
+                logger.info(
+                    "run_index_sync_skip_current run=%s include_runtime_assets=%s reason=mtime_hint_current total_ms=%.2f",
+                    run_root,
+                    include_runtime_assets,
+                    _perf_elapsed_ms(sync_started),
+                )
                 return record
         source_mtime = (
             _compute_source_mtime(run_root)
@@ -950,13 +968,40 @@ class RunIndexService:
             record.source_hash = source_hash
             db.add(record)
             db.flush()
+            logger.info(
+                "run_index_sync_skip_current run=%s include_runtime_assets=%s reason=source_mtime_current total_ms=%.2f",
+                run_root,
+                include_runtime_assets,
+                _perf_elapsed_ms(sync_started),
+            )
             return record
 
+        summary_started = time.perf_counter()
         summary = inspect_run_summary(run_root)
+        summary_ms = _perf_elapsed_ms(summary_started)
+
+        detail_started = time.perf_counter()
         detail = inspect_run_detail(run_root)
-        sessions = inspect_sessions(run_root) if include_runtime_assets else []
-        files = inspect_files(run_root, limit=20000) if include_runtime_assets else []
-        run_log = inspect_log(run_root, lines=2000).get("content", "")
+        detail_ms = _perf_elapsed_ms(detail_started)
+
+        sessions: list[dict[str, Any]] = []
+        files: list[dict[str, Any]] = []
+        run_log = ""
+        sessions_ms = 0.0
+        files_ms = 0.0
+        log_ms = 0.0
+        if include_runtime_assets:
+            sessions_started = time.perf_counter()
+            sessions = inspect_sessions(run_root)
+            sessions_ms = _perf_elapsed_ms(sessions_started)
+
+            files_started = time.perf_counter()
+            files = inspect_files(run_root, limit=20000)
+            files_ms = _perf_elapsed_ms(files_started)
+
+            log_started = time.perf_counter()
+            run_log = inspect_log(run_root, lines=2000).get("content", "")
+            log_ms = _perf_elapsed_ms(log_started)
         run_timestamps = _read_json_file(run_root / "run" / "_meta" / "run_timestamps.json") or _read_json_file(run_root / "_meta" / "run_timestamps.json")
         started_at = _parse_datetime(str(run_timestamps.get("started_at") or "")) or _datetime_from_epoch(summary.get("start_epoch"))
         finished_at = _parse_datetime(str(run_timestamps.get("finished_at") or ""))
@@ -1054,6 +1099,7 @@ class RunIndexService:
             target.source_mtime = source_mtime
             target.last_synced_at = now_local()
 
+        persist_started = time.perf_counter()
         apply_payload(record)
         try:
             with db.begin_nested():
@@ -1089,6 +1135,23 @@ class RunIndexService:
             include_files=include_runtime_assets,
         )
         db.flush()
+        persist_ms = _perf_elapsed_ms(persist_started)
+        logger.info(
+            "run_index_sync run=%s include_runtime_assets=%s summary_ms=%.2f detail_ms=%.2f sessions_ms=%.2f files_ms=%.2f log_ms=%.2f persist_ms=%.2f cycles=%s results=%s sessions=%s files=%s total_ms=%.2f",
+            run_root,
+            include_runtime_assets,
+            summary_ms,
+            detail_ms,
+            sessions_ms,
+            files_ms,
+            log_ms,
+            persist_ms,
+            len(detail.get("cycles") or []),
+            len(detail.get("results") or []),
+            len(sessions),
+            len(files),
+            _perf_elapsed_ms(sync_started),
+        )
         return record
 
     def sync_execution_run(self, db: Session, execution: WorkflowExecution) -> RunIndex | None:
@@ -1144,9 +1207,30 @@ class RunIndexService:
         include_runtime_assets: bool = True,
         force_runtime_assets: bool = False,
     ) -> RunIndex:
+        refresh_started = time.perf_counter()
         run_root = Path(run_index.run_root_path)
         if not run_root.is_dir():
             return run_index
+
+        if not force_runtime_assets and run_index.last_synced_at and not _run_index_needs_parser_resync(run_index):
+            debounce_window = (
+                _RUN_INDEX_RUNTIME_REFRESH_DEBOUNCE_SECONDS
+                if include_runtime_assets
+                else _RUN_INDEX_LIGHT_REFRESH_DEBOUNCE_SECONDS
+            )
+            refresh_age = max((now_local() - run_index.last_synced_at).total_seconds(), 0.0)
+            if refresh_age < debounce_window:
+                logger.info(
+                    "run_index_refresh_skip_debounce run=%s include_runtime_assets=%s age_ms=%.2f window_ms=%.2f status=%s total_ms=%.2f",
+                    run_root,
+                    include_runtime_assets,
+                    refresh_age * 1000,
+                    debounce_window * 1000,
+                    run_index.status,
+                    _perf_elapsed_ms(refresh_started),
+                )
+                return run_index
+
         stored_source_mtime = _stored_source_mtime(run_index.source_mtime)
         if (
             not force_runtime_assets
@@ -1155,6 +1239,13 @@ class RunIndexService:
         ):
             hint_mtime = _compute_source_mtime_hint(run_root, run_index.atomic_work_path)
             if _source_mtime_is_current(hint_mtime, stored_source_mtime):
+                logger.info(
+                    "run_index_refresh_skip_current run=%s include_runtime_assets=%s reason=mtime_hint_current status=%s total_ms=%.2f",
+                    run_root,
+                    include_runtime_assets,
+                    run_index.status,
+                    _perf_elapsed_ms(refresh_started),
+                )
                 return run_index
         current_mtime = (
             _compute_source_mtime(run_root)
@@ -1166,9 +1257,17 @@ class RunIndexService:
             and _source_mtime_is_current(current_mtime, stored_source_mtime)
             and not _run_index_needs_parser_resync(run_index)
         ):
+            logger.info(
+                "run_index_refresh_skip_current run=%s include_runtime_assets=%s reason=source_mtime_current status=%s total_ms=%.2f",
+                run_root,
+                include_runtime_assets,
+                run_index.status,
+                _perf_elapsed_ms(refresh_started),
+            )
             return run_index
         linked_execution = db.get(WorkflowExecution, run_index.linked_execution_id) if run_index.linked_execution_id else None
         linked_task = db.get(TriggerTask, run_index.linked_task_id) if run_index.linked_task_id else None
+        sync_started = time.perf_counter()
         run_index = self.sync_run_path(
             db,
             project_id=run_index.project_id,
@@ -1179,7 +1278,17 @@ class RunIndexService:
             profile_id=run_index.profile_id,
             include_runtime_assets=include_runtime_assets,
         )
+        sync_ms = _perf_elapsed_ms(sync_started)
         db.commit()
+        logger.info(
+            "run_index_refresh run=%s include_runtime_assets=%s force_runtime_assets=%s status=%s sync_ms=%.2f total_ms=%.2f",
+            run_root,
+            include_runtime_assets,
+            force_runtime_assets,
+            run_index.status,
+            sync_ms,
+            _perf_elapsed_ms(refresh_started),
+        )
         return run_index
 
     def resolve_run(self, db: Session, *, project_id: str, run_name: str, root_path: str) -> RunIndex:
@@ -1191,7 +1300,7 @@ class RunIndexService:
             RunIndex.run_root_path == str(candidate.resolve()),
         ).first()
         if record is not None:
-            return self.refresh_run_index(db, record, include_runtime_assets=False)
+            return self.refresh_run_index(db, record, include_runtime_assets=False) if _run_index_needs_parser_resync(record) else record
         self.sync_project_runs(db, project_id)
         record = db.query(RunIndex).filter(
             RunIndex.project_id == project_id,
@@ -1254,7 +1363,7 @@ class RunIndexService:
         return [self._summary_payload(item) for item in records]
 
     def get_run_summary(self, db: Session, run_index: RunIndex) -> dict[str, Any]:
-        run_index = self.refresh_run_index(db, run_index)
+        run_index = self.refresh_run_index(db, run_index, include_runtime_assets=False)
         return self._summary_payload(run_index)
 
     def _cycle_payloads(self, db: Session, run_index: RunIndex) -> list[dict[str, Any]]:
@@ -1324,7 +1433,13 @@ class RunIndexService:
             )
         return rows
 
-    def _result_payloads(self, db: Session, run_index: RunIndex) -> list[dict[str, Any]]:
+    def _result_payloads(
+        self,
+        db: Session,
+        run_index: RunIndex,
+        *,
+        include_vulnerability_headings: bool = True,
+    ) -> list[dict[str, Any]]:
         results = (
             db.query(RunIndexResult)
             .filter(RunIndexResult.run_index_id == run_index.id)
@@ -1352,13 +1467,19 @@ class RunIndexService:
                 "taskable": item.taskable,
                 "delivery_bucket": item.delivery_bucket,
                 "multi_finding": item.multi_finding,
-                "vulnerability_headings": _load_externalized_list_payload(run_index.run_root_path, item.vulnerability_headings_json),
+                "vulnerability_headings": _load_externalized_list_payload(run_index.run_root_path, item.vulnerability_headings_json) if include_vulnerability_headings else [],
                 "related_to": item.related_to,
             }
             for item in results
         ]
 
-    def _removed_result_payloads(self, db: Session, run_index: RunIndex) -> list[dict[str, Any]]:
+    def _removed_result_payloads(
+        self,
+        db: Session,
+        run_index: RunIndex,
+        *,
+        include_signals: bool = True,
+    ) -> list[dict[str, Any]]:
         results = (
             db.query(RunIndexRemovedResult)
             .filter(RunIndexRemovedResult.run_index_id == run_index.id)
@@ -1373,10 +1494,98 @@ class RunIndexService:
                 "cycle": item.cycle,
                 "lifecycle_status": item.lifecycle_status,
                 "reason": item.reason or "",
-                "signals": _load_externalized_list_payload(run_index.run_root_path, item.signals_json),
+                "signals": _load_externalized_list_payload(run_index.run_root_path, item.signals_json) if include_signals else [],
             }
             for item in results
         ]
+
+    def _build_lightweight_run_overview(self, db: Session, run_index: RunIndex) -> dict[str, Any]:
+        if _run_index_needs_parser_resync(run_index):
+            return self.get_run_detail(db, run_index, include_runtime_assets=False)
+
+        try:
+            overview = inspect_run_overview_light(run_index.run_root_path)
+        except Exception:
+            logger.exception("run_index_overview_light_failed run=%s", run_index.run_root_path)
+            return self.get_run_detail(db, run_index, include_runtime_assets=False)
+
+        raw_summary = _load_externalized_json_payload(run_index.run_root_path, run_index.raw_summary_json)
+        if not isinstance(raw_summary, dict):
+            raw_summary = dict(run_index.raw_summary_json or {}) if isinstance(run_index.raw_summary_json, dict) else {}
+        raw_summary = dict(raw_summary)
+        current_step = dict(overview.get("current_step") or raw_summary.get("current_step") or {})
+        cycle_timing = dict(overview.get("cycle_timing") or raw_summary.get("cycle_timing") or {})
+        if current_step:
+            raw_summary["current_step"] = current_step
+        if cycle_timing:
+            raw_summary["cycle_timing"] = cycle_timing
+
+        cli_payload = raw_summary.get("dataflow_cli") if isinstance(raw_summary.get("dataflow_cli"), dict) else {}
+        command = cli_payload.get("command") if isinstance(cli_payload.get("command"), list) else raw_summary.get("command")
+        if not isinstance(command, list):
+            command = []
+        command_display = str(cli_payload.get("command_display") or raw_summary.get("command_display") or "")
+
+        cached_new_result_counts = {
+            int(item.cycle or 0): _safe_int((item.raw_json or {}).get("new_result_count"), 0)
+            for item in (
+                db.query(RunIndexCycle)
+                .filter(RunIndexCycle.run_index_id == run_index.id)
+                .all()
+            )
+        }
+        cycles: list[dict[str, Any]] = []
+        for cycle in overview.get("cycles") or []:
+            item = dict(cycle or {})
+            cycle_no = int(item.get("cycle") or 0)
+            if _safe_int(item.get("new_result_count"), 0) <= 0 and cached_new_result_counts.get(cycle_no, 0) > 0:
+                item["new_result_count"] = cached_new_result_counts[cycle_no]
+            cycles.append(item)
+
+        config = dict(overview.get("config") or {})
+        payload = {
+            "run_id": run_index.id,
+            "project_id": run_index.project_id,
+            "source_type": run_index.source_type,
+            "source_key": run_index.source_key,
+            "linked_task_id": run_index.linked_task_id,
+            "linked_execution_id": run_index.linked_execution_id,
+            "profile_id": run_index.profile_id,
+            "name": str(overview.get("name") or run_index.run_name or Path(run_index.run_root_path).name),
+            "path": run_index.run_root_path,
+            "root_path": _parent_root(run_index.run_root_path),
+            "status": str(overview.get("status") or run_index.status or "pending"),
+            "start_time": str(overview.get("start_time") or ""),
+            "start_epoch": int(overview.get("start_epoch") or 0),
+            "duration_seconds": int(overview.get("duration_seconds") or 0),
+            "last_activity": str(overview.get("last_activity") or ""),
+            "model": str(overview.get("model") or config.get("model") or run_index.model or ""),
+            "provider": str(overview.get("provider") or config.get("provider") or run_index.provider or ""),
+            "thinking": str(overview.get("thinking") or config.get("thinking") or run_index.thinking or ""),
+            "review_profile": str(overview.get("review_profile") or config.get("review_profile") or ""),
+            "max_cycles": int(overview.get("max_cycles") or config.get("max_review_cycles") or 0),
+            "cycles_used": int(overview.get("cycles_used") or 0),
+            "result_count": int(overview.get("result_count") or 0),
+            "passed_count": int(overview.get("passed_count") or 0),
+            "failed_count": int(overview.get("failed_count") or 0),
+            "workflow_mode": str(overview.get("workflow_mode") or ""),
+            "updated_at": isoformat_local(now_local()) or _iso_or_empty(run_index.last_synced_at),
+            "config": config,
+            "error": overview.get("error") or run_index.error or None,
+            "cycles": cycles,
+            "results": self._result_payloads(db, run_index, include_vulnerability_headings=False),
+            "removed_results": self._removed_result_payloads(db, run_index, include_signals=False),
+            "manifests": dict(overview.get("manifests") or {}),
+            "latest_issues": list(overview.get("latest_issues") or []),
+            "atomic_work_path": str(overview.get("atomic_work_path") or run_index.atomic_work_path or ""),
+            "command": [str(item) for item in command],
+            "command_display": command_display,
+            "current_step": current_step,
+            "step_history": list(raw_summary.get("step_history") or []),
+            "cycle_timing": cycle_timing,
+            "raw": raw_summary,
+        }
+        return payload
 
     def list_run_sessions(self, db: Session, run_index: RunIndex) -> list[dict[str, Any]]:
         run_index = self.refresh_run_index(
@@ -1471,8 +1680,23 @@ class RunIndexService:
             for item in files
         ]
 
-    def get_run_detail(self, db: Session, run_index: RunIndex) -> dict[str, Any]:
-        run_index = self.refresh_run_index(db, run_index, include_runtime_assets=True)
+    def get_run_overview(self, db: Session, run_index: RunIndex) -> dict[str, Any]:
+        return self._build_lightweight_run_overview(db, run_index)
+
+    def get_run_detail(
+        self,
+        db: Session,
+        run_index: RunIndex,
+        *,
+        include_runtime_assets: bool = False,
+        force_runtime_assets: bool = False,
+    ) -> dict[str, Any]:
+        run_index = self.refresh_run_index(
+            db,
+            run_index,
+            include_runtime_assets=include_runtime_assets,
+            force_runtime_assets=force_runtime_assets,
+        )
         payload = self._summary_payload(run_index)
         raw_summary = dict(_load_externalized_json_payload(run_index.run_root_path, run_index.raw_summary_json) or {})
         cli_payload = raw_summary.get("dataflow_cli") if isinstance(raw_summary.get("dataflow_cli"), dict) else {}
@@ -1504,10 +1728,8 @@ class RunIndexService:
                 command = cli_payload.get("command") if isinstance(cli_payload.get("command"), list) else []
                 command_display = str(cli_payload.get("command_display") or "")
         latest_issues = _load_externalized_list_payload(run_index.run_root_path, run_index.latest_issues_json)
-        try:
-            file_payloads = inspect_files(run_index.run_root_path, limit=1200)
-        except HTTPException:
-            file_payloads = self._list_run_files_rows(db, run_index)
+        file_payloads = self._list_run_files_rows(db, run_index) if include_runtime_assets else []
+        session_payloads = self._list_run_sessions_rows(db, run_index) if include_runtime_assets else []
 
         payload.update(
             {
@@ -1520,8 +1742,8 @@ class RunIndexService:
                 "latest_issues": latest_issues,
                 "atomic_work_path": run_index.atomic_work_path or "",
                 "files": file_payloads,
-                "sessions": self._list_run_sessions_rows(db, run_index),
-                "run_log": run_index.log_tail_text or "",
+                "sessions": session_payloads,
+                "run_log": (run_index.log_tail_text or "") if include_runtime_assets else "",
                 "command": [str(item) for item in command],
                 "command_display": command_display,
                 "current_step": dict(raw_summary.get("current_step") or {}),
@@ -1638,7 +1860,7 @@ class RunIndexService:
             RunIndex.source_type == "execution_workspace",
         ).first()
         if record is not None:
-            return self.refresh_run_index(db, record)
+            return self.refresh_run_index(db, record, include_runtime_assets=False)
         source_key = str(Path(execution.workspace_root).resolve())
         record = _find_run_by_source(
             db,
@@ -1647,7 +1869,7 @@ class RunIndexService:
             source_hash=run_source_hash("execution_workspace", source_key),
         )
         if record is not None:
-            return self.refresh_run_index(db, record)
+            return self.refresh_run_index(db, record, include_runtime_assets=False)
         if str(execution.status or "").strip().lower() in _ACTIVE_RUN_INDEX_STATUSES:
             return None
         record = self.sync_execution_run(db, execution)

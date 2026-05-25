@@ -472,7 +472,7 @@ class RunSessionResponse(BaseModel):
     calls: List[Dict[str, Any]] = Field(default_factory=list)
 
 
-class RunDetailResponse(RunSummaryResponse):
+class RunOverviewResponse(RunSummaryResponse):
     config: Dict[str, Any] = Field(default_factory=dict)
     error: Optional[str] = None
     cycles: List[Dict[str, Any]] = Field(default_factory=list)
@@ -481,15 +481,18 @@ class RunDetailResponse(RunSummaryResponse):
     manifests: Dict[str, Any] = Field(default_factory=dict)
     latest_issues: List[Dict[str, Any]] = Field(default_factory=list)
     atomic_work_path: str = ""
-    files: List[RunFileResponse] = Field(default_factory=list)
-    sessions: List[RunSessionResponse] = Field(default_factory=list)
-    run_log: str = ""
     command: List[str] = Field(default_factory=list)
     command_display: str = ""
     current_step: Dict[str, Any] = Field(default_factory=dict)
     step_history: List[Dict[str, Any]] = Field(default_factory=list)
     cycle_timing: Dict[str, Any] = Field(default_factory=dict)
     raw: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RunDetailResponse(RunOverviewResponse):
+    files: List[RunFileResponse] = Field(default_factory=list)
+    sessions: List[RunSessionResponse] = Field(default_factory=list)
+    run_log: str = ""
 
 
 class RunCycleResponse(BaseModel):

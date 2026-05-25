@@ -22,6 +22,7 @@ from app.models.database import (
     init_database,
     run_source_hash,
 )
+import app.services.run_index_service as run_index_service_module
 from app.services.execution_service import get_execution_service
 from app.services.run_index_service import get_run_index_service
 from app.services.run_inspector import inspect_cycle_detail, inspect_run_detail
@@ -592,13 +593,223 @@ def test_run_resolve_only_returns_execution_bound_records(service_config_path):
     assert resolve_unbound.status_code == 404
 
 
+def test_run_resolve_by_task_avoids_full_project_rescan_when_index_exists(service_config_path, monkeypatch):
+    app = create_app()
+    client = TestClient(app)
+    bound_run = _project_runs_root() / "bound_resolve_by_task_fast_20260508_010205"
+    bound = _create_execution_bound_run(client, bound_run)
+
+    service = get_run_index_service()
+    calls = {"count": 0}
+    original_sync_project_runs = service.sync_project_runs
+
+    def fail_if_called(db, project_id):
+        calls["count"] += 1
+        raise AssertionError("sync_project_runs should not run when direct task/execution binding already exists")
+
+    monkeypatch.setattr(service, "sync_project_runs", fail_if_called)
+    try:
+        response = client.get(
+            "/api/dataflow-vuln-scanner/runs/by-task",
+            params={
+                "project_id": "default",
+                "task_id": bound["task_id"],
+                "execution_id": bound["execution_id"],
+            },
+        )
+    finally:
+        monkeypatch.setattr(service, "sync_project_runs", original_sync_project_runs)
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == bound["run_id"]
+    assert calls["count"] == 0
+
+
+def test_run_detail_is_lightweight_and_runtime_assets_use_dedicated_endpoints(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    bound_run = _project_runs_root() / "bound_lightweight_detail_20260508_010206"
+    bound = _create_execution_bound_run(client, bound_run)
+
+    overview = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
+    assert overview.status_code == 200
+    overview_payload = overview.json()
+    assert "files" not in overview_payload
+    assert "sessions" not in overview_payload
+    assert "run_log" not in overview_payload
+    assert "linked_task_detail" not in overview_payload
+
+    overview_explicit = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/overview")
+    assert overview_explicit.status_code == 200
+    assert overview_explicit.json()["run_id"] == bound["run_id"]
+    assert "files" not in overview_explicit.json()
+    assert "linked_task_detail" not in overview_explicit.json()
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/detail")
+    assert detail.status_code == 200
+    payload = detail.json()
+    assert any(str(item["path"]).endswith("task.md") for item in payload["files"])
+    assert any(item["format"] == "calls" for item in payload["sessions"])
+    assert "line1" in payload["run_log"]
+    assert "linked_task_detail" not in payload
+
+    files_response = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/files")
+    assert files_response.status_code == 200
+    assert any(str(item["path"]).endswith("task.md") for item in files_response.json())
+
+    sessions_response = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/sessions")
+    assert sessions_response.status_code == 200
+    assert any(item["format"] == "calls" for item in sessions_response.json())
+
+    log_response = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/log")
+    assert log_response.status_code == 200
+    assert "line1" in log_response.json()["content"]
+
+
+def test_run_overview_uses_lightweight_refresh_without_heavy_detail_parser(service_config_path, monkeypatch):
+    app = create_app()
+    client = TestClient(app)
+    bound_run = _project_runs_root() / "bound_overview_light_refresh_20260525_010203"
+    bound = _create_execution_bound_run(client, bound_run)
+    atomic = bound_run / "workspace" / "pipeline_demo_run_001" / "stage_01_vuln_scan" / "vuln_scan_initial_001"
+
+    time.sleep(0.02)
+    _write_json(atomic / "_meta" / "workflow_result.json", {
+        "status": "completed",
+        "timestamp": "2026-04-28T01:17:03Z",
+        "detail": {"cycles_used": 2},
+    })
+    _write_json(atomic / "_meta" / "review_summaries" / "cycle_002.json", {
+        "cycle": 2,
+        "timestamp": "2026-04-28T01:17:03Z",
+        "workflow_mode": "closure",
+        "global_review": {
+            "passed": True,
+            "advisor_results": [],
+            "feedback_preview": "ok",
+            "total_advisor_count": 1,
+            "passed_advisor_count": 1,
+        },
+        "result_review": {
+            "total": 2,
+            "passed_count": 2,
+            "failed_count": 0,
+            "passed_files": ["result_001.md", "result_002.md"],
+            "failed_files": [],
+        },
+        "outcome": "all_passed",
+    })
+    _write_json(atomic / "_meta" / "cycle_metrics" / "cycle_002.json", {
+        "cycle": 2,
+        "scores": {"input_coverage": 0.97},
+        "global_failure_scope": "",
+        "issue_count": 1,
+        "issue_ids": ["PROFILE-audit-evidence"],
+        "summary_size": 56,
+        "historical_removed_result_count": 0,
+        "new_result_count": 1,
+    })
+    _write_json(atomic / "_meta" / "review_feedback" / "cycle_002.json", {
+        "issues": [{
+            "id": "PROFILE-audit-evidence",
+            "required_action": "补充关键证据链",
+        }],
+    })
+    _write_json(atomic / "_meta" / "results_manifest.json", {
+        "total_result_files": 2,
+        "active_result_count": 2,
+        "inactive_result_count": 0,
+        "taskable_result_count": 2,
+        "supplemental_result_count": 0,
+        "excluded_results": [],
+        "entries": [{
+            "filename": "result_001.md",
+            "role": "finding",
+            "lifecycle_status": "candidate",
+            "active": True,
+            "taskable": True,
+            "delivery_bucket": "results",
+            "vulnerability_headings": ["VULN-001"],
+        }, {
+            "filename": "result_002.md",
+            "role": "finding",
+            "lifecycle_status": "candidate",
+            "active": True,
+            "taskable": True,
+            "delivery_bucket": "results",
+            "vulnerability_headings": ["VULN-002"],
+        }],
+    })
+    _write_json(atomic / "_meta" / "result_relations_manifest.json", {
+        "all_results": ["result_001.md", "result_002.md"],
+        "taskable_results": ["result_001.md", "result_002.md"],
+        "supplemental_results": [],
+        "inactive_results": [],
+        "relationships": [{
+            "filename": "result_001.md",
+            "role": "finding",
+            "lifecycle_status": "candidate",
+            "active": True,
+            "taskable": True,
+            "delivery_bucket": "results",
+            "vulnerability_headings": ["VULN-001"],
+        }, {
+            "filename": "result_002.md",
+            "role": "finding",
+            "lifecycle_status": "candidate",
+            "active": True,
+            "taskable": True,
+            "delivery_bucket": "results",
+            "vulnerability_headings": ["VULN-002"],
+        }],
+    })
+    _write_json(atomic / "_meta" / "vulnerability_list.json", {
+        "counts": {"confirmed": 2},
+        "entries": [{
+            "result_file": "result_001.md",
+            "status": "confirmed",
+            "verdict": "CONFIRMED",
+            "status_label": "已确认",
+            "vuln_id": "vuln-001",
+        }, {
+            "result_file": "result_002.md",
+            "status": "confirmed",
+            "verdict": "CONFIRMED",
+            "status_label": "已确认",
+            "vuln_id": "vuln-002",
+        }],
+    })
+
+    monkeypatch.setattr(
+        run_index_service_module,
+        "inspect_run_detail",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("overview should not call inspect_run_detail")),
+    )
+    monkeypatch.setattr(
+        type(get_execution_service()),
+        "_scan_task_detail",
+        lambda self, db, trigger: (_ for _ in ()).throw(AssertionError("overview should not build linked_task_detail")),
+    )
+
+    overview = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
+    assert overview.status_code == 200
+    payload = overview.json()
+    assert payload["cycles_used"] == 2
+    assert payload["result_count"] == 2
+    assert payload["manifests"]["total_result_files"] == 2
+    assert len(payload["cycles"]) == 2
+    assert payload["cycles"][1]["new_result_count"] == 1
+    assert payload["cycles"][1]["issue_count"] == 1
+    assert "linked_task_detail" not in payload
+
+
 def test_run_refreshes_after_execution_directory_changes(service_config_path):
     app = create_app()
     client = TestClient(app)
     bound_run = _project_runs_root() / "bound_refresh_20260508_010203"
     bound = _create_execution_bound_run(client, bound_run)
 
-    detail_before = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
+    detail_before = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/detail")
     assert detail_before.status_code == 200
     assert not any(item["path"] == "supporting_docs/new_note.md" for item in detail_before.json()["files"])
 
@@ -606,7 +817,7 @@ def test_run_refreshes_after_execution_directory_changes(service_config_path):
     atomic = bound_run / "workspace" / "pipeline_demo_run_001" / "stage_01_vuln_scan" / "vuln_scan_initial_001"
     _write(atomic / "supporting_docs" / "new_note.md", "# New note\n")
 
-    detail_after = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
+    detail_after = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/detail")
     assert detail_after.status_code == 200
     assert any(item["path"] == "supporting_docs/new_note.md" for item in detail_after.json()["files"])
 

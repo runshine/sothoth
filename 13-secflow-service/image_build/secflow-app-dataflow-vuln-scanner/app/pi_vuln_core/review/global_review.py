@@ -234,15 +234,6 @@ class GlobalReviewExecutor:
                     outcome["detail_feedback"] or outcome["feedback"]
                 )
 
-        profile_issues = self._profile_gate_issues(
-            work_dir=work_dir,
-            review_profile=review_profile,
-        )
-        if profile_issues:
-            all_passed = False
-            all_issues.extend(profile_issues)
-            feedback_parts.append(self._format_profile_gate_feedback(profile_issues))
-
         if all_passed:
             review_state.record_global_review_result(
                 cycle=cycle,

@@ -16,5 +16,11 @@
     "title": "Vulnerability Status Ledger",
     "created": "2026-05-15T09:31:16.014Z",
     "completed": "2026-05-15T09:54:08.398Z"
+  },
+  "simplify-dataflow-vuln-overview": {
+    "status": "done",
+    "title": "简化数据流漏洞挖掘任务概览页",
+    "created": "2026-05-25T06:59:44.375Z",
+    "completed": "2026-05-25T07:08:37.424Z"
   }
 }
