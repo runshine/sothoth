@@ -2336,6 +2336,162 @@ def _resolve_evolution_source_tool_path(task: Any, latest_job: Any | None = None
     return None
 
 
+def _normalize_evolution_token_metrics(payload: Any) -> dict[str, int]:
+    data = payload if isinstance(payload, dict) else {}
+    return {
+        "input": int(data.get("input") or data.get("token_input") or 0),
+        "output": int(data.get("output") or data.get("token_output") or 0),
+        "cacheRead": int(data.get("cacheRead") or data.get("cache_read") or data.get("token_cache_read") or 0),
+        "cacheWrite": int(data.get("cacheWrite") or data.get("cache_write") or data.get("token_cache_write") or 0),
+        "total": int(data.get("total") or data.get("token_total") or 0),
+    }
+
+
+def _parse_evolution_metrics_from_summary(summary_path: str | None) -> dict[str, Any]:
+    if not summary_path:
+        return {}
+    path = Path(str(summary_path))
+    if not path.exists() or not path.is_file():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip().lstrip("-").strip()
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        values[key.strip()] = value.strip()
+    metrics: dict[str, Any] = {}
+    try:
+        if "elapsed_seconds" in values:
+            metrics["tool_unpack_duration_seconds"] = round(max(0.0, float(values["elapsed_seconds"])), 3)
+    except Exception:
+        pass
+    tokens = _normalize_evolution_token_metrics(
+        {
+            "token_input": values.get("token_input"),
+            "token_output": values.get("token_output"),
+            "token_cache_read": values.get("token_cache_read"),
+            "token_cache_write": values.get("token_cache_write"),
+            "token_total": values.get("token_total"),
+        }
+    )
+    if any(tokens.values()):
+        metrics["evolution_executor_tokens"] = tokens
+        metrics["total_tokens"] = tokens
+    return metrics
+
+
+def _mtime_iso_text(path: Path) -> str | None:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat()
+    except Exception:
+        return None
+
+
+def _normalize_evolution_round_metrics(item: dict[str, Any]) -> dict[str, Any]:
+    raw_metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
+    summary_metrics = _parse_evolution_metrics_from_summary(str(item.get("summary_path") or "").strip() or None)
+    tool_duration = raw_metrics.get("tool_unpack_duration_seconds", summary_metrics.get("tool_unpack_duration_seconds"))
+    try:
+        tool_duration_value = round(max(0.0, float(tool_duration or 0.0)), 3)
+    except Exception:
+        tool_duration_value = 0.0
+    executor_tokens = _normalize_evolution_token_metrics(
+        raw_metrics.get("evolution_executor_tokens") or summary_metrics.get("evolution_executor_tokens")
+    )
+    reviewer_tokens = _normalize_evolution_token_metrics(raw_metrics.get("reviewer_tokens"))
+    total_tokens = _normalize_evolution_token_metrics(raw_metrics.get("total_tokens") or summary_metrics.get("total_tokens"))
+    if not any(total_tokens.values()):
+        total_tokens = {
+            key: int(executor_tokens.get(key, 0)) + int(reviewer_tokens.get(key, 0))
+            for key in ("input", "output", "cacheRead", "cacheWrite", "total")
+        }
+    return {
+        "tool_unpack_duration_seconds": tool_duration_value,
+        "evolution_executor_tokens": executor_tokens,
+        "reviewer_tokens": reviewer_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _guess_running_working_tool_path(job_root: Path) -> str | None:
+    working_dir = job_root / "working_tool"
+    if not working_dir.exists() or not working_dir.is_dir():
+        return None
+    candidates = sorted(
+        (path for path in working_dir.glob("*.py") if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return str(candidates[0]) if candidates else None
+
+
+def _build_running_evolution_round(
+    enriched: dict[str, Any],
+    *,
+    job_root: Path,
+) -> dict[str, Any] | None:
+    job_status = str(enriched.get("status") or "").strip().lower()
+    if job_status not in {EVOLUTION_PENDING, EVOLUTION_RUNNING}:
+        return None
+    round_id = int(enriched.get("current_round") or 0)
+    if round_id <= 0:
+        return None
+    round_dir = job_root / f"round_{round_id:03d}"
+    if not round_dir.exists():
+        return None
+    workspace_output = job_root / "workspace" / "output"
+    summary_path = workspace_output / "summary.md"
+    reason_path = workspace_output / "reason.md"
+    item = {
+        "round": round_id,
+        "status": "running",
+        "tool_path_before": enriched.get("source_tool_path") or enriched.get("source_skill_path"),
+        "tool_path_after": enriched.get("working_tool_path") or enriched.get("working_skill_path") or _guess_running_working_tool_path(job_root),
+        "summary_path": str(summary_path) if summary_path.exists() else None,
+        "reason_path": str(reason_path) if reason_path.exists() else None,
+        "tool_response_preview": None,
+        "metrics": {},
+    }
+    metrics = _normalize_evolution_round_metrics(item)
+    review_result = None
+    if reason_path.exists():
+        review_result = _safe_read_text(reason_path)
+    created_at = _mtime_iso_text(round_dir / "evolution_executor.log") or _mtime_iso_text(round_dir)
+    return {
+        "id": f"{str(enriched.get('id') or '').strip()}-{round_id}",
+        "job_id": str(enriched.get("id") or "").strip(),
+        "round": round_id,
+        "status": "running",
+        "tool_skill_path_before": item["tool_path_before"],
+        "tool_skill_path_after": item["tool_path_after"],
+        "tool_path_before": item["tool_path_before"],
+        "tool_path_after": item["tool_path_after"],
+        "tool_changed": bool(item["tool_path_before"] and item["tool_path_after"] and item["tool_path_before"] != item["tool_path_after"]),
+        "review_result": review_result,
+        "summary_path": item["summary_path"],
+        "reason_path": item["reason_path"],
+        "source_skill_path": enriched.get("source_skill_path"),
+        "source_tool_path": enriched.get("source_tool_path"),
+        "started_without_matched_skill": bool(enriched.get("started_without_matched_skill")),
+        "generated_new_skill": False,
+        "generated_new_tool": False,
+        "executed_tool": (round_dir / "tool_manifest.json").exists() or (job_root / "tool_manifest.json").exists(),
+        "tool_response_preview": None,
+        "metrics": metrics,
+        "tool_unpack_duration_seconds": metrics["tool_unpack_duration_seconds"],
+        "evolution_executor_tokens": metrics["evolution_executor_tokens"],
+        "reviewer_tokens": metrics["reviewer_tokens"],
+        "total_tokens": metrics["total_tokens"],
+        "created_at": created_at,
+        "completed_at": None,
+    }
+
+
 def _enrich_evolution_job_payload(
     payload: dict[str, Any],
     *,
@@ -2356,13 +2512,15 @@ def _enrich_evolution_job_payload(
     enriched["effective_tool_path"] = None
     if job_root is None:
         return enriched
+    result_payload: dict[str, Any] = {}
     result_path = job_root / "evolution_result.json"
-    if not result_path.exists():
-        return enriched
-    try:
-        result_payload = json.loads(result_path.read_text(encoding="utf-8"))
-    except Exception:
-        return enriched
+    if result_path.exists():
+        try:
+            loaded = json.loads(result_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                result_payload = loaded
+        except Exception:
+            result_payload = {}
     if isinstance(result_payload, dict):
         enriched["working_skill_path"] = str(result_payload.get("working_skill_path") or "").strip() or None
         enriched["working_tool_path"] = str(result_payload.get("working_tool_path") or enriched["working_skill_path"] or "").strip() or None
@@ -2383,6 +2541,7 @@ def _enrich_evolution_job_payload(
             for item in rounds:
                 if not isinstance(item, dict):
                     continue
+                metrics = _normalize_evolution_round_metrics(item)
                 enriched["rounds"].append(
                     {
                         "id": str(item.get("id") or "").strip() or f"{str(enriched.get('id') or '').strip()}-{int(item.get('round') or 0)}",
@@ -2404,10 +2563,23 @@ def _enrich_evolution_job_payload(
                         "generated_new_tool": bool(item.get("generated_new_tool", item.get("generated_new_skill"))),
                         "executed_tool": bool(item.get("executed_tool")),
                         "tool_response_preview": str(item.get("tool_response_preview") or "").strip() or None,
+                        "metrics": metrics,
+                        "tool_unpack_duration_seconds": metrics["tool_unpack_duration_seconds"],
+                        "evolution_executor_tokens": metrics["evolution_executor_tokens"],
+                        "reviewer_tokens": metrics["reviewer_tokens"],
+                        "total_tokens": metrics["total_tokens"],
                         "created_at": str(item.get("created_at") or "").strip() or None,
                         "completed_at": str(item.get("completed_at") or "").strip() or None,
                     }
                 )
+    rounds_list = list(enriched.get("rounds") or [])
+    running_round = _build_running_evolution_round(enriched, job_root=job_root)
+    if running_round is not None and not any(int(item.get("round") or 0) == int(running_round.get("round") or 0) for item in rounds_list):
+        rounds_list.append(running_round)
+        rounds_list.sort(key=lambda item: int(item.get("round") or 0))
+    if rounds_list:
+        enriched["rounds"] = rounds_list
+        enriched["round_count"] = len(rounds_list)
     return enriched
 
 

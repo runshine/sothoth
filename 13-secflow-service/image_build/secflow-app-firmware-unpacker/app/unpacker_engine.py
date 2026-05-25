@@ -226,38 +226,6 @@ def _expand_one_recursive_file(
     return {"handler": fmt, "success": False, "output_dir": str(output_dir), "error": f"unsupported recursive format: {fmt}"}
 
 
-def _write_recursive_expand_summary(round_dir: Path, *, output_root: Path, manifest: dict[str, Any]) -> None:
-    success_lines: list[str] = []
-    failure_lines: list[str] = []
-    for item in manifest.get("items") or []:
-        source_rel = _safe_relpath(Path(str(item.get("source_path") or "")), output_root)
-        output_dir = str(item.get("output_dir") or "").strip()
-        if item.get("success"):
-            success_lines.append(
-                f"- `{source_rel}` -> `{_safe_relpath(Path(output_dir), output_root) if output_dir else output_dir}` "
-                f"(`{item.get('handler')}`, {int(item.get('new_paths_count') or 0)} new paths)"
-            )
-        else:
-            failure_lines.append(
-                f"- `{source_rel}` (`{item.get('handler')}`): {str(item.get('error') or 'unknown error').strip()}"
-            )
-    summary_lines = [
-        "# Recursive Expand Summary",
-        "",
-        "## Success",
-        *(success_lines or ["- None"]),
-        "",
-        "## Attempted But Failed",
-        *(failure_lines or ["- None"]),
-        "",
-        "## Reviewer Notes",
-        "- Files listed in `Success` have already been recursively expanded and should not be treated as missed unpacking.",
-        "- Files listed in `Attempted But Failed` were already attempted deterministically; review them by value and failure reason, not by mere presence.",
-        "",
-    ]
-    (round_dir / "recursive_expand_summary.md").write_text("\n".join(summary_lines), encoding="utf-8")
-
-
 def _run_recursive_expand(
     output_path: str,
     round_dir: Path,
@@ -271,9 +239,14 @@ def _run_recursive_expand(
     output_root = Path(output_path)
     round_dir.mkdir(parents=True, exist_ok=True)
     processed: set[str] = set()
-    manifest_items: list[dict[str, Any]] = []
+    failed_items: list[dict[str, Any]] = []
     completed_rounds = 0
     stopped_reason = "no_new_files"
+    attempted_items = 0
+    successful_items = 0
+    deleted_source_items = 0
+    failed_items_count = 0
+    total_new_paths = 0
     if event_callback:
         event_callback(
             "recursive_expand_started",
@@ -308,6 +281,7 @@ def _run_recursive_expand(
                 if not fmt:
                     continue
                 processed.add(resolved)
+                attempted_items += 1
                 result = _expand_one_recursive_file(
                     candidate,
                     fmt,
@@ -315,6 +289,20 @@ def _run_recursive_expand(
                     register_cancel_hook=register_cancel_hook,
                 )
                 new_paths_count = _count_tree_entries(Path(str(result.get("output_dir") or ""))) if result.get("success") else 0
+                retained_source = True
+                if result.get("success") and new_paths_count > 0:
+                    successful_items += 1
+                    total_new_paths += int(new_paths_count)
+                    try:
+                        candidate.unlink()
+                        retained_source = False
+                        deleted_source_items += 1
+                    except Exception as exc:
+                        result["error"] = (
+                            f"{result.get('error')}\nsource cleanup failed: {exc}".strip()
+                            if result.get("error")
+                            else f"source cleanup failed: {exc}"
+                        )
                 item = {
                     "round": round_index,
                     "source_path": str(candidate),
@@ -324,10 +312,20 @@ def _run_recursive_expand(
                     "success": bool(result.get("success")),
                     "output_dir": result.get("output_dir"),
                     "new_paths_count": int(new_paths_count),
-                    "retained_source": True,
+                    "retained_source": retained_source,
                     "error": result.get("error"),
                 }
-                manifest_items.append(item)
+                if not result.get("success"):
+                    failed_items_count += 1
+                    failed_items.append(
+                        {
+                            "round": round_index,
+                            "source_path": str(candidate),
+                            "detected_format": fmt,
+                            "handler": result.get("handler"),
+                            "error": result.get("error"),
+                        }
+                    )
                 _append_stage_log(round_dir, "recursive_expand.log", "recursive expand item processed", **item)
                 if result.get("success") and new_paths_count > 0:
                     expanded_this_round += 1
@@ -358,10 +356,16 @@ def _run_recursive_expand(
         "max_rounds": max_rounds,
         "completed_rounds": completed_rounds,
         "stopped_reason": stopped_reason,
-        "items": manifest_items,
+        "stats": {
+            "attempted_items": attempted_items,
+            "successful_items": successful_items,
+            "failed_items": failed_items_count,
+            "deleted_source_items": deleted_source_items,
+            "total_new_paths": total_new_paths,
+        },
+        "failed_items": failed_items,
     }
     _write_json_log(round_dir, "recursive_expand_manifest.json", manifest)
-    _write_recursive_expand_summary(round_dir, output_root=output_root, manifest=manifest)
     if event_callback:
         event_callback(
             "recursive_expand_completed",
@@ -371,7 +375,7 @@ def _run_recursive_expand(
             detail={
                 "completed_rounds": completed_rounds,
                 "stopped_reason": stopped_reason,
-                "processed_items": len(manifest_items),
+                "processed_items": attempted_items,
             },
         )
     return manifest
@@ -541,15 +545,10 @@ def _run_reviewer(
         started_at = datetime.utcnow().isoformat()
         started_monotonic = time.perf_counter()
         review_prompt = render_prompt(VAL_PROMPT_TMPL, firmware_path, output_path)
-        recursive_summary_path = round_dir / "recursive_expand_summary.md" if round_dir is not None else None
         recursive_manifest_path = round_dir / "recursive_expand_manifest.json" if round_dir is not None else None
-        if recursive_summary_path is not None and recursive_summary_path.exists():
-            review_prompt += (
-                "\n\nRecursive expansion context:\n"
-                f"- Read `{recursive_summary_path}` before judging completeness.\n"
-            )
         if recursive_manifest_path is not None and recursive_manifest_path.exists():
             review_prompt += (
+                "\n\nRecursive expansion context:\n"
                 f"- Read `{recursive_manifest_path}` if you need machine-readable recursive expansion details.\n"
             )
         verify_result = validator.prompt(

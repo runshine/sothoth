@@ -83,6 +83,10 @@ logger = logging.getLogger(__name__)
 MAX_LOG_RENDER_BYTES = 128 * 1024
 RUNTIME_ROOT_PATH = Path("/data/secflow-app-firmware-unpacker")
 RUNTIME_FILE_LIST_LIMIT = 2000
+RUNTIME_ALLOWED_ROOTS = [
+    Path("/data/secflow-app-firmware-unpacker"),
+    Path("/data/files"),
+]
 
 
 @router.get("/metrics", include_in_schema=False)
@@ -138,8 +142,20 @@ def _normalize_runtime_config_value(key: str, value: str) -> str:
     return value
 
 
-def _list_runtime_root_files(limit: int = RUNTIME_FILE_LIST_LIMIT) -> dict:
-    root_path = RUNTIME_ROOT_PATH
+def _resolve_runtime_root(root: Optional[str] = None) -> Path:
+    raw = _normalize_runtime_path(str(root or "").strip())
+    candidate = Path(raw or str(RUNTIME_ROOT_PATH)).resolve()
+    for allowed in RUNTIME_ALLOWED_ROOTS:
+        try:
+            candidate.relative_to(allowed.resolve())
+            return candidate
+        except Exception:
+            continue
+    raise ValidationError("非法 runtime 根目录")
+
+
+def _list_runtime_root_files(limit: int = RUNTIME_FILE_LIST_LIMIT, root: Optional[str] = None) -> dict:
+    root_path = _resolve_runtime_root(root)
     items: list[dict[str, Any]] = []
     if not root_path.exists():
         return {"root": str(root_path), "total": 0, "truncated": False, "items": items}
@@ -174,8 +190,8 @@ def _list_runtime_root_files(limit: int = RUNTIME_FILE_LIST_LIMIT) -> dict:
     return {"root": str(root_path), "total": len(items), "truncated": False, "items": items}
 
 
-def _resolve_runtime_root_entry(relative_path: str) -> Path:
-    root_path = RUNTIME_ROOT_PATH.resolve()
+def _resolve_runtime_root_entry(relative_path: str, root: Optional[str] = None) -> Path:
+    root_path = _resolve_runtime_root(root)
     normalized = str(relative_path or "").strip().lstrip("/")
     target = (root_path / normalized).resolve()
     try:
@@ -187,8 +203,8 @@ def _resolve_runtime_root_entry(relative_path: str) -> Path:
     return target
 
 
-def _build_runtime_file_content_response(relative_path: str, max_bytes: int) -> Response:
-    target = _resolve_runtime_root_entry(relative_path)
+def _build_runtime_file_content_response(relative_path: str, max_bytes: int, root: Optional[str] = None) -> Response:
+    target = _resolve_runtime_root_entry(relative_path, root)
     if target.is_dir():
         raise ValidationError("目录不支持内容预览")
     if not target.is_file():
@@ -463,10 +479,11 @@ def _get_task_progress(task_id: str) -> dict:
     cleaner_log_path = _round_log_path(run_dir, 0, "cleaner.log")
     cleaner_log_artifact_path = cleaner_log_path if cleaner_log_path.exists() else cleaner_path
     tool_reviewer_messages = _round_log_path(run_dir, 0, "reviewer_messages.json")
+    tool_reviewer_transcript = _round_log_path(run_dir, 0, "reviewer_transcript.log")
     round_dirs = _llm_round_dirs(run_dir)
     executor_logs = [path / "executor_messages.json" for path in round_dirs if (path / "executor_messages.json").exists()]
     verifier_logs = [path / "reviewer_messages.json" for path in round_dirs if (path / "reviewer_messages.json").exists()]
-    has_tool_review = tool_reviewer_messages.exists() or stage4_llm_review_log.exists()
+    has_tool_review = tool_reviewer_messages.exists() or tool_reviewer_transcript.exists() or stage4_llm_review_log.exists() or stage4_path.exists()
 
     def _cleaner_session_closed() -> bool:
         session_index = _read_json_file(run_dir / "sessions" / "index.json")
@@ -569,6 +586,19 @@ def _get_task_progress(task_id: str) -> dict:
             return _clamp_round(max(len(verifier_logs), len(executor_logs), 1))
         if executor_logs:
             return _clamp_round(max(len(executor_logs), 1))
+        return None
+
+    def _tool_review_duration_seconds() -> Optional[int]:
+        transcript_duration = _log_duration_seconds(tool_reviewer_transcript)
+        if transcript_duration is not None:
+            return transcript_duration
+        stage4_duration = _log_duration_seconds(stage4_llm_review_log)
+        if stage4_duration is not None:
+            return stage4_duration
+        started_at, _ = _log_time_bounds(stage4_llm_review_log)
+        message_updated_at = _parse_iso_datetime(_mtime_iso_text(tool_reviewer_messages))
+        if started_at is not None and message_updated_at is not None:
+            return max(0, int(round((ensure_local(message_updated_at) - ensure_local(started_at)).total_seconds())))
         return None
 
     phases = [
@@ -759,6 +789,28 @@ def _get_task_progress(task_id: str) -> dict:
             except Exception:
                 return None
 
+        tool_review_phase: dict[str, Any] | None = None
+        if has_tool_review:
+            review_status = "success"
+            review_detail = "工具执行后的评审已通过"
+            if fallback_to_llm:
+                review_status = "failed"
+                review_detail = "工具执行后的评审未通过，已回退到 LLM"
+            elif task_current_stage == "review" and not (executor_logs or verifier_logs or round_items):
+                review_status = "running"
+                review_detail = "LLM 正在评审工具执行结果"
+            elif task_status == "failed" and not fallback_to_llm and not (executor_logs or verifier_logs or round_items):
+                review_status = "failed"
+                review_detail = "工具执行后的评审未通过"
+            tool_review_phase = _phase_payload(
+                "llm_review_tool",
+                "LLM 评审（工具阶段）",
+                review_status,
+                review_detail,
+                _mtime_iso_text(tool_reviewer_messages) or _mtime_iso_text(stage4_llm_review_log),
+                duration_seconds=_tool_review_duration_seconds(),
+            )
+
         if started_rounds > 0:
             running_unpack_round = _running_unpack_round()
             running_review_round = _running_review_round()
@@ -769,24 +821,8 @@ def _get_task_progress(task_id: str) -> dict:
                     max(round_items.keys(), default=0),
                     1,
                 )
-            if has_tool_review and (fallback_to_llm or executor_logs or verifier_logs or round_items):
-                review_status = "success"
-                review_detail = "工具执行后的评审未通过，已回退到 LLM"
-                if task_current_stage == "review" and not (executor_logs or verifier_logs or round_items):
-                    review_status = "running"
-                    review_detail = "LLM 正在评审工具执行结果"
-                elif task_status == "failed" and not fallback_to_llm and not (executor_logs or verifier_logs or round_items):
-                    review_status = "failed"
-                    review_detail = "工具执行后的评审未通过"
-                llm_phases.append(
-                    _phase_payload(
-                        "llm_review_tool",
-                        "LLM 评审（工具阶段）",
-                        review_status,
-                        review_detail,
-                        _mtime_iso_text(tool_reviewer_messages) or _mtime_iso_text(stage4_llm_review_log),
-                    )
-                )
+            if tool_review_phase is not None:
+                llm_phases.append(tool_review_phase)
             for round_id in range(1, started_rounds + 1):
                 round_dir = _round_dir(run_dir, round_id)
                 executor_path = round_dir / "executor_messages.json"
@@ -890,21 +926,8 @@ def _get_task_progress(task_id: str) -> dict:
         elif matched_tool and not fallback_to_llm:
             llm_phases.append(_phase_payload("llm_unpack", "LLM 解包", "skipped", "工具执行成功，跳过 LLM 解包"))
             llm_phases.append(_phase_payload("recursive_expand_llm", "递归解包（LLM后）", "skipped", "未进入 LLM 解包，跳过"))
-            if has_tool_review:
-                review_status = "running" if task_current_stage == "review" else "success"
-                review_detail = "LLM 正在评审当前解包结果" if review_status == "running" else "工具执行后的评审已通过"
-                if task_result in {"failed", "max_retries_reached"} or task_status == "failed":
-                    review_status = "failed"
-                    review_detail = "工具执行后的评审未通过"
-                llm_phases.append(
-                    _phase_payload(
-                        "llm_review_tool",
-                        "LLM 评审（工具阶段）",
-                        review_status,
-                        review_detail,
-                        _mtime_iso_text(tool_reviewer_messages) or _mtime_iso_text(stage4_llm_review_log),
-                    )
-                )
+            if tool_review_phase is not None:
+                llm_phases.append(tool_review_phase)
             else:
                 llm_phases.append(_phase_payload("llm_review", "LLM 评审", "not_executed", "工具执行成功后，LLM 评审未执行"))
 
@@ -1019,7 +1042,9 @@ def _get_task_progress(task_id: str) -> dict:
                 round_id = int(phase_key.rsplit("_", 1)[-1])
                 phase_start, _ = _log_time_bounds(_round_dir(run_dir, round_id) / "recursive_expand.log")
             elif phase_key == "llm_review_tool":
-                phase_start, _ = _log_time_bounds(stage4_llm_review_log)
+                phase_start, _ = _log_time_bounds(tool_reviewer_transcript)
+                if phase_start is None:
+                    phase_start, _ = _log_time_bounds(stage4_llm_review_log)
         if phase_start is None or phase_status in {"pending", "skipped", "not_executed"}:
             continue
         if phase.get("duration_seconds") is not None and phase_status != "running":
@@ -1113,10 +1138,8 @@ def _phase_log_files(run_dir: Path, phase: Optional[str]) -> list[Path]:
         "recursive_expand": [
             round_zero / "recursive_expand.log",
             round_zero / "recursive_expand_manifest.json",
-            round_zero / "recursive_expand_summary.md",
             *[path / "recursive_expand.log" for path in llm_round_dirs],
             *[path / "recursive_expand_manifest.json" for path in llm_round_dirs],
-            *[path / "recursive_expand_summary.md" for path in llm_round_dirs],
         ],
         "llm_unpack": [
             round_zero / "stage3_llm_unpack.log",
@@ -1162,7 +1185,6 @@ def _phase_log_files(run_dir: Path, phase: Optional[str]) -> list[Path]:
         return [
             round_dir / "recursive_expand.log",
             round_dir / "recursive_expand_manifest.json",
-            round_dir / "recursive_expand_summary.md",
         ]
     if phase_key.startswith("llm_review_round_"):
         round_id = int(phase_key.rsplit("_", 1)[-1])
@@ -2404,42 +2426,46 @@ async def get_unpacker_tools(
 async def list_project_runtime_files(
     project_id: str,
     limit: int = Query(default=RUNTIME_FILE_LIST_LIMIT, ge=1, le=10000),
+    root: Optional[str] = Query(default=None),
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
     _, token = subject_and_token
     await ensure_project_access(project_id, token)
-    return _list_runtime_root_files(limit)
+    return _list_runtime_root_files(limit, root)
 
 
 @router.get("/api/app/firmware-unpacker/runtime-files")
 async def list_runtime_files_legacy(
     project_id: Optional[str] = Query(default=None),
     limit: int = Query(default=RUNTIME_FILE_LIST_LIMIT, ge=1, le=10000),
+    root: Optional[str] = Query(default=None),
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
     _, token = subject_and_token
     normalized_project_id = _normalize_project_id(project_id)
     if normalized_project_id:
         await ensure_project_access(normalized_project_id, token)
-    return _list_runtime_root_files(limit)
+    return _list_runtime_root_files(limit, root)
 
 
 @router.get("/api/app/firmware-unpacker/projects/{project_id}/runtime-files/content")
 async def get_project_runtime_file_content(
     project_id: str,
     path: str = Query(...),
+    root: Optional[str] = Query(default=None),
     max_bytes: int = Query(default=262144, ge=1, le=1048576),
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
     _, token = subject_and_token
     await ensure_project_access(project_id, token)
-    return _build_runtime_file_content_response(path, max_bytes)
+    return _build_runtime_file_content_response(path, max_bytes, root)
 
 
 @router.get("/api/app/firmware-unpacker/runtime-files/content")
 async def get_runtime_file_content_legacy(
     path: str = Query(...),
     project_id: Optional[str] = Query(default=None),
+    root: Optional[str] = Query(default=None),
     max_bytes: int = Query(default=262144, ge=1, le=1048576),
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
@@ -2447,7 +2473,7 @@ async def get_runtime_file_content_legacy(
     normalized_project_id = _normalize_project_id(project_id)
     if normalized_project_id:
         await ensure_project_access(normalized_project_id, token)
-    return _build_runtime_file_content_response(path, max_bytes)
+    return _build_runtime_file_content_response(path, max_bytes, root)
 
 
 @router.put(

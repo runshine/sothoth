@@ -33,6 +33,7 @@ from app.unpacker_engine_config import (
     EVOLUTION_IMPROVER_PROMPT_TMPL,
     EVOLUTION_REVIEW_PROMPT_TMPL,
     TOOLS_ACTIVE_DIR,
+    TOOLS_DIR,
     TOOLS_ROOT_DIR,
     TOOLS_STORE_DIR,
     VAL_AGENT_DEF,
@@ -873,6 +874,37 @@ def _augment_tool_summary(
     summary_txt.write_text(merged, encoding="utf-8")
 
 
+def _normalize_token_stats(token_stats: dict[str, Any] | None) -> dict[str, int]:
+    payload = token_stats if isinstance(token_stats, dict) else {}
+    return {
+        "input": int(payload.get("input") or 0),
+        "output": int(payload.get("output") or 0),
+        "cacheRead": int(payload.get("cacheRead") or 0),
+        "cacheWrite": int(payload.get("cacheWrite") or 0),
+        "total": int(payload.get("total") or 0),
+    }
+
+
+def _build_evolution_round_metrics(
+    *,
+    tool_elapsed_seconds: float,
+    evolution_executor_tokens: dict[str, Any] | None,
+    reviewer_tokens: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    executor_tokens = _normalize_token_stats(evolution_executor_tokens)
+    review_tokens = _normalize_token_stats(reviewer_tokens)
+    total_tokens = {
+        key: int(executor_tokens.get(key, 0)) + int(review_tokens.get(key, 0))
+        for key in ("input", "output", "cacheRead", "cacheWrite", "total")
+    }
+    return {
+        "tool_unpack_duration_seconds": round(max(0.0, float(tool_elapsed_seconds or 0.0)), 3),
+        "evolution_executor_tokens": executor_tokens,
+        "reviewer_tokens": review_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
 def _build_evolution_execute_prompt(
     *,
     round_id: int,
@@ -1033,12 +1065,14 @@ def run_evolution_job(
             executed_tool = False
             tool_result = ""
             token_stats: dict[str, Any] = {}
+            review_token_stats: dict[str, Any] = {}
             review_result = ""
             review_round_passed = False
 
             if progress_callback:
                 progress_callback(round_id, "evolution_execute")
             tool_round_started_at = time.monotonic()
+            tool_elapsed_seconds = 0.0
             if seeded_initial_tool and int(round_id) == 1:
                 tool_result = str(working_tool)
                 token_stats = {}
@@ -1119,6 +1153,7 @@ def run_evolution_job(
                 elapsed_seconds=time.monotonic() - tool_round_started_at,
                 token_stats=token_stats or _load_token_stats(round_dir, "evolution_executor"),
             )
+            tool_elapsed_seconds = time.monotonic() - tool_round_started_at
             _sync_report_aliases(workspace_output)
 
             generality_issues = _validate_tool_generality(working_tool)
@@ -1168,6 +1203,11 @@ def run_evolution_job(
                     "executed_tool": executed_tool,
                     "tool_response_preview": tool_result[:2000] if tool_result else None,
                     "evolution_executor_response_preview": tool_result[:2000] if tool_result else None,
+                    "metrics": _build_evolution_round_metrics(
+                        tool_elapsed_seconds=tool_elapsed_seconds,
+                        evolution_executor_tokens=token_stats or _load_token_stats(round_dir, "evolution_executor"),
+                        reviewer_tokens=review_token_stats,
+                    ),
                     "created_at": datetime.now().isoformat(),
                     "completed_at": datetime.now().isoformat(),
                 }
@@ -1201,8 +1241,10 @@ def run_evolution_job(
                     elapsed_seconds=time.monotonic() - tool_round_started_at,
                     token_stats=token_stats or _load_token_stats(round_dir, "evolution_executor"),
                 )
+                tool_elapsed_seconds = time.monotonic() - tool_round_started_at
                 _sync_report_aliases(workspace_output)
             except Exception as exc:
+                tool_elapsed_seconds = time.monotonic() - tool_round_started_at
                 review_result = _write_tool_execution_failure(workspace_output, str(exc))
                 review_round_passed = False
                 _append_stage_log(
@@ -1248,6 +1290,11 @@ def run_evolution_job(
                     "executed_tool": executed_tool,
                     "tool_response_preview": tool_result[:2000] if tool_result else None,
                     "evolution_executor_response_preview": tool_result[:2000] if tool_result else None,
+                    "metrics": _build_evolution_round_metrics(
+                        tool_elapsed_seconds=tool_elapsed_seconds,
+                        evolution_executor_tokens=token_stats or _load_token_stats(round_dir, "evolution_executor"),
+                        reviewer_tokens=review_token_stats,
+                    ),
                     "created_at": datetime.now().isoformat(),
                     "completed_at": datetime.now().isoformat(),
                 }
@@ -1308,7 +1355,7 @@ def run_evolution_job(
                     review_prompt,
                     stream_callback=_stream_review_event,
                 )
-                _save_agent_log(review_client, log, round_dir, "reviewer")
+                review_token_stats = _save_agent_log(review_client, log, round_dir, "reviewer")
                 review_round_passed = _review_passed(review_result)
                 _append_stage_log(
                     round_dir,
@@ -1358,6 +1405,11 @@ def run_evolution_job(
                 "executed_tool": executed_tool,
                 "tool_response_preview": tool_result[:2000] if tool_result else None,
                 "evolution_executor_response_preview": tool_result[:2000] if tool_result else None,
+                "metrics": _build_evolution_round_metrics(
+                    tool_elapsed_seconds=tool_elapsed_seconds,
+                    evolution_executor_tokens=token_stats or _load_token_stats(round_dir, "evolution_executor"),
+                    reviewer_tokens=review_token_stats or _load_token_stats(round_dir, "reviewer"),
+                ),
                 "created_at": datetime.now().isoformat(),
                 "completed_at": datetime.now().isoformat(),
             }
