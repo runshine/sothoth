@@ -10532,6 +10532,83 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(task.dispatch_started_at)
         self.assertIsNone(task.lease_expires_at)
 
+    def test_recover_missing_stage_terminal_events_requeues_missing_terminal_signal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="running",
+                current_stage="entry_analysis",
+                task_type=TASK_TYPE_SOURCE,
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root="/o",
+                workspace_root=tmp,
+            )
+            task.dispatch_started_at = _now()
+            task.dispatcher_instance_id = "worker-a"
+            stage_run = BinarySecurityStageRun(
+                id="sr1",
+                task_id="task1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="failed",
+            )
+            stage_run.output_summary = {"error": "input contract mismatch", "failed_count": 1}
+            db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], state_events=[], events=[])
+
+            recovered = self.manager._recover_missing_stage_terminal_events_locked(db)
+
+            self.assertTrue(recovered)
+            terminal_events = [row for row in db.added if row.__class__.__name__ == "BinarySecurityStateEvent"]
+            self.assertEqual(1, len(terminal_events))
+            self.assertEqual("stage_worker_terminal_observed", terminal_events[0].event_type)
+            self.assertEqual("failed", terminal_events[0].payload["status"])
+            self.assertTrue(any(row.event_type == "stage_worker_terminal_event_missing" for row in db.added if row.__class__.__name__ == "BinarySecurityEvent"))
+
+    def test_recover_missing_stage_terminal_events_skips_when_event_already_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="running",
+                current_stage="entry_analysis",
+                task_type=TASK_TYPE_SOURCE,
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root="/o",
+                workspace_root=tmp,
+            )
+            task.dispatch_started_at = _now()
+            execution_token = task.dispatch_started_at.isoformat()
+            stage_run = BinarySecurityStageRun(
+                id="sr1",
+                task_id="task1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="failed",
+            )
+            existing = BinarySecurityStateEvent(
+                id="sev-existing",
+                task_id="task1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                event_type="stage_worker_terminal_observed",
+                idempotency_key=f"stage_worker_terminal_observed:task1:entry_analysis:{execution_token}:failed",
+                status="pending",
+                available_at=_now(),
+            )
+            db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], state_events=[existing], events=[])
+
+            recovered = self.manager._recover_missing_stage_terminal_events_locked(db)
+
+            self.assertFalse(recovered)
+            self.assertFalse(any(row.__class__.__name__ == "BinarySecurityEvent" and row.event_type == "stage_worker_terminal_event_missing" for row in db.added))
+
     def test_list_tasks_needing_downstream_sync_includes_failed_tasks_when_retry_target_stage_is_active(self):
         task = BinarySecurityTask(
             id="task1",
