@@ -291,6 +291,12 @@ STATE_REDUCER_DURATION_SECONDS = Histogram(
     buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60),
 )
 
+STATE_REDUCER_HEALTH = Gauge(
+    "secflow_binary_security_state_reducer_health",
+    "Reducer heartbeat, crash and event-processing health signals by pod.",
+    labelnames=("pod", "signal"),
+)
+
 TASK_STATE_LOCK_WAIT_SECONDS = Histogram(
     "secflow_binary_security_task_state_lock_wait_seconds",
     "Task state reducer lock wait duration in seconds.",
@@ -537,6 +543,25 @@ def observe_state_reducer_run(*, result: str, pod: str, duration_seconds: float 
 
 def observe_state_reducer_event(event_type: str, result: str) -> None:
     STATE_REDUCER_EVENTS_TOTAL.labels(event_type=str(event_type or "unknown"), result=str(result or "unknown")).inc()
+
+
+def observe_state_reducer_health(
+    *,
+    pod: str,
+    loop_ok_at: float | None = None,
+    event_processed_at: float | None = None,
+    crash_at: float | None = None,
+    consecutive_crash_count: int | None = None,
+) -> None:
+    pod_value = str(pod or "unknown")
+    if loop_ok_at is not None:
+        STATE_REDUCER_HEALTH.labels(pod=pod_value, signal="loop_ok_at").set(max(0.0, float(loop_ok_at)))
+    if event_processed_at is not None:
+        STATE_REDUCER_HEALTH.labels(pod=pod_value, signal="event_processed_at").set(max(0.0, float(event_processed_at)))
+    if crash_at is not None:
+        STATE_REDUCER_HEALTH.labels(pod=pod_value, signal="crash_at").set(max(0.0, float(crash_at)))
+    if consecutive_crash_count is not None:
+        STATE_REDUCER_HEALTH.labels(pod=pod_value, signal="consecutive_crash_count").set(max(0, int(consecutive_crash_count)))
 
 
 def observe_task_state_lock(*, operation: str, wait_seconds: float | None = None, held_seconds: float | None = None, active: int | None = None) -> None:

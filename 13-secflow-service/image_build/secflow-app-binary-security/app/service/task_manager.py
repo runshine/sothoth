@@ -62,6 +62,7 @@ from app.observability import (
     observe_state_event_lag,
     observe_state_event_queues,
     observe_state_file_write,
+    observe_state_reducer_health,
     observe_state_reducer_event,
     observe_state_reducer_run,
     observe_task_state_lock,
@@ -786,6 +787,7 @@ class TaskManager:
         self._archive_worker_lock = asyncio.Lock()
         self._last_task_heartbeat_at: dict[str, datetime] = {}
         self._last_queue_reconcile_at: datetime | None = None
+        self._state_reducer_consecutive_crash_count = 0
 
     async def start(self) -> None:
         if self._running:
@@ -4465,11 +4467,23 @@ class TaskManager:
                         processed += 1
                         await self._reduce_state_event(event_id)
                     await self._observe_runtime_metrics(db)
+                    self._state_reducer_consecutive_crash_count = 0
+                    observe_state_reducer_health(
+                        pod=self.instance_id,
+                        loop_ok_at=time.time(),
+                        consecutive_crash_count=0,
+                    )
                     if processed:
                         continue
             except asyncio.CancelledError:
                 raise
             except Exception:
+                self._state_reducer_consecutive_crash_count += 1
+                observe_state_reducer_health(
+                    pod=self.instance_id,
+                    crash_at=time.time(),
+                    consecutive_crash_count=self._state_reducer_consecutive_crash_count,
+                )
                 logger.exception("binary-security state reducer loop crashed and recovered")
                 await asyncio.sleep(1)
             finally:
@@ -4699,6 +4713,10 @@ class TaskManager:
             if event_type == "manual_delete_requested":
                 observe_state_event_lag(event_type, (_now() - event_created_at).total_seconds() if event_created_at else None)
                 observe_state_reducer_event(event_type, "processed")
+                observe_state_reducer_health(
+                    pod=self.instance_id,
+                    event_processed_at=time.time(),
+                )
                 db.expunge(event)
                 db.query(BinarySecurityStateEvent).filter(
                     BinarySecurityStateEvent.task_id == task_id,
@@ -4714,6 +4732,10 @@ class TaskManager:
             event.updated_at = _now()
             observe_state_event_lag(event_type, (_now() - event.created_at).total_seconds() if event.created_at else None)
             observe_state_reducer_event(event_type, "processed")
+            observe_state_reducer_health(
+                pod=self.instance_id,
+                event_processed_at=time.time(),
+            )
             result = "success"
             db.commit()
             if event_type == "manual_blocking_action_requested":

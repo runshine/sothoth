@@ -104,6 +104,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("app.service.task_manager.asyncio.sleep", new=_sleep),
             patch("app.service.task_manager.logger.exception") as logger_exception,
+            patch("app.service.task_manager.observe_state_reducer_health") as observe_health,
         ):
             await manager._state_reducer_loop()
 
@@ -111,6 +112,36 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(sleep_calls), 1)
         self.assertTrue(all(seconds == 1 for seconds in sleep_calls))
         logger_exception.assert_called_once()
+        observe_health.assert_called_once()
+        self.assertEqual(1, manager._state_reducer_consecutive_crash_count)
+
+    async def test_state_reducer_loop_records_healthy_heartbeat_after_iteration(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.cfg.scheduler.poll_interval_seconds = 1
+        sleep_calls = []
+
+        async def _sleep(_seconds):
+            sleep_calls.append(_seconds)
+            manager._running = False
+
+        manager._observe_state_runtime_metrics = lambda _db: None
+        manager._claim_state_event = lambda _db: None
+        async def _observe_runtime_metrics(_db):
+            return None
+        manager._observe_runtime_metrics = _observe_runtime_metrics
+        manager._state_reducer_consecutive_crash_count = 3
+
+        with (
+            patch("app.service.task_manager.asyncio.sleep", new=_sleep),
+            patch("app.service.task_manager.observe_state_reducer_health") as observe_health,
+        ):
+            await manager._state_reducer_loop()
+
+        self.assertGreaterEqual(len(sleep_calls), 1)
+        self.assertEqual(0, manager._state_reducer_consecutive_crash_count)
+        observe_health.assert_called_once()
+        self.assertEqual(0, observe_health.call_args.kwargs["consecutive_crash_count"])
 
 
 if __name__ == "__main__":

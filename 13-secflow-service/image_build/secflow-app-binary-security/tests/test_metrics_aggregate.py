@@ -160,6 +160,16 @@ class MetricsAggregateTests(unittest.TestCase):
                     help_text="Lock held count",
                     samples={(): 3.0},
                 ),
+                "secflow_binary_security_state_reducer_health": SimpleNamespace(
+                    metric_type="gauge",
+                    help_text="Reducer health",
+                    samples={
+                        ((("pod", "reducer-a"), ("signal", "loop_ok_at"))): 5600.0,
+                        ((("pod", "reducer-a"), ("signal", "event_processed_at"))): 5605.0,
+                        ((("pod", "reducer-a"), ("signal", "crash_at"))): 5610.0,
+                        ((("pod", "reducer-a"), ("signal", "consecutive_crash_count"))): 2.0,
+                    },
+                ),
             },
             metadata=AggregateMetadata(
                 attempted_by_role={"api": 2, "worker": 0, "reducer": 1},
@@ -178,6 +188,10 @@ class MetricsAggregateTests(unittest.TestCase):
         self.assertIn("secflow_binary_security_health_event_avg_lag_seconds 8.0", payload)
         self.assertIn("secflow_binary_security_health_lock_wait_avg_seconds 0.5", payload)
         self.assertIn("secflow_binary_security_health_lock_held_avg_seconds 3.0", payload)
+        self.assertIn("secflow_binary_security_health_reducer_consecutive_crash_count 2.0", payload)
+        self.assertRegex(payload, r"secflow_binary_security_health_reducer_loop_ok_age_seconds 78\.8[0-9]+")
+        self.assertRegex(payload, r"secflow_binary_security_health_reducer_last_event_processed_age_seconds 73\.8[0-9]+")
+        self.assertRegex(payload, r"secflow_binary_security_health_reducer_last_crash_age_seconds 68\.8[0-9]+")
         self.assertIn('secflow_binary_security_metrics_aggregate_role_covered{role="worker"} 0.0', payload)
 
     def test_aggregate_endpoint_returns_partial_result_when_some_scrapes_fail(self):

@@ -177,6 +177,27 @@ def _append_binary_security_health_metrics(
         aggregated,
         "secflow_binary_security_task_state_lock_held_seconds",
     )
+    reducer_health_series = aggregated.get("secflow_binary_security_state_reducer_health") or AggregatedMetricSeries("gauge", None)
+    reducer_loop_ok_at = max(
+        (value for label_key, value in reducer_health_series.samples.items() if dict(label_key).get("signal") == "loop_ok_at"),
+        default=0.0,
+    )
+    reducer_event_processed_at = max(
+        (value for label_key, value in reducer_health_series.samples.items() if dict(label_key).get("signal") == "event_processed_at"),
+        default=0.0,
+    )
+    reducer_crash_at = max(
+        (value for label_key, value in reducer_health_series.samples.items() if dict(label_key).get("signal") == "crash_at"),
+        default=0.0,
+    )
+    reducer_consecutive_crashes = max(
+        (value for label_key, value in reducer_health_series.samples.items() if dict(label_key).get("signal") == "consecutive_crash_count"),
+        default=0.0,
+    )
+    generated_at = float(metadata.generated_at or 0.0)
+    reducer_loop_ok_age = max(0.0, generated_at - reducer_loop_ok_at) if reducer_loop_ok_at > 0 else 0.0
+    reducer_event_processed_age = max(0.0, generated_at - reducer_event_processed_at) if reducer_event_processed_at > 0 else 0.0
+    reducer_crash_age = max(0.0, generated_at - reducer_crash_at) if reducer_crash_at > 0 else 0.0
     health_metrics = {
         "secflow_binary_security_health_aggregate_partial": (
             "Whether the current aggregate snapshot is partial.",
@@ -217,6 +238,22 @@ def _append_binary_security_health_metrics(
         "secflow_binary_security_health_lock_held_avg_seconds": (
             "Average task state lock held duration in seconds.",
             float(lock_held_avg or 0.0),
+        ),
+        "secflow_binary_security_health_reducer_loop_ok_age_seconds": (
+            "Age in seconds since the reducer loop last completed a healthy iteration.",
+            float(reducer_loop_ok_age),
+        ),
+        "secflow_binary_security_health_reducer_last_event_processed_age_seconds": (
+            "Age in seconds since the latest successful reducer event processing across pods.",
+            float(reducer_event_processed_age),
+        ),
+        "secflow_binary_security_health_reducer_last_crash_age_seconds": (
+            "Age in seconds since the latest observed reducer loop crash.",
+            float(reducer_crash_age),
+        ),
+        "secflow_binary_security_health_reducer_consecutive_crash_count": (
+            "Maximum consecutive reducer loop crash count across pods.",
+            float(reducer_consecutive_crashes),
         ),
     }
     for metric_name, (help_text, value) in health_metrics.items():
