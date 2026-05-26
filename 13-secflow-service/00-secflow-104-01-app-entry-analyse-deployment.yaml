@@ -1,4 +1,4 @@
-# R6-fixes: tag/force-pass/config/naming
+# R6-fixes: 19:46
 apiVersion: apps/v1
 kind: Deployment
 metadata:
