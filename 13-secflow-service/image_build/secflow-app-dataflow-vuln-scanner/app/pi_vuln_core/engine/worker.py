@@ -46,7 +46,12 @@ from app.pi_vuln_core.utils.result_docs import (
     sync_structured_result_manifests,
     sync_result_relations_manifest,
 )
-from app.pi_vuln_core.utils.template import TemplateRenderError, render_string
+from app.pi_vuln_core.utils.template import (
+    TemplateRenderError,
+    collect_template_kwargs,
+    referenced_placeholders,
+    render_string,
+)
 from app.pi_vuln_core.utils.logger import get_logger
 
 logger = get_logger("worker_executor")
@@ -670,20 +675,14 @@ class WorkerExecutor:
         review_state: ReviewState,
         prompt_file: str,
     ) -> str:
-        prompt_name = os.path.basename(str(prompt_file))
-        simplified_rework_prompts = {
-            "worker_profile_driven_exploration.md",
-            "worker_rework_missed_hunt.md",
-        }
-        include_required_read_files = prompt_name not in simplified_rework_prompts
-        include_convergence_requirements = prompt_name not in simplified_rework_prompts
+        template = read_file(prompt_file)
+        required_keys = set(referenced_placeholders(template)) or None
         sections = self._build_rework_prompt_sections(
             ctx,
             review_state,
-            include_required_read_files=include_required_read_files,
-            include_convergence_requirements=include_convergence_requirements,
+            required_keys=required_keys,
         )
-        return render_string(read_file(prompt_file), strict=True, **sections)
+        return render_string(template, strict=True, **sections)
 
     @staticmethod
     def _prompt_kind_for_rework_stage(stage_id: str) -> str:
@@ -1146,27 +1145,29 @@ class WorkerExecutor:
             return self._build_rework_prompt(ctx, review_state, wf_def=wf_def)
 
         base_prompt = read_file(wf_def.roles.worker.prompts.work.user_prompt_file)
-        return render_string(
+        prompt_kwargs = collect_template_kwargs(
             base_prompt,
-            strict=True,
-            cycle=str(ctx.cycle),
-            review_mode=ctx.review_mode,
-            task=self._read_task_content(ctx.task_file),
-            task_file=ctx.task_file,
-            working_dir=ctx.working_dir,
-            summary_file=ctx.summary_file or os.path.join(ctx.working_dir, "summary.md"),
-            previous_limitations_file=os.path.join(ctx.working_dir, "previous_limitations.md"),
-            results_dir=ctx.results_dir or os.path.join(ctx.working_dir, "results"),
-            supporting_docs_dir=self._supporting_docs_dir(ctx.working_dir),
-            output_contract_text=self._build_worker_output_contract_text(ctx),
-            worker_runtime_context=self._build_initial_worker_context(
-                ctx=ctx,
-                review_state=review_state,
-                current_result_files=current_result_files,
-                system_prompt_file=wf_def.roles.worker.prompts.work.system_prompt_file,
-            ),
-            result_report_template=self._result_report_template(),
+            value_factories={
+                "cycle": lambda: str(ctx.cycle),
+                "review_mode": lambda: ctx.review_mode,
+                "task": lambda: self._read_task_content(ctx.task_file),
+                "task_file": lambda: ctx.task_file,
+                "working_dir": lambda: ctx.working_dir,
+                "summary_file": lambda: ctx.summary_file or os.path.join(ctx.working_dir, "summary.md"),
+                "previous_limitations_file": lambda: os.path.join(ctx.working_dir, "previous_limitations.md"),
+                "results_dir": lambda: ctx.results_dir or os.path.join(ctx.working_dir, "results"),
+                "supporting_docs_dir": lambda: self._supporting_docs_dir(ctx.working_dir),
+                "output_contract_text": lambda: self._build_worker_output_contract_text(ctx),
+                "worker_runtime_context": lambda: self._build_initial_worker_context(
+                    ctx=ctx,
+                    review_state=review_state,
+                    current_result_files=current_result_files,
+                    system_prompt_file=wf_def.roles.worker.prompts.work.system_prompt_file,
+                ),
+                "result_report_template": lambda: self._result_report_template(),
+            },
         )
+        return render_string(base_prompt, strict=True, **prompt_kwargs)
 
     def _should_use_rework_prompt(
         self,
@@ -1382,7 +1383,6 @@ class WorkerExecutor:
         由于 Worker 全程复用同一 session，已拥有完整对话历史，
         此处只注入评审反馈增量（通过/失败结果、近期问题、收敛要求）。
         """
-        sections = self._build_rework_prompt_sections(ctx, review_state)
         rework_prompt_file = None
         if wf_def is not None:
             rework_prompt_file = getattr(
@@ -1402,8 +1402,15 @@ class WorkerExecutor:
                     prompt_file=rework_prompt_file,
                 )
             else:
+                required_keys = set(referenced_placeholders(template)) or None
+                sections = self._build_rework_prompt_sections(
+                    ctx,
+                    review_state,
+                    required_keys=required_keys,
+                )
                 return render_string(template, strict=True, **sections)
 
+        sections = self._build_rework_prompt_sections(ctx, review_state)
         return self._build_legacy_rework_prompt(sections)
 
     def _build_rework_prompt_sections(
@@ -1411,10 +1418,13 @@ class WorkerExecutor:
         ctx: WorkflowContext,
         review_state: ReviewState,
         *,
-        include_required_read_files: bool = True,
-        include_convergence_requirements: bool = True,
+        required_keys: set[str] | None = None,
     ) -> dict[str, Any]:
         """Build dynamic sections shared by file-based and fallback rework prompts."""
+        required = set(required_keys or ())
+
+        def needs(key: str) -> bool:
+            return not required or key in required
         is_closure = (ctx.review_mode == "closure" or review_state.workflow_mode == "closure")
         summary_doc_rework = self._has_summary_doc_rework(ctx, review_state)
         failed_sources = [
@@ -1469,7 +1479,7 @@ class WorkerExecutor:
         ]
 
         failed_result_reasons = ""
-        if failed_files:
+        if needs("failed_result_reasons") and failed_files:
             failed_lines = [
                 "## 未通过结果的失败原因",
             ]
@@ -1483,9 +1493,9 @@ class WorkerExecutor:
                 ])
             failed_result_reasons = "\n".join(failed_lines).rstrip()
 
-        numbering_rules = self._build_summary_rework_rules(ctx)
+        numbering_rules = self._build_summary_rework_rules(ctx) if needs("numbering_rules") else ""
         convergence_requirements = ""
-        if include_convergence_requirements:
+        if needs("convergence_requirements"):
             convergence_requirements = self._build_rework_convergence_requirements(
                 ctx=ctx,
                 is_closure=is_closure,
@@ -1502,14 +1512,18 @@ class WorkerExecutor:
             supporting_docs_dir,
             f"issue_closure_cycle_{ctx.cycle:03d}.md",
         )
-        issue_closure_template = self._build_issue_closure_template(
-            ctx=ctx,
-            review_state=review_state,
-            issue_closure_file=issue_closure_file,
-            failed_files=failed_files,
-            worker_issue_entries=worker_issue_entries,
+        issue_closure_template = (
+            self._build_issue_closure_template(
+                ctx=ctx,
+                review_state=review_state,
+                issue_closure_file=issue_closure_file,
+                failed_files=failed_files,
+                worker_issue_entries=worker_issue_entries,
+            )
+            if needs("issue_closure_template") else
+            ""
         )
-        return {
+        sections = {
             "cycle": str(ctx.cycle),
             "review_mode": ctx.review_mode or review_state.workflow_mode,
             "task": self._read_task_content(ctx.task_file),
@@ -1528,16 +1542,24 @@ class WorkerExecutor:
                     worker_issue_entries=worker_issue_entries,
                     summary_handoff_entries=summary_handoff_entries,
                 )
-                if include_required_read_files else
+                if needs("required_read_files") else
                 ""
             ),
-            "failed_review_guidance": self._build_failed_review_guidance(
-                review_state=review_state,
+            "failed_review_guidance": (
+                self._build_failed_review_guidance(
+                    review_state=review_state,
+                )
+                if needs("failed_review_guidance") else
+                ""
             ),
-            "profile_exploration_guidance": self._build_profile_exploration_guidance(
-                ctx=ctx,
-                review_state=review_state,
-                profile_issue_entries=profile_issue_entries,
+            "profile_exploration_guidance": (
+                self._build_profile_exploration_guidance(
+                    ctx=ctx,
+                    review_state=review_state,
+                    profile_issue_entries=profile_issue_entries,
+                )
+                if needs("profile_exploration_guidance") else
+                ""
             ),
             "review_delta_text": self._build_review_delta_text(
                 ctx=ctx,
@@ -1578,10 +1600,14 @@ class WorkerExecutor:
                 review_state=review_state,
                 failed_files=failed_files,
             ),
-            "missed_hunt_variant_seeds": self._build_missed_hunt_variant_seeds(
-                ctx=ctx,
-                review_state=review_state,
-                failed_files=failed_files,
+            "missed_hunt_variant_seeds": (
+                self._build_missed_hunt_variant_seeds(
+                    ctx=ctx,
+                    review_state=review_state,
+                    failed_files=failed_files,
+                )
+                if needs("missed_hunt_variant_seeds") else
+                ""
             ),
             "issue_hypothesis_queue": self._build_issue_hypothesis_queue(
                 worker_issue_entries=worker_issue_entries,
@@ -1594,8 +1620,16 @@ class WorkerExecutor:
             ),
             "summary_handoff_queue": self._build_summary_handoff_queue(summary_handoff_entries),
             "failed_result_reasons": failed_result_reasons,
-            "output_contract_text": self._build_worker_output_contract_text(ctx),
-            "result_report_template": self._result_report_template(compact=True),
+            "output_contract_text": (
+                self._build_worker_output_contract_text(ctx)
+                if needs("output_contract_text") else
+                ""
+            ),
+            "result_report_template": (
+                self._result_report_template(compact=True)
+                if needs("result_report_template") else
+                ""
+            ),
             "issue_closure_file": issue_closure_file,
             "issue_closure_template": issue_closure_template,
             "rework_scope_policy": self._build_rework_scope_policy(
@@ -1610,6 +1644,9 @@ class WorkerExecutor:
                 "直接使用 read 工具读取需要的文件，不要要求框架重复粘贴全文。"
             ),
         }
+        if required:
+            return {key: value for key, value in sections.items() if key in required}
+        return sections
 
     @staticmethod
     def _record_matches_advisor(
@@ -3250,22 +3287,24 @@ class WorkerExecutor:
                 continue
             prompt = read_file(reflect_cfg.prompt_file)
             try:
-                prompt = render_string(
+                prompt_kwargs = collect_template_kwargs(
                     prompt,
-                    strict=True,
-                    cycle=str(ctx.cycle),
-                    review_mode=ctx.review_mode,
-                    task=self._read_task_content(ctx.task_file),
-                    task_file=ctx.task_file,
-                    working_dir=ctx.working_dir,
-                    summary_file=ctx.summary_file or os.path.join(ctx.working_dir, "summary.md"),
-                    results_dir=ctx.results_dir or os.path.join(ctx.working_dir, "results"),
-                    supporting_docs_dir=self._supporting_docs_dir(ctx.working_dir),
-                    previous_limitations_file=os.path.join(ctx.working_dir, "previous_limitations.md"),
-                    reflection_runtime_context=reflection_runtime_context,
-                    reflection_scope=reflection_scope,
-                    reflection_checklist=reflection_checklist,
+                    value_factories={
+                        "cycle": lambda: str(ctx.cycle),
+                        "review_mode": lambda: ctx.review_mode,
+                        "task": lambda: self._read_task_content(ctx.task_file),
+                        "task_file": lambda: ctx.task_file,
+                        "working_dir": lambda: ctx.working_dir,
+                        "summary_file": lambda: ctx.summary_file or os.path.join(ctx.working_dir, "summary.md"),
+                        "results_dir": lambda: ctx.results_dir or os.path.join(ctx.working_dir, "results"),
+                        "supporting_docs_dir": lambda: self._supporting_docs_dir(ctx.working_dir),
+                        "previous_limitations_file": lambda: os.path.join(ctx.working_dir, "previous_limitations.md"),
+                        "reflection_runtime_context": lambda: reflection_runtime_context,
+                        "reflection_scope": lambda: reflection_scope,
+                        "reflection_checklist": lambda: reflection_checklist,
+                    },
                 )
+                prompt = render_string(prompt, strict=True, **prompt_kwargs)
             except TemplateRenderError as exc:
                 raise WorkerStageError(
                     "reflect",
@@ -3434,31 +3473,38 @@ class WorkerExecutor:
             f"任务文件: {os.path.abspath(ctx.task_file)}",
             f"工作目录: {os.path.abspath(ctx.working_dir)}",
         ])
-        summary_section_template, summary_section_count, summary_limitations_requirement = (
-            self._summary_section_contract_for_cycle(ctx.cycle)
-        )
+        summary_contract_cache: tuple[str, int, str] | None = None
+
+        def _summary_contract() -> tuple[str, int, str]:
+            nonlocal summary_contract_cache
+            if summary_contract_cache is None:
+                summary_contract_cache = self._summary_section_contract_for_cycle(ctx.cycle)
+            return summary_contract_cache
+
         try:
-            prompt = render_string(
+            prompt_kwargs = collect_template_kwargs(
                 prompt,
-                strict=True,
-                cycle=str(ctx.cycle),
-                review_mode=ctx.review_mode,
-                task=self._read_task_content(ctx.task_file),
-                task_file=ctx.task_file,
-                working_dir=ctx.working_dir,
-                summary_file=summary_path,
-                summary_path=summary_path,
-                results_dir=results_dir,
-                supporting_docs_dir=supporting_docs_dir,
-                previous_limitations_file=os.path.join(ctx.working_dir, "previous_limitations.md"),
-                summary_runtime_context=summary_runtime_context,
-                summary_section_template=summary_section_template,
-                summary_section_count=str(summary_section_count),
-                summary_limitations_requirement=summary_limitations_requirement,
-                summary_rework_rules=self._build_summary_rework_rules(ctx) or "(本轮无额外返工规则)",
-                summary_feedback_context=self._build_summary_feedback_context(ctx, summary_state),
-                output_contract_text=self._build_output_contract_text(ctx),
+                value_factories={
+                    "cycle": lambda: str(ctx.cycle),
+                    "review_mode": lambda: ctx.review_mode,
+                    "task": lambda: self._read_task_content(ctx.task_file),
+                    "task_file": lambda: ctx.task_file,
+                    "working_dir": lambda: ctx.working_dir,
+                    "summary_file": lambda: summary_path,
+                    "summary_path": lambda: summary_path,
+                    "results_dir": lambda: results_dir,
+                    "supporting_docs_dir": lambda: supporting_docs_dir,
+                    "previous_limitations_file": lambda: os.path.join(ctx.working_dir, "previous_limitations.md"),
+                    "summary_runtime_context": lambda: summary_runtime_context,
+                    "summary_section_template": lambda: _summary_contract()[0],
+                    "summary_section_count": lambda: str(_summary_contract()[1]),
+                    "summary_limitations_requirement": lambda: _summary_contract()[2],
+                    "summary_rework_rules": lambda: self._build_summary_rework_rules(ctx) or "(本轮无额外返工规则)",
+                    "summary_feedback_context": lambda: self._build_summary_feedback_context(ctx, summary_state),
+                    "output_contract_text": lambda: self._build_output_contract_text(ctx),
+                },
             )
+            prompt = render_string(prompt, strict=True, **prompt_kwargs)
         except TemplateRenderError as exc:
             raise WorkerStageError("summary", f"Summary prompt 渲染失败：{exc}") from exc
         prompt = prompt.rstrip("\n")

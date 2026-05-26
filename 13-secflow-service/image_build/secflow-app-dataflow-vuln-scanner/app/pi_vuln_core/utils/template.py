@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Mapping
 
 from jinja2 import Environment, BaseLoader, StrictUndefined, TemplateError
 
@@ -69,6 +69,43 @@ def unresolved_placeholders(rendered_text: str) -> list[str]:
         if name not in found:
             found.append(name)
     return found
+
+
+def referenced_placeholders(template_str: str) -> list[str]:
+    """Return simple ``{name}`` placeholders referenced by a template string."""
+    if "{{" in (template_str or "") or "{%" in (template_str or ""):
+        return []
+    return unresolved_placeholders(template_str)
+
+
+def collect_template_kwargs(
+    template_str: str,
+    *,
+    values: Mapping[str, Any] | None = None,
+    value_factories: Mapping[str, Callable[[], Any]] | None = None,
+) -> dict[str, Any]:
+    """Collect only the kwargs actually referenced by the template.
+
+    For simple ``{name}`` templates, unused kwargs are dropped and lazy factories are
+    only evaluated when the placeholder is present. For Jinja templates we conservatively
+    materialize every provided value/factory because placeholder introspection would be
+    incomplete.
+    """
+    if "{{" in (template_str or "") or "{%" in (template_str or ""):
+        collected = dict(values or {})
+        for key, factory in (value_factories or {}).items():
+            collected[key] = factory()
+        return collected
+
+    required = set(referenced_placeholders(template_str))
+    collected: dict[str, Any] = {}
+    for key, value in (values or {}).items():
+        if key in required:
+            collected[key] = value
+    for key, factory in (value_factories or {}).items():
+        if key in required:
+            collected[key] = factory()
+    return collected
 
 
 def _raise_if_unresolved(rendered_text: str) -> None:

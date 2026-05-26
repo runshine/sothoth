@@ -48,7 +48,7 @@ from app.pi_vuln_core.utils.result_docs import (
     list_supporting_markdown_files,
 )
 from app.pi_vuln_core.utils.vulnerability_list import apply_result_review_verdict
-from app.pi_vuln_core.utils.template import render_string
+from app.pi_vuln_core.utils.template import collect_template_kwargs, render_string
 from app.pi_vuln_core.utils.logger import get_logger
 
 logger = get_logger("result_review")
@@ -567,17 +567,19 @@ class ResultReviewExecutor:
             # 构建 prompt (R7)
             system_prompt = read_file(advisor_def.system_prompt_file)
             user_prompt_tpl = read_file(advisor_def.user_prompt_template)
-            user_prompt = render_string(
+            prompt_kwargs = collect_template_kwargs(
                 user_prompt_tpl,
-                strict=True,
-                result_filename=result_file,
-                cycle=str(cycle),
-                task_file=task_file,
-                result_file=result_path,
-                supporting_docs_dir=review_context["supporting_docs_dir"],
-                optional_supporting_docs=review_context["optional_supporting_docs"],
-                result_review_context=review_context["context_text"],
+                value_factories={
+                    "result_filename": lambda: result_file,
+                    "cycle": lambda: str(cycle),
+                    "task_file": lambda: task_file,
+                    "result_file": lambda: result_path,
+                    "supporting_docs_dir": lambda: review_context["supporting_docs_dir"],
+                    "optional_supporting_docs": lambda: review_context["optional_supporting_docs"],
+                    "result_review_context": lambda: review_context["context_text"],
+                },
             )
+            user_prompt = render_string(user_prompt_tpl, strict=True, **prompt_kwargs)
 
             # 会话管理（结果评审必须按“结果文件”隔离会话）
             # reset_context=True  → 每次新建 session (独立客观)
