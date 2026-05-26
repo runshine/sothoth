@@ -2567,9 +2567,10 @@ class TaskManager:
             return
         self._last_queue_reconcile_at = now
         stale_dispatching_reclaimed = self._reclaim_stale_dispatching_locked(db)
+        stale_stage_item_reclaimed = self._reclaim_stale_streaming_stage_items_locked(db)
         stale_running_reclaimed = self._reclaim_stale_running_locked(db)
         released_running_requeued = self._requeue_released_running_locked(db)
-        if stale_dispatching_reclaimed or stale_running_reclaimed or released_running_requeued:
+        if stale_dispatching_reclaimed or stale_stage_item_reclaimed or stale_running_reclaimed or released_running_requeued:
             # Persist the reclaimed task state before seeding Redis queues.
             # Otherwise the surrounding loop closes the session and rolls the
             # reclaim back, leaving tasks permanently stuck on dead workers.
@@ -2767,6 +2768,7 @@ class TaskManager:
                                 downstream_payload=payload,
                                 error_message="下游子任务不存在",
                             )
+                            self._reconcile_stage_and_task_state_after_item_update(db, task, item.stage_name)
                             self._mark_stage_item_sync_observation(
                                 item,
                                 sync_status="synced",
@@ -2832,6 +2834,7 @@ class TaskManager:
                                 downstream_payload=payload,
                                 error_message=error_message,
                             )
+                            self._reconcile_stage_and_task_state_after_item_update(db, task, item.stage_name)
                             self._mark_stage_item_sync_observation(
                                 item,
                                 sync_status="synced",
@@ -2996,6 +2999,7 @@ class TaskManager:
                             payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message
                         ),
                     )
+                    self._reconcile_stage_and_task_state_after_item_update(db, task, item.stage_name)
                     self._mark_stage_item_sync_observation(
                         item,
                         sync_status="synced",
@@ -3063,6 +3067,7 @@ class TaskManager:
                         downstream_payload={"status": "downstream_missing", "error": "下游子任务不存在"},
                         error_message="下游子任务不存在",
                     )
+                    self._reconcile_stage_and_task_state_after_item_update(db, task, item.stage_name)
                     self._mark_stage_item_sync_observation(
                         item,
                         sync_status="synced",
@@ -4103,6 +4108,30 @@ class TaskManager:
             elif item.stage_name == "vuln_scan":
                 await self._run_vuln_item(task, stage_run, payload, token, False)
             await self._sync_streaming_task_tail_state(task.id)
+        except StaleTaskExecution as exc:
+            item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == item_id).first()
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == item.task_id).first() if item is not None else None
+            if item is not None and str(item.status or "").strip().lower() == "dispatching":
+                item.status = "pending"
+                item.error_message = str(exc)
+                item.finished_at = None
+                db.commit()
+                if task is not None:
+                    self._record_event(
+                        db,
+                        task,
+                        "streaming_stage_item_requeued_after_stale_execution",
+                        f"流式阶段子任务执行 token 失效，已重新排队: {item.stage_name}:{item.item_key}",
+                        level="warning",
+                        stage_name=item.stage_name,
+                        item=item,
+                        payload={
+                            "error": str(exc),
+                            "requeued_status": item.status,
+                        },
+                    )
+                    db.commit()
+            logger.warning("binary-security streaming stage item stale execution: item_id=%s error=%s", item_id, exc)
         except Exception as exc:
             item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == item_id).first()
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == item.task_id).first() if item is not None else None
@@ -6213,6 +6242,7 @@ class TaskManager:
 
     def _dispatch_once(self, db: Session) -> list[str]:
         stale_reclaimed = self._reclaim_stale_dispatching_locked(db)
+        stale_stage_item_reclaimed = self._reclaim_stale_streaming_stage_items_locked(db)
         stale_running_reclaimed = self._reclaim_stale_running_locked(db)
         released_running_requeued = self._requeue_released_running_locked(db)
         recovered_missing_terminal_events = self._recover_missing_stage_terminal_events_locked(db)
@@ -6220,12 +6250,13 @@ class TaskManager:
         active_count = self._active_dispatch_count(db)
         slots = max(0, service_config.max_concurrent_tasks - active_count)
         claimed_ids = self._claim_pending_tasks(db, slots)
-        if stale_reclaimed or stale_running_reclaimed or released_running_requeued or recovered_missing_terminal_events or claimed_ids:
+        if stale_reclaimed or stale_stage_item_reclaimed or stale_running_reclaimed or released_running_requeued or recovered_missing_terminal_events or claimed_ids:
             db.commit()
         return claimed_ids
 
     def _dispatch_task_by_id(self, db: Session, task_id: str) -> str | None:
         self._reclaim_stale_dispatching_locked(db)
+        self._reclaim_stale_streaming_stage_items_locked(db)
         self._reclaim_stale_running_locked(db)
         self._requeue_released_running_locked(db)
         self._recover_missing_stage_terminal_events_locked(db)
@@ -6852,6 +6883,61 @@ class TaskManager:
                 "调度超时，任务已回收并重新进入队列",
                 level="warning",
             )
+            reclaimed = True
+        if reclaimed:
+            db.flush()
+        return reclaimed
+
+    def _reclaim_stale_streaming_stage_items_locked(self, db: Session) -> bool:
+        service_config = self._load_service_config(db)
+        stale_rows = (
+            db.query(BinarySecurityStageItem)
+            .filter(
+                BinarySecurityStageItem.stage_name.in_(list(STREAMING_TAIL_STAGES)),
+                BinarySecurityStageItem.status == "dispatching",
+            )
+            .all()
+        )
+        if not stale_rows:
+            return False
+        local_workers = {
+            task_id for task_id, worker in self._stage_item_workers.items()
+            if not worker.done()
+        }
+        reclaimed = False
+        timeout_seconds = max(int(service_config.dispatch_timeout_seconds or 0), 60)
+        for item in stale_rows:
+            if item.id in local_workers:
+                continue
+            reference_time = item.updated_at or item.started_at or item.created_at
+            elapsed_seconds = _elapsed_seconds_since(reference_time)
+            if elapsed_seconds is None or elapsed_seconds < timeout_seconds:
+                continue
+            previous_status = str(item.status or "").strip()
+            item.status = "pending"
+            item.error_message = None
+            item.finished_at = None
+            item.result = {
+                **(item.result or {}),
+                "dispatch_reclaimed_at": _now().isoformat(),
+            }
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == item.task_id).first()
+            if task is not None:
+                self._record_event(
+                    db,
+                    task,
+                    "streaming_stage_item_dispatch_reclaimed",
+                    f"流式阶段子任务调度超时，已回收重试: {item.stage_name}:{item.item_key}",
+                    level="warning",
+                    stage_name=item.stage_name,
+                    item=item,
+                    payload={
+                        "previous_status": previous_status,
+                        "requeued_status": item.status,
+                        "downstream_task_id": item.downstream_task_id,
+                        "elapsed_seconds": elapsed_seconds,
+                    },
+                )
             reclaimed = True
         if reclaimed:
             db.flush()
@@ -10379,6 +10465,16 @@ class TaskManager:
             BinarySecurityStageRun.stage_name == stage_name,
         ).first()
 
+    def _reconcile_stage_and_task_state_after_item_update(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> BinarySecurityStageRun | None:
+        stage_run = self._refresh_stage_from_authoritative_items(db, task, stage_name)
+        self._refresh_task_status_after_sync(db, task)
+        return stage_run
+
     def _refresh_stage_run_from_items(self, db: Session, task: BinarySecurityTask, stage_name: str) -> None:
         stage_run = db.query(BinarySecurityStageRun).filter(
             BinarySecurityStageRun.task_id == task.id,
@@ -10785,10 +10881,7 @@ class TaskManager:
             item.item_name = item_name
             item.parent_key = parent_key
             item.item_identity_key = identity_key
-            keep_existing_active = preserve_active_status and (
-                self._is_streaming_active_item_status(item.status)
-                or bool(str(item.downstream_task_id or "").strip())
-            )
+            keep_existing_active = preserve_active_status and self._should_preserve_streaming_item_status(item)
             item.status = item.status if keep_existing_active else running_status
             item.downstream_service = downstream_service
             item.error_message = None
@@ -10825,10 +10918,7 @@ class TaskManager:
                 existing.item_name = item_name
                 existing.parent_key = parent_key
                 existing.item_identity_key = identity_key
-                keep_existing_active = preserve_active_status and (
-                    self._is_streaming_active_item_status(existing.status)
-                    or bool(str(existing.downstream_task_id or "").strip())
-                )
+                keep_existing_active = preserve_active_status and self._should_preserve_streaming_item_status(existing)
                 existing.status = existing.status if keep_existing_active else running_status
                 existing.downstream_service = downstream_service
                 existing.error_message = None
@@ -10852,6 +10942,22 @@ class TaskManager:
                 db.rollback()
                 self._sleep_after_retryable_lock_error(attempt + 1)
         return item
+
+    def _should_preserve_streaming_item_status(self, item: BinarySecurityStageItem) -> bool:
+        status = str(item.status or "").strip().lower()
+        if status == "running":
+            return True
+        if status != "dispatching":
+            return False
+        worker = self._stage_item_workers.get(str(item.id or ""))
+        if worker is not None and not worker.done():
+            return True
+        reference_time = item.updated_at or item.started_at or item.created_at
+        elapsed_seconds = _elapsed_seconds_since(reference_time)
+        if elapsed_seconds is None:
+            return False
+        timeout_seconds = max(int(getattr(self.cfg.service, "dispatch_timeout_seconds", 0) or 0), 60)
+        return elapsed_seconds < timeout_seconds
 
     @staticmethod
     def _entry_contract_fields(entry: dict[str, Any] | None) -> dict[str, Any]:
@@ -11136,7 +11242,7 @@ class TaskManager:
             output_ref={},
             retrying=False,
             running_status="pending",
-            preserve_active_status=True,
+            preserve_active_status=bool(existing is not None and str(existing.status or "").strip().lower() == "running"),
         )
         self._record_event(
             db,
