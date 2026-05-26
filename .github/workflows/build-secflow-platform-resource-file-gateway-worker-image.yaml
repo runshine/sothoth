@@ -1,5 +1,6 @@
 name: build-secflow-platform-resource-file-gateway-worker-image.
 on:
+  workflow_dispatch:
   push:
     branches:
       - 'v2.*'

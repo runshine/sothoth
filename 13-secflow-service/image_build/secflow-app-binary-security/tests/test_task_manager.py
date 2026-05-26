@@ -857,6 +857,164 @@ class TaskManagerTests(unittest.TestCase):
         self.assertTrue(any(run.stage_name == "vuln_scan" for run in db.stage_runs))
         self.assertTrue(any(event.event_type == "streaming_vuln_item_seeded" for event in db.events))
 
+    def test_trigger_vuln_items_from_dataflow_result_resets_stale_dispatching_vuln_item(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si-df",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-df",
+            stage_name="dataflow_analysis",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="success",
+            downstream_service="dataflow_analyse",
+        )
+        existing = BinarySecurityStageItem(
+            id="si-vuln",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-vuln",
+            stage_name="vuln_scan",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="dispatching",
+            downstream_service="dataflow_vuln_scanner",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[existing])
+
+        seeded = self.manager._trigger_vuln_items_from_dataflow_result(
+            db,
+            task,
+            {
+                "entry_key": "entry-1",
+                "module_key": "module-1",
+                "function_name": "handle_req",
+                "data_flow_file": "/tmp/flow.md",
+                "source_dir": "/tmp/source/module-1",
+            },
+            upstream_item=upstream_item,
+        )
+
+        self.assertIs(seeded, existing)
+        self.assertEqual("pending", seeded.status)
+        self.assertEqual("si-df", seeded.input_ref["upstream_item_id"])
+        self.assertTrue(any(event.event_type == "streaming_vuln_item_refreshed" for event in db.events))
+
+    def test_trigger_vuln_items_from_dataflow_result_preserves_running_vuln_item_status(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si-df",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-df",
+            stage_name="dataflow_analysis",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="success",
+            downstream_service="dataflow_analyse",
+        )
+        existing = BinarySecurityStageItem(
+            id="si-vuln",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-vuln",
+            stage_name="vuln_scan",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="running",
+            downstream_service="dataflow_vuln_scanner",
+            downstream_task_id="dvs_existing",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[existing])
+
+        seeded = self.manager._trigger_vuln_items_from_dataflow_result(
+            db,
+            task,
+            {
+                "entry_key": "entry-1",
+                "module_key": "module-1",
+                "function_name": "handle_req",
+                "data_flow_file": "/tmp/flow.md",
+                "source_dir": "/tmp/source/module-1",
+            },
+            upstream_item=upstream_item,
+        )
+
+        self.assertIs(seeded, existing)
+        self.assertEqual("running", seeded.status)
+        self.assertEqual("si-df", seeded.input_ref["upstream_item_id"])
+
+    def test_reclaim_stale_streaming_stage_items_resets_dispatching_vuln_item(self):
+        self.manager.cfg.service.dispatch_timeout_seconds = 60
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        item = BinarySecurityStageItem(
+            id="si-vuln",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-vuln",
+            stage_name="vuln_scan",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="dispatching",
+            downstream_service="dataflow_vuln_scanner",
+            started_at=_now() - timedelta(seconds=180),
+            updated_at=_now() - timedelta(seconds=180),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+        reclaimed = self.manager._reclaim_stale_streaming_stage_items_locked(db)
+
+        self.assertTrue(reclaimed)
+        self.assertEqual("pending", item.status)
+        self.assertTrue(any(event.event_type == "streaming_stage_item_dispatch_reclaimed" for event in db.events))
+
     def test_task_needs_downstream_reconcile_skips_streaming_tail_task(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         task = BinarySecurityTask(
@@ -908,6 +1066,42 @@ class TaskManagerTests(unittest.TestCase):
         claimed = self.manager._claim_streaming_stage_items(db)
 
         self.assertEqual(["si-entry"], claimed)
+        self.assertEqual("dispatching", item.status)
+        self.assertIsNotNone(item.started_at)
+
+    def test_claim_streaming_stage_items_marks_queued_item_dispatching(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming", "stage_parallelism": {"vuln_scan": 1}}),
+        )
+        item = BinarySecurityStageItem(
+            id="si-vuln",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-vuln",
+            stage_name="vuln_scan",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="queued",
+            downstream_service="dataflow_vuln_scanner",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item])
+
+        claimed = self.manager._claim_streaming_stage_items(db)
+
+        self.assertEqual(["si-vuln"], claimed)
         self.assertEqual("dispatching", item.status)
         self.assertIsNotNone(item.started_at)
 
@@ -2709,6 +2903,7 @@ class TaskManagerTests(unittest.TestCase):
                 "archive_dispatch": False,
                 "stage_item_dispatch": False,
                 "downstream_reconcile": True,
+                "readless_reconcile": False,
                 "state_reducer": False,
                 "reducer_metrics_snapshot": False,
             },
@@ -8152,7 +8347,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("下游子任务不存在", item1.error_message)
         self.assertEqual("downstream_missing", item2.status)
         self.assertEqual("下游子任务不存在", item2.error_message)
-        self.assertEqual(2, resp.synced_downstream_count)
+        self.assertEqual(1, resp.synced_downstream_count)
 
     def test_sync_downstream_status_processes_items_in_batches(self):
         task = BinarySecurityTask(
@@ -8223,7 +8418,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._enqueue_task = original_enqueue
 
         self.assertEqual(["si0", "si1"], fetched_ids)
-        self.assertEqual(2, resp.synced_downstream_count)
+        self.assertEqual(1, resp.synced_downstream_count)
 
     def test_sync_downstream_status_http_500_keeps_item_running(self):
         task = BinarySecurityTask(
@@ -8432,7 +8627,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._enqueue_task = original_enqueue
 
         self.assertEqual(["si_failed", "si_q0"], fetched_ids)
-        self.assertEqual(2, resp.synced_downstream_count)
+        self.assertEqual(1, resp.synced_downstream_count)
 
     def test_sync_downstream_status_unknown_status_is_skipped(self):
         task = BinarySecurityTask(
@@ -8496,7 +8691,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(skipped_events[-1].payload.get("mapped_status"))
         self.assertFalse(bool(skipped_events[-1].payload.get("state_applied")))
 
-    def test_sync_downstream_status_running_revives_failed_active_stage_task(self):
+    def test_sync_downstream_status_observe_only_does_not_apply_item_status(self):
         task = BinarySecurityTask(
             id="s1",
             project_id="p1",
@@ -8559,6 +8754,78 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._write_task_metadata_async = original_write
             self.manager._enqueue_task = original_enqueue
 
+        self.assertEqual("failed", item.status)
+        self.assertEqual("failed", run.status)
+        self.assertEqual("failed", task.status)
+        self.assertEqual(1, resp.skipped_downstream_count)
+        self.assertEqual("running", item.result.get("sync_observation", {}).get("status_raw"))
+        self.assertEqual("running", item.result.get("sync_observation", {}).get("mapped_status"))
+        self.assertFalse(bool(item.result.get("sync_observation", {}).get("state_applied")))
+
+    def test_sync_downstream_status_running_revives_failed_active_stage_task(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="failed",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="system_analysis",
+            item_key="fw1",
+            parent_key="fw1",
+            status="failed",
+            downstream_service="system_analyse",
+            downstream_task_id="sat_1",
+            error_message="old failure",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item])
+
+        original_fetch = self.manager._fetch_downstream_task_payload
+        original_write = self.manager._write_task_metadata_async
+        original_enqueue = self.manager._enqueue_task
+
+        async def _fetch(_task, _item, _token):
+            return {"status": "running"}
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._fetch_downstream_task_payload = _fetch
+        self.manager._write_task_metadata_async = _noop_write
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        try:
+            resp = asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id="p1",
+                    task_id="s1",
+                    stage_name="system_analysis",
+                    apply_state=True,
+                )
+            )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+            self.manager._write_task_metadata_async = original_write
+            self.manager._enqueue_task = original_enqueue
+
         self.assertEqual("running", item.status)
         self.assertEqual("running", run.status)
         self.assertEqual("running", task.status)
@@ -8602,11 +8869,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         original_fetch = self.manager._fetch_downstream_task_payload
         original_write = self.manager._write_task_metadata_async
         original_enqueue = self.manager._enqueue_task
-        original_refresh_stage = self.manager._refresh_stage_run_from_items
-        original_refresh_task = self.manager._refresh_task_status_after_sync
+        original_reconcile = self.manager._reconcile_stage_and_task_state_after_item_update
 
-        refreshed_stages = []
-        refreshed_tasks = []
+        reconciled = []
 
         async def _fetch(_task, _item, _token):
             return {"status": "running"}
@@ -8614,17 +8879,13 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         async def _noop_write(*_args, **_kwargs):
             return None
 
-        def _capture_stage(_db, _task, current_stage):
-            refreshed_stages.append(current_stage)
-
-        def _capture_task(_db, current_task):
-            refreshed_tasks.append(current_task.id)
+        def _capture_reconcile(_db, current_task, current_stage):
+            reconciled.append((current_task.id, current_stage))
 
         self.manager._fetch_downstream_task_payload = _fetch
         self.manager._write_task_metadata_async = _noop_write
         self.manager._enqueue_task = lambda *_args, **_kwargs: None
-        self.manager._refresh_stage_run_from_items = _capture_stage
-        self.manager._refresh_task_status_after_sync = _capture_task
+        self.manager._reconcile_stage_and_task_state_after_item_update = _capture_reconcile
         try:
             asyncio.run(
                 self.manager.sync_downstream_status(
@@ -8632,17 +8893,330 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                     project_id="p1",
                     task_id="s1",
                     stage_name="entry_analysis",
+                    apply_state=True,
                 )
             )
         finally:
             self.manager._fetch_downstream_task_payload = original_fetch
             self.manager._write_task_metadata_async = original_write
             self.manager._enqueue_task = original_enqueue
-            self.manager._refresh_stage_run_from_items = original_refresh_stage
-            self.manager._refresh_task_status_after_sync = original_refresh_task
+            self.manager._reconcile_stage_and_task_state_after_item_update = original_reconcile
 
-        self.assertEqual(["entry_analysis"], refreshed_stages)
-        self.assertEqual(["s1"], refreshed_tasks)
+        self.assertEqual([("s1", "entry_analysis")], reconciled)
+
+    def test_sync_downstream_status_running_reconciles_dataflow_stage_summary(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        task.stage_summary = {
+            "dataflow_analysis": {
+                "status": "running",
+                "counts": {
+                    "total_items": 2,
+                    "success_items": 1,
+                    "failed_items": 0,
+                    "downstream_missing_items": 0,
+                    "skipped_items": 0,
+                    "running_items": 1,
+                    "cancelled_items": 0,
+                },
+                "finished_at": None,
+                "last_error": None,
+            }
+        }
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            sequence_no=3,
+            status="running",
+        )
+        item1 = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="dataflow_analysis",
+            item_key="e1",
+            parent_key="m1",
+            status="success",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa_1",
+        )
+        item2 = BinarySecurityStageItem(
+            id="si2",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="dataflow_analysis",
+            item_key="e2",
+            parent_key="m1",
+            status="queued",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa_2",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item1, item2])
+
+        original_fetch = self.manager._fetch_downstream_task_payload
+        original_write = self.manager._write_task_metadata_async
+        original_enqueue = self.manager._enqueue_task
+
+        async def _fetch(_task, current_item, _token):
+            if current_item.id == "si1":
+                return {"status": "running"}
+            return {"status": "running"}
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._fetch_downstream_task_payload = _fetch
+        self.manager._write_task_metadata_async = _noop_write
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        try:
+            resp = asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id="p1",
+                    task_id="s1",
+                    stage_name="dataflow_analysis",
+                    apply_state=True,
+                )
+            )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+            self.manager._write_task_metadata_async = original_write
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual(2, resp.synced_downstream_count)
+        self.assertEqual("running", item1.status)
+        self.assertEqual("running", item2.status)
+        self.assertEqual("running", run.status)
+        self.assertEqual(0, run.counts.get("success_items"))
+        self.assertEqual(2, run.counts.get("running_items"))
+        self.assertEqual("running", task.stage_summary["dataflow_analysis"]["status"])
+        self.assertEqual(0, task.stage_summary["dataflow_analysis"]["counts"]["success_items"])
+        self.assertEqual(2, task.stage_summary["dataflow_analysis"]["counts"]["running_items"])
+
+    def test_apply_downstream_status_event_reuses_unified_reconcile(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="dataflow_analysis",
+            item_key="entry-1",
+            parent_key="mod-1",
+            status="queued",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa_1",
+        )
+        event = BinarySecurityStateEvent(
+            id="sev1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            item_id="si1",
+            event_type="downstream_status_observed",
+            idempotency_key="sev1",
+            status="processing",
+            leased_by=self.manager.instance_id,
+            available_at=_now(),
+            created_at=_now(),
+        )
+        event.payload = {
+            "mapped_status": "running",
+            "before_status": "queued",
+            "downstream_status": "running",
+            "downstream_payload": {"task_id": "dfa_1", "status": "running"},
+        }
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], state_events=[event])
+
+        original_reconcile = self.manager._reconcile_stage_and_task_state_after_item_update
+        original_write = self.manager._write_task_metadata_async
+        reconciled = []
+
+        def _capture_reconcile(_db, current_task, current_stage):
+            reconciled.append((current_task.id, current_stage))
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._reconcile_stage_and_task_state_after_item_update = _capture_reconcile
+        self.manager._write_task_metadata_async = _noop_write
+        try:
+            asyncio.run(self.manager._apply_downstream_status_event_locked(db, event))
+        finally:
+            self.manager._reconcile_stage_and_task_state_after_item_update = original_reconcile
+            self.manager._write_task_metadata_async = original_write
+
+        self.assertEqual("running", item.status)
+        self.assertEqual([("t1", "dataflow_analysis")], reconciled)
+
+    def test_apply_archive_job_status_reuses_unified_reconcile(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="dataflow_analysis",
+            item_key="entry-1",
+            parent_key="mod-1",
+            status="queued",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa_1",
+        )
+        job = BinarySecurityArchiveJob(
+            id="job1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            item_id="si1",
+            item_key="entry-1",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa_1",
+            archive_status="archived",
+        )
+        job.payload = {
+            "mapped_status": "success",
+            "downstream_payload": {"task_id": "dfa_1", "status": "success"},
+        }
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[job])
+
+        original_reconcile = self.manager._reconcile_stage_and_task_state_after_item_update
+        original_refresh_terminal = self.manager._refresh_terminal_item_result_from_downstream
+        original_write = self.manager._write_task_metadata_async
+        reconciled = []
+
+        def _capture_reconcile(_db, current_task, current_stage):
+            reconciled.append((current_task.id, current_stage))
+
+        async def _noop_refresh_terminal(*_args, **_kwargs):
+            return None
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._reconcile_stage_and_task_state_after_item_update = _capture_reconcile
+        self.manager._refresh_terminal_item_result_from_downstream = _noop_refresh_terminal
+        self.manager._write_task_metadata_async = _noop_write
+        try:
+            asyncio.run(self.manager._apply_archive_job_status_locked(db, "job1", "/tmp/archive"))
+        finally:
+            self.manager._reconcile_stage_and_task_state_after_item_update = original_reconcile
+            self.manager._refresh_terminal_item_result_from_downstream = original_refresh_terminal
+            self.manager._write_task_metadata_async = original_write
+
+        self.assertEqual("success", item.status)
+        self.assertEqual("success", job.archive_status)
+        self.assertEqual([("t1", "dataflow_analysis")], reconciled)
+
+    def test_task_detail_refreshes_active_stage_from_items_before_building_summary(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        task.stage_summary = {
+            "dataflow_analysis": {
+                "status": "running",
+                "counts": {
+                    "total_items": 2,
+                    "success_items": 1,
+                    "failed_items": 0,
+                    "downstream_missing_items": 0,
+                    "skipped_items": 0,
+                    "running_items": 1,
+                    "cancelled_items": 0,
+                },
+                "finished_at": None,
+                "last_error": None,
+            }
+        }
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            sequence_no=3,
+            status="running",
+        )
+        item1 = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="dataflow_analysis",
+            item_key="entry-1",
+            parent_key="mod-1",
+            status="running",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa_1",
+        )
+        item2 = BinarySecurityStageItem(
+            id="si2",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="dataflow_analysis",
+            item_key="entry-2",
+            parent_key="mod-1",
+            status="running",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa_2",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item1, item2])
+
+        detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
+        by_stage = {summary.stage_name: summary for summary in detail.stage_summaries}
+
+        self.assertEqual("running", by_stage["dataflow_analysis"].status)
+        self.assertEqual(0, by_stage["dataflow_analysis"].success_items)
+        self.assertEqual(2, by_stage["dataflow_analysis"].running_items)
 
     def test_business_stage_status_prefers_stage_run_success_over_stale_item_status(self):
         task = BinarySecurityTask(
@@ -9925,12 +10499,26 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         item.result = {
             "sync_status": "transport_error",
             "downstream_status_synced_at": "2026-05-24T23:05:39",
+            "sync_observation": {
+                "status_raw": "failed",
+                "mapped_status": "failed",
+                "state_applied": False,
+                "error_message": "gateway timeout",
+                "error_type": "http_error",
+                "http_status": 504,
+            },
         }
 
         response = self.manager._stage_item_response(item)
 
         self.assertEqual("transport_error", response.sync_status)
         self.assertIsNotNone(response.last_synced_at)
+        self.assertEqual("failed", response.downstream_raw_status)
+        self.assertEqual("failed", response.downstream_mapped_status)
+        self.assertFalse(response.downstream_state_applied)
+        self.assertEqual("gateway timeout", response.sync_observation_error_message)
+        self.assertEqual("http_error", response.sync_observation_error_type)
+        self.assertEqual(504, response.sync_observation_http_status)
 
     def test_stage_item_response_exposes_retry_and_rerun_counts(self):
         item = BinarySecurityStageItem(
@@ -11342,6 +11930,59 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("cancelled", status)
         self.assertEqual("cancelled", payload["status"])
+
+    def test_run_stage_item_by_id_requeues_dispatching_item_after_transport_error(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            current_stage="vuln_scan",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw.bin",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="vuln_scan",
+            sequence_no=5,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="vuln_scan",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="dispatching",
+            downstream_service="dataflow_vuln_scanner",
+            input_ref={"entry_key": "entry-1", "module_key": "module-1"},
+        )
+        fake_session = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], events=[])
+
+        async def _raise_transport(*args, **kwargs):
+            del args, kwargs
+            raise task_manager_module.UpstreamError("temporary downstream error")
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(self.manager, "_ensure_stage_run", return_value=stage_run),
+            patch.object(self.manager, "_run_vuln_item", side_effect=_raise_transport),
+        ):
+            asyncio.run(self.manager._run_stage_item_by_id("si1"))
+
+        self.assertEqual("queued", item.status)
+        self.assertIn("temporary downstream error", item.error_message or "")
+        self.assertTrue(any(event.event_type == "streaming_stage_item_requeued_after_worker_error" for event in fake_session.events))
 
     def test_run_task_ignores_stale_worker_failure_after_retry(self):
         task = BinarySecurityTask(
@@ -13106,6 +13747,10 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             "module_key": "module-1",
             "data_flow_file": "/tmp/flow.md",
             "source_dir": "/tmp/src",
+            "module_name": "module-1",
+            "source_root_path": "/tmp/src",
+            "module_input_path": "/tmp/src/module-1",
+            "source_file": "main.c",
         }
         fake_session = _ModelAwareDb()
         client = _AsyncDataflowVulnScannerClientStub(fail_on_create=True)

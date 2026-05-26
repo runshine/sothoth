@@ -1,3 +1,4 @@
+# R6-fixes build-1779796710
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,7 +17,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-app-entry-analyse
-        image: 172.31.30.52:5000/secflow-app-entry-analyse:latest
+        image: ghcr.io/runshine/secflow-app-entry-analyse:latest
         imagePullPolicy: Always
         env:
           - name: TZ

@@ -1,5 +1,6 @@
 name: build-secflow-platform-vuln-image
 on:
+  workflow_dispatch:
   push:
     branches:
       - 'v2.*'

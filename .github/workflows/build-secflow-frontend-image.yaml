@@ -1,5 +1,6 @@
 name: build-secflow-frontend-image
 on:
+  workflow_dispatch:
   push:
     branches:
       - 'v2.*'

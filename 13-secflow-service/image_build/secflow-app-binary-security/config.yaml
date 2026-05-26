@@ -38,6 +38,7 @@ scheduler:
   poll_interval_seconds: 5
   task_concurrency: 2
   stage_poll_interval_seconds: 5
+  downstream_reconcile_interval_seconds: 30
   heartbeat_update_interval_seconds: 15
   downstream_reconcile_grace_seconds: 30
   shutdown_grace_seconds: 10
@@ -119,3 +120,7 @@ app:
 
 logging:
   level: "INFO"
+
+# Build trigger note:
+# Keep a no-op tracked change available when we need to force the
+# binary-security image workflow after orchestration-only fixes.
