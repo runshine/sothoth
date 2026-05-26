@@ -252,6 +252,12 @@ class BinarySecurityStageItemResponse(BaseModel):
     abnormal_reason: Optional[BinarySecurityAbnormalReason] = None
     sync_status: Optional[str] = None
     last_synced_at: Optional[datetime] = None
+    downstream_raw_status: Optional[str] = None
+    downstream_mapped_status: Optional[str] = None
+    downstream_state_applied: Optional[bool] = None
+    sync_observation_error_message: Optional[str] = None
+    sync_observation_error_type: Optional[str] = None
+    sync_observation_http_status: Optional[int] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
 

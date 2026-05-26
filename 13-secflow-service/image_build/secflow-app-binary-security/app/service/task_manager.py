@@ -7,6 +7,7 @@ import errno
 import hashlib
 import httpx
 import json
+import inspect
 import logging
 import os
 import re
@@ -2066,6 +2067,7 @@ class TaskManager:
             token=self._service_token(),
             record_request_event=False,
             record_noop_events=False,
+            apply_state=True,
         )
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
@@ -2606,6 +2608,7 @@ class TaskManager:
         token: str | None = None,
         record_request_event: bool = True,
         record_noop_events: bool = True,
+        apply_state: bool = False,
     ) -> BinarySecurityActionResponse:
         task = self._task_or_404(db, project_id, task_id)
         query = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id)
@@ -2742,7 +2745,8 @@ class TaskManager:
                 terminal_status = mapped_status in {"success", "partial_success", "failed", "cancelled", "downstream_missing"}
                 if terminal_status:
                     if mapped_status == "downstream_missing":
-                        if mapped_status != before_status or force:
+                        should_apply = apply_state and (mapped_status != before_status or force)
+                        if should_apply:
                             self._enqueue_downstream_terminal_event(
                                 db,
                                 task=task,
@@ -2773,13 +2777,20 @@ class TaskManager:
                             touched_stages.add(item.stage_name)
                             synced_count += 1
                         else:
+                            self._mark_stage_item_sync_observation(
+                                item,
+                                sync_status="skipped",
+                                status_raw=downstream_status,
+                                mapped_status=mapped_status,
+                                state_applied=False,
+                            )
                             skipped_count += 1
-                        if force or mapped_status != before_status or record_noop_events:
+                        if force or mapped_status != before_status or record_noop_events or not apply_state:
                             self._record_event(
                                 db,
                                 task,
-                                "downstream_status_synced" if (force or mapped_status != before_status) else "downstream_status_sync_skipped",
-                                "下游子任务不存在，已更新当前阶段子任务状态" if (force or mapped_status != before_status) else "下游子任务不存在，当前状态未变化",
+                                "downstream_status_synced" if should_apply else "downstream_status_sync_skipped",
+                                "下游子任务不存在，已更新当前阶段子任务状态" if should_apply else "下游子任务不存在，本次仅观测未写回状态",
                                 stage_name=item.stage_name,
                                 item=item,
                                 level="warning",
@@ -2790,7 +2801,7 @@ class TaskManager:
                                     "error_type": None,
                                     "status_raw": downstream_status,
                                     "mapped_status": mapped_status,
-                                    "state_applied": bool(force or mapped_status != before_status),
+                                    "state_applied": bool(should_apply),
                                     "before_status": before_status,
                                     "downstream_status": downstream_status,
                                     "after_status": mapped_status,
@@ -2798,8 +2809,9 @@ class TaskManager:
                             )
                         continue
                     if mapped_status not in ARCHIVE_SUCCESS_MAPPED_STATUSES:
-                        if mapped_status != before_status or force:
-                            error_message = payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message
+                        error_message = payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message
+                        should_apply = apply_state and (mapped_status != before_status or force)
+                        if should_apply:
                             self._enqueue_downstream_terminal_event(
                                 db,
                                 task=task,
@@ -2831,13 +2843,21 @@ class TaskManager:
                             touched_stages.add(item.stage_name)
                             synced_count += 1
                         else:
+                            self._mark_stage_item_sync_observation(
+                                item,
+                                sync_status="skipped",
+                                error_message=error_message,
+                                status_raw=downstream_status,
+                                mapped_status=mapped_status,
+                                state_applied=False,
+                            )
                             skipped_count += 1
-                        if force or mapped_status != before_status or record_noop_events:
+                        if force or mapped_status != before_status or record_noop_events or not apply_state:
                             self._record_event(
                                 db,
                                 task,
-                                "downstream_status_synced" if (force or mapped_status != before_status) else "downstream_status_sync_skipped",
-                                "下游终态已同步，当前子任务不再进入归档" if (force or mapped_status != before_status) else "下游终态未变化，当前子任务不进入归档",
+                                "downstream_status_synced" if should_apply else "downstream_status_sync_skipped",
+                                "下游终态已同步，当前子任务不再进入归档" if should_apply else "下游终态已观测，本次仅观测未写回状态",
                                 stage_name=item.stage_name,
                                 item=item,
                                 level="warning" if mapped_status in {"failed", "cancelled"} else "info",
@@ -2848,7 +2868,7 @@ class TaskManager:
                                     "error_type": None,
                                     "status_raw": downstream_status,
                                     "mapped_status": mapped_status,
-                                    "state_applied": bool(force or mapped_status != before_status),
+                                    "state_applied": bool(should_apply),
                                     "before_status": before_status,
                                     "downstream_status": downstream_status,
                                     "after_status": mapped_status,
@@ -2950,7 +2970,8 @@ class TaskManager:
                     touched_stages.add(item.stage_name)
                     skipped_count += 1
                     continue
-                if mapped_status != before_status:
+                should_apply = apply_state and mapped_status != before_status
+                if should_apply:
                     self._enqueue_downstream_status_event(
                         db,
                         task=task,
@@ -2996,12 +3017,12 @@ class TaskManager:
                         state_applied=False,
                     )
                     skipped_count += 1
-                if force or mapped_status != before_status or record_noop_events:
+                if force or mapped_status != before_status or record_noop_events or not apply_state:
                     self._record_event(
                         db,
                         task,
-                        "downstream_status_synced" if (force or mapped_status != before_status) else "downstream_status_sync_skipped",
-                        "下游子任务状态已同步" if (force or mapped_status != before_status) else "下游子任务状态一致，无需同步",
+                        "downstream_status_synced" if should_apply else "downstream_status_sync_skipped",
+                        "下游子任务状态已同步" if should_apply else "下游子任务状态已观测，本次未写回",
                         stage_name=item.stage_name,
                         item=item,
                         payload={
@@ -3011,7 +3032,7 @@ class TaskManager:
                             "error_type": None,
                             "status_raw": downstream_status,
                             "mapped_status": mapped_status,
-                            "state_applied": bool(force or mapped_status != before_status),
+                            "state_applied": bool(should_apply),
                             "before_status": before_status,
                             "downstream_status": downstream_status,
                             "after_status": mapped_status,
@@ -3021,43 +3042,56 @@ class TaskManager:
                 # The exception is raised by downstream fetch only. Rolling the
                 # whole session back here would also discard already-synced
                 # sibling items from earlier loop iterations.
-                self._enqueue_downstream_terminal_event(
-                    db,
-                    task=task,
-                    item=item,
-                    mapped_status="downstream_missing",
-                    before_status=before_status,
-                    downstream_status="downstream_missing",
-                    payload={"status": "downstream_missing", "error": "下游子任务不存在"},
-                    error_message="下游子任务不存在",
-                    http_status=404,
-                    error_type="not_found",
-                    status_raw="downstream_missing",
-                    force=True,
-                )
-                self._apply_downstream_status_inline(
-                    item,
-                    mapped_status="downstream_missing",
-                    downstream_payload={"status": "downstream_missing", "error": "下游子任务不存在"},
-                    error_message="下游子任务不存在",
-                )
-                self._mark_stage_item_sync_observation(
-                    item,
-                    sync_status="synced",
-                    error_message="下游子任务不存在",
-                    http_status=404,
-                    error_type="not_found",
-                    status_raw="downstream_missing",
-                    mapped_status="downstream_missing",
-                    state_applied=True,
-                )
-                touched_stages.add(item.stage_name)
-                synced_count += 1
+                if apply_state:
+                    self._enqueue_downstream_terminal_event(
+                        db,
+                        task=task,
+                        item=item,
+                        mapped_status="downstream_missing",
+                        before_status=before_status,
+                        downstream_status="downstream_missing",
+                        payload={"status": "downstream_missing", "error": "下游子任务不存在"},
+                        error_message="下游子任务不存在",
+                        http_status=404,
+                        error_type="not_found",
+                        status_raw="downstream_missing",
+                        force=True,
+                    )
+                    self._apply_downstream_status_inline(
+                        item,
+                        mapped_status="downstream_missing",
+                        downstream_payload={"status": "downstream_missing", "error": "下游子任务不存在"},
+                        error_message="下游子任务不存在",
+                    )
+                    self._mark_stage_item_sync_observation(
+                        item,
+                        sync_status="synced",
+                        error_message="下游子任务不存在",
+                        http_status=404,
+                        error_type="not_found",
+                        status_raw="downstream_missing",
+                        mapped_status="downstream_missing",
+                        state_applied=True,
+                    )
+                    touched_stages.add(item.stage_name)
+                    synced_count += 1
+                else:
+                    self._mark_stage_item_sync_observation(
+                        item,
+                        sync_status="skipped",
+                        error_message="下游子任务不存在",
+                        http_status=404,
+                        error_type="not_found",
+                        status_raw="downstream_missing",
+                        mapped_status="downstream_missing",
+                        state_applied=False,
+                    )
+                    skipped_count += 1
                 self._record_event(
                     db,
                     task,
-                    "downstream_status_synced",
-                    "下游子任务不存在，已投递 reducer 串行更新事件",
+                    "downstream_status_synced" if apply_state else "downstream_status_sync_skipped",
+                    "下游子任务不存在，已投递 reducer 串行更新事件" if apply_state else "下游子任务不存在，本次仅观测未写回状态",
                     level="warning",
                     stage_name=item_stage_name,
                     item=item,
@@ -3068,7 +3102,7 @@ class TaskManager:
                         "error_type": "not_found",
                         "status_raw": "downstream_missing",
                         "mapped_status": "downstream_missing",
-                        "state_applied": True,
+                        "state_applied": bool(apply_state),
                         "before_status": before_status,
                         "downstream_status": "downstream_missing",
                         "after_status": "downstream_missing",
@@ -4000,7 +4034,7 @@ class TaskManager:
         claimed_ids: list[str] = []
         pending_items = (
             db.query(BinarySecurityStageItem)
-            .filter(BinarySecurityStageItem.status == "pending")
+            .filter(BinarySecurityStageItem.status.in_(["pending", "queued"]))
             .order_by(BinarySecurityStageItem.created_at.asc(), BinarySecurityStageItem.id.asc())
             .all()
         )
@@ -4030,7 +4064,7 @@ class TaskManager:
                 db.query(BinarySecurityStageItem)
                 .filter(
                     BinarySecurityStageItem.id == item.id,
-                    BinarySecurityStageItem.status == "pending",
+                    BinarySecurityStageItem.status.in_(["pending", "queued"]),
                 )
                 .update(
                     {
@@ -4069,6 +4103,32 @@ class TaskManager:
             elif item.stage_name == "vuln_scan":
                 await self._run_vuln_item(task, stage_run, payload, token, False)
             await self._sync_streaming_task_tail_state(task.id)
+        except Exception as exc:
+            item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == item_id).first()
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == item.task_id).first() if item is not None else None
+            if item is not None and str(item.status or "").strip().lower() == "dispatching":
+                retryable_transport = self._is_retryable_downstream_transport_error(exc)
+                item.status = "queued" if retryable_transport else "pending"
+                item.error_message = str(exc)
+                item.finished_at = None
+                db.commit()
+                if task is not None:
+                    self._record_event(
+                        db,
+                        task,
+                        "streaming_stage_item_requeued_after_worker_error",
+                        f"流式阶段子任务执行异常，已重新排队: {item.stage_name}:{item.item_key}",
+                        level="warning",
+                        stage_name=item.stage_name,
+                        item=item,
+                        payload={
+                            "error": str(exc),
+                            "retryable_transport": retryable_transport,
+                            "requeued_status": item.status,
+                        },
+                    )
+                    db.commit()
+            logger.exception("binary-security streaming stage item worker failed: item_id=%s", item_id)
         finally:
             db.close()
             async with self._stage_item_worker_lock:
@@ -5695,7 +5755,15 @@ class TaskManager:
         self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
 
     async def _downstream_reconcile_loop(self) -> None:
-        interval_seconds = max(5, int(self.cfg.scheduler.stage_poll_interval_seconds or self.cfg.scheduler.poll_interval_seconds or 5))
+        interval_seconds = max(
+            5,
+            int(
+                getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30)
+                or self.cfg.scheduler.stage_poll_interval_seconds
+                or self.cfg.scheduler.poll_interval_seconds
+                or 30
+            ),
+        )
         while self._running:
             db = get_session_factory()()
             try:
@@ -5748,6 +5816,7 @@ class TaskManager:
                 token=token,
                 record_request_event=False,
                 record_noop_events=False,
+                apply_state=True,
             )
         finally:
             db.close()
@@ -5810,9 +5879,36 @@ class TaskManager:
                 continue
             if not self._task_needs_downstream_reconcile(task):
                 continue
+            if not self._task_sync_cooldown_elapsed(db, task):
+                continue
             seen.add(task.id)
             refs.append({"project_id": str(task.project_id), "task_id": str(task.id)})
         return refs
+
+    def _task_sync_cooldown_elapsed(self, db: Session, task: BinarySecurityTask) -> bool:
+        interval_seconds = max(
+            5,
+            int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30) or 30),
+        )
+        active_stage_name = self._active_reconcile_stage_name(task)
+        if not active_stage_name:
+            return False
+        items = self._stage_items(db, task.id, active_stage_name)
+        latest_synced_at: datetime | None = None
+        for item in items:
+            result = dict(item.result or {})
+            raw = result.get("downstream_status_synced_at")
+            if not isinstance(raw, str) or not raw.strip():
+                return True
+            try:
+                parsed = datetime.fromisoformat(raw)
+            except ValueError:
+                return True
+            if latest_synced_at is None or parsed > latest_synced_at:
+                latest_synced_at = parsed
+        if latest_synced_at is None:
+            return True
+        return (_now() - latest_synced_at).total_seconds() >= interval_seconds
 
     def _claim_archive_job(self) -> str | None:
         session_factory = get_session_factory()
@@ -8050,7 +8146,7 @@ class TaskManager:
         return task
 
     async def _readless_reconcile_loop(self) -> None:
-        interval_seconds = max(2, int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 5) or 5))
+        interval_seconds = max(5, int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30) or 30))
         await run_readless_sync_loop(
             should_stop=lambda: not self._running,
             interval_seconds=interval_seconds,
@@ -8475,10 +8571,15 @@ class TaskManager:
         if stage_name == "system_analysis":
             if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
                 return "waiting_confirmation"
-            if stage_run and stage_run.status == "waiting_confirmation":
-                return "waiting_confirmation"
+        if stage_run and stage_run.status == "waiting_confirmation":
+            return "waiting_confirmation"
         statuses = [self._normalize_downstream_status(item.status) or item.status for item in items]
         aggregated_item_status = self._aggregate_item_statuses(statuses) if statuses else None
+        if self._is_streaming_tail_stage(task, stage_name) and any(
+            self._is_streaming_active_item_status(item.status)
+            for item in items
+        ):
+            return "running"
         if stage_run:
             normalized_run_status = self._normalize_downstream_status(stage_run.status) or str(stage_run.status or "")
             if normalized_run_status in {"pending", "queued", "running", "dispatching"} and aggregated_item_status not in {None, "pending"}:
@@ -8656,6 +8757,36 @@ class TaskManager:
             ],
             recommended_action="检查归档目录、文件系统权限和下游产物是否完整。",
         )
+
+    def _string_or_none(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _bool_or_none(self, value: Any) -> bool | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "y", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "n", "off"}:
+                return False
+            return None
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return None
+
+    def _int_or_none(self, value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def _stage_abnormal_reason(
         self,
@@ -9285,6 +9416,13 @@ class TaskManager:
             blocking_reason = "当前任务等待模块确认，请先确认模块后再执行其他操作"
             overall = "blocked"
             summary = blocking_reason
+        elif streaming_auto_progressing:
+            blocking_code = "task_running"
+            blocking_reason = (
+                "当前任务处于 streaming tail 自动推进中，当前仅建议等待系统继续收敛或执行取消/同步状态"
+            )
+            overall = "blocked"
+            summary = blocking_reason
         elif running and not can_retry_stage_failed_items:
             blocking_code = "task_running"
             blocking_reason = (
@@ -9327,6 +9465,7 @@ class TaskManager:
 
     def _stage_item_response(self, item: BinarySecurityStageItem) -> BinarySecurityStageItemResponse:
         result = dict(item.result or {})
+        sync_observation = dict(result.get("sync_observation") or {})
         last_synced_at = result.get("downstream_status_synced_at")
         sync_status = result.get("sync_status")
         if not sync_status:
@@ -9359,6 +9498,12 @@ class TaskManager:
             abnormal_reason=self._stage_item_abnormal_reason(item),
             sync_status=str(sync_status) if sync_status is not None else None,
             last_synced_at=parsed_last_synced_at,
+            downstream_raw_status=self._string_or_none(sync_observation.get("status_raw")),
+            downstream_mapped_status=self._string_or_none(sync_observation.get("mapped_status")),
+            downstream_state_applied=self._bool_or_none(sync_observation.get("state_applied")),
+            sync_observation_error_message=self._string_or_none(sync_observation.get("error_message")),
+            sync_observation_error_type=self._string_or_none(sync_observation.get("error_type")),
+            sync_observation_http_status=self._int_or_none(sync_observation.get("http_status")),
             started_at=item.started_at,
             finished_at=item.finished_at,
         )
@@ -10604,6 +10749,7 @@ class TaskManager:
         retrying: bool,
         auto_retrying: bool = False,
         running_status: str = "running",
+        preserve_active_status: bool = False,
     ) -> BinarySecurityStageItem:
         identity_key = build_stage_item_identity_key(item_key, parent_key)
         item = self._find_stage_item(
@@ -10628,6 +10774,8 @@ class TaskManager:
                 downstream_service=downstream_service,
                 started_at=self._stage_item_started_at(running_status),
             )
+            item.retry_count = int(item.retry_count or 0)
+            item.rerun_count = int(item.rerun_count or 0)
             if retrying:
                 item.rerun_count = 1
             if auto_retrying:
@@ -10637,11 +10785,16 @@ class TaskManager:
             item.item_name = item_name
             item.parent_key = parent_key
             item.item_identity_key = identity_key
-            item.status = running_status
+            keep_existing_active = preserve_active_status and (
+                self._is_streaming_active_item_status(item.status)
+                or bool(str(item.downstream_task_id or "").strip())
+            )
+            item.status = item.status if keep_existing_active else running_status
             item.downstream_service = downstream_service
             item.error_message = None
             item.finished_at = None
-            item.started_at = self._stage_item_started_at(running_status)
+            if not keep_existing_active:
+                item.started_at = self._stage_item_started_at(running_status)
             item.payload = {}
             item.result = {}
             if retrying:
@@ -10672,11 +10825,16 @@ class TaskManager:
                 existing.item_name = item_name
                 existing.parent_key = parent_key
                 existing.item_identity_key = identity_key
-                existing.status = running_status
+                keep_existing_active = preserve_active_status and (
+                    self._is_streaming_active_item_status(existing.status)
+                    or bool(str(existing.downstream_task_id or "").strip())
+                )
+                existing.status = existing.status if keep_existing_active else running_status
                 existing.downstream_service = downstream_service
                 existing.error_message = None
                 existing.finished_at = None
-                existing.started_at = self._stage_item_started_at(running_status)
+                if not keep_existing_active:
+                    existing.started_at = self._stage_item_started_at(running_status)
                 existing.payload = {}
                 existing.result = {}
                 existing.input_ref = input_ref
@@ -10978,6 +11136,7 @@ class TaskManager:
             output_ref={},
             retrying=False,
             running_status="pending",
+            preserve_active_status=True,
         )
         self._record_event(
             db,
@@ -11482,6 +11641,8 @@ class TaskManager:
         self,
         task: BinarySecurityTask,
         item: BinarySecurityStageItem,
+        *,
+        allow_rebind: bool = True,
     ) -> dict[str, Any] | None:
         item_id = str(item.id or "").strip()
         if not item_id:
@@ -11507,7 +11668,7 @@ class TaskManager:
         selected = candidates[0]
         selected_task_id = str(selected.get("task_id") or selected.get("id") or "").strip()
         current_task_id = str(item.downstream_task_id or "").strip()
-        if selected_task_id and selected_task_id != current_task_id:
+        if allow_rebind and selected_task_id and selected_task_id != current_task_id:
             item.downstream_task_id = selected_task_id
         return selected
 
@@ -12192,7 +12353,7 @@ class TaskManager:
     def _streaming_tail_auto_progressing(self, db: Session, task: BinarySecurityTask) -> bool:
         if not self._streaming_mode_enabled(task):
             return False
-        if str(task.status or "").strip() not in {"pending", "running", "dispatching"}:
+        if str(task.status or "").strip() not in {"pending", "queued", "running", "dispatching"}:
             return False
         tail_stages = self._streaming_tail_stage_names(task)
         if not tail_stages:
@@ -14334,6 +14495,11 @@ class TaskManager:
     ):
         effective_concurrency = concurrency
         semaphore = asyncio.Semaphore(max(1, effective_concurrency))
+        runner_signature = inspect.signature(runner)
+        supports_auto_retrying = "auto_retrying" in runner_signature.parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in runner_signature.parameters.values()
+        )
 
         async def wrapped(item: dict[str, Any]):
             async with semaphore:
@@ -14346,7 +14512,10 @@ class TaskManager:
                 while result.get("status") == "failed" and attempts < max(0, retries):
                     attempts += 1
                     await self._ensure_task_execution_current_async(task)
-                    result = await runner(item, True, auto_retrying=True)
+                    if supports_auto_retrying:
+                        result = await runner(item, True, auto_retrying=True)
+                    else:
+                        result = await runner(item, True)
                     await self._ensure_task_execution_current_async(task)
                     result["attempts"] = attempts + 1
                 return result
@@ -15529,7 +15698,12 @@ class TaskManager:
             line_hint = ""
             if definition_line:
                 line_hint = definition_line if definition_line.upper().startswith("L") else f"L{definition_line}"
-            reusable_payload = None if retrying else await self._find_reusable_dataflow_payload(task, item)
+            allow_rebind = not auto_retrying
+            reusable_payload = None if retrying else await self._find_reusable_dataflow_payload(
+                task,
+                item,
+                allow_rebind=allow_rebind,
+            )
             if reusable_payload is not None:
                 downstream_status = str(reusable_payload.get("status") or "").lower()
                 mapped_reusable_status = self._map_downstream_status(downstream_status)
