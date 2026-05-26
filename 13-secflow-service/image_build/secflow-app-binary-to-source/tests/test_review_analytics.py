@@ -202,7 +202,6 @@ class ReviewAnalyticsApiTests(unittest.TestCase):
 
         with (
             mock.patch.object(tasks_api, "get_task_or_404", return_value=fake_task),
-            mock.patch.object(tasks_api, "sync_task", new=mock.AsyncMock()),
             mock.patch.object(tasks_api, "get_task_item_or_404", return_value=fake_item),
             mock.patch.object(task_service, "build_task_item_advanced", return_value=_advanced_response()),
         ):

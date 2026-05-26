@@ -132,6 +132,29 @@ class B2SObservability:
         if result == "updated":
             self.prom.inc("cache_replace", mode=mode)
 
+    def record_task_sync_tick(
+        self,
+        *,
+        attempted: int,
+        succeeded: int,
+        changed: int,
+        failed: int,
+        duration_seconds: float,
+        owner_id: str,
+    ) -> None:
+        self.prom.inc("task_sync_ticks", owner=owner_id)
+        self.prom.inc("task_sync_tasks", amount=float(attempted), result="attempted", owner=owner_id)
+        self.prom.inc("task_sync_tasks", amount=float(succeeded), result="succeeded", owner=owner_id)
+        self.prom.inc("task_sync_tasks", amount=float(changed), result="changed", owner=owner_id)
+        self.prom.inc("task_sync_tasks", amount=float(failed), result="failed", owner=owner_id)
+        self.prom.observe("task_sync_duration", duration_seconds, owner=owner_id)
+        self.prom.set_gauge("task_sync_last_attempted_tasks", float(attempted), owner=owner_id)
+        self.prom.set_gauge("task_sync_last_succeeded_tasks", float(succeeded), owner=owner_id)
+        self.prom.set_gauge("task_sync_last_changed_tasks", float(changed), owner=owner_id)
+        self.prom.set_gauge("task_sync_last_failed_tasks", float(failed), owner=owner_id)
+        self.prom.set_gauge("task_sync_last_duration_seconds", duration_seconds, owner=owner_id)
+        self.prom.set_gauge("task_sync_last_run_timestamp", time.time(), owner=owner_id)
+
     def metrics_response(self) -> Response:
         return Response(content=self.prom.render(_build_snapshot_lines()), media_type="text/plain; version=0.0.4; charset=utf-8")
 
@@ -254,6 +277,10 @@ def _snapshot_lines(db: Session) -> list[str]:
     lines.append(f"secflow_binary_to_source_review_issue_resolved_total {review_resolved}")
     lines.append(f"secflow_binary_to_source_review_issue_remaining_total {review_remaining}")
     lines.append(f"secflow_binary_to_source_review_passed_items {review_passed}")
+    lines.append(
+        "secflow_binary_to_source_task_sync_candidates "
+        f"{sum(1 for task in tasks if str(task.status or '') in {'pending', 'queued', 'running', 'dispatching', 'cancelling'})}"
+    )
     _append_ai_snapshot_lines(
         lines,
         items=items,

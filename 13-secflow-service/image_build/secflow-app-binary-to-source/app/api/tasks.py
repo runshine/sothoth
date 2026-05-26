@@ -44,7 +44,6 @@ from app.service.task_service import (
     query_items,
     retry_task,
     rerun_task,
-    refresh_task_function_stats,
     sync_task,
     generate_task_id,
     terminate_task,
@@ -300,15 +299,6 @@ async def list_tasks(
         query = query.filter(B2STask.parent_stage_item_id == parent_stage_item_id)
     total = query.count()
     tasks = query.order_by(B2STask.created_at.desc()).offset(offset).limit(limit).all()
-    stats_changed = False
-    for task in tasks:
-        await sync_task(db, task)
-        if refresh_task_function_stats(db, task, inspect_files=True, only_missing=True, commit=False):
-            stats_changed = True
-    if stats_changed:
-        db.commit()
-        for task in tasks:
-            db.refresh(task)
     items = [build_task_response(db, task) for task in tasks]
     return TaskListResponse(total=total, items=items)
 
@@ -463,8 +453,6 @@ async def get_b2s_task(
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    await sync_task(db, task)
-    refresh_task_function_stats(db, task, inspect_files=True, only_missing=True)
     return build_task_detail(db, task)
 
 
@@ -476,7 +464,6 @@ async def get_b2s_task_timeline(
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    await sync_task(db, task)
     return get_task_timeline(db, task)
 
 
@@ -515,7 +502,6 @@ async def get_b2s_task_sessions(
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    await sync_task(db, task)
     return build_task_session_index(query_items(db, task.id))
 
 
@@ -532,7 +518,6 @@ async def get_b2s_task_session_file(
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    await sync_task(db, task)
     items = query_items(db, task.id)
     return build_task_session_file(items, path, offset=offset, limit=limit, item_id=item_id, node_id=node_id)
 
@@ -545,7 +530,6 @@ async def get_b2s_task_agent_sessions_runtime(
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    await sync_task(db, task)
     items = query_items(db, task.id)
     return build_task_agent_session_runtime(items)
 
@@ -558,7 +542,6 @@ async def get_b2s_task_relationships(
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    await sync_task(db, task)
     items = query_items(db, task.id)
     return build_task_relationship(items)
 
@@ -571,7 +554,6 @@ async def get_b2s_task_result(
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    await sync_task(db, task)
     items = query_items(db, task.id)
     return build_task_result_summary(items)
 
@@ -584,7 +566,6 @@ async def get_b2s_task_observability(
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    await sync_task(db, task)
     items = query_items(db, task.id)
     return build_task_observability_summary(items)
 
@@ -598,7 +579,6 @@ async def get_b2s_task_item_observability(
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    await sync_task(db, task)
     item = get_task_item_or_404(db, task, item_id)
     return build_task_item_observability_summary(item)
 
@@ -613,7 +593,6 @@ async def get_b2s_task_item_advanced(
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    await sync_task(db, task)
     item = get_task_item_or_404(db, task, item_id)
     return build_task_item_advanced(item, include_content=include_content)
 
@@ -627,7 +606,6 @@ async def get_b2s_task_item_artifacts(
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    await sync_task(db, task)
     item = get_task_item_or_404(db, task, item_id)
     return build_task_item_artifacts(item)
 
@@ -644,7 +622,6 @@ async def get_b2s_task_item_artifact_content(
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    await sync_task(db, task)
     item = get_task_item_or_404(db, task, item_id)
     return build_task_item_artifact_content(item, artifact_id, offset=offset, limit=limit)
 
@@ -658,7 +635,6 @@ async def get_b2s_task_item_review_analytics(
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    await sync_task(db, task)
     item = get_task_item_or_404(db, task, item_id)
     return build_task_item_review_analytics(item)
 

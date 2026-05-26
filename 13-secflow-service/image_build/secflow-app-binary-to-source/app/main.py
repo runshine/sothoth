@@ -21,6 +21,7 @@ from app.observability import get_observability
 from app.service.dispatcher import get_dispatcher
 from app.service.llm_provider import materialize_llm_provider
 from app.service.registry import get_registry_service
+from app.service.task_syncer import get_task_syncer
 
 
 logging.basicConfig(
@@ -85,12 +86,14 @@ async def lifespan(_: FastAPI):
         await materialize_llm_provider()
         await get_registry_service().start()
         get_dispatcher().start()
+        get_task_syncer().start()
     except Exception as exc:
         logger.exception("B2S服务启动失败: %s", exc)
         sys.exit(1)
     logger.info("SecFlow B2S后端适配服务启动成功")
     yield
     try:
+        await get_task_syncer().stop()
         await get_dispatcher().stop()
         await get_registry_service().stop()
     except Exception as exc:

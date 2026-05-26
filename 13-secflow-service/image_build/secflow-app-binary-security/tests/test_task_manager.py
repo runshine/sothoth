@@ -1834,7 +1834,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertIsNone(task.finished_at)
         self.assertIsNone(task.last_error)
 
-    def test_get_task_detail_reconciles_dispatching_task_to_running_when_stage_is_running(self):
+    def test_get_task_detail_keeps_read_path_side_effect_free_when_stage_is_running(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -1872,11 +1872,11 @@ class TaskManagerTests(unittest.TestCase):
 
         detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
 
-        self.assertEqual("running", detail.status)
-        self.assertEqual("running", task.status)
+        self.assertEqual("dispatching", detail.status)
+        self.assertEqual("dispatching", task.status)
         self.assertEqual("running", next(summary.status for summary in detail.stage_summaries if summary.stage_name == "system_analysis"))
 
-    def test_list_tasks_reconciles_dispatching_task_to_running_when_stage_is_running(self):
+    def test_list_tasks_keeps_read_path_side_effect_free_when_stage_is_running(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -1915,8 +1915,8 @@ class TaskManagerTests(unittest.TestCase):
         response = self.manager.list_tasks(db, project_id="p1")
 
         self.assertEqual(1, response.total)
-        self.assertEqual("running", response.items[0].status)
-        self.assertEqual("running", task.status)
+        self.assertEqual("dispatching", response.items[0].status)
+        self.assertEqual("dispatching", task.status)
 
     def test_stage_run_output_summary_db_payload_is_hard_capped(self):
         task = BinarySecurityTask(

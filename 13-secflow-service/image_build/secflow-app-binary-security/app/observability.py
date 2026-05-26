@@ -121,6 +121,31 @@ SCHEDULER_LOOP_DURATION_SECONDS = Histogram(
     labelnames=("loop",),
     buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30),
 )
+TASK_READLESS_RECONCILE_TASKS_TOTAL = Counter(
+    "secflow_binary_security_task_readless_reconcile_tasks_total",
+    "Total tasks processed by the background readless reconcile loop.",
+    labelnames=("result",),
+)
+TASK_READLESS_RECONCILE_CANDIDATES = Gauge(
+    "secflow_binary_security_task_readless_reconcile_candidates",
+    "Current number of tasks eligible for background readless reconciliation.",
+)
+TASK_READLESS_RECONCILE_LAST_ATTEMPTED = Gauge(
+    "secflow_binary_security_task_readless_reconcile_last_attempted",
+    "Number of tasks attempted in the last readless reconcile loop iteration.",
+)
+TASK_READLESS_RECONCILE_LAST_CHANGED = Gauge(
+    "secflow_binary_security_task_readless_reconcile_last_changed",
+    "Number of tasks changed in the last readless reconcile loop iteration.",
+)
+TASK_READLESS_RECONCILE_LAST_FAILED = Gauge(
+    "secflow_binary_security_task_readless_reconcile_last_failed",
+    "Number of tasks failed in the last readless reconcile loop iteration.",
+)
+TASK_READLESS_RECONCILE_LAST_RUN_TIMESTAMP = Gauge(
+    "secflow_binary_security_task_readless_reconcile_last_run_timestamp",
+    "Unix timestamp of the last readless reconcile loop run.",
+)
 
 TASK_OPERATIONS_TOTAL = Counter(
     "secflow_binary_security_task_operations_total",
@@ -370,6 +395,17 @@ def observe_scheduler_loop(loop_name: str) -> Iterator[None]:
     finally:
         SCHEDULER_LOOP_ITERATIONS_TOTAL.labels(loop=loop_name).inc()
         SCHEDULER_LOOP_DURATION_SECONDS.labels(loop=loop_name).observe(max(0.0, time.perf_counter() - started))
+
+
+def observe_task_readless_reconcile(*, attempted: int, changed: int, failed: int, candidates: int) -> None:
+    TASK_READLESS_RECONCILE_TASKS_TOTAL.labels(result="attempted").inc(max(0, int(attempted)))
+    TASK_READLESS_RECONCILE_TASKS_TOTAL.labels(result="changed").inc(max(0, int(changed)))
+    TASK_READLESS_RECONCILE_TASKS_TOTAL.labels(result="failed").inc(max(0, int(failed)))
+    TASK_READLESS_RECONCILE_CANDIDATES.set(max(0, int(candidates)))
+    TASK_READLESS_RECONCILE_LAST_ATTEMPTED.set(max(0, int(attempted)))
+    TASK_READLESS_RECONCILE_LAST_CHANGED.set(max(0, int(changed)))
+    TASK_READLESS_RECONCILE_LAST_FAILED.set(max(0, int(failed)))
+    TASK_READLESS_RECONCILE_LAST_RUN_TIMESTAMP.set(time.time())
 
 
 def observe_task_operation(action: str, result: str) -> None:
