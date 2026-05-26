@@ -2756,16 +2756,44 @@ def _safe_existing_file(path: Path, root: Path) -> str | None:
     return str(resolved)
 
 
-def _item_run_root(output_root: Path) -> Path:
+def _legacy_item_run_root(output_root: Path) -> Path:
     return output_root / "run"
 
 
+def _pi_re_work_root(output_root: Path) -> Path | None:
+    roots = sorted(
+        [path for path in output_root.glob(".re_work_*") if path.is_dir()],
+        key=lambda path: path.name,
+    )
+    return roots[-1] if roots else None
+
+
+def _item_run_root(output_root: Path) -> Path:
+    return _legacy_item_run_root(output_root)
+
+
 def _item_ida_cache_dir(output_root: Path) -> Path:
-    return _item_run_root(output_root) / "ida_cache"
+    legacy = _legacy_item_run_root(output_root) / "ida_cache"
+    if legacy.exists():
+        return legacy
+    work_root = _pi_re_work_root(output_root)
+    if work_root is not None:
+        candidate = work_root / "ida_cache"
+        if candidate.exists():
+            return candidate
+    return legacy
 
 
 def _item_runs_root(output_root: Path) -> Path:
-    return _item_run_root(output_root) / "runs"
+    legacy = _legacy_item_run_root(output_root) / "runs"
+    if legacy.exists():
+        return legacy
+    work_root = _pi_re_work_root(output_root)
+    if work_root is not None:
+        candidate = work_root / "runs"
+        if candidate.exists():
+            return candidate
+    return legacy
 
 
 def ida_decompiled_c_path(item: B2STaskItem, reference_path: str | None = None) -> str | None:
