@@ -1228,6 +1228,9 @@ class TaskManager:
 
     def get_task_detail(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskDetailResponse:
         task = self._task_or_404(db, project_id, task_id)
+        active_stage_name = self._active_reconcile_stage_name(task)
+        if active_stage_name:
+            self._refresh_stage_from_authoritative_items(db, task, active_stage_name)
         items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).order_by(
             BinarySecurityStageItem.created_at.asc()
         ).all()
@@ -4960,11 +4963,7 @@ class TaskManager:
             "downstream": self._lightweight_downstream_payload(downstream_payload),
             "downstream_status_synced_at": _now().isoformat(),
         }
-        if item.stage_name == "system_analysis":
-            self._refresh_system_analysis_stage_from_synced_items(db, task)
-        else:
-            self._refresh_stage_run_from_items(db, task, item.stage_name)
-        self._refresh_task_status_after_sync(db, task)
+        self._reconcile_stage_and_task_state_after_item_update(db, task, item.stage_name)
         self._record_event(
             db,
             task,
@@ -6195,11 +6194,7 @@ class TaskManager:
                     mapped_status=normalized_mapped_status,
                     archived_dir=Path(effective_archive_root) if effective_archive_root else None,
                 )
-            if item.stage_name == "system_analysis":
-                self._refresh_system_analysis_stage_from_synced_items(db, task)
-            else:
-                self._refresh_stage_run_from_items(db, task, item.stage_name)
-            self._refresh_task_status_after_sync(db, task)
+            self._reconcile_stage_and_task_state_after_item_update(db, task, item.stage_name)
             job.archive_status = "success"
             job.error_message = None
             job.completed_at = _now()
@@ -9368,6 +9363,9 @@ class TaskManager:
         return list(aggregates.values())
 
     def _task_response(self, db: Session, task: BinarySecurityTask, queue_info: dict[str, Any] | None = None) -> BinarySecurityTaskResponse:
+        active_stage_name = self._active_reconcile_stage_name(task)
+        if active_stage_name:
+            self._refresh_stage_from_authoritative_items(db, task, active_stage_name)
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).order_by(BinarySecurityStageRun.sequence_no.asc()).all()
         items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
         archive_jobs = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id).all()
