@@ -42,9 +42,6 @@ def _global_advisor() -> AdvisorInstanceDef:
         system_prompt_file="sys.md",
         user_prompt_template="user.md",
         score_fields=["coverage"],
-        score_thresholds_start={"coverage": 0.8},
-        score_thresholds={"coverage": 1.0},
-        score_threshold_ramp_cycles=5,
     )
 
 
@@ -204,17 +201,9 @@ def test_direct_context_separates_supporting_docs_from_reviewable_results(
     assert context["supporting_docs_dir"].endswith("supporting_docs")
 
 
-def test_global_score_threshold_helpers_removed_from_executor(
-    tmp_path: Path,
-) -> None:
-    executor, _ = _make_executor(tmp_path)
-
-    assert not hasattr(executor, "_apply_score_thresholds")
-    assert not hasattr(executor, "_score_threshold_issues")
-    assert not hasattr(executor, "_format_score_threshold_feedback")
 
 
-def test_load_existing_global_review_record_recovers_original_pass_from_legacy_threshold_fail(
+def test_load_existing_global_review_record_recovers_original_pass_from_legacy_override(
     tmp_path: Path,
 ) -> None:
     executor, _ = _make_executor(tmp_path)
@@ -231,8 +220,8 @@ def test_load_existing_global_review_record_recovers_original_pass_from_legacy_t
                 "passed": False,
                 "verdict": "FAIL",
                 "scores": {"coverage": 0.84},
-                "feedback": "FAIL（未通过） - coverage=0.84 低于本轮通过阈值 0.90（Cycle 1）",
-                "feedback_detail": "reviewer 原本判定通过。\n\n[框架分数阈值校验未通过]\n- coverage=0.84 低于本轮通过阈值 0.90（Cycle 1）",
+                "feedback": "FAIL（未通过） - framework legacy override",
+                "feedback_detail": "reviewer 原本判定通过。\n\n[legacy framework override] canonical pass was rewritten to fail.",
                 "raw_response": json.dumps(
                     {
                         "passed": True,
@@ -247,9 +236,10 @@ def test_load_existing_global_review_record_recovers_original_pass_from_legacy_t
                 ),
                 "issues": [
                     {
-                        "id": "global_quality:score-threshold:coverage",
-                        "category": "score_threshold",
+                        "id": "global_quality:legacy-pass-override",
+                        "category": "evidence_gap",
                         "target": "coverage",
+                        "actionable_by": "worker",
                     }
                 ],
                 "parser_mode": "canonical_json",

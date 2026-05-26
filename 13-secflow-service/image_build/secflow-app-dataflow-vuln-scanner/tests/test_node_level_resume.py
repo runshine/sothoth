@@ -283,7 +283,7 @@ def test_rebuild_review_state_ignores_agent_error_records(tmp_path: Path) -> Non
     ) == ["result_001.md"]
 
 
-def test_rebuild_review_state_recovers_original_pass_from_legacy_score_threshold_fail(
+def test_rebuild_review_state_recovers_original_pass_from_legacy_override(
     tmp_path: Path,
 ) -> None:
     _, atomic_dir, _ = _make_resume_run(tmp_path)
@@ -298,8 +298,8 @@ def test_rebuild_review_state_recovers_original_pass_from_legacy_score_threshold
                 "passed": False,
                 "verdict": "FAIL",
                 "scores": {"coverage": 0.84},
-                "feedback": "FAIL（未通过） - coverage=0.84 低于本轮通过阈值 0.90（Cycle 1）",
-                "feedback_detail": "reviewer 原本判定通过。\n\n[框架分数阈值校验未通过]\n- coverage=0.84 低于本轮通过阈值 0.90（Cycle 1）",
+                "feedback": "FAIL（未通过） - framework legacy override",
+                "feedback_detail": "reviewer 原本判定通过。\n\n[legacy framework override] canonical pass was rewritten to fail.",
                 "raw_response": json.dumps(
                     {
                         "passed": True,
@@ -314,9 +314,10 @@ def test_rebuild_review_state_recovers_original_pass_from_legacy_score_threshold
                 ),
                 "issues": [
                     {
-                        "id": "global_completeness:score-threshold:coverage",
-                        "category": "score_threshold",
+                        "id": "global_completeness:legacy-pass-override",
+                        "category": "evidence_gap",
                         "target": "coverage",
+                        "actionable_by": "worker",
                     }
                 ],
             },

@@ -116,9 +116,6 @@ class AdvisorInstanceDef(BaseModel):
     system_prompt_file: str
     user_prompt_template: str
     score_fields: list[str] = Field(default_factory=list)
-    score_thresholds_start: dict[str, float] = Field(default_factory=dict)
-    score_thresholds: dict[str, float] = Field(default_factory=dict)
-    score_threshold_ramp_cycles: int = Field(default=5, ge=1)
 
 
 class AdvisorsDef(BaseModel):

@@ -15,7 +15,6 @@ from app.pi_vuln_core.review.global_review import GlobalReviewExecutor
 from app.pi_vuln_core.review.profile import (
     _MODEL_THINKING_LEVELS,
     get_review_profile_policy,
-    get_review_score_threshold_policy,
     normalize_review_profile,
     resolve_profile_thinking,
 )
@@ -55,30 +54,6 @@ def test_review_profiles_have_monotonic_execution_budgets() -> None:
     assert audit.progress_no_signal_abort_streak == 2
 
 
-def test_review_profiles_have_monotonic_score_gates() -> None:
-    fast_depth = get_review_score_threshold_policy("fast", "global_depth")
-    balanced_depth = get_review_score_threshold_policy("balanced", "global_depth")
-    audit_depth = get_review_score_threshold_policy("audit", "global_depth")
-    assert (
-        fast_depth.score_thresholds["vuln_pattern_breadth"]
-        < balanced_depth.score_thresholds["vuln_pattern_breadth"]
-        < audit_depth.score_thresholds["vuln_pattern_breadth"]
-    )
-    assert get_review_score_threshold_policy("strict", "global_depth") == audit_depth
-
-    fast_cmp = get_review_score_threshold_policy("fast", "global_completeness")
-    balanced_cmp = get_review_score_threshold_policy("balanced", "global_completeness")
-    audit_cmp = get_review_score_threshold_policy("audit", "global_completeness")
-    assert (
-        fast_cmp.score_thresholds["coverage"]
-        < balanced_cmp.score_thresholds["coverage"]
-        <= audit_cmp.score_thresholds["coverage"]
-    )
-    assert (
-        fast_cmp.score_threshold_ramp_cycles
-        < balanced_cmp.score_threshold_ramp_cycles
-        < audit_cmp.score_threshold_ramp_cycles
-    )
 
 
 def test_profile_thinking_resolution_by_model_capability(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -233,8 +208,6 @@ def test_generate_config_uses_profile_default_budget_when_max_cycles_not_set(
     global_reviews = config["workflows"]["atomic"][0]["roles"]["advisors"]["global_review"]
     depth_review = next(item for item in global_reviews if item["instance_id"] == "global_depth")
     assert depth_review["score_fields"] == ["vuln_pattern_breadth"]
-    assert depth_review["score_thresholds"]["vuln_pattern_breadth"] == 0.95
-    assert depth_review["score_threshold_ramp_cycles"] == 8
 
 
 def test_generate_config_respects_explicit_cycles_but_keeps_profile_depth_budget(
@@ -277,10 +250,7 @@ def test_profile_template_compilation_applies_score_gates() -> None:
     completeness = next(item for item in global_reviews if item["instance_id"] == "global_completeness")
     depth = next(item for item in global_reviews if item["instance_id"] == "global_depth")
     assert completeness["score_fields"] == ["coverage"]
-    assert completeness["score_thresholds"]["coverage"] == 1.00
-    assert completeness["score_threshold_ramp_cycles"] == 8
     assert depth["score_fields"] == ["vuln_pattern_breadth"]
-    assert depth["score_thresholds"]["vuln_pattern_breadth"] == 0.95
     assert config["agents"][0]["runtime_config"]["rpc_stdout_abort_bytes"] == get_review_profile_policy("audit").worker_rpc_stdout_abort_bytes
     assert config["agents"][1]["runtime_config"]["rpc_stdout_abort_bytes"] == get_review_profile_policy("audit").advisor_rpc_stdout_abort_bytes
     assert config["agents"][1]["runtime_config"]["api_max_retries"] == 0

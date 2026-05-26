@@ -255,44 +255,6 @@ class ConfigLoader:
         if unknown:
             errors.append(f"{prefix} 的 score_fields 包含未知字段: {', '.join(unknown)}")
 
-        final_thresholds = advisor.score_thresholds or {}
-        start_thresholds = advisor.score_thresholds_start or final_thresholds
-        missing_final = [key for key in score_fields if key not in final_thresholds]
-        if missing_final:
-            errors.append(f"{prefix} 的 score_thresholds 缺少字段: {', '.join(missing_final)}")
-        extra_final = sorted(set(final_thresholds) - set(score_fields))
-        if extra_final:
-            errors.append(f"{prefix} 的 score_thresholds 包含非本角色字段: {', '.join(extra_final)}")
-        extra_start = sorted(set(start_thresholds) - set(score_fields))
-        if extra_start:
-            errors.append(f"{prefix} 的 score_thresholds_start 包含非本角色字段: {', '.join(extra_start)}")
-
-        for label, thresholds in (
-            ("score_thresholds", final_thresholds),
-            ("score_thresholds_start", start_thresholds),
-        ):
-            for key, value in thresholds.items():
-                try:
-                    numeric = float(value)
-                except (TypeError, ValueError):
-                    errors.append(f"{prefix} 的 {label}.{key} 必须是 0.0-1.0 数值")
-                    continue
-                if numeric < 0.0 or numeric > 1.0:
-                    errors.append(f"{prefix} 的 {label}.{key} 超出 0.0-1.0 范围")
-
-        for key in score_fields:
-            if key not in final_thresholds or key not in start_thresholds:
-                continue
-            try:
-                start_value = float(start_thresholds[key])
-                final_value = float(final_thresholds[key])
-            except (TypeError, ValueError):
-                continue
-            if start_value > final_value:
-                errors.append(
-                    f"{prefix} 的 score_thresholds_start.{key} 不能高于最终阈值 {final_value:.2f}"
-                )
-
         return errors
 
     @staticmethod

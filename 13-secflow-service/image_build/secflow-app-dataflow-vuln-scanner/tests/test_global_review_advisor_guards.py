@@ -21,20 +21,6 @@ COMPLETENESS_SCORE_FIELDS = [
     "limitations_honesty",
     "report_completeness",
 ]
-COMPLETENESS_SCORE_THRESHOLDS_START = {
-    "input_coverage": 0.8,
-    "export_followthrough": 0.7,
-    "used_coverage": 0.7,
-    "limitations_honesty": 0.75,
-    "report_completeness": 0.7,
-}
-COMPLETENESS_SCORE_THRESHOLDS = {
-    "input_coverage": 1.0,
-    "export_followthrough": 0.95,
-    "used_coverage": 0.95,
-    "limitations_honesty": 0.95,
-    "report_completeness": 0.9,
-}
 
 
 class MutatingGlobalAdvisorRuntime(BaseAgentRuntime):
@@ -234,8 +220,6 @@ async def test_global_review_read_only_violation_fails_and_closes_reset_session(
         system_prompt_file=str(system_prompt),
         user_prompt_template=str(user_prompt),
         score_fields=COMPLETENESS_SCORE_FIELDS,
-        score_thresholds_start=COMPLETENESS_SCORE_THRESHOLDS_START,
-        score_thresholds=COMPLETENESS_SCORE_THRESHOLDS,
     )
     advisor_sessions: dict[str, str] = {}
     executor = GlobalReviewExecutor(registry, ExecutionRecorder(str(tmp_path)))
@@ -310,8 +294,6 @@ async def test_global_review_runtime_error_is_framework_actionable(
         system_prompt_file=str(system_prompt),
         user_prompt_template=str(user_prompt),
         score_fields=COMPLETENESS_SCORE_FIELDS,
-        score_thresholds_start=COMPLETENESS_SCORE_THRESHOLDS_START,
-        score_thresholds=COMPLETENESS_SCORE_THRESHOLDS,
     )
     review_state = ReviewState()
     executor = GlobalReviewExecutor(registry, ExecutionRecorder(str(tmp_path)))
@@ -392,8 +374,6 @@ async def test_global_review_runtime_timeout_retries_with_fresh_sessions(
         system_prompt_file=str(system_prompt),
         user_prompt_template=str(user_prompt),
         score_fields=COMPLETENESS_SCORE_FIELDS,
-        score_thresholds_start=COMPLETENESS_SCORE_THRESHOLDS_START,
-        score_thresholds=COMPLETENESS_SCORE_THRESHOLDS,
     )
     review_state = ReviewState()
     executor = GlobalReviewExecutor(registry, ExecutionRecorder(str(tmp_path)))

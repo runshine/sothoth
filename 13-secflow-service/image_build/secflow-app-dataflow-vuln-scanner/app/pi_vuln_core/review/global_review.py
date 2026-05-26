@@ -283,7 +283,7 @@ class GlobalReviewExecutor:
         # agent_error 是运行层错误，不应在 resume 时固化为业务评审结论。
         if parser_mode == "agent_error" or verdict == "ERROR":
             return None
-        data = GlobalReviewExecutor._normalize_legacy_score_threshold_record(
+        data = GlobalReviewExecutor._normalize_legacy_framework_override_record(
             data,
             advisor_def=advisor_def,
         )
@@ -304,16 +304,29 @@ class GlobalReviewExecutor:
         }
 
     @classmethod
-    def _normalize_legacy_score_threshold_record(
+    def _normalize_legacy_framework_override_record(
         cls,
         data: dict[str, Any],
         *,
         advisor_def: AdvisorInstanceDef,
     ) -> dict[str, Any]:
-        if not cls._is_legacy_score_threshold_fail_record(data):
+        if bool(data.get("passed", False)):
             return dict(data)
 
         raw_response = str(data.get("raw_response") or "")
+        if not raw_response.strip():
+            return dict(data)
+
+        issues = [
+            item for item in list(data.get("issues") or [])
+            if isinstance(item, dict)
+        ]
+        if any(
+            str(item.get("actionable_by") or item.get("owner") or "").strip().lower() == "framework"
+            for item in issues
+        ):
+            return dict(data)
+
         parse_outcome = parse_global_review_response(
             raw_response,
             required_score_keys=cls._required_score_keys_for_advisor(advisor_def),
@@ -335,29 +348,6 @@ class GlobalReviewExecutor:
         normalized["issues"] = list(parsed.issues or [])
         normalized["resolved_issue_ids"] = list(parsed.resolved_issue_ids or [])
         return normalized
-
-    @staticmethod
-    def _is_legacy_score_threshold_fail_record(data: dict[str, Any]) -> bool:
-        if bool(data.get("passed", False)):
-            return False
-        issues = [
-            item for item in list(data.get("issues") or [])
-            if isinstance(item, dict)
-        ]
-        if not issues:
-            return False
-        if not all(
-            str(item.get("category") or "").strip().lower() == "score_threshold"
-            or "score-threshold" in str(item.get("id") or "").strip().lower()
-            for item in issues
-        ):
-            return False
-        feedback_text = str(
-            data.get("feedback_detail")
-            or data.get("feedback")
-            or ""
-        )
-        return "[框架分数阈值校验未通过]" in feedback_text
 
     async def _run_single_advisor(
         self,

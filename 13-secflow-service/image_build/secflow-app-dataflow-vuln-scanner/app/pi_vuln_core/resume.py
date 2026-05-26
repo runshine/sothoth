@@ -486,34 +486,24 @@ def _invalid_review_record(data: dict[str, Any]) -> bool:
     return parser_mode == "agent_error" or verdict == "ERROR"
 
 
-def _is_legacy_score_threshold_fail_record(data: dict[str, Any]) -> bool:
+def _normalize_legacy_framework_override_record(data: dict[str, Any]) -> dict[str, Any]:
     if bool(data.get("passed", False)):
-        return False
+        return dict(data)
+
+    raw_response = str(data.get("raw_response") or "")
+    if not raw_response.strip():
+        return dict(data)
+
     issues = [
         item for item in list(data.get("issues") or [])
         if isinstance(item, dict)
     ]
-    if not issues:
-        return False
-    if not all(
-        str(item.get("category") or "").strip().lower() == "score_threshold"
-        or "score-threshold" in str(item.get("id") or "").strip().lower()
+    if any(
+        str(item.get("actionable_by") or item.get("owner") or "").strip().lower() == "framework"
         for item in issues
     ):
-        return False
-    feedback_text = str(
-        data.get("feedback_detail")
-        or data.get("feedback")
-        or ""
-    )
-    return "[框架分数阈值校验未通过]" in feedback_text
-
-
-def _normalize_legacy_score_threshold_record(data: dict[str, Any]) -> dict[str, Any]:
-    if not _is_legacy_score_threshold_fail_record(data):
         return dict(data)
 
-    raw_response = str(data.get("raw_response") or "")
     score_keys = [
         str(key).strip()
         for key in (data.get("scores") or {}).keys()
@@ -716,7 +706,7 @@ def rebuild_review_state(atomic_work_dir: str | Path) -> ReviewState:
                     continue
                 if not isinstance(data, dict) or _invalid_review_record(data):
                     continue
-                data = _normalize_legacy_score_threshold_record(data)
+                data = _normalize_legacy_framework_override_record(data)
                 passed = bool(data.get("passed", False))
                 feedback = str(
                     data.get("feedback_detail")

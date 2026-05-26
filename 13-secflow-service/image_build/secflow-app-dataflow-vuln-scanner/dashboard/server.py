@@ -337,8 +337,6 @@ def _summarize_global_review_advisors(config: dict) -> list[dict[str, Any]]:
                 "instance_id": advisor.get("instance_id", ""),
                 "role_name": advisor.get("role_name", ""),
                 "score_fields": advisor.get("score_fields", []),
-                "score_thresholds": advisor.get("score_thresholds", {}),
-                "score_thresholds_start": advisor.get("score_thresholds_start", {}),
             })
     return advisors
 

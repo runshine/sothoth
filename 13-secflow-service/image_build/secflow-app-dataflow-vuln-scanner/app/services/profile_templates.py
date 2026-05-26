@@ -10,8 +10,8 @@ from fastapi import HTTPException, status
 from app.pi_vuln_core.review.profile import (
     apply_profile_thinking_to_config,
     apply_profile_runtime_policy_to_config,
+    get_global_review_score_fields,
     get_review_profile_policy,
-    get_review_score_threshold_policy,
     normalize_review_profile,
     resolve_profile_thinking,
 )
@@ -212,14 +212,10 @@ class ProfileTemplateService:
                     instance_id = str(advisor.get("instance_id") or "")
                     if not instance_id:
                         continue
-                    score_policy = get_review_score_threshold_policy(
-                        review_profile,
-                        instance_id,
-                    )
-                    advisor["score_fields"] = list(score_policy.score_fields)
-                    advisor["score_thresholds_start"] = score_policy.score_thresholds_start
-                    advisor["score_thresholds"] = score_policy.score_thresholds
-                    advisor["score_threshold_ramp_cycles"] = score_policy.score_threshold_ramp_cycles
+                    advisor["score_fields"] = list(get_global_review_score_fields(instance_id))
+                    for legacy_key in list(advisor.keys()):
+                        if str(legacy_key).startswith("score_") and legacy_key != "score_fields":
+                            advisor.pop(legacy_key, None)
 
         runtime_overrides_set_engine_cycles = (
             _overrides_engine_max_cycles(payload_runtime_overrides)

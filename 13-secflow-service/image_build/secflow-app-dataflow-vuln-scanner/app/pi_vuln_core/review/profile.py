@@ -42,14 +42,6 @@ class ReviewProfilePolicy:
     depth_lanes: tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class ReviewScoreThresholdPolicy:
-    score_fields: tuple[str, ...]
-    score_thresholds_start: dict[str, float]
-    score_thresholds: dict[str, float]
-    score_threshold_ramp_cycles: int
-
-
 _THINKING_LEVEL_ORDER: tuple[ThinkingLevel, ...] = ("low", "medium", "high", "xhigh")
 
 _MODEL_THINKING_LEVELS: dict[str, tuple[ThinkingLevel, ...]] = {
@@ -192,81 +184,9 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
 }
 
 
-_COMPLETENESS_SCORE_FIELDS = (
-    "coverage",
-)
-_DEPTH_SCORE_FIELDS = (
-    "vuln_pattern_breadth",
-)
-
-
-_SCORE_THRESHOLD_POLICIES: dict[str, dict[str, ReviewScoreThresholdPolicy]] = {
-    "fast": {
-        "global_completeness": ReviewScoreThresholdPolicy(
-            score_fields=_COMPLETENESS_SCORE_FIELDS,
-            score_thresholds_start={
-                "coverage": 0.45,
-            },
-            score_thresholds={
-                "coverage": 0.70,
-            },
-            score_threshold_ramp_cycles=2,
-        ),
-        "global_depth": ReviewScoreThresholdPolicy(
-            score_fields=_DEPTH_SCORE_FIELDS,
-            score_thresholds_start={
-                "vuln_pattern_breadth": 0.35,
-            },
-            score_thresholds={
-                "vuln_pattern_breadth": 0.55,
-            },
-            score_threshold_ramp_cycles=2,
-        ),
-    },
-    "balanced": {
-        "global_completeness": ReviewScoreThresholdPolicy(
-            score_fields=_COMPLETENESS_SCORE_FIELDS,
-            score_thresholds_start={
-                "coverage": 0.80,
-            },
-            score_thresholds={
-                "coverage": 0.95,
-            },
-            score_threshold_ramp_cycles=5,
-        ),
-        "global_depth": ReviewScoreThresholdPolicy(
-            score_fields=_DEPTH_SCORE_FIELDS,
-            score_thresholds_start={
-                "vuln_pattern_breadth": 0.60,
-            },
-            score_thresholds={
-                "vuln_pattern_breadth": 0.82,
-            },
-            score_threshold_ramp_cycles=5,
-        ),
-    },
-    "audit": {
-        "global_completeness": ReviewScoreThresholdPolicy(
-            score_fields=_COMPLETENESS_SCORE_FIELDS,
-            score_thresholds_start={
-                "coverage": 0.90,
-            },
-            score_thresholds={
-                "coverage": 1.00,
-            },
-            score_threshold_ramp_cycles=8,
-        ),
-        "global_depth": ReviewScoreThresholdPolicy(
-            score_fields=_DEPTH_SCORE_FIELDS,
-            score_thresholds_start={
-                "vuln_pattern_breadth": 0.75,
-            },
-            score_thresholds={
-                "vuln_pattern_breadth": 0.95,
-            },
-            score_threshold_ramp_cycles=8,
-        ),
-    },
+_GLOBAL_REVIEW_SCORE_FIELDS: dict[str, tuple[str, ...]] = {
+    "global_completeness": ("coverage",),
+    "global_depth": ("vuln_pattern_breadth",),
 }
 
 
@@ -439,27 +359,13 @@ def apply_profile_thinking_to_config(config: dict, review_profile: str | None) -
             apply_profile_thinking_to_runtime_config(runtime_config, review_profile)
 
 
-def get_review_score_threshold_policy(
-    value: str | None,
-    advisor_id: str,
-) -> ReviewScoreThresholdPolicy:
-    profile_name = normalize_review_profile(value)
+def get_global_review_score_fields(advisor_id: str) -> tuple[str, ...]:
     normalized_advisor = str(advisor_id or "").strip().lower()
     if normalized_advisor in {"completeness", "global_completeness"}:
-        normalized_advisor = "global_completeness"
-    elif normalized_advisor in {"depth", "global_depth"}:
-        normalized_advisor = "global_depth"
-    elif "depth" in normalized_advisor:
-        normalized_advisor = "global_depth"
-    else:
-        normalized_advisor = "global_completeness"
-    policy = _SCORE_THRESHOLD_POLICIES[profile_name][normalized_advisor]
-    return ReviewScoreThresholdPolicy(
-        score_fields=tuple(policy.score_fields),
-        score_thresholds_start=dict(policy.score_thresholds_start),
-        score_thresholds=dict(policy.score_thresholds),
-        score_threshold_ramp_cycles=policy.score_threshold_ramp_cycles,
-    )
+        return _GLOBAL_REVIEW_SCORE_FIELDS["global_completeness"]
+    if normalized_advisor in {"depth", "global_depth"} or "depth" in normalized_advisor:
+        return _GLOBAL_REVIEW_SCORE_FIELDS["global_depth"]
+    return _GLOBAL_REVIEW_SCORE_FIELDS["global_completeness"]
 
 
 def _runtime_config_dict(agent: dict) -> dict:
@@ -588,20 +494,12 @@ def apply_profile_runtime_policy_to_config(
             instance_id = str(advisor.get("instance_id") or "")
             if not instance_id:
                 continue
-            score_policy = get_review_score_threshold_policy(policy.name, instance_id)
-            advisor["score_fields"] = list(score_policy.score_fields)
-            advisor["score_thresholds_start"] = score_policy.score_thresholds_start
-            advisor["score_thresholds"] = score_policy.score_thresholds
-            advisor["score_threshold_ramp_cycles"] = score_policy.score_threshold_ramp_cycles
+            advisor["score_fields"] = list(get_global_review_score_fields(instance_id))
+            for legacy_key in list(advisor.keys()):
+                if str(legacy_key).startswith("score_") and legacy_key != "score_fields":
+                    advisor.pop(legacy_key, None)
 
     return policy.name
-
-
-def _format_threshold_brief(policy: ReviewScoreThresholdPolicy) -> str:
-    return ", ".join(
-        f"{key}>={value:.2f}"
-        for key, value in policy.score_thresholds.items()
-    )
 
 
 def _format_pattern_families(families: tuple[str, ...]) -> str:

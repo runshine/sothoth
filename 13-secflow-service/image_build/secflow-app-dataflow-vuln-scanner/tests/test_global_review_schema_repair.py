@@ -25,31 +25,7 @@ ALL_SCORE_FIELDS = [
     "limitations_honesty",
     "report_completeness",
 ]
-ALL_SCORE_THRESHOLDS_START = {
-    "input_coverage": 0.8,
-    "export_followthrough": 0.7,
-    "used_coverage": 0.7,
-    "vuln_pattern_breadth": 0.6,
-    "code_evidence_depth": 0.6,
-    "limitations_honesty": 0.75,
-    "report_completeness": 0.7,
-}
-ALL_SCORE_THRESHOLDS = {
-    "input_coverage": 1.0,
-    "export_followthrough": 0.95,
-    "used_coverage": 0.95,
-    "vuln_pattern_breadth": 0.85,
-    "code_evidence_depth": 0.85,
-    "limitations_honesty": 0.95,
-    "report_completeness": 0.9,
-}
 DEPTH_SCORE_FIELDS = ["vuln_pattern_breadth"]
-DEPTH_SCORE_THRESHOLDS_START = {
-    "vuln_pattern_breadth": 0.6,
-}
-DEPTH_SCORE_THRESHOLDS = {
-    "vuln_pattern_breadth": 0.85,
-}
 COMPLETENESS_SCORE_FIELDS = [
     "input_coverage",
     "export_followthrough",
@@ -57,14 +33,6 @@ COMPLETENESS_SCORE_FIELDS = [
     "limitations_honesty",
     "report_completeness",
 ]
-COMPLETENESS_SCORE_THRESHOLDS_START = {
-    key: ALL_SCORE_THRESHOLDS_START[key]
-    for key in COMPLETENESS_SCORE_FIELDS
-}
-COMPLETENESS_SCORE_THRESHOLDS = {
-    key: ALL_SCORE_THRESHOLDS[key]
-    for key in COMPLETENESS_SCORE_FIELDS
-}
 
 
 class RepairingGlobalRuntime(BaseAgentRuntime):
@@ -432,8 +400,6 @@ async def _run_global_review(
         system_prompt_file=str(sys_prompt),
         user_prompt_template=str(user_prompt),
         score_fields=ALL_SCORE_FIELDS,
-        score_thresholds_start=ALL_SCORE_THRESHOLDS_START,
-        score_thresholds=ALL_SCORE_THRESHOLDS,
     )
 
     executor = GlobalReviewExecutor(registry, ExecutionRecorder(str(tmp_path)))
@@ -548,8 +514,6 @@ async def _run_depth_only_review(
         system_prompt_file="",
         user_prompt_template=str(user_prompt),
         score_fields=DEPTH_SCORE_FIELDS,
-        score_thresholds_start=DEPTH_SCORE_THRESHOLDS_START,
-        score_thresholds=DEPTH_SCORE_THRESHOLDS,
     )
 
     executor = GlobalReviewExecutor(registry, ExecutionRecorder(str(tmp_path)))
@@ -709,8 +673,6 @@ async def test_split_global_review_keeps_upstream_resolutions_when_depth_fails(
             system_prompt_file="",
             user_prompt_template=str(completeness_user),
             score_fields=COMPLETENESS_SCORE_FIELDS,
-            score_thresholds_start=COMPLETENESS_SCORE_THRESHOLDS_START,
-            score_thresholds=COMPLETENESS_SCORE_THRESHOLDS,
         ),
         AdvisorInstanceDef(
             instance_id="global_depth",
@@ -720,8 +682,6 @@ async def test_split_global_review_keeps_upstream_resolutions_when_depth_fails(
             system_prompt_file="",
             user_prompt_template=str(depth_user),
             score_fields=DEPTH_SCORE_FIELDS,
-            score_thresholds_start=DEPTH_SCORE_THRESHOLDS_START,
-            score_thresholds=DEPTH_SCORE_THRESHOLDS,
         ),
     ]
 

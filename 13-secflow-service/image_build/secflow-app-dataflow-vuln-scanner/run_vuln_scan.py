@@ -33,8 +33,8 @@ from pathlib import Path
 from app.pi_vuln_core.review.profile import (
     apply_profile_runtime_policy_to_config,
     apply_profile_thinking_to_config,
+    get_global_review_score_fields,
     get_review_profile_policy,
-    get_review_score_threshold_policy,
     normalize_review_profile,
     resolve_profile_thinking,
 )
@@ -417,14 +417,6 @@ def generate_config(
     normalized_review_profile = normalize_review_profile(review_profile)
     profile_policy = get_review_profile_policy(normalized_review_profile)
     resolved_thinking = resolve_profile_thinking(model, profile_policy.name)
-    completeness_score_policy = get_review_score_threshold_policy(
-        profile_policy.name,
-        "global_completeness",
-    )
-    depth_score_policy = get_review_score_threshold_policy(
-        profile_policy.name,
-        "global_depth",
-    )
     effective_max_cycles = (
         int(max_cycles)
         if max_cycles is not None else
@@ -622,10 +614,7 @@ def generate_config(
                                     "system_prompt_file": "",
                                     "user_prompt_template": os.path.join(
                                         prompts_dir, "global_review_completeness_user.md"),
-                                    "score_fields": list(completeness_score_policy.score_fields),
-                                    "score_thresholds_start": completeness_score_policy.score_thresholds_start,
-                                    "score_thresholds": completeness_score_policy.score_thresholds,
-                                    "score_threshold_ramp_cycles": completeness_score_policy.score_threshold_ramp_cycles,
+                                    "score_fields": list(get_global_review_score_fields("global_completeness")),
                                 },
                                 {
                                     "instance_id": "global_depth",
@@ -635,10 +624,7 @@ def generate_config(
                                     "system_prompt_file": "",
                                     "user_prompt_template": os.path.join(
                                         prompts_dir, "global_review_depth_user.md"),
-                                    "score_fields": list(depth_score_policy.score_fields),
-                                    "score_thresholds_start": depth_score_policy.score_thresholds_start,
-                                    "score_thresholds": depth_score_policy.score_thresholds,
-                                    "score_threshold_ramp_cycles": depth_score_policy.score_threshold_ramp_cycles,
+                                    "score_fields": list(get_global_review_score_fields("global_depth")),
                                 },
                             ],
                             "result_review": [

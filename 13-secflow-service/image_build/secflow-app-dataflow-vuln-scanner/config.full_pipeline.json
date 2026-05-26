@@ -424,14 +424,7 @@
                 "user_prompt_template": "prompts/vuln_scan/global_review_completeness_user.md",
                 "score_fields": [
                   "coverage"
-                ],
-                "score_thresholds_start": {
-                  "coverage": 0.8
-                },
-                "score_thresholds": {
-                  "coverage": 0.95
-                },
-                "score_threshold_ramp_cycles": 5
+                ]
               },
               {
                 "instance_id": "global_depth",
@@ -442,14 +435,7 @@
                 "user_prompt_template": "prompts/vuln_scan/global_review_depth_user.md",
                 "score_fields": [
                   "vuln_pattern_breadth"
-                ],
-                "score_thresholds_start": {
-                  "vuln_pattern_breadth": 0.6
-                },
-                "score_thresholds": {
-                  "vuln_pattern_breadth": 0.82
-                },
-                "score_threshold_ramp_cycles": 5
+                ]
               }
             ],
             "result_review": [
