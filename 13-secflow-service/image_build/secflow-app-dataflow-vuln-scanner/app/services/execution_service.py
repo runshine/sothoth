@@ -1719,7 +1719,7 @@ class ExecutionService:
                 detail="output_dir is not supported by run_vuln_scan.py launcher; final outputs are written to the task output directory",
             )
         data_flow_path = self._resolve_dataflow_input_ref(project_id=project_id, ref=data_flow_ref, expected="data_flow")
-        if not (data_flow_path.is_dir() or data_flow_path.is_file()):
+        if not data_flow_path.is_dir():
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {data_flow_path}")
         source_dir_path = self._resolve_dataflow_input_ref(project_id=project_id, ref=source_dir_ref, expected="source_dir")
         if not source_dir_path.is_dir():
@@ -1922,7 +1922,7 @@ class ExecutionService:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="dataflow scan request is incomplete")
 
         source_data_flow = self._resolve_dataflow_input_ref(project_id=project_id, ref=data_flow_ref, expected="data_flow")
-        if not (source_data_flow.is_dir() or source_data_flow.is_file()):
+        if not source_data_flow.is_dir():
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {source_data_flow}")
         source_source_dir = self._resolve_dataflow_input_ref(project_id=project_id, ref=source_dir_ref, expected="source_dir")
         workspace_base = None
@@ -1947,11 +1947,7 @@ class ExecutionService:
         scan_input_dir = ensure_dir(materialized_input_dir / "dataflow_scan")
         data_flow_target = scan_input_dir / "data_flow"
         source_target = scan_input_dir / "source"
-        if source_data_flow.is_file():
-            data_flow_target = data_flow_target / sanitize_name(str(data_flow_ref.get("filename") or source_data_flow.name or "data_flow.md"))
-            self._copy_ref_to_target(source_path=source_data_flow, target_path=data_flow_target, expected="file")
-        else:
-            self._copy_ref_to_target(source_path=source_data_flow, target_path=data_flow_target, expected="directory")
+        self._copy_ref_to_target(source_path=source_data_flow, target_path=data_flow_target, expected="directory")
         self._copy_ref_to_target(source_path=source_source_dir, target_path=source_target, expected="directory")
 
         from run_vuln_scan import data_flow_manifest_input, generate_task_md

@@ -56,9 +56,11 @@ def _prepare_business_case(case_name: str) -> Path:
     config = get_config()
     case_root = Path(config.fileserver_service.data_mount_path) / "files" / "default" / case_name
     source_dir = case_root / "source"
+    data_flow_dir = case_root / "data_flow"
     source_dir.mkdir(parents=True, exist_ok=True)
+    data_flow_dir.mkdir(parents=True, exist_ok=True)
     (source_dir / "demo.c").write_text("int demo(char *p) { return p[0]; }\n", encoding="utf-8")
-    (case_root / "data_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
+    (data_flow_dir / "data_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
     return case_root
 
 
@@ -75,7 +77,7 @@ def _create_business_dataflow_task(
         "project_id": "default",
         "profile_id": profile_id,
         "title": title,
-        "data_flow": {"source": "project_filesystem", "path": f"/{case_name}/data_flow.md"},
+        "data_flow": {"source": "project_filesystem", "path": f"/{case_name}/data_flow"},
         "source_dir": {"source": "project_filesystem", "path": f"/{case_name}/source"},
         "model": "mock/model",
         "review_profile": "fast",
@@ -444,8 +446,9 @@ def test_dataflow_task_rejects_absolute_input_refs_by_default(service_config_pat
     case_root = Path(project_root) / "files" / "default" / "case-absolute"
     source_dir = case_root / "source"
     source_dir.mkdir(parents=True, exist_ok=True)
-    data_flow_file = case_root / "data_flow.md"
-    data_flow_file.write_text("# 数据流追踪：demo\n", encoding="utf-8")
+    data_flow_dir = case_root / "data_flow"
+    data_flow_dir.mkdir(parents=True, exist_ok=True)
+    (data_flow_dir / "data_flow.md").write_text("# 数据流追踪：demo\n", encoding="utf-8")
 
     app = create_app()
     client = TestClient(app)
@@ -457,7 +460,7 @@ def test_dataflow_task_rejects_absolute_input_refs_by_default(service_config_pat
             "project_id": "default",
             "profile_id": profile["profile_id"],
             "title": "absolute path rejected",
-            "data_flow": {"source": "absolute_path", "path": str(data_flow_file.resolve())},
+            "data_flow": {"source": "absolute_path", "path": str(data_flow_dir.resolve())},
             "source_dir": {"source": "absolute_path", "path": str(source_dir.resolve())},
         },
     )
@@ -473,7 +476,9 @@ def test_dataflow_task_rejects_fileserver_storage_outside_project(service_config
     other_root = Path(project_root) / "files" / "other" / "case-cross-project"
     other_source = other_root / "source"
     other_source.mkdir(parents=True, exist_ok=True)
-    (other_root / "data_flow.md").write_text("# 数据流追踪：demo\n", encoding="utf-8")
+    other_data_flow_dir = other_root / "data_flow"
+    other_data_flow_dir.mkdir(parents=True, exist_ok=True)
+    (other_data_flow_dir / "data_flow.md").write_text("# 数据流追踪：demo\n", encoding="utf-8")
 
     app = create_app()
     client = TestClient(app)
@@ -485,7 +490,7 @@ def test_dataflow_task_rejects_fileserver_storage_outside_project(service_config
             "project_id": "default",
             "profile_id": profile["profile_id"],
             "title": "cross project storage rejected",
-            "data_flow": {"source": "fileserver_storage", "storage_key": "files/other/case-cross-project/data_flow.md"},
+            "data_flow": {"source": "fileserver_storage", "storage_key": "files/other/case-cross-project/data_flow"},
             "source_dir": {"source": "fileserver_storage", "storage_key": "files/other/case-cross-project/source"},
         },
     )
@@ -585,7 +590,10 @@ def test_business_dataflow_task_ignores_selected_runs_root_for_standard_task_lay
     source_dir.mkdir(parents=True, exist_ok=True)
     runs_root.mkdir(parents=True, exist_ok=True)
     (source_dir / "demo.c").write_text("int demo(char *p) { return p[0]; }\n", encoding="utf-8")
-    (case_root / "data_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
+    (runs_root / ".keep").write_text("", encoding="utf-8")
+    data_flow_dir = case_root / "data_flow"
+    data_flow_dir.mkdir(parents=True, exist_ok=True)
+    (data_flow_dir / "data_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
 
     app = create_app()
     client = TestClient(app)
@@ -598,7 +606,7 @@ def test_business_dataflow_task_ignores_selected_runs_root_for_standard_task_lay
             "profile_id": profile["profile_id"],
             "title": "business scan custom workspace",
             "workspace_dir": {"source": "project_filesystem", "path": "/case-custom/runs"},
-            "data_flow": {"source": "project_filesystem", "path": "/case-custom/data_flow.md"},
+            "data_flow": {"source": "project_filesystem", "path": "/case-custom/data_flow"},
             "source_dir": {"source": "project_filesystem", "path": "/case-custom/source"},
             "model": "mock/model",
             "thinking": "medium",
@@ -664,7 +672,9 @@ def test_business_dataflow_task_without_title_uses_task_id_for_run_name(service_
     source_dir = case_root / "source"
     source_dir.mkdir(parents=True, exist_ok=True)
     (source_dir / "demo.c").write_text("int demo(char *p) { return p[0]; }\n", encoding="utf-8")
-    (case_root / "custom_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
+    data_flow_dir = case_root / "data_flow"
+    data_flow_dir.mkdir(parents=True, exist_ok=True)
+    (data_flow_dir / "custom_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
 
     app = create_app()
     client = TestClient(app)
@@ -675,7 +685,7 @@ def test_business_dataflow_task_without_title_uses_task_id_for_run_name(service_
         json={
             "project_id": "default",
             "profile_id": profile["profile_id"],
-            "data_flow": {"source": "project_filesystem", "path": "/case-no-title/custom_flow.md"},
+            "data_flow": {"source": "project_filesystem", "path": "/case-no-title/data_flow"},
             "source_dir": {"source": "project_filesystem", "path": "/case-no-title/source"},
             "model": "mock/model",
             "review_profile": "fast",
@@ -717,7 +727,9 @@ def test_dataflow_run_resolve_by_task_reinitializes_missing_pending_run(
     source_dir = case_root / "source"
     source_dir.mkdir(parents=True, exist_ok=True)
     (source_dir / "demo.c").write_text("int demo(char *p) { return p[0]; }\n", encoding="utf-8")
-    (case_root / "data_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
+    data_flow_dir = case_root / "data_flow"
+    data_flow_dir.mkdir(parents=True, exist_ok=True)
+    (data_flow_dir / "data_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
 
     app = create_app()
     client = TestClient(app)
@@ -729,7 +741,7 @@ def test_dataflow_run_resolve_by_task_reinitializes_missing_pending_run(
             "project_id": "default",
             "profile_id": profile["profile_id"],
             "title": "pending resolve scan",
-            "data_flow": {"source": "project_filesystem", "path": "/case-pending-resolve/data_flow.md"},
+            "data_flow": {"source": "project_filesystem", "path": "/case-pending-resolve/data_flow"},
             "source_dir": {"source": "project_filesystem", "path": "/case-pending-resolve/source"},
             "model": "mock/model",
             "review_profile": "fast",
@@ -777,7 +789,9 @@ def test_dataflow_run_resolve_by_task_recovers_from_metadata_when_workspace_root
     source_dir = case_root / "source"
     source_dir.mkdir(parents=True, exist_ok=True)
     (source_dir / "demo.c").write_text("int demo(char *p) { return p[0]; }\n", encoding="utf-8")
-    (case_root / "data_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
+    data_flow_dir = case_root / "data_flow"
+    data_flow_dir.mkdir(parents=True, exist_ok=True)
+    (data_flow_dir / "data_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
 
     app = create_app()
     client = TestClient(app)
@@ -789,7 +803,7 @@ def test_dataflow_run_resolve_by_task_recovers_from_metadata_when_workspace_root
             "project_id": "default",
             "profile_id": profile["profile_id"],
             "title": "metadata resolve scan",
-            "data_flow": {"source": "project_filesystem", "path": "/case-metadata-resolve/data_flow.md"},
+            "data_flow": {"source": "project_filesystem", "path": "/case-metadata-resolve/data_flow"},
             "source_dir": {"source": "project_filesystem", "path": "/case-metadata-resolve/source"},
             "model": "mock/model",
             "review_profile": "fast",
@@ -849,7 +863,9 @@ def test_business_dataflow_task_rejects_output_dir_with_cli_launcher(service_con
     source_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     (source_dir / "demo.c").write_text("int demo(char *p) { return p[0]; }\n", encoding="utf-8")
-    (case_root / "data_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
+    data_flow_dir = case_root / "data_flow"
+    data_flow_dir.mkdir(parents=True, exist_ok=True)
+    (data_flow_dir / "data_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
 
     app = create_app()
     client = TestClient(app)
@@ -862,7 +878,7 @@ def test_business_dataflow_task_rejects_output_dir_with_cli_launcher(service_con
             "profile_id": profile["profile_id"],
             "title": "business scan default output",
             "workspace_dir": {"source": "project_filesystem", "path": "/case-workspace-only/runs"},
-            "data_flow": {"source": "project_filesystem", "path": "/case-workspace-only/data_flow.md"},
+            "data_flow": {"source": "project_filesystem", "path": "/case-workspace-only/data_flow"},
             "source_dir": {"source": "project_filesystem", "path": "/case-workspace-only/source"},
             "output_dir": {"source": "project_filesystem", "path": "/case-workspace-only/runs/nested-output"},
             "model": "mock/model",
@@ -885,7 +901,9 @@ def test_dataflow_task_creates_missing_profile_version_snapshot(service_config_p
     source_dir = case_root / "source"
     source_dir.mkdir(parents=True, exist_ok=True)
     (source_dir / "demo.c").write_text("int demo(char *p) { return p[0]; }\n", encoding="utf-8")
-    (case_root / "data_flow.md").write_text("# 数据流追踪：demo\n\nINPUT-1\n", encoding="utf-8")
+    data_flow_dir = case_root / "data_flow"
+    data_flow_dir.mkdir(parents=True, exist_ok=True)
+    (data_flow_dir / "data_flow.md").write_text("# 数据流追踪：demo\n\nINPUT-1\n", encoding="utf-8")
 
     app = create_app()
     client = TestClient(app)
@@ -907,7 +925,7 @@ def test_dataflow_task_creates_missing_profile_version_snapshot(service_config_p
             "project_id": "default",
             "profile_id": profile_id,
             "title": "business scan with repaired profile version",
-            "data_flow": {"source": "project_filesystem", "path": "/case-missing-profile-version/data_flow.md"},
+            "data_flow": {"source": "project_filesystem", "path": "/case-missing-profile-version/data_flow"},
             "source_dir": {"source": "project_filesystem", "path": "/case-missing-profile-version/source"},
         },
     )
@@ -1153,7 +1171,9 @@ def test_project_filesystem_browser_uses_local_project_tree(service_config_path)
     case_root = Path(project_root) / "files" / "default" / "case-browser"
     nested_dir = case_root / "source"
     nested_dir.mkdir(parents=True, exist_ok=True)
-    (case_root / "data_flow.md").write_text("# browser test\n", encoding="utf-8")
+    data_flow_dir = case_root / "data_flow"
+    data_flow_dir.mkdir(parents=True, exist_ok=True)
+    (data_flow_dir / "data_flow.md").write_text("# browser test\n", encoding="utf-8")
     (nested_dir / "demo.c").write_text("int demo(void) { return 0; }\n", encoding="utf-8")
 
     app = create_app()
@@ -1176,7 +1196,7 @@ def test_project_filesystem_browser_uses_local_project_tree(service_config_path)
     directories = {item["name"]: item for item in payload["directories"]}
     files = {item["name"]: item for item in payload["files"]}
     assert directories["source"]["node_type"] == "directory"
-    assert files["data_flow.md"]["node_type"] == "file"
+    assert directories["data_flow"]["node_type"] == "directory"
 
     escaped = client.get(
         "/api/dataflow-vuln-scanner/project-filesystem/children",

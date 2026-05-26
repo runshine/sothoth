@@ -15485,11 +15485,19 @@ class TaskManager:
             "source_root_path": source_root_path,
             "source_dir": source_dir,
             "source_file": source_file,
-            "data_flow_file": data_flow_file,
-            "data_flow_root": dataflow_dir or artifact_root,
+            "data_flow_root": artifact_root,
             "dataflow_dir": dataflow_dir,
-            "primary_report_path": data_flow_file,
         }
+
+    def _compress_source_file_hint(self, value: str) -> str:
+        normalized = str(value or "").strip().replace("\\", "/")
+        if not normalized:
+            return ""
+        if len(normalized) <= 240:
+            return normalized
+        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
+        suffix = Path(normalized).name or "source"
+        return f".../{suffix}#{digest}"
 
     def _validate_dataflow_output_contract(self, item: dict[str, Any], *, allow_fallback: bool = False) -> dict[str, Any]:
         if not isinstance(item, dict):
@@ -15499,9 +15507,9 @@ class TaskManager:
             normalized["source_dir"] = normalized.get("source_dir") or self._resolve_entry_source_dir(normalized)
             normalized["module_input_path"] = normalized.get("module_input_path") or self._resolve_dfa_module_input_path(normalized)
             normalized["source_root_path"] = normalized.get("source_root_path") or self._resolve_dfa_source_root_path(normalized)
-            normalized["primary_report_path"] = normalized.get("primary_report_path") or normalized.get("data_flow_file")
             normalized["dataflow_dir"] = normalized.get("dataflow_dir") or normalized.get("data_flow_root")
             normalized["data_flow_root"] = normalized.get("data_flow_root") or normalized.get("dataflow_dir") or normalized.get("artifact_root") or normalized.get("archive_root")
+        normalized["source_file"] = self._compress_source_file_hint(str(normalized.get("source_file") or normalized.get("definition_file") or normalized.get("file_name") or ""))
         for field, message in (
             ("entry_key", "数据流分析输出缺少 entry_key"),
             ("module_key", "数据流分析输出缺少 module_key"),
@@ -15511,7 +15519,6 @@ class TaskManager:
             ("module_input_path", "数据流分析输出缺少 module_input_path"),
             ("source_root_path", "数据流分析输出缺少 source_root_path"),
             ("source_file", "数据流分析输出缺少 source_file"),
-            ("data_flow_file", "数据流分析输出缺少 data_flow_file"),
             ("dataflow_dir", "数据流分析输出缺少 dataflow_dir"),
         ):
             if not str(normalized.get(field) or "").strip():
@@ -15972,6 +15979,8 @@ class TaskManager:
                 session.commit()
                 return {"status": "archive_blocked", "error": error, "item": entry, "archive_blocked": True}
             archived_dataflow_dir = self._resolve_dataflow_directory(archived_dir)
+            if archived_dataflow_dir is None:
+                raise ValidationError(f"数据流分析归档产物缺少 dataflow 目录: {archived_dir}")
             archived_data_flow_file = self._find_first(archived_dir, [r"final_report\.md", r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"])
             result = self._build_dataflow_output_contract(
                 entry,
@@ -15980,9 +15989,9 @@ class TaskManager:
                 module_input_path=module_input_path,
                 source_root_path=source_root_path,
                 source_dir=source_root_path,
-                source_file=normalized_source_file,
-                data_flow_file=str(archived_data_flow_file or data_flow_file) if (archived_data_flow_file or data_flow_file) else "",
-                dataflow_dir=str(archived_dataflow_dir or dataflow_dir or archived_dir),
+                source_file=self._compress_source_file_hint(normalized_source_file),
+                data_flow_file="",
+                dataflow_dir=str(archived_dataflow_dir),
             )
             result["downstream"] = self._lightweight_downstream_payload(payload)
             item.result = self._compact_result_for_storage(stage_run.stage_name, result)
@@ -15993,11 +16002,9 @@ class TaskManager:
                 "module_input_path": module_input_path,
                 "source_root_path": source_root_path,
                 "source_dir": source_root_path,
-                "source_file": normalized_source_file,
-                "data_flow_file": result["data_flow_file"],
+                "source_file": result["source_file"],
                 "data_flow_root": result["data_flow_root"],
                 "dataflow_dir": result["dataflow_dir"],
-                "primary_report_path": result["primary_report_path"],
             }
             if self._streaming_mode_enabled(task):
                 self._trigger_vuln_items_from_dataflow_result(session, task, result, upstream_item=item)
@@ -16478,10 +16485,8 @@ class TaskManager:
             "source_file": item.get("source_file") or item.get("definition_file") or item.get("file_name"),
             "artifact_root": item.get("artifact_root"),
             "archive_root": item.get("archive_root"),
-            "data_flow_file": item.get("data_flow_file"),
-            "data_flow_root": item.get("data_flow_root") or item.get("dataflow_dir") or item.get("artifact_root"),
-            "dataflow_dir": item.get("dataflow_dir") or item.get("data_flow_root") or item.get("artifact_root"),
-            "primary_report_path": item.get("primary_report_path") or item.get("data_flow_file"),
+            "data_flow_root": item.get("data_flow_root") or item.get("artifact_root"),
+            "dataflow_dir": item.get("dataflow_dir") or item.get("artifact_root"),
         }
 
     def _compact_vuln_summary_item(self, item: dict[str, Any]) -> dict[str, Any]:

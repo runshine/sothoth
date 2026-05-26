@@ -13310,7 +13310,6 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(fake_session, call_args.args[0])
         self.assertIs(task, call_args.args[1])
         self.assertEqual("entry-1", call_args.args[2]["entry_key"])
-        self.assertTrue(call_args.args[2]["data_flow_file"].endswith("dataflow.md"))
         self.assertEqual("/tmp/repo/modules/module-1", call_args.args[2]["module_input_path"])
         self.assertEqual("/tmp/repo/src", call_args.args[2]["source_root_path"])
         self.assertEqual("/tmp/repo/src", call_args.args[2]["source_dir"])
@@ -13378,6 +13377,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.manager, "_poll_until_terminal", return_value=("success", {"task_id": "dfa-live", "status": "passed"})),
             patch.object(self.manager, "_service_output_dir", return_value=Path("/tmp")),
             patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
+            patch.object(self.manager, "_resolve_dataflow_directory", return_value=Path("/tmp/dataflow")),
             patch.object(self.manager, "_find_first", return_value=Path("/tmp/dataflow.md")),
             patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
             patch.object(self.manager, "_lightweight_downstream_payload", side_effect=lambda payload: {"status": payload.get("status")}),
@@ -13468,10 +13468,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("/tmp/repo/src", item.output_ref["source_root_path"])
         self.assertEqual("/tmp/repo/src", item.output_ref["source_dir"])
         self.assertEqual("main.c", item.output_ref["source_file"])
-        self.assertEqual("/tmp/dataflow", item.output_ref["data_flow_root"])
+        self.assertEqual("/tmp", item.output_ref["data_flow_root"])
         self.assertEqual("/tmp/dataflow", item.output_ref["dataflow_dir"])
-        self.assertEqual("/tmp/dataflow.md", item.output_ref["primary_report_path"])
-
     def test_run_dataflow_item_rejects_declaration_only_entries(self):
         task = BinarySecurityTask(id="t1", name="source-task", project_id="p1", workspace_root="/tmp/ws")
         stage_run = BinarySecurityStageRun(
@@ -13878,7 +13876,27 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("success", result["status"])
         self.assertEqual(1, len(create_calls))
         self.assertEqual("/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1/dataflow", create_calls[0]["data_flow_path"])
-        self.assertEqual("/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/binary-to-source/modules/module-1", create_calls[0]["source_dir"])
+
+    def test_validate_dataflow_output_contract_requires_dataflow_dir(self):
+        payload = {
+            "entry_key": "entry-1",
+            "function_name": "main",
+            "module_key": "module-1",
+            "module_name": "module-1",
+            "source_dir": ".",
+            "source_root_path": "/tmp/src",
+            "module_input_path": "/tmp/src/module-1",
+            "source_file": "main.c",
+        }
+        with self.assertRaises(ValidationError):
+            self.manager._validate_dataflow_output_contract(payload, allow_fallback=True)
+
+    def test_compress_source_file_hint_limits_length(self):
+        raw = "/" + "/".join(["very-long-segment"] * 40) + "/main.c"
+        compressed = self.manager._compress_source_file_hint(raw)
+        self.assertLessEqual(len(compressed), 240)
+        self.assertTrue(compressed.startswith(".../"))
+        self.assertIn("main.c#", compressed)
 
     def test_run_entry_item_uses_descriptor_contract_for_binary_module(self):
         task = BinarySecurityTask(
@@ -14311,6 +14329,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.manager, "_poll_until_terminal", return_value=("success", {"task_id": "dfa-new", "status": "passed"})),
             patch.object(self.manager, "_service_output_dir", return_value=Path("/tmp")),
             patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
+            patch.object(self.manager, "_resolve_dataflow_directory", return_value=Path("/tmp/dataflow")),
             patch.object(self.manager, "_find_first", return_value=Path("/tmp/dataflow.md")),
             patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
             patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
