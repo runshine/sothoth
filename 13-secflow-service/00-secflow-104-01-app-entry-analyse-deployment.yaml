@@ -16,21 +16,17 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-app-entry-analyse
-        image: ghcr.io/runshine/secflow-app-entry-analyse:latest
+        image: 172.31.30.52:5000/secflow-app-entry-analyse:latest
         imagePullPolicy: Always
         env:
           - name: TZ
             value: Asia/Shanghai
-          - name: EA_RUNTIME_ROLE
-            value: "api"
           - name: PORT
             value: "8080"
           - name: FILESERVER_ROOT
             value: /data/files
           - name: WORKER_ISOLATION_MODE
             value: "none"
-          - name: EA_SESSION_INDEX_REFRESH_SECONDS
-            value: "60"
         ports:
         - containerPort: 8080
         volumeMounts:
@@ -41,11 +37,11 @@ spec:
           mountPath: /data
         resources:
           requests:
-            memory: "512Mi"
-            cpu: "500m"
+            memory: "256Mi"
+            cpu: "200m"
           limits:
-            memory: "2Gi"
-            cpu: "2"
+            memory: "1Gi"
+            cpu: "1000m"
         livenessProbe:
           httpGet:
             path: /api/app/entry-analyse/health
