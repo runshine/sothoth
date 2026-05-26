@@ -16,6 +16,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import load_only
 
 from app.api.dependencies import ensure_project_access, get_current_subject
+from app.build_info import build_service_meta
 from app.exception import ForbiddenError, InternalError, NotFoundError, ValidationError
 from app.model import FirmwareEvolutionJob, FirmwareEvolutionRound, ServiceConfig, TaskStatus, UnpackTask, UnpackTaskEvent, get_db_session
 from app.schemas import (
@@ -2372,7 +2373,7 @@ def _list_llm_config_file_summaries() -> dict:
 @router.get("/health", response_model=HealthResponse)
 @router.get("/api/app/firmware-unpacker/health", response_model=HealthResponse)
 async def health_check():
-    return {"status": "ok", "owner_id": get_worker_id()}
+    return {"status": "ok", "owner_id": get_worker_id(), **build_service_meta()}
 
 
 @router.get("/ready", response_model=ReadyResponse)

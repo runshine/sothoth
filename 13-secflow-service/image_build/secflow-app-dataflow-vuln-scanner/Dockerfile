@@ -2,6 +2,7 @@ FROM python:3.11-slim
 
 ARG INSTALL_PI_CLI=1
 ARG PI_NPM_PACKAGE=@mariozechner/pi-coding-agent
+ARG SECFLOW_BUILD_VERSION=""
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -42,6 +43,7 @@ COPY config.vuln_scan_default.json ./config.vuln_scan_default.json
 COPY config.full_pipeline.json ./config.full_pipeline.json
 COPY config.yaml ./config.yaml
 COPY docker/entrypoint.sh /usr/local/bin/secflow-entrypoint
+RUN printf '{\"build_version\":\"%s\"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
 RUN chmod +x /usr/local/bin/secflow-entrypoint \
     && mkdir -p /app/runs /data /root

@@ -2,6 +2,7 @@ FROM mcr.microsoft.com/devcontainers/python:1-3.11-bookworm
 
 WORKDIR /app
 
+ARG SECFLOW_BUILD_VERSION=""
 ENV TZ=Asia/Shanghai
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
@@ -13,6 +14,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app/ /app/app/
 COPY config.yaml /app/config.yaml
+RUN printf '{\"build_version\":\"%s\"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
 EXPOSE 8080
 
