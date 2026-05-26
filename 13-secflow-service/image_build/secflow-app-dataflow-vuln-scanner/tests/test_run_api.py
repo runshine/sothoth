@@ -1217,6 +1217,65 @@ def test_run_delete_active_run_stops_process_and_removes_records(service_config_
         assert db.query(WorkflowExecutionEvent).filter(WorkflowExecutionEvent.execution_id == bound["execution_id"]).count() == 0
 
 
+def test_run_delete_pending_run_removes_records_without_stale_data(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_delete_pending_20260508_010203"
+    bound = _create_execution_bound_run(client, run_root)
+
+    with get_db_session() as db:
+        run_index = db.get(RunIndex, bound["run_id"])
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        trigger = db.get(TriggerTask, bound["task_id"])
+        assert run_index is not None and execution is not None and trigger is not None
+        run_index.status = "pending"
+        execution.status = "pending"
+        execution.process_status = "not_started"
+        trigger.status = "pending"
+        db.add_all([run_index, execution, trigger])
+        db.commit()
+
+    delete_response = client.delete(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
+    assert delete_response.status_code == 200
+    assert delete_response.json()["status"] == "deleted"
+    assert not run_root.exists()
+
+    with get_db_session() as db:
+        assert db.get(RunIndex, bound["run_id"]) is None
+        assert db.get(TriggerTask, bound["task_id"]) is None
+        assert db.get(WorkflowExecution, bound["execution_id"]) is None
+
+
+
+def test_delete_task_pending_run_removes_records_without_stale_data(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_delete_task_pending_20260508_010203"
+    bound = _create_execution_bound_run(client, run_root)
+
+    with get_db_session() as db:
+        run_index = db.get(RunIndex, bound["run_id"])
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        trigger = db.get(TriggerTask, bound["task_id"])
+        assert run_index is not None and execution is not None and trigger is not None
+        run_index.status = "pending"
+        execution.status = "pending"
+        execution.process_status = "not_started"
+        trigger.status = "pending"
+        db.add_all([run_index, execution, trigger])
+        db.commit()
+
+    delete_response = client.delete(f"/api/dataflow-vuln-scanner/tasks/{bound['task_id']}")
+    assert delete_response.status_code == 200
+    assert delete_response.json()["success"] is True
+    assert not run_root.exists()
+
+    with get_db_session() as db:
+        assert db.get(RunIndex, bound["run_id"]) is None
+        assert db.get(TriggerTask, bound["task_id"]) is None
+        assert db.get(WorkflowExecution, bound["execution_id"]) is None
+
+
 def test_run_delete_active_run_does_not_wait_after_local_process_stopped(service_config_path, monkeypatch):
     app = create_app()
     client = TestClient(app)

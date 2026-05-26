@@ -3758,6 +3758,18 @@ class ExecutionService:
                 return False
             time.sleep(0.5)
 
+    @staticmethod
+    def _expunge_loaded_records(db: Session, model: type, record_ids: list[str] | None) -> None:
+        id_set = {str(item).strip() for item in (record_ids or []) if str(item).strip()}
+        if not id_set:
+            return
+        for instance in list(db.identity_map.values()):
+            if isinstance(instance, model) and str(getattr(instance, "id", "") or "") in id_set:
+                try:
+                    db.expunge(instance)
+                except Exception:
+                    pass
+
     def _delete_linked_runtime_records(self, db: Session, *, linked_task_id: str | None, linked_execution_id: str | None) -> None:
         execution_ids: list[str] = []
         if linked_task_id:
@@ -3769,14 +3781,15 @@ class ExecutionService:
             ]
         elif linked_execution_id:
             execution_ids = [linked_execution_id]
+
+        self._expunge_loaded_records(db, WorkflowExecution, execution_ids)
+        self._expunge_loaded_records(db, TriggerTask, [linked_task_id] if linked_task_id else [])
+
         if execution_ids:
             db.query(WorkflowExecutionEvent).filter(WorkflowExecutionEvent.execution_id.in_(execution_ids)).delete(synchronize_session=False)
             db.query(WorkflowExecution).filter(WorkflowExecution.id.in_(execution_ids)).delete(synchronize_session=False)
         if linked_task_id:
-            trigger = db.get(TriggerTask, linked_task_id)
-            if trigger is not None:
-                db.delete(trigger)
-        db.flush()
+            db.query(TriggerTask).filter(TriggerTask.id == linked_task_id).delete(synchronize_session=False)
 
     def delete_run(self, db: Session, run_index_id: str, principal: dict) -> dict[str, Any]:
         run_index = self._run_index_or_404(db, run_index_id, principal)
@@ -4354,11 +4367,7 @@ class ExecutionService:
             db.query(RunIndexCycle).filter(RunIndexCycle.run_index_id.in_(list(run_index_ids))).delete(synchronize_session=False)
             db.query(RunIndex).filter(RunIndex.id.in_(list(run_index_ids))).delete(synchronize_session=False)
 
-        execution_ids = [execution.id for execution in executions]
-        if execution_ids:
-            db.query(WorkflowExecutionEvent).filter(WorkflowExecutionEvent.execution_id.in_(execution_ids)).delete(synchronize_session=False)
-            db.query(WorkflowExecution).filter(WorkflowExecution.id.in_(execution_ids)).delete(synchronize_session=False)
-        db.delete(trigger)
+        self._delete_linked_runtime_records(db, linked_task_id=trigger.id, linked_execution_id=None)
         db.commit()
 
         for path in workspace_roots:

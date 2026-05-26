@@ -158,6 +158,8 @@ def generate_task_md(dataflow_dir: str, source_dir: str) -> str:
     sub_reports = _find_sub_dataflow_reports(dataflow_root, dataflow_files)
     overview = _extract_dataflow_overview(final_report, dataflow_files)
     marker_counts = _extract_analysis_marker_counts(final_report, dataflow_files)
+    source_manifest_files = _discover_source_manifest_files(source_root)
+    source_manifest_entries = _discover_source_manifest_entries(source_root, source_manifest_files)
     source_files = _discover_source_files(source_root)
 
     root_name = str(overview.get("root_function") or "").strip()
@@ -205,16 +207,27 @@ def generate_task_md(dataflow_dir: str, source_dir: str) -> str:
         dataflow_lines.extend(marker_lines)
 
     source_lines = [f"`{os.path.abspath(source_root)}`", ""]
+    if source_manifest_files:
+        source_lines.extend(
+            _format_source_manifest_lines(
+                source_root,
+                source_manifest_files,
+                source_manifest_entries,
+            )
+        )
+        source_lines.append("")
     if source_files:
-        source_lines.append("该目录包含反编译源码和辅助文件：")
+        source_lines.append("该目录下直接可枚举到的反编译源码和辅助文件：")
         source_lines.extend(_format_source_file_lines(source_root, source_files))
         source_lines.append("")
         source_lines.append(
             "源码用于验证数据流报告中的函数签名、行号、条件判断、内存访问、拷贝长度、"
             "指针偏移、外部调用和清洗逻辑。"
         )
+    elif source_manifest_files:
+        source_lines.append("当前未直接枚举到常见源码后缀文件，请优先按上面的 `files.list` 路径定位源码。")
     else:
-        source_lines.append("当前未枚举到 `.c`、`.h` 或 `.asm` 文件，请确认源码目录路径是否正确。")
+        source_lines.append("当前未枚举到 `.c`、`.h`、`.cc`、`.cpp`、`.hpp`、`.asm` 或 `.s` 文件，请确认源码目录路径是否正确。")
 
     return f"""# 漏洞挖掘任务
 
@@ -232,8 +245,9 @@ def generate_task_md(dataflow_dir: str, source_dir: str) -> str:
 ## 分析要求
 1. 先阅读 `final_report.md`，建立入口函数、调用链和高危传播路径的整体视图。
 2. 再按需要阅读 `dataflow/` 中对应的子函数报告，补齐跨函数传播、导入污点对象和终点语义。
-3. 对照源码目录中的反编译源码按数据流污点传播路径进行漏洞挖掘和报告生成。
-4. 输出漏洞时必须给出从污点源到危险操作的证据链，并引用数据流报告文件和源码位置。
+3. 若源码目录下存在 `files.list`，先读取并按 task.md 中给出的清单路径定位实际源码文件，不要只在当前目录盲目猜测文件位置。
+4. 对照源码目录中的反编译源码按数据流污点传播路径进行漏洞挖掘和报告生成。
+5. 输出漏洞时必须给出从污点源到危险操作的证据链，并引用数据流报告文件和源码位置。
 """
 
 
@@ -351,10 +365,54 @@ def _format_marker_meaning_lines() -> list[str]:
     ]
 
 
+def _discover_source_manifest_files(source_root: Path) -> list[Path]:
+    if not source_root.is_dir():
+        return []
+    return sorted(
+        (item for item in source_root.rglob("files.list") if item.is_file()),
+        key=lambda item: str(item.relative_to(source_root)),
+    )
+
+
+def _resolve_source_manifest_entry(source_root: Path, manifest_path: Path, entry: str) -> Path:
+    candidate = Path(entry)
+    if candidate.is_absolute():
+        return candidate
+    normalized = entry.replace("\\", "/").lstrip("/")
+    source_root_candidate = source_root / normalized
+    if source_root_candidate.exists():
+        return source_root_candidate
+    manifest_dir_candidate = manifest_path.parent / normalized
+    if manifest_dir_candidate.exists():
+        return manifest_dir_candidate
+    return source_root_candidate
+
+
+def _discover_source_manifest_entries(
+    source_root: Path,
+    manifest_files: list[Path] | None = None,
+) -> list[tuple[Path, str, Path]]:
+    manifests = manifest_files if manifest_files is not None else _discover_source_manifest_files(source_root)
+    rows: list[tuple[Path, str, Path]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for manifest_path in manifests:
+        for raw_line in _read_text_if_exists(manifest_path).splitlines():
+            entry = raw_line.strip().replace("\\", "/")
+            if not entry or entry.startswith("#"):
+                continue
+            resolved = _resolve_source_manifest_entry(source_root, manifest_path, entry)
+            key = (str(manifest_path), entry, str(resolved))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append((manifest_path, entry, resolved))
+    return rows
+
+
 def _discover_source_files(source_root: Path) -> list[Path]:
     if not source_root.is_dir():
         return []
-    suffix_order = {".c": 0, ".h": 1, ".asm": 2}
+    suffix_order = {".c": 0, ".h": 1, ".cc": 2, ".cpp": 3, ".hpp": 4, ".asm": 5, ".s": 6}
     return sorted(
         (
             item
@@ -365,11 +423,49 @@ def _discover_source_files(source_root: Path) -> list[Path]:
     )
 
 
+def _format_source_manifest_lines(
+    source_root: Path,
+    manifest_files: list[Path],
+    manifest_entries: list[tuple[Path, str, Path]],
+) -> list[str]:
+    entry_counts: dict[Path, int] = {path: 0 for path in manifest_files}
+    for manifest_path, _entry, _resolved in manifest_entries:
+        entry_counts[manifest_path] = entry_counts.get(manifest_path, 0) + 1
+
+    lines = ["检测到模块源码清单 `files.list`："]
+    for manifest_path in manifest_files:
+        lines.append(
+            f"- `{os.path.abspath(manifest_path)}`：列出当前模块需要优先查阅的源码文件，共 {entry_counts.get(manifest_path, 0)} 项。"
+        )
+    lines.append("")
+    lines.append(
+        f"`files.list` 中的相对路径默认相对于源码目录 `{os.path.abspath(source_root)}` 解析；"
+        "若该路径不存在，则回退到 `files.list` 所在目录解析。"
+    )
+    if not manifest_entries:
+        lines.append("")
+        lines.append("当前未从 `files.list` 解析到可用条目，请直接打开上面的清单文件核对源码路径。")
+        return lines
+
+    lines.append("")
+    lines.append("按 `files.list` 解析后的源码文件路径：")
+    for _manifest_path, entry, resolved in manifest_entries:
+        if resolved.exists():
+            lines.append(f"- `{os.path.abspath(resolved)}`")
+        else:
+            lines.append(f"- `{entry}`（当前未解析到现有文件，请手动核对）")
+    return lines
+
+
 def _format_source_file_lines(source_root: Path, source_files: list[Path]) -> list[str]:
     descriptions = {
         ".c": "反编译 C 代码，主要用于验证函数实现、条件判断、污点传播和危险操作。",
         ".h": "头文件，主要用于查看结构体、类型、宏和函数声明。",
-        ".asm": "汇编/反汇编结果，主要用于在反编译代码不明确时核对指令和地址。"
+        ".cc": "C++ 源码，主要用于验证类方法、模板展开和复杂控制流。",
+        ".cpp": "C++ 源码，主要用于验证类方法、模板展开和复杂控制流。",
+        ".hpp": "C++ 头文件，主要用于查看类定义、模板、内联函数和声明。",
+        ".asm": "汇编/反汇编结果，主要用于在反编译代码不明确时核对指令和地址。",
+        ".s": "汇编/反汇编结果，主要用于在反编译代码不明确时核对指令和地址。",
     }
     lines = []
     for item in source_files[:30]:
