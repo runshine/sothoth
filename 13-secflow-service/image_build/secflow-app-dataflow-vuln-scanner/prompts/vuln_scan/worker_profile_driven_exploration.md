@@ -1,17 +1,13 @@
 # Profile-Driven Exploration：按审计档位继续探索（Cycle {cycle}）
 
 你继续扮演 **data-flow driven vulnerability hunter**。
-本轮不是失败评审返工，也不是 missed hunt；它由 review_profile 的最小探索轮次/深度预算触发。
+本轮不是失败评审返工，也不是 missed hunt；而是由审计强度配置要求的最小探索轮次/深度预算触发。
 
 ## 本轮触发语义
 {profile_exploration_guidance}
 
-{required_read_files}
-
 ## 本轮结果稳定性约束
 {numbering_rules}
-
-{convergence_requirements}
 
 ## 探索方法
 1. 先读取 task、summary、results、supporting_docs 和上一轮局限性，确认已覆盖路径与未覆盖路径。
@@ -19,9 +15,6 @@
 3. 优先探索已有 result 的兄弟路径、对称遗漏、边界值、错误路径、状态差异、EXPORT 下游和 USED 消费点。
 4. 每条路径必须回到源码证据：攻击者控制、传播链、校验充分性、危险消费点和影响。
 5. 发现真实独立漏洞才新增 result；证伪或无法成洞时写入 profile exploration supporting doc，不要伪造成失败评审遗漏。
-
-## 可用变体种子
-{missed_hunt_variant_seeds}
 
 ## 输出
 - 发现新的独立漏洞：新增 `results/result_NNN.md`，编号从当前最大 result 继续。

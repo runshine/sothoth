@@ -14,12 +14,6 @@
 - 结果目录: `{results_dir}`
 - 辅助文档目录: `{supporting_docs_dir}`
 
-## 框架评审快照
-{review_context}
-
-## 收敛策略
-{closure_review_policy}
-
 ## 评审重点
 
 围绕 task.md、summary.md、results/、supporting_docs/ 和必要源码判断：
