@@ -634,6 +634,7 @@ TASK_STATUS_PENDING_MODULE_CONFIRMATION = "pending_module_confirmation"
 TASK_STATUS_CONTINUE_PREPARING = "continue_preparing"
 TASK_STATUS_RETRY_PREPARING = "retry_preparing"
 TASK_STATUS_HARD_RESTART_FAILED = "hard_restart_failed"
+TASK_STATUS_DELETE_FAILED = "delete_failed"
 TASK_PREPARING_STATUSES = {TASK_STATUS_CONTINUE_PREPARING, TASK_STATUS_RETRY_PREPARING}
 TASK_ACTION_CONTINUE = "continue"
 TASK_ACTION_RETRY = "retry"
@@ -5589,8 +5590,35 @@ class TaskManager:
             await self._cancel_local_worker(task.id)
             token = self._service_token()
             await self._cancel_downstream_refs(db, task, downstream_refs, token)
-            await self._delete_downstream_refs(db, task, downstream_refs, token)
-            await self._cleanup_task_workspace(task, token)
+            deleted_downstream_count = await self._delete_downstream_refs(db, task, downstream_refs, token)
+            cleanup_status = await self._cleanup_task_workspace(task, token)
+            if cleanup_status != "deleted":
+                task.status = TASK_STATUS_DELETE_FAILED
+                task.last_error = f"任务目录清理失败: cleanup_status={cleanup_status}"
+                task.cleanup_snapshot = {
+                    **dict(task.cleanup_snapshot or {}),
+                    "delete_cleanup_status": cleanup_status,
+                    "delete_failed_at": _isoformat_or_none(_now()),
+                    "workspace_root": task.workspace_root,
+                    "downstream_ref_count": len(downstream_refs),
+                    "deleted_downstream_count": int(deleted_downstream_count or 0),
+                }
+                self._record_event(
+                    db,
+                    task,
+                    "task_delete_failed",
+                    f"任务目录清理失败，任务保留为 delete_failed: {cleanup_status}",
+                    stage_name=task.current_stage,
+                    level="error",
+                    payload={
+                        "state_event_id": event.id,
+                        "cleanup_status": cleanup_status,
+                        "workspace_root": task.workspace_root,
+                        "downstream_ref_count": len(downstream_refs),
+                        "deleted_downstream_count": int(deleted_downstream_count or 0),
+                    },
+                )
+                return
 
             if operation_token:
                 self._release_task_operation_lease(db, task.id, token=operation_token)
@@ -13114,6 +13142,8 @@ class TaskManager:
         try:
             await asyncio.to_thread(shutil.rmtree, workspace_root, True)
         except Exception:
+            cleanup_status = "partial_failed"
+        if workspace_root.exists():
             cleanup_status = "partial_failed"
         return cleanup_status
 

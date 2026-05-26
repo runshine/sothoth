@@ -2565,7 +2565,12 @@ async def delete_task(db: Session, task: B2STask) -> int:
     if task_dir.exists():
         if not task_dir.is_dir():
             raise ValidationError("B2S任务路径不是目录，拒绝删除")
-        shutil.rmtree(task_dir)
+        try:
+            shutil.rmtree(task_dir)
+        except OSError as exc:
+            raise ValidationError(f"B2S任务目录删除失败: {task_dir}: {exc}") from exc
+        if task_dir.exists():
+            raise ValidationError(f"B2S任务目录删除失败，目录仍然存在: {task_dir}")
 
     deleted_event_count = clear_task_timeline(db, task)
     for item in items:

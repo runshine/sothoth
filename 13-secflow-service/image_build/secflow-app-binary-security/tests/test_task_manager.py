@@ -14599,6 +14599,47 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(deferred_events)
         self.assertEqual("reconcile", deferred_events[-1].payload.get("deferred_mode"))
 
+    def test_manual_delete_keeps_task_when_workspace_cleanup_fails(self):
+        task = BinarySecurityTask(
+            id="t-delete",
+            project_id="p1",
+            name="delete-me",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/out",
+            workspace_root="/tmp/ws-delete",
+            current_stage="entry_analysis",
+        )
+        event = BinarySecurityStateEvent(
+            id="se-delete",
+            task_id="t-delete",
+            project_id="p1",
+            stage_name="entry_analysis",
+            event_type="manual_delete_requested",
+            status="pending",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], state_events=[event], events=[])
+
+        async def _run():
+            with (
+                patch.object(self.manager, "_cancel_local_worker", unittest.mock.AsyncMock()),
+                patch.object(self.manager, "_cancel_downstream_refs", unittest.mock.AsyncMock()),
+                patch.object(self.manager, "_delete_downstream_refs", unittest.mock.AsyncMock(return_value=0)),
+                patch.object(self.manager, "_cleanup_task_workspace", unittest.mock.AsyncMock(return_value="partial_failed")),
+                patch.object(self.manager, "_write_task_metadata_async", unittest.mock.AsyncMock()),
+            ):
+                await self.manager._apply_manual_delete_request_locked(db, event)
+
+        asyncio.run(_run())
+
+        self.assertEqual("delete_failed", task.status)
+        self.assertIn("任务目录清理失败", str(task.last_error or ""))
+        self.assertEqual(1, len(db.tasks))
+        failed_events = [row for row in db.added if isinstance(row, BinarySecurityEvent) and row.event_type == "task_delete_failed"]
+        self.assertTrue(failed_events)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -237,6 +237,23 @@ class TimelineServiceTests(unittest.TestCase):
         self.assertEqual([], self.db.query(B2STaskItem).all())
         self.assertEqual([], self.db.query(B2STask).all())
 
+    def test_delete_task_raises_when_workspace_still_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project-1"
+            task_root = project_root / "secflow-app-binary-to-source" / self.task.id
+            task_root.mkdir(parents=True)
+
+            with (
+                mock.patch.object(task_service, "project_root", return_value=project_root),
+                mock.patch.object(task_service, "app_task_root", return_value=task_root),
+                mock.patch.object(task_service.shutil, "rmtree", return_value=None),
+                mock.patch.object(Path, "exists", autospec=True, side_effect=lambda path: True if path == task_root else Path.__dict__["exists"](path)),
+            ):
+                with self.assertRaisesRegex(Exception, "目录仍然存在"):
+                    asyncio.run(task_service.delete_task(self.db, self.task))
+
+        self.assertEqual(1, self.db.query(B2STask).count())
+
 
 class TimelineBatchDeleteApiTests(unittest.TestCase):
     def test_batch_delete_sums_deleted_event_count(self) -> None:
