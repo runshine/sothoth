@@ -10433,17 +10433,23 @@ class TaskManager:
             task.lease_expires_at = None
             self._enqueue_action(task.id)
             return
-        if task.status == "failed" and not self._task_has_active_reconcile_items(db, task):
-            self._invalidate_task_execution(task)
-            task.finished_at = task.finished_at or _now()
-            return
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
         statuses = [run.status for run in stage_runs]
         if any(status in {"running", "dispatching"} for status in statuses):
             task.status = "running"
+            active_run = next((run for run in stage_runs if run.status in {"running", "dispatching"}), None)
+            if active_run and active_run.stage_name:
+                task.current_stage = active_run.stage_name
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.lease_expires_at = None
             task.finished_at = None
             task.last_error = None
             self._clear_task_abnormal_reason_snapshot(db, task)
+            return
+        if task.status == "failed" and not self._task_has_active_reconcile_items(db, task):
+            self._invalidate_task_execution(task)
+            task.finished_at = task.finished_at or _now()
             return
         stage_retry_mode = task.execution_mode in {"stage_retry", "stage_retry_failed_items", "stage_retry_full"} and bool(task.target_stage_name)
         task_retry_mode = task.execution_mode in {"task_retry", "task_retry_failed_items"} and bool(task.target_stage_name)

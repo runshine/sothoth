@@ -1772,7 +1772,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertIsNotNone(task.finished_at)
 
-    def test_refresh_task_status_after_sync_does_not_resurrect_failed_task(self):
+    def test_refresh_task_status_after_sync_keeps_failed_task_terminal_without_active_stage(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -1788,21 +1788,51 @@ class TaskManagerTests(unittest.TestCase):
             dispatch_started_at=_now(),
             lease_expires_at=_now() + timedelta(minutes=1),
         )
-        run = BinarySecurityStageRun(
-            id="sr1",
-            task_id="t1",
-            project_id="p1",
-            stage_name="system_analysis",
-            sequence_no=2,
-            status="running",
-        )
-        db = _ModelAwareDb(tasks=[task], stage_runs=[run])
+        db = _ModelAwareDb(tasks=[task], stage_runs=[])
 
         self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("failed", task.status)
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertIsNotNone(task.finished_at)
+
+    def test_refresh_task_status_after_sync_resurrects_failed_task_when_stage_retry_is_running(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="pod-a",
+            dispatch_started_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=1),
+            last_error="old failed snapshot",
+            finished_at=_now(),
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=4,
+            status="running",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[run])
+
+        self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual("running", task.status)
+        self.assertEqual("entry_analysis", task.current_stage)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertIsNone(task.dispatch_started_at)
+        self.assertIsNone(task.lease_expires_at)
+        self.assertIsNone(task.finished_at)
+        self.assertIsNone(task.last_error)
 
     def test_get_task_detail_reconciles_dispatching_task_to_running_when_stage_is_running(self):
         task = BinarySecurityTask(
