@@ -283,6 +283,10 @@ class GlobalReviewExecutor:
         # agent_error 是运行层错误，不应在 resume 时固化为业务评审结论。
         if parser_mode == "agent_error" or verdict == "ERROR":
             return None
+        data = GlobalReviewExecutor._normalize_legacy_score_threshold_record(
+            data,
+            advisor_def=advisor_def,
+        )
         feedback = str(data.get("feedback") or "")
         detail_feedback = str(data.get("feedback_detail") or feedback)
         return {
@@ -298,6 +302,62 @@ class GlobalReviewExecutor:
             "issues": data.get("issues") or [],
             "already_recorded": True,
         }
+
+    @classmethod
+    def _normalize_legacy_score_threshold_record(
+        cls,
+        data: dict[str, Any],
+        *,
+        advisor_def: AdvisorInstanceDef,
+    ) -> dict[str, Any]:
+        if not cls._is_legacy_score_threshold_fail_record(data):
+            return dict(data)
+
+        raw_response = str(data.get("raw_response") or "")
+        parse_outcome = parse_global_review_response(
+            raw_response,
+            required_score_keys=cls._required_score_keys_for_advisor(advisor_def),
+        )
+        if not parse_outcome.schema_valid or not bool(parse_outcome.parsed.passed):
+            return dict(data)
+
+        parsed = parse_outcome.parsed
+        normalized = dict(data)
+        normalized["passed"] = True
+        normalized["verdict"] = parsed.verdict or "PASS"
+        normalized["feedback"] = parsed.feedback or ""
+        normalized["feedback_detail"] = parsed.feedback_detail or parsed.feedback or ""
+        normalized["scores"] = cls._filter_scores_for_advisor(
+            parsed.scores or {},
+            advisor_def,
+        )
+        normalized["confidence"] = parsed.confidence
+        normalized["issues"] = list(parsed.issues or [])
+        normalized["resolved_issue_ids"] = list(parsed.resolved_issue_ids or [])
+        return normalized
+
+    @staticmethod
+    def _is_legacy_score_threshold_fail_record(data: dict[str, Any]) -> bool:
+        if bool(data.get("passed", False)):
+            return False
+        issues = [
+            item for item in list(data.get("issues") or [])
+            if isinstance(item, dict)
+        ]
+        if not issues:
+            return False
+        if not all(
+            str(item.get("category") or "").strip().lower() == "score_threshold"
+            or "score-threshold" in str(item.get("id") or "").strip().lower()
+            for item in issues
+        ):
+            return False
+        feedback_text = str(
+            data.get("feedback_detail")
+            or data.get("feedback")
+            or ""
+        )
+        return "[框架分数阈值校验未通过]" in feedback_text
 
     async def _run_single_advisor(
         self,
@@ -346,7 +406,6 @@ class GlobalReviewExecutor:
                 "total_global_review_advisors": lambda: str(total_advisors),
                 "prior_global_findings": lambda: "(本轮全局评审并行执行，各参谋独立评审)",
                 "worker_system_prompt_file": lambda: worker_system_prompt_file,
-                "score_thresholds": lambda: self._format_score_thresholds_for_advisor(advisor_def, cycle),
                 "required_score_fields": lambda: self._format_required_score_fields_for_advisor(advisor_def),
                 "closure_review_policy": lambda: self._format_closure_review_policy(review_state.workflow_mode),
             },
@@ -545,24 +604,20 @@ class GlobalReviewExecutor:
                     f"[global review schema invalid] {schema_detail}"
                 )
             else:
-                (
-                    effective_passed,
-                    effective_feedback,
-                    effective_detail_feedback,
-                    effective_verdict,
-                    threshold_issues,
-                    ) = self._apply_score_thresholds(
-                        parsed,
-                        advisor_def,
-                        cycle,
-                        workflow_mode=review_state.workflow_mode,
-                    )
+                effective_passed = bool(parsed.passed)
+                effective_feedback = parsed.feedback or ""
+                effective_detail_feedback = (
+                    parsed.feedback_detail
+                    or parsed.feedback
+                    or ""
+                )
+                effective_verdict = parsed.verdict or (
+                    "PASS" if effective_passed else "FAIL"
+                )
                 model_issues = list(parsed.issues or [])
                 issues = (
                     model_issues
                     if not effective_passed and model_issues
-                    else threshold_issues
-                    if not effective_passed and threshold_issues
                     else [{"source": advisor_def.instance_id, "detail": effective_detail_feedback or effective_feedback}]
                     if not effective_passed else []
                 )
@@ -760,45 +815,6 @@ class GlobalReviewExecutor:
     @staticmethod
     def _required_score_keys_for_advisor(advisor_def: AdvisorInstanceDef) -> list[str]:
         return [str(key).strip() for key in advisor_def.score_fields if str(key).strip()]
-
-    @classmethod
-    def _thresholds_for_advisor(cls, advisor_def: AdvisorInstanceDef, cycle: int = 1) -> dict[str, float]:
-        fields = cls._required_score_keys_for_advisor(advisor_def)
-        final = {
-            key: float(advisor_def.score_thresholds[key])
-            for key in fields
-            if key in advisor_def.score_thresholds
-        }
-        start = {
-            key: float((advisor_def.score_thresholds_start or advisor_def.score_thresholds).get(key, final[key]))
-            for key in final
-        }
-        ramp_cycles = max(1, int(advisor_def.score_threshold_ramp_cycles or 1))
-        t = 1.0 if ramp_cycles <= 1 else min(1.0, max(0.0, (cycle - 1) / float(ramp_cycles - 1)))
-        return {
-            key: round(start[key] + t * (final[key] - start[key]), 2)
-            for key in fields
-            if key in final and key in start
-        }
-
-    @classmethod
-    def _format_score_thresholds_for_advisor(cls, advisor_def: AdvisorInstanceDef, cycle: int = 1) -> str:
-        thresholds = cls._thresholds_for_advisor(advisor_def, cycle)
-        final = advisor_def.score_thresholds or {}
-        lines: list[str] = []
-        for key in cls._required_score_keys_for_advisor(advisor_def):
-            if key not in thresholds:
-                continue
-            current = thresholds[key]
-            target = float(final[key])
-            if abs(current - target) < 0.01:
-                lines.append(f"- `{key}`: ≥ {current:.2f}")
-            else:
-                lines.append(f"- `{key}`: ≥ {current:.2f}（本轮）→ {target:.2f}（最终）")
-        if not lines:
-            return "(无专属分数阈值)"
-        lines.insert(0, f"当前轮次: Cycle {cycle}（阈值随轮次渐进提升）")
-        return "\n".join(lines)
 
     @classmethod
     def _format_required_score_fields_for_advisor(cls, advisor_def: AdvisorInstanceDef) -> str:
@@ -1080,80 +1096,6 @@ class GlobalReviewExecutor:
                 "blocking_type": "framework_contract",
                 "acceptance_criteria": "advisor 评审阶段不再修改 workspace；违规修改已回滚或隔离。",
             }]
-
-    def _apply_score_thresholds(
-        self,
-        parsed,
-        advisor_def: AdvisorInstanceDef,
-        cycle: int = 1,
-        *,
-        workflow_mode: str = "discovery",
-    ) -> tuple[bool, str, str, str, list[dict[str, str]]]:
-        if parsed.passed and workflow_mode == "closure":
-            return (
-                parsed.passed,
-                parsed.feedback,
-                parsed.feedback_detail,
-                parsed.verdict,
-                [],
-            )
-        threshold_issues = self._score_threshold_issues(parsed.scores or {}, advisor_def, cycle)
-        if not parsed.passed or not threshold_issues:
-            return (
-                parsed.passed,
-                parsed.feedback,
-                parsed.feedback_detail,
-                parsed.verdict,
-                [],
-            )
-
-        threshold_feedback = self._format_score_threshold_feedback(threshold_issues)
-        base_detail = (parsed.feedback_detail or parsed.feedback or "").strip()
-        detail = (
-            f"{base_detail}\n\n{threshold_feedback}"
-            if base_detail else threshold_feedback
-        )
-        feedback = f"FAIL（未通过） - {threshold_issues[0]['detail']}"[:300]
-        return False, feedback, detail, "FAIL", threshold_issues
-
-    def _score_threshold_issues(self, scores: dict[str, float], advisor_def: AdvisorInstanceDef, cycle: int = 1) -> list[dict[str, str]]:
-        if not scores:
-            return []
-
-        advisor_id = advisor_def.instance_id
-        thresholds = self._thresholds_for_advisor(advisor_def, cycle)
-        issues: list[dict[str, str]] = []
-        for key, threshold in thresholds.items():
-            if key not in scores:
-                continue
-            try:
-                actual = float(scores[key])
-            except (TypeError, ValueError):
-                actual = 0.0
-            if actual + 1e-9 >= threshold:
-                continue
-            detail = f"{key}={actual:.2f} 低于本轮通过阈值 {threshold:.2f}（Cycle {cycle}）"
-            issues.append({
-                "id": self._prefix_issue_id(advisor_id, f"score-threshold:{key.replace('_', '-') }"),
-                "category": "score_threshold",
-                "target": key,
-                "severity": "high",
-                "required_action": (
-                    f"补齐 {key} 对应的分析证据，或将该分数提升到至少 {threshold:.2f} 后再通过全局评审"
-                ),
-                "detail": detail,
-                "owner": "worker",
-                "actionable_by": "worker",
-                "blocking_type": "evidence_gap",
-                "acceptance_criteria": f"{key} 分数达到本轮阈值 {threshold:.2f}，或 summary 中诚实说明不可闭环 residual。",
-            })
-        return issues
-
-    @staticmethod
-    def _format_score_threshold_feedback(issues: list[dict[str, str]]) -> str:
-        lines = ["[框架分数阈值校验未通过]"]
-        lines.extend(f"- {item['detail']}" for item in issues)
-        return "\n".join(lines)
 
     @staticmethod
     def _profile_gate_issues(

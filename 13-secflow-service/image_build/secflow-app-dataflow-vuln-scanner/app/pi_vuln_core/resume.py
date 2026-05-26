@@ -22,6 +22,7 @@ from app.pi_vuln_core.engine.models import CompositeWorkflowResult
 from app.pi_vuln_core.plugins.executor import PluginChainExecutor
 from app.pi_vuln_core.plugins.registry import PluginRegistry
 from app.pi_vuln_core.recorder.recorder import ExecutionRecorder
+from app.pi_vuln_core.review.global_review_parser import parse_global_review_response
 from app.pi_vuln_core.review.profile import (
     apply_profile_runtime_policy_to_config,
     apply_profile_thinking_to_runtime_config,
@@ -485,6 +486,59 @@ def _invalid_review_record(data: dict[str, Any]) -> bool:
     return parser_mode == "agent_error" or verdict == "ERROR"
 
 
+def _is_legacy_score_threshold_fail_record(data: dict[str, Any]) -> bool:
+    if bool(data.get("passed", False)):
+        return False
+    issues = [
+        item for item in list(data.get("issues") or [])
+        if isinstance(item, dict)
+    ]
+    if not issues:
+        return False
+    if not all(
+        str(item.get("category") or "").strip().lower() == "score_threshold"
+        or "score-threshold" in str(item.get("id") or "").strip().lower()
+        for item in issues
+    ):
+        return False
+    feedback_text = str(
+        data.get("feedback_detail")
+        or data.get("feedback")
+        or ""
+    )
+    return "[框架分数阈值校验未通过]" in feedback_text
+
+
+def _normalize_legacy_score_threshold_record(data: dict[str, Any]) -> dict[str, Any]:
+    if not _is_legacy_score_threshold_fail_record(data):
+        return dict(data)
+
+    raw_response = str(data.get("raw_response") or "")
+    score_keys = [
+        str(key).strip()
+        for key in (data.get("scores") or {}).keys()
+        if str(key).strip()
+    ]
+    parse_outcome = parse_global_review_response(
+        raw_response,
+        required_score_keys=score_keys or None,
+    )
+    if not parse_outcome.schema_valid or not bool(parse_outcome.parsed.passed):
+        return dict(data)
+
+    parsed = parse_outcome.parsed
+    normalized = dict(data)
+    normalized["passed"] = True
+    normalized["verdict"] = parsed.verdict or "PASS"
+    normalized["feedback"] = parsed.feedback or ""
+    normalized["feedback_detail"] = parsed.feedback_detail or parsed.feedback or ""
+    normalized["scores"] = dict(parsed.scores or {})
+    normalized["confidence"] = parsed.confidence
+    normalized["issues"] = list(parsed.issues or [])
+    normalized["resolved_issue_ids"] = list(parsed.resolved_issue_ids or [])
+    return normalized
+
+
 def _discover_atomic_work_dir(stage_dir: str | Path) -> str:
     stage_path = Path(stage_dir)
     if not stage_path.is_dir():
@@ -662,6 +716,7 @@ def rebuild_review_state(atomic_work_dir: str | Path) -> ReviewState:
                     continue
                 if not isinstance(data, dict) or _invalid_review_record(data):
                     continue
+                data = _normalize_legacy_score_threshold_record(data)
                 passed = bool(data.get("passed", False))
                 feedback = str(
                     data.get("feedback_detail")

@@ -283,6 +283,56 @@ def test_rebuild_review_state_ignores_agent_error_records(tmp_path: Path) -> Non
     ) == ["result_001.md"]
 
 
+def test_rebuild_review_state_recovers_original_pass_from_legacy_score_threshold_fail(
+    tmp_path: Path,
+) -> None:
+    _, atomic_dir, _ = _make_resume_run(tmp_path)
+
+    global_dir = atomic_dir / "reviews" / "global" / "cycle_001"
+    global_dir.mkdir(parents=True, exist_ok=True)
+    (global_dir / "global_completeness.json").write_text(
+        json.dumps(
+            {
+                "advisor_instance_id": "global_completeness",
+                "cycle": 1,
+                "passed": False,
+                "verdict": "FAIL",
+                "scores": {"coverage": 0.84},
+                "feedback": "FAIL（未通过） - coverage=0.84 低于本轮通过阈值 0.90（Cycle 1）",
+                "feedback_detail": "reviewer 原本判定通过。\n\n[框架分数阈值校验未通过]\n- coverage=0.84 低于本轮通过阈值 0.90（Cycle 1）",
+                "raw_response": json.dumps(
+                    {
+                        "passed": True,
+                        "verdict": "PASS",
+                        "feedback": "reviewer 原本判定通过",
+                        "scores": {"coverage": 0.84},
+                        "confidence": 0.9,
+                        "issues": [],
+                        "resolved_issues": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                "issues": [
+                    {
+                        "id": "global_completeness:score-threshold:coverage",
+                        "category": "score_threshold",
+                        "target": "coverage",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    state = rebuild_review_state(atomic_dir)
+
+    assert len(state.global_review_history) == 1
+    assert state.global_review_history[0].passed is True
+    assert state.global_review_history[0].issues == []
+    assert state.has_failures(actionable_by="worker") is False
+
+
 def test_result_review_marks_current_cycle_missing_advisor_pending(tmp_path: Path) -> None:
     _, atomic_dir, config = _make_resume_run(tmp_path)
     results_dir = atomic_dir / "results"

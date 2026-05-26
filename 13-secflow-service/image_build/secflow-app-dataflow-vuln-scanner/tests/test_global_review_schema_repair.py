@@ -266,6 +266,48 @@ class DepthExtraLowCoverageRuntime(RepairingGlobalRuntime):
         )
 
 
+class LowScorePassRuntime(RepairingGlobalRuntime):
+    async def send_message(
+        self,
+        message: str,
+        system_prompt: Optional[str] = None,
+        session_id: Optional[str] = None,
+        working_dir: Optional[str] = None,
+    ) -> AgentResponse:
+        if session_id is None:
+            session_id = await self.create_session()
+        session = self._sessions.setdefault(session_id, {"turns": 0})
+        session["turns"] += 1
+        self.call_count += 1
+
+        content = json.dumps(
+            {
+                "passed": True,
+                "verdict": "PASS",
+                "feedback": "advisor 明确判定通过；低分只表示保守打分，不应被框架改判。",
+                "scores": {
+                    "input_coverage": 0.20,
+                    "export_followthrough": 0.22,
+                    "used_coverage": 0.18,
+                    "vuln_pattern_breadth": 0.25,
+                    "code_evidence_depth": 0.24,
+                    "limitations_honesty": 0.30,
+                    "report_completeness": 0.28,
+                },
+                "confidence": 0.88,
+                "issues": [],
+                "resolved_issues": [],
+            },
+            ensure_ascii=False,
+        )
+        return AgentResponse(
+            content=content,
+            conversation_id=session_id,
+            turn_count=session["turns"],
+            finished=True,
+        )
+
+
 class SplitGlobalRuntime(RepairingGlobalRuntime):
     def __init__(self, agent_config: dict):
         super().__init__(agent_config)
@@ -590,6 +632,26 @@ async def test_global_depth_thresholds_ignore_non_owned_extra_scores(
     assert feedback == ""
     assert review_json["passed"] is True
     assert review_json["issues"] == []
+
+
+@pytest.mark.asyncio
+async def test_global_review_respects_advisor_pass_even_when_scores_are_low(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    passed, feedback, review_json, runtime = await _run_global_review(
+        monkeypatch,
+        tmp_path,
+        LowScorePassRuntime,
+    )
+
+    assert passed is True
+    assert feedback == ""
+    assert review_json["passed"] is True
+    assert review_json["verdict"] == "PASS"
+    assert review_json["issues"] == []
+    assert review_json["scores"]["input_coverage"] == 0.2
+    assert runtime.call_count == 1
 
 
 @pytest.mark.asyncio

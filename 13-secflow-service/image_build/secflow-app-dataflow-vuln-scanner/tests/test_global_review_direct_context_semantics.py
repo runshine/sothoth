@@ -204,77 +204,72 @@ def test_direct_context_separates_supporting_docs_from_reviewable_results(
     assert context["supporting_docs_dir"].endswith("supporting_docs")
 
 
-def test_global_score_thresholds_fail_close_when_passed_json_scores_are_too_low(
+def test_global_score_threshold_helpers_removed_from_executor(
     tmp_path: Path,
 ) -> None:
     executor, _ = _make_executor(tmp_path)
-    advisor = _global_advisor()
 
-    parsed = type("Parsed", (), {
-        "passed": True,
-        "feedback": "PASS（通过） - reviewer 声称通过",
-        "feedback_detail": "reviewer 声称通过",
-        "verdict": "PASS",
-        "scores": {
-            "coverage": 0.90,
-        },
-    })()
+    assert not hasattr(executor, "_apply_score_thresholds")
+    assert not hasattr(executor, "_score_threshold_issues")
+    assert not hasattr(executor, "_format_score_threshold_feedback")
 
-    passed, feedback, detail, verdict, issues = executor._apply_score_thresholds(
-        parsed,
-        advisor,
-        cycle=5,
-    )
 
-    assert passed is False
-    assert verdict == "FAIL"
-    assert "框架分数阈值校验未通过" in detail
-    assert "coverage=0.90" in detail
-    assert issues == [
+def test_load_existing_global_review_record_recovers_original_pass_from_legacy_threshold_fail(
+    tmp_path: Path,
+) -> None:
+    executor, _ = _make_executor(tmp_path)
+    work_dir, summary_path, results_dir, task_path = _prepare_work_dir(tmp_path)
+    _ = summary_path, results_dir, task_path
+
+    record_dir = work_dir / "reviews" / "global" / "cycle_001"
+    record_dir.mkdir(parents=True, exist_ok=True)
+    (record_dir / "global_quality.json").write_text(
+        json.dumps(
             {
-                "id": "score-threshold:coverage",
-                "category": "score_threshold",
-                "target": "coverage",
-                "severity": "high",
-                "required_action": "补齐 coverage 对应的分析证据，或将该分数提升到至少 1.00 后再通过全局评审",
-                "detail": "coverage=0.90 低于本轮通过阈值 1.00（Cycle 5）",
-                "owner": "worker",
-                "actionable_by": "worker",
-                "blocking_type": "evidence_gap",
-                "acceptance_criteria": "coverage 分数达到本轮阈值 1.00，或 summary 中诚实说明不可闭环 residual。",
-            }
-        ]
-    assert feedback.startswith("FAIL（未通过）")
-
-
-def test_global_score_thresholds_do_not_override_closure_pass_after_residual(
-    tmp_path: Path,
-) -> None:
-    executor, _ = _make_executor(tmp_path)
-    advisor = _global_advisor()
-
-    parsed = type("Parsed", (), {
-        "passed": True,
-        "feedback": "closure residual accepted",
-        "feedback_detail": "accepted_residual 已记录且自洽",
-        "verdict": "PASS",
-        "scores": {
-            "coverage": 0.90,
-        },
-    })()
-
-    passed, feedback, detail, verdict, issues = executor._apply_score_thresholds(
-        parsed,
-        advisor,
-        cycle=5,
-        workflow_mode="closure",
+                "advisor_instance_id": "global_quality",
+                "cycle": 1,
+                "passed": False,
+                "verdict": "FAIL",
+                "scores": {"coverage": 0.84},
+                "feedback": "FAIL（未通过） - coverage=0.84 低于本轮通过阈值 0.90（Cycle 1）",
+                "feedback_detail": "reviewer 原本判定通过。\n\n[框架分数阈值校验未通过]\n- coverage=0.84 低于本轮通过阈值 0.90（Cycle 1）",
+                "raw_response": json.dumps(
+                    {
+                        "passed": True,
+                        "verdict": "PASS",
+                        "feedback": "reviewer 原本判定通过",
+                        "scores": {"coverage": 0.84},
+                        "confidence": 0.9,
+                        "issues": [],
+                        "resolved_issues": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                "issues": [
+                    {
+                        "id": "global_quality:score-threshold:coverage",
+                        "category": "score_threshold",
+                        "target": "coverage",
+                    }
+                ],
+                "parser_mode": "canonical_json",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
     )
 
-    assert passed is True
-    assert verdict == "PASS"
-    assert feedback == "closure residual accepted"
-    assert "accepted_residual" in detail
-    assert issues == []
+    record = executor._load_existing_global_review_record(
+        work_dir=str(work_dir),
+        cycle=1,
+        advisor_def=_global_advisor(),
+    )
+
+    assert record is not None
+    assert record["passed"] is True
+    assert "reviewer 原本判定通过" in record["feedback"]
+    assert record["issues"] == []
+    assert record["scores"] == {"coverage": 0.84}
 
 
 def test_profile_gate_no_longer_emits_artifact_issues(

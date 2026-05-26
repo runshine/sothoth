@@ -222,7 +222,6 @@ async def test_global_review_read_only_violation_fails_and_closes_reset_session(
         "cycle={cycle}\n"
         "advisor_instance_id={advisor_instance_id}\n"
         "{review_context}\n"
-        "{score_thresholds}\n"
         "{required_score_fields}\n",
         encoding="utf-8",
     )
@@ -299,7 +298,7 @@ async def test_global_review_runtime_error_is_framework_actionable(
     user_prompt = tmp_path / "global_user.md"
     system_prompt.write_text("global system\n", encoding="utf-8")
     user_prompt.write_text(
-        "{review_context}\n{score_thresholds}\n{required_score_fields}\n",
+        "{review_context}\n{required_score_fields}\n",
         encoding="utf-8",
     )
 
@@ -381,7 +380,7 @@ async def test_global_review_runtime_timeout_retries_with_fresh_sessions(
     user_prompt = tmp_path / "global_user.md"
     system_prompt.write_text("global system\n", encoding="utf-8")
     user_prompt.write_text(
-        "{review_context}\n{score_thresholds}\n{required_score_fields}\n",
+        "{review_context}\n{required_score_fields}\n",
         encoding="utf-8",
     )
 
