@@ -223,6 +223,54 @@ class BinarySecurityProjectStageAggregate(BaseModel):
     archive: BinarySecurityProjectStageArchiveAggregate = Field(default_factory=BinarySecurityProjectStageArchiveAggregate)
 
 
+class BinarySecurityReducerEventSummaryResponse(BaseModel):
+    pending_count: int = 0
+    processing_count: int = 0
+    retryable_count: int = 0
+    dead_letter_count: int = 0
+    processed_count: int = 0
+    failed_like_count: int = 0
+    slow_event_count: int = 0
+    max_processing_duration_ms: Optional[int] = None
+    p95_processing_duration_ms: Optional[int] = None
+    avg_processing_duration_ms: Optional[float] = None
+
+
+class BinarySecurityReducerEventRecordResponse(BaseModel):
+    event_id: str
+    task_id: str
+    project_id: str
+    stage_name: Optional[str] = None
+    event_type: str
+    queue_status: str
+    attempts: int = 0
+    leased_by: Optional[str] = None
+    created_at: Optional[datetime] = None
+    available_at: Optional[datetime] = None
+    lease_expires_at: Optional[datetime] = None
+    processed_at: Optional[datetime] = None
+    processing_started_at: Optional[datetime] = None
+    queue_wait_ms: Optional[int] = None
+    processing_duration_ms: Optional[int] = None
+    end_to_end_duration_ms: Optional[int] = None
+    result: str
+    failure_kind: str = "none"
+    failure_reason: Optional[str] = None
+    last_error: Optional[str] = None
+    handler_pod: Optional[str] = None
+    handler_instance: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+
+class BinarySecurityReducerEventPageResponse(BaseModel):
+    total: int = 0
+    page: int = 1
+    page_size: int = 50
+    truncated: bool = False
+    items: list[BinarySecurityReducerEventRecordResponse] = Field(default_factory=list)
+    summary: BinarySecurityReducerEventSummaryResponse = Field(default_factory=BinarySecurityReducerEventSummaryResponse)
+
+
 class BinarySecurityTaskListResponse(BaseModel):
     total: int
     running_count: int = 0

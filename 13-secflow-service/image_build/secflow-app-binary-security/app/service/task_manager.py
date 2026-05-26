@@ -91,6 +91,9 @@ from app.schemas import (
     BinarySecurityProjectStats,
     BinarySecurityProjectConfigPayload,
     BinarySecurityProjectConfigResponse,
+    BinarySecurityReducerEventPageResponse,
+    BinarySecurityReducerEventRecordResponse,
+    BinarySecurityReducerEventSummaryResponse,
     BinarySecurityServiceConfigPayload,
     BinarySecurityServiceConfigResponse,
     BinarySecurityStageItemResponse,
@@ -657,6 +660,8 @@ TASK_OPERATION_LOCK_HEARTBEAT_SECONDS = 20
 STATE_EVENT_LEASE_SECONDS = 120
 TASK_STATE_LEASE_SECONDS = 300
 STATE_EVENT_MAX_ATTEMPTS = 5
+REDUCER_EVENT_LIMIT_CAP = 10_000
+REDUCER_EVENT_SLOW_THRESHOLD_MS = 1_000
 MODULE_SELECTION_MODE_AUTO = "auto"
 MODULE_SELECTION_MODE_MANUAL_CONFIRM = "manual_confirm"
 ALLOWED_MODULE_RISK_LEVELS = ("高", "中", "低")
@@ -1433,6 +1438,220 @@ class TaskManager:
                 "metadata_path": str(Path(task.workspace_root) / "input" / "task-metadata.json") if task.workspace_root else None,
             },
         }
+
+    def list_reducer_event_records(
+        self,
+        db: Session,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        sort_by: str = "processed_at",
+        sort_order: str = "desc",
+        statuses: list[str] | None = None,
+        event_type: str | None = None,
+        handler_pod: str | None = None,
+        task_id: str | None = None,
+        failed_only: bool = False,
+        slow_only: bool = False,
+    ) -> BinarySecurityReducerEventPageResponse:
+        normalized_statuses = [
+            str(value or "").strip()
+            for value in (statuses or [])
+            if str(value or "").strip() in {"pending", "processing", "retryable", "dead_letter", "processed"}
+        ]
+        events = db.query(BinarySecurityStateEvent).order_by(BinarySecurityStateEvent.created_at.desc()).limit(REDUCER_EVENT_LIMIT_CAP).all()
+        filtered_events = self._filter_reducer_events(
+            events,
+            statuses=normalized_statuses,
+            event_type=event_type,
+            handler_pod=handler_pod,
+            task_id=task_id,
+            failed_only=failed_only,
+            slow_only=slow_only,
+        )
+        sort_descriptor = self._reducer_event_sort_key(sort_by=sort_by, sort_order=sort_order)
+        filtered_events.sort(key=sort_descriptor["key"], reverse=sort_descriptor["reverse"])
+        total = len(filtered_events)
+        start = max(0, (page - 1) * page_size)
+        end = start + page_size
+        return BinarySecurityReducerEventPageResponse(
+            total=min(total, REDUCER_EVENT_LIMIT_CAP),
+            page=page,
+            page_size=page_size,
+            truncated=total >= REDUCER_EVENT_LIMIT_CAP,
+            items=[self._build_reducer_event_record(event) for event in filtered_events[start:end]],
+            summary=self._build_reducer_event_summary(filtered_events),
+        )
+
+    def _filter_reducer_events(
+        self,
+        events: list[BinarySecurityStateEvent],
+        *,
+        statuses: list[str],
+        event_type: str | None,
+        handler_pod: str | None,
+        task_id: str | None,
+        failed_only: bool,
+        slow_only: bool,
+    ) -> list[BinarySecurityStateEvent]:
+        normalized_event_type = str(event_type or "").strip()
+        normalized_handler = str(handler_pod or "").strip()
+        normalized_task_id = str(task_id or "").strip()
+        result: list[BinarySecurityStateEvent] = []
+        for event in events:
+            if statuses and str(event.status or "").strip() not in statuses:
+                continue
+            if normalized_event_type and str(event.event_type or "").strip() != normalized_event_type:
+                continue
+            handler = str(getattr(event, "processed_by", None) or event.leased_by or "").strip()
+            if normalized_handler and handler != normalized_handler:
+                continue
+            if normalized_task_id and str(event.task_id or "").strip() != normalized_task_id:
+                continue
+            record = self._build_reducer_event_record(event)
+            if failed_only and record.failure_kind == "none":
+                continue
+            if slow_only and (record.processing_duration_ms or 0) < REDUCER_EVENT_SLOW_THRESHOLD_MS:
+                continue
+            result.append(event)
+        return result
+
+    def _reducer_event_sort_key(self, *, sort_by: str, sort_order: str) -> dict[str, Any]:
+        normalized_sort_by = str(sort_by or "processed_at").strip()
+        reverse = str(sort_order or "desc").strip().lower() != "asc"
+        if normalized_sort_by == "duration_ms":
+            return {
+                "key": lambda event: (
+                    self._event_processing_duration_ms(event) is None,
+                    self._event_processing_duration_ms(event) or -1,
+                    event.updated_at or event.created_at or datetime.min,
+                    event.id,
+                ),
+                "reverse": reverse,
+            }
+        if normalized_sort_by == "created_at":
+            return {
+                "key": lambda event: (
+                    event.created_at or datetime.min,
+                    event.updated_at or datetime.min,
+                    event.id,
+                ),
+                "reverse": reverse,
+            }
+        return {
+            "key": lambda event: (
+                self._event_processed_at(event) or event.created_at or datetime.min,
+                event.created_at or datetime.min,
+                event.id,
+            ),
+            "reverse": reverse,
+        }
+
+    def _build_reducer_event_summary(self, events: list[BinarySecurityStateEvent]) -> BinarySecurityReducerEventSummaryResponse:
+        counts = {"pending": 0, "processing": 0, "retryable": 0, "dead_letter": 0, "processed": 0}
+        durations: list[int] = []
+        slow_count = 0
+        failed_like_count = 0
+        for event in events:
+            status = str(event.status or "pending").strip()
+            if status in counts:
+                counts[status] += 1
+            record = self._build_reducer_event_record(event)
+            if record.failure_kind != "none":
+                failed_like_count += 1
+            if record.processing_duration_ms is not None:
+                durations.append(record.processing_duration_ms)
+                if record.processing_duration_ms >= REDUCER_EVENT_SLOW_THRESHOLD_MS:
+                    slow_count += 1
+        durations.sort()
+        avg_duration = round(sum(durations) / len(durations), 2) if durations else None
+        p95_duration = durations[max(0, int(round((len(durations) - 1) * 0.95)))] if durations else None
+        max_duration = durations[-1] if durations else None
+        return BinarySecurityReducerEventSummaryResponse(
+            pending_count=counts["pending"],
+            processing_count=counts["processing"],
+            retryable_count=counts["retryable"],
+            dead_letter_count=counts["dead_letter"],
+            processed_count=counts["processed"],
+            failed_like_count=failed_like_count,
+            slow_event_count=slow_count,
+            max_processing_duration_ms=max_duration,
+            p95_processing_duration_ms=p95_duration,
+            avg_processing_duration_ms=avg_duration,
+        )
+
+    def _build_reducer_event_record(self, event: BinarySecurityStateEvent) -> BinarySecurityReducerEventRecordResponse:
+        processed_at = self._event_processed_at(event)
+        processing_started_at = getattr(event, "processing_started_at", None)
+        processing_duration_ms = self._event_processing_duration_ms(event)
+        queue_wait_ms = self._duration_ms(event.created_at, processing_started_at)
+        end_to_end_duration_ms = self._duration_ms(event.created_at, processed_at)
+        handler = str(getattr(event, "processed_by", None) or event.leased_by or "").strip() or None
+        return BinarySecurityReducerEventRecordResponse(
+            event_id=event.id,
+            task_id=event.task_id,
+            project_id=event.project_id,
+            stage_name=event.stage_name,
+            event_type=event.event_type,
+            queue_status=str(event.status or "pending"),
+            attempts=int(event.attempts or 0),
+            leased_by=event.leased_by,
+            created_at=event.created_at,
+            available_at=event.available_at,
+            lease_expires_at=event.lease_expires_at,
+            processed_at=processed_at,
+            processing_started_at=processing_started_at,
+            queue_wait_ms=queue_wait_ms,
+            processing_duration_ms=processing_duration_ms,
+            end_to_end_duration_ms=end_to_end_duration_ms,
+            result=self._event_result(event),
+            failure_kind=self._event_failure_kind(event),
+            failure_reason=self._event_failure_reason(event),
+            last_error=str(getattr(event, "last_error_message", None) or event.error_message or "").strip() or None,
+            handler_pod=handler,
+            handler_instance=handler,
+            idempotency_key=event.idempotency_key,
+        )
+
+    def _event_processed_at(self, event: BinarySecurityStateEvent) -> datetime | None:
+        status = str(event.status or "").strip()
+        if status in {"processed", "retryable", "dead_letter"}:
+            return getattr(event, "processing_finished_at", None) or event.processed_at or event.updated_at
+        return None
+
+    def _event_processing_duration_ms(self, event: BinarySecurityStateEvent) -> int | None:
+        return self._duration_ms(getattr(event, "processing_started_at", None), self._event_processed_at(event))
+
+    def _duration_ms(self, started_at: datetime | None, finished_at: datetime | None) -> int | None:
+        if started_at is None or finished_at is None:
+            return None
+        return max(0, int((finished_at - started_at).total_seconds() * 1000))
+
+    def _event_result(self, event: BinarySecurityStateEvent) -> str:
+        processing_result = str(getattr(event, "processing_result", None) or "").strip()
+        if processing_result:
+            return processing_result
+        status = str(event.status or "pending").strip()
+        return "success" if status == "processed" else status
+
+    def _event_failure_kind(self, event: BinarySecurityStateEvent) -> str:
+        status = str(event.status or "").strip()
+        if status == "retryable":
+            return "retryable"
+        if status == "dead_letter":
+            return "dead_letter"
+        if status == "processing" and event.lease_expires_at and event.lease_expires_at < _now():
+            return "lease_expired"
+        if str(getattr(event, "processing_result", None) or "").strip() == "failed":
+            return "reducer_failed"
+        if str(getattr(event, "last_error_message", None) or event.error_message or "").strip() and status not in {"pending", "processed"}:
+            return "unknown"
+        return "none"
+
+    def _event_failure_reason(self, event: BinarySecurityStateEvent) -> str | None:
+        if self._event_failure_kind(event) == "none":
+            return None
+        return str(getattr(event, "last_error_message", None) or event.error_message or "").strip() or None
 
     def update_task_concurrency(
         self,
@@ -4050,44 +4269,87 @@ class TaskManager:
         for item in pending_items:
             if item.stage_name not in STREAMING_TAIL_STAGES:
                 continue
-            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == item.task_id).first()
+            try:
+                task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == item.task_id).first()
+            except OperationalError as exc:
+                if not self._is_retryable_lock_error(exc):
+                    raise
+                db.rollback()
+                logger.warning(
+                    "binary-security streaming stage item claim skipped by retryable lock conflict while loading task: item_id=%s task_id=%s",
+                    item.id,
+                    item.task_id,
+                )
+                continue
             if task is None or not self._streaming_mode_enabled(task):
                 continue
             if task.status in TASK_TERMINAL_STATUSES or task.status == "cancelled":
                 continue
             if not self._is_streaming_tail_stage(task, item.stage_name):
                 continue
-            active_count = int(
-                db.query(func.count(BinarySecurityStageItem.id))
-                .filter(
-                    BinarySecurityStageItem.task_id == task.id,
-                    BinarySecurityStageItem.stage_name == item.stage_name,
-                    BinarySecurityStageItem.status.in_(["dispatching", "queued", "running"]),
+            try:
+                active_count = int(
+                    db.query(func.count(BinarySecurityStageItem.id))
+                    .filter(
+                        BinarySecurityStageItem.task_id == task.id,
+                        BinarySecurityStageItem.stage_name == item.stage_name,
+                        BinarySecurityStageItem.status.in_(["dispatching", "queued", "running"]),
+                    )
+                    .scalar()
+                    or 0
                 )
-                .scalar()
-                or 0
-            )
+            except OperationalError as exc:
+                if not self._is_retryable_lock_error(exc):
+                    raise
+                db.rollback()
+                logger.warning(
+                    "binary-security streaming stage item claim skipped by retryable lock conflict while counting active items: item_id=%s stage=%s",
+                    item.id,
+                    item.stage_name,
+                )
+                continue
             if active_count >= self._stage_parallelism(task, item.stage_name):
                 continue
-            updated = (
-                db.query(BinarySecurityStageItem)
-                .filter(
-                    BinarySecurityStageItem.id == item.id,
-                    BinarySecurityStageItem.status.in_(["pending", "queued"]),
+            try:
+                updated = (
+                    db.query(BinarySecurityStageItem)
+                    .filter(
+                        BinarySecurityStageItem.id == item.id,
+                        BinarySecurityStageItem.status.in_(["pending", "queued"]),
+                    )
+                    .update(
+                        {
+                            BinarySecurityStageItem.status: "dispatching",
+                            BinarySecurityStageItem.started_at: _now(),
+                            BinarySecurityStageItem.updated_at: _now(),
+                        },
+                        synchronize_session=False,
+                    )
                 )
-                .update(
-                    {
-                        BinarySecurityStageItem.status: "dispatching",
-                        BinarySecurityStageItem.started_at: _now(),
-                        BinarySecurityStageItem.updated_at: _now(),
-                    },
-                    synchronize_session=False,
+            except OperationalError as exc:
+                if not self._is_retryable_lock_error(exc):
+                    raise
+                db.rollback()
+                logger.warning(
+                    "binary-security streaming stage item claim skipped by retryable lock conflict while updating item: item_id=%s stage=%s",
+                    item.id,
+                    item.stage_name,
                 )
-            )
+                continue
             if updated:
                 claimed_ids.append(item.id)
         if claimed_ids:
-            db.commit()
+            try:
+                db.commit()
+            except OperationalError as exc:
+                if not self._is_retryable_lock_error(exc):
+                    raise
+                db.rollback()
+                logger.warning(
+                    "binary-security streaming stage item claim commit skipped by retryable lock conflict: item_ids=%s",
+                    claimed_ids,
+                )
+                return []
         return claimed_ids
 
     async def _run_stage_item_by_id(self, item_id: str) -> None:
@@ -4643,45 +4905,67 @@ class TaskManager:
 
     def _claim_state_event(self, db: Session) -> str | None:
         now_value = _now()
-        event = (
-            db.query(BinarySecurityStateEvent)
-            .filter(
-                BinarySecurityStateEvent.status.in_(["pending", "retryable", "processing"]),
-                BinarySecurityStateEvent.available_at <= now_value,
-                or_(
-                    BinarySecurityStateEvent.status != "processing",
-                    BinarySecurityStateEvent.lease_expires_at.is_(None),
-                    BinarySecurityStateEvent.lease_expires_at < now_value,
-                ),
+        try:
+            event = (
+                db.query(BinarySecurityStateEvent)
+                .filter(
+                    BinarySecurityStateEvent.status.in_(["pending", "retryable", "processing"]),
+                    BinarySecurityStateEvent.available_at <= now_value,
+                    or_(
+                        BinarySecurityStateEvent.status != "processing",
+                        BinarySecurityStateEvent.lease_expires_at.is_(None),
+                        BinarySecurityStateEvent.lease_expires_at < now_value,
+                    ),
+                )
+                .order_by(BinarySecurityStateEvent.available_at.asc(), BinarySecurityStateEvent.created_at.asc(), BinarySecurityStateEvent.id.asc())
+                .first()
             )
-            .order_by(BinarySecurityStateEvent.available_at.asc(), BinarySecurityStateEvent.created_at.asc(), BinarySecurityStateEvent.id.asc())
-            .first()
-        )
+        except OperationalError as exc:
+            if not self._is_retryable_lock_error(exc):
+                raise
+            db.rollback()
+            logger.warning("binary-security state reducer skipped event claim after retryable lock conflict during lookup")
+            return None
         if event is None:
             return None
-        updated = (
-            db.query(BinarySecurityStateEvent)
-            .filter(
-                BinarySecurityStateEvent.id == event.id,
-                BinarySecurityStateEvent.status.in_(["pending", "retryable", "processing"]),
-                or_(
-                    BinarySecurityStateEvent.status != "processing",
-                    BinarySecurityStateEvent.lease_expires_at.is_(None),
-                    BinarySecurityStateEvent.lease_expires_at < now_value,
-                ),
+        try:
+            updated = (
+                db.query(BinarySecurityStateEvent)
+                .filter(
+                    BinarySecurityStateEvent.id == event.id,
+                    BinarySecurityStateEvent.status.in_(["pending", "retryable", "processing"]),
+                    or_(
+                        BinarySecurityStateEvent.status != "processing",
+                        BinarySecurityStateEvent.lease_expires_at.is_(None),
+                        BinarySecurityStateEvent.lease_expires_at < now_value,
+                    ),
+                )
+                .update(
+                    {
+                        BinarySecurityStateEvent.status: "processing",
+                        BinarySecurityStateEvent.leased_by: self.instance_id,
+                        BinarySecurityStateEvent.processed_by: self.instance_id,
+                        BinarySecurityStateEvent.lease_expires_at: now_value + timedelta(seconds=STATE_EVENT_LEASE_SECONDS),
+                        BinarySecurityStateEvent.processing_started_at: now_value,
+                        BinarySecurityStateEvent.processing_finished_at: None,
+                        BinarySecurityStateEvent.processing_result: "processing",
+                        BinarySecurityStateEvent.attempts: int(event.attempts or 0) + 1,
+                        BinarySecurityStateEvent.last_error_message: None,
+                        BinarySecurityStateEvent.updated_at: now_value,
+                    },
+                    synchronize_session=False,
+                )
             )
-            .update(
-                {
-                    BinarySecurityStateEvent.status: "processing",
-                    BinarySecurityStateEvent.leased_by: self.instance_id,
-                    BinarySecurityStateEvent.lease_expires_at: now_value + timedelta(seconds=STATE_EVENT_LEASE_SECONDS),
-                    BinarySecurityStateEvent.attempts: int(event.attempts or 0) + 1,
-                    BinarySecurityStateEvent.updated_at: now_value,
-                },
-                synchronize_session=False,
+            db.commit()
+        except OperationalError as exc:
+            if not self._is_retryable_lock_error(exc):
+                raise
+            db.rollback()
+            logger.warning(
+                "binary-security state reducer skipped event claim after retryable lock conflict: event_id=%s",
+                getattr(event, "id", None),
             )
-        )
-        db.commit()
+            return None
         return event.id if updated else None
 
     def _acquire_task_state_lease(self, db: Session, task_id: str, *, operation: str = "state_reduce") -> str | None:
@@ -4800,6 +5084,9 @@ class TaskManager:
                 event.available_at = _now() + timedelta(seconds=5)
                 event.leased_by = None
                 event.lease_expires_at = None
+                event.processing_finished_at = _now()
+                event.processing_result = "retryable"
+                event.last_error_message = "task state lease busy"
                 event.updated_at = _now()
                 db.commit()
                 result = "lock_busy"
@@ -4817,12 +5104,18 @@ class TaskManager:
             task_id = event.task_id
             event_created_at = event.created_at
             if event_type == "manual_delete_requested":
+                finished_at = _now()
                 observe_state_event_lag(event_type, (_now() - event_created_at).total_seconds() if event_created_at else None)
                 observe_state_reducer_event(event_type, "processed")
                 observe_state_reducer_health(
                     pod=self.instance_id,
                     event_processed_at=time.time(),
                 )
+                event.processing_finished_at = finished_at
+                event.processing_result = "success"
+                event.processed_at = finished_at
+                event.updated_at = finished_at
+                event.last_error_message = None
                 db.expunge(event)
                 db.query(BinarySecurityStateEvent).filter(
                     BinarySecurityStateEvent.task_id == task_id,
@@ -4831,11 +5124,15 @@ class TaskManager:
                 db.commit()
                 return
             event.status = "processed"
-            event.processed_at = _now()
+            finished_at = _now()
+            event.processed_at = finished_at
+            event.processing_finished_at = finished_at
+            event.processing_result = "success"
             event.leased_by = None
             event.lease_expires_at = None
             event.error_message = None
-            event.updated_at = _now()
+            event.last_error_message = None
+            event.updated_at = finished_at
             observe_state_event_lag(event_type, (_now() - event.created_at).total_seconds() if event.created_at else None)
             observe_state_reducer_event(event_type, "processed")
             observe_state_reducer_health(
@@ -4858,13 +5155,18 @@ class TaskManager:
                         event.error_message = str(exc)
                         event.leased_by = None
                         event.lease_expires_at = None
-                        event.updated_at = _now()
+                        finished_at = _now()
+                        event.processing_finished_at = finished_at
+                        event.last_error_message = str(exc)
+                        event.updated_at = finished_at
                         if int(event.attempts or 0) >= STATE_EVENT_MAX_ATTEMPTS:
                             event.status = "dead_letter"
-                            event.processed_at = _now()
+                            event.processed_at = finished_at
+                            event.processing_result = "dead_letter"
                             observe_state_dead_letter(event.event_type, "max_attempts")
                         else:
                             event.status = "retryable"
+                            event.processing_result = "retryable"
                             event.available_at = _now() + timedelta(seconds=min(300, 2 ** max(1, int(event.attempts or 1))))
                         db.commit()
                 except Exception:
@@ -7986,10 +8288,13 @@ class TaskManager:
 
     def _touch_task_preparing_heartbeat(self, task_id: str) -> None:
         now = _now()
+        worker = self._action_workers.get(task_id)
+        if worker is None or worker.done():
+            return
         session = get_session_factory()()
         try:
             lease_expires_at = self._next_lease_expiry(session, now_value=now)
-            session.query(BinarySecurityTask).filter(
+            updated = session.query(BinarySecurityTask).filter(
                 BinarySecurityTask.id == task_id,
                 BinarySecurityTask.status.in_(list(TASK_PREPARING_STATUSES)),
                 BinarySecurityTask.dispatcher_instance_id == self.instance_id,
@@ -8000,7 +8305,10 @@ class TaskManager:
                 },
                 synchronize_session=False,
             )
-            session.commit()
+            if updated:
+                session.commit()
+            else:
+                session.rollback()
         finally:
             session.close()
 
@@ -8287,6 +8595,9 @@ class TaskManager:
             task = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
             if task is None:
                 return False, False
+            if self._should_skip_readless_reconcile_for_active_task(task):
+                session.rollback()
+                return True, False
             before_status = str(task.status or "").strip()
             before_stage = str(task.current_stage or "").strip()
             self._refresh_task_status_after_sync(session, task)
@@ -10762,9 +11073,10 @@ class TaskManager:
             active_run = next((run for run in stage_runs if run.status in {"running", "dispatching"}), None)
             if active_run and active_run.stage_name:
                 task.current_stage = active_run.stage_name
-            task.dispatcher_instance_id = None
-            task.dispatch_started_at = None
-            task.lease_expires_at = None
+            if not self._should_preserve_task_dispatch_ownership(task, previous_status=current_status):
+                task.dispatcher_instance_id = None
+                task.dispatch_started_at = None
+                task.lease_expires_at = None
             task.finished_at = None
             task.last_error = None
             self._clear_task_abnormal_reason_snapshot(db, task)
@@ -10789,6 +11101,22 @@ class TaskManager:
             summary.pop("task_retry_context", None)
             summary.pop("retry_plan", None)
             task.summary = summary
+        failed_stage_run = next(
+            (
+                run
+                for run in stage_runs
+                if str(run.status or "").strip() in {"failed", "downstream_missing", "cancelled"}
+            ),
+            None,
+        )
+        if failed_stage_run is not None and not stage_retry_mode and not task_retry_mode:
+            task.status = "failed"
+            task.current_stage = failed_stage_run.stage_name or task.current_stage
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.lease_expires_at = None
+            task.finished_at = task.finished_at or _now()
+            return
         next_stage = self._next_incomplete_stage(db, task)
         next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
         next_stage_status = next_stage_run.status if next_stage_run else "pending"
@@ -10816,6 +11144,22 @@ class TaskManager:
             self._enqueue_task(task.id)
             return
         self._finalize_task(db, task)
+
+    def _should_skip_readless_reconcile_for_active_task(self, task: BinarySecurityTask) -> bool:
+        status = str(task.status or "").strip()
+        if status not in {"running", "dispatching", *TASK_PREPARING_STATUSES}:
+            return False
+        if not str(task.dispatcher_instance_id or "").strip():
+            return False
+        return self._lease_is_active(task)
+
+    def _should_preserve_task_dispatch_ownership(self, task: BinarySecurityTask, *, previous_status: str | None = None) -> bool:
+        status = str(previous_status if previous_status is not None else task.status or "").strip()
+        if status not in {"running", "dispatching"}:
+            return False
+        if not str(task.dispatcher_instance_id or "").strip():
+            return False
+        return self._lease_is_active(task)
 
     def _stage_items(self, db: Session, task_id: str, stage_name: str) -> list[BinarySecurityStageItem]:
         return db.query(BinarySecurityStageItem).filter(
@@ -13179,10 +13523,14 @@ class TaskManager:
         if last_heartbeat_at and (now - last_heartbeat_at).total_seconds() < interval_seconds:
             observe_heartbeat_update("skipped")
             return
+        worker = self._workers.get(task_id)
+        if worker is None or worker.done():
+            observe_heartbeat_update("skipped")
+            return
         session = get_session_factory()()
         try:
             lease_expires_at = self._next_lease_expiry(session, now_value=now)
-            session.query(BinarySecurityTask).filter(
+            updated = session.query(BinarySecurityTask).filter(
                 BinarySecurityTask.id == task_id,
                 BinarySecurityTask.status == "running",
                 BinarySecurityTask.dispatcher_instance_id == self.instance_id,
@@ -13193,9 +13541,13 @@ class TaskManager:
                 },
                 synchronize_session=False,
             )
-            session.commit()
-            self._last_task_heartbeat_at[task_id] = now
-            observe_heartbeat_update("written")
+            if updated:
+                session.commit()
+                self._last_task_heartbeat_at[task_id] = now
+                observe_heartbeat_update("written")
+            else:
+                session.rollback()
+                observe_heartbeat_update("skipped")
         finally:
             session.close()
 

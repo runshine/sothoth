@@ -1,7 +1,10 @@
 import unittest
+from datetime import timedelta
 from unittest.mock import patch
 
-from app.service.task_manager import TaskManager
+from app.model import BinarySecurityTask, TASK_TYPE_BINARY
+from app.service import task_manager as task_manager_module
+from app.service.task_manager import TaskManager, _now
 
 
 class TaskManagerRuntimeStatusTests(unittest.TestCase):
@@ -237,6 +240,158 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, observe_calls[0]["failed"])
         self.assertEqual(1, observe_calls[0]["candidates"])
         self.assertGreaterEqual(len(sleep_calls), 1)
+
+    async def test_readless_reconcile_skips_active_leased_task_without_refreshing(self):
+        manager = TaskManager()
+        lease_expires_at = _now() + timedelta(minutes=5)
+
+        class _TaskSession:
+            def __init__(self):
+                self.task = BinarySecurityTask(
+                    id="t1",
+                    project_id="p1",
+                    name="demo",
+                    status="running",
+                    task_type=TASK_TYPE_BINARY,
+                    current_stage="vuln_scan",
+                    firmware_source="project_filesystem",
+                    firmware_path="/fw",
+                    output_root="/o",
+                    workspace_root="/tmp/ws",
+                    dispatcher_instance_id="worker-a",
+                    lease_expires_at=lease_expires_at,
+                )
+                self.commits = 0
+                self.rollbacks = 0
+
+            def query(self, model):
+                del model
+                return self
+
+            def filter(self, *args, **kwargs):
+                del args, kwargs
+                return self
+
+            def first(self):
+                return self.task
+
+            def commit(self):
+                self.commits += 1
+
+            def rollback(self):
+                self.rollbacks += 1
+
+            def close(self):
+                return None
+
+        task_session = _TaskSession()
+        refresh_calls = []
+
+        def _refresh(_session, _task):
+            refresh_calls.append("called")
+
+        manager._refresh_task_status_after_sync = _refresh
+
+        with patch.object(task_manager_module, "get_session_factory", return_value=lambda: task_session):
+            attempted, changed = await manager._process_readless_reconcile_task("t1")
+
+        self.assertTrue(attempted)
+        self.assertFalse(changed)
+        self.assertEqual([], refresh_calls)
+        self.assertEqual(0, task_session.commits)
+        self.assertEqual(1, task_session.rollbacks)
+
+    async def test_claim_state_event_returns_none_on_retryable_lock_conflict(self):
+        manager = TaskManager()
+
+        class _Query:
+            def filter(self, *args, **kwargs):
+                del args, kwargs
+                return self
+
+            def order_by(self, *args, **kwargs):
+                del args, kwargs
+                return self
+
+            def first(self):
+                raise task_manager_module.OperationalError(
+                    "SELECT ... FROM secflow_binary_security_state_event",
+                    {},
+                    Exception(1205, "Lock wait timeout exceeded; try restarting transaction"),
+                )
+
+        class _Session:
+            def __init__(self):
+                self.rollbacks = 0
+
+            def query(self, _model):
+                return _Query()
+
+            def rollback(self):
+                self.rollbacks += 1
+
+        session = _Session()
+
+        event_id = manager._claim_state_event(session)
+
+        self.assertIsNone(event_id)
+        self.assertEqual(1, session.rollbacks)
+
+    async def test_claim_state_event_sets_processing_metadata(self):
+        manager = TaskManager()
+        event = type(
+            "Event",
+            (),
+            {
+                "id": "sev-1",
+                "attempts": 0,
+            },
+        )()
+        captured = {}
+
+        class _Query:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def filter(self, *args, **kwargs):
+                del args, kwargs
+                return self
+
+            def order_by(self, *args, **kwargs):
+                del args, kwargs
+                return self
+
+            def first(self):
+                return self._rows[0] if self._rows else None
+
+            def update(self, values, synchronize_session=False):
+                del synchronize_session
+                captured.update({getattr(key, "name", str(key)): value for key, value in values.items()})
+                return 1
+
+        class _Session:
+            def __init__(self):
+                self.commits = 0
+
+            def query(self, _model):
+                return _Query([event])
+
+            def commit(self):
+                self.commits += 1
+
+            def rollback(self):
+                return None
+
+        session = _Session()
+
+        event_id = manager._claim_state_event(session)
+
+        self.assertEqual("sev-1", event_id)
+        self.assertEqual("processing", captured.get("status"))
+        self.assertEqual(manager.instance_id, captured.get("processed_by"))
+        self.assertEqual("processing", captured.get("processing_result"))
+        self.assertIsNotNone(captured.get("processing_started_at"))
+        self.assertEqual(1, session.commits)
 
 
 if __name__ == "__main__":

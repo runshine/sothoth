@@ -396,9 +396,14 @@ class BinarySecurityStateEvent(Base, JsonMixin):
     attempts = Column(Integer, nullable=False, default=0)
     available_at = Column(DateTime, default=now_local, nullable=False, index=True)
     leased_by = Column(String(128), nullable=True, index=True)
+    processed_by = Column(String(128), nullable=True, index=True)
     lease_expires_at = Column(DateTime, nullable=True, index=True)
+    processing_started_at = Column(DateTime, nullable=True, index=True)
+    processing_finished_at = Column(DateTime, nullable=True, index=True)
     processed_at = Column(DateTime, nullable=True, index=True)
+    processing_result = Column(String(32), nullable=True, index=True)
     error_message = Column(Text, nullable=True)
+    last_error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=now_local, nullable=False, index=True)
     updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
 
@@ -629,6 +634,50 @@ def _ensure_compat_columns(engine) -> None:
             index_statements.append(
                 f"CREATE INDEX ix_bsaj_task_stage_dedupe_status ON {archive_job_table} "
                 "(task_id, stage_name, job_dedupe_key, archive_status)"
+            )
+        with engine.begin() as conn:
+            for statement in index_statements:
+                conn.execute(text(statement))
+    state_event_table = BinarySecurityStateEvent.__tablename__
+    if inspector.has_table(state_event_table):
+        columns = {column["name"] for column in inspector.get_columns(state_event_table)}
+        statements = []
+        if "processed_by" not in columns:
+            statements.append(
+                f"ALTER TABLE {state_event_table} ADD COLUMN processed_by VARCHAR(128) NULL"
+            )
+        if "processing_started_at" not in columns:
+            statements.append(
+                f"ALTER TABLE {state_event_table} ADD COLUMN processing_started_at DATETIME NULL"
+            )
+        if "processing_finished_at" not in columns:
+            statements.append(
+                f"ALTER TABLE {state_event_table} ADD COLUMN processing_finished_at DATETIME NULL"
+            )
+        if "processing_result" not in columns:
+            statements.append(
+                f"ALTER TABLE {state_event_table} ADD COLUMN processing_result VARCHAR(32) NULL"
+            )
+        if "last_error_message" not in columns:
+            statements.append(
+                f"ALTER TABLE {state_event_table} ADD COLUMN last_error_message TEXT NULL"
+            )
+        with engine.begin() as conn:
+            for statement in statements:
+                conn.execute(text(statement))
+        indexes = {index["name"] for index in inspector.get_indexes(state_event_table)}
+        index_statements = []
+        if "ix_bsst_status_updated_id" not in indexes:
+            index_statements.append(
+                f"CREATE INDEX ix_bsst_status_updated_id ON {state_event_table} (status, updated_at, id)"
+            )
+        if "ix_bsst_processed_by_updated" not in indexes:
+            index_statements.append(
+                f"CREATE INDEX ix_bsst_processed_by_updated ON {state_event_table} (processed_by, updated_at)"
+            )
+        if "ix_bsst_event_type_status_created" not in indexes:
+            index_statements.append(
+                f"CREATE INDEX ix_bsst_event_type_status_created ON {state_event_table} (event_type, status, created_at)"
             )
         with engine.begin() as conn:
             for statement in index_statements:

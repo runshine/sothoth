@@ -275,6 +275,8 @@ class _AppendingModelAwareDb(_ModelAwareDb):
             self.archive_jobs.append(obj)
         elif model_name == "BinarySecurityEvent":
             self.events.append(obj)
+        elif model_name == "BinarySecurityStateEvent":
+            self.state_events.append(obj)
         elif model_name == "BinarySecurityTask":
             self.tasks.append(obj)
         elif model_name == "BinarySecurityProjectConfig":
@@ -1104,6 +1106,70 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(["si-vuln"], claimed)
         self.assertEqual("dispatching", item.status)
         self.assertIsNotNone(item.started_at)
+
+    def test_claim_streaming_stage_items_returns_empty_on_retryable_lock_conflict(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming", "stage_parallelism": {"entry_analysis": 1}}),
+        )
+        item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="mod.so",
+            parent_key="fw-1",
+            item_identity_key="module-1::fw-1",
+            status="pending",
+            downstream_service="entry_analyse",
+        )
+
+        class _RetryableLockQuery(_FakeQuery):
+            def filter(self, *args, **kwargs):
+                result = super().filter(*args, **kwargs)
+                return _RetryableLockQuery(result._rows)
+
+            def order_by(self, *args, **kwargs):
+                del args, kwargs
+                return self
+
+            def update(self, values, synchronize_session=False):
+                del values, synchronize_session
+                raise _deadlock_operational_error()
+
+        class _RetryableLockDb(_AppendingModelAwareDb):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.rollback_calls = 0
+
+            def query(self, model, *args, **kwargs):
+                query = super().query(model, *args, **kwargs)
+                if getattr(model, "__name__", "") == "BinarySecurityStageItem":
+                    return _RetryableLockQuery(query._rows)
+                return query
+
+            def rollback(self):
+                self.rollback_calls += 1
+
+        db = _RetryableLockDb(tasks=[task], stage_items=[item])
+
+        claimed = self.manager._claim_streaming_stage_items(db)
+
+        self.assertEqual([], claimed)
+        self.assertEqual("pending", item.status)
+        self.assertGreaterEqual(db.rollback_calls, 1)
 
     def test_write_json_concurrent_writes_use_unique_temp_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2027,6 +2093,142 @@ class TaskManagerTests(unittest.TestCase):
         self.assertIsNone(task.lease_expires_at)
         self.assertIsNone(task.finished_at)
         self.assertIsNone(task.last_error)
+
+    def test_refresh_task_status_after_sync_preserves_active_running_dispatch_ownership(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="binary_to_source",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="worker-a",
+            dispatch_started_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=1),
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            sequence_no=3,
+            status="running",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[run])
+
+        self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual("running", task.status)
+        self.assertEqual("binary_to_source", task.current_stage)
+        self.assertEqual("worker-a", task.dispatcher_instance_id)
+        self.assertIsNotNone(task.dispatch_started_at)
+        self.assertIsNotNone(task.lease_expires_at)
+        self.assertIsNone(task.finished_at)
+        self.assertIsNone(task.last_error)
+
+    def test_list_reducer_event_records_filters_and_summarizes(self):
+        created_at = _now() - timedelta(minutes=5)
+        started_at = created_at + timedelta(seconds=1)
+        finished_at = started_at + timedelta(seconds=2)
+        processed = BinarySecurityStateEvent(
+            id="sev-processed",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            event_type="stage_worker_terminal_observed",
+            idempotency_key="sev-processed",
+            status="processed",
+            attempts=1,
+            leased_by=None,
+            processed_by="reducer-a",
+            available_at=created_at,
+            processing_started_at=started_at,
+            processing_finished_at=finished_at,
+            processed_at=finished_at,
+            processing_result="success",
+            created_at=created_at,
+            updated_at=finished_at,
+        )
+        retryable = BinarySecurityStateEvent(
+            id="sev-retry",
+            task_id="t2",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            event_type="downstream_status_observed",
+            idempotency_key="sev-retry",
+            status="retryable",
+            attempts=3,
+            leased_by=None,
+            processed_by="reducer-b",
+            available_at=created_at,
+            processing_started_at=started_at,
+            processing_finished_at=started_at + timedelta(milliseconds=400),
+            processing_result="retryable",
+            last_error_message="downstream timeout",
+            error_message="downstream timeout",
+            created_at=created_at,
+            updated_at=started_at + timedelta(milliseconds=400),
+        )
+        pending = BinarySecurityStateEvent(
+            id="sev-pending",
+            task_id="t3",
+            project_id="p2",
+            stage_name="vuln_scan",
+            event_type="manual_cancel_requested",
+            idempotency_key="sev-pending",
+            status="pending",
+            attempts=0,
+            available_at=created_at,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        db = _AppendingModelAwareDb(state_events=[processed, retryable, pending])
+
+        page = self.manager.list_reducer_event_records(
+            db,
+            page=1,
+            page_size=10,
+            sort_by="processed_at",
+            sort_order="desc",
+            statuses=[],
+            event_type=None,
+            handler_pod=None,
+            task_id=None,
+            failed_only=False,
+            slow_only=False,
+        )
+
+        self.assertEqual(3, page.total)
+        self.assertEqual(1, page.summary.pending_count)
+        self.assertEqual(1, page.summary.retryable_count)
+        self.assertEqual(1, page.summary.processed_count)
+        self.assertEqual(1, page.summary.failed_like_count)
+        self.assertEqual(1, page.summary.slow_event_count)
+        self.assertEqual("sev-processed", page.items[0].event_id)
+        self.assertEqual("sev-retry", page.items[1].event_id)
+        self.assertEqual("retryable", page.items[1].failure_kind)
+        self.assertEqual(2000, page.items[0].processing_duration_ms)
+        self.assertIsNone(page.items[2].processing_duration_ms)
+
+        failed_only_page = self.manager.list_reducer_event_records(
+            db,
+            page=1,
+            page_size=10,
+            sort_by="processed_at",
+            sort_order="desc",
+            statuses=[],
+            event_type=None,
+            handler_pod="reducer-b",
+            task_id=None,
+            failed_only=True,
+            slow_only=False,
+        )
+        self.assertEqual(1, failed_only_page.total)
+        self.assertEqual("sev-retry", failed_only_page.items[0].event_id)
 
     def test_get_task_detail_keeps_read_path_side_effect_free_when_stage_is_running(self):
         task = BinarySecurityTask(
@@ -12065,6 +12267,75 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(task.last_error)
         self.assertIsNone(task.latest_abnormal_reason)
         self.assertTrue(db.closed)
+
+    def test_touch_task_heartbeat_skips_when_local_worker_is_not_active(self):
+        manager = TaskManager()
+        manager._workers = {}
+        manager._last_task_heartbeat_at.pop("task-1", None)
+
+        class _Session:
+            def __init__(self):
+                self.query_called = False
+
+            def query(self, *_args, **_kwargs):
+                self.query_called = True
+                raise AssertionError("query should not be called when worker is inactive")
+
+            def close(self):
+                return None
+
+        session = _Session()
+
+        with patch.object(task_manager_module, "get_session_factory", return_value=lambda: session):
+            manager._touch_task_heartbeat("task-1")
+
+        self.assertFalse(session.query_called)
+        self.assertNotIn("task-1", manager._last_task_heartbeat_at)
+
+    def test_touch_task_heartbeat_rolls_back_when_update_matches_no_rows(self):
+        manager = TaskManager()
+
+        class _Worker:
+            def done(self):
+                return False
+
+        manager._workers = {"task-1": _Worker()}
+        manager._last_task_heartbeat_at.pop("task-1", None)
+
+        class _Query:
+            def filter(self, *args, **kwargs):
+                del args, kwargs
+                return self
+
+            def update(self, *args, **kwargs):
+                del args, kwargs
+                return 0
+
+        class _Session:
+            def __init__(self):
+                self.commit_calls = 0
+                self.rollback_calls = 0
+
+            def query(self, *_args, **_kwargs):
+                return _Query()
+
+            def commit(self):
+                self.commit_calls += 1
+
+            def rollback(self):
+                self.rollback_calls += 1
+
+            def close(self):
+                return None
+
+        session = _Session()
+
+        with patch.object(task_manager_module, "get_session_factory", return_value=lambda: session):
+            manager._touch_task_heartbeat("task-1")
+
+        self.assertEqual(0, session.commit_calls)
+        self.assertEqual(1, session.rollback_calls)
+        self.assertNotIn("task-1", manager._last_task_heartbeat_at)
 
     def test_execute_task_failed_stage_does_not_requeue_same_stage(self):
         with tempfile.TemporaryDirectory() as tmp:

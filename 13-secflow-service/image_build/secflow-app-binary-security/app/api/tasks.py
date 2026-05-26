@@ -20,6 +20,7 @@ from app.schemas import (
     BinarySecurityModuleSelectionResponse,
     BinarySecurityProjectConfigPayload,
     BinarySecurityProjectConfigResponse,
+    BinarySecurityReducerEventPageResponse,
     BinarySecurityServiceConfigPayload,
     BinarySecurityServiceConfigResponse,
     BinarySecurityStageItemPageResponse,
@@ -90,6 +91,36 @@ def list_tasks(
     db: Session = Depends(get_db),
 ):
     return get_task_manager().list_tasks(db, project_id=project_id, status=status, task_type=task_type)
+
+
+@router.get("/reducer/events", response_model=BinarySecurityReducerEventPageResponse)
+def list_reducer_events(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    sort_by: str = Query("processed_at"),
+    sort_order: str = Query("desc"),
+    status: Optional[list[str]] = Query(default=None),
+    event_type: Optional[str] = Query(default=None),
+    handler_pod: Optional[str] = Query(default=None),
+    task_id: Optional[str] = Query(default=None),
+    failed_only: bool = Query(default=False),
+    slow_only: bool = Query(default=False),
+    _: TokenUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().list_reducer_event_records(
+        db,
+        page=page,
+        page_size=page_size,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        statuses=status or [],
+        event_type=event_type,
+        handler_pod=handler_pod,
+        task_id=task_id,
+        failed_only=failed_only,
+        slow_only=slow_only,
+    )
 
 
 @router.post("/projects/{project_id}/tasks/prepare", response_model=BinarySecurityTaskPrepareResponse)
