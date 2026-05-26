@@ -564,6 +564,133 @@ async def test_pi_agent_runtime_rpc_reuses_long_lived_process(
 
 
 @pytest.mark.asyncio
+async def test_pi_agent_runtime_rpc_context_overflow_triggers_manual_compact_once_and_retries(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = PiAgentRuntime(
+        {
+            "id": "pi-test",
+            "name": "Pi Test",
+            "type": "pi_agent",
+            "reset_context": False,
+            "runtime_config": {
+                "model": "anthropic/claude-test",
+                "transport": "rpc",
+                "sdk_specific": {"thinking": "high"},
+            },
+        }
+    )
+
+    class _DeterministicUUID:
+        def __init__(self, hex_value: str) -> None:
+            self.hex = hex_value
+
+    uuid_values = iter([
+        "aaaabbbbccccddddeeeeffff00001111",
+        "11112222333344445555666677778888",
+    ])
+
+    def fake_uuid4():
+        return _DeterministicUUID(next(uuid_values))
+
+    monkeypatch.setattr(
+        "app.pi_vuln_core.agents.runtime_trace.uuid.uuid4",
+        fake_uuid4,
+    )
+    monkeypatch.setattr(
+        "app.pi_vuln_core.agents.runtimes.pi_agent.uuid.uuid4",
+        fake_uuid4,
+    )
+
+    overflow_event = {
+        "type": "message_end",
+        "message": {
+            "role": "assistant",
+            "stopReason": "error",
+            "errorMessage": "ContextWindowExceeded: too many tokens",
+            "content": [],
+        },
+    }
+    success_event = {
+        "type": "message_end",
+        "message": {
+            "role": "assistant",
+            "stopReason": "stop",
+            "content": [{"type": "text", "text": "post-compact response"}],
+        },
+    }
+    proc = _FakeProc(
+        returncode=None,
+        rpc_events=[
+            {"type": "response", "command": "set_auto_retry", "success": True},
+            {"type": "response", "command": "prompt", "success": True},
+            overflow_event,
+            {"type": "agent_end", "messages": []},
+            {"type": "compaction_start", "reason": "manual"},
+            {
+                "type": "compaction_end",
+                "reason": "manual",
+                "result": {
+                    "summary": "Summary of conversation...",
+                    "firstKeptEntryId": "abc123",
+                    "tokensBefore": 150000,
+                    "details": {},
+                },
+                "aborted": False,
+                "willRetry": False,
+            },
+            {
+                "id": "compact-11112222",
+                "type": "response",
+                "command": "compact",
+                "success": True,
+                "data": {
+                    "summary": "Summary of conversation...",
+                    "firstKeptEntryId": "abc123",
+                    "tokensBefore": 150000,
+                    "details": {},
+                },
+            },
+            {"type": "response", "command": "prompt", "success": True},
+            success_event,
+            {"type": "agent_end", "messages": []},
+        ],
+    )
+
+    async def fake_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    response = await runtime.send_message(
+        message="overflow then compact",
+        system_prompt="system",
+        session_id="rpc_compact_session",
+        working_dir=str(tmp_path),
+    )
+
+    assert response.success is True
+    assert response.content == "post-compact response"
+
+    written_commands = [json.loads(item) for item in proc.stdin.writes]
+    assert written_commands[0] == {"type": "set_auto_retry", "enabled": True}
+    assert [cmd["type"] for cmd in written_commands[1:]] == ["prompt", "compact", "prompt"]
+
+    call_dir = next((tmp_path / "sessions" / "rpc_compact_session" / "calls").iterdir())
+    response_payload = json.loads((call_dir / "response.json").read_text(encoding="utf-8"))
+    assert response_payload["status"] == "completed"
+    assert len(response_payload["attempts"]) == 2
+    assert response_payload["attempts"][0]["retry_kind"] == "rpc_manual_compact_on_context_overflow"
+    assert response_payload["attempts"][0]["manual_compaction_attempted"] is True
+    assert response_payload["attempts"][0]["manual_compaction"]["success"] is True
+    assert response_payload["manual_compaction_attempts"][0]["success"] is True
+    assert (call_dir / "rpc_compact_request.json").is_file()
+    assert (call_dir / "rpc_compact_response.json").is_file()
+    assert (call_dir / "rpc_compact_events.json").is_file()
+
+
+@pytest.mark.asyncio
 async def test_pi_agent_runtime_rpc_uses_pi_native_timeout_without_framework_timeout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

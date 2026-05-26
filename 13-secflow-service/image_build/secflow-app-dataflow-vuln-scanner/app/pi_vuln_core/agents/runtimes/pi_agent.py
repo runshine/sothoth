@@ -156,6 +156,22 @@ class _AttemptResult:
     internal_turns: int = 0
 
 
+@dataclass
+class _RpcCommandResult:
+    command: str
+    success: bool = False
+    response_data: dict[str, Any] | None = None
+    error: str = ""
+    duration_ms: int = 0
+    stdout_text: str = ""
+    stderr_text: str = ""
+    events: list[dict[str, Any]] = field(default_factory=list)
+    stdout_total_bytes: int = 0
+    stderr_total_bytes: int = 0
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+
+
 class _RuntimeOutputLimitError(RuntimeError):
     """Raised when a child process exceeds framework runtime output limits."""
 
@@ -1277,6 +1293,170 @@ class PiAgentRuntime(BaseAgentRuntime):
         )
         return proc
 
+    async def _rpc_run_command(
+        self,
+        *,
+        cmd_args: list[str],
+        working_dir: Optional[str],
+        session_id: str,
+        call_dir: str,
+        session: dict,
+        command: dict[str, Any],
+        expected_command: str,
+        max_stdout_bytes: int,
+        max_stderr_bytes: int,
+        max_single_line_bytes: int,
+        heartbeat_interval_seconds: float,
+    ) -> _RpcCommandResult:
+        """Send one control command to a long-lived RPC process and wait for its response."""
+        started_monotonic = time.monotonic()
+        stdout_buffer = _BoundedBytesBuffer(max_stdout_bytes)
+        stderr_buffer = _BoundedBytesBuffer(max_stderr_bytes)
+        response_data: dict[str, Any] | None = None
+        response_error = ""
+        response_success = False
+        events: list[dict[str, Any]] = []
+        request_id = str(command.get("id") or "")
+
+        if call_dir:
+            write_json(Path(call_dir) / f"rpc_{expected_command}_request.json", command)
+
+        try:
+            proc = await self._ensure_rpc_process(
+                cmd_args=cmd_args,
+                working_dir=working_dir,
+                session_id=session_id,
+                call_dir=call_dir,
+                session=session,
+            )
+            session["rpc_stderr_parts"] = []
+            session["rpc_stderr_total_bytes"] = 0
+            session["rpc_stderr_retained_bytes"] = 0
+            session["rpc_stderr_truncated"] = False
+            session["rpc_max_stderr_bytes"] = max_stderr_bytes
+            last_heartbeat = started_monotonic
+
+            await self._rpc_send(proc, command)
+            while True:
+                raw_line, eof = await self._read_rpc_jsonl_record(
+                    proc=proc,
+                    session=session,
+                    stdout_buffer=stdout_buffer,
+                    max_single_line_bytes=max_single_line_bytes,
+                )
+                now = time.monotonic()
+                if now - last_heartbeat >= heartbeat_interval_seconds:
+                    last_heartbeat = now
+                    self._write_call_heartbeat(
+                        call_dir,
+                        status=f"rpc_{expected_command}",
+                        detail={
+                            "stdout_bytes": stdout_buffer.total_bytes,
+                            "event_count": len(events),
+                        },
+                    )
+                if raw_line is None:
+                    raise RuntimeError(
+                        f"pi rpc process exited before {expected_command} response"
+                    )
+                try:
+                    event = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    if eof:
+                        raise RuntimeError(
+                            f"pi rpc process exited before {expected_command} response"
+                        )
+                    continue
+
+                events.append(self._compact_trace_event(event))
+
+                if (
+                    event.get("type") == "response"
+                    and event.get("command") == expected_command
+                    and (not request_id or str(event.get("id") or "") == request_id)
+                ):
+                    response_success = bool(event.get("success", False))
+                    raw_data = event.get("data")
+                    if isinstance(raw_data, dict):
+                        response_data = raw_data
+                    elif raw_data is not None:
+                        response_data = {"value": raw_data}
+                    response_error = str(event.get("error") or "")
+                    break
+
+                if eof:
+                    raise RuntimeError(
+                        f"pi rpc process exited before {expected_command} response"
+                    )
+
+            for chunk in session.get("rpc_stderr_parts", []):
+                stderr_buffer.append(chunk)
+            stderr_buffer.total_bytes = int(
+                session.get("rpc_stderr_total_bytes") or stderr_buffer.total_bytes
+            )
+            stderr_buffer.truncated = bool(
+                session.get("rpc_stderr_truncated") or stderr_buffer.truncated
+            )
+            stderr_text = stderr_buffer.text().strip()
+            if not response_success and not response_error:
+                for event in reversed(events):
+                    if event.get("type") == "compaction_end":
+                        response_error = str(event.get("errorMessage") or "")
+                        if response_error:
+                            break
+            result = _RpcCommandResult(
+                command=expected_command,
+                success=response_success,
+                response_data=response_data,
+                error=response_error,
+                duration_ms=int((time.monotonic() - started_monotonic) * 1000),
+                stdout_text=stdout_buffer.text(),
+                stderr_text=stderr_text,
+                events=events,
+                stdout_total_bytes=stdout_buffer.total_bytes,
+                stderr_total_bytes=stderr_buffer.total_bytes,
+                stdout_truncated=stdout_buffer.truncated,
+                stderr_truncated=stderr_buffer.truncated,
+            )
+            return result
+        except Exception as exc:
+            stderr_text = b"".join(session.get("rpc_stderr_parts", [])).decode(
+                "utf-8", errors="replace"
+            ).strip()
+            await self._close_rpc_process_for_session(session)
+            return _RpcCommandResult(
+                command=expected_command,
+                success=False,
+                error=f"pi rpc {expected_command} error: {exc}",
+                duration_ms=int((time.monotonic() - started_monotonic) * 1000),
+                stdout_text=stdout_buffer.text(),
+                stderr_text=stderr_text,
+                events=events,
+                stdout_total_bytes=stdout_buffer.total_bytes,
+                stderr_total_bytes=len(stderr_text.encode("utf-8", errors="replace")),
+                stdout_truncated=stdout_buffer.truncated,
+                stderr_truncated=False,
+            )
+        finally:
+            if call_dir:
+                if events:
+                    write_json(
+                        Path(call_dir) / f"rpc_{expected_command}_events.json",
+                        events,
+                    )
+                write_json(
+                    Path(call_dir) / f"rpc_{expected_command}_response.json",
+                    {
+                        "command": expected_command,
+                        "success": response_success,
+                        "error": response_error,
+                        "response_data": response_data,
+                        "duration_ms": int((time.monotonic() - started_monotonic) * 1000),
+                        "stdout_total_bytes": stdout_buffer.total_bytes,
+                        "stderr_text": stderr_buffer.text().strip() if stderr_buffer.total_bytes else "",
+                    },
+                )
+
     async def _execute_once_rpc(
         self,
         *,
@@ -1783,6 +1963,14 @@ class PiAgentRuntime(BaseAgentRuntime):
         pi_failures = 0
         timeout_failures = 0
         timeout_retry_sessions: list[dict[str, Any]] = []
+        manual_compaction_attempts: list[dict[str, Any]] = []
+        manual_compaction_enabled = (
+            transport == "rpc"
+            and self._runtime_bool("rpc_manual_compact_on_context_overflow", True)
+        )
+        manual_compaction_custom_instructions = str(
+            self.runtime_config.get("rpc_manual_compact_instructions") or ""
+        ).strip() or None
         active_session_id = session_id
         active_session = session
         active_session_dir = trace_context.session_dir
@@ -2028,6 +2216,72 @@ class PiAgentRuntime(BaseAgentRuntime):
                     attempts[-1]["will_retry"] = False
                     break
 
+                # 0.45) RPC context overflow: manually compact once, then resend the
+                # same prompt on the same session/process. Pi exposes `compact`
+                # as an RPC command, but the subprocess wrapper must trigger it
+                # explicitly after blocked_context_window if auto-compaction did
+                # not happen.
+                if (
+                    manual_compaction_enabled
+                    and transport == "rpc"
+                    and result.error_code == "blocked_context_window"
+                    and not any(item.get("success") for item in manual_compaction_attempts)
+                ):
+                    attempts[-1]["retry_kind"] = "rpc_manual_compact_on_context_overflow"
+                    compact_request = {
+                        "id": f"compact-{uuid.uuid4().hex[:8]}",
+                        "type": "compact",
+                    }
+                    if manual_compaction_custom_instructions:
+                        compact_request["customInstructions"] = manual_compaction_custom_instructions
+                    compact_result = await self._rpc_run_command(
+                        cmd_args=attempt_cmd_args,
+                        working_dir=working_dir,
+                        session_id=active_session_id,
+                        call_dir=trace_context.call_dir or "",
+                        session=active_session,
+                        command=compact_request,
+                        expected_command="compact",
+                        max_stdout_bytes=effective_rpc_stdout_trace_bytes,
+                        max_stderr_bytes=max_stderr_bytes,
+                        max_single_line_bytes=max_single_line_bytes,
+                        heartbeat_interval_seconds=heartbeat_interval_seconds,
+                    )
+                    compact_record = {
+                        "success": compact_result.success,
+                        "error": compact_result.error,
+                        "duration_ms": compact_result.duration_ms,
+                        "stdout_total_bytes": compact_result.stdout_total_bytes,
+                        "stderr_total_bytes": compact_result.stderr_total_bytes,
+                        "events": compact_result.events,
+                        "response_data": compact_result.response_data,
+                    }
+                    manual_compaction_attempts.append(compact_record)
+                    attempts[-1]["manual_compaction"] = compact_record
+                    attempts[-1]["manual_compaction_attempted"] = True
+                    attempts[-1]["rpc_process_preserved"] = bool(
+                        active_session.get("rpc_proc") is not None
+                    )
+                    if compact_result.success:
+                        attempts[-1]["will_retry"] = True
+                        logger.warning(
+                            "runtime_rpc_manual_compact_retry",
+                            runtime="pi_agent",
+                            agent_id=self.agent_id,
+                            session_id=active_session_id,
+                            session_dir=active_session_dir,
+                            error=result.error,
+                            compact_duration_ms=compact_result.duration_ms,
+                        )
+                        continue
+                    attempts[-1]["will_retry"] = False
+                    result.error = (
+                        (result.error or "blocked context window")
+                        + f" [rpc manual compact failed: {compact_result.error or 'unknown error'}]"
+                    )
+                    attempts[-1]["error"] = result.error
+                    break
+
                 # 0.5) 框架已分类的终态错误不进入 API/pi 无限重试。
                 if result.error_code in _TERMINAL_ERROR_CODES:
                     break
@@ -2148,6 +2402,7 @@ class PiAgentRuntime(BaseAgentRuntime):
                     "timeout_retry_interval_seconds": timeout_retry_delay,
                     "timeout_retry_fresh_session": timeout_retry_fresh_session,
                     "timeout_retry_sessions": timeout_retry_sessions,
+                    "manual_compaction_attempts": manual_compaction_attempts,
                     "trace_limits": trace_limits,
                     "output_total_bytes": final_result.stdout_total_bytes,
                     "stderr_total_bytes": final_result.stderr_total_bytes,
@@ -2232,6 +2487,7 @@ class PiAgentRuntime(BaseAgentRuntime):
                         response_error_code == "runtime_timeout"
                         and timeout_failures > 0
                     ),
+                    "manual_compaction_attempts": manual_compaction_attempts,
                     "event_total_count": final_result.parsed.total_event_count,
                     "events_truncated_count": final_result.parsed.events_truncated_count,
                     "internal_turn_count": final_result.internal_turns,
