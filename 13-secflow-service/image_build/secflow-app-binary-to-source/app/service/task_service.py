@@ -3988,15 +3988,17 @@ def build_task_item_review_analytics(item: B2STaskItem) -> ReviewAnalyticsRespon
 def build_task_item_advanced(item: B2STaskItem, include_content: bool = True) -> TaskItemAdvancedResponse:
     output_dir = Path(item.output_dir)
     base = output_dir.resolve()
-    work_dir = _item_run_root(output_dir)
+    legacy_work_dir = _item_run_root(output_dir)
+    pi_work_dir = _pi_re_work_root(output_dir)
+    work_dir = legacy_work_dir if legacy_work_dir.exists() else (pi_work_dir or legacy_work_dir)
     runs: list[AdvancedRun] = []
     ida_files: list[AdvancedFile] = []
-    if work_dir.exists():
-        ida_root = _item_ida_cache_dir(output_dir)
+    ida_root = _item_ida_cache_dir(output_dir)
+    runs_root = _item_runs_root(output_dir)
+    if ida_root.exists() or runs_root.exists():
         if ida_root.exists():
             ida_paths = [p for p in ida_root.rglob("*") if p.is_file() and p.suffix.lower() in ADVANCED_TEXT_EXTENSIONS]
             ida_files = [file for path in sorted(ida_paths) if (file := _safe_read_advanced_file(path, base, include_content, _ida_file_meta(path)))]
-        runs_root = _item_runs_root(output_dir)
         run_dirs = sorted([p for p in runs_root.iterdir() if p.is_dir()], key=lambda p: p.name) if runs_root.exists() else []
         for run_dir in run_dirs:
             batch_map: dict[int, AdvancedBatch] = {}
