@@ -4,6 +4,7 @@ import logging
 
 from fastapi import APIRouter
 
+from app.build_info import build_service_meta
 from app.models.database import get_engine
 from app.schemas import HealthResponse, SuccessResponse
 from app.services.auth import get_auth_service
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 @router.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    return HealthResponse.model_validate(get_scheduler_service().health_payload())
+    return HealthResponse.model_validate({**get_scheduler_service().health_payload(), **build_service_meta()})
 
 
 @router.get("/ready", response_model=SuccessResponse)

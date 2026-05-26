@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, Header, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.build_info import build_service_meta
 from app.exception import NotFoundError, UnauthorizedError, ValidationError
 from app.model import B2STask, B2STaskItem, get_db
 from app.schemas import ActionResponse, B2SAgentSessionRuntimeResponse, B2SArtifactContentResponse, B2SCacheBatchDeleteRequest, B2SCacheBatchDeleteResponse, B2SCacheDeleteResponse, B2SCacheDetailResponse, B2SCacheListResponse, B2SServiceConfig, B2STaskTimelineResponse, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, SessionFileResponse, SessionIndexResponse, TaskBatchDeleteItemResult, TaskBatchDeleteRequest, TaskBatchDeleteResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskListResponse, TaskObservabilitySummary, TaskPrepareResponse, TaskRelationshipResponse, TaskResponse, TaskResultSummary, TokenUser
@@ -132,7 +133,7 @@ async def _effective_llm_provider_summary(provider_key: str | None) -> dict | No
 
 @router.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "secflow-app-binary-to-source"}
+    return {"status": "ok", "service": "secflow-app-binary-to-source", **build_service_meta()}
 
 
 @router.get("/ready")

@@ -3,6 +3,7 @@ FROM ubuntu:24.04
 LABEL maintainer="icsl"
 LABEL description="Firmware unpacking microservice powered by pi coding agent"
 
+ARG SECFLOW_BUILD_VERSION=""
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Asia/Shanghai
 ENV NODE_VERSION=v25.8.1
@@ -146,6 +147,7 @@ PICONF
 COPY app/ /app/app/
 COPY config.yaml /app/config.yaml
 COPY start.sh /app/start.sh
+RUN printf '{\"build_version\":\"%s\"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
 RUN mkdir -p /app/data \
     && chmod +x /app/start.sh

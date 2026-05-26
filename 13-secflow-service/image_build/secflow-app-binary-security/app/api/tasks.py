@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Header, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
+from app.build_info import build_service_meta
 from app.exception import UnauthorizedError
 from app.model import get_db
 from app.runtime_health import collect_liveness, collect_readiness
@@ -68,6 +69,7 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> Token
 async def health_check():
     return {
         "service": "secflow-app-binary-security",
+        **build_service_meta(),
         **collect_liveness(),
     }
 

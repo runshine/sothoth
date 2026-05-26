@@ -407,6 +407,9 @@ class HealthResponse(BaseModel):
     scheduler: str
     scheduler_role: str = "standalone"
     worker_enabled: str = "true"
+    service_id: Optional[str] = None
+    service_name: Optional[str] = None
+    build_version: Optional[str] = None
 
 
 class RunSummaryResponse(BaseModel):

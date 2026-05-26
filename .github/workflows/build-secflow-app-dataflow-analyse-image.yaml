@@ -50,6 +50,7 @@ jobs:
       - name: Build amd64 image
         run: |
           docker build \
+            --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --file 13-secflow-service/image_build/secflow-app-dataflow-analyse/Dockerfile \
             --tag ghcr.io/runshine/secflow-app-dataflow-analyse:amd64-latest \
             --tag ghcr.io/runshine/secflow-app-dataflow-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
@@ -91,6 +92,7 @@ jobs:
       - name: Build arm64 image
         run: |
           docker build \
+            --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --file 13-secflow-service/image_build/secflow-app-dataflow-analyse/Dockerfile \
             --tag ghcr.io/runshine/secflow-app-dataflow-analyse:arm64-latest \
             --tag ghcr.io/runshine/secflow-app-dataflow-analyse:arm64-${{ needs.prepare.outputs.date_tag }} \
