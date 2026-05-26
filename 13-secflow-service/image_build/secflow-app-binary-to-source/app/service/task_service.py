@@ -2845,7 +2845,7 @@ def remove_ida_intermediate_outputs(output_dir: str | Path | None) -> list[str]:
             relative_parts = [part.lower() for part in path.relative_to(root).parts]
         except Exception:
             relative_parts = [part.lower() for part in path.parts]
-        if "run" in relative_parts:
+        if "run" in relative_parts or any(part.startswith(".re_work_") for part in relative_parts):
             continue
         if path.is_dir():
             if not _is_legacy_re_work_dir(path):
