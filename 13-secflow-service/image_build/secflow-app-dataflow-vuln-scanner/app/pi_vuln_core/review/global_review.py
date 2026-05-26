@@ -49,7 +49,7 @@ from app.pi_vuln_core.utils.result_docs import (
     list_supporting_markdown_files,
     results_manifest_path,
 )
-from app.pi_vuln_core.utils.template import render_string
+from app.pi_vuln_core.utils.template import collect_template_kwargs, render_string
 from app.pi_vuln_core.utils.logger import get_logger
 
 logger = get_logger("global_review")
@@ -326,30 +326,32 @@ class GlobalReviewExecutor:
         )
         user_prompt_tpl = read_file(advisor_def.user_prompt_template)
         required_score_keys = self._required_score_keys_for_advisor(advisor_def)
-        user_prompt = render_string(
+        prompt_kwargs = collect_template_kwargs(
             user_prompt_tpl,
-            strict=True,
-            cycle=str(cycle),
-            workflow_mode=review_state.workflow_mode,
-            current_issue_count=str(len(review_state.get_recent_issues(last_n=2))),
-            task_file=task_file,
-            summary_file=prompt_context["summary_file"],
-            results_dir=results_dir,
-            supporting_docs_dir=prompt_context["supporting_docs_dir"],
-            previous_limitations_file=prompt_context["previous_limitations_file"],
-            result_relations_manifest_file=prompt_context["result_relations_manifest_file"],
-            results_manifest_file=prompt_context["results_manifest_file"],
-            review_context=prompt_context["context_text"],
-            advisor_instance_id=advisor_def.instance_id,
-            advisor_role_name=advisor_def.role_name,
-            current_global_review_index=str(index),
-            total_global_review_advisors=str(total_advisors),
-            prior_global_findings="(本轮全局评审并行执行，各参谋独立评审)",
-            worker_system_prompt_file=worker_system_prompt_file,
-            score_thresholds=self._format_score_thresholds_for_advisor(advisor_def, cycle),
-            required_score_fields=self._format_required_score_fields_for_advisor(advisor_def),
-            closure_review_policy=self._format_closure_review_policy(review_state.workflow_mode),
+            value_factories={
+                "cycle": lambda: str(cycle),
+                "workflow_mode": lambda: review_state.workflow_mode,
+                "current_issue_count": lambda: str(len(review_state.get_recent_issues(last_n=2))),
+                "task_file": lambda: task_file,
+                "summary_file": lambda: prompt_context["summary_file"],
+                "results_dir": lambda: results_dir,
+                "supporting_docs_dir": lambda: prompt_context["supporting_docs_dir"],
+                "previous_limitations_file": lambda: prompt_context["previous_limitations_file"],
+                "result_relations_manifest_file": lambda: prompt_context["result_relations_manifest_file"],
+                "results_manifest_file": lambda: prompt_context["results_manifest_file"],
+                "review_context": lambda: prompt_context["context_text"],
+                "advisor_instance_id": lambda: advisor_def.instance_id,
+                "advisor_role_name": lambda: advisor_def.role_name,
+                "current_global_review_index": lambda: str(index),
+                "total_global_review_advisors": lambda: str(total_advisors),
+                "prior_global_findings": lambda: "(本轮全局评审并行执行，各参谋独立评审)",
+                "worker_system_prompt_file": lambda: worker_system_prompt_file,
+                "score_thresholds": lambda: self._format_score_thresholds_for_advisor(advisor_def, cycle),
+                "required_score_fields": lambda: self._format_required_score_fields_for_advisor(advisor_def),
+                "closure_review_policy": lambda: self._format_closure_review_policy(review_state.workflow_mode),
+            },
         )
+        user_prompt = render_string(user_prompt_tpl, strict=True, **prompt_kwargs)
 
         session_key = advisor_def.instance_id
         session_id = advisor_sessions.get(session_key)

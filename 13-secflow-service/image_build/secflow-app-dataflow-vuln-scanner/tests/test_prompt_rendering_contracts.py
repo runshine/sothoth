@@ -759,7 +759,7 @@ def test_profile_min_cycle_uses_profile_exploration_stage_not_missed_hunt(tmp_pa
     assert response.metadata["rework_skipped_stages"] == ["missed_vuln_hunting"]
     assert len(agent.messages) == 1
     assert "Profile-Driven Exploration" in agent.messages[0]["message"]
-    assert "这不是失败评审返工，也不是 missed hunt" in agent.messages[0]["message"]
+    assert "不是失败评审返工，也不是 missed hunt" in agent.messages[0]["message"]
     assert "基于失败评审继续挖洞" not in agent.messages[0]["message"]
     assert "上游评审节点已经完成筛选" not in agent.messages[0]["message"]
     assert "profile_exploration_cycle_3.md" in agent.messages[0]["message"]
