@@ -120,3 +120,7 @@ app:
 
 logging:
   level: "INFO"
+
+# Build trigger note:
+# Keep a no-op tracked change available when we need to force the
+# binary-security image workflow after orchestration-only fixes.
