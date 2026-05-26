@@ -26,6 +26,8 @@ class BinarySecurityInputFile(BaseModel):
 
 class StageOptions(BaseModel):
     enabled: bool = True
+    mode: Optional[str] = None
+    engine: Optional[str] = None
 
 
 class TaskPolicyOverrides(BaseModel):

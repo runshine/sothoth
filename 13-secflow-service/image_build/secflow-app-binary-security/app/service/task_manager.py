@@ -7921,6 +7921,17 @@ class TaskManager:
             return True
         return bool(option.get("enabled", True))
 
+    def _b2s_execution_mode(self, task: BinarySecurityTask) -> tuple[str, str]:
+        policy = task.policy or {}
+        stage_options = policy.get("stage_options", {}) if isinstance(policy.get("stage_options"), dict) else {}
+        option = stage_options.get("binary_to_source") if isinstance(stage_options.get("binary_to_source"), dict) else {}
+        mode = str(option.get("mode") or policy.get("b2s_mode") or "fast").strip().lower()
+        if mode == "turbo":
+            return "turbo", "turbo"
+        if mode == "deep":
+            return "deep", "agent"
+        return "fast", "hybrid"
+
     def _pipeline_mode(self, task: BinarySecurityTask | dict[str, Any] | None) -> str:
         if isinstance(task, dict):
             policy = task
@@ -14458,12 +14469,15 @@ class TaskManager:
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
+                    b2s_mode, b2s_engine = self._b2s_execution_mode(task)
                     created = await get_binary_to_source_client().create_task(
                         task.project_id,
                         f"{task.name}-{module['module_name']}",
                         elf_tasks,
                         token or "",
                         _downstream_origin_payload(task, item),
+                        mode=b2s_mode,
+                        engine=b2s_engine,
                     )
                     item.downstream_task_id = created.get("id") or item.downstream_task_id
                     item.result = {"project_id": task.project_id}

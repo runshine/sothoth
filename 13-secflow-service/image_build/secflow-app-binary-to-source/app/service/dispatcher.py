@@ -88,33 +88,31 @@ class B2SDispatcher:
     async def _dispatch_once(self) -> None:
         cfg = get_config().pi_re_agent
         snapshot = await get_pi_cluster_monitor().snapshot()
-        if snapshot.total_capacity <= 0:
-            return
         queued_buffer = max(0, snapshot.worker_count * cfg.queued_buffer_per_worker)
         max_inflight = snapshot.total_capacity + queued_buffer
 
         db = get_db_session()
         try:
-            inflight = db.query(B2STaskItem).filter(
-                B2STaskItem.status.in_(["queued", "running"]),
-                B2STaskItem.pi_job_id.isnot(None),
-            ).count()
-            dispatch_limit = min(cfg.max_dispatch_batch_size, max(0, max_inflight - inflight))
-            if dispatch_limit <= 0:
-                return
             now = now_local()
-            items = db.query(B2STaskItem).filter(
-                or_(
-                    B2STaskItem.status == "pending",
-                    (B2STaskItem.status == "queued") & B2STaskItem.pi_job_id.is_(None),
-                ),
-                or_(B2STaskItem.next_dispatch_at.is_(None), B2STaskItem.next_dispatch_at <= now),
-            ).order_by(B2STaskItem.created_at.asc(), B2STaskItem.sequence_no.asc()).limit(dispatch_limit).all()
             touched_tasks: set[str] = set()
-            for item in items:
-                await dispatch_item_to_pi(db, item, owner_id=self.owner_id)
-                touched_tasks.add(item.task_id)
-                db.commit()
+            if max_inflight > 0:
+                inflight = db.query(B2STaskItem).filter(
+                    B2STaskItem.status.in_(["queued", "running"]),
+                    B2STaskItem.pi_job_id.isnot(None),
+                ).count()
+                dispatch_limit = min(cfg.max_dispatch_batch_size, max(0, max_inflight - inflight))
+                if dispatch_limit > 0:
+                    items = db.query(B2STaskItem).filter(
+                        or_(
+                            B2STaskItem.status == "pending",
+                            (B2STaskItem.status == "queued") & B2STaskItem.pi_job_id.is_(None),
+                        ),
+                        or_(B2STaskItem.next_dispatch_at.is_(None), B2STaskItem.next_dispatch_at <= now),
+                    ).order_by(B2STaskItem.created_at.asc(), B2STaskItem.sequence_no.asc()).limit(dispatch_limit).all()
+                    for item in items:
+                        await dispatch_item_to_pi(db, item, owner_id=self.owner_id)
+                        touched_tasks.add(item.task_id)
+                        db.commit()
             for task_id in touched_tasks:
                 task = db.query(B2STask).filter(B2STask.id == task_id).first()
                 if task:

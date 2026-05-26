@@ -77,7 +77,7 @@ class PiReAgentConfig(BaseModel):
     agent_run_timeout_seconds: int = 3600
     agent_timeout_retry_enabled: bool = True
     agent_timeout_max_retries: int = 3
-    engine: Literal["agent", "hybrid"] = "hybrid"
+    engine: Literal["turbo", "agent", "hybrid"] = "hybrid"
     concurrency: int = 8
     model: Optional[str] = None
     llm_provider_key: Optional[str] = "share_codex"
