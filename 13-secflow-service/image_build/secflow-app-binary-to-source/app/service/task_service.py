@@ -110,6 +110,8 @@ PI_PHASE_MAP = {
 PHASE_LABELS = {
     "queued": "排队中",
     "ida": "IDA 分析",
+    "decompiling": "IDA 反编译",
+    "packaging": "产物整理",
     "batching": "函数分批",
     "header": "头文件恢复",
     "body": "函数体恢复",
@@ -544,6 +546,8 @@ def _get_task_batch_row(db: Session, *, item: B2STaskItem, batch_no: int) -> B2S
 
 
 def _get_task_phase_row(db: Session, *, item: B2STaskItem, phase: str) -> B2STaskPhase:
+    if not hasattr(db, "query"):
+        return B2STaskPhase(task_id=item.task_id, project_id=item.project_id, item_id=item.id, sequence_no=item.sequence_no, phase=phase)
     row = (
         db.query(B2STaskPhase)
         .filter(
@@ -638,6 +642,8 @@ def sync_phase_records_from_item(
     item: B2STaskItem,
     previous: dict[str, Any] | None,
 ) -> None:
+    if not hasattr(db, "query"):
+        return
     prev = previous or {}
     prev_phase = str(prev.get("phase") or "").strip().lower()
     current_phase = str(item.phase or "").strip().lower()
@@ -773,6 +779,8 @@ def _close_running_batches_for_item(
     only_batch_no: int | None = None,
     completed_progress_count: int | None = None,
 ) -> None:
+    if not hasattr(db, "query"):
+        return
     query = db.query(B2STaskBatch).filter(
         B2STaskBatch.task_id == item.task_id,
         B2STaskBatch.item_id == item.id,
@@ -920,8 +928,9 @@ def _record_item_snapshot_events(
     source: str,
     payload: dict[str, Any] | None = None,
 ) -> None:
-    sync_batch_records_from_progress(db, item=item, previous=previous)
-    sync_phase_records_from_item(db, item=item, previous=previous)
+    if hasattr(db, "query"):
+        sync_batch_records_from_progress(db, item=item, previous=previous)
+        sync_phase_records_from_item(db, item=item, previous=previous)
     prev = previous or {}
     prev_progress = prev.get("progress") if isinstance(prev.get("progress"), dict) else {}
     prev_metrics = prev.get("runtime_metrics")
@@ -1519,7 +1528,7 @@ def item_pi_worker_url(item: B2STaskItem) -> str | None:
 
 def _normalized_target(path: str | None) -> str:
     try:
-        return str(Path(path or "").resolve())
+        return os.path.abspath(str(path or ""))
     except Exception:
         return str(path or "")
 
@@ -1965,6 +1974,11 @@ def _classify_pi_failure(error: str | None) -> str:
     return "pi-re-agent"
 
 
+def _item_engine(item: B2STaskItem) -> str:
+    engine = str((item.extra_metadata or {}).get("engine") or get_config().pi_re_agent.engine or "hybrid").strip().lower()
+    return engine if engine in {"turbo", "hybrid", "agent"} else "hybrid"
+
+
 def _job_model_for_item(item: B2STaskItem) -> str | None:
     metadata = item.extra_metadata or {}
     key = _normalize_llm_provider_key(metadata.get("llm_provider_key"))
@@ -2077,13 +2091,23 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
 
     cfg = get_config()
     pi_cfg = cfg.pi_re_agent
+    mode_engine_map = {"turbo": "turbo", "fast": "hybrid", "deep": "agent"}
+    engine_mode_map = {"turbo": "turbo", "hybrid": "fast", "agent": "deep"}
+    job_mode = req.mode or (engine_mode_map.get(req.engine or "") if req.engine else None)
+    job_engine = mode_engine_map.get(job_mode or "") or req.engine or pi_cfg.engine
+    job_mode = job_mode or engine_mode_map.get(job_engine) or "fast"
     request_provider_key = _normalize_llm_provider_key(req.llm_provider_key)
     project_provider_key = _project_default_llm_provider_key(db, project_id)
     effective_provider_key = request_provider_key or project_provider_key
-    provider = await materialize_llm_provider(effective_provider_key) if cfg.configcenter_service.enabled else None
-    job_model = _provider_model_name(provider) or pi_cfg.model
-    frozen_provider_key = _normalize_llm_provider_key(provider.get("provider_key") if provider else effective_provider_key)
-    frozen_provider_model = _normalize_llm_provider_key(provider.get("model") if provider else job_model)
+    provider = None
+    job_model = None
+    frozen_provider_key = None
+    frozen_provider_model = None
+    if job_engine != "turbo":
+        provider = await materialize_llm_provider(effective_provider_key) if cfg.configcenter_service.enabled else None
+        job_model = _provider_model_name(provider) or pi_cfg.model
+        frozen_provider_key = _normalize_llm_provider_key(provider.get("provider_key") if provider else effective_provider_key)
+        frozen_provider_model = _normalize_llm_provider_key(provider.get("model") if provider else job_model)
     request_concurrency = normalize_concurrency(req.concurrency) if req.concurrency is not None else None
     project_concurrency = _project_default_concurrency(db, project_id)
     job_concurrency = request_concurrency or project_concurrency or normalize_concurrency(pi_cfg.concurrency)
@@ -2091,10 +2115,6 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
     job_timeout_retry_enabled = req.agent_timeout_retry_enabled if req.agent_timeout_retry_enabled is not None else pi_cfg.agent_timeout_retry_enabled
     job_timeout_max_retries = req.agent_timeout_max_retries if req.agent_timeout_max_retries is not None else pi_cfg.agent_timeout_max_retries
     budget_exhausted_action = _budget_exhausted_action_for_project(db, project_id)
-    mode_engine_map = {"fast": "hybrid", "deep": "agent"}
-    job_mode = req.mode or ({"hybrid": "fast", "agent": "deep"}.get(req.engine or "") if req.engine else None)
-    job_engine = mode_engine_map.get(job_mode or "") or req.engine or pi_cfg.engine
-    job_mode = job_mode or {"hybrid": "fast", "agent": "deep"}.get(job_engine)
     reuse_cache = _normalize_reuse_cache(req.reuse_cache)
     for idx, elf in enumerate(req.elf_tasks, start=1):
         source_elf_path = ensure_path_in_project(project_id, elf.elf_path, must_be_file=True)
@@ -2123,6 +2143,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             "llm_provider_model": frozen_provider_model,
             "llm_provider_display_name": str(provider.get("display_name") or "").strip() if provider else None,
             "llm_provider_type": str(provider.get("provider_type") or "").strip() if provider else None,
+            "llm_used": job_engine != "turbo",
             "concurrency": job_concurrency,
             "agent_run_timeout_seconds": job_timeout_seconds,
             "agent_timeout_retry_enabled": job_timeout_retry_enabled,
@@ -2959,7 +2980,7 @@ def count_status(items: list[B2STaskItem]) -> dict[str, int]:
 
 def task_mode_summary(items: list[B2STaskItem]) -> tuple[str | None, str | None]:
     modes: list[str] = []
-    engine_mode_map = {"hybrid": "fast", "agent": "deep"}
+    engine_mode_map = {"turbo": "turbo", "hybrid": "fast", "agent": "deep"}
     for item in items:
         metadata = item.extra_metadata or {}
         mode = str(metadata.get("mode") or "").strip()
@@ -2975,6 +2996,8 @@ def task_mode_summary(items: list[B2STaskItem]) -> tuple[str | None, str | None]
             return mode, "深度模式"
         if mode == "fast":
             return mode, "快速模式"
+        if mode == "turbo":
+            return mode, "极速模式"
         return mode, mode
     return "mixed", "混合模式"
 

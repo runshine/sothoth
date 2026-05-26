@@ -32,8 +32,8 @@ class TaskCreate(BaseModel):
     agent_run_timeout_seconds: Optional[int] = None
     agent_timeout_retry_enabled: Optional[bool] = None
     agent_timeout_max_retries: Optional[int] = None
-    mode: Optional[Literal["fast", "deep"]] = None
-    engine: Optional[Literal["hybrid", "agent"]] = None
+    mode: Optional[Literal["turbo", "fast", "deep"]] = None
+    engine: Optional[Literal["turbo", "hybrid", "agent"]] = None
     reuse_cache: Optional[bool] = None
     task_origin_type: Optional[str] = None
     parent_project_id: Optional[str] = None
@@ -706,6 +706,7 @@ class B2SCacheSummary(BaseModel):
     current_project_entries: int = 0
     fast_entries: int = 0
     deep_entries: int = 0
+    turbo_entries: int = 0
     total_hit_count: int = 0
     latest_hit_at: Optional[str] = None
 

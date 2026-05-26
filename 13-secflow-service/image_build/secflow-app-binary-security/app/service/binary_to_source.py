@@ -20,18 +20,29 @@ class BinaryToSourceClient(JsonHttpClient):
         elf_tasks: list[dict[str, Any]],
         token: str,
         origin: dict[str, Any] | None = None,
+        *,
+        mode: str | None = None,
+        engine: str | None = None,
+        reuse_cache: bool | None = None,
     ) -> dict:
+        payload = {
+            "name": name,
+            "description": "由 binary security 编排器触发的反编译任务",
+            "priority": 5,
+            "tags": ["binary-security", "b2s"],
+            **(origin or {}),
+            "elf_tasks": elf_tasks,
+        }
+        if mode:
+            payload["mode"] = mode
+        if engine:
+            payload["engine"] = engine
+        if reuse_cache is not None:
+            payload["reuse_cache"] = bool(reuse_cache)
         return await self.post(
             f"/projects/{project_id}/tasks",
             token=token,
-            json_body={
-                "name": name,
-                "description": "由 binary security 编排器触发的反编译任务",
-                "priority": 5,
-                "tags": ["binary-security", "b2s"],
-                **(origin or {}),
-                "elf_tasks": elf_tasks,
-            },
+            json_body=payload,
         )
 
     async def get_task(self, project_id: str, task_id: str, token: str) -> dict:

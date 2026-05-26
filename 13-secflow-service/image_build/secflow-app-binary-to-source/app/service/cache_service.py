@@ -21,7 +21,7 @@ from app.model import B2SAnalysisCache, B2STaskItem
 from app.observability import get_observability
 from app.time_utils import isoformat_local, now_local
 
-CACHE_KEY_RE = re.compile(r"^[a-f0-9]{64}_(fast|deep)$")
+CACHE_KEY_RE = re.compile(r"^[a-f0-9]{64}_(turbo|fast|deep)$")
 
 
 def _is_ida_intermediate_path(path: str | Path | None) -> bool:
@@ -112,11 +112,21 @@ class B2SCacheService:
 
     def normalize_cache_mode(self, metadata: dict[str, Any] | None) -> str:
         mode = str((metadata or {}).get("mode") or "").strip().lower()
-        return "deep" if mode == "deep" else "fast"
+        if mode == "deep":
+            return "deep"
+        if mode == "turbo":
+            return "turbo"
+        return "fast"
 
     def build_cache_key(self, file_sha256: str, mode: str) -> str:
         digest = str(file_sha256 or "").strip().lower()
-        normalized_mode = "deep" if str(mode or "").strip().lower() == "deep" else "fast"
+        raw_mode = str(mode or "").strip().lower()
+        if raw_mode == "deep":
+            normalized_mode = "deep"
+        elif raw_mode == "turbo":
+            normalized_mode = "turbo"
+        else:
+            normalized_mode = "fast"
         if not re.fullmatch(r"[a-f0-9]{64}", digest):
             raise ValueError("invalid file sha256")
         return f"{digest}_{normalized_mode}"
@@ -136,6 +146,8 @@ class B2SCacheService:
         key = str(cache_key or "")
         if key.endswith("_deep"):
             return "deep"
+        if key.endswith("_turbo"):
+            return "turbo"
         return "fast" if key.endswith("_fast") else "unknown"
 
     def lookup_ready_cache(self, db: Session, cache_key: str) -> B2SAnalysisCache | None:
@@ -580,6 +592,7 @@ class B2SCacheService:
                 func.sum(case((B2SAnalysisCache.source_project_id == project_id, 1), else_=0)),
                 func.sum(case((B2SAnalysisCache.cache_key.like("%_fast"), 1), else_=0)),
                 func.sum(case((B2SAnalysisCache.cache_key.like("%_deep"), 1), else_=0)),
+                func.sum(case((B2SAnalysisCache.cache_key.like("%_turbo"), 1), else_=0)),
                 func.sum(func.coalesce(B2SAnalysisCache.hit_count, 0)),
                 func.max(B2SAnalysisCache.last_hit_at),
             ),
@@ -593,7 +606,7 @@ class B2SCacheService:
             source_item_id=source_item_id,
             has_hits=has_hits,
         )
-        visible_entries, current_project_entries, fast_entries, deep_entries, total_hit_count, latest_hit = (
+        visible_entries, current_project_entries, fast_entries, deep_entries, turbo_entries, total_hit_count, latest_hit = (
             summary_query.one()
         )
         return {
@@ -601,6 +614,7 @@ class B2SCacheService:
             "current_project_entries": int(current_project_entries or 0),
             "fast_entries": int(fast_entries or 0),
             "deep_entries": int(deep_entries or 0),
+            "turbo_entries": int(turbo_entries or 0),
             "total_hit_count": int(total_hit_count or 0),
             "latest_hit_at": isoformat_local(latest_hit) if latest_hit else None,
         }
@@ -629,6 +643,8 @@ class B2SCacheService:
             query = query.filter(B2SAnalysisCache.cache_key.like("%_fast"))
         elif normalized_mode == "deep":
             query = query.filter(B2SAnalysisCache.cache_key.like("%_deep"))
+        elif normalized_mode == "turbo":
+            query = query.filter(B2SAnalysisCache.cache_key.like("%_turbo"))
         if cache_key:
             query = query.filter(B2SAnalysisCache.cache_key.contains(str(cache_key).strip()))
         if elf_basename:

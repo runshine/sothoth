@@ -213,6 +213,8 @@ def _snapshot_lines(db: Session) -> list[str]:
             cache_mode_counts["fast"] += 1
         elif key.endswith("_deep"):
             cache_mode_counts["deep"] += 1
+        elif key.endswith("_turbo"):
+            cache_mode_counts["turbo"] += 1
         else:
             cache_mode_counts["unknown"] += 1
 
