@@ -1653,23 +1653,19 @@ class ExecutionService:
     def _build_dataflow_cli_run_name(
         self,
         *,
-        data_flow_path: Path,
+        trigger_id: str,
         runs_root: Path,
-        execution_id: str,
-        requested_run_name: str | None = None,
     ) -> str:
-        requested = str(requested_run_name or "").strip()
-        if requested:
-            base_name = _sanitize_dataflow_run_name(requested)
-        else:
-            base_name = f"{_sanitize_dataflow_run_name(data_flow_path.stem)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        run_name = base_name or f"dataflow_vuln_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        if not (runs_root / run_name).exists():
-            return run_name
-        fallback = f"{run_name}_{sanitize_name(execution_id)[-8:]}"
-        if not (runs_root / fallback).exists():
-            return fallback
-        return f"{fallback}_{uuid.uuid4().hex[:6]}"
+        run_name = sanitize_name(trigger_id)
+        if not run_name:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="invalid trigger task id")
+        candidate = runs_root / run_name
+        if candidate.exists() and not candidate.is_dir():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"task directory path is occupied by a non-directory: {candidate}",
+            )
+        return run_name
 
     def _build_dataflow_cli_resume_plan(
         self,
@@ -1708,8 +1704,8 @@ class ExecutionService:
         self,
         *,
         project_id: str,
+        trigger_id: str,
         request: dict[str, Any],
-        execution_id: str,
     ) -> dict[str, Any]:
         if self._is_dataflow_cli_resume_request(request):
             return self._build_dataflow_cli_resume_plan(project_id=project_id, request=request)
@@ -1731,12 +1727,9 @@ class ExecutionService:
         from run_vuln_scan import data_flow_manifest_input
         data_flow_manifest = data_flow_manifest_input(data_flow_path)
         runs_root = self._resolve_dataflow_cli_runs_root(project_id=project_id, request=request)
-        options = request.get("options") if isinstance(request.get("options"), dict) else {}
         run_name = self._build_dataflow_cli_run_name(
-            data_flow_path=data_flow_path,
+            trigger_id=trigger_id,
             runs_root=runs_root,
-            execution_id=execution_id,
-            requested_run_name=options.get("run_name"),
         )
         run_dir = runs_root / run_name
         task_md_path = run_dir / "run" / "input" / "task.md"
@@ -1777,6 +1770,7 @@ class ExecutionService:
                         f"- Extra cycles: `{plan.get('extra_cycles', 5)}`\n"
                     ),
                 )
+            input_manifest["task"]["task_id"] = plan.get("run_name")
             input_manifest["input"] = {"resume_run_dir": plan.get("resume_run_dir")}
         else:
             from run_vuln_scan import generate_task_md
@@ -1786,6 +1780,7 @@ class ExecutionService:
                 task_content,
             )
             import hashlib
+            input_manifest["task"]["task_id"] = plan.get("run_name")
             input_manifest["input"] = {
                 "data_flow_dir": plan.get("data_flow_dir"),
                 "data_flow_files": plan.get("data_flow_files") or [],
@@ -2329,8 +2324,8 @@ class ExecutionService:
         request = {**request, "task_id": trigger.id}
         plan = self._build_dataflow_cli_plan(
             project_id=definition.project_id,
+            trigger_id=trigger.id,
             request=request,
-            execution_id=execution_id,
         )
         if plan.get("mode") == "resume" or self._is_dataflow_cli_resume_request(request):
             plan = {
@@ -2411,7 +2406,7 @@ class ExecutionService:
                 TaskItem(
                     task_id=_new_id("task"),
                     task_type="dataflow_vuln_scan_cli",
-                    title=str(payload.title or "").strip() or "Pending dataflow vulnerability scan",
+                    title=str(payload.title or "").strip() or trigger.id,
                     task_md_path=abs_path(self._default_dataflow_cli_runs_root(definition.project_id) / "_pending" / trigger.id / "task.md"),
                     metadata=metadata,
                     upstream_refs=[],
@@ -2987,12 +2982,14 @@ class ExecutionService:
             workspace_root = run_index.run_root_path
             run_payload = get_run_index_service().get_run_summary(db, run_index)
             files = get_run_index_service().list_run_files(db, run_index, limit=20000)
+        output_root = str(Path(workspace_root) / "output") if str(workspace_root or "").strip() else ""
         return {
             "task_id": trigger.id,
             "project_id": trigger.project_id,
             "status": trigger.status,
             "execution_id": latest_execution.id if latest_execution is not None else None,
             "workspace_root": workspace_root or "",
+            "output_root": output_root,
             "run_id": run_index.id if run_index is not None else None,
             "run": run_payload,
             "files": files,

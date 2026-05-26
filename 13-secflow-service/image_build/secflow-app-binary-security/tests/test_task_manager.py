@@ -3845,6 +3845,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                         "line_no": "10",
                         "source_dir": "/tmp/archive/openssl",
                         "data_flow_file": "/tmp/archive/openssl/dataflow.md",
+                        "dataflow_dir": "/tmp/archive/openssl/dataflow",
                         "artifact_root": "/tmp/archive/openssl/dataflow",
                         "downstream": {"items": [{"blob": "z" * 4000}]},
                     },
@@ -3856,6 +3857,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         stored = task.summary["dataflow_results"][0]
         self.assertEqual("/tmp/archive/openssl/dataflow.md", stored["data_flow_file"])
         self.assertEqual("/tmp/archive/openssl", stored["source_dir"])
+        self.assertEqual("/tmp/archive/openssl/dataflow", stored["dataflow_dir"])
         self.assertNotIn("downstream", stored)
 
     def test_vuln_results_store_only_archive_summary(self):
@@ -10899,6 +10901,20 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(output_dir, rows[0])
 
+    def test_resolve_downstream_output_sources_reads_artifacts_output_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_dir = root / "service" / "down1" / "output"
+            output_dir.mkdir(parents=True)
+            (output_dir / "report.md").write_text("ok", encoding="utf-8")
+
+            rows = self.manager._resolve_downstream_output_sources(
+                {"artifacts": {"output_root": str(output_dir)}},
+                downstream_task_id="down1",
+            )
+
+            self.assertEqual(output_dir, rows[0])
+
     def test_resolve_downstream_output_sources_prefers_task_scoped_output_over_service_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -13277,6 +13293,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.manager, "_poll_until_terminal", return_value=("success", {"task_id": "dfa-live", "status": "passed"})),
             patch.object(self.manager, "_service_output_dir", return_value=Path("/tmp")),
             patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
+            patch.object(self.manager, "_resolve_dataflow_directory", return_value=Path("/tmp/dataflow")),
             patch.object(self.manager, "_find_first", return_value=Path("/tmp/dataflow.md")),
             patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
             patch.object(self.manager, "_lightweight_downstream_payload", side_effect=lambda payload: {"status": payload.get("status")}),
@@ -13296,10 +13313,13 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(call_args.args[2]["data_flow_file"].endswith("dataflow.md"))
         self.assertEqual("/tmp/repo/modules/module-1", call_args.args[2]["module_input_path"])
         self.assertEqual("/tmp/repo/src", call_args.args[2]["source_root_path"])
+        self.assertEqual("/tmp/repo/src", call_args.args[2]["source_dir"])
         self.assertEqual("main.c", call_args.args[2]["source_file"])
+        self.assertEqual("/tmp/dataflow", call_args.args[2]["dataflow_dir"])
         self.assertIs(item, call_args.kwargs["upstream_item"])
         self.assertEqual("/tmp/repo/modules/module-1", item.output_ref["module_input_path"])
         self.assertEqual("/tmp/repo/src", item.output_ref["source_root_path"])
+        self.assertEqual("/tmp/repo/src", item.output_ref["source_dir"])
         self.assertEqual("main.c", item.output_ref["source_file"])
 
     def test_run_dataflow_item_reusable_payload_keeps_token_available_for_cleanup(self):
@@ -13430,6 +13450,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.manager, "_poll_until_terminal", return_value=("success", {"task_id": "dfa-live", "status": "passed"})),
             patch.object(self.manager, "_service_output_dir", return_value=Path("/tmp")),
             patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
+            patch.object(self.manager, "_resolve_dataflow_directory", return_value=Path("/tmp/dataflow")),
             patch.object(self.manager, "_find_first", return_value=Path("/tmp/dataflow.md")),
             patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
             patch.object(self.manager, "_lightweight_downstream_payload", side_effect=lambda payload: {"status": payload.get("status")}),
@@ -13445,8 +13466,10 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("main.c", create_calls[0]["source_file"])
         self.assertEqual("/tmp/repo/modules/module-1", item.output_ref["module_input_path"])
         self.assertEqual("/tmp/repo/src", item.output_ref["source_root_path"])
+        self.assertEqual("/tmp/repo/src", item.output_ref["source_dir"])
         self.assertEqual("main.c", item.output_ref["source_file"])
-        self.assertEqual("/tmp", item.output_ref["data_flow_root"])
+        self.assertEqual("/tmp/dataflow", item.output_ref["data_flow_root"])
+        self.assertEqual("/tmp/dataflow", item.output_ref["dataflow_dir"])
         self.assertEqual("/tmp/dataflow.md", item.output_ref["primary_report_path"])
 
     def test_run_dataflow_item_rejects_declaration_only_entries(self):
@@ -13746,6 +13769,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             "function_name": "main",
             "module_key": "module-1",
             "data_flow_file": "/tmp/flow.md",
+            "dataflow_dir": "/tmp/flow-dir",
             "source_dir": "/tmp/src",
             "module_name": "module-1",
             "source_root_path": "/tmp/src",
@@ -13773,6 +13797,88 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("success", result["status"])
         self.assertEqual("dfvs-live", item.downstream_task_id)
         self.assertEqual("success", item.status)
+
+    def test_run_vuln_item_uses_dataflow_dir_and_source_root_for_dfvs_create(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="scan-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="vuln_scan",
+            sequence_no=4,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="vuln_scan",
+            item_key="entry-1",
+            item_name="main",
+            parent_key="module-1",
+            downstream_service="dataflow_vuln_scanner",
+            status="pending",
+            output_ref={},
+        )
+        dataflow_result = {
+            "entry_key": "entry-1",
+            "function_name": "main",
+            "module_key": "module-1",
+            "module_name": "module-1",
+            "data_flow_file": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1/final_report.md",
+            "primary_report_path": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1/final_report.md",
+            "dataflow_dir": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1/dataflow",
+            "source_dir": ".",
+            "source_root_path": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/binary-to-source/modules/module-1",
+            "module_input_path": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/binary-to-source/modules/module-1",
+            "source_file": "main.c",
+        }
+        fake_session = _ModelAwareDb()
+        create_calls: list[dict[str, str]] = []
+
+        class _FakeClient:
+            async def create_task(self, project_id, title, token, data_flow_path, source_dir, origin):
+                create_calls.append(
+                    {
+                        "project_id": project_id,
+                        "title": title,
+                        "token": token,
+                        "data_flow_path": data_flow_path,
+                        "source_dir": source_dir,
+                        "origin_parent_task_id": str(origin.get("parent_task_id") or ""),
+                    }
+                )
+                return {"task_id": "dfvs-1"}
+
+            async def get_task(self, task_id, token):
+                return {"task_id": task_id, "status": "success"}
+
+            async def get_artifacts(self, task_id, token):
+                return {"archive_root": "/tmp/archive", "artifact_files": []}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(task_manager_module, "get_dataflow_vuln_scanner_client", return_value=_FakeClient()),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_active_downstream_payload", return_value=None),
+            patch.object(self.manager, "_find_reusable_vuln_payload", return_value=None),
+            patch.object(self.manager, "_poll_until_terminal", return_value=("success", {"task_id": "dfvs-1", "status": "success"})),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp/archive"), None)),
+        ):
+            result = asyncio.run(self.manager._run_vuln_item(task, stage_run, dataflow_result, token="tok", retrying=False))
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual(1, len(create_calls))
+        self.assertEqual("/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1/dataflow", create_calls[0]["data_flow_path"])
+        self.assertEqual("/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/binary-to-source/modules/module-1", create_calls[0]["source_dir"])
 
     def test_run_entry_item_uses_descriptor_contract_for_binary_module(self):
         task = BinarySecurityTask(

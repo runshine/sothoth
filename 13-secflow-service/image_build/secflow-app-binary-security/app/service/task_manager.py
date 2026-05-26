@@ -14209,7 +14209,10 @@ class TaskManager:
             if raw.suffix:
                 candidates.extend([raw.parent, raw.parent / "output"])
             if key in {"output_path", "output_root"} and downstream_task_id:
-                candidates.extend([raw / downstream_task_id / "output", raw / downstream_task_id])
+                if raw.name == "output" and _path_matches_task_id(raw, downstream_task_id):
+                    candidates.append(raw)
+                else:
+                    candidates.extend([raw / downstream_task_id / "output", raw / downstream_task_id])
             if key in {"workspace_root", "work_dir", "task_root"}:
                 candidates.append(raw / "output")
             candidates.append(raw)
@@ -15471,6 +15474,8 @@ class TaskManager:
         source_root_path: str,
         source_file: str,
         data_flow_file: str,
+        dataflow_dir: str,
+        source_dir: str,
     ) -> dict[str, Any]:
         return {
             **entry,
@@ -15478,9 +15483,11 @@ class TaskManager:
             "archive_root": archive_root,
             "module_input_path": module_input_path,
             "source_root_path": source_root_path,
+            "source_dir": source_dir,
             "source_file": source_file,
             "data_flow_file": data_flow_file,
-            "data_flow_root": artifact_root,
+            "data_flow_root": dataflow_dir or artifact_root,
+            "dataflow_dir": dataflow_dir,
             "primary_report_path": data_flow_file,
         }
 
@@ -15493,7 +15500,8 @@ class TaskManager:
             normalized["module_input_path"] = normalized.get("module_input_path") or self._resolve_dfa_module_input_path(normalized)
             normalized["source_root_path"] = normalized.get("source_root_path") or self._resolve_dfa_source_root_path(normalized)
             normalized["primary_report_path"] = normalized.get("primary_report_path") or normalized.get("data_flow_file")
-            normalized["data_flow_root"] = normalized.get("data_flow_root") or normalized.get("artifact_root") or normalized.get("archive_root")
+            normalized["dataflow_dir"] = normalized.get("dataflow_dir") or normalized.get("data_flow_root")
+            normalized["data_flow_root"] = normalized.get("data_flow_root") or normalized.get("dataflow_dir") or normalized.get("artifact_root") or normalized.get("archive_root")
         for field, message in (
             ("entry_key", "数据流分析输出缺少 entry_key"),
             ("module_key", "数据流分析输出缺少 module_key"),
@@ -15504,10 +15512,21 @@ class TaskManager:
             ("source_root_path", "数据流分析输出缺少 source_root_path"),
             ("source_file", "数据流分析输出缺少 source_file"),
             ("data_flow_file", "数据流分析输出缺少 data_flow_file"),
+            ("dataflow_dir", "数据流分析输出缺少 dataflow_dir"),
         ):
             if not str(normalized.get(field) or "").strip():
                 raise ValidationError(message)
         return normalized
+
+    def _resolve_dataflow_directory(self, root: Path) -> Path | None:
+        if not root.exists():
+            return None
+        direct = root / "dataflow"
+        if direct.is_dir():
+            return direct
+        for path in sorted(p for p in root.rglob("dataflow") if p.is_dir()):
+            return path
+        return None
 
     def _resolve_dfa_source_root_path(self, entry: dict[str, Any]) -> str:
         if not isinstance(entry, dict):
@@ -15927,7 +15946,8 @@ class TaskManager:
                 task=task,
                 item=item,
             )
-            data_flow_file = self._find_first(materialized, [r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"])
+            dataflow_dir = self._resolve_dataflow_directory(materialized)
+            data_flow_file = self._find_first(materialized, [r"final_report\.md", r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"])
             downstream_status = str(payload.get("status") or "").lower()
             mapped_status = self._map_downstream_status(downstream_status) or (
                 "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
@@ -15951,15 +15971,18 @@ class TaskManager:
                 item.error_message = error
                 session.commit()
                 return {"status": "archive_blocked", "error": error, "item": entry, "archive_blocked": True}
-            archived_data_flow_file = self._find_first(archived_dir, [r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"])
+            archived_dataflow_dir = self._resolve_dataflow_directory(archived_dir)
+            archived_data_flow_file = self._find_first(archived_dir, [r"final_report\.md", r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"])
             result = self._build_dataflow_output_contract(
                 entry,
                 artifact_root=str(archived_dir),
                 archive_root=str(archived_dir),
                 module_input_path=module_input_path,
                 source_root_path=source_root_path,
+                source_dir=source_root_path,
                 source_file=normalized_source_file,
                 data_flow_file=str(archived_data_flow_file or data_flow_file) if (archived_data_flow_file or data_flow_file) else "",
+                dataflow_dir=str(archived_dataflow_dir or dataflow_dir or archived_dir),
             )
             result["downstream"] = self._lightweight_downstream_payload(payload)
             item.result = self._compact_result_for_storage(stage_run.stage_name, result)
@@ -15969,9 +15992,11 @@ class TaskManager:
                 "archive_root": str(archived_dir),
                 "module_input_path": module_input_path,
                 "source_root_path": source_root_path,
+                "source_dir": source_root_path,
                 "source_file": normalized_source_file,
                 "data_flow_file": result["data_flow_file"],
                 "data_flow_root": result["data_flow_root"],
+                "dataflow_dir": result["dataflow_dir"],
                 "primary_report_path": result["primary_report_path"],
             }
             if self._streaming_mode_enabled(task):
@@ -16123,12 +16148,18 @@ class TaskManager:
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
+                    dataflow_input_dir = str(dataflow_result.get("dataflow_dir") or dataflow_result.get("data_flow_root") or "")
+                    source_dir = str(dataflow_result.get("source_root_path") or dataflow_result.get("source_dir") or "")
+                    if not dataflow_input_dir:
+                        raise ValidationError("数据流漏洞挖掘输入缺少 dataflow_dir")
+                    if not source_dir:
+                        raise ValidationError("数据流漏洞挖掘输入缺少 source_dir")
                     created = await get_dataflow_vuln_scanner_client().create_task(
                         task.project_id,
                         f"{task.name}-{dataflow_result['function_name']}-scan",
                         token or "",
-                        str(dataflow_result.get("primary_report_path") or dataflow_result["data_flow_file"]),
-                        dataflow_result["source_dir"],
+                        dataflow_input_dir,
+                        source_dir,
                         _downstream_origin_payload(task, item),
                     )
             if created is not None:
@@ -16448,7 +16479,8 @@ class TaskManager:
             "artifact_root": item.get("artifact_root"),
             "archive_root": item.get("archive_root"),
             "data_flow_file": item.get("data_flow_file"),
-            "data_flow_root": item.get("data_flow_root") or item.get("artifact_root"),
+            "data_flow_root": item.get("data_flow_root") or item.get("dataflow_dir") or item.get("artifact_root"),
+            "dataflow_dir": item.get("dataflow_dir") or item.get("data_flow_root") or item.get("artifact_root"),
             "primary_report_path": item.get("primary_report_path") or item.get("data_flow_file"),
         }
 

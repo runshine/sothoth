@@ -147,7 +147,9 @@ def test_profiles_tasks_and_effective_config(service_config_path, patch_mock_age
 
     run_detail = client.get(f"/api/dataflow-vuln-scanner/runs/{run_resolve.json()['run_id']}")
     assert run_detail.status_code == 200
-    artifact_paths = [item["path"] for item in run_detail.json()["files"]]
+    run_files = client.get(f"/api/dataflow-vuln-scanner/runs/{run_resolve.json()['run_id']}/files")
+    assert run_files.status_code == 200
+    artifact_paths = [item["path"] for item in run_files.json()]
     assert "run/input/task.md" in artifact_paths
     assert "run/run.log" in artifact_paths
 
@@ -155,6 +157,7 @@ def test_profiles_tasks_and_effective_config(service_config_path, patch_mock_age
     assert task_artifacts.status_code == 200
     artifacts_payload = task_artifacts.json()
     assert artifacts_payload["workspace_root"]
+    assert artifacts_payload["output_root"] == str((Path(artifacts_payload["workspace_root"]) / "output").resolve())
     assert artifacts_payload["run_id"] == run_resolve.json()["run_id"]
     assert "run/input/task.md" in [item["path"] for item in artifacts_payload["files"]]
 
@@ -530,7 +533,7 @@ def test_business_dataflow_task_materializes_inputs_and_runs(service_config_path
     payload = detail.json()
     assert "漏洞挖掘任务" in payload["task_markdown"]
     cli_plan = payload["task_metadata"]["dataflow_cli"]
-    expected_run_name = "business-scan"
+    expected_run_name = task_id
     assert cli_plan["launcher"] == "run_vuln_scan.py"
     assert cli_plan["data_flow_dir"] == str(data_flow_dir.resolve())
     assert cli_plan["data_flow_files"] == [str((data_flow_dir / "data_flow.md").resolve())]
@@ -607,7 +610,7 @@ def test_business_dataflow_task_ignores_selected_runs_root_for_standard_task_lay
     assert task.status_code == 201
     created_payload = task.json()
     task_id = created_payload["task_id"]
-    expected_run_name = "business-scan-custom-workspace"
+    expected_run_name = task_id
     service_root = Path(project_root) / "files" / "default" / "app" / "secflow-app-dataflow-vuln-scanner"
     assert created_payload["run_name"] == expected_run_name
     assert created_payload["runs_root"] == str(service_root.resolve())
@@ -652,7 +655,7 @@ def test_business_dataflow_task_ignores_selected_runs_root_for_standard_task_lay
     assert runtime_config["execution"]["output_dir"] == str((expected_run_root / "output").resolve())
 
 
-def test_business_dataflow_task_without_title_uses_dataflow_file_and_time_run_name(service_config_path, patch_mock_agent_runtime):
+def test_business_dataflow_task_without_title_uses_task_id_for_run_name(service_config_path, patch_mock_agent_runtime):
     config = get_config()
     project_root = config.fileserver_service.data_mount_path
     from pathlib import Path
@@ -682,8 +685,8 @@ def test_business_dataflow_task_without_title_uses_dataflow_file_and_time_run_na
     )
     assert task.status_code == 201
     payload = task.json()
-    assert payload["run_name"].startswith("custom_flow_")
-    assert payload["title"] == payload["run_name"]
+    assert payload["run_name"] == payload["task_id"]
+    assert payload["title"] == payload["task_id"]
 
     detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{payload['task_id']}")
     assert detail.status_code == 200
