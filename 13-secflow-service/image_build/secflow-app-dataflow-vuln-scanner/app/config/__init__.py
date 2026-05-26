@@ -154,12 +154,20 @@ class SchedulerConfig(BaseModel):
     poll_interval_seconds: int = 2
     heartbeat_interval_seconds: int = 5
     worker_timeout_seconds: int = 300
+    worker_retention_seconds: int = 1800
     cleanup_interval_seconds: int = 10
+    discovery_mode: str = "registry"
+    reservation_lease_seconds: int = 30
+    worker_queue_depth: int = 0
+    dispatch_batch_size: int = 8
+    requeue_stuck_dispatch_after_seconds: int = 60
 
 
 class DataflowWorkerConfig(BaseModel):
     base_url: str = "http://secflow-app-dataflow-vuln-scanner-worker:8080"
     worker_urls: list[str] = Field(default_factory=list)
+    worker_url_template: str = ""
+    advertise_url_template: str = ""
     api_key: Optional[str] = None
     timeout: int = 30
     dispatch_retry_interval_seconds: int = 2

@@ -17,6 +17,7 @@ from app.config import get_config
 from app.models.database import (
     RunIndex,
     SchedulerWorker,
+    SchedulerWorkerSlotReservation,
     TriggerTask,
     WorkflowDefinition,
     WorkflowExecution,
@@ -30,6 +31,7 @@ from app.schemas import (
 )
 from app.services.dataflow_worker_client import DataflowWorkerError, get_dataflow_worker_client
 from app.services.execution_service import get_execution_service
+from app.services.runtime_config_service import get_runtime_config_service
 from app.time_utils import now_local
 
 logger = logging.getLogger(__name__)
@@ -153,10 +155,51 @@ class SchedulerService:
             "worker_enabled": "true" if self.runs_worker else "false",
         }
 
+    @property
+    def runtime_config(self) -> dict[str, Any]:
+        db = get_db_session()
+        try:
+            return get_runtime_config_service().get_config(db)
+        finally:
+            db.close()
+
+    @property
+    def discovery_mode(self) -> str:
+        mode = str((self.runtime_config.get("scheduler") or {}).get("discovery_mode") or get_config().scheduler.discovery_mode or "registry").strip().lower()
+        return mode if mode in {"registry", "static_urls", "hybrid"} else "registry"
+
+    @property
+    def reservation_lease_seconds(self) -> int:
+        return max(5, int((self.runtime_config.get("scheduler") or {}).get("reservation_lease_seconds") or get_config().scheduler.reservation_lease_seconds or 30))
+
+    @property
+    def worker_queue_depth(self) -> int:
+        return max(0, int((self.runtime_config.get("scheduler") or {}).get("worker_queue_depth") or get_config().scheduler.worker_queue_depth or 0))
+
+    @property
+    def dispatch_batch_size(self) -> int:
+        return max(1, int((self.runtime_config.get("scheduler") or {}).get("dispatch_batch_size") or get_config().scheduler.dispatch_batch_size or 8))
+
+    @property
+    def requeue_stuck_dispatch_after_seconds(self) -> int:
+        return max(10, int((self.runtime_config.get("scheduler") or {}).get("requeue_stuck_dispatch_after_seconds") or get_config().scheduler.requeue_stuck_dispatch_after_seconds or 60))
+
     def configured_worker_urls(self) -> list[str]:
         cfg = get_config().dataflow_worker
+        runtime_cfg = self.runtime_config.get("dataflow_worker") or {}
+        configured_urls = runtime_cfg.get("worker_urls")
         workers = [url.rstrip("/") for url in (cfg.worker_urls or []) if url and url.strip()]
-        return workers or [cfg.base_url.rstrip("/")]
+        if isinstance(configured_urls, list):
+            workers = [str(url).rstrip("/") for url in configured_urls if str(url).strip()]
+        base_url = str(runtime_cfg.get("base_url") or cfg.base_url or "").rstrip("/")
+        return workers or ([base_url] if base_url else [])
+
+    def advertise_url(self) -> str:
+        runtime_cfg = self.runtime_config.get("dataflow_worker") or {}
+        template = str(runtime_cfg.get("advertise_url_template") or get_config().dataflow_worker.advertise_url_template or "").strip()
+        if template:
+            return template.format(pod_id=self.pod_id, host_name=self.host_name)
+        return f"http://{self.host_name}:8080"
 
     def local_running_count(self) -> int:
         return len(self._running_tasks)
@@ -175,6 +218,7 @@ class SchedulerService:
         workers = db.query(SchedulerWorker).order_by(SchedulerWorker.last_heartbeat_at.desc(), SchedulerWorker.pod_id.asc()).all()
         worker_rows: list[WorkerClusterWorkerResponse] = []
         worker_timeout_at = now_local() - timedelta(seconds=get_config().scheduler.worker_timeout_seconds)
+        reservation_counts = self._reservation_counts(db)
 
         active_executions = (
             db.query(WorkflowExecution, TriggerTask, RunIndex)
@@ -227,7 +271,7 @@ class SchedulerService:
                 stale_workers += 1
             running_jobs = len(active_jobs)
             capacity = max(int(worker.capacity or 0), 0)
-            available_slots = max(capacity - running_jobs, 0)
+            available_slots = max(capacity - running_jobs - reservation_counts.get(str(worker.pod_id), 0), 0)
             total_capacity += capacity
             total_running += running_jobs
             worker_rows.append(
@@ -256,6 +300,21 @@ class SchedulerService:
             updated_at=now_local(),
             workers=worker_rows,
         )
+
+    def _reservation_counts(self, db: Session) -> dict[str, int]:
+        rows = (
+            db.query(SchedulerWorkerSlotReservation.worker_pod_id)
+            .filter(
+                SchedulerWorkerSlotReservation.status == "reserved",
+                SchedulerWorkerSlotReservation.lease_expires_at >= now_local(),
+            )
+            .all()
+        )
+        counts: dict[str, int] = {}
+        for (worker_pod_id,) in rows:
+            key = str(worker_pod_id)
+            counts[key] = counts.get(key, 0) + 1
+        return counts
 
     def set_worker_status(self, db: Session, pod_id: str, status_value: str) -> None:
         worker = db.get(SchedulerWorker, pod_id)
@@ -388,7 +447,11 @@ class SchedulerService:
                     running_count=len(self._running_tasks),
                     last_heartbeat_at=now,
                     status=self._worker_status,
-                    metadata_json={"service": "secflow-app-dataflow-vuln-scanner", "role": self.role},
+                    metadata_json={
+                        "service": "secflow-app-dataflow-vuln-scanner",
+                        "role": self.role,
+                        "advertise_url": self.advertise_url(),
+                    },
                 )
             else:
                 # Do not inherit stale DB "draining" on process startup; a restarted
@@ -404,7 +467,11 @@ class SchedulerService:
                 worker.running_count = len(self._running_tasks)
                 worker.last_heartbeat_at = now
                 worker.status = self._worker_status
-                worker.metadata_json = {"service": "secflow-app-dataflow-vuln-scanner", "role": self.role}
+                worker.metadata_json = {
+                    "service": "secflow-app-dataflow-vuln-scanner",
+                    "role": self.role,
+                    "advertise_url": self.advertise_url(),
+                }
             db.add(worker)
             db.commit()
             self._heartbeat_published = True
@@ -440,7 +507,7 @@ class SchedulerService:
     def _dispatch_pending_to_workers_once(self) -> None:
         if not self.is_manager_role:
             return
-        for execution_id in self._pending_worker_dispatch_execution_ids():
+        for execution_id in self._pending_worker_dispatch_execution_ids(limit=self.dispatch_batch_size):
             try:
                 self._dispatch_execution_to_worker(execution_id)
             except Exception:
@@ -677,6 +744,7 @@ class SchedulerService:
     def _dispatch_execution_to_worker(self, execution_id: str) -> bool:
         db = get_db_session()
         worker_url = ""
+        worker_pod_id = ""
         last_error = ""
         try:
             execution = db.get(WorkflowExecution, execution_id)
@@ -685,7 +753,8 @@ class SchedulerService:
             trigger = db.get(TriggerTask, execution.trigger_task_id)
             if trigger is None or trigger.status != "pending":
                 return False
-            worker_url = self._choose_dataflow_worker(db, execution_id)
+            worker_pod_id, worker_url = self._choose_dataflow_worker(db, execution_id)
+            self._reserve_worker_slot(db, worker_pod_id, execution_id)
             message = f"dispatching to worker {worker_url}"
             updated_execution = (
                 db.query(WorkflowExecution)
@@ -719,16 +788,21 @@ class SchedulerService:
                 db.rollback()
                 return False
             db.commit()
+        except Exception:
+            db.rollback()
+            raise
         finally:
             db.close()
 
-        attempts = max(1, int(get_config().dataflow_worker.dispatch_max_retries or 1))
+        attempts = max(1, int((self.runtime_config.get("dataflow_worker") or {}).get("dispatch_max_retries") or get_config().dataflow_worker.dispatch_max_retries or 1))
+        retry_interval = max(0, int((self.runtime_config.get("dataflow_worker") or {}).get("dispatch_retry_interval_seconds") or get_config().dataflow_worker.dispatch_retry_interval_seconds or 0))
         for attempt in range(1, attempts + 1):
             try:
                 job = get_dataflow_worker_client(worker_url).create_job(
                     {
                         "execution_id": execution_id,
                         "worker_url": worker_url,
+                        "worker_pod_id": worker_pod_id,
                     }
                 )
                 self._mark_dispatch_success(execution_id, worker_url, job)
@@ -736,12 +810,40 @@ class SchedulerService:
             except DataflowWorkerError as exc:
                 last_error = str(exc)
                 if attempt < attempts:
-                    time.sleep(max(0, int(get_config().dataflow_worker.dispatch_retry_interval_seconds or 0)))
+                    time.sleep(retry_interval)
 
         self._mark_dispatch_failure(execution_id, worker_url, last_error or "dataflow worker dispatch failed")
         return False
 
-    def _choose_dataflow_worker(self, db: Session, execution_id: str) -> str:
+    def _choose_dataflow_worker(self, db: Session, execution_id: str) -> tuple[str, str]:
+        if self.discovery_mode == "static_urls":
+            worker_url = self._choose_dataflow_worker_from_urls(db, execution_id)
+            return worker_url, worker_url
+
+        workers = self._healthy_registry_workers(db)
+        if workers:
+            reservations = self._reservation_counts(db)
+            candidates: list[tuple[int, str, str]] = []
+            for worker in workers:
+                running_count = self._running_count_for_worker(db, str(worker.pod_id))
+                reserved_count = reservations.get(str(worker.pod_id), 0)
+                capacity = max(int(worker.capacity or 0), 0)
+                if capacity > 0 and running_count + reserved_count >= capacity + self.worker_queue_depth:
+                    continue
+                worker_url = self._worker_url_from_registry(worker)
+                if not worker_url:
+                    continue
+                candidates.append((running_count + reserved_count, str(worker.pod_id), worker_url))
+            if candidates:
+                salt = int(hashlib.sha256(execution_id.encode("utf-8")).hexdigest(), 16)
+                candidates.sort(key=lambda item: (item[0], (hash(item[1]) - salt)))
+                _, worker_pod_id, worker_url = candidates[0]
+                return worker_pod_id, worker_url
+
+        worker_url = self._choose_dataflow_worker_from_urls(db, execution_id)
+        return worker_url, worker_url
+
+    def _choose_dataflow_worker_from_urls(self, db: Session, execution_id: str) -> str:
         workers = self.configured_worker_urls()
         if len(workers) == 1:
             return workers[0]
@@ -767,6 +869,71 @@ class SchedulerService:
         salt = int(hashlib.sha256(execution_id.encode("utf-8")).hexdigest(), 16)
         return min(enumerate(workers), key=lambda item: (counts[item[1]], (item[0] - salt) % len(workers)))[1]
 
+    def _healthy_registry_workers(self, db: Session) -> list[SchedulerWorker]:
+        timeout_seconds = int((self.runtime_config.get("scheduler") or {}).get("worker_timeout_seconds") or get_config().scheduler.worker_timeout_seconds or 300)
+        worker_timeout_at = now_local() - timedelta(seconds=timeout_seconds)
+        return (
+            db.query(SchedulerWorker)
+            .filter(
+                SchedulerWorker.status == "active",
+                SchedulerWorker.last_heartbeat_at >= worker_timeout_at,
+            )
+            .order_by(SchedulerWorker.last_heartbeat_at.desc(), SchedulerWorker.pod_id.asc())
+            .all()
+        )
+
+    def _worker_url_from_registry(self, worker: SchedulerWorker) -> str | None:
+        metadata = worker.metadata_json if isinstance(worker.metadata_json, dict) else {}
+        advertise_url = str(metadata.get("advertise_url") or "").strip()
+        if advertise_url:
+            return advertise_url.rstrip("/")
+        urls = self.configured_worker_urls()
+        host_name = str(worker.host_name or "").strip().lower()
+        pod_id = str(worker.pod_id or "").strip().lower()
+        for url in urls:
+            normalized = url.lower()
+            if host_name and host_name in normalized:
+                return url
+            if pod_id and pod_id in normalized:
+                return url
+        if self.discovery_mode == "hybrid" and urls:
+            return urls[0]
+        return None
+
+    def _running_count_for_worker(self, db: Session, worker_pod_id: str) -> int:
+        return (
+            db.query(WorkflowExecution)
+            .filter(
+                WorkflowExecution.owner_pod_id == worker_pod_id,
+                or_(
+                    WorkflowExecution.status.in_(tuple(ACTIVE_JOB_STATUSES)),
+                    WorkflowExecution.dispatch_status.in_(tuple(ACTIVE_JOB_STATUSES)),
+                ),
+            )
+            .count()
+        )
+
+    def _reserve_worker_slot(self, db: Session, worker_pod_id: str, execution_id: str) -> None:
+        expires_at = now_local() + timedelta(seconds=self.reservation_lease_seconds)
+        reservation = (
+            db.query(SchedulerWorkerSlotReservation)
+            .filter(SchedulerWorkerSlotReservation.execution_id == execution_id)
+            .first()
+        )
+        if reservation is None:
+            reservation = SchedulerWorkerSlotReservation(
+                id=f"resv-{execution_id}",
+                worker_pod_id=worker_pod_id,
+                execution_id=execution_id,
+                status="reserved",
+                lease_expires_at=expires_at,
+            )
+        else:
+            reservation.worker_pod_id = worker_pod_id
+            reservation.status = "reserved"
+            reservation.lease_expires_at = expires_at
+        db.add(reservation)
+
     def _mark_dispatch_success(self, execution_id: str, worker_url: str, job: dict[str, Any]) -> None:
         db = get_db_session()
         try:
@@ -778,6 +945,14 @@ class SchedulerService:
             execution.worker_job_id = job_id
             execution.dispatch_status = str(job.get("status") or "queued")
             execution.dispatch_error = None
+            reservation = (
+                db.query(SchedulerWorkerSlotReservation)
+                .filter(SchedulerWorkerSlotReservation.execution_id == execution_id)
+                .first()
+            )
+            if reservation is not None:
+                reservation.status = "accepted"
+                db.add(reservation)
             if execution.status == "pending":
                 execution.message = f"queued on worker {worker_url}"
             trigger = db.get(TriggerTask, execution.trigger_task_id)
@@ -802,11 +977,18 @@ class SchedulerService:
             execution = db.get(WorkflowExecution, execution_id)
             if execution is None:
                 return
-            execution.worker_url = worker_url
-            execution.worker_job_id = execution.worker_job_id or execution.id
-            execution.dispatch_status = "failed"
+            execution.worker_url = None
+            execution.worker_job_id = None
+            execution.dispatch_status = None
             execution.dispatch_error = error
             execution.message = f"worker dispatch failed: {error}"
+            reservation = (
+                db.query(SchedulerWorkerSlotReservation)
+                .filter(SchedulerWorkerSlotReservation.execution_id == execution_id)
+                .first()
+            )
+            if reservation is not None:
+                db.delete(reservation)
             trigger = db.get(TriggerTask, execution.trigger_task_id)
             if trigger is not None and trigger.status == "pending":
                 trigger.message = execution.message
@@ -915,6 +1097,14 @@ class SchedulerService:
             execution.worker_job_id = execution.worker_job_id or execution.id
             execution.dispatch_status = "queued"
             execution.dispatch_error = None
+            reservation = (
+                db.query(SchedulerWorkerSlotReservation)
+                .filter(SchedulerWorkerSlotReservation.execution_id == execution_id)
+                .first()
+            )
+            if reservation is not None:
+                reservation.status = "accepted"
+                db.add(reservation)
             execution.message = f"queued on worker {self.pod_id}"
             trigger.message = execution.message
             db.add(execution)
@@ -1083,7 +1273,10 @@ class SchedulerService:
         db = get_db_session()
         try:
             now = now_local()
-            worker_timeout_at = now - timedelta(seconds=get_config().scheduler.worker_timeout_seconds)
+            worker_timeout_seconds = int((self.runtime_config.get("scheduler") or {}).get("worker_timeout_seconds") or get_config().scheduler.worker_timeout_seconds or 300)
+            worker_retention_seconds = int((self.runtime_config.get("scheduler") or {}).get("worker_retention_seconds") or get_config().scheduler.worker_retention_seconds or 1800)
+            worker_timeout_at = now - timedelta(seconds=worker_timeout_seconds)
+            worker_retention_at = now - timedelta(seconds=worker_retention_seconds)
             offline_workers = (
                 db.query(SchedulerWorker)
                 .filter(SchedulerWorker.last_heartbeat_at < worker_timeout_at, SchedulerWorker.status != "offline")
@@ -1093,11 +1286,67 @@ class SchedulerService:
                 worker.status = "offline"
                 db.add(worker)
 
+            stale_workers = (
+                db.query(SchedulerWorker)
+                .filter(
+                    SchedulerWorker.status == "offline",
+                    SchedulerWorker.last_heartbeat_at < worker_retention_at,
+                )
+                .all()
+            )
+            for worker in stale_workers:
+                db.delete(worker)
+
+            self._cleanup_stale_reservations(db, now)
+            self._requeue_stuck_dispatches(db, now)
+
             db.commit()
             get_execution_service().reconcile_stale_active_executions(db)
             db.commit()
         finally:
             db.close()
+
+    def _cleanup_stale_reservations(self, db: Session, now: Any) -> None:
+        reservations = (
+            db.query(SchedulerWorkerSlotReservation)
+            .filter(SchedulerWorkerSlotReservation.lease_expires_at < now)
+            .all()
+        )
+        for reservation in reservations:
+            execution = db.get(WorkflowExecution, reservation.execution_id)
+            if execution is not None and execution.status == "pending" and execution.owner_pod_id is None:
+                execution.dispatch_status = None
+                execution.dispatch_error = "reservation expired"
+                execution.worker_url = None
+                execution.worker_job_id = None
+                db.add(execution)
+            db.delete(reservation)
+
+    def _requeue_stuck_dispatches(self, db: Session, now: Any) -> None:
+        threshold = now - timedelta(seconds=self.requeue_stuck_dispatch_after_seconds)
+        executions = (
+            db.query(WorkflowExecution)
+            .filter(
+                WorkflowExecution.status == "pending",
+                WorkflowExecution.owner_pod_id.is_(None),
+                WorkflowExecution.dispatch_status == "dispatching",
+                WorkflowExecution.updated_at < threshold,
+            )
+            .all()
+        )
+        for execution in executions:
+            execution.dispatch_status = None
+            execution.dispatch_error = "dispatch timeout requeued"
+            execution.worker_url = None
+            execution.worker_job_id = None
+            db.add(execution)
+            reservation = (
+                db.query(SchedulerWorkerSlotReservation)
+                .filter(SchedulerWorkerSlotReservation.execution_id == execution.id)
+                .first()
+            )
+            if reservation is not None:
+                db.delete(reservation)
 
 
 _scheduler_service: SchedulerService | None = None

@@ -4,7 +4,9 @@ from typing import Any
 
 from app.artifacts.io import sanitize_name
 from app.config import get_config
+from app.models.database import ServiceRuntimeConfig, get_db_session
 from app.services.profile_templates import get_profile_template_service
+from app.services.runtime_config_service import SERVICE_RUNTIME_CONFIG_KEY
 
 REDACTED_KEYS = {"password", "token", "secret", "api_key", "authorization"}
 
@@ -32,6 +34,17 @@ def _redact(value: Any, key: str | None = None) -> Any:
 def build_sanitized_service_config() -> dict[str, Any]:
     config = get_config()
     payload = config.model_dump(mode="json")
+    db = get_db_session()
+    try:
+        row = db.get(ServiceRuntimeConfig, SERVICE_RUNTIME_CONFIG_KEY)
+        if row is not None and isinstance(row.config_json, dict):
+            for key, value in row.config_json.items():
+                if isinstance(value, dict) and isinstance(payload.get(key), dict):
+                    payload[key] = {**payload[key], **value}
+                else:
+                    payload[key] = value
+    finally:
+        db.close()
     agent_storage = _build_agent_storage_view()
     return {
         "service_name": config.registry.service_name,

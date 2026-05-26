@@ -381,6 +381,27 @@ class SchedulerWorker(Base):
     updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
 
 
+class SchedulerWorkerSlotReservation(Base):
+    __tablename__ = _prefix("scheduler_worker_slot_reservation")
+
+    id = Column(String(64), primary_key=True)
+    worker_pod_id = Column(String(128), ForeignKey(f"{SchedulerWorker.__tablename__}.pod_id"), nullable=False)
+    execution_id = Column(String(64), ForeignKey(f"{WorkflowExecution.__tablename__}.id"), nullable=False, unique=True)
+    status = Column(String(32), nullable=False, default="reserved")
+    lease_expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=now_utc)
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
+
+
+class ServiceRuntimeConfig(Base):
+    __tablename__ = _prefix("service_runtime_config")
+
+    config_key = Column(String(64), primary_key=True)
+    config_json = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, default=now_utc)
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
+
+
 MODEL_CLASSES = [
     WorkflowDefinition,
     WorkflowDefinitionVersion,
@@ -397,6 +418,8 @@ MODEL_CLASSES = [
     RunIndexFile,
     VulnReportSubmission,
     SchedulerWorker,
+    SchedulerWorkerSlotReservation,
+    ServiceRuntimeConfig,
 ]
 
 
@@ -450,6 +473,8 @@ INDEX_DEFINITIONS = [
     (VulnReportSubmission.__tablename__, "ux_dfvs_vrs_result", "CREATE UNIQUE INDEX ux_dfvs_vrs_result ON {table} (task_id, execution_id, result_file)"),
     (SchedulerWorker.__tablename__, "ix_dfvs_worker_heartbeat", "CREATE INDEX ix_dfvs_worker_heartbeat ON {table} (last_heartbeat_at)"),
     (SchedulerWorker.__tablename__, "ix_dfvs_worker_status", "CREATE INDEX ix_dfvs_worker_status ON {table} (status)"),
+    (SchedulerWorkerSlotReservation.__tablename__, "ix_dfvs_worker_reservation_worker", "CREATE INDEX ix_dfvs_worker_reservation_worker ON {table} (worker_pod_id, status, lease_expires_at)"),
+    (SchedulerWorkerSlotReservation.__tablename__, "ix_dfvs_worker_reservation_execution", "CREATE UNIQUE INDEX ix_dfvs_worker_reservation_execution ON {table} (execution_id)"),
 ]
 
 
@@ -845,6 +870,7 @@ def run_auto_migrations() -> None:
         "trigger_task": TriggerTask.__tablename__,
         "workflow_execution": WorkflowExecution.__tablename__,
         "run_index": RunIndex.__tablename__,
+        "scheduler_worker": SchedulerWorker.__tablename__,
     }
 
     column_migrations = [
@@ -881,6 +907,7 @@ def run_auto_migrations() -> None:
         (tables["workflow_execution"], "process_started_at", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN process_started_at DATETIME NULL"),
         (tables["workflow_execution"], "process_finished_at", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN process_finished_at DATETIME NULL"),
         (tables["run_index"], "source_hash", f"ALTER TABLE {tables['run_index']} ADD COLUMN source_hash VARCHAR(64) NOT NULL DEFAULT ''"),
+        (tables["scheduler_worker"], "metadata_json", f"ALTER TABLE {tables['scheduler_worker']} ADD COLUMN metadata_json {_column_sql(dialect, 'JSON')} NULL"),
     ]
     index_migrations = [
         (table_name, index_name, _render_index_sql(table_name, index_name, sql_template, dialect))

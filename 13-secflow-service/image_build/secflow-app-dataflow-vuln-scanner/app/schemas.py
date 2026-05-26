@@ -292,6 +292,16 @@ class ServiceEffectiveConfigResponse(BaseModel):
     config: Dict[str, Any]
 
 
+class ServiceConfigSaveRequest(BaseModel):
+    config: Dict[str, Any]
+
+
+class ServiceConfigResponse(BaseModel):
+    service_name: str
+    api_prefix: str
+    config: Dict[str, Any]
+
+
 class ProjectFilesystemBreadcrumbItemResponse(BaseModel):
     node_type: str
     name: str

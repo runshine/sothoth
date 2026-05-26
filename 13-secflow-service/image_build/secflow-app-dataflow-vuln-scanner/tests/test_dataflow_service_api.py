@@ -1255,3 +1255,35 @@ def test_service_config_is_redacted(service_config_path):
     payload = response.json()["config"]
     assert payload["database"]["password"] == "***"
     assert payload["auth_service"]["service_machine_token"] == "***"
+
+
+def test_service_runtime_config_roundtrip(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+
+    response = client.get("/api/dataflow-vuln-scanner/service/config")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["config"]["scheduler"]["discovery_mode"] in {"registry", "static_urls", "hybrid"}
+
+    save_response = client.put(
+        "/api/dataflow-vuln-scanner/service/config",
+        json={
+            "config": {
+                "scheduler": {
+                    "discovery_mode": "hybrid",
+                    "worker_capacity": 3,
+                    "reservation_lease_seconds": 45,
+                },
+                "dataflow_worker": {
+                    "advertise_url_template": "http://{host_name}:8080",
+                    "dispatch_retry_interval_seconds": 4,
+                },
+            }
+        },
+    )
+    assert save_response.status_code == 200
+    saved = save_response.json()
+    assert saved["config"]["scheduler"]["discovery_mode"] == "hybrid"
+    assert saved["config"]["scheduler"]["worker_capacity"] == 3
+    assert saved["config"]["dataflow_worker"]["advertise_url_template"] == "http://{host_name}:8080"

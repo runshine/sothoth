@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.config import get_config
 from app.main import create_app
-from app.models.database import SchedulerWorker, TriggerTask, WorkflowDefinition, WorkflowExecution, get_db_session
+from app.models.database import SchedulerWorker, SchedulerWorkerSlotReservation, TriggerTask, WorkflowDefinition, WorkflowExecution, get_db_session
 from app.services.scheduler import SchedulerService
 
 
@@ -200,6 +200,7 @@ def test_worker_role_registers_single_capacity_worker(service_config_path: Path)
         assert worker is not None
         assert worker.capacity == 1
         assert worker.metadata_json["role"] == "worker"
+        assert worker.metadata_json["advertise_url"] == f"http://{worker.host_name}:8080"
     finally:
         db.close()
 
@@ -318,7 +319,7 @@ def test_manager_dispatches_execution_to_dataflow_worker(
 
     scheduler = SchedulerService()
     assert scheduler.start_execution_now(execution_id) is True
-    assert calls == [("http://worker-a", {"execution_id": execution_id, "worker_url": "http://worker-a"})]
+    assert calls == [("http://worker-a", {"execution_id": execution_id, "worker_url": "http://worker-a", "worker_pod_id": "http://worker-a"})]
 
     db = get_db_session()
     try:
@@ -333,6 +334,58 @@ def test_manager_dispatches_execution_to_dataflow_worker(
         assert execution.dispatch_status == "queued"
     finally:
         db.close()
+
+
+def test_manager_dispatch_uses_registry_worker_and_creates_reservation(
+    service_config_path: Path,
+    framework_config_payload: dict,
+    monkeypatch,
+):
+    config = get_config()
+    config.scheduler.role = "manager"
+    config.dataflow_worker.worker_urls = []
+
+    db = get_db_session()
+    try:
+        db.add(SchedulerWorker(
+            pod_id="worker-registry-1",
+            host_name="worker-registry-1",
+            capacity=2,
+            running_count=0,
+            status="active",
+            metadata_json={"advertise_url": "http://worker-registry-1:8080"},
+        ))
+        execution_id = _create_pending_execution(db, framework_config_payload, suffix="manager-registry-dispatch")
+        db.commit()
+    finally:
+        db.close()
+
+    calls: list[tuple[str, dict]] = []
+
+    class FakeClient:
+        def __init__(self, base_url: str):
+            self.base_url = base_url
+
+        def create_job(self, payload: dict) -> dict:
+            calls.append((self.base_url, payload))
+            return {"id": f"job-{payload['execution_id']}", "status": "queued"}
+
+    monkeypatch.setattr("app.services.scheduler.get_dataflow_worker_client", lambda base_url=None: FakeClient(base_url or ""))
+
+    scheduler = SchedulerService()
+    assert scheduler.start_execution_now(execution_id) is True
+    assert calls[0][0] == "http://worker-registry-1:8080"
+    assert calls[0][1]["worker_pod_id"] == "worker-registry-1"
+
+    db = get_db_session()
+    try:
+        reservation = db.query(SchedulerWorkerSlotReservation).filter(SchedulerWorkerSlotReservation.execution_id == execution_id).first()
+        assert reservation is not None
+        assert reservation.worker_pod_id == "worker-registry-1"
+        assert reservation.status == "accepted"
+    finally:
+        db.close()
+
 
 
 def test_manager_chooses_lowest_load_worker_with_db_supplement(
@@ -375,7 +428,7 @@ def test_manager_chooses_lowest_load_worker_with_db_supplement(
             worker_job_id="job-active",
             owner_pod_id="worker-b-pod",
         )
-        assert SchedulerService()._choose_dataflow_worker(db, execution_id) == "http://worker-c"
+        assert SchedulerService()._choose_dataflow_worker(db, execution_id) == ("http://worker-c", "http://worker-c")
     finally:
         db.close()
 
