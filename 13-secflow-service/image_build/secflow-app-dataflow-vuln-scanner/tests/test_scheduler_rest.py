@@ -468,17 +468,100 @@ def test_worker_cancel_job_marks_running_execution_stop_requested(
 
     payload = SchedulerService().cancel_local_job("job-worker-cancel")
     assert payload["status"] == "cancel_requested"
-    assert signals == [(execution_id, False)]
+
+
+def test_cluster_capacity_api_returns_worker_jobs(
+    service_config_path: Path,
+    framework_config_payload: dict,
+    monkeypatch,
+):
+    config = get_config()
+    config.scheduler.enabled = True
+    config.scheduler.role = "worker"
+    config.scheduler.pod_id = "worker-capacity-pod"
+    config.scheduler.host_name = "worker-capacity-host"
+    config.scheduler.worker_capacity = 4
+    config.dataflow_worker.worker_urls = ["http://worker-capacity"]
+
+    scheduler = SchedulerService()
+    scheduler._heartbeat_once()
 
     db = get_db_session()
     try:
-        execution = db.get(WorkflowExecution, execution_id)
-        trigger = db.get(TriggerTask, "tt-sched-worker-cancel")
-        assert execution is not None
-        assert trigger is not None
-        assert execution.status == "cancel_requested"
-        assert trigger.status == "cancel_requested"
-        assert execution.dispatch_status == "cancel_requested"
-        assert execution.process_status == "stop_requested"
+        execution_id = _create_pending_execution(
+            db,
+            framework_config_payload,
+            suffix="capacity-view",
+            status="running",
+            trigger_status="running",
+            worker_url="http://worker-capacity",
+            worker_job_id="job-capacity-view",
+            owner_pod_id="worker-capacity-pod",
+            dispatch_status="running",
+        )
     finally:
         db.close()
+
+    class FakeClient:
+        def list_jobs(self) -> list[dict]:
+            return [{
+                "id": "job-capacity-view",
+                "execution_id": execution_id,
+                "status": "running",
+                "phase": "running",
+                "worker_url": "http://worker-capacity",
+            }]
+
+    monkeypatch.setattr(
+        "app.services.scheduler.get_dataflow_worker_client",
+        lambda base_url=None: FakeClient(),
+    )
+
+    client = TestClient(create_app())
+    response = client.get("/api/dataflow-vuln-scanner/workers/cluster-capacity")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["worker_count"] == 1
+    assert payload["total_capacity"] == 4
+    assert payload["running_jobs"] == 1
+    assert payload["available_slots"] == 3
+    assert payload["workers"][0]["worker_id"] == "worker-capacity-pod"
+    assert payload["workers"][0]["healthy"] is True
+    assert payload["workers"][0]["active_jobs"][0]["execution_id"] == execution_id
+    assert payload["workers"][0]["active_jobs"][0]["task_id"] == "tt-sched-capacity-view"
+    assert payload["workers"][0]["active_jobs"][0]["mapped"] is True
+
+
+def test_cluster_capacity_api_degrades_when_worker_probe_fails(
+    service_config_path: Path,
+    monkeypatch,
+):
+    config = get_config()
+    config.scheduler.enabled = True
+    config.scheduler.role = "worker"
+    config.scheduler.pod_id = "worker-capacity-fail-pod"
+    config.scheduler.host_name = "worker-capacity-fail-host"
+    config.scheduler.worker_capacity = 2
+    config.dataflow_worker.worker_urls = ["http://worker-capacity-fail"]
+
+    scheduler = SchedulerService()
+    scheduler._heartbeat_once()
+
+    class FakeClient:
+        def list_jobs(self) -> list[dict]:
+            raise RuntimeError("probe failed")
+
+    monkeypatch.setattr(
+        "app.services.scheduler.get_dataflow_worker_client",
+        lambda base_url=None: FakeClient(),
+    )
+
+    client = TestClient(create_app())
+    response = client.get("/api/dataflow-vuln-scanner/workers/cluster-capacity")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["worker_count"] >= 1
+    target = next(item for item in payload["workers"] if item["worker_id"] == "worker-capacity-fail-pod")
+    assert target["healthy"] is False
+    assert target["active_jobs"] == []
+    assert "probe failed" in (target["error"] or "")

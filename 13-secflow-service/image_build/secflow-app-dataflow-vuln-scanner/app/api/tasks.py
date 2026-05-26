@@ -28,6 +28,7 @@ from app.schemas import (
     RunVulnReportRequest,
     RunVulnReportResponse,
     ScanTaskCreateRequest,
+    WorkerClusterCapacityResponse,
     ScanTaskDetailResponse,
     ScanTaskPriorityUpdateRequest,
     ScanTaskResponse,
@@ -125,6 +126,14 @@ async def list_tasks(
         limit=limit,
         offset=offset,
     )
+
+
+@router.get("/workers/cluster-capacity", response_model=WorkerClusterCapacityResponse)
+async def get_worker_cluster_capacity(
+    subject=Depends(get_current_or_machine_subject),
+    db: Session = Depends(get_db),
+):
+    return get_scheduler_service().get_cluster_capacity(db)
 
 
 @router.get("/tasks/{task_id}", response_model=ScanTaskDetailResponse)

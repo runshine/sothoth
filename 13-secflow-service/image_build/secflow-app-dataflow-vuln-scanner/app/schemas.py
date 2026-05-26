@@ -349,6 +349,48 @@ class SchedulerWorkerResponse(BaseModel):
     metadata_json: Optional[Dict[str, Any]]
 
 
+class WorkerActiveJobResponse(BaseModel):
+    execution_id: str
+    task_id: Optional[str] = None
+    task_title: Optional[str] = None
+    status: str
+    worker_job_id: str
+    worker_url: Optional[str] = None
+    dispatch_status: Optional[str] = None
+    started_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    run_name: Optional[str] = None
+    run_path: Optional[str] = None
+    project_id: Optional[str] = None
+    mapped: bool = False
+    mapping_reason: str = "orphan_job"
+
+
+class WorkerClusterWorkerResponse(BaseModel):
+    worker_id: str
+    host_name: str
+    healthy: bool
+    max_concurrent_jobs: int
+    running_jobs: int
+    available_slots: int
+    source: str = "scheduler_worker"
+    last_heartbeat_at: Optional[datetime] = None
+    error: Optional[str] = None
+    active_jobs: List[WorkerActiveJobResponse] = Field(default_factory=list)
+
+
+class WorkerClusterCapacityResponse(BaseModel):
+    worker_count: int
+    healthy_workers: int
+    stale_workers: int
+    total_capacity: int
+    running_jobs: int
+    queued_jobs: int
+    available_slots: int
+    updated_at: datetime
+    workers: List[WorkerClusterWorkerResponse] = Field(default_factory=list)
+
+
 class SuccessResponse(BaseModel):
     success: bool = True
     message: str

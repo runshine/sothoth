@@ -71,6 +71,7 @@ def create_app() -> FastAPI:
                 or path in {
                     "/api/dataflow-vuln-scanner/health",
                     "/api/dataflow-vuln-scanner/ready",
+                    "/api/dataflow-vuln-scanner/workers/cluster-capacity",
                     "/api/app/dataflow-vuln-scanner/metrics",
                     "/metrics",
                     "/openapi.json",

@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 from datetime import timedelta
+import json
 from typing import Any, Dict, List
 
 from fastapi import HTTPException, status
@@ -14,13 +15,19 @@ from sqlalchemy.orm import Session
 
 from app.config import get_config
 from app.models.database import (
+    RunIndex,
     SchedulerWorker,
     TriggerTask,
     WorkflowDefinition,
     WorkflowExecution,
     get_db_session,
 )
-from app.schemas import SchedulerWorkerResponse
+from app.schemas import (
+    SchedulerWorkerResponse,
+    WorkerActiveJobResponse,
+    WorkerClusterCapacityResponse,
+    WorkerClusterWorkerResponse,
+)
 from app.services.dataflow_worker_client import DataflowWorkerError, get_dataflow_worker_client
 from app.services.execution_service import get_execution_service
 from app.time_utils import now_local
@@ -164,6 +171,92 @@ class SchedulerService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="scheduler worker not found")
         return SchedulerWorkerResponse.model_validate(worker, from_attributes=True)
 
+    def get_cluster_capacity(self, db: Session) -> WorkerClusterCapacityResponse:
+        workers = db.query(SchedulerWorker).order_by(SchedulerWorker.last_heartbeat_at.desc(), SchedulerWorker.pod_id.asc()).all()
+        worker_rows: list[WorkerClusterWorkerResponse] = []
+        worker_timeout_at = now_local() - timedelta(seconds=get_config().scheduler.worker_timeout_seconds)
+
+        active_executions = (
+            db.query(WorkflowExecution, TriggerTask, RunIndex)
+            .join(TriggerTask, WorkflowExecution.trigger_task_id == TriggerTask.id)
+            .outerjoin(RunIndex, RunIndex.linked_execution_id == WorkflowExecution.id)
+            .filter(
+                or_(
+                    WorkflowExecution.status.in_(tuple(ACTIVE_JOB_STATUSES)),
+                    WorkflowExecution.dispatch_status.in_(tuple(ACTIVE_JOB_STATUSES)),
+                )
+            )
+            .all()
+        )
+        execution_map: dict[str, tuple[WorkflowExecution, TriggerTask, RunIndex | None]] = {}
+        for execution, trigger, run_index in active_executions:
+            execution_map[str(execution.id)] = (execution, trigger, run_index)
+
+        queued_jobs = (
+            db.query(WorkflowExecution)
+            .join(TriggerTask, WorkflowExecution.trigger_task_id == TriggerTask.id)
+            .join(WorkflowDefinition, WorkflowExecution.workflow_definition_id == WorkflowDefinition.id)
+            .filter(
+                WorkflowExecution.status == "pending",
+                TriggerTask.status == "pending",
+                WorkflowDefinition.enabled.is_(True),
+            )
+            .count()
+        )
+
+        total_capacity = 0
+        total_running = 0
+        healthy_workers = 0
+        stale_workers = 0
+
+        for worker in workers:
+            heartbeat_healthy = bool(worker.last_heartbeat_at and worker.last_heartbeat_at >= worker_timeout_at and worker.status == "active")
+            try:
+                jobs = self._list_worker_jobs_for_capacity(worker)
+                active_jobs = [self._build_active_job_payload(job, execution_map) for job in jobs if self._job_is_active(job)]
+                active_jobs.sort(key=lambda item: item.started_at or item.updated_at or now_local())
+                error = None
+            except Exception as exc:
+                logger.exception("failed to probe worker jobs for cluster capacity: pod_id=%s", worker.pod_id)
+                active_jobs = []
+                error = str(exc)
+            healthy = heartbeat_healthy and error is None
+            if healthy:
+                healthy_workers += 1
+            else:
+                stale_workers += 1
+            running_jobs = len(active_jobs)
+            capacity = max(int(worker.capacity or 0), 0)
+            available_slots = max(capacity - running_jobs, 0)
+            total_capacity += capacity
+            total_running += running_jobs
+            worker_rows.append(
+                WorkerClusterWorkerResponse(
+                    worker_id=str(worker.pod_id),
+                    host_name=str(worker.host_name or worker.pod_id),
+                    healthy=healthy,
+                    max_concurrent_jobs=capacity,
+                    running_jobs=running_jobs,
+                    available_slots=available_slots,
+                    source="scheduler_worker",
+                    last_heartbeat_at=worker.last_heartbeat_at,
+                    error=error,
+                    active_jobs=active_jobs,
+                )
+            )
+
+        return WorkerClusterCapacityResponse(
+            worker_count=len(worker_rows),
+            healthy_workers=healthy_workers,
+            stale_workers=stale_workers,
+            total_capacity=total_capacity,
+            running_jobs=total_running,
+            queued_jobs=queued_jobs,
+            available_slots=max(total_capacity - total_running, 0),
+            updated_at=now_local(),
+            workers=worker_rows,
+        )
+
     def set_worker_status(self, db: Session, pod_id: str, status_value: str) -> None:
         worker = db.get(SchedulerWorker, pod_id)
         if worker is None:
@@ -174,6 +267,104 @@ class SchedulerService:
         db.commit()
         if pod_id == self.pod_id:
             self._worker_status = status_value
+
+    def _list_worker_jobs_for_capacity(self, worker: SchedulerWorker) -> list[dict[str, Any]]:
+        jobs_from_db = self._active_jobs_from_db(worker)
+        worker_url = self._resolve_worker_url(worker, jobs_from_db)
+        if not worker_url:
+            return jobs_from_db
+        jobs = get_dataflow_worker_client(worker_url).list_jobs()
+        return [job for job in jobs if isinstance(job, dict)]
+
+    def _resolve_worker_url(self, worker: SchedulerWorker, jobs_from_db: list[dict[str, Any]]) -> str | None:
+        urls = self.configured_worker_urls()
+        if not urls:
+            return None
+        if len(urls) == 1:
+            return urls[0]
+        for job in jobs_from_db:
+            worker_url = str(job.get("worker_url") or "").strip().rstrip("/")
+            if worker_url:
+                return worker_url
+        host_name = str(worker.host_name or "").strip().lower()
+        pod_id = str(worker.pod_id or "").strip().lower()
+        for url in urls:
+            normalized = url.lower()
+            if host_name and host_name in normalized:
+                return url
+            if pod_id and pod_id in normalized:
+                return url
+        return urls[0]
+
+    def _active_jobs_from_db(self, worker: SchedulerWorker) -> list[dict[str, Any]]:
+        db = get_db_session()
+        try:
+            executions = (
+                db.query(WorkflowExecution)
+                .filter(
+                    WorkflowExecution.owner_pod_id == worker.pod_id,
+                    or_(
+                        WorkflowExecution.status.in_(tuple(ACTIVE_JOB_STATUSES)),
+                        WorkflowExecution.dispatch_status.in_(tuple(ACTIVE_JOB_STATUSES)),
+                    ),
+                )
+                .all()
+            )
+            return [self._job_payload(execution) for execution in executions]
+        finally:
+            db.close()
+
+    @staticmethod
+    def _job_is_active(job: dict[str, Any]) -> bool:
+        status_text = str(job.get("status") or "").strip().lower()
+        phase_text = str(job.get("phase") or "").strip().lower()
+        return status_text in ACTIVE_JOB_STATUSES or phase_text in ACTIVE_JOB_STATUSES
+
+    @staticmethod
+    def _build_active_job_payload(
+        job: dict[str, Any],
+        execution_map: dict[str, tuple[WorkflowExecution, TriggerTask, RunIndex | None]],
+    ) -> WorkerActiveJobResponse:
+        execution_id = str(job.get("execution_id") or job.get("id") or "")
+        mapped_execution = execution_map.get(execution_id)
+        execution = mapped_execution[0] if mapped_execution else None
+        trigger = mapped_execution[1] if mapped_execution else None
+        run_index = mapped_execution[2] if mapped_execution else None
+        return WorkerActiveJobResponse(
+            execution_id=execution_id,
+            task_id=str(trigger.id) if trigger is not None else None,
+            task_title=SchedulerService._trigger_title_for_capacity(trigger),
+            status=str(job.get("status") or execution.status if execution is not None else "running"),
+            worker_job_id=str(job.get("id") or execution.worker_job_id or execution_id),
+            worker_url=str(job.get("worker_url") or execution.worker_url) if execution is not None or job.get("worker_url") else None,
+            dispatch_status=str(job.get("phase") or execution.dispatch_status or execution.process_status) if execution is not None or job.get("phase") else None,
+            started_at=execution.started_at if execution is not None else None,
+            updated_at=execution.updated_at if execution is not None else None,
+            run_name=str(run_index.run_name) if run_index is not None and getattr(run_index, "run_name", None) else None,
+            run_path=str(run_index.run_root_path) if run_index is not None and getattr(run_index, "run_root_path", None) else None,
+            project_id=str(execution.project_id) if execution is not None else None,
+            mapped=execution is not None and trigger is not None,
+            mapping_reason="matched_execution" if execution is not None and trigger is not None else "orphan_job",
+        )
+
+    @staticmethod
+    def _trigger_title_for_capacity(trigger: TriggerTask | None) -> str | None:
+        if trigger is None:
+            return None
+        payload = trigger.input_tasks_json
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        tasks = payload.get("tasks") if isinstance(payload, dict) else None
+        if isinstance(tasks, list) and tasks:
+            first = tasks[0]
+            if isinstance(first, dict):
+                title = str(first.get("title") or "").strip()
+                if title:
+                    return title
+        return str(trigger.id)
 
     async def _heartbeat_loop(self) -> None:
         interval = get_config().scheduler.heartbeat_interval_seconds
