@@ -36,7 +36,7 @@ def _scheduler_readiness() -> tuple[bool, dict[str, Any]]:
         return True, {"enabled": False, "running": False, "loops": loops}
 
     running = bool(runtime.get("running"))
-    required_loops = ("task_dispatch", "action_dispatch", "archive_dispatch", "downstream_reconcile")
+    required_loops = ("task_dispatch", "action_dispatch", "archive_dispatch", "downstream_reconcile", "readless_reconcile")
     missing = [loop_name for loop_name in required_loops if not bool(loops.get(loop_name))]
     return running and not missing, {
         "enabled": True,

@@ -65,6 +65,7 @@ from app.observability import (
     observe_state_reducer_health,
     observe_state_reducer_event,
     observe_state_reducer_run,
+    observe_task_readless_reconcile,
     observe_task_state_lock,
     observe_task_duration,
     observe_task_error,
@@ -113,6 +114,7 @@ from app.service.firmware_unpacker import get_firmware_unpacker_client
 from app.service.security import app_task_root, ensure_dir, validate_task_id
 from app.service.system_analyse import get_system_analyse_client
 from app.service.reducer_metrics_snapshot import get_reducer_metrics_snapshot_store
+from app.service.readless_sync import ReadlessSyncStats, run_readless_sync_loop
 from app.service.task_queue import get_task_queue
 from app.time_utils import now_local
 
@@ -773,6 +775,7 @@ class TaskManager:
         self._loop_task: Optional[asyncio.Task] = None
         self._archive_loop_task: Optional[asyncio.Task] = None
         self._downstream_reconcile_task: Optional[asyncio.Task] = None
+        self._readless_reconcile_task: Optional[asyncio.Task] = None
         self._action_loop_task: Optional[asyncio.Task] = None
         self._state_reducer_loop_task: Optional[asyncio.Task] = None
         self._reducer_metrics_snapshot_loop_task: Optional[asyncio.Task] = None
@@ -811,6 +814,10 @@ class TaskManager:
             self._downstream_reconcile_task = asyncio.create_task(
                 self._downstream_reconcile_loop(),
                 name="binary-security-downstream-reconcile",
+            )
+            self._readless_reconcile_task = asyncio.create_task(
+                self._readless_reconcile_loop(),
+                name="binary-security-readless-reconcile",
             )
         if run_reducer_loop:
             self._state_reducer_loop_task = asyncio.create_task(
@@ -854,6 +861,12 @@ class TaskManager:
             self._downstream_reconcile_task.cancel()
             try:
                 await self._downstream_reconcile_task
+            except asyncio.CancelledError:
+                pass
+        if self._readless_reconcile_task:
+            self._readless_reconcile_task.cancel()
+            try:
+                await self._readless_reconcile_task
             except asyncio.CancelledError:
                 pass
         if self._state_reducer_loop_task:
@@ -1200,7 +1213,6 @@ class TaskManager:
                 BinarySecurityTask.target_stage_name,
             )
         ).order_by(BinarySecurityTask.created_at.desc()).all()
-        self._reconcile_task_statuses_for_read(db, tasks)
         queue_info = self._build_queue_info(db, project_id=project_id)
         service_config = self._load_service_config(db)
         return BinarySecurityTaskListResponse(
@@ -1215,7 +1227,6 @@ class TaskManager:
 
     def get_task_detail(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskDetailResponse:
         task = self._task_or_404(db, project_id, task_id)
-        self._reconcile_task_statuses_for_read(db, [task])
         items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).order_by(
             BinarySecurityStageItem.created_at.asc()
         ).all()
@@ -6518,6 +6529,7 @@ class TaskManager:
         archive_loop_alive = bool(self._archive_loop_task and not self._archive_loop_task.done())
         stage_item_loop_alive = bool(self._stage_item_loop_task and not self._stage_item_loop_task.done())
         reconcile_loop_alive = bool(self._downstream_reconcile_task and not self._downstream_reconcile_task.done())
+        readless_reconcile_loop_alive = bool(self._readless_reconcile_task and not self._readless_reconcile_task.done())
         state_reducer_loop_alive = bool(self._state_reducer_loop_task and not self._state_reducer_loop_task.done())
         reducer_metrics_snapshot_loop_alive = bool(
             self._reducer_metrics_snapshot_loop_task and not self._reducer_metrics_snapshot_loop_task.done()
@@ -6530,6 +6542,7 @@ class TaskManager:
                 "archive_dispatch": archive_loop_alive,
                 "stage_item_dispatch": stage_item_loop_alive,
                 "downstream_reconcile": reconcile_loop_alive,
+                "readless_reconcile": readless_reconcile_loop_alive,
                 "state_reducer": state_reducer_loop_alive,
                 "reducer_metrics_snapshot": reducer_metrics_snapshot_loop_alive,
             },
@@ -8025,27 +8038,58 @@ class TaskManager:
             raise NotFoundError("任务不存在")
         return task
 
-    def _reconcile_task_statuses_for_read(self, db: Session, tasks: list[BinarySecurityTask]) -> None:
-        changed = False
-        for task in tasks:
+    async def _readless_reconcile_loop(self) -> None:
+        interval_seconds = max(2, int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 5) or 5))
+        await run_readless_sync_loop(
+            should_stop=lambda: not self._running,
+            interval_seconds=interval_seconds,
+            before_tick=None,
+            candidate_ids_loader=self._load_readless_reconcile_candidate_ids,
+            process_one=self._process_readless_reconcile_task,
+            observe=self._observe_readless_reconcile_stats,
+            loop_context=observe_scheduler_loop,
+            loop_name="readless_reconcile",
+        )
+
+    def _load_readless_reconcile_candidate_ids(self) -> list[str]:
+        candidate_session = get_session_factory()()
+        try:
+            return [
+                str(task_id)
+                for (task_id,) in candidate_session.query(BinarySecurityTask.id)
+                .filter(BinarySecurityTask.status.in_(["pending", "running", "dispatching", "retry_preparing", "continue_preparing"]))
+                .order_by(BinarySecurityTask.updated_at.asc(), BinarySecurityTask.created_at.asc())
+                .limit(64)
+                .all()
+            ]
+        finally:
+            candidate_session.close()
+
+    async def _process_readless_reconcile_task(self, task_id: str) -> tuple[bool, bool]:
+        session = get_session_factory()()
+        try:
+            task = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
             if task is None:
-                continue
+                return False, False
             before_status = str(task.status or "").strip()
             before_stage = str(task.current_stage or "").strip()
-            self._refresh_task_status_after_sync(db, task)
-            if str(task.status or "").strip() != before_status or str(task.current_stage or "").strip() != before_stage:
-                changed = True
-        if not changed:
-            return
-        db.flush()
-        if hasattr(db, "refresh"):
-            for task in tasks:
-                if task is None:
-                    continue
-                try:
-                    db.refresh(task)
-                except Exception:
-                    pass
+            self._refresh_task_status_after_sync(session, task)
+            changed = str(task.status or "").strip() != before_status or str(task.current_stage or "").strip() != before_stage
+            session.commit()
+            return True, changed
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def _observe_readless_reconcile_stats(self, stats: ReadlessSyncStats) -> None:
+        observe_task_readless_reconcile(
+            attempted=stats.attempted,
+            changed=stats.changed,
+            failed=stats.failed,
+            candidates=stats.candidates,
+        )
 
     def _ensure_stage_run(self, db: Session, task: BinarySecurityTask, stage_name: str) -> BinarySecurityStageRun:
         stage_run = db.query(BinarySecurityStageRun).filter(

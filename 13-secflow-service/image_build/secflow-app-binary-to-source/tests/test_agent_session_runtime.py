@@ -217,7 +217,6 @@ class AgentSessionRuntimeApiTests(unittest.TestCase):
         async def _run():
             with (
                 mock.patch.object(task_api, "get_task_or_404", return_value=task),
-                mock.patch.object(task_api, "sync_task", new=mock.AsyncMock()),
                 mock.patch.object(task_api, "query_items", return_value=[item]),
                 mock.patch.object(task_api, "build_task_agent_session_runtime", return_value=response),
             ):

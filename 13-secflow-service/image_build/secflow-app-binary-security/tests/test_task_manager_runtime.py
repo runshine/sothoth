@@ -23,6 +23,7 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
         self.manager._archive_loop_task = _Task(True)
         self.manager._stage_item_loop_task = _Task(False)
         self.manager._downstream_reconcile_task = _Task(False)
+        self.manager._readless_reconcile_task = _Task(False)
         self.manager._state_reducer_loop_task = _Task(False)
         self.manager._reducer_metrics_snapshot_loop_task = _Task(False)
 
@@ -36,6 +37,7 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
                 "archive_dispatch": False,
                 "stage_item_dispatch": True,
                 "downstream_reconcile": True,
+                "readless_reconcile": True,
                 "state_reducer": True,
                 "reducer_metrics_snapshot": True,
             },
@@ -142,6 +144,99 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, manager._state_reducer_consecutive_crash_count)
         observe_health.assert_called_once()
         self.assertEqual(0, observe_health.call_args.kwargs["consecutive_crash_count"])
+
+    async def test_readless_reconcile_loop_commits_per_task_and_stops_after_sleep(self):
+        manager = TaskManager()
+        manager._running = True
+
+        class _CandidateSession:
+            def query(self, model):
+                del model
+                return self
+
+            def filter(self, *args, **kwargs):
+                del args, kwargs
+                return self
+
+            def order_by(self, *args, **kwargs):
+                del args, kwargs
+                return self
+
+            def limit(self, *args, **kwargs):
+                del args, kwargs
+                return self
+
+            def all(self):
+                return [("t1",)]
+
+            def close(self):
+                return None
+
+        class _TaskSession:
+            def __init__(self):
+                self.task = type("Task", (), {"id": "t1", "status": "pending", "current_stage": "system_analysis"})()
+                self.commits = 0
+                self.rollbacks = 0
+
+            def query(self, model):
+                del model
+                return self
+
+            def filter(self, *args, **kwargs):
+                del args, kwargs
+                return self
+
+            def first(self):
+                return self.task
+
+            def commit(self):
+                self.commits += 1
+
+            def rollback(self):
+                self.rollbacks += 1
+
+            def close(self):
+                return None
+
+        task_session = _TaskSession()
+        sessions = [_CandidateSession(), task_session]
+
+        def _session_factory():
+            return sessions.pop(0)
+
+        refresh_calls = []
+        observe_calls = []
+        sleep_calls = []
+
+        def _refresh(_session, task):
+            refresh_calls.append(task.id)
+            task.status = "running"
+
+        def _observe(**kwargs):
+            observe_calls.append(kwargs)
+
+        async def _sleep(seconds):
+            sleep_calls.append(seconds)
+            manager._running = False
+
+        manager._refresh_task_status_after_sync = _refresh
+
+        with (
+            patch("app.service.task_manager.get_session_factory", return_value=_session_factory),
+            patch("app.service.task_manager.observe_task_readless_reconcile", side_effect=_observe),
+            patch("app.service.task_manager.asyncio.sleep", new=_sleep),
+        ):
+            await manager._readless_reconcile_loop()
+
+        self.assertEqual(["t1"], refresh_calls)
+        self.assertEqual(1, task_session.commits)
+        self.assertEqual(0, task_session.rollbacks)
+        self.assertEqual(1, len(observe_calls))
+        self.assertEqual(1, observe_calls[0]["attempted"])
+        self.assertEqual(1, observe_calls[0]["changed"])
+        self.assertEqual(0, observe_calls[0]["failed"])
+        self.assertEqual(1, observe_calls[0]["candidates"])
+        self.assertGreaterEqual(len(sleep_calls), 1)
 
 
 if __name__ == "__main__":
