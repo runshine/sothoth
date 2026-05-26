@@ -40,13 +40,8 @@ jobs:
       - name: Prepare Android tool cache
         run: |
           bash 13-secflow-service/image_build/secflow-app-kernel-scan/scripts/prepare-android-tools.sh
-
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
 
       - name: Build amd64 image
         run: |
