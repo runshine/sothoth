@@ -2805,6 +2805,7 @@ class TaskManagerTests(unittest.TestCase):
                 "archive_dispatch": False,
                 "stage_item_dispatch": False,
                 "downstream_reconcile": True,
+                "readless_reconcile": False,
                 "state_reducer": False,
                 "reducer_metrics_snapshot": False,
             },
