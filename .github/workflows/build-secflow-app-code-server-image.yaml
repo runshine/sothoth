@@ -1,5 +1,6 @@
 name: build-secflow-app-code-server-image
 on:
+  workflow_dispatch:
   push:
     branches:
       - 'v2.*'

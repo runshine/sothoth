@@ -1,5 +1,6 @@
 name: build-secflow-platform-deploy-script-image.
 on:
+  workflow_dispatch:
   push:
     branches:
       - 'v2.*'

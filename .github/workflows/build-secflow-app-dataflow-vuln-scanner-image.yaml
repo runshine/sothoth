@@ -1,5 +1,6 @@
 name: build-secflow-app-dataflow-vuln-scanner-image
 on:
+  workflow_dispatch:
   push:
     branches:
       - 'v2.*'
