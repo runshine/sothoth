@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Body, Depends, Query, status
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import ensure_project_access, get_current_subject, get_db
+from app.api.dependencies import ensure_project_access, get_current_or_machine_subject, get_current_subject, get_db
 from app.config import get_config
 from app.models.database import WorkflowExecution
 from app.schemas import (
@@ -92,7 +92,7 @@ async def get_project_filesystem_children(
 @router.post("/tasks", response_model=ScanTaskResponse, status_code=status.HTTP_201_CREATED)
 async def create_task(
     payload: ScanTaskCreateRequest,
-    subject=Depends(get_current_subject),
+    subject=Depends(get_current_or_machine_subject),
     db: Session = Depends(get_db),
 ):
     principal, token = subject
@@ -110,7 +110,7 @@ async def list_tasks(
     profile_id: Optional[str] = Query(None),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    subject=Depends(get_current_subject),
+    subject=Depends(get_current_or_machine_subject),
     db: Session = Depends(get_db),
 ):
     principal, token = subject
@@ -128,13 +128,13 @@ async def list_tasks(
 
 
 @router.get("/tasks/{task_id}", response_model=ScanTaskDetailResponse)
-async def get_task(task_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+async def get_task(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().get_scan_task(db, task_id, principal)
 
 
 @router.get("/tasks/{task_id}/replay-ready", response_model=ReplayReadyResponse)
-async def get_task_replay_ready(task_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+async def get_task_replay_ready(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().get_task_replay_ready(db, task_id, principal)
 
@@ -143,7 +143,7 @@ async def get_task_replay_ready(task_id: str, subject=Depends(get_current_subjec
 async def create_evolution_task(
     task_id: str,
     payload: CreateEvolutionTaskRequest,
-    subject=Depends(get_current_subject),
+    subject=Depends(get_current_or_machine_subject),
     db: Session = Depends(get_db),
 ):
     principal, token = subject
@@ -160,7 +160,7 @@ async def create_evolution_task(
 
 
 @router.get("/tasks/{task_id}/artifacts", response_model=Dict[str, Any])
-async def get_task_artifacts(task_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+async def get_task_artifacts(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().get_scan_task_artifacts(db, task_id, principal)
 
@@ -173,7 +173,7 @@ async def get_task_artifacts(task_id: str, subject=Depends(get_current_subject),
 async def retry_task(
     task_id: str,
     payload: RunRetryRequest | None = Body(default=None),
-    subject=Depends(get_current_subject),
+    subject=Depends(get_current_or_machine_subject),
     db: Session = Depends(get_db),
 ):
     principal, _ = subject
@@ -371,13 +371,13 @@ async def retry_run(
 
 
 @router.post("/tasks/{task_id}/cancel", response_model=ScanTaskResponse)
-async def cancel_task(task_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+async def cancel_task(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().cancel_scan_task(db, task_id, principal)
 
 
 @router.delete("/tasks/{task_id}", response_model=SuccessResponse)
-async def delete_task(task_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+async def delete_task(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().delete_scan_task(db, task_id, principal)
 
@@ -386,7 +386,7 @@ async def delete_task(task_id: str, subject=Depends(get_current_subject), db: Se
 async def update_task_priority(
     task_id: str,
     payload: ScanTaskPriorityUpdateRequest,
-    subject=Depends(get_current_subject),
+    subject=Depends(get_current_or_machine_subject),
     db: Session = Depends(get_db),
 ):
     principal, _ = subject

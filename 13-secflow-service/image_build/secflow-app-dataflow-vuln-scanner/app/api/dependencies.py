@@ -19,6 +19,16 @@ async def get_current_subject(authorization: Optional[str] = Header(default=None
     return await auth.validate_human_authorization(authorization)
 
 
+async def get_current_or_machine_subject(authorization: Optional[str] = Header(default=None)) -> Tuple[dict, str]:
+    auth = get_auth_service()
+    try:
+        return await auth.validate_human_authorization(authorization)
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_401_UNAUTHORIZED:
+            raise
+    return await auth.validate_machine_authorization(authorization)
+
+
 async def get_machine_subject(authorization: Optional[str] = Header(default=None)) -> Tuple[dict, str]:
     auth = get_auth_service()
     return await auth.validate_machine_authorization(authorization)
@@ -38,6 +48,7 @@ __all__ = [
     "ensure_project_access",
     "generate_id",
     "get_db",
+    "get_current_or_machine_subject",
     "get_current_subject",
     "get_machine_subject",
 ]

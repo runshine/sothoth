@@ -6,6 +6,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from fastapi import HTTPException
 
 from app.config import get_config
 from app.main import create_app
@@ -167,6 +168,40 @@ def test_profiles_tasks_and_effective_config(service_config_path, patch_mock_age
     assert retry.status_code == 202
     assert retry.json()["latest_execution_id"] != execution_id
     _wait_for_task_status(client, task_id)
+
+
+def test_task_apis_accept_machine_subject(service_config_path, patch_mock_agent_runtime, monkeypatch):
+    app = create_app()
+    client = TestClient(app)
+
+    create_profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload())
+    assert create_profile.status_code == 201
+    profile_id = create_profile.json()["profile_id"]
+    created = _create_business_dataflow_task(
+        client,
+        profile_id=profile_id,
+        case_name="machine-subject-demo",
+        title="machine subject scan",
+    )
+
+    from app.api import tasks as task_api
+
+    async def _machine_subject(_authorization=None):
+        return ({"token_type": "machine", "project_ids": ["default"]}, "machine-token")
+
+    async def _reject_human(_authorization=None):
+        raise HTTPException(status_code=401, detail="human token invalid")
+
+    monkeypatch.setattr(task_api, "get_current_or_machine_subject", _machine_subject)
+    monkeypatch.setattr(task_api, "get_current_subject", _reject_human)
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{created['task_id']}")
+    assert detail.status_code == 200
+    assert detail.json()["task_id"] == created["task_id"]
+
+    listed = client.get("/api/dataflow-vuln-scanner/tasks", params={"project_id": "default"})
+    assert listed.status_code == 200
+    assert any(item["task_id"] == created["task_id"] for item in listed.json())
 
 
 def test_task_list_uses_lightweight_run_locator_without_full_run_summary(service_config_path, patch_mock_agent_runtime, monkeypatch):

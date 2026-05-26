@@ -15507,8 +15507,8 @@ class TaskManager:
             normalized["source_dir"] = normalized.get("source_dir") or self._resolve_entry_source_dir(normalized)
             normalized["module_input_path"] = normalized.get("module_input_path") or self._resolve_dfa_module_input_path(normalized)
             normalized["source_root_path"] = normalized.get("source_root_path") or self._resolve_dfa_source_root_path(normalized)
-            normalized["dataflow_dir"] = normalized.get("dataflow_dir") or normalized.get("data_flow_root")
-            normalized["data_flow_root"] = normalized.get("data_flow_root") or normalized.get("dataflow_dir") or normalized.get("artifact_root") or normalized.get("archive_root")
+            normalized["dataflow_dir"] = normalized.get("dataflow_dir")
+            normalized["data_flow_root"] = normalized.get("data_flow_root") or normalized.get("dataflow_dir")
         normalized["source_file"] = self._compress_source_file_hint(str(normalized.get("source_file") or normalized.get("definition_file") or normalized.get("file_name") or ""))
         for field, message in (
             ("entry_key", "数据流分析输出缺少 entry_key"),
@@ -16485,8 +16485,8 @@ class TaskManager:
             "source_file": item.get("source_file") or item.get("definition_file") or item.get("file_name"),
             "artifact_root": item.get("artifact_root"),
             "archive_root": item.get("archive_root"),
-            "data_flow_root": item.get("data_flow_root") or item.get("artifact_root"),
-            "dataflow_dir": item.get("dataflow_dir") or item.get("artifact_root"),
+            "data_flow_root": item.get("data_flow_root"),
+            "dataflow_dir": item.get("dataflow_dir"),
         }
 
     def _compact_vuln_summary_item(self, item: dict[str, Any]) -> dict[str, Any]:

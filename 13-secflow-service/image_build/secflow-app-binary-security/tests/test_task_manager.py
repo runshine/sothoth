@@ -13891,6 +13891,23 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValidationError):
             self.manager._validate_dataflow_output_contract(payload, allow_fallback=True)
 
+    def test_validate_dataflow_output_contract_does_not_fallback_dataflow_dir_from_artifact_root(self):
+        payload = {
+            "entry_key": "entry-1",
+            "function_name": "main",
+            "module_key": "module-1",
+            "module_name": "module-1",
+            "source_dir": ".",
+            "source_root_path": "/tmp/src",
+            "module_input_path": "/tmp/src/module-1",
+            "source_file": "main.c",
+            "artifact_root": "/tmp/archive-root",
+            "archive_root": "/tmp/archive-root",
+            "data_flow_root": "/tmp/archive-root",
+        }
+        with self.assertRaises(ValidationError):
+            self.manager._validate_dataflow_output_contract(payload, allow_fallback=True)
+
     def test_compress_source_file_hint_limits_length(self):
         raw = "/" + "/".join(["very-long-segment"] * 40) + "/main.c"
         compressed = self.manager._compress_source_file_hint(raw)
