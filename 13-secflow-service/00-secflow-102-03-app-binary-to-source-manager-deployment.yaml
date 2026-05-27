@@ -43,18 +43,29 @@ spec:
           limits:
             memory: "512Mi"
             cpu: "1000m"
+        startupProbe:
+          httpGet:
+            path: /api/app/binary-to-source/health
+            port: 8080
+          periodSeconds: 10
+          timeoutSeconds: 15
+          failureThreshold: 18
         livenessProbe:
           httpGet:
             path: /api/app/binary-to-source/health
             port: 8080
           initialDelaySeconds: 30
           periodSeconds: 30
+          timeoutSeconds: 15
+          failureThreshold: 5
         readinessProbe:
           httpGet:
             path: /api/app/binary-to-source/ready
             port: 8080
           initialDelaySeconds: 15
           periodSeconds: 15
+          timeoutSeconds: 15
+          failureThreshold: 5
       volumes:
       - name: secflow-app-binary-to-source-config
         configMap:

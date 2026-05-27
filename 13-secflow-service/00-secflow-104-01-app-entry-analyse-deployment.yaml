@@ -48,7 +48,7 @@ spec:
             path: /api/app/entry-analyse/health
             port: 8080
           periodSeconds: 10
-          timeoutSeconds: 3
+          timeoutSeconds: 15
           failureThreshold: 18
         livenessProbe:
           httpGet:
@@ -56,7 +56,7 @@ spec:
             port: 8080
           initialDelaySeconds: 30
           periodSeconds: 30
-          timeoutSeconds: 5
+          timeoutSeconds: 15
           failureThreshold: 5
         readinessProbe:
           httpGet:
@@ -64,7 +64,7 @@ spec:
             port: 8080
           initialDelaySeconds: 15
           periodSeconds: 15
-          timeoutSeconds: 3
+          timeoutSeconds: 15
           failureThreshold: 5
       volumes:
       - name: secflow-app-entry-analyse-config

@@ -60,21 +60,21 @@ spec:
             tcpSocket:
               port: 8080
             periodSeconds: 10
-            timeoutSeconds: 5
+            timeoutSeconds: 15
             failureThreshold: 18
           livenessProbe:
             tcpSocket:
               port: 8080
             initialDelaySeconds: 30
             periodSeconds: 30
-            timeoutSeconds: 10
+            timeoutSeconds: 15
             failureThreshold: 5
           readinessProbe:
             tcpSocket:
               port: 8080
             initialDelaySeconds: 15
             periodSeconds: 15
-            timeoutSeconds: 10
+            timeoutSeconds: 15
             failureThreshold: 5
           lifecycle:
             preStop:

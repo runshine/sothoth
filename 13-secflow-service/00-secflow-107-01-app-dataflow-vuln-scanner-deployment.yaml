@@ -71,13 +71,20 @@ spec:
             limits:
               memory: "16Gi"
               cpu: "4"
+          startupProbe:
+            httpGet:
+              path: /api/dataflow-vuln-scanner/health
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 15
+            failureThreshold: 18
           livenessProbe:
             httpGet:
               path: /api/dataflow-vuln-scanner/health
               port: 8080
             initialDelaySeconds: 30
             periodSeconds: 30
-            timeoutSeconds: 5
+            timeoutSeconds: 15
             failureThreshold: 6
           readinessProbe:
             httpGet:
@@ -85,7 +92,7 @@ spec:
               port: 8080
             initialDelaySeconds: 15
             periodSeconds: 15
-            timeoutSeconds: 5
+            timeoutSeconds: 15
             failureThreshold: 6
       volumes:
         - name: secflow-app-dataflow-vuln-scanner-config
@@ -185,13 +192,20 @@ spec:
             limits:
               memory: "16Gi"
               cpu: "4"
+          startupProbe:
+            httpGet:
+              path: /api/dataflow-vuln-scanner/health
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 15
+            failureThreshold: 18
           livenessProbe:
             httpGet:
               path: /api/dataflow-vuln-scanner/health
               port: 8080
             initialDelaySeconds: 30
             periodSeconds: 30
-            timeoutSeconds: 5
+            timeoutSeconds: 15
             failureThreshold: 6
           readinessProbe:
             httpGet:
@@ -199,7 +213,7 @@ spec:
               port: 8080
             initialDelaySeconds: 20
             periodSeconds: 20
-            timeoutSeconds: 5
+            timeoutSeconds: 15
             failureThreshold: 6
       volumes:
         - name: secflow-app-dataflow-vuln-scanner-config

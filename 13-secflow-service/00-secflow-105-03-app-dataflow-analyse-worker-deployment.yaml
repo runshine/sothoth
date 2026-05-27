@@ -78,6 +78,7 @@ spec:
             path: /api/app/dataflow-analyse/health
             port: 8080
           periodSeconds: 10
+          timeoutSeconds: 15
           failureThreshold: 18
         livenessProbe:
           httpGet:
@@ -85,7 +86,7 @@ spec:
             port: 8080
           initialDelaySeconds: 60
           periodSeconds: 30
-          timeoutSeconds: 5
+          timeoutSeconds: 15
           failureThreshold: 6
         readinessProbe:
           httpGet:
@@ -93,7 +94,7 @@ spec:
             port: 8080
           initialDelaySeconds: 20
           periodSeconds: 15
-          timeoutSeconds: 5
+          timeoutSeconds: 15
           failureThreshold: 6
       volumes:
       - name: secflow-app-dataflow-analyse-config
