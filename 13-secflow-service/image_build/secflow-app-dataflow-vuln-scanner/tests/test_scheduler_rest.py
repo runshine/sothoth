@@ -169,6 +169,19 @@ def test_scheduler_claim_allows_multiple_running_executions_per_definition(
         db.close()
 
 
+def test_worker_advertise_url_defaults_to_headless_fqdn(service_config_path: Path):
+    config = get_config()
+    config.scheduler.pod_id = "worker-3"
+    config.scheduler.host_name = "worker-3"
+    config.scheduler.pod_namespace = "secflow-ns"
+    config.scheduler.worker_headless_service_name = "secflow-app-dataflow-vuln-scanner-worker-headless"
+    config.dataflow_worker.advertise_url_template = ""
+
+    assert SchedulerService().advertise_url() == (
+        "http://worker-3.secflow-app-dataflow-vuln-scanner-worker-headless.secflow-ns.svc.cluster.local:8080"
+    )
+
+
 def test_manager_role_does_not_register_worker(service_config_path: Path):
     config = get_config()
     config.scheduler.enabled = True

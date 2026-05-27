@@ -40,13 +40,26 @@ def _default_payload() -> dict[str, Any]:
             "cluster_capacity_summary_stale_after_seconds": 15,
         },
         "dataflow_worker": {
-            "worker_url_template": config.dataflow_worker.worker_url_template,
             "advertise_url_template": config.dataflow_worker.advertise_url_template,
             "timeout": config.dataflow_worker.timeout,
             "dispatch_retry_interval_seconds": config.dataflow_worker.dispatch_retry_interval_seconds,
             "dispatch_max_retries": config.dataflow_worker.dispatch_max_retries,
         },
     }
+
+
+def _sanitize_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
+    data = dict(payload or {})
+    scheduler = dict(data.get("scheduler") or {})
+    scheduler.pop("discovery_mode", None)
+    data["scheduler"] = scheduler
+
+    worker_cfg = dict(data.get("dataflow_worker") or {})
+    worker_cfg.pop("base_url", None)
+    worker_cfg.pop("worker_urls", None)
+    worker_cfg.pop("worker_url_template", None)
+    data["dataflow_worker"] = worker_cfg
+    return data
 
 
 class RuntimeConfigService:
@@ -58,11 +71,11 @@ class RuntimeConfigService:
                 db.rollback()
                 return _default_payload()
             raise
-        payload = row.config_json if row and isinstance(row.config_json, dict) else {}
+        payload = _sanitize_payload(row.config_json if row and isinstance(row.config_json, dict) else {})
         return _deep_merge(_default_payload(), payload)
 
     def save_config(self, db: Session, config_data: dict[str, Any]) -> dict[str, Any]:
-        merged = _deep_merge(_default_payload(), config_data or {})
+        merged = _deep_merge(_default_payload(), _sanitize_payload(config_data or {}))
         row = db.get(ServiceRuntimeConfig, SERVICE_RUNTIME_CONFIG_KEY)
         if row is None:
             row = ServiceRuntimeConfig(config_key=SERVICE_RUNTIME_CONFIG_KEY, config_json=merged)

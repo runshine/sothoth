@@ -149,6 +149,8 @@ class SchedulerConfig(BaseModel):
     role: str = Field(default_factory=lambda: os.getenv("SECFLOW_DATAFLOW_ROLE") or os.getenv("ROLE") or "standalone")
     pod_id: str = Field(default_factory=lambda: os.getenv("POD_ID") or os.getenv("HOSTNAME") or "local-pod")
     host_name: str = Field(default_factory=lambda: os.getenv("HOSTNAME") or "localhost")
+    pod_namespace: str = Field(default_factory=lambda: os.getenv("POD_NAMESPACE") or "secflow-ns")
+    worker_headless_service_name: str = "secflow-app-dataflow-vuln-scanner-worker-headless"
     # worker_capacity <= 0 means no scheduler-side concurrency limit.
     worker_capacity: int = 5
     poll_interval_seconds: int = 2
@@ -163,7 +165,6 @@ class SchedulerConfig(BaseModel):
 
 
 class DataflowWorkerConfig(BaseModel):
-    worker_url_template: str = ""
     advertise_url_template: str = ""
     api_key: Optional[str] = None
     timeout: int = 30

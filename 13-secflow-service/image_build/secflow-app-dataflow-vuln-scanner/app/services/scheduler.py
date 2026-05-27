@@ -210,8 +210,17 @@ class SchedulerService:
         runtime_cfg = self.runtime_config.get("dataflow_worker") or {}
         template = str(runtime_cfg.get("advertise_url_template") or get_config().dataflow_worker.advertise_url_template or "").strip()
         if template:
-            return template.format(pod_id=self.pod_id, host_name=self.host_name)
-        return f"http://{self.host_name}:8080"
+            return template.format(
+                pod_id=self.pod_id,
+                host_name=self.host_name,
+                pod_namespace=get_config().scheduler.pod_namespace,
+                headless_service_name=get_config().scheduler.worker_headless_service_name,
+            )
+        return (
+            f"http://{self.pod_id}."
+            f"{get_config().scheduler.worker_headless_service_name}."
+            f"{get_config().scheduler.pod_namespace}.svc.cluster.local:8080"
+        )
 
     def local_running_count(self) -> int:
         return len(self._running_tasks)

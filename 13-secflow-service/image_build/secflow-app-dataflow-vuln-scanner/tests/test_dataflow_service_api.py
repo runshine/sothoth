@@ -1369,6 +1369,7 @@ def test_service_runtime_config_roundtrip(service_config_path):
     assert "discovery_mode" not in payload["config"]["scheduler"]
     assert "base_url" not in payload["config"]["dataflow_worker"]
     assert "worker_urls" not in payload["config"]["dataflow_worker"]
+    assert "worker_url_template" not in payload["config"]["dataflow_worker"]
 
     save_response = client.put(
         "/api/dataflow-vuln-scanner/service/config",
@@ -1379,7 +1380,7 @@ def test_service_runtime_config_roundtrip(service_config_path):
                     "reservation_lease_seconds": 45,
                 },
                 "dataflow_worker": {
-                    "advertise_url_template": "http://{host_name}:8080",
+                    "advertise_url_template": "http://{pod_id}.{headless_service_name}.{pod_namespace}.svc.cluster.local:8080",
                     "dispatch_retry_interval_seconds": 4,
                 },
             }
@@ -1388,4 +1389,4 @@ def test_service_runtime_config_roundtrip(service_config_path):
     assert save_response.status_code == 200
     saved = save_response.json()
     assert saved["config"]["scheduler"]["worker_capacity"] == 3
-    assert saved["config"]["dataflow_worker"]["advertise_url_template"] == "http://{host_name}:8080"
+    assert saved["config"]["dataflow_worker"]["advertise_url_template"] == "http://{pod_id}.{headless_service_name}.{pod_namespace}.svc.cluster.local:8080"

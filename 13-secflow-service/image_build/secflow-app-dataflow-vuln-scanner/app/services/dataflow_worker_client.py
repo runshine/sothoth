@@ -18,9 +18,9 @@ class DataflowWorkerClient:
 
     @property
     def base_url(self) -> str:
-        base_url = (self._base_url or os.environ.get("DATAFLOW_WORKER_URL") or "").rstrip("/")
+        base_url = (self._base_url or "").rstrip("/")
         if not base_url:
-            raise DataflowWorkerError("dataflow worker base url is required")
+            raise DataflowWorkerError("registry worker url is required")
         return base_url
 
     @property
@@ -103,16 +103,10 @@ def _handle_response(response: httpx.Response) -> dict[str, Any]:
 
 
 _clients: dict[str, DataflowWorkerClient] = {}
-_default_client: DataflowWorkerClient | None = None
-
-
 def get_dataflow_worker_client(base_url: str | None = None) -> DataflowWorkerClient:
-    global _default_client
-    if base_url:
-        normalized = base_url.rstrip("/")
-        if normalized not in _clients:
-            _clients[normalized] = DataflowWorkerClient(normalized)
-        return _clients[normalized]
-    if _default_client is None:
-        _default_client = DataflowWorkerClient()
-    return _default_client
+    normalized = (base_url or "").rstrip("/")
+    if not normalized:
+        raise DataflowWorkerError("registry worker url is required")
+    if normalized not in _clients:
+        _clients[normalized] = DataflowWorkerClient(normalized)
+    return _clients[normalized]
