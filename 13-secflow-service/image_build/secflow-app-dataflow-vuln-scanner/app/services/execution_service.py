@@ -2616,6 +2616,35 @@ class ExecutionService:
         db.add(execution)
         db.add(trigger)
 
+    def _apply_terminal_state_mutation(
+        self,
+        db: Session,
+        *,
+        execution: WorkflowExecution | None,
+        trigger: TriggerTask | None,
+        terminal_status: str,
+        message: str,
+        process_status: str = "exited",
+        sync_abnormal_reason: bool = True,
+    ) -> None:
+        now = now_local()
+        if execution is not None:
+            execution.status = terminal_status
+            execution.message = message
+            execution.finished_at = now
+            if process_status:
+                execution.process_status = process_status
+                execution.process_finished_at = now
+            db.add(execution)
+        if trigger is not None:
+            trigger.status = terminal_status
+            trigger.message = message
+            trigger.finished_at = now if execution is None else execution.finished_at
+            if sync_abnormal_reason:
+                self._sync_trigger_abnormal_reason(db, trigger=trigger, execution=execution)
+            db.add(trigger)
+        db.flush()
+
     def _create_execution_attempt(
         self,
         db: Session,
@@ -4337,21 +4366,14 @@ class ExecutionService:
         execution: WorkflowExecution | None,
         message: str,
     ) -> None:
-        now = now_local()
-        if execution is not None and self._run_index_status_is_active(execution.status):
-            execution.status = "failed"
-            execution.message = message
-            execution.finished_at = now
-            execution.process_status = "exited"
-            execution.process_finished_at = now
-            db.add(execution)
-        if trigger is not None and self._run_index_status_is_active(trigger.status):
-            trigger.status = "failed"
-            trigger.message = message
-            trigger.finished_at = now
-            self._sync_trigger_abnormal_reason(db, trigger=trigger, execution=execution)
-            db.add(trigger)
-        db.flush()
+        self._apply_terminal_state_mutation(
+            db,
+            execution=execution if execution is not None and self._run_index_status_is_active(execution.status) else None,
+            trigger=trigger if trigger is not None and self._run_index_status_is_active(trigger.status) else None,
+            terminal_status="failed",
+            message=message,
+            process_status="exited",
+        )
 
     def _reconcile_stale_runtime(
         self,
@@ -4395,20 +4417,15 @@ class ExecutionService:
                     output_task_count=int(execution.output_task_count or run_index.result_count or 0),
                 )
             else:
-                now = now_local()
-                if execution is not None:
-                    execution.status = terminal_status
-                    execution.message = message
-                    execution.finished_at = now
-                    execution.process_status = "exited"
-                    execution.process_finished_at = now
-                    db.add(execution)
-                if trigger is not None:
-                    trigger.status = terminal_status
-                    trigger.message = message
-                    trigger.finished_at = now
-                    db.add(trigger)
-                db.flush()
+                self._apply_terminal_state_mutation(
+                    db,
+                    execution=execution,
+                    trigger=trigger,
+                    terminal_status=terminal_status,
+                    message=message,
+                    process_status="exited",
+                    sync_abnormal_reason=False,
+                )
             self._write_run_control_state(run_index.run_root_path, status_text=control_status, message=message)
             get_run_index_service().sync_execution_run(db, execution)
             db.flush()
@@ -4617,16 +4634,15 @@ class ExecutionService:
                     detail="active run is not linked to a managed execution and still appears to be running; retry delete after it stops",
                 )
         if execution is not None and execution.status == "pending":
-            execution.status = "cancelled"
-            execution.finished_at = now_local()
-            execution.message = "deleted before dispatch"
-            execution.process_status = "not_started"
-            db.add(execution)
-            if trigger is not None:
-                trigger.status = "cancelled"
-                trigger.finished_at = execution.finished_at
-                trigger.message = "deleted before dispatch"
-                db.add(trigger)
+            self._apply_terminal_state_mutation(
+                db,
+                execution=execution,
+                trigger=trigger,
+                terminal_status="cancelled",
+                message="deleted before dispatch",
+                process_status="not_started",
+                sync_abnormal_reason=False,
+            )
         elif execution is not None and self._run_index_status_is_active(execution.status):
             execution.status = "running"
             execution.message = "delete requested; stopping run_vuln_scan.py"
