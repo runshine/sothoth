@@ -67,7 +67,7 @@ def save_dispatcher_rules(dispatcher_rules_path: Path, payload: dict[str, Any]) 
 
 
 def family_store_dir(tools_store_dir: Path, family_id: str) -> Path:
-    path = tools_store_dir / _slugify(family_id)
+    path = tools_store_dir / ".families" / _slugify(family_id)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -116,8 +116,15 @@ def parse_tool_version(path: Path) -> int | None:
 
 
 def next_tool_version(tools_store_dir: Path, family_id: str) -> int:
+    family_slug = _slugify(family_id)
     version_max = 0
-    for tool_path in family_store_dir(tools_store_dir, family_id).glob("*.py"):
+    for tool_path in tools_store_dir.glob("*/*.py"):
+        if not tool_path.is_file():
+            continue
+        if tool_path.parent.name.startswith("."):
+            continue
+        if not tool_path.name.startswith(f"{family_slug}-v"):
+            continue
         version = parse_tool_version(tool_path)
         if version is not None:
             version_max = max(version_max, version)
@@ -125,7 +132,9 @@ def next_tool_version(tools_store_dir: Path, family_id: str) -> int:
 
 
 def build_versioned_tool_path(tools_store_dir: Path, family_id: str, version: int, timestamp: str) -> Path:
-    return family_store_dir(tools_store_dir, family_id) / f"v{int(version)}__{timestamp}.py"
+    day_dir = tools_store_dir / str(timestamp or "")[:8]
+    day_dir.mkdir(parents=True, exist_ok=True)
+    return day_dir / f"{_slugify(family_id)}-v{int(version)}-{timestamp}.py"
 
 
 def active_tool_path(tools_active_dir: Path, family_id: str) -> Path:
@@ -162,7 +171,10 @@ def activate_tool_version(
 ) -> Path:
     family_id = _slugify(family_id)
     manifest = read_family_manifest(tools_store_dir, family_id)
-    version_name = target_path.name
+    try:
+        version_name = str(target_path.relative_to(tools_store_dir))
+    except Exception:
+        version_name = target_path.name
     versions = list(manifest.get("versions") or [])
     for item in versions:
         if str(item.get("file") or "") == version_name:
@@ -232,6 +244,25 @@ def upsert_dispatcher_rule(
     return next((item for item in rules if isinstance(item, dict) and str(item.get("id") or "") == rule_id), {})
 
 
+def find_dispatcher_rule(
+    *,
+    dispatcher_rules_path: Path,
+    family_id: str,
+    magic_hex: str = "",
+) -> dict[str, Any] | None:
+    family_id = _slugify(family_id)
+    magic_hex = str(magic_hex or "").strip().lower()
+    payload = load_dispatcher_rules(dispatcher_rules_path)
+    for item in payload.get("rules") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("id") or "") == family_id:
+            return item
+        if magic_hex and str(item.get("magic_hex") or "").strip().lower() == magic_hex:
+            return item
+    return None
+
+
 def dispatch_tool_by_magic(features: dict[str, Any], dispatcher_rules_path: Path) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     payload = load_dispatcher_rules(dispatcher_rules_path)
     feat_magic = str(features.get("magic_hex") or "").strip().lower()
@@ -272,6 +303,7 @@ __all__ = [
     "ensure_dispatcher_environment",
     "family_manifest_path",
     "family_store_dir",
+    "find_dispatcher_rule",
     "load_dispatcher_rules",
     "next_tool_version",
     "parse_tool_version",

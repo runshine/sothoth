@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -90,26 +89,16 @@ CONCURRENCY_GAUGE = Gauge(
     "firmware_unpacker_effective_max_concurrent",
     "Effective runtime concurrency limit for the current process.",
 )
-HTTP_REQUESTS_TOTAL = Counter(
-    "firmware_unpacker_http_requests_total",
-    "Total normalized HTTP requests handled by the firmware unpacker service.",
-    ("method", "route", "status_class", "status_code"),
+API_REQUESTS_TOTAL = Counter(
+    "firmware_unpacker_api_requests_total",
+    "Total HTTP requests handled by the firmware unpacker service.",
+    ("method", "path", "status"),
 )
-HTTP_REQUEST_DURATION_SECONDS = Histogram(
-    "firmware_unpacker_http_request_duration_seconds",
-    "Normalized HTTP request duration in seconds.",
-    ("method", "route"),
-    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60),
-)
-HTTP_REQUEST_INFLIGHT = Gauge(
-    "firmware_unpacker_http_request_inflight",
-    "Current inflight HTTP requests.",
-    ("method", "route"),
-)
-AUTH_TOKEN_CACHE_TOTAL = Counter(
-    "firmware_unpacker_auth_token_cache_total",
-    "Auth token cache lookups by result.",
-    ("result",),
+API_REQUEST_DURATION_SECONDS = Histogram(
+    "firmware_unpacker_api_request_duration_seconds",
+    "HTTP request duration in seconds.",
+    ("method", "path"),
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30),
 )
 TASK_LIFECYCLE_TOTAL = Counter(
     "firmware_unpacker_task_lifecycle_total",
@@ -192,27 +181,6 @@ AI_TOKEN_COST_TOTAL = Gauge(
     "Aggregated AI token cost for firmware unpacker.",
 )
 
-_PATH_ID_SEGMENT_RE = re.compile(r"/(?:\d+|[0-9a-f]{8,}|[0-9a-f]{8}-[0-9a-f-]{27,})(?=/|$)", re.IGNORECASE)
-
-
-def normalize_http_route(path: str | None) -> str:
-    raw = str(path or "/").strip() or "/"
-    return _PATH_ID_SEGMENT_RE.sub("/{id}", raw)
-
-
-def http_status_class(status_code: int | str | None) -> str:
-    try:
-        code = int(status_code or 500)
-    except (TypeError, ValueError):
-        code = 500
-    if code < 0:
-        return "cancelled"
-    return f"{code // 100}xx"
-
-
-def record_http_request_inflight(*, method: str, path: str, delta: int) -> None:
-    HTTP_REQUEST_INFLIGHT.labels(str(method or "GET").upper(), normalize_http_route(path)).inc(delta)
-
 
 @contextmanager
 def observe_duration(histogram: Histogram, *labels: str) -> Iterator[None]:
@@ -245,10 +213,6 @@ def record_db_retry(operation: str) -> None:
 
 def record_db_operation_result(operation: str, result: str) -> None:
     DB_OPERATION_RESULTS_TOTAL.labels(operation=operation, result=result).inc()
-
-
-def record_auth_token_cache(result: str) -> None:
-    AUTH_TOKEN_CACHE_TOTAL.labels(result=result).inc()
 
 
 def record_claim_result(*, claimed_count: int, duration_seconds: float, result: str) -> None:
@@ -284,12 +248,12 @@ def record_dispatch_backpressure() -> None:
     DISPATCH_BACKPRESSURE_TOTAL.inc()
 
 
-def record_http_request(*, method: str, path: str, status_code: int, duration_seconds: float) -> None:
+def record_api_request(*, method: str, path: str, status_code: int, duration_seconds: float) -> None:
     status = str(int(status_code))
     normalized_method = str(method or "GET").upper()
-    normalized_route = normalize_http_route(path)
-    HTTP_REQUESTS_TOTAL.labels(normalized_method, normalized_route, http_status_class(status_code), status).inc()
-    HTTP_REQUEST_DURATION_SECONDS.labels(normalized_method, normalized_route).observe(max(0.0, duration_seconds))
+    normalized_path = str(path or "/")
+    API_REQUESTS_TOTAL.labels(normalized_method, normalized_path, status).inc()
+    API_REQUEST_DURATION_SECONDS.labels(normalized_method, normalized_path).observe(max(0.0, duration_seconds))
 
 
 def record_task_lifecycle(*, event: str, status: str, task_origin: str) -> None:

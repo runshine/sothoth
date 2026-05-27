@@ -550,9 +550,6 @@ class ToolListResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     owner_id: Optional[str] = None
-    service_id: Optional[str] = None
-    service_name: Optional[str] = None
-    build_version: Optional[str] = None
 
 
 class ReadyResponse(BaseModel):

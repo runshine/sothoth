@@ -12,6 +12,7 @@ Analyze a firmware extraction output directory, identify and remove:
 2. **Duplicate directories** — extraction subdirectories with highly overlapping content (e.g., duplicate initramfs for multiple board types)
 3. **Duplicate files** — files with identical content appearing in multiple locations
 4. **Extraction artifacts** — zero-byte files, empty directories, etc.
+5. **Binwalk bulk-dd artifacts** — large `.zlib` files named by extraction offset, typically produced by `binwalk -e --dd`
 
 ## Workflow
 
@@ -67,6 +68,13 @@ find <extraction_dir> -type f \( \
 | `dbupgrade.zip` inside squashfs | Database upgrade script package | Can delete if already extracted elsewhere |
 | Top-level `.squashfs` / `.cpio` raw files | Intermediate archives extracted by binwalk | Can delete if corresponding `*_squashfs_root/` or `cpio_extracted/` exists |
 | `.ext2` / `.ext3` filesystem images | Extracted filesystem images | Can delete if superblock is corrupt and contents are unrecoverable |
+| `<HEX_OFFSET>.zlib` such as `6D65AD4.zlib` | Large zlib blobs emitted by `binwalk -e --dd` from embedded signatures | Treat as redundant extraction artifacts and prioritize deletion, especially when many such files exist and structured results already exist elsewhere |
+
+**Special rule for offset-named `.zlib` blobs:**
+
+- If a file matches the pattern `^[0-9A-Fa-f]{6,}\.zlib$`, especially when it is large and appears in batches, assume it is a binwalk bulk extraction artifact unless there is strong evidence that it is a deliberate firmware payload the user wants to preserve
+- These files are usually generated from embedded zlib signatures after `binwalk -e --dd`, often overlap heavily, and often consume tens of GB without adding meaningful unpacking value
+- If structured extraction results already exist, such as extracted squashfs/rootfs trees, these offset-named `.zlib` files should be listed as high-priority cleanup candidates
 
 ### Step 3: Identify Duplicate Directories
 
@@ -212,4 +220,5 @@ Present a before-and-after comparison to the user.
 3. **Architecture awareness** — x86_64 and aarch64 files are NOT duplicates even if they share the same name
 4. **Firmware resource files** — `.zip`/`.tar.gz` files inside squashfs roots that are runtime resources (e.g., YANG models, config files) should not be treated as intermediates
 5. **Signature files** — `.cms`, `.pss.cms`, `.crl` files are firmware signature verification files; keep them unless the user explicitly requests removal
-6. **Remote operations** — if operating on a remote server via SSH, all shell commands must be executed through the SSH connection
+6. **Offset-named `.zlib` blobs** — filenames like `6D65AD4.zlib` are normally binwalk extraction artifacts, not first-class unpack results; default to cleaning them unless explicitly preserved
+7. **Remote operations** — if operating on a remote server via SSH, all shell commands must be executed through the SSH connection
