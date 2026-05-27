@@ -180,6 +180,44 @@ def _canonical_task_status(value: str | None) -> str:
     return "pending"
 
 
+def _is_control_message(message: str | None) -> bool:
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    return text in {
+        "cancel requested",
+        "run cancel requested",
+        "delete requested",
+        "delete requested; stopping run_vuln_scan.py",
+        "run delete requested; worker unreachable",
+        "run_vuln_scan.py running",
+        "execution running",
+        "running",
+    } or text.endswith("before dispatch")
+
+
+def _preferred_abnormal_message(
+    *,
+    trigger_message: str | None,
+    execution_message: str | None,
+    dispatch_error: str | None,
+    run_error: str | None,
+) -> str:
+    for candidate in (
+        dispatch_error,
+        run_error,
+        execution_message,
+        trigger_message,
+    ):
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        if _is_control_message(text):
+            continue
+        return text
+    return ""
+
+
 def _command_display(args: list[str]) -> str:
     return " ".join(shlex.quote(str(item)) for item in args)
 
@@ -263,13 +301,15 @@ class ExecutionService:
         run_summary = run_summary or {}
         run_status = str(run_summary.get("status") or "").strip()
         run_error = str(run_summary.get("error") or "").strip()
-        message = str(
-            trigger.message
-            or (execution.message if execution is not None else "")
-            or (execution.dispatch_error if execution is not None else "")
-            or run_error
-            or ""
-        ).strip()
+        trigger_message = str(trigger.message or "").strip()
+        execution_message = str(execution.message or "").strip() if execution is not None else ""
+        dispatch_error = str(execution.dispatch_error or "").strip() if execution is not None else ""
+        message = _preferred_abnormal_message(
+            trigger_message=trigger_message,
+            execution_message=execution_message,
+            dispatch_error=dispatch_error,
+            run_error=run_error,
+        )
         if status_value == "cancelled":
             code, category, title = "user_cancelled", "cancel", "任务已取消"
         elif execution is not None and str(execution.dispatch_status or "").strip().lower() == "failed":
@@ -302,7 +342,7 @@ class ExecutionService:
                     _abnormal_evidence("dispatch_status", "调度状态", execution.dispatch_status if execution is not None else None),
                     _abnormal_evidence("process_status", "进程状态", execution.process_status if execution is not None else None),
                     _abnormal_evidence("run_status", "运行摘要状态", run_status),
-                    _abnormal_evidence("error", "原始错误", message),
+                    _abnormal_evidence("error", "原始错误", message or dispatch_error or run_error),
                 ] if item is not None
             ],
             "recommended_action": "查看最近一次 execution、run summary 和 dispatch_error，确认是调度失败、运行时中断还是扫描执行本身失败。",
