@@ -4846,7 +4846,7 @@ class ExecutionService:
         return self._run_mutation_response(
             run_id=run_index.id,
             project_id=run_index.project_id,
-            status_text=run_index.status,
+            status_text=_canonical_task_status(run_index.status),
             message=adoption_message,
             linked_task_id=trigger.id,
             linked_execution_id=execution.id,
@@ -4893,7 +4893,7 @@ class ExecutionService:
             return self._run_mutation_response(
                 run_id=run_index.id,
                 project_id=run_index.project_id,
-                status_text=run_index.status,
+                status_text=_canonical_task_status(run_index.status),
                 message=message,
                 linked_task_id=run_index.linked_task_id,
                 linked_execution_id=run_index.linked_execution_id,
@@ -5060,7 +5060,7 @@ class ExecutionService:
         response = self._run_mutation_response(
             run_id=run_index.id,
             project_id=run_index.project_id,
-            status_text=run_index.status,
+            status_text=_canonical_task_status(run_index.status),
             message="Run resume started",
             linked_task_id=trigger.id,
             linked_execution_id=execution.id,
