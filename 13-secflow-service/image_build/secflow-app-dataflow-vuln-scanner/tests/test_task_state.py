@@ -78,6 +78,30 @@ def test_resolve_public_task_state_returns_dispatching_for_queued_dispatch() -> 
     assert resolved.started_at == started_at
 
 
+def test_resolve_public_task_state_prefers_completed_run_over_stale_runtime_failure() -> None:
+    run_started_at = datetime(2026, 1, 1, 0, 0, 0)
+    run_finished_at = datetime(2026, 1, 1, 0, 10, 0)
+    resolved = resolve_public_task_state(
+        trigger_status="failed",
+        trigger_message="stale active runtime assumed failed",
+        trigger_started_at=run_started_at,
+        trigger_finished_at=run_finished_at,
+        execution_status="failed",
+        execution_message="stale active runtime assumed failed",
+        execution_started_at=run_started_at,
+        execution_finished_at=run_finished_at,
+        dispatch_status="failed",
+        preferred_error_message="stale active runtime assumed failed",
+        run_status="completed",
+        run_message=None,
+        run_started_at=run_started_at,
+        run_finished_at=run_finished_at,
+    )
+    assert resolved.status == "success"
+    assert resolved.source == "run_reconciled_success"
+    assert resolved.finished_at == run_finished_at
+
+
 def test_public_task_status_matches_filter_uses_public_status() -> None:
     assert public_task_status_matches_filter("review_error", "failed")
     assert public_task_status_matches_filter("queued", "dispatching")

@@ -46,6 +46,10 @@ _RUN_SUCCESS_STATUSES = {"success", "succeeded", "completed", "passed"}
 _DISPATCH_ACTIVE_STATUSES = {"queued", "dispatching", "accepted"}
 _RUNNING_ALIASES = {"running", "processing", "in_progress", "started"}
 _PENDING_ALIASES = {"pending", "ready", "ready_to_start", "not_started", "unassigned"}
+_RUNTIME_RECONCILED_FAILURE_MARKERS = {
+    "stale active runtime assumed failed",
+    "runtime heartbeat lost; assumed failed",
+}
 
 
 @dataclass(frozen=True)
@@ -134,6 +138,13 @@ def public_task_status_matches_filter(status: str | None, status_filter: str | N
     return normalize_public_task_status(status) == normalized_filter
 
 
+def _looks_like_runtime_reconciled_failure(message: str | None) -> bool:
+    normalized = str(message or "").strip().lower()
+    if not normalized:
+        return False
+    return normalized in _RUNTIME_RECONCILED_FAILURE_MARKERS
+
+
 def resolve_public_task_state(
     *,
     trigger_status: str | None,
@@ -148,12 +159,26 @@ def resolve_public_task_state(
     preferred_error_message: str | None,
     run_status: str | None,
     run_message: str | None,
+    run_started_at: datetime | None = None,
+    run_finished_at: datetime | None = None,
 ) -> ResolvedPublicTaskState:
     trigger_public = normalize_public_task_status(trigger_status)
     execution_public = normalize_public_task_status(execution_status)
     run_public = normalize_public_task_status(run_status)
     dispatch_public = normalize_public_task_status(dispatch_status)
     effective_started_at = execution_started_at or trigger_started_at
+
+    if run_public == "success" and run_finished_at is not None:
+        trigger_reconciled_failure = trigger_public == "failed" and _looks_like_runtime_reconciled_failure(trigger_message)
+        execution_reconciled_failure = execution_public == "failed" and _looks_like_runtime_reconciled_failure(execution_message)
+        if trigger_reconciled_failure or execution_reconciled_failure:
+            return ResolvedPublicTaskState(
+                status="success",
+                message=run_message or None,
+                started_at=run_started_at or effective_started_at,
+                finished_at=run_finished_at,
+                source="run_reconciled_success",
+            )
 
     for source, status, message, started_at, finished_at in (
         ("trigger", trigger_public, trigger_message, trigger_started_at, trigger_finished_at),

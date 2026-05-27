@@ -1503,6 +1503,43 @@ def test_run_status_preserves_specific_terminal_workflow_result(service_config_p
     assert detail.json()["status"] == "summary_incomplete"
 
 
+def test_reconcile_terminal_run_state_overrides_stale_runtime_failure_with_completed_run(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_completed_run_reconciles_stale_failure_20260508_010203"
+    bound = _create_execution_bound_run(client, run_root)
+    with get_db_session() as db:
+        trigger = db.get(TriggerTask, bound["task_id"])
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        run_index = db.get(RunIndex, bound["run_id"])
+        assert trigger is not None and execution is not None and run_index is not None
+        trigger.status = "failed"
+        trigger.message = "stale active runtime assumed failed"
+        execution.status = "failed"
+        execution.message = "stale active runtime assumed failed"
+        execution.dispatch_status = "failed"
+        execution.dispatch_error = "stale active runtime assumed failed"
+        run_index.status = "completed"
+        run_index.error = None
+        db.add_all([trigger, execution, run_index])
+        db.commit()
+
+        changed = get_execution_service()._reconcile_terminal_run_state(
+            db,
+            run_index=run_index,
+            trigger=trigger,
+            execution=execution,
+        )
+        db.commit()
+        db.refresh(trigger)
+        db.refresh(execution)
+
+    assert changed is True
+    assert trigger.status == "succeeded"
+    assert execution.status == "succeeded"
+    assert execution.dispatch_status == "succeeded"
+
+
 def test_run_sessions_expose_stdout_soft_limit_metadata(service_config_path):
     app = create_app()
     client = TestClient(app)

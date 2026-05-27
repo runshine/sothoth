@@ -152,6 +152,15 @@ _TIMELINE_STAGE_LABELS = {
     "abnormal": "异常",
 }
 
+_RUNTIME_RECONCILED_FAILURE_MESSAGES = {
+    "stale active runtime assumed failed",
+    "runtime heartbeat lost; assumed failed",
+}
+
+
+def _is_runtime_reconciled_failure_message(message: str | None) -> bool:
+    return str(message or "").strip().lower() in _RUNTIME_RECONCILED_FAILURE_MESSAGES
+
 
 def _normalize_timeline_stage_name(stage_key: str | None, payload: dict[str, Any] | None = None) -> str | None:
     raw_stage = str(stage_key or "").strip()
@@ -727,6 +736,8 @@ class ExecutionService:
             "workflow_mode": run_index.workflow_mode,
             "duration_seconds": run_index.duration_seconds,
             "start_epoch": int(run_index.started_at.timestamp()) if run_index.started_at else None,
+            "started_at": run_index.started_at,
+            "finished_at": run_index.finished_at,
             "linked_execution_id": str(latest_execution.id) if latest_execution is not None else None,
         }
 
@@ -1827,6 +1838,8 @@ class ExecutionService:
             preferred_error_message=preferred_error_message,
             run_status=run_summary.get("status"),
             run_message=run_error or execution_message or trigger_message,
+            run_started_at=run_summary.get("started_at"),
+            run_finished_at=run_summary.get("finished_at"),
         )
         return (
             resolved.status,
@@ -5195,12 +5208,31 @@ class ExecutionService:
 
         trigger_status = _public_task_status(trigger.status) if trigger is not None else ""
         execution_status = _public_task_status(execution.status) if execution is not None else ""
-        if trigger_status in {"success", "failed", "cancelled"} and execution_status in {"", "success", "failed", "cancelled"}:
+        trigger_runtime_reconciled_failure = (
+            trigger is not None
+            and trigger_status == "failed"
+            and _is_runtime_reconciled_failure_message(trigger.message)
+        )
+        execution_runtime_reconciled_failure = (
+            execution is not None
+            and execution_status == "failed"
+            and _is_runtime_reconciled_failure_message(execution.message)
+        )
+        allow_success_override = (
+            run_status == "success"
+            and (trigger_runtime_reconciled_failure or execution_runtime_reconciled_failure)
+        )
+        if (
+            not allow_success_override
+            and trigger_status in {"success", "failed", "cancelled"}
+            and execution_status in {"", "success", "failed", "cancelled"}
+        ):
             return False
 
         terminal_status = "succeeded" if run_status == "success" else run_status
         message = (
-            str(run_index.error or "").strip()
+            ("run index reconciled to success" if terminal_status == "succeeded" else "")
+            or str(run_index.error or "").strip()
             or (str(execution.message or "").strip() if execution is not None else "")
             or (str(trigger.message or "").strip() if trigger is not None else "")
             or f"run index reconciled to {run_status}"
