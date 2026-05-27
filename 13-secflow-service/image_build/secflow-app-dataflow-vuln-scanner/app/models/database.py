@@ -1037,6 +1037,20 @@ def _database_init_lock_name() -> str:
     return f"{_prefix('schema_init')}_lock"
 
 
+def _mysql_core_tables_exist(connection: Connection) -> bool:
+    inspector = inspect(connection)
+    table_names = set(inspector.get_table_names())
+    required_tables = {
+        WorkflowDefinition.__tablename__,
+        WorkflowDefinitionVersion.__tablename__,
+        TriggerTask.__tablename__,
+        WorkflowExecution.__tablename__,
+        RunIndex.__tablename__,
+        SchedulerWorker.__tablename__,
+    }
+    return required_tables.issubset(table_names)
+
+
 def _is_mysql_concurrent_ddl_error(exc: Exception) -> bool:
     if not isinstance(exc, OperationalError):
         return False
@@ -1060,7 +1074,8 @@ def _init_database_with_mysql_lock() -> None:
         if int(lock_row or 0) != 1:
             raise RuntimeError(f"failed to acquire database init lock: {lock_name}")
         try:
-            Base.metadata.create_all(bind=connection)
+            if not _mysql_core_tables_exist(connection):
+                Base.metadata.create_all(bind=connection)
             run_auto_migrations(connection)
             connection.commit()
         finally:

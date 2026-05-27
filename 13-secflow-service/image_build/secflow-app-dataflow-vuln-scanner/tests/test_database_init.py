@@ -49,6 +49,7 @@ def test_init_database_uses_mysql_advisory_lock(monkeypatch):
 
     fake_engine = FakeEngine()
     monkeypatch.setattr(database, "get_engine", lambda: fake_engine)
+    monkeypatch.setattr(database, "_mysql_core_tables_exist", lambda connection: False)
     monkeypatch.setattr(database.Base.metadata, "create_all", lambda bind: events.append(("create_all", bind)))
     monkeypatch.setattr(database, "run_auto_migrations", lambda connection=None: events.append(("migrate", connection)))
 
@@ -60,6 +61,51 @@ def test_init_database_uses_mysql_advisory_lock(monkeypatch):
     assert events[3][0] == "migrate"
     assert events[4] == ("commit", None)
     assert events[5][0] == "release_lock"
+
+
+def test_init_database_skips_create_all_when_mysql_tables_exist(monkeypatch):
+    events: list[str] = []
+
+    class FakeResult:
+        def __init__(self, value):
+            self._value = value
+
+        def scalar(self):
+            return self._value
+
+    class FakeConnection:
+        dialect = SimpleNamespace(name="mysql")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, stmt, params=None):
+            sql = str(stmt)
+            if "GET_LOCK" in sql or "RELEASE_LOCK" in sql:
+                return FakeResult(1)
+            return FakeResult(None)
+
+        def commit(self):
+            events.append("commit")
+
+    class FakeEngine:
+        dialect = SimpleNamespace(name="mysql")
+
+        def connect(self):
+            return FakeConnection()
+
+    fake_engine = FakeEngine()
+    monkeypatch.setattr(database, "get_engine", lambda: fake_engine)
+    monkeypatch.setattr(database, "_mysql_core_tables_exist", lambda connection: True)
+    monkeypatch.setattr(database.Base.metadata, "create_all", lambda bind: events.append("create_all"))
+    monkeypatch.setattr(database, "run_auto_migrations", lambda connection=None: events.append("migrate"))
+
+    database.init_database()
+
+    assert events == ["migrate", "commit"]
 
 
 def test_init_database_retries_mysql_concurrent_ddl(monkeypatch):
