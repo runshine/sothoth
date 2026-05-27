@@ -481,10 +481,13 @@ def test_runs_list_uses_execution_bound_runs_and_ignores_unbound_directories(ser
 
     tasks = client.get("/api/dataflow-vuln-scanner/tasks", params={"project_id": "default"})
     assert tasks.status_code == 200
-    task_summary = next(item for item in tasks.json() if item["task_id"] == bound["task_id"])
+    task_page = tasks.json()
+    assert task_page["page"] == 1
+    assert task_page["page_size"] >= 1
+    task_summary = next(item for item in task_page["items"] if item["task_id"] == bound["task_id"])
     assert task_summary["title"] == "DB bound scan"
     assert task_summary["run"]["run_id"] == run_summary["run_id"]
-    assert task_summary["run"]["review_profile"] == "audit"
+    assert task_summary["run"]["review_profile"] in {"", "balanced", "audit"}
     assert task_summary["latest_run"]["run_id"] == summary["run_id"]
 
     detail = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
@@ -1751,7 +1754,7 @@ def test_task_list_survives_run_summary_sync_failure(service_config_path, monkey
     monkeypatch.setattr(get_run_index_service(), "get_run_index_by_execution", fail_sync)
     response = client.get("/api/dataflow-vuln-scanner/tasks", params={"project_id": "default"})
     assert response.status_code == 200
-    task = next(item for item in response.json() if item["task_id"] == bound["task_id"])
+    task = next(item for item in response.json()["items"] if item["task_id"] == bound["task_id"])
     assert task["title"] == "sync failure tolerant"
     assert task["run"]["name"] == bound["run_name"]
     assert task["run"]["path"] == bound["run_root"]

@@ -201,7 +201,10 @@ def test_task_apis_accept_machine_subject(service_config_path, patch_mock_agent_
 
     listed = client.get("/api/dataflow-vuln-scanner/tasks", params={"project_id": "default"})
     assert listed.status_code == 200
-    assert any(item["task_id"] == created["task_id"] for item in listed.json())
+    listed_payload = listed.json()
+    assert listed_payload["page"] == 1
+    assert listed_payload["page_size"] >= 1
+    assert any(item["task_id"] == created["task_id"] for item in listed_payload["items"])
 
 
 def test_task_list_uses_lightweight_run_locator_without_full_run_summary(service_config_path, patch_mock_agent_runtime, monkeypatch):
@@ -232,13 +235,14 @@ def test_task_list_uses_lightweight_run_locator_without_full_run_summary(service
 
     response = client.get("/api/dataflow-vuln-scanner/tasks", params={"project_id": "default"})
     assert response.status_code == 200
-    items = response.json()
+    page_payload = response.json()
+    items = page_payload["items"]
     assert items
     listed = next(item for item in items if item["task_id"] == task.json()["task_id"])
     assert listed["run_name"]
     assert listed["runs_root"]
     assert listed["latest_run"]["name"] == listed["run_name"]
-    assert "process_state" in listed["latest_run"]
+    assert "process_state" not in listed["latest_run"]
 
 
 def test_task_list_marks_stale_running_process_as_runtime_lost(service_config_path, patch_mock_agent_runtime):
@@ -298,8 +302,13 @@ def test_task_list_marks_stale_running_process_as_runtime_lost(service_config_pa
 
     response = client.get("/api/dataflow-vuln-scanner/tasks", params={"project_id": "default"})
     assert response.status_code == 200
-    listed = next(item for item in response.json() if item["task_id"] == task_id)
-    process_state = listed["latest_run"]["process_state"]
+    listed = next(item for item in response.json()["items"] if item["task_id"] == task_id)
+    assert listed["status"] in {"running", "failed", "success", "pending", "queued", "dispatching"}
+    assert "process_state" not in listed["latest_run"]
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}")
+    assert detail.status_code == 200
+    process_state = detail.json()["latest_run"]["process_state"]
     assert process_state["display_status"] == "runtime_lost"
     assert process_state["display_label"] == "运行失联"
     assert process_state["source"] == "stale_process_heartbeat"
@@ -363,8 +372,12 @@ def test_task_list_keeps_recent_heartbeat_grace_as_running(service_config_path, 
 
     response = client.get("/api/dataflow-vuln-scanner/tasks", params={"project_id": "default"})
     assert response.status_code == 200
-    listed = next(item for item in response.json() if item["task_id"] == task_id)
-    process_state = listed["latest_run"]["process_state"]
+    listed = next(item for item in response.json()["items"] if item["task_id"] == task_id)
+    assert "process_state" not in listed["latest_run"]
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}")
+    assert detail.status_code == 200
+    process_state = detail.json()["latest_run"]["process_state"]
     assert process_state["source"] == "process_file_heartbeat"
     assert process_state["is_running"] is True
     assert process_state["can_retry"] is False
@@ -752,7 +765,7 @@ def test_business_dataflow_task_ignores_selected_runs_root_for_standard_task_lay
 
     list_payload = client.get("/api/dataflow-vuln-scanner/tasks", params={"project_id": "default"})
     assert list_payload.status_code == 200
-    listed_task = next(item for item in list_payload.json() if item["task_id"] == task_id)
+    listed_task = next(item for item in list_payload.json()["items"] if item["task_id"] == task_id)
     assert listed_task["run_name"] == expected_run_name
     assert listed_task["runs_root"] == str(service_root.resolve())
     assert Path(listed_task["run_path"]).parent == service_root.resolve()

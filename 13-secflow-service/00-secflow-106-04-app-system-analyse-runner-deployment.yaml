@@ -4,7 +4,7 @@ metadata:
   name: secflow-app-system-analyse-runner
   namespace: secflow-ns
 spec:
-  replicas: 2
+  replicas: 5
   selector:
     matchLabels:
       name: secflow-app-system-analyse-runner
@@ -16,7 +16,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-app-system-analyse-runner
-        image: ghcr.io/runshine/secflow-app-system-analyse:latest
+        image: ghcr.io/runshine/secflow-app-system-analyse:20260513-c0d930a
         imagePullPolicy: Always
         env:
           - name: SECFLOW_SYSTEM_ANALYSE_ROLE

@@ -6432,6 +6432,130 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             order,
         )
 
+    def test_manual_cancel_collects_dispatching_and_orphan_downstream_refs(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="i1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_key="m1",
+            status="dispatching",
+            downstream_service="system_analyse",
+            downstream_task_id="sat_1",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item])
+        calls: list[dict[str, object]] = []
+
+        async def fake_write_task_metadata_async(*args, **kwargs):
+            return None
+
+        async def fake_cancel_local_worker(task_id: str):
+            self.assertEqual("t1", task_id)
+
+        async def fake_cancel_downstream_refs(db_arg, task_arg, refs_arg, token_arg):
+            calls.append(
+                {
+                    "db": db_arg,
+                    "task_id": task_arg.id,
+                    "refs": list(refs_arg),
+                    "token": token_arg,
+                }
+            )
+            return len(refs_arg)
+
+        original_discover = self.manager._discover_parent_linked_downstream_refs
+        self.manager._write_task_metadata_async = fake_write_task_metadata_async
+        self.manager._cancel_local_worker = fake_cancel_local_worker
+        self.manager._cancel_downstream_refs = fake_cancel_downstream_refs
+        self.manager._discover_parent_linked_downstream_refs = lambda _db, _task: [
+            {"service": "dataflow_analyse", "task_id": "dfa_orphan", "project_id": "p1", "stage_name": "dataflow_analysis"},
+        ]
+        try:
+            asyncio.run(self.manager.cancel_task(db, project_id="p1", task_id="t1"))
+            asyncio.run(self.manager._apply_manual_cancel_request_locked(db, db.added[-1]))
+        finally:
+            self.manager._discover_parent_linked_downstream_refs = original_discover
+
+        self.assertEqual("cancelled", task.status)
+        self.assertEqual("cancelled", item.status)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(
+            ["sat_1", "dfa_orphan"],
+            [ref["task_id"] for ref in calls[0]["refs"]],
+        )
+
+    def test_manual_cancel_noop_retries_orphan_downstream_cancel(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="cancelled",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="i1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_key="m1",
+            status="running",
+            downstream_service="system_analyse",
+            downstream_task_id="sat_1",
+        )
+        event = BinarySecurityStateEvent(
+            id="evt1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            event_type="manual_cancel_requested",
+            payload={"operation_token": ""},
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], state_events=[event])
+        calls: list[dict[str, object]] = []
+
+        async def fake_cancel_downstream_refs(db_arg, task_arg, refs_arg, token_arg):
+            calls.append(
+                {
+                    "db": db_arg,
+                    "task_id": task_arg.id,
+                    "refs": list(refs_arg),
+                    "token": token_arg,
+                }
+            )
+            return len(refs_arg)
+
+        original_discover = self.manager._discover_parent_linked_downstream_refs
+        self.manager._cancel_downstream_refs = fake_cancel_downstream_refs
+        self.manager._discover_parent_linked_downstream_refs = lambda _db, _task: [
+            {"service": "dataflow_analyse", "task_id": "dfa_orphan", "project_id": "p1", "stage_name": "dataflow_analysis"},
+        ]
+        try:
+            asyncio.run(self.manager._apply_manual_cancel_request_locked(db, event))
+        finally:
+            self.manager._discover_parent_linked_downstream_refs = original_discover
+
+        self.assertEqual("cancelled", item.status)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(
+            ["sat_1", "dfa_orphan"],
+            [ref["task_id"] for ref in calls[0]["refs"]],
+        )
+
     def test_retry_task_clears_archive_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -8492,6 +8616,67 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual("dataflow_analysis", task.current_stage)
             self.assertEqual("failed", task.status)
+            self.assertEqual(self.manager.instance_id, task.dispatcher_instance_id)
+            self.assertIsNotNone(task.dispatch_started_at)
+            self.assertIsNotNone(task.lease_expires_at)
+
+    def test_touch_task_heartbeat_keeps_lease_alive_for_active_streaming_stage_workers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            started_at = _now() - timedelta(seconds=20)
+            original_expiry = _now() + timedelta(seconds=5)
+            task = BinarySecurityTask(
+                id="task-streaming-heartbeat",
+                project_id="p1",
+                name="n",
+                status="running",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="dataflow_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(Path(tmp) / "output"),
+                workspace_root=tmp,
+                dispatcher_instance_id=self.manager.instance_id,
+                dispatch_started_at=started_at,
+                lease_expires_at=original_expiry,
+                updated_at=started_at,
+                policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+            )
+            active_item = BinarySecurityStageItem(
+                id="si-df-active",
+                task_id="task-streaming-heartbeat",
+                project_id="p1",
+                stage_run_id="sr-df",
+                stage_name="dataflow_analysis",
+                item_key="entry-a",
+                item_name="func_a",
+                parent_key="mod-a",
+                item_identity_key="entry-a::mod-a",
+                status="running",
+            )
+            db = _AppendingModelAwareDb(tasks=[task], stage_items=[active_item])
+
+            original_factory = task_manager_module.get_session_factory
+            original_interval = self.manager.cfg.scheduler.heartbeat_update_interval_seconds
+            original_workers = dict(self.manager._workers)
+            original_stage_workers = dict(self.manager._stage_item_workers)
+            task_manager_module.get_session_factory = lambda: (lambda: db)
+            self.manager.cfg.scheduler.heartbeat_update_interval_seconds = 0
+            self.manager._workers.pop(task.id, None)
+
+            loop = asyncio.new_event_loop()
+            try:
+                worker = loop.create_future()
+                self.manager._stage_item_workers[active_item.id] = worker
+                self.manager._touch_task_heartbeat(task.id)
+            finally:
+                task_manager_module.get_session_factory = original_factory
+                self.manager.cfg.scheduler.heartbeat_update_interval_seconds = original_interval
+                self.manager._workers = original_workers
+                self.manager._stage_item_workers = original_stage_workers
+                loop.close()
+
+            self.assertGreater(task.lease_expires_at, original_expiry)
+            self.assertGreater(task.updated_at, started_at)
 
     def test_refresh_stage_run_from_items_preserves_streaming_tail_failed_status_without_items(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -15186,6 +15371,136 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(db.tasks))
         failed_events = [row for row in db.added if isinstance(row, BinarySecurityEvent) and row.event_type == "task_delete_failed"]
         self.assertTrue(failed_events)
+
+
+def _test_manual_cancel_collects_dispatching_and_orphan_downstream_refs(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = BinarySecurityStageItem(
+        id="i1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="system_analysis",
+        item_key="m1",
+        status="dispatching",
+        downstream_service="system_analyse",
+        downstream_task_id="sat_1",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[item])
+    calls: list[dict[str, object]] = []
+
+    async def fake_write_task_metadata_async(*args, **kwargs):
+        return None
+
+    async def fake_cancel_local_worker(task_id: str):
+        self.assertEqual("t1", task_id)
+
+    async def fake_cancel_downstream_refs(db_arg, task_arg, refs_arg, token_arg):
+        calls.append(
+            {
+                "db": db_arg,
+                "task_id": task_arg.id,
+                "refs": list(refs_arg),
+                "token": token_arg,
+            }
+        )
+        return len(refs_arg)
+
+    original_discover = self.manager._discover_parent_linked_downstream_refs
+    self.manager._write_task_metadata_async = fake_write_task_metadata_async
+    self.manager._cancel_local_worker = fake_cancel_local_worker
+    self.manager._cancel_downstream_refs = fake_cancel_downstream_refs
+    self.manager._discover_parent_linked_downstream_refs = lambda _db, _task: [
+        {"service": "dataflow_analyse", "task_id": "dfa_orphan", "project_id": "p1", "stage_name": "dataflow_analysis"},
+    ]
+    try:
+        asyncio.run(self.manager.cancel_task(db, project_id="p1", task_id="t1"))
+        asyncio.run(self.manager._apply_manual_cancel_request_locked(db, db.added[-1]))
+    finally:
+        self.manager._discover_parent_linked_downstream_refs = original_discover
+
+    self.assertEqual("cancelled", task.status)
+    self.assertEqual("cancelled", item.status)
+    self.assertEqual(1, len(calls))
+    self.assertEqual(
+        ["sat_1", "dfa_orphan"],
+        [ref["task_id"] for ref in calls[0]["refs"]],
+    )
+
+
+def _test_manual_cancel_noop_retries_orphan_downstream_cancel(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="source",
+        status="cancelled",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = BinarySecurityStageItem(
+        id="i1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="system_analysis",
+        item_key="m1",
+        status="running",
+        downstream_service="system_analyse",
+        downstream_task_id="sat_1",
+    )
+    event = BinarySecurityStateEvent(
+        id="evt1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="system_analysis",
+        event_type="manual_cancel_requested",
+        payload={"operation_token": ""},
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[item], state_events=[event])
+    calls: list[dict[str, object]] = []
+
+    async def fake_cancel_downstream_refs(db_arg, task_arg, refs_arg, token_arg):
+        calls.append(
+            {
+                "db": db_arg,
+                "task_id": task_arg.id,
+                "refs": list(refs_arg),
+                "token": token_arg,
+            }
+        )
+        return len(refs_arg)
+
+    original_discover = self.manager._discover_parent_linked_downstream_refs
+    self.manager._cancel_downstream_refs = fake_cancel_downstream_refs
+    self.manager._discover_parent_linked_downstream_refs = lambda _db, _task: [
+        {"service": "dataflow_analyse", "task_id": "dfa_orphan", "project_id": "p1", "stage_name": "dataflow_analysis"},
+    ]
+    try:
+        asyncio.run(self.manager._apply_manual_cancel_request_locked(db, event))
+    finally:
+        self.manager._discover_parent_linked_downstream_refs = original_discover
+
+    self.assertEqual("cancelled", item.status)
+    self.assertEqual(1, len(calls))
+    self.assertEqual(
+        ["sat_1", "dfa_orphan"],
+        [ref["task_id"] for ref in calls[0]["refs"]],
+    )
+
+
+TaskManagerTests.test_manual_cancel_collects_dispatching_and_orphan_downstream_refs = _test_manual_cancel_collects_dispatching_and_orphan_downstream_refs
+TaskManagerTests.test_manual_cancel_noop_retries_orphan_downstream_cancel = _test_manual_cancel_noop_retries_orphan_downstream_cancel
 
 
 if __name__ == "__main__":

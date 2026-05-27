@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import logging
 import threading
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 from typing import Any, Dict, List
 
@@ -23,10 +24,12 @@ from app.models.database import (
     WorkflowExecution,
     get_db_session,
 )
+from app.observability.service_ops import observe_service_operation
 from app.schemas import (
     SchedulerWorkerResponse,
     WorkerActiveJobResponse,
     WorkerClusterCapacityResponse,
+    WorkerClusterCapacitySummaryResponse,
     WorkerClusterWorkerResponse,
 )
 from app.services.dataflow_worker_client import DataflowWorkerError, get_dataflow_worker_client
@@ -47,6 +50,14 @@ class SchedulerService:
         self._running_tasks: Dict[str, Any] = {}
         self._worker_status = "active"
         self._heartbeat_published = False
+        self._cluster_capacity_summary_snapshot: WorkerClusterCapacitySummaryResponse | None = None
+        self._cluster_capacity_summary_snapshot_at: datetime | None = None
+        self._cluster_capacity_summary_refreshing = False
+        self._cluster_capacity_summary_lock = threading.Lock()
+        self._cluster_capacity_summary_hits_total = 0
+        self._cluster_capacity_summary_misses_total = 0
+        self._cluster_capacity_summary_refresh_failures_total = 0
+        self._cluster_capacity_summary_last_refresh_duration_seconds = 0.0
 
     @property
     def role(self) -> str:
@@ -115,6 +126,8 @@ class SchedulerService:
             self._tasks.append(asyncio.create_task(self._manager_dispatch_loop(), name="scheduler-manager-dispatch"))
         if self.runs_manager or self.runs_worker:
             self._tasks.append(asyncio.create_task(self._cleanup_loop(), name="scheduler-cleanup"))
+            await asyncio.to_thread(functools.partial(self._refresh_cluster_capacity_summary_snapshot, force=True))
+            self._tasks.append(asyncio.create_task(self._cluster_capacity_summary_loop(), name="scheduler-cluster-capacity-summary"))
         logger.info("scheduler started role=%s worker_enabled=%s capacity=%s", self.role, self.runs_worker, self.capacity)
 
     async def stop(self) -> None:
@@ -184,6 +197,19 @@ class SchedulerService:
     def requeue_stuck_dispatch_after_seconds(self) -> int:
         return max(10, int((self.runtime_config.get("scheduler") or {}).get("requeue_stuck_dispatch_after_seconds") or get_config().scheduler.requeue_stuck_dispatch_after_seconds or 60))
 
+    @property
+    def cluster_capacity_summary_refresh_interval_seconds(self) -> int:
+        scheduler_cfg = self.runtime_config.get("scheduler") or {}
+        return max(2, int(scheduler_cfg.get("cluster_capacity_summary_refresh_interval_seconds") or 5))
+
+    @property
+    def cluster_capacity_summary_stale_after_seconds(self) -> int:
+        scheduler_cfg = self.runtime_config.get("scheduler") or {}
+        return max(
+            self.cluster_capacity_summary_refresh_interval_seconds,
+            int(scheduler_cfg.get("cluster_capacity_summary_stale_after_seconds") or 15),
+        )
+
     def configured_worker_urls(self) -> list[str]:
         cfg = get_config().dataflow_worker
         runtime_cfg = self.runtime_config.get("dataflow_worker") or {}
@@ -214,11 +240,176 @@ class SchedulerService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="scheduler worker not found")
         return SchedulerWorkerResponse.model_validate(worker, from_attributes=True)
 
-    def get_cluster_capacity(self, db: Session) -> WorkerClusterCapacityResponse:
+    def _cluster_capacity_base(
+        self,
+        db: Session,
+    ) -> tuple[list[SchedulerWorker], datetime, dict[str, int], int]:
         workers = db.query(SchedulerWorker).order_by(SchedulerWorker.last_heartbeat_at.desc(), SchedulerWorker.pod_id.asc()).all()
-        worker_rows: list[WorkerClusterWorkerResponse] = []
         worker_timeout_at = now_local() - timedelta(seconds=get_config().scheduler.worker_timeout_seconds)
         reservation_counts = self._reservation_counts(db)
+        queued_jobs = (
+            db.query(WorkflowExecution)
+            .join(TriggerTask, WorkflowExecution.trigger_task_id == TriggerTask.id)
+            .join(WorkflowDefinition, WorkflowExecution.workflow_definition_id == WorkflowDefinition.id)
+            .filter(
+                WorkflowExecution.status == "pending",
+                TriggerTask.status == "pending",
+                WorkflowDefinition.enabled.is_(True),
+            )
+            .count()
+        )
+        return workers, worker_timeout_at, reservation_counts, queued_jobs
+
+    def _compute_cluster_capacity_summary(self, db: Session) -> WorkerClusterCapacitySummaryResponse:
+        started = time.perf_counter()
+        workers, worker_timeout_at, reservation_counts, queued_jobs = self._cluster_capacity_base(db)
+        worker_rows: list[WorkerClusterWorkerResponse] = []
+        total_capacity = 0
+        total_running = 0
+        healthy_workers = 0
+        stale_workers = 0
+
+        for worker in workers:
+            heartbeat_healthy = bool(worker.last_heartbeat_at and worker.last_heartbeat_at >= worker_timeout_at and worker.status == "active")
+            capacity = max(int(worker.capacity or 0), 0)
+            running_jobs = max(int(worker.running_count or 0), 0)
+            available_slots = max(capacity - running_jobs - reservation_counts.get(str(worker.pod_id), 0), 0)
+            healthy = heartbeat_healthy
+            if healthy:
+                healthy_workers += 1
+            else:
+                stale_workers += 1
+            total_capacity += capacity
+            total_running += running_jobs
+            worker_rows.append(
+                WorkerClusterWorkerResponse(
+                    worker_id=str(worker.pod_id),
+                    host_name=str(worker.host_name or worker.pod_id),
+                    healthy=healthy,
+                    max_concurrent_jobs=capacity,
+                    running_jobs=running_jobs,
+                    available_slots=available_slots,
+                    source="scheduler_worker",
+                    last_heartbeat_at=worker.last_heartbeat_at,
+                    error=None if healthy else "worker heartbeat stale or worker status inactive",
+                    active_jobs=[],
+                )
+            )
+
+        response = WorkerClusterCapacitySummaryResponse(
+            worker_count=len(worker_rows),
+            healthy_workers=healthy_workers,
+            stale_workers=stale_workers,
+            total_capacity=total_capacity,
+            running_jobs=total_running,
+            queued_jobs=queued_jobs,
+            available_slots=max(total_capacity - total_running, 0),
+            updated_at=now_local(),
+            workers=worker_rows,
+            detail_mode="summary",
+        )
+        observe_service_operation("cluster_capacity_summary", max(time.perf_counter() - started, 0.0))
+        return response
+
+    def _cluster_capacity_summary_snapshot_copy(self) -> WorkerClusterCapacitySummaryResponse | None:
+        with self._cluster_capacity_summary_lock:
+            snapshot = self._cluster_capacity_summary_snapshot
+            return snapshot.model_copy(deep=True) if snapshot is not None else None
+
+    def _cluster_capacity_summary_snapshot_stale(self) -> bool:
+        with self._cluster_capacity_summary_lock:
+            if self._cluster_capacity_summary_snapshot_at is None:
+                return True
+            age = (now_local() - self._cluster_capacity_summary_snapshot_at).total_seconds()
+            return age >= self.cluster_capacity_summary_stale_after_seconds
+
+    def _set_cluster_capacity_summary_snapshot(
+        self,
+        snapshot: WorkerClusterCapacitySummaryResponse,
+    ) -> WorkerClusterCapacitySummaryResponse:
+        copied = snapshot.model_copy(deep=True)
+        with self._cluster_capacity_summary_lock:
+            self._cluster_capacity_summary_snapshot = copied
+            self._cluster_capacity_summary_snapshot_at = now_local()
+        return copied.model_copy(deep=True)
+
+    def cluster_capacity_summary_snapshot_metrics(self) -> dict[str, float]:
+        with self._cluster_capacity_summary_lock:
+            age_seconds = (
+                max((now_local() - self._cluster_capacity_summary_snapshot_at).total_seconds(), 0.0)
+                if self._cluster_capacity_summary_snapshot_at is not None
+                else -1.0
+            )
+            stale = 1.0 if self._cluster_capacity_summary_snapshot_at is not None and age_seconds >= self.cluster_capacity_summary_stale_after_seconds else 0.0
+            return {
+                "hits_total": float(self._cluster_capacity_summary_hits_total),
+                "misses_total": float(self._cluster_capacity_summary_misses_total),
+                "refresh_failures_total": float(self._cluster_capacity_summary_refresh_failures_total),
+                "last_refresh_duration_seconds": float(self._cluster_capacity_summary_last_refresh_duration_seconds or 0.0),
+                "age_seconds": age_seconds,
+                "available": 1.0 if self._cluster_capacity_summary_snapshot is not None else 0.0,
+                "stale": stale,
+                "refreshing": 1.0 if self._cluster_capacity_summary_refreshing else 0.0,
+            }
+
+    def _refresh_cluster_capacity_summary_snapshot(
+        self,
+        db: Session | None = None,
+        *,
+        force: bool = False,
+    ) -> WorkerClusterCapacitySummaryResponse | None:
+        started = time.perf_counter()
+        with self._cluster_capacity_summary_lock:
+            if self._cluster_capacity_summary_refreshing:
+                snapshot = self._cluster_capacity_summary_snapshot
+                return snapshot.model_copy(deep=True) if snapshot is not None else None
+            if not force and self._cluster_capacity_summary_snapshot_at is not None:
+                age = (now_local() - self._cluster_capacity_summary_snapshot_at).total_seconds()
+                if age < self.cluster_capacity_summary_refresh_interval_seconds:
+                    snapshot = self._cluster_capacity_summary_snapshot
+                    return snapshot.model_copy(deep=True) if snapshot is not None else None
+            self._cluster_capacity_summary_refreshing = True
+
+        owns_db = db is None
+        session = db or get_db_session()
+        try:
+            snapshot = self._compute_cluster_capacity_summary(session)
+            stored = self._set_cluster_capacity_summary_snapshot(snapshot)
+            with self._cluster_capacity_summary_lock:
+                self._cluster_capacity_summary_last_refresh_duration_seconds = max(time.perf_counter() - started, 0.0)
+            return stored
+        except Exception:
+            logger.exception("failed to refresh cluster capacity summary snapshot")
+            with self._cluster_capacity_summary_lock:
+                self._cluster_capacity_summary_refresh_failures_total += 1
+                self._cluster_capacity_summary_last_refresh_duration_seconds = max(time.perf_counter() - started, 0.0)
+                snapshot = self._cluster_capacity_summary_snapshot
+                return snapshot.model_copy(deep=True) if snapshot is not None else None
+        finally:
+            with self._cluster_capacity_summary_lock:
+                self._cluster_capacity_summary_refreshing = False
+            if owns_db:
+                session.close()
+
+    def get_cluster_capacity_summary(self, db: Session) -> WorkerClusterCapacitySummaryResponse:
+        snapshot = self._cluster_capacity_summary_snapshot_copy()
+        if snapshot is not None and not self._cluster_capacity_summary_snapshot_stale():
+            with self._cluster_capacity_summary_lock:
+                self._cluster_capacity_summary_hits_total += 1
+            return snapshot
+        with self._cluster_capacity_summary_lock:
+            self._cluster_capacity_summary_misses_total += 1
+        refreshed = self._refresh_cluster_capacity_summary_snapshot(db, force=bool(snapshot is None))
+        if refreshed is not None:
+            return refreshed
+        if snapshot is not None:
+            return snapshot
+        return self._compute_cluster_capacity_summary(db)
+
+    def get_cluster_capacity(self, db: Session) -> WorkerClusterCapacityResponse:
+        started = time.perf_counter()
+        workers, worker_timeout_at, reservation_counts, queued_jobs = self._cluster_capacity_base(db)
+        worker_rows: list[WorkerClusterWorkerResponse] = []
 
         active_executions = (
             db.query(WorkflowExecution, TriggerTask, RunIndex)
@@ -235,18 +426,6 @@ class SchedulerService:
         execution_map: dict[str, tuple[WorkflowExecution, TriggerTask, RunIndex | None]] = {}
         for execution, trigger, run_index in active_executions:
             execution_map[str(execution.id)] = (execution, trigger, run_index)
-
-        queued_jobs = (
-            db.query(WorkflowExecution)
-            .join(TriggerTask, WorkflowExecution.trigger_task_id == TriggerTask.id)
-            .join(WorkflowDefinition, WorkflowExecution.workflow_definition_id == WorkflowDefinition.id)
-            .filter(
-                WorkflowExecution.status == "pending",
-                TriggerTask.status == "pending",
-                WorkflowDefinition.enabled.is_(True),
-            )
-            .count()
-        )
 
         total_capacity = 0
         total_running = 0
@@ -289,7 +468,7 @@ class SchedulerService:
                 )
             )
 
-        return WorkerClusterCapacityResponse(
+        response = WorkerClusterCapacityResponse(
             worker_count=len(worker_rows),
             healthy_workers=healthy_workers,
             stale_workers=stale_workers,
@@ -300,6 +479,8 @@ class SchedulerService:
             updated_at=now_local(),
             workers=worker_rows,
         )
+        observe_service_operation("cluster_capacity_detail", max(time.perf_counter() - started, 0.0))
+        return response
 
     def _reservation_counts(self, db: Session) -> dict[str, int]:
         rows = (
@@ -1268,6 +1449,11 @@ class SchedulerService:
         while True:
             await asyncio.sleep(interval)
             await asyncio.to_thread(self._cleanup_once)
+
+    async def _cluster_capacity_summary_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.cluster_capacity_summary_refresh_interval_seconds)
+            await asyncio.to_thread(self._refresh_cluster_capacity_summary_snapshot)
 
     def _cleanup_once(self) -> None:
         db = get_db_session()

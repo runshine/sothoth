@@ -120,6 +120,28 @@ PI_RE_ALLOWED_DIRS=/data/files
 }
 ```
 
+## 缓存机制
+
+当前 B2S 只保留一套固定行为的共享结果缓存，不再支持可配置的 `scope`、`ttl_days`、`max_size_gb`。
+
+缓存行为如下：
+
+- 仅缓存 `success` 的分析结果。
+- 缓存键固定为 `sha256(ELF 文件内容) + mode(fast/deep)`。
+- `reuse_cache=true` 时，任务创建阶段会优先查缓存；命中后直接物化已有输出，不再派发到 `pi-re-agent`。
+- 缓存目录默认位于 `/data/files/.secflow-cache/binary-to-source`。
+- 当前可配置项只保留：
+  - `cache.enabled`
+  - `cache.root_dir`
+  - `cache.materialize_mode`
+  - `cache.cache_success_only`
+
+当前限制：
+
+- 缓存是共享结果缓存，不是项目级隔离缓存。
+- 目前没有内建 TTL 淘汰和容量上限治理。
+- 目前缓存签名只包含文件内容哈希和 `mode`，不包含模型、provider、engine、concurrency 等更细执行参数。
+
 ## 运行
 
 ```bash

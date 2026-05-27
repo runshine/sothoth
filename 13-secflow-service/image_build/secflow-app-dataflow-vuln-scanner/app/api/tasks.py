@@ -28,7 +28,9 @@ from app.schemas import (
     RunVulnReportRequest,
     RunVulnReportResponse,
     ScanTaskCreateRequest,
+    ScanTaskListPageResponse,
     WorkerClusterCapacityResponse,
+    WorkerClusterCapacitySummaryResponse,
     ScanTaskDetailResponse,
     ScanTaskPriorityUpdateRequest,
     ScanTaskResponse,
@@ -104,13 +106,13 @@ async def create_task(
     return get_execution_service().get_scan_task_summary(db, created.task_id, principal)
 
 
-@router.get("/tasks", response_model=List[ScanTaskResponse])
+@router.get("/tasks", response_model=ScanTaskListPageResponse)
 async def list_tasks(
     project_id: Optional[str] = Query(None),
     status_filter: Optional[str] = Query(None, alias="status"),
     profile_id: Optional[str] = Query(None),
-    limit: int = Query(100, ge=1, le=500),
-    offset: int = Query(0, ge=0),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
     subject=Depends(get_current_or_machine_subject),
     db: Session = Depends(get_db),
 ):
@@ -123,9 +125,17 @@ async def list_tasks(
         project_id=project_id,
         status_filter=status_filter,
         profile_id=profile_id,
-        limit=limit,
-        offset=offset,
+        page=page,
+        page_size=page_size,
     )
+
+
+@router.get("/workers/cluster-capacity/summary", response_model=WorkerClusterCapacitySummaryResponse)
+async def get_worker_cluster_capacity_summary(
+    subject=Depends(get_current_or_machine_subject),
+    db: Session = Depends(get_db),
+):
+    return get_scheduler_service().get_cluster_capacity_summary(db)
 
 
 @router.get("/workers/cluster-capacity", response_model=WorkerClusterCapacityResponse)

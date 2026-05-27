@@ -237,6 +237,50 @@ class ScanTaskResponse(BaseModel):
     abnormal_reason: Optional[Dict[str, Any]] = None
 
 
+class ScanTaskListItemResponse(BaseModel):
+    task_id: str
+    project_id: str
+    task_purpose: Literal["normal", "evolution"] = "normal"
+    task_origin_type: Optional[str] = None
+    parent_project_id: Optional[str] = None
+    parent_task_id: Optional[str] = None
+    parent_task_type: Optional[str] = None
+    parent_stage_name: Optional[str] = None
+    parent_stage_item_id: Optional[str] = None
+    parent_stage_item_key: Optional[str] = None
+    origin_label: Optional[str] = None
+    parent_task_display: Optional[str] = None
+    profile_id: str
+    profile_version: int
+    title: str = ""
+    status: str
+    latest_attempt_no: int
+    retry_count: int
+    max_retry_count: int
+    priority: int
+    created_by: str
+    created_at: datetime
+    started_at: Optional[datetime]
+    finished_at: Optional[datetime]
+    message: Optional[str]
+    latest_execution_id: Optional[str]
+    run_name: Optional[str] = None
+    runs_root: Optional[str] = None
+    run_path: Optional[str] = None
+    run: Dict[str, Any] = Field(default_factory=dict)
+    latest_run: Dict[str, Any] = Field(default_factory=dict)
+    auto_report_vulnerabilities: bool = True
+    vuln_report_status: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ScanTaskListPageResponse(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+    items: List[ScanTaskListItemResponse] = Field(default_factory=list)
+
+
 class ScanTaskAttemptResponse(BaseModel):
     execution_id: str
     task_id: str
@@ -399,6 +443,10 @@ class WorkerClusterCapacityResponse(BaseModel):
     available_slots: int
     updated_at: datetime
     workers: List[WorkerClusterWorkerResponse] = Field(default_factory=list)
+
+
+class WorkerClusterCapacitySummaryResponse(WorkerClusterCapacityResponse):
+    detail_mode: Literal["summary", "detail"] = "summary"
 
 
 class SuccessResponse(BaseModel):

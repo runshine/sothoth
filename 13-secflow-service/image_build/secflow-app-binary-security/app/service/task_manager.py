@@ -5721,12 +5721,8 @@ class TaskManager:
         ):
             task.status = "running"
             task.current_stage = next_stage
-            task.dispatcher_instance_id = None
-            task.dispatch_started_at = None
-            task.lease_expires_at = None
             task.finished_at = None
             task.last_error = None
-            self._invalidate_task_execution(task)
             self._record_event(
                 db,
                 task,
@@ -5835,6 +5831,7 @@ class TaskManager:
         if task is None:
             return
         try:
+            token = self._service_token()
             if operation_token:
                 current_operation_token = str(task.operation_lock_token or "").strip()
                 if current_operation_token and current_operation_token != operation_token:
@@ -5851,7 +5848,7 @@ class TaskManager:
             if task.status == "cancelled":
                 running_items = db.query(BinarySecurityStageItem).filter(
                     BinarySecurityStageItem.task_id == task.id,
-                    BinarySecurityStageItem.status.in_(["pending", "queued", "running"]),
+                    BinarySecurityStageItem.status.in_(["pending", "queued", "dispatching", "running"]),
                 ).all()
                 for item in running_items:
                     item.status = "cancelled"
@@ -5863,6 +5860,10 @@ class TaskManager:
                 for stage_run in active_stage_runs:
                     stage_run.status = "cancelled"
                     stage_run.finished_at = stage_run.finished_at or _now()
+                downstream_refs = self._dedupe_downstream_refs(
+                    self._collect_downstream_refs(task, running_items)
+                    + self._discover_parent_linked_downstream_refs(db, task)
+                )
                 self._record_event(
                     db,
                     task,
@@ -5873,15 +5874,18 @@ class TaskManager:
                         "state_event_id": event.id,
                         "cancelled_item_count": len(running_items),
                         "cancelled_stage_run_count": len(active_stage_runs),
+                        "downstream_ref_count": len(downstream_refs),
                     },
                 )
+                if downstream_refs:
+                    await self._cancel_downstream_refs(db, task, downstream_refs, token)
                 return
             task.status = "cancelled"
             self._invalidate_task_execution(task)
             task.finished_at = _now()
             running_items = db.query(BinarySecurityStageItem).filter(
                 BinarySecurityStageItem.task_id == task.id,
-                BinarySecurityStageItem.status.in_(["pending", "queued", "running"]),
+                BinarySecurityStageItem.status.in_(["pending", "queued", "dispatching", "running"]),
             ).all()
             for item in running_items:
                 item.status = "cancelled"
@@ -5893,7 +5897,10 @@ class TaskManager:
             for stage_run in active_stage_runs:
                 stage_run.status = "cancelled"
                 stage_run.finished_at = stage_run.finished_at or _now()
-            downstream_items = [item for item in running_items if item.downstream_task_id]
+            downstream_refs = self._dedupe_downstream_refs(
+                self._collect_downstream_refs(task, running_items)
+                + self._discover_parent_linked_downstream_refs(db, task)
+            )
             self._record_event(
                 db,
                 task,
@@ -5903,18 +5910,15 @@ class TaskManager:
                 payload={
                     "state_event_id": event.id,
                     "cancelled_item_count": len(running_items),
-                    "cancelled_downstream_count": len(downstream_items),
+                    "cancelled_downstream_count": len(downstream_refs),
                 },
             )
             observe_task_error("cancel", stage=str(task.current_stage or "none"), result="accepted")
             observe_task_lifecycle("finished", status=task.status, task_type=self._task_type(task))
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="cancelled")
             await self._cancel_local_worker(task.id)
-            token = self._service_token()
-            await asyncio.gather(
-                *(self._cancel_downstream(item, token) for item in downstream_items),
-                return_exceptions=True,
-            )
+            if downstream_refs:
+                await self._cancel_downstream_refs(db, task, downstream_refs, token)
         finally:
             if operation_token:
                 self._release_task_operation_lease(db, task.id, token=operation_token)
@@ -14002,7 +14006,9 @@ class TaskManager:
             observe_heartbeat_update("skipped")
             return
         worker = self._workers.get(task_id)
-        if worker is None or worker.done():
+        has_primary_worker = worker is not None and not worker.done()
+        has_streaming_workers = self._task_has_active_streaming_stage_workers(task_id)
+        if not has_primary_worker and not has_streaming_workers:
             observe_heartbeat_update("skipped")
             return
         session = get_session_factory()()
