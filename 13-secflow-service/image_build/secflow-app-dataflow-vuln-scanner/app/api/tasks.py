@@ -30,6 +30,8 @@ from app.schemas import (
     RunVulnReportRequest,
     RunVulnReportResponse,
     ScanTaskCreateRequest,
+    ScanTaskProjectionRepairResponse,
+    ScanTaskStatsResponse,
     WorkerClusterCapacityResponse,
     WorkerClusterCapacitySummaryResponse,
     ScanTaskDetailResponse,
@@ -108,7 +110,7 @@ async def create_task(
     return get_execution_service().get_scan_task_summary(db, created.task_id, principal)
 
 
-@router.get("/tasks", response_model=List[ScanTaskResponse] | ScanTaskListResponse)
+@router.get("/tasks", response_model=ScanTaskListResponse)
 async def list_tasks(
     project_id: Optional[str] = Query(None),
     status_filter: Optional[str] = Query(None, alias="status"),
@@ -127,25 +129,67 @@ async def list_tasks(
     principal, token = subject
     if project_id:
         await ensure_project_access(project_id, token)
-    use_paged_response = any(
-        value is not None and str(value).strip() != ""
-        for value in (page, per_page, mode, parent_task_id, sort_by, sort_order)
-    )
+    if page is None and per_page is None:
+        if limit is not None:
+            safe_limit = max(1, min(int(limit), 500))
+            safe_offset = max(0, int(offset or 0))
+            per_page = safe_limit
+            page = (safe_offset // safe_limit) + 1
+        else:
+            page = 1
+            per_page = 100
     return get_execution_service().list_scan_tasks(
         db,
         principal,
         project_id=project_id,
         status_filter=status_filter,
         profile_id=profile_id,
-        limit=limit,
-        offset=offset,
         page=page,
         per_page=per_page,
         mode=mode,
         parent_task_id=parent_task_id,
         sort_by=sort_by,
         sort_order=sort_order,
-        paged=use_paged_response,
+    )
+
+
+@router.get("/tasks/stats", response_model=ScanTaskStatsResponse)
+async def get_task_stats(
+    project_id: Optional[str] = Query(None),
+    status_filter: Optional[str] = Query(None, alias="status"),
+    profile_id: Optional[str] = Query(None),
+    mode: Optional[str] = Query(None),
+    parent_task_id: Optional[str] = Query(None),
+    subject=Depends(get_current_or_machine_subject),
+    db: Session = Depends(get_db),
+):
+    principal, token = subject
+    if project_id:
+        await ensure_project_access(project_id, token)
+    return get_execution_service().get_scan_task_stats(
+        db,
+        principal,
+        project_id=project_id,
+        status_filter=status_filter,
+        profile_id=profile_id,
+        mode=mode,
+        parent_task_id=parent_task_id,
+    )
+
+
+@router.post("/tasks/projection/rebuild", response_model=ScanTaskProjectionRepairResponse)
+async def rebuild_task_projection_batch(
+    project_id: Optional[str] = Query(None),
+    subject=Depends(get_current_or_machine_subject),
+    db: Session = Depends(get_db),
+):
+    principal, token = subject
+    if project_id:
+        await ensure_project_access(project_id, token)
+    return get_execution_service().rebuild_scan_task_projections(
+        db,
+        principal,
+        project_id=project_id,
     )
 
 
@@ -169,6 +213,12 @@ async def get_worker_cluster_capacity(
 async def get_task(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().get_scan_task(db, task_id, principal)
+
+
+@router.post("/tasks/{task_id}/projection/rebuild", response_model=ScanTaskProjectionRepairResponse)
+async def rebuild_task_projection(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
+    principal, _ = subject
+    return get_execution_service().rebuild_single_scan_task_projection(db, task_id, principal)
 
 
 @router.get("/tasks/{task_id}/timeline", response_model=DataflowTaskTimelineResponse)

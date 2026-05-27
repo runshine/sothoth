@@ -242,11 +242,73 @@ class ScanTaskResponse(BaseModel):
     abnormal_reason: Optional[Dict[str, Any]] = None
 
 
+class ScanTaskListItemResponse(BaseModel):
+    task_id: str
+    project_id: str
+    task_purpose: Literal["normal", "evolution"] = "normal"
+    task_origin_type: Optional[str] = None
+    parent_task_id: Optional[str] = None
+    parent_task_type: Optional[str] = None
+    parent_stage_name: Optional[str] = None
+    parent_stage_item_id: Optional[str] = None
+    parent_stage_item_key: Optional[str] = None
+    origin_mode: Literal["manual", "binary", "source"] = "manual"
+    origin_label: Optional[str] = None
+    parent_task_display: Optional[str] = None
+    profile_id: str
+    profile_version: int
+    title: str = ""
+    status: str
+    control_state: str = "none"
+    latest_attempt_no: int
+    priority: int
+    created_by: str
+    created_at: datetime
+    started_at: Optional[datetime]
+    finished_at: Optional[datetime]
+    updated_at: datetime
+    message: Optional[str]
+    latest_execution_id: Optional[str]
+    owner_pod_id: Optional[str] = None
+    dispatch_status: Optional[str] = None
+    slot_binding_state: Optional[str] = None
+    slot_binding_reason: Optional[str] = None
+    latest_run_id: Optional[str] = None
+    latest_run_status: Optional[str] = None
+    run_name: Optional[str] = None
+    runs_root: Optional[str] = None
+    run_path: Optional[str] = None
+    run: Dict[str, Any] = Field(default_factory=dict)
+    latest_run: Dict[str, Any] = Field(default_factory=dict)
+    auto_report_vulnerabilities: bool = True
+    vuln_report_status: Dict[str, Any] = Field(default_factory=dict)
+    abnormal_reason_title: Optional[str] = None
+    abnormal_reason_code: Optional[str] = None
+    abnormal_reason_category: Optional[str] = None
+
+
 class ScanTaskListResponse(BaseModel):
-    items: List[ScanTaskResponse] = Field(default_factory=list)
+    items: List[ScanTaskListItemResponse] = Field(default_factory=list)
     total: int = 0
     page: int = 1
     per_page: int = 100
+
+
+class ScanTaskStatsResponse(BaseModel):
+    total: int = 0
+    pending: int = 0
+    running: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    cancelled: int = 0
+
+
+class ScanTaskProjectionRepairResponse(BaseModel):
+    status: str = "success"
+    task_id: Optional[str] = None
+    project_id: Optional[str] = None
+    repaired_count: int = 0
+    message: str
 
 
 class ScanTaskAttemptResponse(BaseModel):

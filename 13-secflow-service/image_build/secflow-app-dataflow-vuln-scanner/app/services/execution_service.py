@@ -29,6 +29,7 @@ from app.artifacts.io import abs_path, ensure_dir, sanitize_name, write_json, wr
 from app.config import get_config
 from app.models.contracts import TaskItem, TaskManifest
 from app.models.database import (
+    DfvsTaskListProjection,
     RunIndex,
     RunIndexCycle,
     RunIndexFile,
@@ -63,8 +64,11 @@ from app.schemas import (
     ScanTaskAttemptResponse,
     ScanTaskCreateRequest,
     ScanTaskDetailResponse,
+    ScanTaskListItemResponse,
     ScanTaskListResponse,
+    ScanTaskProjectionRepairResponse,
     ScanTaskResponse,
+    ScanTaskStatsResponse,
     TriggerTaskInputTask,
 )
 from app.services.fileserver_client import get_fileserver_client
@@ -120,12 +124,13 @@ _TASK_PURPOSE_LABELS = {
 _CANONICAL_TASK_STATUSES = {"pending", "running", "succeeded", "failed", "cancelled"}
 
 _TASK_LIST_SORT_COLUMNS = {
-    "created_at": TriggerTask.created_at,
-    "updated_at": TriggerTask.updated_at,
-    "started_at": TriggerTask.started_at,
-    "finished_at": TriggerTask.finished_at,
-    "status": TriggerTask.status,
-    "priority": TriggerTask.priority,
+    "created_at": DfvsTaskListProjection.created_at,
+    "updated_at": DfvsTaskListProjection.updated_at,
+    "started_at": DfvsTaskListProjection.started_at,
+    "finished_at": DfvsTaskListProjection.finished_at,
+    "priority": DfvsTaskListProjection.priority,
+    "public_status": DfvsTaskListProjection.public_status,
+    "status": DfvsTaskListProjection.public_status,
 }
 
 _TIMELINE_STAGE_LABELS = {
@@ -600,6 +605,410 @@ class ExecutionService:
 
     def _task_effective_profile_id(self, trigger: TriggerTask) -> str:
         return str(trigger.profile_id or trigger.workflow_definition_id or "").strip()
+
+    def _task_origin_mode(self, trigger: TriggerTask) -> str:
+        task_origin_type = str(trigger.task_origin_type or "").strip().lower()
+        parent_task_type = str(trigger.parent_task_type or "").strip().lower()
+        if task_origin_type == "binary_security" and parent_task_type == "source":
+            return "source"
+        if task_origin_type == "binary_security":
+            return "binary"
+        return "manual"
+
+    def _task_origin_label(self, trigger: TriggerTask) -> str:
+        origin_mode = self._task_origin_mode(trigger)
+        if origin_mode == "source":
+            return "二进制安全-源码扫描"
+        if origin_mode == "binary":
+            return "二进制安全-二进制类扫描"
+        return "手动任务"
+
+    def _projection_run_summary(self, row: DfvsTaskListProjection) -> dict[str, Any]:
+        if not row.latest_run_id and not row.run_name and not row.latest_run_status:
+            return {}
+        return {
+            "run_id": row.latest_run_id,
+            "status": row.latest_run_status,
+            "model": row.run_model,
+            "provider": row.run_provider,
+            "thinking": row.run_thinking,
+            "max_cycles": row.run_max_cycles,
+            "cycles_used": row.run_cycles_used,
+            "result_count": row.run_result_count,
+            "passed_count": row.run_passed_count,
+            "failed_count": row.run_failed_count,
+            "workflow_mode": row.run_workflow_mode,
+            "duration_seconds": row.run_duration_seconds,
+            "start_epoch": row.run_start_epoch,
+            "name": row.run_name,
+            "root_path": row.runs_root,
+            "path": row.run_path,
+            "linked_task_id": row.task_id,
+            "linked_execution_id": row.latest_execution_id,
+        }
+
+    def _projection_vuln_report_status(self, row: DfvsTaskListProjection) -> dict[str, Any]:
+        return {
+            "enabled": bool(row.vuln_report_enabled),
+            "status": row.vuln_report_status,
+            "total": int(row.vuln_report_total or 0),
+            "reported": int(row.vuln_report_reported or 0),
+            "failed": int(row.vuln_report_failed or 0),
+            "pending": int(row.vuln_report_pending or 0),
+            "items": [],
+        }
+
+    def _projection_to_task_list_item(self, row: DfvsTaskListProjection) -> ScanTaskListItemResponse:
+        run_summary = self._projection_run_summary(row)
+        return ScanTaskListItemResponse(
+            task_id=row.task_id,
+            project_id=row.project_id,
+            task_purpose=self._normalize_task_purpose(row.task_purpose),
+            task_origin_type=row.task_origin_type,
+            parent_task_id=row.parent_task_id,
+            parent_task_type=row.parent_task_type,
+            parent_stage_name=row.parent_stage_name,
+            parent_stage_item_id=row.parent_stage_item_id,
+            parent_stage_item_key=row.parent_stage_item_key,
+            origin_mode=row.origin_mode if row.origin_mode in {"manual", "binary", "source"} else "manual",
+            origin_label=row.origin_label,
+            parent_task_display=row.parent_task_display,
+            profile_id=row.profile_id,
+            profile_version=int(row.profile_version or 0),
+            title=row.title or "",
+            status=row.public_status,
+            control_state=row.control_state or "none",
+            latest_attempt_no=int(row.latest_attempt_no or 0),
+            priority=int(row.priority or 0),
+            created_by=row.created_by or "",
+            created_at=row.created_at,
+            started_at=row.started_at,
+            finished_at=row.finished_at,
+            updated_at=row.updated_at,
+            message=row.message,
+            latest_execution_id=row.latest_execution_id,
+            owner_pod_id=row.owner_pod_id,
+            dispatch_status=row.dispatch_status,
+            slot_binding_state=row.slot_binding_state,
+            slot_binding_reason=row.slot_binding_reason,
+            latest_run_id=row.latest_run_id,
+            latest_run_status=row.latest_run_status,
+            run_name=row.run_name,
+            runs_root=row.runs_root,
+            run_path=row.run_path,
+            run=run_summary,
+            latest_run=run_summary,
+            auto_report_vulnerabilities=bool(row.auto_report_vulnerabilities),
+            vuln_report_status=self._projection_vuln_report_status(row),
+            abnormal_reason_title=row.abnormal_reason_title,
+            abnormal_reason_code=row.abnormal_reason_code,
+            abnormal_reason_category=row.abnormal_reason_category,
+        )
+
+    def _run_summary_snapshot(
+        self,
+        *,
+        run_index: RunIndex | None,
+        latest_execution: WorkflowExecution | None,
+    ) -> dict[str, Any]:
+        if run_index is None:
+            return {}
+        return {
+            "run_id": run_index.id,
+            "status": get_run_index_service().normalized_run_status(run_index),
+            "model": run_index.model,
+            "provider": run_index.provider,
+            "thinking": run_index.thinking,
+            "max_cycles": run_index.max_cycles,
+            "cycles_used": run_index.cycles_used,
+            "result_count": run_index.result_count,
+            "passed_count": run_index.passed_count,
+            "failed_count": run_index.failed_count,
+            "workflow_mode": run_index.workflow_mode,
+            "duration_seconds": run_index.duration_seconds,
+            "start_epoch": int(run_index.started_at.timestamp()) if run_index.started_at else None,
+            "linked_execution_id": str(latest_execution.id) if latest_execution is not None else None,
+        }
+
+    def _vuln_report_counts_for_task_ids(self, db: Session, task_ids: list[str]) -> dict[str, dict[str, int]]:
+        normalized_ids = [str(task_id or "").strip() for task_id in task_ids if str(task_id or "").strip()]
+        if not normalized_ids:
+            return {}
+        rows = (
+            db.query(
+                VulnReportSubmission.task_id,
+                VulnReportSubmission.status,
+                func.count(VulnReportSubmission.id),
+            )
+            .filter(VulnReportSubmission.task_id.in_(normalized_ids))
+            .group_by(VulnReportSubmission.task_id, VulnReportSubmission.status)
+            .all()
+        )
+        counts_by_task: dict[str, dict[str, int]] = {task_id: {"total": 0, "reported": 0, "failed": 0, "pending": 0} for task_id in normalized_ids}
+        for task_id, status, count in rows:
+            bucket = counts_by_task.setdefault(str(task_id), {"total": 0, "reported": 0, "failed": 0, "pending": 0})
+            bucket["total"] += int(count or 0)
+            status_value = str(status or "").strip().lower()
+            if status_value == "reported":
+                bucket["reported"] += int(count or 0)
+            elif status_value == "failed":
+                bucket["failed"] += int(count or 0)
+            else:
+                bucket["pending"] += int(count or 0)
+        return counts_by_task
+
+    def _rebuild_task_list_projections(self, db: Session, triggers: list[TriggerTask]) -> None:
+        if not triggers:
+            return
+        latest_execution_map = self._build_latest_execution_map(db, triggers)
+        run_index_map = self._build_lightweight_run_index_map(db, triggers, latest_execution_map)
+        report_counts_by_task = self._vuln_report_counts_for_task_ids(db, [str(item.id) for item in triggers])
+
+        version_by_id: dict[str, WorkflowDefinitionVersion] = {}
+        explicit_version_ids = [str(item.workflow_definition_version_id) for item in triggers if item.workflow_definition_version_id]
+        if explicit_version_ids:
+            version_rows = (
+                db.query(WorkflowDefinitionVersion)
+                .filter(WorkflowDefinitionVersion.id.in_(explicit_version_ids))
+                .all()
+            )
+            version_by_id = {str(item.id): item for item in version_rows}
+
+        fallback_version_no_by_definition: dict[str, int] = {}
+        for trigger in triggers:
+            if trigger.workflow_definition_version_id:
+                continue
+            definition_id = str(trigger.workflow_definition_id or "").strip()
+            if not definition_id or definition_id in fallback_version_no_by_definition:
+                continue
+            latest_version = (
+                db.query(WorkflowDefinitionVersion)
+                .filter(WorkflowDefinitionVersion.workflow_definition_id == definition_id)
+                .order_by(WorkflowDefinitionVersion.version_no.desc(), WorkflowDefinitionVersion.created_at.desc())
+                .first()
+            )
+            fallback_version_no_by_definition[definition_id] = int(latest_version.version_no if latest_version is not None else 0)
+
+        for trigger in triggers:
+            latest_execution = latest_execution_map.get(str(trigger.id))
+            run_index = run_index_map.get(str(trigger.id))
+            run_summary = self._run_summary_snapshot(run_index=run_index, latest_execution=latest_execution)
+            run_locator = self._run_locator_for_execution(latest_execution, trigger)
+            effective_status, effective_message, effective_started_at, effective_finished_at = self._effective_scan_task_runtime_state(
+                trigger=trigger,
+                execution=latest_execution,
+                run_summary=run_summary,
+            )
+            control_state = derive_task_control_state(
+                dispatch_status=latest_execution.dispatch_status if latest_execution is not None else None,
+                process_status=latest_execution.process_status if latest_execution is not None else None,
+                trigger_message=trigger.message,
+                execution_message=latest_execution.message if latest_execution is not None else None,
+            )
+            slot_binding_state, slot_binding_reason = self._slot_binding_state(
+                execution=latest_execution,
+                effective_status=effective_status,
+            )
+            abnormal_reason = self._task_abnormal_reason(trigger, latest_execution, run_summary)
+            report_status = self._vuln_report_status_from_counts(
+                enabled=bool(self._trigger_task_metadata(trigger).get("auto_report_vulnerabilities", True)),
+                counts=report_counts_by_task.get(str(trigger.id)),
+            )
+            row = db.get(DfvsTaskListProjection, trigger.id)
+            if row is None:
+                row = DfvsTaskListProjection(task_id=trigger.id)
+            row.project_id = trigger.project_id
+            row.title = self._trigger_title(trigger)
+            row.profile_id = self._task_effective_profile_id(trigger)
+            if trigger.workflow_definition_version_id:
+                version = version_by_id.get(str(trigger.workflow_definition_version_id))
+                row.profile_version = int(version.version_no if version is not None else 0)
+            else:
+                row.profile_version = int(fallback_version_no_by_definition.get(str(trigger.workflow_definition_id or "").strip(), 0))
+            row.priority = int(trigger.priority or 0)
+            row.created_by = str(trigger.submitted_by or "").strip()
+            row.task_purpose = self._normalize_task_purpose(getattr(trigger, "task_purpose", None))
+            row.task_origin_type = str(trigger.task_origin_type or "").strip() or "manual"
+            row.parent_task_id = trigger.parent_task_id
+            row.parent_task_type = trigger.parent_task_type
+            row.parent_stage_name = trigger.parent_stage_name
+            row.parent_stage_item_id = trigger.parent_stage_item_id
+            row.parent_stage_item_key = trigger.parent_stage_item_key
+            row.origin_mode = self._task_origin_mode(trigger)
+            row.origin_label = self._task_origin_label(trigger)
+            row.parent_task_display = trigger.parent_task_id
+            row.public_status = effective_status
+            row.control_state = control_state
+            row.message = effective_message
+            row.abnormal_reason_title = str(abnormal_reason.get("title") or "").strip() or None if abnormal_reason else None
+            row.abnormal_reason_code = str(abnormal_reason.get("code") or "").strip() or None if abnormal_reason else None
+            row.abnormal_reason_category = str(abnormal_reason.get("category") or "").strip() or None if abnormal_reason else None
+            row.latest_execution_id = latest_execution.id if latest_execution is not None else trigger.latest_execution_id
+            row.latest_attempt_no = int(latest_execution.attempt_no if latest_execution is not None else 0)
+            row.owner_pod_id = latest_execution.owner_pod_id if latest_execution is not None else None
+            row.dispatch_status = latest_execution.dispatch_status if latest_execution is not None else None
+            row.slot_binding_state = slot_binding_state
+            row.slot_binding_reason = slot_binding_reason
+            row.latest_run_id = run_index.id if run_index is not None else None
+            row.latest_run_status = str(run_summary.get("status") or "").strip() or None
+            row.run_name = (str(run_index.run_name or "").strip() if run_index is not None else "") or run_locator.get("run_name")
+            row.run_path = (str(run_index.run_root_path or "").strip() if run_index is not None else "") or run_locator.get("run_path")
+            row.runs_root = (
+                str(Path(run_index.run_root_path).parent) if run_index is not None and run_index.run_root_path
+                else run_locator.get("runs_root")
+            )
+            row.run_model = str(run_index.model or "").strip() or None if run_index is not None else None
+            row.run_provider = str(run_index.provider or "").strip() or None if run_index is not None else None
+            row.run_thinking = str(run_index.thinking or "").strip() or None if run_index is not None else None
+            row.run_workflow_mode = str(run_index.workflow_mode or "").strip() or None if run_index is not None else None
+            row.run_max_cycles = int(run_index.max_cycles) if run_index is not None and run_index.max_cycles is not None else None
+            row.run_cycles_used = int(run_index.cycles_used) if run_index is not None and run_index.cycles_used is not None else None
+            row.run_result_count = int(run_index.result_count) if run_index is not None and run_index.result_count is not None else None
+            row.run_passed_count = int(run_index.passed_count) if run_index is not None and run_index.passed_count is not None else None
+            row.run_failed_count = int(run_index.failed_count) if run_index is not None and run_index.failed_count is not None else None
+            row.run_duration_seconds = float(run_index.duration_seconds) if run_index is not None and run_index.duration_seconds is not None else None
+            row.run_start_epoch = int(run_index.started_at.timestamp()) if run_index is not None and run_index.started_at else None
+            row.auto_report_vulnerabilities = bool(report_status.get("enabled"))
+            row.vuln_report_enabled = bool(report_status.get("enabled"))
+            row.vuln_report_status = str(report_status.get("status") or "not_started")
+            row.vuln_report_total = int(report_status.get("total") or 0)
+            row.vuln_report_reported = int(report_status.get("reported") or 0)
+            row.vuln_report_failed = int(report_status.get("failed") or 0)
+            row.vuln_report_pending = int(report_status.get("pending") or 0)
+            row.started_at = effective_started_at
+            row.finished_at = effective_finished_at
+            row.created_at = trigger.created_at
+            row.updated_at = trigger.updated_at
+            db.add(row)
+        db.flush()
+
+    def _backfill_missing_task_list_projections(
+        self,
+        db: Session,
+        principal: dict,
+        *,
+        project_id: str | None = None,
+        batch_size: int = 200,
+    ) -> None:
+        project_ids = _project_ids(principal)
+        while True:
+            query = (
+                db.query(TriggerTask.id)
+                .outerjoin(DfvsTaskListProjection, DfvsTaskListProjection.task_id == TriggerTask.id)
+                .filter(DfvsTaskListProjection.task_id.is_(None))
+            )
+            if project_id:
+                self._ensure_project_access(principal, project_id)
+                query = query.filter(TriggerTask.project_id == project_id)
+            elif project_ids:
+                query = query.filter(TriggerTask.project_id.in_(project_ids))
+            missing_ids = [str(task_id) for task_id, in query.order_by(TriggerTask.created_at.desc(), TriggerTask.id.desc()).limit(batch_size).all()]
+            if not missing_ids:
+                return
+            triggers = (
+                db.query(TriggerTask)
+                .filter(TriggerTask.id.in_(missing_ids))
+                .all()
+            )
+            self._rebuild_task_list_projections(db, triggers)
+            db.commit()
+
+    def _refresh_task_list_projection_for_task_id(self, db: Session, task_id: str | None) -> None:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return
+        trigger = db.get(TriggerTask, normalized_task_id)
+        if trigger is None:
+            db.query(DfvsTaskListProjection).filter(DfvsTaskListProjection.task_id == normalized_task_id).delete()
+            db.flush()
+            return
+        self._rebuild_task_list_projections(db, [trigger])
+
+    def _refresh_task_list_projection_for_execution(self, db: Session, execution: WorkflowExecution | None) -> None:
+        if execution is None:
+            return
+        self._refresh_task_list_projection_for_task_id(db, execution.trigger_task_id)
+
+    def rebuild_single_scan_task_projection(
+        self,
+        db: Session,
+        task_id: str,
+        principal: dict,
+    ) -> ScanTaskProjectionRepairResponse:
+        trigger = self._trigger_or_404(db, task_id)
+        self._ensure_project_access(principal, trigger.project_id)
+        self._rebuild_task_list_projections(db, [trigger])
+        db.commit()
+        return ScanTaskProjectionRepairResponse(
+            task_id=trigger.id,
+            project_id=trigger.project_id,
+            repaired_count=1,
+            message="task list projection rebuilt",
+        )
+
+    def rebuild_scan_task_projections(
+        self,
+        db: Session,
+        principal: dict,
+        *,
+        project_id: str | None = None,
+    ) -> ScanTaskProjectionRepairResponse:
+        query = db.query(TriggerTask)
+        if project_id:
+            self._ensure_project_access(principal, project_id)
+            query = query.filter(TriggerTask.project_id == project_id)
+        else:
+            project_ids = _project_ids(principal)
+            if project_ids:
+                query = query.filter(TriggerTask.project_id.in_(project_ids))
+        triggers = query.order_by(TriggerTask.created_at.desc(), TriggerTask.id.desc()).all()
+        self._rebuild_task_list_projections(db, triggers)
+        db.commit()
+        return ScanTaskProjectionRepairResponse(
+            project_id=project_id,
+            repaired_count=len(triggers),
+            message="task list projections rebuilt",
+        )
+
+    def _list_task_projection_query(
+        self,
+        db: Session,
+        principal: dict,
+        *,
+        project_id: str | None = None,
+        status_filter: str | None = None,
+        profile_id: str | None = None,
+        mode: str | None = None,
+        parent_task_id: str | None = None,
+        sort_by: str | None = None,
+        sort_order: str | None = None,
+    ):
+        project_ids = _project_ids(principal)
+        query = db.query(DfvsTaskListProjection)
+        if project_id:
+            self._ensure_project_access(principal, project_id)
+            query = query.filter(DfvsTaskListProjection.project_id == project_id)
+        elif project_ids:
+            query = query.filter(DfvsTaskListProjection.project_id.in_(project_ids))
+        if status_filter:
+            query = query.filter(DfvsTaskListProjection.public_status == normalize_public_task_status(status_filter))
+        if profile_id:
+            query = query.filter(DfvsTaskListProjection.profile_id == profile_id)
+        normalized_mode = str(mode or "").strip().lower()
+        if normalized_mode in {"manual", "binary", "source"}:
+            query = query.filter(DfvsTaskListProjection.origin_mode == normalized_mode)
+        normalized_parent_task_id = str(parent_task_id or "").strip()
+        if normalized_parent_task_id:
+            query = query.filter(DfvsTaskListProjection.parent_task_id == normalized_parent_task_id)
+        normalized_sort_by = str(sort_by or "created_at").strip()
+        sort_column = _TASK_LIST_SORT_COLUMNS.get(normalized_sort_by)
+        if sort_column is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"unsupported sort_by: {normalized_sort_by}",
+            )
+        order_expr = sort_column.asc() if str(sort_order or "").lower() == "asc" else sort_column.desc()
+        return query.order_by(order_expr, DfvsTaskListProjection.task_id.desc())
 
     def _source_run_index_for_trigger(self, db: Session, trigger: TriggerTask, execution: WorkflowExecution | None) -> RunIndex | None:
         if execution is not None:
@@ -2730,6 +3139,7 @@ class ExecutionService:
         self._sync_trigger_abnormal_reason(db, trigger=trigger, execution=execution)
         db.add(execution)
         db.add(trigger)
+        self._refresh_task_list_projection_for_task_id(db, trigger.id)
 
     def _apply_terminal_state_mutation(
         self,
@@ -2762,6 +3172,9 @@ class ExecutionService:
             if sync_abnormal_reason:
                 self._sync_trigger_abnormal_reason(db, trigger=trigger, execution=execution)
             db.add(trigger)
+            self._refresh_task_list_projection_for_task_id(db, trigger.id)
+        elif execution is not None:
+            self._refresh_task_list_projection_for_execution(db, execution)
         db.flush()
 
     def mark_dispatch_failure_terminal(
@@ -2790,6 +3203,9 @@ class ExecutionService:
             trigger.latest_abnormal_reason_json = None
             self._sync_trigger_abnormal_reason(db, trigger=trigger, execution=execution)
             db.add(trigger)
+            self._refresh_task_list_projection_for_task_id(db, trigger.id)
+        else:
+            self._refresh_task_list_projection_for_execution(db, execution)
         db.flush()
 
     def _legacy_dispatch_failure_reconcile_threshold(self) -> datetime:
@@ -3488,6 +3904,8 @@ class ExecutionService:
                 message="task start requested",
                 payload_json={"task_id": trigger.id, "attempt_no": latest_execution.attempt_no},
             )
+        self._refresh_task_list_projection_for_task_id(db, trigger.id)
+        db.commit()
         return self._scan_task_response(db, trigger)
 
     def create_evolution_task(
@@ -3917,54 +4335,85 @@ class ExecutionService:
         project_id: str | None = None,
         status_filter: str | None = None,
         profile_id: str | None = None,
-        limit: int = 100,
-        offset: int = 0,
         page: int | None = None,
         per_page: int | None = None,
         mode: str | None = None,
         parent_task_id: str | None = None,
         sort_by: str | None = None,
         sort_order: str | None = None,
-        paged: bool = False,
-    ) -> List[ScanTaskResponse] | ScanTaskListResponse:
-        query = self._list_scan_tasks_query(
+    ) -> ScanTaskListResponse:
+        self._backfill_missing_task_list_projections(db, principal, project_id=project_id)
+        query = self._list_task_projection_query(
             db,
             principal,
             project_id=project_id,
+            status_filter=status_filter,
             profile_id=profile_id,
             mode=mode,
             parent_task_id=parent_task_id,
             sort_by=sort_by,
             sort_order=sort_order,
         )
-        if not paged:
-            safe_limit = max(1, min(int(limit or 100), 500))
-            safe_offset = max(0, int(offset or 0))
-            responses = [
-                self._scan_task_response(db, item, include_run_summary=False)
-                for item in query.all()
-            ]
-            filtered = self._filter_task_responses_by_status(responses, status_filter)
-            return filtered[safe_offset:safe_offset + safe_limit]
-
         safe_page = max(1, int(page or 1))
         safe_per_page = max(1, min(int(per_page or 100), 500))
-        if not status_filter:
-            total = query.count()
-            rows = query.offset((safe_page - 1) * safe_per_page).limit(safe_per_page).all()
-            items = self._build_light_scan_task_responses(db, rows)
-        else:
-            rows = query.all()
-            items = self._filter_task_responses_by_status(
-                self._build_light_scan_task_responses(db, rows),
-                status_filter,
-            )
-            total = len(items)
+        total = query.order_by(None).count()
+        rows = query.offset((safe_page - 1) * safe_per_page).limit(safe_per_page).all()
+        items = [self._projection_to_task_list_item(row) for row in rows]
         return ScanTaskListResponse(
-            items=items[(safe_page - 1) * safe_per_page:safe_page * safe_per_page] if status_filter else items,
+            items=items,
             total=total,
             page=safe_page,
             per_page=safe_per_page,
+        )
+
+    def get_scan_task_stats(
+        self,
+        db: Session,
+        principal: dict,
+        *,
+        project_id: str | None = None,
+        status_filter: str | None = None,
+        profile_id: str | None = None,
+        mode: str | None = None,
+        parent_task_id: str | None = None,
+    ) -> ScanTaskStatsResponse:
+        self._backfill_missing_task_list_projections(db, principal, project_id=project_id)
+        query = self._list_task_projection_query(
+            db,
+            principal,
+            project_id=project_id,
+            status_filter=status_filter,
+            profile_id=profile_id,
+            mode=mode,
+            parent_task_id=parent_task_id,
+            sort_by="created_at",
+            sort_order="desc",
+        )
+        rows = (
+            query.order_by(None)
+            .with_entities(DfvsTaskListProjection.public_status, func.count(DfvsTaskListProjection.task_id))
+            .group_by(DfvsTaskListProjection.public_status)
+            .all()
+        )
+        counts = {
+            "pending": 0,
+            "running": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "cancelled": 0,
+        }
+        total = 0
+        for public_status, count in rows:
+            normalized = normalize_public_task_status(public_status)
+            counts[normalized] = counts.get(normalized, 0) + int(count or 0)
+            total += int(count or 0)
+        return ScanTaskStatsResponse(
+            total=total,
+            pending=counts.get("pending", 0),
+            running=counts.get("running", 0),
+            succeeded=counts.get("succeeded", 0),
+            failed=counts.get("failed", 0),
+            cancelled=counts.get("cancelled", 0),
         )
 
     def get_scan_task(self, db: Session, task_id: str, principal: dict) -> ScanTaskDetailResponse:
@@ -4409,6 +4858,8 @@ class ExecutionService:
             level="warning" if report_status.get("status") in {"failed", "partial_failed"} else "info",
             payload_json={**report_status, "result_files": selected},
         )
+        self._refresh_task_list_projection_for_task_id(db, trigger.id)
+        db.commit()
         return report_status
 
     def get_run_cycle(self, db: Session, run_index_id: str, cycle: int, principal: dict) -> dict[str, Any]:
@@ -4847,6 +5298,7 @@ class ExecutionService:
                 )
             self._write_run_control_state(run_index.run_root_path, status_text=control_status, message=message)
             get_run_index_service().sync_execution_run(db, execution)
+            self._refresh_task_list_projection_for_execution(db, execution)
             db.flush()
             if execution is not None:
                 self.record_event(
@@ -4867,6 +5319,7 @@ class ExecutionService:
         )
         self._write_run_control_state(run_index.run_root_path, status_text=control_status, message=message)
         get_run_index_service().sync_execution_run(db, execution)
+        self._refresh_task_list_projection_for_execution(db, execution)
         db.flush()
         if execution is not None:
             self.record_event(
@@ -5036,12 +5489,14 @@ class ExecutionService:
 
         self._expunge_loaded_records(db, WorkflowExecution, execution_ids)
         self._expunge_loaded_records(db, TriggerTask, [linked_task_id] if linked_task_id else [])
+        self._expunge_loaded_records(db, DfvsTaskListProjection, [linked_task_id] if linked_task_id else [])
 
         if execution_ids:
             db.query(WorkflowExecutionEvent).filter(WorkflowExecutionEvent.execution_id.in_(execution_ids)).delete(synchronize_session=False)
             db.query(WorkflowExecution).filter(WorkflowExecution.id.in_(execution_ids)).delete(synchronize_session=False)
         if linked_task_id:
             db.query(TriggerTask).filter(TriggerTask.id == linked_task_id).delete(synchronize_session=False)
+            db.query(DfvsTaskListProjection).filter(DfvsTaskListProjection.task_id == linked_task_id).delete(synchronize_session=False)
 
     def delete_run(self, db: Session, run_index_id: str, principal: dict) -> dict[str, Any]:
         run_index = self._run_index_or_404(db, run_index_id, principal)
@@ -5669,6 +6124,7 @@ class ExecutionService:
         trigger.priority = priority
         trigger.message = f"priority updated to {priority}"
         db.add(trigger)
+        self._refresh_task_list_projection_for_task_id(db, trigger.id)
         db.commit()
         db.refresh(trigger)
         return self._scan_task_response(db, trigger)
@@ -5736,6 +6192,7 @@ class ExecutionService:
         execution.process_finished_at = None
         self._sync_runtime_state_snapshots(trigger=trigger, execution=execution, public_status="running", control_state="none")
         db.add(execution)
+        self._refresh_task_list_projection_for_execution(db, execution)
         db.commit()
         self._try_write_cli_process_file(
             execution=execution,
@@ -5841,6 +6298,7 @@ class ExecutionService:
         self._sync_runtime_state_snapshots(trigger=trigger, execution=execution, public_status="running", control_state="none")
         db.add(execution)
         db.add(trigger)
+        self._refresh_task_list_projection_for_task_id(db, trigger.id)
         db.commit()
 
         runtime_overrides = dict(metadata.get("runtime_overrides") or {})
@@ -5876,6 +6334,7 @@ class ExecutionService:
             db.add(trigger)
             db.commit()
             get_run_index_service().sync_execution_run(db, execution)
+            self._refresh_task_list_projection_for_execution(db, execution)
             db.commit()
             self.record_event(
                 db,
@@ -5902,6 +6361,7 @@ class ExecutionService:
             db.refresh(execution)
             db.refresh(trigger)
             run_index = get_run_index_service().sync_execution_run(db, execution)
+            self._refresh_task_list_projection_for_execution(db, execution)
             output_summary = run_dir / "output" / "execution_summary.json"
             output_manifest = run_dir / "output" / "tasks.json"
             output_manifest_path = output_manifest if output_manifest.is_file() else output_summary if output_summary.is_file() else None
@@ -5931,6 +6391,7 @@ class ExecutionService:
             )
             db.commit()
             get_run_index_service().sync_execution_run(db, execution)
+            self._refresh_task_list_projection_for_execution(db, execution)
             db.commit()
             report_status = {}
             if terminal_status == "succeeded":
@@ -6031,6 +6492,7 @@ class ExecutionService:
             self._sync_runtime_state_snapshots(trigger=trigger, execution=execution, public_status="running", control_state="none")
             db.add(execution)
             db.add(trigger)
+            self._refresh_task_list_projection_for_task_id(db, trigger.id)
             db.commit()
             custom_workspace_root, custom_output_dir = self._resolve_custom_execution_paths(
                 project_id=definition.project_id,
@@ -6071,6 +6533,7 @@ class ExecutionService:
                 },
             )
             get_run_index_service().sync_execution_run(db, execution)
+            self._refresh_task_list_projection_for_execution(db, execution)
             db.commit()
             log_path = attach_log_file(abs_path(runtime_root / "run.log"))
             self.record_event(
@@ -6131,6 +6594,7 @@ class ExecutionService:
                 },
             )
             get_run_index_service().sync_execution_run(db, execution)
+            self._refresh_task_list_projection_for_execution(db, execution)
             db.commit()
             self.record_event(
                 db,
@@ -6168,6 +6632,7 @@ class ExecutionService:
                         },
                     )
                     get_run_index_service().sync_execution_run(db, execution)
+                    self._refresh_task_list_projection_for_execution(db, execution)
                     db.commit()
                 self.record_event(
                     db,
@@ -6197,6 +6662,7 @@ class ExecutionService:
                     },
                 )
                 get_run_index_service().sync_execution_run(db, execution)
+                self._refresh_task_list_projection_for_execution(db, execution)
                 db.commit()
             self.record_event(
                 db,

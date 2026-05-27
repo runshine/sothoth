@@ -400,6 +400,67 @@ class SchedulerWorkerSlotReservation(Base):
     updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
 
 
+class DfvsTaskListProjection(Base):
+    __tablename__ = _prefix("task_list_projection")
+
+    task_id = Column(String(64), primary_key=True)
+    project_id = Column(String(64), nullable=False, index=True)
+    title = Column(String(255), nullable=False, default="")
+    profile_id = Column(String(64), nullable=False, default="")
+    profile_version = Column(Integer, nullable=False, default=1)
+    priority = Column(Integer, nullable=False, default=100)
+    created_by = Column(String(128), nullable=False, default="")
+    task_purpose = Column(String(32), nullable=False, default="normal")
+    task_origin_type = Column(String(32), nullable=True)
+    parent_task_id = Column(String(64), nullable=True)
+    parent_task_type = Column(String(32), nullable=True)
+    parent_stage_name = Column(String(64), nullable=True)
+    parent_stage_item_id = Column(String(64), nullable=True)
+    parent_stage_item_key = Column(String(255), nullable=True)
+    origin_mode = Column(String(32), nullable=False, default="manual")
+    origin_label = Column(String(255), nullable=True)
+    parent_task_display = Column(String(255), nullable=True)
+    public_status = Column(String(32), nullable=False, default="pending")
+    control_state = Column(String(32), nullable=False, default="none")
+    message = Column(Text)
+    abnormal_reason_title = Column(String(255), nullable=True)
+    abnormal_reason_code = Column(String(128), nullable=True)
+    abnormal_reason_category = Column(String(128), nullable=True)
+    latest_execution_id = Column(String(64), nullable=True)
+    latest_attempt_no = Column(Integer, nullable=False, default=0)
+    owner_pod_id = Column(String(255), nullable=True)
+    dispatch_status = Column(String(32), nullable=True)
+    slot_binding_state = Column(String(64), nullable=True)
+    slot_binding_reason = Column(String(255), nullable=True)
+    latest_run_id = Column(String(64), nullable=True)
+    latest_run_status = Column(String(32), nullable=True)
+    run_name = Column(String(255), nullable=True)
+    run_path = Column(String(1024), nullable=True)
+    runs_root = Column(String(1024), nullable=True)
+    run_model = Column(String(255), nullable=True)
+    run_provider = Column(String(255), nullable=True)
+    run_thinking = Column(String(64), nullable=True)
+    run_workflow_mode = Column(String(64), nullable=True)
+    run_max_cycles = Column(Integer, nullable=True)
+    run_cycles_used = Column(Integer, nullable=True)
+    run_result_count = Column(Integer, nullable=True)
+    run_passed_count = Column(Integer, nullable=True)
+    run_failed_count = Column(Integer, nullable=True)
+    run_duration_seconds = Column(Float, nullable=True)
+    run_start_epoch = Column(Integer, nullable=True)
+    auto_report_vulnerabilities = Column(Boolean, nullable=False, default=True)
+    vuln_report_enabled = Column(Boolean, nullable=False, default=True)
+    vuln_report_status = Column(String(32), nullable=False, default="not_started")
+    vuln_report_total = Column(Integer, nullable=False, default=0)
+    vuln_report_reported = Column(Integer, nullable=False, default=0)
+    vuln_report_failed = Column(Integer, nullable=False, default=0)
+    vuln_report_pending = Column(Integer, nullable=False, default=0)
+    started_at = Column(DateTime)
+    finished_at = Column(DateTime)
+    created_at = Column(DateTime, default=now_utc)
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
+
+
 class ServiceRuntimeConfig(Base):
     __tablename__ = _prefix("service_runtime_config")
 
@@ -426,6 +487,7 @@ MODEL_CLASSES = [
     VulnReportSubmission,
     SchedulerWorker,
     SchedulerWorkerSlotReservation,
+    DfvsTaskListProjection,
     ServiceRuntimeConfig,
 ]
 
@@ -447,6 +509,11 @@ INDEX_DEFINITIONS = [
     (TriggerTask.__tablename__, "ix_dfvs_task_project_profile_created", "CREATE INDEX ix_dfvs_task_project_profile_created ON {table} (project_id, profile_id, created_at)"),
     (TriggerTask.__tablename__, "ix_dfvs_task_latest_exec", "CREATE INDEX ix_dfvs_task_latest_exec ON {table} (latest_execution_id)"),
     (TriggerTask.__tablename__, "ix_dfvs_task_def_status", "CREATE INDEX ix_dfvs_task_def_status ON {table} (workflow_definition_id, status)"),
+    (DfvsTaskListProjection.__tablename__, "ix_dfvs_tlp_project_created", "CREATE INDEX ix_dfvs_tlp_project_created ON {table} (project_id, created_at)"),
+    (DfvsTaskListProjection.__tablename__, "ix_dfvs_tlp_project_status_created", "CREATE INDEX ix_dfvs_tlp_project_status_created ON {table} (project_id, public_status, created_at)"),
+    (DfvsTaskListProjection.__tablename__, "ix_dfvs_tlp_project_profile_created", "CREATE INDEX ix_dfvs_tlp_project_profile_created ON {table} (project_id, profile_id, created_at)"),
+    (DfvsTaskListProjection.__tablename__, "ix_dfvs_tlp_project_parent_created", "CREATE INDEX ix_dfvs_tlp_project_parent_created ON {table} (project_id, parent_task_id, created_at)"),
+    (DfvsTaskListProjection.__tablename__, "ix_dfvs_tlp_project_origin_created", "CREATE INDEX ix_dfvs_tlp_project_origin_created ON {table} (project_id, origin_mode, created_at)"),
     (WorkflowExecution.__tablename__, "ix_dfvs_exec_task", "CREATE INDEX ix_dfvs_exec_task ON {table} (trigger_task_id)"),
     (WorkflowExecution.__tablename__, "ix_dfvs_exec_def", "CREATE INDEX ix_dfvs_exec_def ON {table} (workflow_definition_id)"),
     (WorkflowExecution.__tablename__, "ix_dfvs_exec_defver", "CREATE INDEX ix_dfvs_exec_defver ON {table} (workflow_definition_version_id)"),
