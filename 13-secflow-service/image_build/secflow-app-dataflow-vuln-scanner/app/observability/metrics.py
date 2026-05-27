@@ -395,13 +395,13 @@ def _collect_task_and_execution_metrics(db: Session, builder: MetricsBuilder) ->
 
     task_queue_depth = (
         db.query(func.count(TriggerTask.id))
-        .filter(TriggerTask.status.in_(("pending", "queued")))
+        .filter(TriggerTask.status == "pending")
         .scalar()
         or 0
     )
     execution_queue_depth = (
         db.query(func.count(WorkflowExecution.id))
-        .filter(WorkflowExecution.status.in_(("pending", "queued")))
+        .filter(WorkflowExecution.status == "pending")
         .scalar()
         or 0
     )

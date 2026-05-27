@@ -105,6 +105,8 @@ _TASK_PURPOSE_LABELS = {
     "evolution": "进化任务",
 }
 
+_CANONICAL_TASK_STATUSES = {"pending", "running", "succeeded", "failed", "cancelled"}
+
 _TASK_LIST_SORT_COLUMNS = {
     "created_at": TriggerTask.created_at,
     "updated_at": TriggerTask.updated_at,
@@ -183,6 +185,21 @@ _RETRYABLE_RUN_INDEX_STATUSES = {
     "blocked_external_source",
     "error",
 }
+
+
+def _canonical_task_status(value: str | None) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"pending", "queued", "dispatching"}:
+        return "pending"
+    if text in {"running", "cancel_requested", "delete_requested"}:
+        return "running"
+    if text in {"succeeded", "completed", "success", "passed"}:
+        return "succeeded"
+    if text in {"cancelled", "interrupted", "stopped"}:
+        return "cancelled"
+    if text:
+        return "failed"
+    return "pending"
 
 
 def _command_display(args: list[str]) -> str:
@@ -1024,6 +1041,10 @@ class ExecutionService:
             execution=latest_execution,
             run_summary=run_summary,
         )
+        slot_binding_state, slot_binding_reason = self._slot_binding_state(
+            execution=latest_execution,
+            effective_status=effective_task_status,
+        )
         return ScanTaskResponse(
             task_id=trigger.id,
             project_id=trigger.project_id,
@@ -1063,6 +1084,10 @@ class ExecutionService:
             finished_at=effective_finished_at,
             message=effective_task_message,
             latest_execution_id=trigger.latest_execution_id,
+            owner_pod_id=latest_execution.owner_pod_id if latest_execution is not None else None,
+            dispatch_status=latest_execution.dispatch_status if latest_execution is not None else None,
+            slot_binding_state=slot_binding_state,
+            slot_binding_reason=slot_binding_reason,
             run_name=run_locator["run_name"],
             runs_root=run_locator["runs_root"],
             run_path=run_locator["run_path"],
@@ -1239,6 +1264,10 @@ class ExecutionService:
             execution=latest_execution,
             run_summary=latest_run,
         )
+        slot_binding_state, slot_binding_reason = self._slot_binding_state(
+            execution=latest_execution,
+            effective_status=effective_status,
+        )
         auto_report_enabled = bool(task_metadata.get("auto_report_vulnerabilities", True))
         report_status = {"status": "disabled" if not auto_report_enabled else "not_started", "enabled": auto_report_enabled}
         return ScanTaskListItemResponse(
@@ -1268,6 +1297,10 @@ class ExecutionService:
             finished_at=effective_finished_at,
             message=effective_message,
             latest_execution_id=trigger.latest_execution_id or (str(latest_execution.id) if latest_execution is not None else None),
+            owner_pod_id=latest_execution.owner_pod_id if latest_execution is not None else None,
+            dispatch_status=latest_execution.dispatch_status if latest_execution is not None else None,
+            slot_binding_state=slot_binding_state,
+            slot_binding_reason=slot_binding_reason,
             run_name=run_locator["run_name"],
             runs_root=run_locator["runs_root"],
             run_path=run_locator["run_path"],
@@ -1284,20 +1317,19 @@ class ExecutionService:
         execution: WorkflowExecution | None,
         run_summary: dict[str, Any] | None,
     ) -> tuple[str, str | None, datetime | None, datetime | None]:
-        trigger_status = str(trigger.status or "").strip().lower()
+        trigger_status = _canonical_task_status(trigger.status)
         trigger_message = str(trigger.message or "").strip() or None
         trigger_started_at = trigger.started_at
         trigger_finished_at = trigger.finished_at
 
-        execution_status = str(execution.status or "").strip().lower() if execution is not None else ""
+        execution_status = _canonical_task_status(execution.status) if execution is not None else ""
         dispatch_status = str(execution.dispatch_status or "").strip().lower() if execution is not None else ""
         execution_message = str(execution.message or "").strip() if execution is not None else ""
         execution_started_at = execution.started_at if execution is not None else None
         execution_finished_at = execution.finished_at if execution is not None else None
 
         run_summary = run_summary or {}
-        run_status = str(run_summary.get("status") or "").strip().lower()
-
+        run_status = _canonical_task_status(run_summary.get("status"))
         effective_status = trigger_status or execution_status or run_status or "pending"
         effective_message = trigger_message or execution_message or None
         effective_started_at = trigger_started_at or execution_started_at
@@ -1305,25 +1337,45 @@ class ExecutionService:
 
         if effective_status == "pending":
             if dispatch_status in {"queued", "dispatching"}:
-                effective_status = "queued"
                 effective_message = execution_message or trigger_message or effective_message
-            elif execution_status in {"queued", "running", "cancel_requested", "delete_requested"}:
+            elif execution_status == "running":
                 effective_status = execution_status
                 effective_message = execution_message or trigger_message or effective_message
                 effective_started_at = execution_started_at or effective_started_at
                 effective_finished_at = execution_finished_at or effective_finished_at
-            elif run_status in {"queued", "running", "cancel_requested", "delete_requested"}:
-                effective_status = "running" if run_status == "running" else run_status
-                effective_message = execution_message or trigger_message or effective_message
 
-        if effective_status in {"running", "cancel_requested", "delete_requested"}:
+        if effective_status == "running":
             effective_started_at = execution_started_at or trigger_started_at or effective_started_at
-            effective_finished_at = execution_finished_at if effective_status not in {"running"} else None
-        elif effective_status == "queued":
+            effective_finished_at = None
+        elif effective_status == "pending":
             effective_started_at = execution_started_at or trigger_started_at or effective_started_at
             effective_finished_at = None
 
         return effective_status, effective_message, effective_started_at, effective_finished_at
+
+    def _slot_binding_state(
+        self,
+        *,
+        execution: WorkflowExecution | None,
+        effective_status: str,
+    ) -> tuple[str | None, str | None]:
+        normalized_status = _canonical_task_status(effective_status)
+        if normalized_status in {"succeeded", "failed", "cancelled"}:
+            return "released", None
+        if execution is None:
+            return ("unbound", "no execution record") if normalized_status else (None, None)
+
+        owner_pod_id = str(execution.owner_pod_id or "").strip()
+        dispatch_status = str(execution.dispatch_status or "").strip().lower()
+        execution_status = _canonical_task_status(execution.status)
+
+        if owner_pod_id:
+            return "bound", None
+        if dispatch_status in {"queued", "dispatching"}:
+            return "queued", f"dispatch_status={dispatch_status}"
+        if execution_status == "running":
+            return "unbound_running", "active execution without owner_pod_id"
+        return "unbound", None
 
     def _scan_task_detail(self, db: Session, trigger: TriggerTask) -> ScanTaskDetailResponse:
         response = self._scan_task_response(db, trigger)
@@ -1425,6 +1477,10 @@ class ExecutionService:
         )
 
     def _attempt_response(self, execution: WorkflowExecution, run_id: str | None = None) -> ScanTaskAttemptResponse:
+        slot_binding_state, slot_binding_reason = self._slot_binding_state(
+            execution=execution,
+            effective_status=execution.status,
+        )
         return ScanTaskAttemptResponse(
             execution_id=execution.id,
             task_id=execution.trigger_task_id,
@@ -1435,6 +1491,8 @@ class ExecutionService:
             worker_url=execution.worker_url,
             worker_job_id=execution.worker_job_id,
             dispatch_status=execution.dispatch_status,
+            slot_binding_state=slot_binding_state,
+            slot_binding_reason=slot_binding_reason,
             dispatch_error=execution.dispatch_error,
             process_pid=execution.process_pid,
             process_host=execution.process_host,
@@ -2875,32 +2933,7 @@ class ExecutionService:
         return str(status_text or "").strip().lower() in _ACTIVE_RUN_INDEX_STATUSES
 
     def _adopted_run_index_task_status(self, status_text: str | None) -> str:
-        value = str(status_text or "").strip().lower()
-        if value in {"pending", "queued", "running", "cancel_requested", "delete_requested", "failed", "cancelled"}:
-            return value
-        if value == "orphaned":
-            return "failed"
-        if value in {"completed", "succeeded", "success", "passed"}:
-            return "succeeded"
-        if value in {"interrupted", "stopped"}:
-            return "cancelled"
-        if value in {
-            "timeout",
-            "error",
-            "review_error",
-            "review_plateau",
-            "summary_incomplete",
-            "runtime_output_limit",
-            "runtime_timeout",
-            "blocked_context_window",
-            "blocked_quota",
-            "provider_rate_limited",
-            "model_contract_violation",
-            "blocked_external_source",
-            "no_workspace",
-        }:
-            return "failed"
-        return value or "succeeded"
+        return _canonical_task_status(status_text or "succeeded")
 
     def _run_index_output_manifest_path(self, run_index) -> str | None:
         atomic_work_path = str(run_index.atomic_work_path or "").strip()
@@ -3315,7 +3348,8 @@ class ExecutionService:
         elif project_ids:
             query = query.filter(TriggerTask.project_id.in_(project_ids))
         if status_filter:
-            query = query.filter(TriggerTask.status == status_filter)
+            normalized_status = _canonical_task_status(status_filter)
+            query = query.filter(TriggerTask.status == normalized_status)
         if profile_id:
             query = query.filter(TriggerTask.profile_id == profile_id)
         normalized_mode = str(mode or "").strip().lower()
@@ -3759,7 +3793,7 @@ class ExecutionService:
         """
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
-        if trigger.status in {"pending", "queued", "running", "cancel_requested", "delete_requested"}:
+        if _canonical_task_status(trigger.status) in {"pending", "running"}:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="task is still active and cannot be retried")
         definition = db.get(WorkflowDefinition, trigger.workflow_definition_id)
         if definition is None:
@@ -4325,18 +4359,15 @@ class ExecutionService:
         if not bool(process_state.get("stale")):
             return False
 
-        execution_status = str(execution.status or "").strip().lower() if execution is not None else ""
-        trigger_status = str(trigger.status or "").strip().lower() if trigger is not None else ""
+        execution_status = _canonical_task_status(execution.status) if execution is not None else ""
+        trigger_status = _canonical_task_status(trigger.status) if trigger is not None else ""
+        process_status = str(execution.process_status or "").strip().lower() if execution is not None else ""
         if execution_status not in _ACTIVE_RUN_INDEX_STATUSES and trigger_status not in _ACTIVE_RUN_INDEX_STATUSES:
             return False
 
-        if execution_status in {"cancel_requested", "delete_requested"} or trigger_status in {"cancel_requested", "delete_requested"}:
-            delete_requested = execution_status == "delete_requested" or trigger_status == "delete_requested"
-            message = (
-                "stale delete_requested runtime assumed stopped"
-                if delete_requested
-                else "stale cancel_requested runtime assumed cancelled"
-            )
+        if process_status in {"stop_requested", "delete_requested"}:
+            delete_requested = process_status == "delete_requested"
+            message = "stale delete_requested runtime assumed stopped" if delete_requested else "stale cancel_requested runtime assumed cancelled"
             if execution is not None and trigger is not None:
                 self._set_terminal_state(
                     db,
@@ -4571,12 +4602,12 @@ class ExecutionService:
                 trigger.message = "deleted before dispatch"
                 db.add(trigger)
         elif execution is not None and self._run_index_status_is_active(execution.status):
-            execution.status = "delete_requested"
+            execution.status = "running"
             execution.message = "delete requested; stopping run_vuln_scan.py"
             execution.process_status = "delete_requested"
             db.add(execution)
             if trigger is not None:
-                trigger.status = "delete_requested"
+                trigger.status = "running"
                 trigger.message = "delete requested; stopping run_vuln_scan.py"
                 db.add(trigger)
             run_index = get_run_index_service().bind_runtime_state(
@@ -4606,7 +4637,7 @@ class ExecutionService:
                     return self._run_mutation_response(
                         run_id=run_index_id,
                         project_id=project_id,
-                        status_text="delete_requested",
+                        status_text="running",
                         message="Run delete requested; worker unreachable",
                         linked_task_id=linked_task_id,
                         linked_execution_id=linked_execution_id,
@@ -4831,7 +4862,7 @@ class ExecutionService:
                 self._cancel_worker_job(latest_execution)
                 if latest_execution is not None and latest_execution.worker_url and latest_execution.worker_job_id
                 else self._signal_local_cli_process(latest_execution.id, wait=False)
-                if latest_execution is not None and latest_execution.status in {"running", "cancel_requested"}
+                if latest_execution is not None and _canonical_task_status(latest_execution.status) == "running"
                 else {"signal": None}
             )
             if latest_execution is not None and latest_execution.worker_url and latest_execution.worker_job_id:
@@ -4841,7 +4872,7 @@ class ExecutionService:
                     action="cancel",
                     payload=stop_payload,
                 )
-            status_text = "cancel_requested"
+            status_text = "running"
             message = "Run cancel requested"
             if latest_execution is None or latest_execution.status == "cancelled":
                 status_text = "cancelled"
@@ -5057,12 +5088,12 @@ class ExecutionService:
                 latest_execution.message = "cancelled before dispatch"
                 db.add(latest_execution)
             self._sync_trigger_abnormal_reason(db, trigger=trigger, execution=latest_execution)
-        elif trigger.status in {"running", "cancel_requested"}:
-            trigger.status = "cancel_requested"
+        elif _canonical_task_status(trigger.status) == "running":
+            trigger.status = "running"
             trigger.message = "cancel requested"
             trigger.latest_abnormal_reason_json = None
-            if latest_execution is not None and latest_execution.status == "running":
-                latest_execution.status = "cancel_requested"
+            if latest_execution is not None and _canonical_task_status(latest_execution.status) == "running":
+                latest_execution.status = "running"
                 latest_execution.message = "cancel requested"
                 latest_execution.process_status = "stop_requested"
                 db.add(latest_execution)
@@ -5080,7 +5111,7 @@ class ExecutionService:
                     action="cancel",
                     payload=stop_payload,
                 )
-            elif latest_execution.status in {"running", "cancel_requested"}:
+            elif _canonical_task_status(latest_execution.status) == "running":
                 self._signal_local_cli_process(latest_execution.id, wait=False)
         db.refresh(trigger)
         return self._scan_task_response(db, trigger)
@@ -5088,7 +5119,7 @@ class ExecutionService:
     def delete_scan_task(self, db: Session, task_id: str, principal: dict) -> dict[str, Any]:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
-        if trigger.status in {"pending", "running", "cancel_requested"}:
+        if _canonical_task_status(trigger.status) in {"pending", "running"}:
             try:
                 self.cancel_scan_task(db, task_id, principal)
                 trigger = self._trigger_or_404(db, task_id)
@@ -5231,8 +5262,7 @@ class ExecutionService:
                 )
                 db.expire(execution)
                 db.expire(trigger)
-                if execution.status in {"cancel_requested", "delete_requested"} or trigger.status in {"cancel_requested", "delete_requested"}:
-                    execution.process_status = "delete_requested" if execution.status == "delete_requested" or trigger.status == "delete_requested" else "stop_requested"
+                if str(execution.process_status or "").strip().lower() in {"stop_requested", "delete_requested"}:
                     db.add(execution)
                     db.commit()
                     self._try_write_cli_process_file(
@@ -5372,11 +5402,10 @@ class ExecutionService:
                 message = "run_vuln_scan.py completed"
             elif (
                 exit_code in {130, -signal.SIGINT, -signal.SIGTERM, -signal.SIGKILL}
-                or execution.status in {"cancel_requested", "delete_requested"}
-                or trigger.status in {"cancel_requested", "delete_requested"}
+                or str(execution.process_status or "").strip().lower() in {"stop_requested", "delete_requested"}
             ):
                 terminal_status = "cancelled"
-                message = "run_vuln_scan.py stopped for delete" if execution.status == "delete_requested" or trigger.status == "delete_requested" else "run_vuln_scan.py cancelled"
+                message = "run_vuln_scan.py stopped for delete" if str(execution.process_status or "").strip().lower() == "delete_requested" else "run_vuln_scan.py cancelled"
             elif exit_code == 124:
                 terminal_status = "failed"
                 message = "run_vuln_scan.py exited with timeout code 124"

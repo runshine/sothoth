@@ -352,6 +352,7 @@ def test_manager_dispatches_execution_to_dataflow_worker(
         assert trigger is not None
         assert execution.status == "pending"
         assert trigger.status == "pending"
+        assert execution.owner_pod_id == "worker-a"
         assert execution.worker_url == "http://worker-a"
         assert execution.worker_job_id == f"job-{execution_id}"
         assert execution.dispatch_status == "queued"
@@ -402,7 +403,10 @@ def test_manager_dispatch_uses_registry_worker_and_creates_reservation(
     db = get_db_session()
     try:
         reservation = db.query(SchedulerWorkerSlotReservation).filter(SchedulerWorkerSlotReservation.execution_id == execution_id).first()
+        execution = db.get(WorkflowExecution, execution_id)
         assert reservation is not None
+        assert execution is not None
+        assert execution.owner_pod_id == "worker-registry-1"
         assert reservation.worker_pod_id == "worker-registry-1"
         assert reservation.status == "accepted"
     finally:
@@ -584,7 +588,7 @@ def test_worker_cancel_job_marks_running_execution_stop_requested(
     monkeypatch.setattr("app.services.scheduler.get_execution_service", lambda: FakeExecutionService())
 
     payload = SchedulerService().cancel_local_job("job-worker-cancel")
-    assert payload["status"] == "cancel_requested"
+    assert payload["status"] == "running"
 
 
 def test_cluster_capacity_api_returns_worker_jobs(

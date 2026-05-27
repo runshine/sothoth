@@ -39,7 +39,7 @@ from app.time_utils import now_local
 
 logger = logging.getLogger(__name__)
 
-ACTIVE_JOB_STATUSES = {"queued", "pending", "running", "cancel_requested", "delete_requested"}
+ACTIVE_JOB_STATUSES = {"queued", "pending", "running"}
 TERMINAL_EXECUTION_STATUSES = {"succeeded", "failed", "cancelled"}
 
 
@@ -973,7 +973,7 @@ class SchedulerService:
                         "worker_pod_id": worker_pod_id,
                     }
                 )
-                self._mark_dispatch_success(execution_id, worker_url, job)
+                self._mark_dispatch_success(execution_id, worker_pod_id, worker_url, job)
                 return True
             except DataflowWorkerError as exc:
                 last_error = str(exc)
@@ -1059,15 +1059,17 @@ class SchedulerService:
             reservation.lease_expires_at = expires_at
         db.add(reservation)
 
-    def _mark_dispatch_success(self, execution_id: str, worker_url: str, job: dict[str, Any]) -> None:
+    def _mark_dispatch_success(self, execution_id: str, worker_pod_id: str, worker_url: str, job: dict[str, Any]) -> None:
         db = get_db_session()
         try:
             execution = db.get(WorkflowExecution, execution_id)
             if execution is None:
                 return
             job_id = str(job.get("id") or job.get("job_id") or execution.worker_job_id or execution.id)
+            owner_pod_id = str(job.get("owner_pod_id") or worker_pod_id or execution.owner_pod_id or "").strip() or None
             execution.worker_url = worker_url
             execution.worker_job_id = job_id
+            execution.owner_pod_id = owner_pod_id
             execution.dispatch_status = str(job.get("status") or "queued")
             execution.dispatch_error = None
             reservation = (
@@ -1091,7 +1093,11 @@ class SchedulerService:
                 execution_id=execution_id,
                 event_type="worker_dispatch_succeeded",
                 message=f"execution dispatched to {worker_url}",
-                payload_json={"worker_url": worker_url, "job": job},
+                payload_json={
+                    "worker_url": worker_url,
+                    "worker_pod_id": owner_pod_id,
+                    "job": job,
+                },
             )
         finally:
             db.close()
@@ -1104,6 +1110,7 @@ class SchedulerService:
                 return
             execution.worker_url = None
             execution.worker_job_id = None
+            execution.owner_pod_id = None
             execution.dispatch_status = None
             execution.dispatch_error = error
             execution.message = f"worker dispatch failed: {error}"
@@ -1274,14 +1281,14 @@ class SchedulerService:
                 db.commit()
                 return self._job_payload(execution)
 
-            if execution.status in {"running", "cancel_requested", "delete_requested"}:
-                requested_status = "delete_requested" if execution.status == "delete_requested" else "cancel_requested"
-                execution.status = requested_status
+            if execution.status == "running":
+                requested_status = "cancel_requested"
+                execution.status = "running"
                 execution.dispatch_status = requested_status
-                execution.process_status = "delete_requested" if requested_status == "delete_requested" else "stop_requested"
-                execution.message = "delete requested" if requested_status == "delete_requested" else "cancel requested"
-                if trigger is not None and trigger.status in {"running", "cancel_requested", "delete_requested"}:
-                    trigger.status = requested_status
+                execution.process_status = "stop_requested"
+                execution.message = "cancel requested"
+                if trigger is not None and trigger.status == "running":
+                    trigger.status = "running"
                     trigger.message = execution.message
                     db.add(trigger)
                 db.add(execution)
@@ -1430,6 +1437,7 @@ class SchedulerService:
             for worker in stale_workers:
                 db.delete(worker)
 
+            self._backfill_execution_owner_bindings(db)
             self._cleanup_stale_reservations(db, now)
             self._requeue_stuck_dispatches(db, now)
 
@@ -1438,6 +1446,53 @@ class SchedulerService:
             db.commit()
         finally:
             db.close()
+
+    def _backfill_execution_owner_bindings(self, db: Session, *, limit: int = 200) -> int:
+        executions = (
+            db.query(WorkflowExecution)
+            .filter(
+                WorkflowExecution.owner_pod_id.is_(None),
+                WorkflowExecution.worker_job_id.isnot(None),
+                or_(
+                    WorkflowExecution.status.in_(tuple(ACTIVE_JOB_STATUSES)),
+                    WorkflowExecution.dispatch_status.in_(tuple(ACTIVE_JOB_STATUSES)),
+                ),
+            )
+            .order_by(WorkflowExecution.updated_at.asc())
+            .limit(limit)
+            .all()
+        )
+        if not executions:
+            return 0
+
+        reservations = (
+            db.query(SchedulerWorkerSlotReservation)
+            .filter(
+                SchedulerWorkerSlotReservation.execution_id.in_([execution.id for execution in executions])
+            )
+            .all()
+        )
+        reservation_map = {str(item.execution_id): str(item.worker_pod_id) for item in reservations}
+        registry_workers = db.query(SchedulerWorker).all()
+        worker_url_map: dict[str, str] = {}
+        for worker in registry_workers:
+            worker_url = self._worker_url_from_registry(worker)
+            if not worker_url:
+                continue
+            worker_url_map[worker_url.rstrip("/")] = str(worker.pod_id)
+
+        repaired = 0
+        for execution in executions:
+            owner_pod_id = reservation_map.get(str(execution.id))
+            if not owner_pod_id:
+                worker_url = str(execution.worker_url or "").strip().rstrip("/")
+                owner_pod_id = worker_url_map.get(worker_url) if worker_url else None
+            if not owner_pod_id:
+                continue
+            execution.owner_pod_id = owner_pod_id
+            db.add(execution)
+            repaired += 1
+        return repaired
 
     def _cleanup_stale_reservations(self, db: Session, now: Any) -> None:
         reservations = (
