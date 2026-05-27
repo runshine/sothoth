@@ -44,12 +44,12 @@ from app.services.run_inspector import (
     inspect_session_file,
     inspect_sessions,
 )
+from app.services.run_state import is_run_active, is_run_terminal
 from app.time_utils import UTC_PLUS_8, ensure_local, isoformat_local, now_local
 
 logger = logging.getLogger("dataflow_vuln.run_index")
 
 RUN_INDEX_LOG_SUMMARY_MAX_CHARS = 32768
-_ACTIVE_RUN_INDEX_STATUSES = {"running", "pending", "queued", "cancel_requested", "delete_requested"}
 _SOURCE_MTIME_COMPARE_EPSILON = 1e-6
 _RUN_INDEX_LIGHT_REFRESH_DEBOUNCE_SECONDS = 1.0
 _RUN_INDEX_RUNTIME_REFRESH_DEBOUNCE_SECONDS = 2.0
@@ -495,7 +495,7 @@ def _run_index_needs_parser_resync(record: RunIndex) -> bool:
 
 
 def _run_index_is_active(record: RunIndex) -> bool:
-    return str(record.status or "").strip().lower() in _ACTIVE_RUN_INDEX_STATUSES
+    return is_run_active(record.status)
 
 
 def _new_results_by_cycle_for_index(run_index: RunIndex) -> dict[int, list[dict[str, Any]]]:
@@ -1006,7 +1006,7 @@ class RunIndexService:
         started_at = _parse_datetime(str(run_timestamps.get("started_at") or "")) or _datetime_from_epoch(summary.get("start_epoch"))
         finished_at = _parse_datetime(str(run_timestamps.get("finished_at") or ""))
         last_activity_at = _parse_datetime(str(detail.get("last_activity") or "")) or finished_at
-        if finished_at is None and summary.get("status") not in {"running", "pending", "queued", "cancel_requested", "delete_requested"}:
+        if finished_at is None and is_run_terminal(summary.get("status")):
             duration = int(summary.get("duration_seconds") or 0)
             if started_at and duration > 0:
                 finished_at = started_at + timedelta(seconds=duration)
@@ -1870,7 +1870,7 @@ class RunIndexService:
         )
         if record is not None:
             return self.refresh_run_index(db, record, include_runtime_assets=False)
-        if str(execution.status or "").strip().lower() in _ACTIVE_RUN_INDEX_STATUSES:
+        if is_run_active(execution.status):
             return None
         record = self.sync_execution_run(db, execution)
         if record is not None:

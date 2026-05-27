@@ -71,6 +71,7 @@ from app.services.run_index_service import (
     _load_externalized_mapping_payload,
     get_run_index_service,
 )
+from app.services.run_state import is_run_active, is_run_queued, is_run_terminal
 from app.services.dataflow_worker_client import DataflowWorkerError, get_dataflow_worker_client
 from app.services.pi_vuln_adapter import (
     DbExecutionObserver,
@@ -145,29 +146,6 @@ def _project_ids(principal: dict) -> set[str]:
     return set(principal.get("project_ids") or [])
 
 
-_ACTIVE_RUN_INDEX_STATUSES = {"pending", "queued", "running", "cancel_requested", "delete_requested"}
-_QUEUE_RUN_INDEX_STATUSES = {"pending", "queued"}
-_TERMINAL_RUN_INDEX_STATUSES = {
-    "succeeded",
-    "completed",
-    "failed",
-    "cancelled",
-    "interrupted",
-    "stopped",
-    "deleted",
-    "review_error",
-    "review_plateau",
-    "summary_incomplete",
-    "runtime_output_limit",
-    "runtime_timeout",
-    "blocked_context_window",
-    "blocked_quota",
-    "provider_rate_limited",
-    "model_contract_violation",
-    "blocked_external_source",
-    "no_workspace",
-    "error",
-}
 _RETRYABLE_RUN_INDEX_STATUSES = {
     "cancelled",
     "failed",
@@ -1831,7 +1809,7 @@ class ExecutionService:
                     "last_updated_at": isoformat_local(current),
                 }
             )
-            if normalized_status in _TERMINAL_RUN_INDEX_STATUSES and not payload.get("finished_at"):
+            if is_run_terminal(normalized_status) and not payload.get("finished_at"):
                 payload["finished_at"] = isoformat_local(current)
             write_json(
                 timestamp_path,
@@ -2930,7 +2908,7 @@ class ExecutionService:
         }
 
     def _run_index_status_is_active(self, status_text: str | None) -> bool:
-        return str(status_text or "").strip().lower() in _ACTIVE_RUN_INDEX_STATUSES
+        return is_run_active(status_text)
 
     def _adopted_run_index_task_status(self, status_text: str | None) -> str:
         return _canonical_task_status(status_text or "succeeded")
@@ -4145,7 +4123,7 @@ class ExecutionService:
         run_status = str(run_index.status or "").strip().lower()
         trigger_status = str(trigger.status or "").strip().lower() if trigger is not None else ""
         execution_status = str(execution.status or "").strip().lower() if execution is not None else ""
-        if run_status in _QUEUE_RUN_INDEX_STATUSES or trigger_status in _QUEUE_RUN_INDEX_STATUSES or execution_status in _QUEUE_RUN_INDEX_STATUSES:
+        if is_run_queued(run_status) or is_run_queued(trigger_status) or is_run_queued(execution_status):
             base.update(
                 {
                     "can_retry": False,
@@ -4217,7 +4195,7 @@ class ExecutionService:
                 )
                 return base
 
-        if run_status in _ACTIVE_RUN_INDEX_STATUSES or trigger_status in _ACTIVE_RUN_INDEX_STATUSES or execution_status in _ACTIVE_RUN_INDEX_STATUSES:
+        if is_run_active(run_status) or is_run_active(trigger_status) or is_run_active(execution_status):
             started_at = None
             if execution is not None:
                 started_at = execution.process_started_at or execution.started_at or started_at
@@ -4240,7 +4218,7 @@ class ExecutionService:
                     )
                     return base
 
-        if run_status in _ACTIVE_RUN_INDEX_STATUSES or trigger_status in _ACTIVE_RUN_INDEX_STATUSES or execution_status in _ACTIVE_RUN_INDEX_STATUSES:
+        if is_run_active(run_status) or is_run_active(trigger_status) or is_run_active(execution_status):
             base.update(
                 {
                     "can_retry": True,
@@ -4270,8 +4248,12 @@ class ExecutionService:
             str(execution.status or "").strip().lower() if execution is not None else "",
             str(trigger.status or "").strip().lower() if trigger is not None else "",
         ]
-        if current in _ACTIVE_RUN_INDEX_STATUSES or not current:
-            terminal_linked_statuses = [candidate for candidate in linked_statuses if candidate in _TERMINAL_RUN_INDEX_STATUSES]
+        current_canonical = _canonical_task_status(current)
+        linked_canonical_statuses = [_canonical_task_status(candidate) for candidate in linked_statuses if candidate]
+        if any(status in {"pending", "running"} for status in linked_canonical_statuses):
+            return "running" if "running" in linked_canonical_statuses else "pending"
+        if is_run_active(current) or not current:
+            terminal_linked_statuses = [candidate for candidate in linked_statuses if is_run_terminal(candidate)]
             for candidate in terminal_linked_statuses:
                 if candidate not in {"succeeded", "completed"}:
                     return candidate
@@ -4285,7 +4267,7 @@ class ExecutionService:
                 # vanished.  Surface that as interrupted so the UI does not show
                 # an impossible active process and enables retry guidance.
                 return "interrupted"
-        return current or str(current_status or "")
+        return current or current_canonical or str(current_status or "")
 
     def _enrich_run_payload(
         self,
@@ -4362,7 +4344,7 @@ class ExecutionService:
         execution_status = _canonical_task_status(execution.status) if execution is not None else ""
         trigger_status = _canonical_task_status(trigger.status) if trigger is not None else ""
         process_status = str(execution.process_status or "").strip().lower() if execution is not None else ""
-        if execution_status not in _ACTIVE_RUN_INDEX_STATUSES and trigger_status not in _ACTIVE_RUN_INDEX_STATUSES:
+        if not is_run_active(execution_status) and not is_run_active(trigger_status):
             return False
 
         if process_status in {"stop_requested", "delete_requested"}:
@@ -4432,7 +4414,18 @@ class ExecutionService:
         reconciled = 0
         rows = (
             db.query(WorkflowExecution)
-            .filter(WorkflowExecution.status.in_(tuple(_ACTIVE_RUN_INDEX_STATUSES)))
+            .filter(
+                WorkflowExecution.status.in_(
+                    (
+                        "pending",
+                        "queued",
+                        "dispatching",
+                        "running",
+                        "cancel_requested",
+                        "delete_requested",
+                    )
+                )
+            )
             .order_by(WorkflowExecution.updated_at.asc())
             .limit(limit)
             .all()

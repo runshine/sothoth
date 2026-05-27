@@ -10,44 +10,11 @@ from typing import Any
 from fastapi import HTTPException
 
 from app.pi_vuln_core.utils.win_compat import from_msys_path
-
-
-_RUNNING_WORKFLOW_STATES = {
-    "created",
-    "start_plugins",
-    "worker",
-    "reflect",
-    "summary",
-    "global_review",
-    "result_review",
-    "end_plugins",
-    "running",
-    "queued",
-    "pending",
-}
-
-_TERMINAL_STATUSES = {
-    "completed",
-    "succeeded",
-    "failed",
-    "interrupted",
-    "cancelled",
-    "stopped",
-    "review_error",
-    "review_plateau",
-    "summary_incomplete",
-    "runtime_output_limit",
-    "runtime_timeout",
-    "blocked_context_window",
-    "blocked_quota",
-    "provider_rate_limited",
-    "model_contract_violation",
-    "blocked_external_source",
-    "no_workspace",
-    "error",
-}
-
-_GENERIC_TERMINAL_STATUSES = {"failed", "error"}
+from app.services.run_state import (
+    RUN_GENERIC_TERMINAL_STATES,
+    RUN_TERMINAL_STATES,
+    normalize_run_status,
+)
 
 
 def _is_profile_gate_issue(issue: dict[str, Any]) -> bool:
@@ -689,25 +656,9 @@ def _read_run_timestamps(run_dir: Path) -> dict[str, Any]:
 
 
 def _normalize_run_status(raw_status: str, run_meta: dict[str, Any] | None = None) -> str:
-    run_meta = run_meta or {}
-    text = str(raw_status or "").strip().lower()
-    meta_status = str(run_meta.get("status") or "").strip().lower()
-    # The control/timestamps file is written by the managed task runtime and by
-    # stale-runtime reconciliation.  Treat a terminal control status as
-    # authoritative even when the original run_vuln_scan.py process disappeared
-    # before it could fill finished_at; otherwise stale state.json entries such
-    # as current_state=running keep resurrecting a dead Run as "running".
-    if meta_status in _TERMINAL_STATUSES:
-        if meta_status in _GENERIC_TERMINAL_STATUSES and text in (_TERMINAL_STATUSES - _GENERIC_TERMINAL_STATUSES):
-            return text
-        return meta_status
-    if not run_meta.get("finished_at") and meta_status in _RUNNING_WORKFLOW_STATES:
-        return "running" if meta_status == "in_progress" else meta_status
-    if text in _TERMINAL_STATUSES:
-        return text
-    if text in _RUNNING_WORKFLOW_STATES:
-        return "running" if text not in {"pending", "queued"} else text
-    return text or "pending"
+    # Keep this shim for existing imports/tests while the internal model moves
+    # to shared helpers.
+    return normalize_run_status(raw_status, run_meta)
 
 
 def _find_last_activity(atomic: Path | None, run_dir: Path, *, include_session_events: bool = True) -> str:

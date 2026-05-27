@@ -976,14 +976,14 @@ def test_run_retry_queue_cancel_and_delete(service_config_path, monkeypatch):
     )
     assert completed_retry_response.status_code == 202
     retry_payload = completed_retry_response.json()
-    assert retry_payload["status"] == "queued"
+    assert retry_payload["status"] == "pending"
     assert retry_payload["linked_task_id"]
     assert retry_payload["linked_execution_id"]
 
     detail_queued = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
     assert detail_queued.status_code == 200
     detail_payload = detail_queued.json()
-    assert detail_payload["status"] == "queued"
+    assert detail_payload["status"] == "pending"
     assert detail_payload["process_state"]["can_retry"] is False
     assert "--resume-run-dir" in detail_payload["retry_command_display"]
 

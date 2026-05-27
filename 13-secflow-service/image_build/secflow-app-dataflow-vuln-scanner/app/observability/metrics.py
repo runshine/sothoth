@@ -23,8 +23,8 @@ from app.models.database import (
     get_db_session,
 )
 from app.observability.service_ops import emit_service_operation_metrics
-from app.services.execution_service import _ACTIVE_RUN_INDEX_STATUSES
 from app.services.run_index_service import _load_externalized_json_payload, _load_externalized_mapping_payload
+from app.services.run_state import RUN_QUEUE_STATES
 from app.services.scheduler import ACTIVE_JOB_STATUSES, get_scheduler_service
 
 PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
@@ -407,7 +407,7 @@ def _collect_task_and_execution_metrics(db: Session, builder: MetricsBuilder) ->
     )
     run_queue_depth = (
         db.query(func.count(RunIndex.id))
-        .filter(RunIndex.status.in_(tuple(_ACTIVE_RUN_INDEX_STATUSES & {"pending", "queued"})))
+        .filter(RunIndex.status.in_(tuple(sorted(RUN_QUEUE_STATES & {"pending", "queued"}))))
         .scalar()
         or 0
     )
