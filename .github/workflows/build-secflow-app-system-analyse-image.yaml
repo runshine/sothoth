@@ -22,7 +22,7 @@ jobs:
           MAIN_REPO_SHA: ${{ github.sha }}
         run: |
           SHORT_SHA="${MAIN_REPO_SHA::7}"
-          echo "date_tag=$(date +'%Y%m%d-%H%M%S')-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "date_tag=$(TZ=Asia/Shanghai date +'%Y%m%d-%H%M%S')-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
   build-amd64:
     needs: prepare
