@@ -16396,6 +16396,28 @@ class TaskManager:
                 raise ValidationError(message)
         return normalized
 
+    def _resolve_vuln_scan_dataflow_input_dir(self, item: dict[str, Any]) -> str:
+        # DFVS should receive the DFA archive root so it can see both
+        # final_report.md and the nested dataflow/ reports together.
+        if not isinstance(item, dict):
+            return ""
+        for key in ("data_flow_root", "archive_root", "artifact_root"):
+            candidate = str(item.get(key) or "").strip()
+            if candidate:
+                return candidate
+        nested_dir = str(item.get("dataflow_dir") or "").strip()
+        if nested_dir:
+            nested_path = Path(nested_dir)
+            if nested_path.name == "dataflow" and nested_path.parent != nested_path:
+                return str(nested_path.parent)
+            return nested_dir
+        data_flow_file = str(item.get("data_flow_file") or item.get("primary_report_path") or "").strip()
+        if data_flow_file:
+            report_path = Path(data_flow_file)
+            if report_path.name == "final_report.md" and report_path.parent != report_path:
+                return str(report_path.parent)
+        return ""
+
     def _resolve_dataflow_directory(self, root: Path) -> Path | None:
         if not root.exists():
             return None
@@ -17023,10 +17045,10 @@ class TaskManager:
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
-                    dataflow_input_dir = str(dataflow_result.get("dataflow_dir") or dataflow_result.get("data_flow_root") or "")
+                    dataflow_input_dir = self._resolve_vuln_scan_dataflow_input_dir(dataflow_result)
                     source_dir = str(dataflow_result.get("source_root_path") or dataflow_result.get("source_dir") or "")
                     if not dataflow_input_dir:
-                        raise ValidationError("数据流漏洞挖掘输入缺少 dataflow_dir")
+                        raise ValidationError("数据流漏洞挖掘输入缺少 data_flow_root/dataflow_dir")
                     if not source_dir:
                         raise ValidationError("数据流漏洞挖掘输入缺少 source_dir")
                     created = await get_dataflow_vuln_scanner_client().create_task(

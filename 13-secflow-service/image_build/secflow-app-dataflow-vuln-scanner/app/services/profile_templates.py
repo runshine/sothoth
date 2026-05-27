@@ -199,6 +199,10 @@ class ProfileTemplateService:
                 engine["reflection_rpc_stdout_trace_bytes"] = profile_policy.reflection_rpc_stdout_trace_bytes
                 engine["reflection_rpc_stdout_abort_bytes"] = profile_policy.reflection_rpc_stdout_abort_bytes
                 engine.setdefault("summary_repair_attempt_budget", 2)
+                engine.setdefault("global_review_schema_repair_limit", 2)
+                engine.setdefault("result_review_schema_repair_limit", 2)
+                engine.setdefault("global_review_fresh_session_schema_repair_limit", 1)
+                engine.setdefault("result_review_fresh_session_schema_repair_limit", 1)
                 engine["min_discovery_cycles_before_pass"] = profile_policy.min_discovery_cycles_before_pass
                 engine["progress_required_after_cycle"] = profile_policy.progress_required_after_cycle
                 engine["progress_no_signal_closure_streak"] = profile_policy.progress_no_signal_closure_streak

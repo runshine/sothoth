@@ -74,6 +74,7 @@ class ReviewScheduler:
         parallel: bool = True,
         concurrency_limit: int = 3,
         advisor_sessions: dict[str, str] | None = None,
+        engine_config: EngineConfig | None = None,
         resume_cursor: dict | None = None,
     ) -> tuple[bool, list[FailedResultItem]]:
         """执行结果评审"""
@@ -94,5 +95,6 @@ class ReviewScheduler:
             parallel=parallel,
             concurrency_limit=concurrency_limit,
             advisor_sessions=advisor_sessions,
+            engine_config=engine_config,
             resume_cursor=resume_cursor,
         )

@@ -17,6 +17,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from app.pi_vuln_core.review.json_repair import repair_json_like_candidate
+
 
 @dataclass
 class ParsedReviewResult:
@@ -231,7 +233,7 @@ def _try_parse_json(content: str) -> Optional[ParsedReviewResult]:
         unique_candidates.append(candidate)
 
     for candidate in unique_candidates:
-        for variant in (candidate, _repair_json_like_candidate(candidate)):
+        for variant in (candidate, repair_json_like_candidate(candidate)):
             variant = variant.strip()
             if not variant:
                 continue
@@ -350,20 +352,6 @@ def _walk_values(obj: Any):
     elif isinstance(obj, list):
         for item in obj:
             yield from _walk_values(item)
-
-
-def _repair_json_like_candidate(candidate: str) -> str:
-    repaired = candidate or ""
-    def _fix_range_value(m: re.Match) -> str:
-        cleaned = re.sub(r'\s+', '', m.group(2))
-        return f'{m.group(1)}"{cleaned}"{m.group(3)}'
-    repaired = re.sub(
-        r'(:\s*)(\d+\s*-\s*\d+)(\s*[,}\]])',
-        _fix_range_value,
-        repaired,
-    )
-    repaired = re.sub(r',\s*([}\]])', r'\1', repaired)
-    return repaired
 
 
 def _extract_pseudo_json_fields(candidate: str) -> dict[str, Any]:

@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from app.pi_vuln_core.review.json_repair import repair_json_like_candidate
 from app.pi_vuln_core.review.models import ParsedReviewResult
 
 
@@ -124,7 +125,7 @@ def parse_result_review_response(content: str) -> ResultReviewParseOutcome:
         )
 
     for candidate in _extract_json_candidates(raw):
-        for variant, mode in ((candidate, "json"), (_repair_json_like_candidate(candidate), "json_repaired")):
+        for variant, mode in ((candidate, "json"), (repair_json_like_candidate(candidate), "json_repaired")):
             try:
                 data = json.loads(variant)
             except (json.JSONDecodeError, TypeError, ValueError):
@@ -252,20 +253,6 @@ def _extract_json_candidates(raw: str) -> list[str]:
         seen.add(item)
         unique.append(item)
     return unique
-
-
-def _repair_json_like_candidate(candidate: str) -> str:
-    repaired = candidate
-    def _fix_range_value(m: re.Match) -> str:
-        cleaned = re.sub(r'\s+', '', m.group(2))
-        return f'{m.group(1)}"{cleaned}"{m.group(3)}'
-    repaired = re.sub(
-        r'(:\s*)(\d+\s*-\s*\d+)(\s*[,}\]])',
-        _fix_range_value,
-        repaired,
-    )
-    repaired = re.sub(r',\s*([}\]])', r'\1', repaired)
-    return repaired
 
 
 def _is_canonical_result_review_dict(data: dict[str, Any]) -> tuple[bool, str]:

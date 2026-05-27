@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from app.pi_vuln_core.agents.registry import AgentRuntimeRegistry
-from app.pi_vuln_core.config.models import AdvisorInstanceDef
+from app.pi_vuln_core.config.models import AdvisorInstanceDef, EngineConfig
 from app.pi_vuln_core.engine.checkpoint import record_step_checkpoint
 from app.pi_vuln_core.recorder.recorder import ExecutionRecorder
 from app.pi_vuln_core.review.models import ParsedReviewResult
@@ -54,6 +54,7 @@ from app.pi_vuln_core.utils.logger import get_logger
 logger = get_logger("result_review")
 
 _RESULT_REVIEW_SCHEMA_REPAIR_LIMIT = 2
+_RESULT_REVIEW_FRESH_SESSION_SCHEMA_REPAIR_LIMIT = 1
 
 
 class ResultReviewFrameworkError(RuntimeError):
@@ -103,6 +104,7 @@ class ResultReviewExecutor:
         parallel: bool = True,
         concurrency_limit: int = 3,
         advisor_sessions: dict[str, str] | None = None,
+        engine_config: EngineConfig | None = None,
         resume_cursor: dict | None = None,
     ) -> tuple[bool, list[FailedResultItem]]:
         """
@@ -222,6 +224,8 @@ class ResultReviewExecutor:
                         review_state,
                         advisor_sessions,
                         current_fingerprints.get(result_file),
+                        self._schema_repair_limit(engine_config),
+                        self._fresh_session_schema_repair_limit(engine_config),
                     )
 
             tasks = [_bounded_review(result_file) for result_file in pending]
@@ -240,6 +244,8 @@ class ResultReviewExecutor:
                         review_state,
                         advisor_sessions,
                         current_fingerprints.get(result_file),
+                        self._schema_repair_limit(engine_config),
+                        self._fresh_session_schema_repair_limit(engine_config),
                     )
                     outcomes.append(outcome)
                 except Exception as e:
@@ -390,6 +396,25 @@ class ResultReviewExecutor:
             f"{Path(result_file).stem}_{advisor_def.instance_id}"
         )
 
+    @staticmethod
+    def _schema_repair_limit(engine_config: EngineConfig | None) -> int:
+        value = getattr(engine_config, "result_review_schema_repair_limit", None)
+        if isinstance(value, int) and value >= 0:
+            return value
+        return _RESULT_REVIEW_SCHEMA_REPAIR_LIMIT
+
+    @staticmethod
+    def _fresh_session_schema_repair_limit(engine_config: EngineConfig | None) -> int:
+        value = getattr(engine_config, "result_review_fresh_session_schema_repair_limit", None)
+        if isinstance(value, int) and value >= 0:
+            return value
+        return _RESULT_REVIEW_FRESH_SESSION_SCHEMA_REPAIR_LIMIT
+
+    @staticmethod
+    def _schema_repair_session_hint(session_hint: str, attempt: int) -> str:
+        base = str(session_hint or "result_review_schema_repair").strip() or "result_review_schema_repair"
+        return f"{base}_schema_repair_fresh_{attempt:02d}"
+
     def _build_result_review_context_text(
         self,
         *,
@@ -474,6 +499,8 @@ class ResultReviewExecutor:
         review_state: ReviewState,
         advisor_sessions: dict[str, str] | None = None,
         current_fingerprint: str | None = None,
+        schema_repair_limit: int = _RESULT_REVIEW_SCHEMA_REPAIR_LIMIT,
+        fresh_session_schema_repair_limit: int = _RESULT_REVIEW_FRESH_SESSION_SCHEMA_REPAIR_LIMIT,
     ) -> bool:
         """
         评审单个结果文件 (R6f: 结果内串行)
@@ -600,6 +627,7 @@ class ResultReviewExecutor:
             response = None
             guard_before = None
             early_violations: list[str] = []
+            force_close_session = False
             try:
                 for attempt_index in range(retry_limit + 1):
                     if attempt_index > 0:
@@ -729,16 +757,22 @@ class ResultReviewExecutor:
                         error_code=response.error_code,
                     )
 
-                parse_outcome, repair_attempts, raw_chain = await self._parse_with_schema_repair(
+                parse_outcome, repair_attempts, raw_chain, session_id = await self._parse_with_schema_repair(
                     agent=agent,
                     session_id=session_id,
+                    session_key=session_key,
+                    advisor_sessions=advisor_sessions,
+                    session_hint=session_hint,
                     system_prompt=system_prompt,
                     working_dir=work_dir,
                     result_file=result_file,
                     review_context_hint=review_context["repair_hint"],
                     initial_response_content=response.content or "",
+                    schema_repair_limit=schema_repair_limit,
+                    fresh_session_schema_repair_limit=fresh_session_schema_repair_limit,
                 )
                 if not parse_outcome.schema_valid:
+                    force_close_session = True
                     reason = parse_outcome.repair_reason or "结果评审未返回 canonical JSON"
                     await self.recorder.record_result_review(
                         work_dir=work_dir,
@@ -779,6 +813,7 @@ class ResultReviewExecutor:
                     take_read_only_snapshot(work_dir),
                 )
                 if violations:
+                    force_close_session = True
                     violation_feedback = format_read_only_violations(violations)
                     logger.error(
                         "result_review_read_only_violation",
@@ -897,6 +932,7 @@ class ResultReviewExecutor:
             finally:
                 close_after_call = (
                     should_reset
+                    or force_close_session
                     or response is None
                     or (response is not None and not response.success)
                     or bool(early_violations)
@@ -914,22 +950,28 @@ class ResultReviewExecutor:
         *,
         agent,
         session_id: str,
+        session_key: str,
+        advisor_sessions: dict[str, str],
+        session_hint: str,
         system_prompt: str,
         working_dir: str,
         result_file: str,
         review_context_hint: str,
         initial_response_content: str,
-    ) -> tuple[ResultReviewParseOutcome, int, str]:
+        schema_repair_limit: int = _RESULT_REVIEW_SCHEMA_REPAIR_LIMIT,
+        fresh_session_schema_repair_limit: int = _RESULT_REVIEW_FRESH_SESSION_SCHEMA_REPAIR_LIMIT,
+    ) -> tuple[ResultReviewParseOutcome, int, str, str]:
         parse_outcome = parse_result_review_response(initial_response_content)
         repair_attempts = 0
         raw_chain = initial_response_content or ""
+        current_session_id = session_id
 
-        while parse_outcome.needs_repair and repair_attempts < _RESULT_REVIEW_SCHEMA_REPAIR_LIMIT:
+        while parse_outcome.needs_repair and repair_attempts < schema_repair_limit:
             repair_attempts += 1
             logger.warning(
                 "result_review_schema_invalid",
                 result_file=result_file,
-                session_id=session_id,
+                session_id=current_session_id,
                 parser_mode=parse_outcome.parser_mode,
                 reason=parse_outcome.repair_reason,
                 repair_attempt=repair_attempts,
@@ -942,14 +984,14 @@ class ResultReviewExecutor:
             repair_response = await agent.send_message(
                 message=repair_prompt,
                 system_prompt=system_prompt,
-                session_id=session_id,
+                session_id=current_session_id,
                 working_dir=working_dir,
             )
             if not repair_response.success:
                 logger.warning(
                     "result_review_schema_repair_failed",
                     result_file=result_file,
-                    session_id=session_id,
+                    session_id=current_session_id,
                     error=repair_response.error,
                     repair_attempt=repair_attempts,
                 )
@@ -959,7 +1001,60 @@ class ResultReviewExecutor:
             raw_chain = self._merge_raw_response_chain(raw_chain, repair_content, repair_attempts)
             parse_outcome = parse_result_review_response(repair_content)
 
-        return parse_outcome, repair_attempts, raw_chain
+        fresh_attempts = 0
+        while parse_outcome.needs_repair and fresh_attempts < fresh_session_schema_repair_limit:
+            fresh_attempts += 1
+            previous_session_id = current_session_id
+            if previous_session_id:
+                with contextlib.suppress(Exception):
+                    await agent.close_session(previous_session_id)
+                if advisor_sessions.get(session_key) == previous_session_id:
+                    advisor_sessions.pop(session_key, None)
+            current_session_id = await agent.create_session_with_hint(
+                self._schema_repair_session_hint(session_hint, fresh_attempts)
+            )
+            advisor_sessions[session_key] = current_session_id
+            logger.warning(
+                "result_review_schema_repair_fresh_session_retry",
+                result_file=result_file,
+                previous_session_id=previous_session_id,
+                session_id=current_session_id,
+                parser_mode=parse_outcome.parser_mode,
+                reason=parse_outcome.repair_reason,
+                fresh_attempt=fresh_attempts,
+            )
+            repair_prompt = self._build_fresh_session_schema_repair_prompt(
+                result_file=result_file,
+                review_context_hint=review_context_hint,
+                parse_outcome=parse_outcome,
+                raw_response=raw_chain,
+            )
+            repair_response = await agent.send_message(
+                message=repair_prompt,
+                system_prompt=system_prompt,
+                session_id=current_session_id,
+                working_dir=working_dir,
+            )
+            repair_attempts += 1
+            if not repair_response.success:
+                logger.warning(
+                    "result_review_schema_repair_fresh_session_failed",
+                    result_file=result_file,
+                    session_id=current_session_id,
+                    error=repair_response.error,
+                    fresh_attempt=fresh_attempts,
+                )
+                continue
+
+            repair_content = repair_response.content or ""
+            raw_chain = self._merge_raw_response_chain_with_label(
+                raw_chain,
+                repair_content,
+                f"fresh_session_schema_repair_attempt_{fresh_attempts}",
+            )
+            parse_outcome = parse_result_review_response(repair_content)
+
+        return parse_outcome, repair_attempts, raw_chain, current_session_id
 
     @staticmethod
     def _build_schema_repair_prompt(
@@ -1000,12 +1095,42 @@ class ResultReviewExecutor:
         )
 
     @staticmethod
+    def _build_fresh_session_schema_repair_prompt(
+        *,
+        result_file: str,
+        review_context_hint: str,
+        parse_outcome: ResultReviewParseOutcome,
+        raw_response: str,
+    ) -> str:
+        base = ResultReviewExecutor._build_schema_repair_prompt(
+            result_file=result_file,
+            review_context_hint=review_context_hint,
+            parse_outcome=parse_outcome,
+        )
+        return (
+            "上一会话连续未能输出符合 schema 的 JSON。当前是一个新的修复会话。\n"
+            "不要重新做代码分析；只基于下面给出的上一会话原始输出，把结论重编码为 canonical JSON。\n\n"
+            "[previous_raw_response_begin]\n"
+            f"{raw_response}\n"
+            "[previous_raw_response_end]\n\n"
+            f"{base}"
+        )
+
+    @staticmethod
     def _merge_raw_response_chain(original: str, repaired: str, repair_attempt: int) -> str:
+        return ResultReviewExecutor._merge_raw_response_chain_with_label(
+            original,
+            repaired,
+            f"schema_repair_attempt_{repair_attempt}",
+        )
+
+    @staticmethod
+    def _merge_raw_response_chain_with_label(original: str, repaired: str, label: str) -> str:
         if not original:
             return repaired
         if not repaired:
             return original
         return (
             f"[original_response]\n{original}\n\n"
-            f"[schema_repair_attempt_{repair_attempt}]\n{repaired}"
+            f"[{label}]\n{repaired}"
         )

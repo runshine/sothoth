@@ -71,6 +71,7 @@ _KNOWN_SCORE_KEYS: tuple[str, ...] = (
 )
 
 _GLOBAL_REVIEW_SCHEMA_REPAIR_LIMIT = 2
+_GLOBAL_REVIEW_FRESH_SESSION_SCHEMA_REPAIR_LIMIT = 1
 
 
 class GlobalReviewExecutor:
@@ -171,6 +172,8 @@ class GlobalReviewExecutor:
                 cycle=cycle,
                 review_state=review_state,
                 advisor_sessions=advisor_sessions,
+                schema_repair_limit=self._schema_repair_limit(engine_config),
+                fresh_session_schema_repair_limit=self._fresh_session_schema_repair_limit(engine_config),
             ))
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -362,6 +365,8 @@ class GlobalReviewExecutor:
         cycle: int,
         review_state: ReviewState,
         advisor_sessions: dict[str, str],
+        schema_repair_limit: int,
+        fresh_session_schema_repair_limit: int,
     ) -> dict:
         """执行单个全局评审参谋，返回结构化结果。"""
         agent = self.agents.get(advisor_def.agent_id)
@@ -422,6 +427,7 @@ class GlobalReviewExecutor:
         response = None
         guard_before = None
         early_violations: list[str] = []
+        force_close_session = False
         try:
             for attempt_index in range(retry_limit + 1):
                 if attempt_index > 0:
@@ -563,20 +569,26 @@ class GlobalReviewExecutor:
                     "issues": fallback_issues,
                 }
 
-            parse_outcome, repair_attempts, raw_chain = await self._parse_with_schema_repair(
+            parse_outcome, repair_attempts, raw_chain, session_id = await self._parse_with_schema_repair(
                 agent=agent,
                 session_id=session_id,
+                session_key=session_key,
+                advisor_sessions=advisor_sessions,
+                session_hint=session_hint,
                 system_prompt=system_prompt,
                 working_dir=work_dir,
                 review_context_hint=prompt_context["repair_hint"],
                 initial_response_content=response.content or "",
                 required_score_keys=required_score_keys,
+                schema_repair_limit=schema_repair_limit,
+                fresh_session_schema_repair_limit=fresh_session_schema_repair_limit,
             )
             parsed = parse_outcome.parsed
             parsed.scores = self._filter_scores_for_advisor(parsed.scores, advisor_def)
             resolved_issue_ids = list(parsed.resolved_issue_ids or [])
 
             if not parse_outcome.schema_valid:
+                force_close_session = True
                 issues = self._schema_invalid_issues(
                     parse_outcome.repair_reason, advisor_def.instance_id,
                 )
@@ -617,6 +629,7 @@ class GlobalReviewExecutor:
                 take_read_only_snapshot(work_dir),
             )
             if violations:
+                force_close_session = True
                 violation_feedback = format_read_only_violations(violations)
                 logger.error(
                     "global_review_read_only_violation",
@@ -691,6 +704,7 @@ class GlobalReviewExecutor:
         finally:
             close_after_call = (
                 should_reset
+                or force_close_session
                 or response is None
                 or (response is not None and not response.success)
                 or bool(early_violations)
@@ -725,6 +739,25 @@ class GlobalReviewExecutor:
         if total_advisors <= 1 and advisor_def.instance_id in {"global_quality", "global-review", "global_review"}:
             return f"global_review_cycle_{cycle:03d}"
         return f"global_review_cycle_{cycle:03d}_{advisor_def.instance_id}"
+
+    @staticmethod
+    def _schema_repair_limit(engine_config: EngineConfig | None) -> int:
+        value = getattr(engine_config, "global_review_schema_repair_limit", None)
+        if isinstance(value, int) and value >= 0:
+            return value
+        return _GLOBAL_REVIEW_SCHEMA_REPAIR_LIMIT
+
+    @staticmethod
+    def _fresh_session_schema_repair_limit(engine_config: EngineConfig | None) -> int:
+        value = getattr(engine_config, "global_review_fresh_session_schema_repair_limit", None)
+        if isinstance(value, int) and value >= 0:
+            return value
+        return _GLOBAL_REVIEW_FRESH_SESSION_SCHEMA_REPAIR_LIMIT
+
+    @staticmethod
+    def _schema_repair_session_hint(session_hint: str, attempt: int) -> str:
+        base = str(session_hint or "global_review_schema_repair").strip() or "global_review_schema_repair"
+        return f"{base}_schema_repair_fresh_{attempt:02d}"
 
     @staticmethod
     def _merge_unique_ids(existing: list[str], incoming: list[str]) -> list[str]:
@@ -934,24 +967,30 @@ class GlobalReviewExecutor:
         *,
         agent,
         session_id: str,
+        session_key: str,
+        advisor_sessions: dict[str, str],
+        session_hint: str,
         system_prompt: str | None,
         working_dir: str,
         review_context_hint: str,
         initial_response_content: str,
         required_score_keys: list[str] | None = None,
-    ) -> tuple[GlobalReviewParseOutcome, int, str]:
+        schema_repair_limit: int = _GLOBAL_REVIEW_SCHEMA_REPAIR_LIMIT,
+        fresh_session_schema_repair_limit: int = _GLOBAL_REVIEW_FRESH_SESSION_SCHEMA_REPAIR_LIMIT,
+    ) -> tuple[GlobalReviewParseOutcome, int, str, str]:
         parse_outcome = parse_global_review_response(
             initial_response_content,
             required_score_keys=required_score_keys,
         )
         repair_attempts = 0
         raw_chain = initial_response_content or ""
+        current_session_id = session_id
 
-        while parse_outcome.needs_repair and repair_attempts < _GLOBAL_REVIEW_SCHEMA_REPAIR_LIMIT:
+        while parse_outcome.needs_repair and repair_attempts < schema_repair_limit:
             repair_attempts += 1
             logger.warning(
                 "global_review_schema_invalid",
-                session_id=session_id,
+                session_id=current_session_id,
                 parser_mode=parse_outcome.parser_mode,
                 reason=parse_outcome.repair_reason,
                 repair_attempt=repair_attempts,
@@ -964,13 +1003,13 @@ class GlobalReviewExecutor:
             repair_response = await agent.send_message(
                 message=repair_prompt,
                 system_prompt=system_prompt,
-                session_id=session_id,
+                session_id=current_session_id,
                 working_dir=working_dir,
             )
             if not repair_response.success:
                 logger.warning(
                     "global_review_schema_repair_failed",
-                    session_id=session_id,
+                    session_id=current_session_id,
                     error=repair_response.error,
                     repair_attempt=repair_attempts,
                 )
@@ -983,7 +1022,61 @@ class GlobalReviewExecutor:
                 required_score_keys=required_score_keys,
             )
 
-        return parse_outcome, repair_attempts, raw_chain
+        fresh_attempts = 0
+        while parse_outcome.needs_repair and fresh_attempts < fresh_session_schema_repair_limit:
+            fresh_attempts += 1
+            previous_session_id = current_session_id
+            if previous_session_id:
+                with contextlib.suppress(Exception):
+                    await agent.close_session(previous_session_id)
+                if advisor_sessions.get(session_key) == previous_session_id:
+                    advisor_sessions.pop(session_key, None)
+            current_session_id = await agent.create_session_with_hint(
+                self._schema_repair_session_hint(session_hint, fresh_attempts)
+            )
+            advisor_sessions[session_key] = current_session_id
+            logger.warning(
+                "global_review_schema_repair_fresh_session_retry",
+                previous_session_id=previous_session_id,
+                session_id=current_session_id,
+                parser_mode=parse_outcome.parser_mode,
+                reason=parse_outcome.repair_reason,
+                fresh_attempt=fresh_attempts,
+            )
+            repair_prompt = self._build_fresh_session_schema_repair_prompt(
+                review_context_hint=review_context_hint,
+                parse_outcome=parse_outcome,
+                raw_response=raw_chain,
+                required_score_keys=required_score_keys,
+            )
+            repair_response = await agent.send_message(
+                message=repair_prompt,
+                system_prompt=system_prompt,
+                session_id=current_session_id,
+                working_dir=working_dir,
+            )
+            repair_attempts += 1
+            if not repair_response.success:
+                logger.warning(
+                    "global_review_schema_repair_fresh_session_failed",
+                    session_id=current_session_id,
+                    error=repair_response.error,
+                    fresh_attempt=fresh_attempts,
+                )
+                continue
+
+            repair_content = repair_response.content or ""
+            raw_chain = self._merge_raw_response_chain_with_label(
+                raw_chain,
+                repair_content,
+                f"fresh_session_schema_repair_attempt_{fresh_attempts}",
+            )
+            parse_outcome = parse_global_review_response(
+                repair_content,
+                required_score_keys=required_score_keys,
+            )
+
+        return parse_outcome, repair_attempts, raw_chain, current_session_id
 
     @staticmethod
     def _build_schema_repair_prompt(
@@ -1026,14 +1119,44 @@ class GlobalReviewExecutor:
         )
 
     @staticmethod
+    def _build_fresh_session_schema_repair_prompt(
+        *,
+        review_context_hint: str,
+        parse_outcome: GlobalReviewParseOutcome,
+        raw_response: str,
+        required_score_keys: list[str] | None = None,
+    ) -> str:
+        base = GlobalReviewExecutor._build_schema_repair_prompt(
+            review_context_hint=review_context_hint,
+            parse_outcome=parse_outcome,
+            required_score_keys=required_score_keys,
+        )
+        return (
+            "上一会话连续未能输出符合 schema 的 JSON。当前是一个新的修复会话。\n"
+            "不要重新做全面审计；只基于下面给出的上一会话原始输出，把结论重编码为 canonical JSON。\n\n"
+            "[previous_raw_response_begin]\n"
+            f"{raw_response}\n"
+            "[previous_raw_response_end]\n\n"
+            f"{base}"
+        )
+
+    @staticmethod
     def _merge_raw_response_chain(original: str, repaired: str, repair_attempt: int) -> str:
+        return GlobalReviewExecutor._merge_raw_response_chain_with_label(
+            original,
+            repaired,
+            f"schema_repair_attempt_{repair_attempt}",
+        )
+
+    @staticmethod
+    def _merge_raw_response_chain_with_label(original: str, repaired: str, label: str) -> str:
         if not original:
             return repaired
         if not repaired:
             return original
         return (
             f"[original_response]\n{original}\n\n"
-            f"[schema_repair_attempt_{repair_attempt}]\n{repaired}"
+            f"[{label}]\n{repaired}"
         )
 
     def _schema_invalid_issues(self, reason: str, advisor_id: str = "global_review") -> list[dict[str, str]]:
