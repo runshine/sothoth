@@ -2230,6 +2230,73 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(1, failed_only_page.total)
         self.assertEqual("sev-retry", failed_only_page.items[0].event_id)
 
+    def test_build_project_stats_sql_aggregates_counts_from_database(self):
+        task1 = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="a",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw/a",
+            output_root="/o",
+            workspace_root="/w/a",
+        )
+        task1.metrics = {
+            "selected_module_count": 2,
+            "candidate_module_count": 3,
+            "high_risk_module_count": 1,
+            "entry_count": 4,
+            "vuln_result_count": 5,
+            "firmware_item_count": 6,
+            "unpacked_firmware_count": 1,
+            "failed_firmware_count": 0,
+        }
+        task2 = BinarySecurityTask(
+            id="t2",
+            project_id="p1",
+            name="b",
+            status="success",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/fw/b",
+            output_root="/o",
+            workspace_root="/w/b",
+        )
+        task2.metrics = {
+            "selected_module_count": 7,
+            "candidate_module_count": 8,
+            "high_risk_module_count": 2,
+            "entry_count": 9,
+            "vuln_result_count": 10,
+            "firmware_item_count": 11,
+            "unpacked_firmware_count": 0,
+            "failed_firmware_count": 0,
+        }
+
+        engine = create_engine("sqlite:///:memory:")
+        BinarySecurityTask.__table__.create(bind=engine)
+        SessionLocal = sessionmaker(bind=engine)
+        session = SessionLocal()
+        try:
+            session.add(task1)
+            session.add(task2)
+            session.commit()
+
+            stats = self.manager._build_project_stats_sql(session, project_id="p1", task_type=None)
+
+            self.assertEqual(2, stats.total)
+            self.assertEqual(1, stats.running)
+            self.assertEqual(1, stats.success)
+            self.assertEqual(9, stats.selected_module_count)
+            self.assertEqual(11, stats.candidate_module_count)
+            self.assertEqual(3, stats.high_risk_module_count)
+            self.assertEqual(13, stats.entry_count)
+            self.assertEqual(15, stats.vuln_result_count)
+            self.assertEqual(17, stats.input_count)
+        finally:
+            session.close()
+
     def test_get_task_detail_keeps_read_path_side_effect_free_when_stage_is_running(self):
         task = BinarySecurityTask(
             id="t1",
@@ -2308,11 +2375,40 @@ class TaskManagerTests(unittest.TestCase):
         )
         db = _ModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item])
 
+        task.stage_summary = {
+            "system_analysis": {
+                "sequence_no": 2,
+                "status": "running",
+                "total_items": 1,
+                "running_items": 1,
+            }
+        }
+        task.latest_abnormal_reason = {
+            "is_abnormal": True,
+            "category": "runtime",
+            "code": "task_running",
+            "title": "任务运行中",
+            "message": "列表页轻量快照",
+            "terminal": False,
+            "source_layer": "task",
+            "status": "dispatching",
+            "service": "binary-security",
+            "stage_name": "system_analysis",
+            "evidence": [],
+            "related_event_ids": [],
+        }
+        task.operation_lock_type = "retry"
+        task.operation_lock_owner = "worker-a"
+        task.operation_lock_expires_at = _now() + timedelta(minutes=1)
         response = self.manager.list_tasks(db, project_id="p1")
 
         self.assertEqual(1, response.total)
         self.assertEqual("dispatching", response.items[0].status)
         self.assertEqual("dispatching", task.status)
+        summary_by_stage = {summary.stage_name: summary for summary in response.items[0].stage_summaries}
+        self.assertEqual("running", summary_by_stage["system_analysis"].status)
+        self.assertEqual("任务运行中", response.items[0].abnormal_reason_title)
+        self.assertEqual("in_progress", response.items[0].manual_operation_state["overall"])
 
     def test_stage_run_output_summary_db_payload_is_hard_capped(self):
         task = BinarySecurityTask(
@@ -3660,6 +3756,165 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("firmware_unpack", [item.stage_name for item in aggregates])
         self.assertEqual(1, aggregates[0].business.success_items)
         self.assertEqual(1, aggregates[0].archive.success_count)
+
+    def test_build_project_stage_aggregates_sql_aggregates_by_project_and_task_type(self):
+        binary_task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        source_task = BinarySecurityTask(
+            id="t2",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src.zip",
+            output_root="/o",
+            workspace_root="/w2",
+        )
+        other_project_task = BinarySecurityTask(
+            id="t3",
+            project_id="p2",
+            name="other",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw2",
+            output_root="/o",
+            workspace_root="/w3",
+        )
+
+        engine = create_engine("sqlite:///:memory:")
+        BinarySecurityTask.__table__.create(bind=engine)
+        BinarySecurityStageRun.__table__.create(bind=engine)
+        BinarySecurityArchiveJob.__table__.create(bind=engine)
+        SessionLocal = sessionmaker(bind=engine)
+        session = SessionLocal()
+        try:
+            session.add_all([binary_task, source_task, other_project_task])
+            session.add_all(
+                [
+                    BinarySecurityStageRun(
+                        id="sr1",
+                        task_id="t1",
+                        project_id="p1",
+                        stage_name="system_analysis",
+                        sequence_no=1,
+                        status="running",
+                    ),
+                    BinarySecurityStageRun(
+                        id="sr2",
+                        task_id="t2",
+                        project_id="p1",
+                        stage_name="entry_analysis",
+                        sequence_no=2,
+                        status="running",
+                    ),
+                    BinarySecurityStageRun(
+                        id="sr3",
+                        task_id="t3",
+                        project_id="p2",
+                        stage_name="system_analysis",
+                        sequence_no=1,
+                        status="running",
+                    ),
+                ]
+            )
+            session.add_all(
+                [
+                    BinarySecurityArchiveJob(
+                        id="aj1",
+                        task_id="t1",
+                        project_id="p1",
+                        stage_name="system_analysis",
+                        item_id="si1",
+                        archive_status="pending",
+                    ),
+                    BinarySecurityArchiveJob(
+                        id="aj2",
+                        task_id="t2",
+                        project_id="p1",
+                        stage_name="entry_analysis",
+                        item_id="si2",
+                        archive_status="success",
+                    ),
+                    BinarySecurityArchiveJob(
+                        id="aj3",
+                        task_id="t3",
+                        project_id="p2",
+                        stage_name="system_analysis",
+                        item_id="si3",
+                        archive_status="failed",
+                    ),
+                ]
+            )
+            session.commit()
+
+            fake_db = _ModelAwareDb(
+                tasks=[binary_task, source_task, other_project_task],
+                stage_runs=[
+                    SimpleNamespace(task_id="t1", stage_name="system_analysis"),
+                    SimpleNamespace(task_id="t2", stage_name="entry_analysis"),
+                    SimpleNamespace(task_id="t3", stage_name="system_analysis"),
+                ],
+                stage_items=[
+                    SimpleNamespace(task_id="t1", stage_name="system_analysis", status="running"),
+                    SimpleNamespace(task_id="t2", stage_name="entry_analysis", status="success"),
+                    SimpleNamespace(task_id="t3", stage_name="system_analysis", status="failed"),
+                ],
+                archive_jobs=[
+                    SimpleNamespace(task_id="t1", stage_name="system_analysis", archive_status="pending"),
+                    SimpleNamespace(task_id="t2", stage_name="entry_analysis", archive_status="success"),
+                    SimpleNamespace(task_id="t3", stage_name="system_analysis", archive_status="failed"),
+                ],
+            )
+            binary_aggregates = self.manager._build_project_stage_aggregates(fake_db, [binary_task], TASK_TYPE_BINARY)
+            binary_by_stage = {item.stage_name: item for item in binary_aggregates}
+            self.assertEqual(1, binary_by_stage["system_analysis"].business.task_count)
+            self.assertEqual(1, binary_by_stage["system_analysis"].business.running_items)
+            self.assertEqual(1, binary_by_stage["system_analysis"].archive.pending_count)
+
+            source_aggregates = self.manager._build_project_stage_aggregates(fake_db, [source_task], TASK_TYPE_SOURCE)
+            self.assertEqual(
+                ["system_analysis", "entry_analysis", "dataflow_analysis", "vuln_scan"],
+                [item.stage_name for item in source_aggregates],
+            )
+            source_by_stage = {item.stage_name: item for item in source_aggregates}
+            self.assertEqual(1, source_by_stage["entry_analysis"].business.success_items)
+            self.assertEqual(1, source_by_stage["entry_analysis"].archive.success_count)
+
+            sql_binary_aggregates = self.manager._build_project_stage_aggregates_sql(
+                session,
+                project_id="p1",
+                task_type=TASK_TYPE_BINARY,
+            )
+            sql_binary_by_stage = {item.stage_name: item for item in sql_binary_aggregates}
+            self.assertEqual(1, sql_binary_by_stage["system_analysis"].business.task_count)
+            self.assertEqual(1, sql_binary_by_stage["system_analysis"].archive.pending_count)
+            self.assertEqual(0, sql_binary_by_stage["entry_analysis"].business.task_count)
+
+            sql_source_aggregates = self.manager._build_project_stage_aggregates_sql(
+                session,
+                project_id="p1",
+                task_type=TASK_TYPE_SOURCE,
+            )
+            self.assertEqual(
+                ["system_analysis", "entry_analysis", "dataflow_analysis", "vuln_scan"],
+                [item.stage_name for item in sql_source_aggregates],
+            )
+            sql_source_by_stage = {item.stage_name: item for item in sql_source_aggregates}
+            self.assertEqual(1, sql_source_by_stage["entry_analysis"].business.task_count)
+            self.assertEqual(1, sql_source_by_stage["entry_analysis"].archive.success_count)
+        finally:
+            session.close()
 
     def test_aggregate_stage_items_marks_partial_success(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
