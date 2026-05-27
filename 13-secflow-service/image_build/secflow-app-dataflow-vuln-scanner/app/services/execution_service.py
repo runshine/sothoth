@@ -4263,12 +4263,37 @@ class ExecutionService:
                 and bool(process_state.get("stale"))
                 and process_state.get("is_running") is False
             ):
-                # Unlinked/legacy run directories can still have a stale
-                # state.json that says "running" after the runtime process has
-                # vanished.  Surface that as interrupted so the UI does not show
-                # an impossible active process and enables retry guidance.
-                return "interrupted"
+                stale_resolution = self._stale_runtime_terminal_resolution(
+                    process_status=str(execution.process_status or "").strip().lower() if execution is not None else "",
+                    process_state=process_state,
+                )
+                if stale_resolution is not None:
+                    return stale_resolution["terminal_status"]
         return current or current_canonical or str(current_status or "")
+
+    def _stale_runtime_terminal_resolution(
+        self,
+        *,
+        process_status: str | None,
+        process_state: dict[str, Any],
+    ) -> dict[str, str] | None:
+        if not bool(process_state.get("stale")):
+            return None
+        normalized_process_status = str(process_status or "").strip().lower()
+        if normalized_process_status in {"stop_requested", "delete_requested"}:
+            delete_requested = normalized_process_status == "delete_requested"
+            return {
+                "terminal_status": "cancelled",
+                "control_status": "cancelled",
+                "message": "stale delete_requested runtime assumed stopped" if delete_requested else "stale cancel_requested runtime assumed cancelled",
+                "event_type": "execution_cancelled",
+            }
+        return {
+            "terminal_status": "failed",
+            "control_status": "failed",
+            "message": "stale active runtime assumed failed",
+            "event_type": "execution_failed",
+        }
 
     def _enrich_run_payload(
         self,
@@ -4347,16 +4372,24 @@ class ExecutionService:
         process_status = str(execution.process_status or "").strip().lower() if execution is not None else ""
         if not is_run_active(execution_status) and not is_run_active(trigger_status):
             return False
+        resolution = self._stale_runtime_terminal_resolution(
+            process_status=process_status,
+            process_state=process_state,
+        )
+        if resolution is None:
+            return False
 
-        if process_status in {"stop_requested", "delete_requested"}:
-            delete_requested = process_status == "delete_requested"
-            message = "stale delete_requested runtime assumed stopped" if delete_requested else "stale cancel_requested runtime assumed cancelled"
+        terminal_status = resolution["terminal_status"]
+        message = resolution["message"]
+        event_type = resolution["event_type"]
+        control_status = resolution["control_status"]
+        if terminal_status == "cancelled":
             if execution is not None and trigger is not None:
                 self._set_terminal_state(
                     db,
                     execution=execution,
                     trigger=trigger,
-                    execution_status="cancelled",
+                    execution_status=terminal_status,
                     message=message,
                     output_manifest_path=execution.output_manifest_path,
                     output_task_count=int(execution.output_task_count or run_index.result_count or 0),
@@ -4364,47 +4397,46 @@ class ExecutionService:
             else:
                 now = now_local()
                 if execution is not None:
-                    execution.status = "cancelled"
+                    execution.status = terminal_status
                     execution.message = message
                     execution.finished_at = now
                     execution.process_status = "exited"
                     execution.process_finished_at = now
                     db.add(execution)
                 if trigger is not None:
-                    trigger.status = "cancelled"
+                    trigger.status = terminal_status
                     trigger.message = message
                     trigger.finished_at = now
                     db.add(trigger)
                 db.flush()
-            self._write_run_control_state(run_index.run_root_path, status_text="cancelled", message=message)
+            self._write_run_control_state(run_index.run_root_path, status_text=control_status, message=message)
             get_run_index_service().sync_execution_run(db, execution)
             db.flush()
             if execution is not None:
                 self.record_event(
                     db,
                     execution_id=execution.id,
-                    event_type="execution_cancelled",
+                    event_type=event_type,
                     message=message,
                     level="warning",
                     payload_json={"reason": "stale_runtime_reconciled", "process_state": process_state},
                 )
             return True
 
-        message = "stale active runtime assumed failed"
         self._mark_stale_runtime_exited(
             db,
             trigger=trigger,
             execution=execution,
             message=message,
         )
-        self._write_run_control_state(run_index.run_root_path, status_text="failed", message=message)
+        self._write_run_control_state(run_index.run_root_path, status_text=control_status, message=message)
         get_run_index_service().sync_execution_run(db, execution)
         db.flush()
         if execution is not None:
             self.record_event(
                 db,
                 execution_id=execution.id,
-                event_type="execution_failed",
+                event_type=event_type,
                 message=message,
                 level="warning",
                 payload_json={"reason": "stale_runtime_reconciled", "process_state": process_state},
