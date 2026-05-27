@@ -669,6 +669,10 @@ def generate_config(
                         "plateau_closure_streak": profile_policy.progress_no_signal_closure_streak,
                         "plateau_abort_streak": profile_policy.progress_no_signal_abort_streak,
                         "summary_repair_attempt_budget": 2,
+                        "global_review_schema_repair_limit": 2,
+                        "result_review_schema_repair_limit": 2,
+                        "global_review_fresh_session_schema_repair_limit": 1,
+                        "result_review_fresh_session_schema_repair_limit": 1,
                         "score_min_delta": 0.03,
                     },
                     "roles": {

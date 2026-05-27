@@ -14609,6 +14609,87 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(create_calls))
         self.assertEqual("/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1", create_calls[0]["data_flow_path"])
 
+    def test_run_vuln_item_strips_nested_dataflow_dir_for_dfvs_create(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="scan-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="vuln_scan",
+            sequence_no=4,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="vuln_scan",
+            item_key="entry-1",
+            item_name="main",
+            parent_key="module-1",
+            downstream_service="dataflow_vuln_scanner",
+            status="pending",
+            output_ref={},
+        )
+        dataflow_result = {
+            "entry_key": "entry-1",
+            "function_name": "main",
+            "module_key": "module-1",
+            "module_name": "module-1",
+            "data_flow_file": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1/final_report.md",
+            "primary_report_path": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1/final_report.md",
+            "dataflow_dir": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1/dataflow",
+            "source_dir": ".",
+            "source_root_path": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/binary-to-source/modules/module-1",
+            "module_input_path": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/binary-to-source/modules/module-1",
+            "source_file": "main.c",
+        }
+        fake_session = _ModelAwareDb()
+        create_calls: list[dict[str, str]] = []
+
+        class _FakeClient:
+            async def create_task(self, project_id, title, token, data_flow_path, source_dir, origin):
+                create_calls.append(
+                    {
+                        "project_id": project_id,
+                        "title": title,
+                        "token": token,
+                        "data_flow_path": data_flow_path,
+                        "source_dir": source_dir,
+                        "origin_parent_task_id": str(origin.get("parent_task_id") or ""),
+                    }
+                )
+                return {"task_id": "dfvs-1"}
+
+            async def get_task(self, task_id, token):
+                return {"task_id": task_id, "status": "success"}
+
+            async def get_artifacts(self, task_id, token):
+                return {"archive_root": "/tmp/archive", "artifact_files": []}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(task_manager_module, "get_dataflow_vuln_scanner_client", return_value=_FakeClient()),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_active_downstream_payload", return_value=None),
+            patch.object(self.manager, "_find_reusable_vuln_payload", return_value=None),
+            patch.object(self.manager, "_poll_until_terminal", return_value=("success", {"task_id": "dfvs-1", "status": "success"})),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp/archive"), None)),
+        ):
+            result = asyncio.run(self.manager._run_vuln_item(task, stage_run, dataflow_result, token="tok", retrying=False))
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual(1, len(create_calls))
+        self.assertEqual("/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1", create_calls[0]["data_flow_path"])
+
     def test_validate_dataflow_output_contract_requires_dataflow_dir(self):
         payload = {
             "entry_key": "entry-1",

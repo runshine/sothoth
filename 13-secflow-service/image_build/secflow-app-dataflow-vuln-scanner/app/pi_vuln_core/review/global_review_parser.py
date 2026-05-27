@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from app.pi_vuln_core.review.json_repair import repair_json_like_candidate
 from app.pi_vuln_core.review.models import ParsedReviewResult, parse_review_response
 
 
@@ -45,7 +46,7 @@ def parse_global_review_response(
         )
 
     for candidate in _extract_json_candidates(raw):
-        for variant, mode in ((candidate, "json"), (_repair_json_like_candidate(candidate), "json_repaired")):
+        for variant, mode in ((candidate, "json"), (repair_json_like_candidate(candidate), "json_repaired")):
             try:
                 data = json.loads(variant)
             except (json.JSONDecodeError, TypeError, ValueError):
@@ -175,7 +176,3 @@ def _extract_json_candidates(raw: str) -> list[str]:
     return unique
 
 
-def _repair_json_like_candidate(candidate: str) -> str:
-    repaired = candidate or ""
-    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
-    return repaired

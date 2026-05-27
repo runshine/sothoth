@@ -154,6 +154,10 @@ class EngineConfig(BaseModel):
     plateau_closure_streak: int = Field(default=2, ge=1)
     plateau_abort_streak: int = Field(default=3, ge=1)
     summary_repair_attempt_budget: int = Field(default=2, ge=1)
+    global_review_schema_repair_limit: int = Field(default=2, ge=0)
+    result_review_schema_repair_limit: int = Field(default=2, ge=0)
+    global_review_fresh_session_schema_repair_limit: int = Field(default=1, ge=0)
+    result_review_fresh_session_schema_repair_limit: int = Field(default=1, ge=0)
     score_min_delta: float = Field(default=0.03, ge=0.0)
 
 

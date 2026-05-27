@@ -9,7 +9,7 @@ import pytest
 from app.pi_vuln_core.agents.base import BaseAgentRuntime
 from app.pi_vuln_core.agents.models import AgentResponse
 from app.pi_vuln_core.agents.registry import AgentRuntimeRegistry
-from app.pi_vuln_core.config.models import AdvisorInstanceDef
+from app.pi_vuln_core.config.models import AdvisorInstanceDef, EngineConfig
 from app.pi_vuln_core.recorder.recorder import ExecutionRecorder
 from app.pi_vuln_core.review.global_review import GlobalReviewExecutor
 from app.pi_vuln_core.review.global_review_parser import GlobalReviewParseOutcome
@@ -156,6 +156,36 @@ class UnrepairableGlobalRuntime(RepairingGlobalRuntime):
         )
 
 
+class MalformedIssueKeyRuntime(RepairingGlobalRuntime):
+    async def send_message(
+        self,
+        message: str,
+        system_prompt: Optional[str] = None,
+        session_id: Optional[str] = None,
+        working_dir: Optional[str] = None,
+    ) -> AgentResponse:
+        if session_id is None:
+            session_id = await self.create_session()
+        session = self._sessions.setdefault(session_id, {"turns": 0})
+        session["turns"] += 1
+        self.call_count += 1
+
+        content = (
+            '{"passed":false,"verdict":"FAIL","feedback":"ESP 入站路径仍有明显遗漏。",'
+            '"scores":{"input_coverage":0.91,"export_followthrough":0.9,"used_coverage":0.88,'
+            '"vuln_pattern_breadth":0.86,"code_evidence_depth":0.87,"limitations_honesty":0.93,'
+            '"report_completeness":0.9},"confidence":0.85,'
+            '"issues":[{"id":"CMP-esp-v4-truncation","target":"IPSEC_ESP_HandleInputPktV4 L10129",required_action":"验证 uint16 截断是否能形成对称漏洞。"}],'
+            '"resolved_issues":[]}'
+        )
+        return AgentResponse(
+            content=content,
+            conversation_id=session_id,
+            turn_count=session["turns"],
+            finished=True,
+        )
+
+
 class DepthOnlyScoreRuntime(RepairingGlobalRuntime):
     async def send_message(
         self,
@@ -226,6 +256,116 @@ class DepthExtraLowCoverageRuntime(RepairingGlobalRuntime):
             },
             ensure_ascii=False,
         )
+        return AgentResponse(
+            content=content,
+            conversation_id=session_id,
+            turn_count=session["turns"],
+            finished=True,
+        )
+
+
+class DelayedRepairGlobalRuntime(RepairingGlobalRuntime):
+    async def send_message(
+        self,
+        message: str,
+        system_prompt: Optional[str] = None,
+        session_id: Optional[str] = None,
+        working_dir: Optional[str] = None,
+    ) -> AgentResponse:
+        if session_id is None:
+            session_id = await self.create_session()
+        session = self._sessions.setdefault(session_id, {"turns": 0})
+        session["turns"] += 1
+        self.call_count += 1
+
+        if "未满足框架 schema" in message and session["turns"] >= 3:
+            content = json.dumps(
+                {
+                    "passed": True,
+                    "verdict": "PASS",
+                    "feedback": "延迟修复后输出规范 JSON。",
+                    "scores": {
+                        "input_coverage": 0.95,
+                        "export_followthrough": 0.95,
+                        "used_coverage": 0.95,
+                        "vuln_pattern_breadth": 0.9,
+                        "code_evidence_depth": 0.9,
+                        "limitations_honesty": 0.95,
+                        "report_completeness": 0.95,
+                    },
+                    "confidence": 0.9,
+                    "issues": [],
+                    "resolved_issues": [],
+                },
+                ensure_ascii=False,
+            )
+        else:
+            content = json.dumps(
+                {
+                    "passed": True,
+                    "verdict": "PASS",
+                    "feedback": "先故意返回非 canonical JSON。",
+                    "scores": {},
+                    "confidence": "HIGH",
+                },
+                ensure_ascii=False,
+            )
+
+        return AgentResponse(
+            content=content,
+            conversation_id=session_id,
+            turn_count=session["turns"],
+            finished=True,
+        )
+
+
+class FreshSessionRepairGlobalRuntime(RepairingGlobalRuntime):
+    async def send_message(
+        self,
+        message: str,
+        system_prompt: Optional[str] = None,
+        session_id: Optional[str] = None,
+        working_dir: Optional[str] = None,
+    ) -> AgentResponse:
+        if session_id is None:
+            session_id = await self.create_session()
+        session = self._sessions.setdefault(session_id, {"turns": 0})
+        session["turns"] += 1
+        self.call_count += 1
+
+        if "新的修复会话" in message:
+            content = json.dumps(
+                {
+                    "passed": True,
+                    "verdict": "PASS",
+                    "feedback": "新会话重编码成功。",
+                    "scores": {
+                        "input_coverage": 0.96,
+                        "export_followthrough": 0.95,
+                        "used_coverage": 0.94,
+                        "vuln_pattern_breadth": 0.9,
+                        "code_evidence_depth": 0.91,
+                        "limitations_honesty": 0.96,
+                        "report_completeness": 0.95,
+                    },
+                    "confidence": 0.92,
+                    "issues": [],
+                    "resolved_issues": [],
+                },
+                ensure_ascii=False,
+            )
+        else:
+            content = json.dumps(
+                {
+                    "passed": True,
+                    "verdict": "PASS",
+                    "feedback": "我会一直输出非 canonical JSON，直到框架重开新会话。",
+                    "scores": {},
+                    "confidence": "HIGH",
+                },
+                ensure_ascii=False,
+            )
+
         return AgentResponse(
             content=content,
             conversation_id=session_id,
@@ -359,6 +499,7 @@ async def _run_global_review(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     runtime_cls: type[BaseAgentRuntime],
+    engine_config: EngineConfig | None = None,
 ) -> tuple[bool, str, dict, BaseAgentRuntime]:
     monkeypatch.setitem(AgentRuntimeRegistry.RUNTIME_MAP, "claude_code", runtime_cls)
 
@@ -404,6 +545,9 @@ async def _run_global_review(
 
     executor = GlobalReviewExecutor(registry, ExecutionRecorder(str(tmp_path)))
     review_state = ReviewState()
+    if engine_config is None:
+        engine_config = EngineConfig(global_review_fresh_session_schema_repair_limit=0)
+
     passed, feedback = await executor.execute(
         advisors_cfg=[advisor],
         task_file=str(task_file),
@@ -413,6 +557,7 @@ async def _run_global_review(
         cycle=1,
         review_state=review_state,
         advisor_sessions={},
+        engine_config=engine_config,
     )
 
     review_json = json.loads(
@@ -465,6 +610,85 @@ async def test_global_review_fail_closes_when_scores_remain_noncanonical_after_r
     assert "schema_repair_attempt_2" in review_json["raw_response"]
     assert runtime.call_count == 3
     assert "schema" in feedback.lower() or "scores" in feedback.lower()
+
+
+@pytest.mark.asyncio
+async def test_global_review_salvages_common_broken_json_issue_keys_without_framework_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    passed, feedback, review_json, runtime = await _run_global_review(
+        monkeypatch,
+        tmp_path,
+        MalformedIssueKeyRuntime,
+    )
+
+    assert passed is False
+    assert "schema" not in feedback.lower()
+    assert review_json["passed"] is False
+    assert review_json["schema_valid"] is True
+    assert review_json["repair_attempts"] == 0
+    assert review_json["issues"][0]["id"] == "CMP-esp-v4-truncation"
+    assert review_json["issues"][0]["required_action"] == "验证 uint16 截断是否能形成对称漏洞。"
+    assert runtime.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_global_review_schema_repair_limit_is_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    passed_fail, _, review_fail, runtime_fail = await _run_global_review(
+        monkeypatch,
+        tmp_path / "fail",
+        DelayedRepairGlobalRuntime,
+        EngineConfig(
+            global_review_schema_repair_limit=1,
+            global_review_fresh_session_schema_repair_limit=0,
+        ),
+    )
+    assert passed_fail is False
+    assert review_fail["schema_valid"] is False
+    assert review_fail["repair_attempts"] == 1
+    assert runtime_fail.call_count == 2
+
+    passed_ok, feedback_ok, review_ok, runtime_ok = await _run_global_review(
+        monkeypatch,
+        tmp_path / "pass",
+        DelayedRepairGlobalRuntime,
+        EngineConfig(
+            global_review_schema_repair_limit=2,
+            global_review_fresh_session_schema_repair_limit=0,
+        ),
+    )
+    assert passed_ok is True
+    assert feedback_ok == ""
+    assert review_ok["schema_valid"] is True
+    assert review_ok["repair_attempts"] == 2
+    assert runtime_ok.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_global_review_uses_fresh_session_schema_repair_after_same_session_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    passed, feedback, review_json, runtime = await _run_global_review(
+        monkeypatch,
+        tmp_path,
+        FreshSessionRepairGlobalRuntime,
+        EngineConfig(
+            global_review_schema_repair_limit=1,
+            global_review_fresh_session_schema_repair_limit=1,
+        ),
+    )
+
+    assert passed is True
+    assert feedback == ""
+    assert review_json["schema_valid"] is True
+    assert review_json["repair_attempts"] == 2
+    assert "fresh_session_schema_repair_attempt_1" in review_json["raw_response"]
+    assert runtime.call_count == 3
 
 
 async def _run_depth_only_review(

@@ -809,6 +809,7 @@ class AtomicWorkflowEngine:
                     parallel=self.global_cfg.parallel_result_review,
                     concurrency_limit=self.global_cfg.parallel_result_review_limit,
                     advisor_sessions=ctx.advisor_sessions,
+                    engine_config=self.wf.engine,
                     resume_cursor=active_resume_cursor,
                 )
             except ResultReviewFrameworkError as exc:
