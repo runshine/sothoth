@@ -8,6 +8,7 @@ from typing import Dict, Optional
 import httpx
 
 from app.config import get_config
+from app.services.observability import record_auth_token_cache
 
 
 class AuthServiceError(Exception):
@@ -39,13 +40,17 @@ class AuthService:
 
     def _get_cached_user(self, token: str, project_id: Optional[str]) -> Optional[dict]:
         if not self._cache_enabled:
+            record_auth_token_cache("disabled")
             return None
         entry = self._token_cache.get(self._cache_key(token, project_id))
         if entry is None:
+            record_auth_token_cache("miss")
             return None
         if entry.is_expired():
             self._token_cache.pop(self._cache_key(token, project_id), None)
+            record_auth_token_cache("expired")
             return None
+        record_auth_token_cache("hit")
         return entry.payload
 
     def _set_cached_user(self, token: str, payload: dict, project_id: Optional[str]) -> None:
