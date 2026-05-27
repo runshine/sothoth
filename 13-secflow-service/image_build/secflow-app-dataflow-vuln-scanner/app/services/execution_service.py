@@ -959,9 +959,10 @@ class ExecutionService:
                             break
                     if not review_profile:
                         review_profile = _version_review_profile()
+                    normalized_run_status = get_run_index_service().normalized_run_status(lightweight_run_index)
                     run_summary.update({
                         "run_id": lightweight_run_index.id,
-                        "status": lightweight_run_index.status,
+                        "status": normalized_run_status,
                         "model": lightweight_run_index.model,
                         "provider": lightweight_run_index.provider,
                         "thinking": lightweight_run_index.thinking,
@@ -1212,7 +1213,7 @@ class ExecutionService:
         if run_index is not None:
             latest_run = {
                 "run_id": run_index.id,
-                "status": run_index.status,
+                "status": get_run_index_service().normalized_run_status(run_index),
                 "model": run_index.model,
                 "provider": run_index.provider,
                 "thinking": run_index.thinking,
@@ -3531,7 +3532,7 @@ class ExecutionService:
             effective_provider = str((run_index.provider if run_index is not None else None) or request_payload.get("provider") or "").strip()
             effective_thinking = str((run_index.thinking if run_index is not None else None) or default_thinking or "").strip()
             run_summary: dict[str, Any] = {
-                "status": str(run_index.status or "") if run_index is not None else "",
+                "status": get_run_index_service().normalized_run_status(run_index) if run_index is not None else "",
                 "model": effective_model,
                 "provider": effective_provider,
                 "thinking": effective_thinking,

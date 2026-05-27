@@ -44,7 +44,7 @@ from app.services.run_inspector import (
     inspect_session_file,
     inspect_sessions,
 )
-from app.services.run_state import is_run_active, is_run_terminal
+from app.services.run_state import is_run_active, is_run_terminal, normalize_run_status
 from app.time_utils import UTC_PLUS_8, ensure_local, isoformat_local, now_local
 
 logger = logging.getLogger("dataflow_vuln.run_index")
@@ -496,6 +496,23 @@ def _run_index_needs_parser_resync(record: RunIndex) -> bool:
 
 def _run_index_is_active(record: RunIndex) -> bool:
     return is_run_active(record.status)
+
+
+def _normalize_persisted_run_status(status_text: str | None, *, finished_at: datetime | None = None) -> str:
+    run_meta: dict[str, Any] = {}
+    if finished_at is not None:
+        run_meta["finished_at"] = isoformat_local(finished_at)
+    return normalize_run_status(status_text, run_meta)
+
+
+def _effective_payload_run_status(
+    *,
+    overview_status: str | None = None,
+    persisted_status: str | None = None,
+    finished_at: datetime | None = None,
+) -> str:
+    candidate = overview_status if str(overview_status or "").strip() else persisted_status
+    return _normalize_persisted_run_status(candidate, finished_at=finished_at)
 
 
 def _new_results_by_cycle_for_index(run_index: RunIndex) -> dict[int, list[dict[str, Any]]]:
@@ -1057,7 +1074,7 @@ class RunIndexService:
             target.run_name = str(summary.get("name") or run_root.name)
             target.run_root_path = str(run_root)
             target.atomic_work_path = atomic_work_path
-            target.status = str(summary.get("status") or "pending")
+            target.status = _normalize_persisted_run_status(summary.get("status"), finished_at=finished_at)
             target.started_at = started_at
             target.finished_at = finished_at
             target.duration_seconds = int(summary.get("duration_seconds") or 0)
@@ -1324,7 +1341,10 @@ class RunIndexService:
             "name": run_index.run_name,
             "path": run_index.run_root_path,
             "root_path": _parent_root(run_index.run_root_path),
-            "status": run_index.status,
+            "status": _effective_payload_run_status(
+                persisted_status=run_index.status,
+                finished_at=run_index.finished_at,
+            ),
             "start_time": str((_load_externalized_json_payload(run_index.run_root_path, run_index.raw_summary_json) or {}).get("start_time") or ""),
             "start_epoch": int(run_index.started_at.replace(tzinfo=timezone.utc).timestamp()) if run_index.started_at else 0,
             "duration_seconds": run_index.duration_seconds,
@@ -1341,6 +1361,13 @@ class RunIndexService:
             "workflow_mode": run_index.workflow_mode,
             "updated_at": _iso_or_empty(run_index.last_synced_at),
         }
+
+    def normalized_run_status(self, run_index: RunIndex, *, overview_status: str | None = None) -> str:
+        return _effective_payload_run_status(
+            overview_status=overview_status,
+            persisted_status=run_index.status,
+            finished_at=run_index.finished_at,
+        )
 
     def list_runs(self, db: Session, project_id: str) -> list[dict[str, Any]]:
         self.sync_project_runs(db, project_id)
@@ -1554,7 +1581,11 @@ class RunIndexService:
             "name": str(overview.get("name") or run_index.run_name or Path(run_index.run_root_path).name),
             "path": run_index.run_root_path,
             "root_path": _parent_root(run_index.run_root_path),
-            "status": str(overview.get("status") or run_index.status or "pending"),
+            "status": _effective_payload_run_status(
+                overview_status=overview.get("status"),
+                persisted_status=run_index.status,
+                finished_at=run_index.finished_at,
+            ),
             "start_time": str(overview.get("start_time") or ""),
             "start_epoch": int(overview.get("start_epoch") or 0),
             "duration_seconds": int(overview.get("duration_seconds") or 0),
@@ -1896,7 +1927,7 @@ class RunIndexService:
             profile_id=profile_id,
         )
         if status_text:
-            run_index.status = status_text
+            run_index.status = _normalize_persisted_run_status(status_text, finished_at=run_index.finished_at)
         if run_index.source_key and not run_index.source_hash:
             run_index.source_hash = run_source_hash(run_index.source_type, run_index.source_key)
         run_root = Path(run_index.run_root_path)
