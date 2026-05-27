@@ -13,7 +13,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "budget_exhausted_action": "treat_as_passed",
     "concurrency": 8,
     "llm_provider_key": None,
-    "default_mode": "fast",
+    "default_mode": "turbo",
 }
 
 _VALID_ACTIONS = {"treat_as_passed", "treat_as_failed"}
@@ -45,7 +45,7 @@ def normalize_b2s_mode(value: Any) -> str:
     candidate = _LEGACY_MODE_MAP.get(candidate, candidate)
     if candidate in _VALID_MODES:
         return candidate
-    return "fast"
+    return "turbo"
 
 
 class ConfigService:
