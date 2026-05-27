@@ -180,6 +180,23 @@ def _canonical_task_status(value: str | None) -> str:
     return "pending"
 
 
+def _public_task_status(value: str | None) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"success", "succeeded", "completed", "passed"}:
+        return "success"
+    if text in {"cancelled", "canceled", "interrupted", "stopped"}:
+        return "cancelled"
+    if text in {"failed", "error", "failure"}:
+        return "failed"
+    if text == "dispatching":
+        return "dispatching"
+    if text in {"running", "processing", "in_progress", "started"}:
+        return "running"
+    if text in {"pending", "queued", "created", "ready", "ready_to_start"}:
+        return "pending"
+    return "pending"
+
+
 def _is_control_message(message: str | None) -> bool:
     text = str(message or "").strip().lower()
     if not text:
@@ -1336,41 +1353,82 @@ class ExecutionService:
         execution: WorkflowExecution | None,
         run_summary: dict[str, Any] | None,
     ) -> tuple[str, str | None, datetime | None, datetime | None]:
-        trigger_status = _canonical_task_status(trigger.status)
+        trigger_status = _public_task_status(trigger.status)
         trigger_message = str(trigger.message or "").strip() or None
         trigger_started_at = trigger.started_at
         trigger_finished_at = trigger.finished_at
 
-        execution_status = _canonical_task_status(execution.status) if execution is not None else ""
+        execution_status = _public_task_status(execution.status) if execution is not None else ""
         dispatch_status = str(execution.dispatch_status or "").strip().lower() if execution is not None else ""
         execution_message = str(execution.message or "").strip() if execution is not None else ""
+        dispatch_error = str(execution.dispatch_error or "").strip() if execution is not None else ""
         execution_started_at = execution.started_at if execution is not None else None
         execution_finished_at = execution.finished_at if execution is not None else None
 
         run_summary = run_summary or {}
-        run_status = _canonical_task_status(run_summary.get("status"))
-        effective_status = trigger_status or execution_status or run_status or "pending"
-        effective_message = trigger_message or execution_message or None
-        effective_started_at = trigger_started_at or execution_started_at
-        effective_finished_at = trigger_finished_at or execution_finished_at
+        run_status = _public_task_status(run_summary.get("status"))
+        run_error = str(run_summary.get("error") or "").strip()
+        effective_started_at = execution_started_at or trigger_started_at
+        effective_finished_at = None
 
-        if effective_status == "pending":
-            if dispatch_status in {"queued", "dispatching"}:
-                effective_message = execution_message or trigger_message or effective_message
-            elif execution_status == "running":
-                effective_status = execution_status
-                effective_message = execution_message or trigger_message or effective_message
-                effective_started_at = execution_started_at or effective_started_at
-                effective_finished_at = execution_finished_at or effective_finished_at
+        preferred_error_message = _preferred_abnormal_message(
+            trigger_message=trigger_message,
+            execution_message=execution_message,
+            dispatch_error=dispatch_error,
+            run_error=run_error,
+        ) or execution_message or trigger_message or None
 
-        if effective_status == "running":
-            effective_started_at = execution_started_at or trigger_started_at or effective_started_at
-            effective_finished_at = None
-        elif effective_status == "pending":
-            effective_started_at = execution_started_at or trigger_started_at or effective_started_at
-            effective_finished_at = None
+        for terminal_status, terminal_message, terminal_started_at, terminal_finished_at in (
+            (trigger_status, trigger_message, trigger_started_at, trigger_finished_at),
+            (execution_status, execution_message or dispatch_error or trigger_message, execution_started_at or trigger_started_at, execution_finished_at or trigger_finished_at),
+            (run_status, run_error or execution_message or trigger_message, execution_started_at or trigger_started_at, execution_finished_at or trigger_finished_at or trigger_finished_at),
+        ):
+            if terminal_status in {"success", "failed", "cancelled"}:
+                return (
+                    terminal_status,
+                    terminal_message or preferred_error_message,
+                    terminal_started_at,
+                    terminal_finished_at,
+                )
 
-        return effective_status, effective_message, effective_started_at, effective_finished_at
+        if dispatch_status == "failed":
+            return (
+                "failed",
+                preferred_error_message,
+                effective_started_at,
+                execution_finished_at or trigger_finished_at,
+            )
+
+        if dispatch_status == "dispatching":
+            return (
+                "dispatching",
+                execution_message or trigger_message,
+                effective_started_at,
+                None,
+            )
+
+        if execution_status == "running" or trigger_status == "running" or run_status == "running":
+            return (
+                "running",
+                execution_message or trigger_message,
+                effective_started_at,
+                None,
+            )
+
+        if execution_status == "dispatching" or trigger_status == "dispatching" or run_status == "dispatching":
+            return (
+                "dispatching",
+                execution_message or trigger_message,
+                effective_started_at,
+                None,
+            )
+
+        return (
+            "pending",
+            execution_message or trigger_message,
+            effective_started_at,
+            None,
+        )
 
     def _slot_binding_state(
         self,
@@ -2685,6 +2743,33 @@ class ExecutionService:
             db.add(trigger)
         db.flush()
 
+    def mark_dispatch_failure_terminal(
+        self,
+        db: Session,
+        *,
+        execution: WorkflowExecution,
+        trigger: TriggerTask | None,
+        error: str,
+    ) -> None:
+        now = now_local()
+        message = f"worker dispatch failed: {error}"
+        execution.status = "failed"
+        execution.message = message
+        execution.finished_at = now
+        execution.dispatch_status = "failed"
+        execution.dispatch_error = error
+        execution.process_status = "not_started"
+        execution.process_finished_at = now
+        db.add(execution)
+        if trigger is not None:
+            trigger.status = "failed"
+            trigger.message = message
+            trigger.finished_at = now
+            trigger.latest_abnormal_reason_json = None
+            self._sync_trigger_abnormal_reason(db, trigger=trigger, execution=execution)
+            db.add(trigger)
+        db.flush()
+
     def _create_execution_attempt(
         self,
         db: Session,
@@ -3632,6 +3717,15 @@ class ExecutionService:
 
             auto_report_enabled = bool(task_metadata.get("auto_report_vulnerabilities", True))
             abnormal_reason = dict(trigger.latest_abnormal_reason_json) if isinstance(trigger.latest_abnormal_reason_json, dict) else None
+            effective_status, effective_message, effective_started_at, effective_finished_at = self._effective_scan_task_runtime_state(
+                trigger=trigger,
+                execution=latest_execution,
+                run_summary=run_summary,
+            )
+            slot_binding_state, slot_binding_reason = self._slot_binding_state(
+                execution=latest_execution,
+                effective_status=effective_status,
+            )
             responses.append(
                 ScanTaskResponse(
                     task_id=trigger.id,
@@ -3661,17 +3755,21 @@ class ExecutionService:
                     profile_id=self._task_effective_profile_id(trigger),
                     profile_version=int(version.version_no if version is not None else 0),
                     title=self._task_title_from_manifest_payload(first_task_payload, trigger.id),
-                    status=trigger.status,
+                    status=effective_status,
                     latest_attempt_no=latest_execution.attempt_no if latest_execution is not None else 0,
                     retry_count=trigger.retry_count,
                     max_retry_count=trigger.max_retry_count,
                     priority=trigger.priority,
                     created_by=trigger.submitted_by,
                     created_at=trigger.created_at,
-                    started_at=trigger.started_at,
-                    finished_at=trigger.finished_at,
-                    message=trigger.message,
+                    started_at=effective_started_at,
+                    finished_at=effective_finished_at,
+                    message=effective_message,
                     latest_execution_id=(latest_execution.id if latest_execution is not None else trigger.latest_execution_id),
+                    owner_pod_id=latest_execution.owner_pod_id if latest_execution is not None else None,
+                    dispatch_status=latest_execution.dispatch_status if latest_execution is not None else None,
+                    slot_binding_state=slot_binding_state,
+                    slot_binding_reason=slot_binding_reason,
                     run_name=run_locator.get("run_name"),
                     runs_root=run_locator.get("runs_root"),
                     run_path=run_locator.get("run_path"),
@@ -4415,6 +4513,68 @@ class ExecutionService:
             process_status="exited",
         )
 
+    def _reconcile_terminal_run_state(
+        self,
+        db: Session,
+        *,
+        run_index: RunIndex | None,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+    ) -> bool:
+        if run_index is None or (trigger is None and execution is None):
+            return False
+        run_status = _public_task_status(run_index.status)
+        if run_status not in {"success", "failed", "cancelled"}:
+            return False
+
+        trigger_status = _public_task_status(trigger.status) if trigger is not None else ""
+        execution_status = _public_task_status(execution.status) if execution is not None else ""
+        if trigger_status in {"success", "failed", "cancelled"} and execution_status in {"", "success", "failed", "cancelled"}:
+            return False
+
+        terminal_status = "succeeded" if run_status == "success" else run_status
+        message = (
+            str(run_index.error or "").strip()
+            or (str(execution.message or "").strip() if execution is not None else "")
+            or (str(trigger.message or "").strip() if trigger is not None else "")
+            or f"run index reconciled to {run_status}"
+        )
+        if execution is not None and trigger is not None:
+            self._set_terminal_state(
+                db,
+                execution=execution,
+                trigger=trigger,
+                execution_status=terminal_status,
+                message=message,
+                output_manifest_path=execution.output_manifest_path,
+                output_task_count=int(execution.output_task_count or run_index.result_count or 0),
+            )
+        else:
+            self._apply_terminal_state_mutation(
+                db,
+                execution=execution,
+                trigger=trigger,
+                terminal_status=terminal_status,
+                message=message,
+                process_status="exited",
+                sync_abnormal_reason=terminal_status != "succeeded",
+            )
+        db.flush()
+        if execution is not None:
+            self.record_event(
+                db,
+                execution_id=execution.id,
+                event_type="run_index_terminal_state_reconciled",
+                message=message,
+                level="warning" if terminal_status in {"failed", "cancelled"} else "info",
+                payload_json={
+                    "reason": "run_index_terminal_reconciled",
+                    "run_index_id": run_index.id,
+                    "run_status": run_status,
+                },
+            )
+        return True
+
     def _reconcile_stale_runtime(
         self,
         db: Session,
@@ -4425,6 +4585,13 @@ class ExecutionService:
     ) -> bool:
         if run_index is None or (trigger is None and execution is None):
             return False
+        if self._reconcile_terminal_run_state(
+            db,
+            run_index=run_index,
+            trigger=trigger,
+            execution=execution,
+        ):
+            return True
         process_state = self._run_process_state(db, run_index, trigger=trigger, execution=execution)
         if not bool(process_state.get("stale")):
             return False

@@ -11210,8 +11210,10 @@ class TaskManager:
         normalized = (status or "").lower()
         if normalized in {"downstream_missing", "not_found", "missing", "task_not_found"}:
             return "downstream_missing"
-        if normalized in {"pending", "queued", "created", "dispatching", "ready", "ready_to_start"}:
-            return "queued"
+        if normalized in {"pending", "queued", "created", "ready", "ready_to_start"}:
+            return "pending"
+        if normalized == "dispatching":
+            return "dispatching"
         if normalized in {"running", "processing", "in_progress", "cancelling", "started"}:
             return "running"
         if normalized in {"success", "passed", "completed", "complete", "done"}:
@@ -11231,9 +11233,12 @@ class TaskManager:
     def _aggregate_item_statuses(self, statuses: list[str]) -> str:
         if not statuses:
             return "pending"
-        active = {"pending", "queued", "running", "dispatching"}
-        if any(status in active for status in statuses):
+        if any(status == "running" for status in statuses):
             return "running"
+        if any(status == "dispatching" for status in statuses):
+            return "dispatching"
+        if any(status in {"pending", "queued"} for status in statuses):
+            return "pending"
         if all(status == "success" for status in statuses):
             return "success"
         if any(status == "success" for status in statuses) and any(status in {"failed", "cancelled", "partial_success", "downstream_missing"} for status in statuses):
@@ -16965,7 +16970,7 @@ class TaskManager:
             active_payload = await self._active_downstream_payload(task, item, token)
             if active_payload is not None:
                 item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
-                item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "running"
+                item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "pending"
                 session.commit()
                 status, payload = await self._poll_until_terminal(
                     lambda: get_dataflow_vuln_scanner_client().get_task(item.downstream_task_id, token or ""),
@@ -16988,7 +16993,7 @@ class TaskManager:
                         token,
                         keep_task_ids={str(item.downstream_task_id or "").strip()},
                     )
-                    if mapped_reusable_status in {"queued", "running"}:
+                    if mapped_reusable_status in {"pending", "dispatching", "running"}:
                         item.status = mapped_reusable_status
                         session.commit()
                         status, payload = await self._poll_until_terminal(
@@ -17011,7 +17016,7 @@ class TaskManager:
                     elif outcome == "already_running":
                         payload = dict(control.get("payload") or {})
                         item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
-                        item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
+                        item.status = self._map_downstream_status(str(payload.get("status") or "")) or "dispatching"
                         session.commit()
                         status, payload = await self._poll_until_terminal(
                             lambda: get_dataflow_vuln_scanner_client().get_task(item.downstream_task_id, token or ""),
@@ -17061,7 +17066,7 @@ class TaskManager:
                     )
             if created is not None:
                 item.downstream_task_id = created.get("task_id") or item.downstream_task_id
-                item.status = "running"
+                item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
                 session.commit()
                 status, payload = await self._poll_until_terminal(
                     lambda: get_dataflow_vuln_scanner_client().get_task(item.downstream_task_id, token or ""),
@@ -17192,9 +17197,20 @@ class TaskManager:
         failed_like_all = failed_all + downstream_missing_all
         failed = failed_like_all[:DB_FAILURE_ITEM_LIMIT]
         cancelled = cancelled_all[:DB_FAILURE_ITEM_LIMIT]
+        running_active = [result for result in active_results if result.get("status") == "running" or result.get("deferred_mode") == "reconcile"]
+        dispatching_active = [result for result in active_results if result.get("status") == "dispatching"]
+        pending_active = [
+            result
+            for result in active_results
+            if result.get("status") in {"pending", "queued"} or result.get("deferred_mode") == "redispatch"
+        ]
         if reconcile_waiting:
             status = "running"
-        elif redispatch_waiting:
+        elif running_active:
+            status = "running"
+        elif dispatching_active:
+            status = "dispatching"
+        elif pending_active or redispatch_waiting:
             status = "pending"
         elif failed_like_all and success:
             status = "partial_success"
@@ -17212,8 +17228,9 @@ class TaskManager:
             "failed_count": len(failed_like_all),
             "downstream_missing_count": len(downstream_missing_all),
             "cancelled_count": len(cancelled_all),
-            "running_count": len(reconcile_waiting),
-            "pending_count": len(redispatch_waiting),
+            "running_count": len(running_active),
+            "dispatching_count": len(dispatching_active),
+            "pending_count": len(pending_active),
             "entry_count": self._entry_count_for_summary(summary_key, compact_success),
             "vuln_result_count": len(compact_success) if summary_key == "vuln_results" else 0,
             "items_truncated": len(db_success) < len(compact_success),

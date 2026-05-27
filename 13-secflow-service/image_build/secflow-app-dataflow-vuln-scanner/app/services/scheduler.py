@@ -1108,12 +1108,6 @@ class SchedulerService:
             execution = db.get(WorkflowExecution, execution_id)
             if execution is None:
                 return
-            execution.worker_url = None
-            execution.worker_job_id = None
-            execution.owner_pod_id = None
-            execution.dispatch_status = None
-            execution.dispatch_error = error
-            execution.message = f"worker dispatch failed: {error}"
             reservation = (
                 db.query(SchedulerWorkerSlotReservation)
                 .filter(SchedulerWorkerSlotReservation.execution_id == execution_id)
@@ -1122,10 +1116,15 @@ class SchedulerService:
             if reservation is not None:
                 db.delete(reservation)
             trigger = db.get(TriggerTask, execution.trigger_task_id)
-            if trigger is not None and trigger.status == "pending":
-                trigger.message = execution.message
-                db.add(trigger)
-            db.add(execution)
+            execution.worker_url = None
+            execution.worker_job_id = None
+            execution.owner_pod_id = None
+            get_execution_service().mark_dispatch_failure_terminal(
+                db,
+                execution=execution,
+                trigger=trigger,
+                error=error,
+            )
             db.commit()
             get_execution_service().record_event(
                 db,
