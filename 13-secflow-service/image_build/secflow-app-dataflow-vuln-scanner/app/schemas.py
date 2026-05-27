@@ -408,6 +408,10 @@ class WorkerClusterCapacityResponse(BaseModel):
     workers: List[WorkerClusterWorkerResponse] = Field(default_factory=list)
 
 
+class WorkerClusterCapacitySummaryResponse(WorkerClusterCapacityResponse):
+    detail_mode: Literal["summary", "detail"] = "summary"
+
+
 class SuccessResponse(BaseModel):
     success: bool = True
     message: str

@@ -1254,6 +1254,9 @@ class TaskManagerTests(unittest.TestCase):
                 output_root=str(Path(tmp) / "output"),
                 workspace_root=tmp,
                 started_at=_now(),
+                dispatcher_instance_id=self.manager.instance_id,
+                dispatch_started_at=_now(),
+                lease_expires_at=_now() + timedelta(minutes=1),
                 policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
             )
             stage_run = BinarySecurityStageRun(
@@ -1319,6 +1322,9 @@ class TaskManagerTests(unittest.TestCase):
                 output_root=str(Path(tmp) / "output"),
                 workspace_root=tmp,
                 started_at=_now(),
+                dispatcher_instance_id=self.manager.instance_id,
+                dispatch_started_at=_now(),
+                lease_expires_at=_now() + timedelta(minutes=1),
                 policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
             )
             entry_run = BinarySecurityStageRun(
@@ -1402,6 +1408,9 @@ class TaskManagerTests(unittest.TestCase):
 
             self.assertEqual("running", task.status)
             self.assertEqual("dataflow_analysis", task.current_stage)
+            self.assertEqual(self.manager.instance_id, task.dispatcher_instance_id)
+            self.assertIsNotNone(task.dispatch_started_at)
+            self.assertIsNotNone(task.lease_expires_at)
 
     def test_streaming_reducer_sequence_applies_terminal_then_downstream_status(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -1418,6 +1427,9 @@ class TaskManagerTests(unittest.TestCase):
                 output_root=str(Path(tmp) / "output"),
                 workspace_root=tmp,
                 started_at=_now(),
+                dispatcher_instance_id=self.manager.instance_id,
+                dispatch_started_at=_now(),
+                lease_expires_at=_now() + timedelta(minutes=1),
                 policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
             )
             system_run = BinarySecurityStageRun(
@@ -2230,6 +2242,73 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(1, failed_only_page.total)
         self.assertEqual("sev-retry", failed_only_page.items[0].event_id)
 
+    def test_build_project_stats_sql_aggregates_counts_from_database(self):
+        task1 = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="a",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw/a",
+            output_root="/o",
+            workspace_root="/w/a",
+        )
+        task1.metrics = {
+            "selected_module_count": 2,
+            "candidate_module_count": 3,
+            "high_risk_module_count": 1,
+            "entry_count": 4,
+            "vuln_result_count": 5,
+            "firmware_item_count": 6,
+            "unpacked_firmware_count": 1,
+            "failed_firmware_count": 0,
+        }
+        task2 = BinarySecurityTask(
+            id="t2",
+            project_id="p1",
+            name="b",
+            status="success",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/fw/b",
+            output_root="/o",
+            workspace_root="/w/b",
+        )
+        task2.metrics = {
+            "selected_module_count": 7,
+            "candidate_module_count": 8,
+            "high_risk_module_count": 2,
+            "entry_count": 9,
+            "vuln_result_count": 10,
+            "firmware_item_count": 11,
+            "unpacked_firmware_count": 0,
+            "failed_firmware_count": 0,
+        }
+
+        engine = create_engine("sqlite:///:memory:")
+        BinarySecurityTask.__table__.create(bind=engine)
+        SessionLocal = sessionmaker(bind=engine)
+        session = SessionLocal()
+        try:
+            session.add(task1)
+            session.add(task2)
+            session.commit()
+
+            stats = self.manager._build_project_stats_sql(session, project_id="p1", task_type=None)
+
+            self.assertEqual(2, stats.total)
+            self.assertEqual(1, stats.running)
+            self.assertEqual(1, stats.success)
+            self.assertEqual(9, stats.selected_module_count)
+            self.assertEqual(11, stats.candidate_module_count)
+            self.assertEqual(3, stats.high_risk_module_count)
+            self.assertEqual(13, stats.entry_count)
+            self.assertEqual(15, stats.vuln_result_count)
+            self.assertEqual(17, stats.input_count)
+        finally:
+            session.close()
+
     def test_get_task_detail_keeps_read_path_side_effect_free_when_stage_is_running(self):
         task = BinarySecurityTask(
             id="t1",
@@ -2308,11 +2387,40 @@ class TaskManagerTests(unittest.TestCase):
         )
         db = _ModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item])
 
+        task.stage_summary = {
+            "system_analysis": {
+                "sequence_no": 2,
+                "status": "running",
+                "total_items": 1,
+                "running_items": 1,
+            }
+        }
+        task.latest_abnormal_reason = {
+            "is_abnormal": True,
+            "category": "runtime",
+            "code": "task_running",
+            "title": "任务运行中",
+            "message": "列表页轻量快照",
+            "terminal": False,
+            "source_layer": "task",
+            "status": "dispatching",
+            "service": "binary-security",
+            "stage_name": "system_analysis",
+            "evidence": [],
+            "related_event_ids": [],
+        }
+        task.operation_lock_type = "retry"
+        task.operation_lock_owner = "worker-a"
+        task.operation_lock_expires_at = _now() + timedelta(minutes=1)
         response = self.manager.list_tasks(db, project_id="p1")
 
         self.assertEqual(1, response.total)
         self.assertEqual("dispatching", response.items[0].status)
         self.assertEqual("dispatching", task.status)
+        summary_by_stage = {summary.stage_name: summary for summary in response.items[0].stage_summaries}
+        self.assertEqual("running", summary_by_stage["system_analysis"].status)
+        self.assertEqual("任务运行中", response.items[0].abnormal_reason_title)
+        self.assertEqual("in_progress", response.items[0].manual_operation_state["overall"])
 
     def test_stage_run_output_summary_db_payload_is_hard_capped(self):
         task = BinarySecurityTask(
@@ -3661,6 +3769,165 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, aggregates[0].business.success_items)
         self.assertEqual(1, aggregates[0].archive.success_count)
 
+    def test_build_project_stage_aggregates_sql_aggregates_by_project_and_task_type(self):
+        binary_task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        source_task = BinarySecurityTask(
+            id="t2",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src.zip",
+            output_root="/o",
+            workspace_root="/w2",
+        )
+        other_project_task = BinarySecurityTask(
+            id="t3",
+            project_id="p2",
+            name="other",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw2",
+            output_root="/o",
+            workspace_root="/w3",
+        )
+
+        engine = create_engine("sqlite:///:memory:")
+        BinarySecurityTask.__table__.create(bind=engine)
+        BinarySecurityStageRun.__table__.create(bind=engine)
+        BinarySecurityArchiveJob.__table__.create(bind=engine)
+        SessionLocal = sessionmaker(bind=engine)
+        session = SessionLocal()
+        try:
+            session.add_all([binary_task, source_task, other_project_task])
+            session.add_all(
+                [
+                    BinarySecurityStageRun(
+                        id="sr1",
+                        task_id="t1",
+                        project_id="p1",
+                        stage_name="system_analysis",
+                        sequence_no=1,
+                        status="running",
+                    ),
+                    BinarySecurityStageRun(
+                        id="sr2",
+                        task_id="t2",
+                        project_id="p1",
+                        stage_name="entry_analysis",
+                        sequence_no=2,
+                        status="running",
+                    ),
+                    BinarySecurityStageRun(
+                        id="sr3",
+                        task_id="t3",
+                        project_id="p2",
+                        stage_name="system_analysis",
+                        sequence_no=1,
+                        status="running",
+                    ),
+                ]
+            )
+            session.add_all(
+                [
+                    BinarySecurityArchiveJob(
+                        id="aj1",
+                        task_id="t1",
+                        project_id="p1",
+                        stage_name="system_analysis",
+                        item_id="si1",
+                        archive_status="pending",
+                    ),
+                    BinarySecurityArchiveJob(
+                        id="aj2",
+                        task_id="t2",
+                        project_id="p1",
+                        stage_name="entry_analysis",
+                        item_id="si2",
+                        archive_status="success",
+                    ),
+                    BinarySecurityArchiveJob(
+                        id="aj3",
+                        task_id="t3",
+                        project_id="p2",
+                        stage_name="system_analysis",
+                        item_id="si3",
+                        archive_status="failed",
+                    ),
+                ]
+            )
+            session.commit()
+
+            fake_db = _ModelAwareDb(
+                tasks=[binary_task, source_task, other_project_task],
+                stage_runs=[
+                    SimpleNamespace(task_id="t1", stage_name="system_analysis"),
+                    SimpleNamespace(task_id="t2", stage_name="entry_analysis"),
+                    SimpleNamespace(task_id="t3", stage_name="system_analysis"),
+                ],
+                stage_items=[
+                    SimpleNamespace(task_id="t1", stage_name="system_analysis", status="running"),
+                    SimpleNamespace(task_id="t2", stage_name="entry_analysis", status="success"),
+                    SimpleNamespace(task_id="t3", stage_name="system_analysis", status="failed"),
+                ],
+                archive_jobs=[
+                    SimpleNamespace(task_id="t1", stage_name="system_analysis", archive_status="pending"),
+                    SimpleNamespace(task_id="t2", stage_name="entry_analysis", archive_status="success"),
+                    SimpleNamespace(task_id="t3", stage_name="system_analysis", archive_status="failed"),
+                ],
+            )
+            binary_aggregates = self.manager._build_project_stage_aggregates(fake_db, [binary_task], TASK_TYPE_BINARY)
+            binary_by_stage = {item.stage_name: item for item in binary_aggregates}
+            self.assertEqual(1, binary_by_stage["system_analysis"].business.task_count)
+            self.assertEqual(1, binary_by_stage["system_analysis"].business.running_items)
+            self.assertEqual(1, binary_by_stage["system_analysis"].archive.pending_count)
+
+            source_aggregates = self.manager._build_project_stage_aggregates(fake_db, [source_task], TASK_TYPE_SOURCE)
+            self.assertEqual(
+                ["system_analysis", "entry_analysis", "dataflow_analysis", "vuln_scan"],
+                [item.stage_name for item in source_aggregates],
+            )
+            source_by_stage = {item.stage_name: item for item in source_aggregates}
+            self.assertEqual(1, source_by_stage["entry_analysis"].business.success_items)
+            self.assertEqual(1, source_by_stage["entry_analysis"].archive.success_count)
+
+            sql_binary_aggregates = self.manager._build_project_stage_aggregates_sql(
+                session,
+                project_id="p1",
+                task_type=TASK_TYPE_BINARY,
+            )
+            sql_binary_by_stage = {item.stage_name: item for item in sql_binary_aggregates}
+            self.assertEqual(1, sql_binary_by_stage["system_analysis"].business.task_count)
+            self.assertEqual(1, sql_binary_by_stage["system_analysis"].archive.pending_count)
+            self.assertEqual(0, sql_binary_by_stage["entry_analysis"].business.task_count)
+
+            sql_source_aggregates = self.manager._build_project_stage_aggregates_sql(
+                session,
+                project_id="p1",
+                task_type=TASK_TYPE_SOURCE,
+            )
+            self.assertEqual(
+                ["system_analysis", "entry_analysis", "dataflow_analysis", "vuln_scan"],
+                [item.stage_name for item in sql_source_aggregates],
+            )
+            sql_source_by_stage = {item.stage_name: item for item in sql_source_aggregates}
+            self.assertEqual(1, sql_source_by_stage["entry_analysis"].business.task_count)
+            self.assertEqual(1, sql_source_by_stage["entry_analysis"].archive.success_count)
+        finally:
+            session.close()
+
     def test_aggregate_stage_items_marks_partial_success(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
         task.summary = {}
@@ -4047,8 +4314,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                         "line_no": "10",
                         "source_dir": "/tmp/archive/openssl",
                         "data_flow_file": "/tmp/archive/openssl/dataflow.md",
-                        "dataflow_dir": "/tmp/archive/openssl/dataflow",
-                        "artifact_root": "/tmp/archive/openssl/dataflow",
+                        "dataflow_dir": "/tmp/archive/openssl",
+                        "artifact_root": "/tmp/archive/openssl",
                         "downstream": {"items": [{"blob": "z" * 4000}]},
                     },
                 }
@@ -4059,7 +4326,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         stored = task.summary["dataflow_results"][0]
         self.assertEqual("/tmp/archive/openssl/dataflow.md", stored["data_flow_file"])
         self.assertEqual("/tmp/archive/openssl", stored["source_dir"])
-        self.assertEqual("/tmp/archive/openssl/dataflow", stored["dataflow_dir"])
+        self.assertEqual("/tmp/archive/openssl", stored["dataflow_dir"])
         self.assertNotIn("downstream", stored)
 
     def test_vuln_results_store_only_archive_summary(self):
@@ -6165,6 +6432,130 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             order,
         )
 
+    def test_manual_cancel_collects_dispatching_and_orphan_downstream_refs(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="i1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_key="m1",
+            status="dispatching",
+            downstream_service="system_analyse",
+            downstream_task_id="sat_1",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item])
+        calls: list[dict[str, object]] = []
+
+        async def fake_write_task_metadata_async(*args, **kwargs):
+            return None
+
+        async def fake_cancel_local_worker(task_id: str):
+            self.assertEqual("t1", task_id)
+
+        async def fake_cancel_downstream_refs(db_arg, task_arg, refs_arg, token_arg):
+            calls.append(
+                {
+                    "db": db_arg,
+                    "task_id": task_arg.id,
+                    "refs": list(refs_arg),
+                    "token": token_arg,
+                }
+            )
+            return len(refs_arg)
+
+        original_discover = self.manager._discover_parent_linked_downstream_refs
+        self.manager._write_task_metadata_async = fake_write_task_metadata_async
+        self.manager._cancel_local_worker = fake_cancel_local_worker
+        self.manager._cancel_downstream_refs = fake_cancel_downstream_refs
+        self.manager._discover_parent_linked_downstream_refs = lambda _db, _task: [
+            {"service": "dataflow_analyse", "task_id": "dfa_orphan", "project_id": "p1", "stage_name": "dataflow_analysis"},
+        ]
+        try:
+            asyncio.run(self.manager.cancel_task(db, project_id="p1", task_id="t1"))
+            asyncio.run(self.manager._apply_manual_cancel_request_locked(db, db.added[-1]))
+        finally:
+            self.manager._discover_parent_linked_downstream_refs = original_discover
+
+        self.assertEqual("cancelled", task.status)
+        self.assertEqual("cancelled", item.status)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(
+            ["sat_1", "dfa_orphan"],
+            [ref["task_id"] for ref in calls[0]["refs"]],
+        )
+
+    def test_manual_cancel_noop_retries_orphan_downstream_cancel(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="cancelled",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="i1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_key="m1",
+            status="running",
+            downstream_service="system_analyse",
+            downstream_task_id="sat_1",
+        )
+        event = BinarySecurityStateEvent(
+            id="evt1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            event_type="manual_cancel_requested",
+            payload={"operation_token": ""},
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], state_events=[event])
+        calls: list[dict[str, object]] = []
+
+        async def fake_cancel_downstream_refs(db_arg, task_arg, refs_arg, token_arg):
+            calls.append(
+                {
+                    "db": db_arg,
+                    "task_id": task_arg.id,
+                    "refs": list(refs_arg),
+                    "token": token_arg,
+                }
+            )
+            return len(refs_arg)
+
+        original_discover = self.manager._discover_parent_linked_downstream_refs
+        self.manager._cancel_downstream_refs = fake_cancel_downstream_refs
+        self.manager._discover_parent_linked_downstream_refs = lambda _db, _task: [
+            {"service": "dataflow_analyse", "task_id": "dfa_orphan", "project_id": "p1", "stage_name": "dataflow_analysis"},
+        ]
+        try:
+            asyncio.run(self.manager._apply_manual_cancel_request_locked(db, event))
+        finally:
+            self.manager._discover_parent_linked_downstream_refs = original_discover
+
+        self.assertEqual("cancelled", item.status)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(
+            ["sat_1", "dfa_orphan"],
+            [ref["task_id"] for ref in calls[0]["refs"]],
+        )
+
     def test_retry_task_clears_archive_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -8107,6 +8498,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 firmware_path="/src",
                 output_root=str(Path(tmp) / "output"),
                 workspace_root=tmp,
+                dispatcher_instance_id=self.manager.instance_id,
+                dispatch_started_at=_now(),
+                lease_expires_at=_now() + timedelta(minutes=1),
                 policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
             )
             task.summary = {}
@@ -8155,6 +8549,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(["entry-a"], [row.get("entries", [{}])[0].get("entry_key") for row in task.summary.get("entry_results") or []])
             self.assertEqual("dataflow_analysis", task.current_stage)
             self.assertEqual("pending", task.status)
+            self.assertEqual(self.manager.instance_id, task.dispatcher_instance_id)
+            self.assertIsNotNone(task.dispatch_started_at)
+            self.assertIsNotNone(task.lease_expires_at)
 
     def test_sync_streaming_task_tail_state_keeps_current_stage_on_earliest_incomplete_tail_before_finalize(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -8170,6 +8567,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 firmware_path="/src",
                 output_root=str(Path(tmp) / "output"),
                 workspace_root=tmp,
+                dispatcher_instance_id=self.manager.instance_id,
+                dispatch_started_at=_now(),
+                lease_expires_at=_now() + timedelta(minutes=1),
                 policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
             )
             runs = [
@@ -8216,6 +8616,67 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual("dataflow_analysis", task.current_stage)
             self.assertEqual("failed", task.status)
+            self.assertEqual(self.manager.instance_id, task.dispatcher_instance_id)
+            self.assertIsNotNone(task.dispatch_started_at)
+            self.assertIsNotNone(task.lease_expires_at)
+
+    def test_touch_task_heartbeat_keeps_lease_alive_for_active_streaming_stage_workers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            started_at = _now() - timedelta(seconds=20)
+            original_expiry = _now() + timedelta(seconds=5)
+            task = BinarySecurityTask(
+                id="task-streaming-heartbeat",
+                project_id="p1",
+                name="n",
+                status="running",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="dataflow_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(Path(tmp) / "output"),
+                workspace_root=tmp,
+                dispatcher_instance_id=self.manager.instance_id,
+                dispatch_started_at=started_at,
+                lease_expires_at=original_expiry,
+                updated_at=started_at,
+                policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+            )
+            active_item = BinarySecurityStageItem(
+                id="si-df-active",
+                task_id="task-streaming-heartbeat",
+                project_id="p1",
+                stage_run_id="sr-df",
+                stage_name="dataflow_analysis",
+                item_key="entry-a",
+                item_name="func_a",
+                parent_key="mod-a",
+                item_identity_key="entry-a::mod-a",
+                status="running",
+            )
+            db = _AppendingModelAwareDb(tasks=[task], stage_items=[active_item])
+
+            original_factory = task_manager_module.get_session_factory
+            original_interval = self.manager.cfg.scheduler.heartbeat_update_interval_seconds
+            original_workers = dict(self.manager._workers)
+            original_stage_workers = dict(self.manager._stage_item_workers)
+            task_manager_module.get_session_factory = lambda: (lambda: db)
+            self.manager.cfg.scheduler.heartbeat_update_interval_seconds = 0
+            self.manager._workers.pop(task.id, None)
+
+            loop = asyncio.new_event_loop()
+            try:
+                worker = loop.create_future()
+                self.manager._stage_item_workers[active_item.id] = worker
+                self.manager._touch_task_heartbeat(task.id)
+            finally:
+                task_manager_module.get_session_factory = original_factory
+                self.manager.cfg.scheduler.heartbeat_update_interval_seconds = original_interval
+                self.manager._workers = original_workers
+                self.manager._stage_item_workers = original_stage_workers
+                loop.close()
+
+            self.assertGreater(task.lease_expires_at, original_expiry)
+            self.assertGreater(task.updated_at, started_at)
 
     def test_refresh_stage_run_from_items_preserves_streaming_tail_failed_status_without_items(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -14104,7 +14565,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             "module_name": "module-1",
             "data_flow_file": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1/final_report.md",
             "primary_report_path": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1/final_report.md",
-            "dataflow_dir": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1/dataflow",
+            "dataflow_dir": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1",
             "source_dir": ".",
             "source_root_path": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/binary-to-source/modules/module-1",
             "module_input_path": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/binary-to-source/modules/module-1",
@@ -14146,7 +14607,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("success", result["status"])
         self.assertEqual(1, len(create_calls))
-        self.assertEqual("/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1/dataflow", create_calls[0]["data_flow_path"])
+        self.assertEqual("/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1", create_calls[0]["data_flow_path"])
 
     def test_validate_dataflow_output_contract_requires_dataflow_dir(self):
         payload = {
@@ -14910,6 +15371,136 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(db.tasks))
         failed_events = [row for row in db.added if isinstance(row, BinarySecurityEvent) and row.event_type == "task_delete_failed"]
         self.assertTrue(failed_events)
+
+
+def _test_manual_cancel_collects_dispatching_and_orphan_downstream_refs(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = BinarySecurityStageItem(
+        id="i1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="system_analysis",
+        item_key="m1",
+        status="dispatching",
+        downstream_service="system_analyse",
+        downstream_task_id="sat_1",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[item])
+    calls: list[dict[str, object]] = []
+
+    async def fake_write_task_metadata_async(*args, **kwargs):
+        return None
+
+    async def fake_cancel_local_worker(task_id: str):
+        self.assertEqual("t1", task_id)
+
+    async def fake_cancel_downstream_refs(db_arg, task_arg, refs_arg, token_arg):
+        calls.append(
+            {
+                "db": db_arg,
+                "task_id": task_arg.id,
+                "refs": list(refs_arg),
+                "token": token_arg,
+            }
+        )
+        return len(refs_arg)
+
+    original_discover = self.manager._discover_parent_linked_downstream_refs
+    self.manager._write_task_metadata_async = fake_write_task_metadata_async
+    self.manager._cancel_local_worker = fake_cancel_local_worker
+    self.manager._cancel_downstream_refs = fake_cancel_downstream_refs
+    self.manager._discover_parent_linked_downstream_refs = lambda _db, _task: [
+        {"service": "dataflow_analyse", "task_id": "dfa_orphan", "project_id": "p1", "stage_name": "dataflow_analysis"},
+    ]
+    try:
+        asyncio.run(self.manager.cancel_task(db, project_id="p1", task_id="t1"))
+        asyncio.run(self.manager._apply_manual_cancel_request_locked(db, db.added[-1]))
+    finally:
+        self.manager._discover_parent_linked_downstream_refs = original_discover
+
+    self.assertEqual("cancelled", task.status)
+    self.assertEqual("cancelled", item.status)
+    self.assertEqual(1, len(calls))
+    self.assertEqual(
+        ["sat_1", "dfa_orphan"],
+        [ref["task_id"] for ref in calls[0]["refs"]],
+    )
+
+
+def _test_manual_cancel_noop_retries_orphan_downstream_cancel(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="source",
+        status="cancelled",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = BinarySecurityStageItem(
+        id="i1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="system_analysis",
+        item_key="m1",
+        status="running",
+        downstream_service="system_analyse",
+        downstream_task_id="sat_1",
+    )
+    event = BinarySecurityStateEvent(
+        id="evt1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="system_analysis",
+        event_type="manual_cancel_requested",
+        payload={"operation_token": ""},
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[item], state_events=[event])
+    calls: list[dict[str, object]] = []
+
+    async def fake_cancel_downstream_refs(db_arg, task_arg, refs_arg, token_arg):
+        calls.append(
+            {
+                "db": db_arg,
+                "task_id": task_arg.id,
+                "refs": list(refs_arg),
+                "token": token_arg,
+            }
+        )
+        return len(refs_arg)
+
+    original_discover = self.manager._discover_parent_linked_downstream_refs
+    self.manager._cancel_downstream_refs = fake_cancel_downstream_refs
+    self.manager._discover_parent_linked_downstream_refs = lambda _db, _task: [
+        {"service": "dataflow_analyse", "task_id": "dfa_orphan", "project_id": "p1", "stage_name": "dataflow_analysis"},
+    ]
+    try:
+        asyncio.run(self.manager._apply_manual_cancel_request_locked(db, event))
+    finally:
+        self.manager._discover_parent_linked_downstream_refs = original_discover
+
+    self.assertEqual("cancelled", item.status)
+    self.assertEqual(1, len(calls))
+    self.assertEqual(
+        ["sat_1", "dfa_orphan"],
+        [ref["task_id"] for ref in calls[0]["refs"]],
+    )
+
+
+TaskManagerTests.test_manual_cancel_collects_dispatching_and_orphan_downstream_refs = _test_manual_cancel_collects_dispatching_and_orphan_downstream_refs
+TaskManagerTests.test_manual_cancel_noop_retries_orphan_downstream_cancel = _test_manual_cancel_noop_retries_orphan_downstream_cancel
 
 
 if __name__ == "__main__":

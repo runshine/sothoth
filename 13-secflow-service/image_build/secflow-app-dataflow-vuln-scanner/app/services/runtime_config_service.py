@@ -37,6 +37,8 @@ def _default_payload() -> dict[str, Any]:
             "worker_queue_depth": config.scheduler.worker_queue_depth,
             "dispatch_batch_size": config.scheduler.dispatch_batch_size,
             "requeue_stuck_dispatch_after_seconds": config.scheduler.requeue_stuck_dispatch_after_seconds,
+            "cluster_capacity_summary_refresh_interval_seconds": 5,
+            "cluster_capacity_summary_stale_after_seconds": 15,
         },
         "dataflow_worker": {
             "base_url": config.dataflow_worker.base_url,

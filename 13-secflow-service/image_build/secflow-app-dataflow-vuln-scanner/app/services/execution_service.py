@@ -45,6 +45,7 @@ from app.models.database import (
     WorkflowExecutionEvent,
     get_db_session,
 )
+from app.observability.service_ops import observe_service_operation
 from app.pi_vuln_core.review.profile import apply_profile_runtime_policy_to_config
 from app.pi_vuln_core.runner import build_runtime_framework_config, run_framework_config
 from app.pi_vuln_core.utils.logger import attach_log_file, detach_log_file
@@ -1018,6 +1019,11 @@ class ExecutionService:
                 **run_summary,
             }
         abnormal_reason = self._task_abnormal_reason(trigger, latest_execution, run_summary)
+        effective_task_status, effective_task_message, effective_started_at, effective_finished_at = self._effective_scan_task_runtime_state(
+            trigger=trigger,
+            execution=latest_execution,
+            run_summary=run_summary,
+        )
         return ScanTaskResponse(
             task_id=trigger.id,
             project_id=trigger.project_id,
@@ -1046,16 +1052,16 @@ class ExecutionService:
                 ).items()
             },
             title=self._trigger_title(trigger),
-            status=trigger.status,
+            status=effective_task_status,
             latest_attempt_no=latest_execution.attempt_no if latest_execution else 0,
             retry_count=trigger.retry_count,
             max_retry_count=trigger.max_retry_count,
             priority=trigger.priority,
             created_by=trigger.submitted_by,
             created_at=trigger.created_at,
-            started_at=trigger.started_at,
-            finished_at=trigger.finished_at,
-            message=trigger.message,
+            started_at=effective_started_at,
+            finished_at=effective_finished_at,
+            message=effective_task_message,
             latest_execution_id=trigger.latest_execution_id,
             run_name=run_locator["run_name"],
             runs_root=run_locator["runs_root"],
@@ -1075,6 +1081,249 @@ class ExecutionService:
             abnormal_reason_category=abnormal_reason.get("category") if abnormal_reason else None,
             abnormal_reason=abnormal_reason,
         )
+
+    def _build_profile_version_map(
+        self,
+        db: Session,
+        triggers: list[TriggerTask],
+    ) -> dict[str, int]:
+        version_ids = {str(item.workflow_definition_version_id) for item in triggers if item.workflow_definition_version_id}
+        version_rows = {}
+        if version_ids:
+            version_rows = {
+                str(item.id): int(item.version_no or 0)
+                for item in db.query(WorkflowDefinitionVersion).filter(WorkflowDefinitionVersion.id.in_(version_ids)).all()
+            }
+        definition_ids = {str(item.workflow_definition_id) for item in triggers if item.workflow_definition_id}
+        latest_versions: dict[str, int] = {}
+        if definition_ids:
+            rows = (
+                db.query(WorkflowDefinitionVersion.workflow_definition_id, WorkflowDefinitionVersion.version_no)
+                .filter(WorkflowDefinitionVersion.workflow_definition_id.in_(definition_ids))
+                .all()
+            )
+            for workflow_definition_id, version_no in rows:
+                key = str(workflow_definition_id)
+                latest_versions[key] = max(latest_versions.get(key, 0), int(version_no or 0))
+        profile_versions: dict[str, int] = {}
+        for trigger in triggers:
+            trigger_id = str(trigger.id)
+            if trigger.workflow_definition_version_id and str(trigger.workflow_definition_version_id) in version_rows:
+                profile_versions[trigger_id] = version_rows[str(trigger.workflow_definition_version_id)]
+            else:
+                profile_versions[trigger_id] = latest_versions.get(str(trigger.workflow_definition_id), 0)
+        return profile_versions
+
+    def _build_latest_execution_map(
+        self,
+        db: Session,
+        triggers: list[TriggerTask],
+    ) -> dict[str, WorkflowExecution]:
+        trigger_ids = [str(item.id) for item in triggers if item.id]
+        if not trigger_ids:
+            return {}
+        executions = (
+            db.query(WorkflowExecution)
+            .filter(WorkflowExecution.trigger_task_id.in_(trigger_ids))
+            .order_by(WorkflowExecution.trigger_task_id.asc(), WorkflowExecution.attempt_no.desc(), WorkflowExecution.created_at.desc())
+            .all()
+        )
+        latest: dict[str, WorkflowExecution] = {}
+        for execution in executions:
+            key = str(execution.trigger_task_id)
+            if key not in latest:
+                latest[key] = execution
+        return latest
+
+    def _build_lightweight_run_index_map(
+        self,
+        db: Session,
+        triggers: list[TriggerTask],
+        latest_execution_map: dict[str, WorkflowExecution],
+    ) -> dict[str, RunIndex]:
+        trigger_ids = [str(item.id) for item in triggers if item.id]
+        execution_ids = [str(item.id) for item in latest_execution_map.values() if item.id]
+        run_indexes = (
+            db.query(RunIndex)
+            .filter(
+                (RunIndex.linked_execution_id.in_(execution_ids) if execution_ids else False)
+                | (RunIndex.linked_task_id.in_(trigger_ids) if trigger_ids else False)
+            )
+            .order_by(RunIndex.started_at.desc(), RunIndex.created_at.desc())
+            .all()
+        )
+        by_execution: dict[str, RunIndex] = {}
+        by_task: dict[str, RunIndex] = {}
+        for item in run_indexes:
+            execution_id = str(item.linked_execution_id or "").strip()
+            task_id = str(item.linked_task_id or "").strip()
+            if execution_id and execution_id not in by_execution:
+                by_execution[execution_id] = item
+            if task_id and task_id not in by_task:
+                by_task[task_id] = item
+        resolved: dict[str, RunIndex] = {}
+        for trigger in triggers:
+            trigger_id = str(trigger.id)
+            latest_execution = latest_execution_map.get(trigger_id)
+            if latest_execution is not None:
+                run_index = by_execution.get(str(latest_execution.id))
+                if run_index is not None:
+                    resolved[trigger_id] = run_index
+                    continue
+            run_index = by_task.get(trigger_id)
+            if run_index is not None:
+                resolved[trigger_id] = run_index
+        return resolved
+
+    def _scan_task_list_response(
+        self,
+        *,
+        trigger: TriggerTask,
+        latest_execution: WorkflowExecution | None,
+        profile_version: int,
+        run_index: RunIndex | None,
+    ) -> ScanTaskListItemResponse:
+        task_metadata = self._trigger_task_metadata(trigger)
+        task_origin_type = str(trigger.task_origin_type or "").strip() or "manual"
+        derivation = self._task_derivation_metadata(task_metadata)
+        parent_task_type = str(trigger.parent_task_type or "").strip() or None
+        request_payload = task_metadata.get("dataflow_scan_request") if isinstance(task_metadata.get("dataflow_scan_request"), dict) else {}
+        execution_metadata = getattr(latest_execution, "metadata_json", None) if latest_execution is not None else None
+        run_index_config = dict(getattr(run_index, "config_json", {}) or {}) if run_index is not None else {}
+        review_profile = str(
+            run_index_config.get("review_profile")
+            or ((execution_metadata or {}).get("review_profile") if isinstance(execution_metadata, dict) else None)
+            or request_payload.get("review_profile")
+            or task_metadata.get("review_profile")
+            or "balanced"
+        ).strip() or "balanced"
+        origin_label = (
+            "二进制安全-源码扫描"
+            if task_origin_type == "binary_security" and parent_task_type == "source"
+            else "二进制安全-二进制类扫描"
+            if task_origin_type == "binary_security"
+            else "手动任务"
+        )
+        run_locator = self._run_locator_for_execution(latest_execution, trigger)
+        latest_run: dict[str, Any] = {}
+        if run_index is not None:
+            latest_run = {
+                "run_id": run_index.id,
+                "status": run_index.status,
+                "model": run_index.model,
+                "provider": run_index.provider,
+                "thinking": run_index.thinking,
+                "max_cycles": run_index.max_cycles,
+                "cycles_used": run_index.cycles_used,
+                "result_count": run_index.result_count,
+                "passed_count": run_index.passed_count,
+                "failed_count": run_index.failed_count,
+                "workflow_mode": run_index.workflow_mode,
+                "duration_seconds": run_index.duration_seconds,
+                "start_epoch": int(run_index.started_at.timestamp()) if run_index.started_at else None,
+                "linked_execution_id": str(latest_execution.id) if latest_execution is not None else None,
+                "review_profile": review_profile,
+            }
+        if run_locator["run_name"] and run_locator["runs_root"]:
+            latest_run = {
+                "name": run_locator["run_name"],
+                "root_path": run_locator["runs_root"],
+                "path": run_locator["run_path"],
+                "linked_task_id": trigger.id,
+                "linked_execution_id": str(latest_execution.id) if latest_execution is not None else None,
+                "review_profile": review_profile,
+                **latest_run,
+            }
+        effective_status, effective_message, effective_started_at, effective_finished_at = self._effective_scan_task_runtime_state(
+            trigger=trigger,
+            execution=latest_execution,
+            run_summary=latest_run,
+        )
+        auto_report_enabled = bool(task_metadata.get("auto_report_vulnerabilities", True))
+        report_status = {"status": "disabled" if not auto_report_enabled else "not_started", "enabled": auto_report_enabled}
+        return ScanTaskListItemResponse(
+            task_id=trigger.id,
+            project_id=trigger.project_id,
+            task_purpose=self._normalize_task_purpose(getattr(trigger, "task_purpose", None) or task_metadata.get("task_purpose")),
+            task_origin_type=task_origin_type,
+            parent_project_id=trigger.parent_project_id,
+            parent_task_id=trigger.parent_task_id,
+            parent_task_type=parent_task_type,
+            parent_stage_name=trigger.parent_stage_name,
+            parent_stage_item_id=trigger.parent_stage_item_id,
+            parent_stage_item_key=trigger.parent_stage_item_key,
+            origin_label=origin_label,
+            parent_task_display=trigger.parent_task_id,
+            profile_id=trigger.profile_id or trigger.workflow_definition_id,
+            profile_version=profile_version,
+            title=self._trigger_title(trigger),
+            status=effective_status,
+            latest_attempt_no=latest_execution.attempt_no if latest_execution else 0,
+            retry_count=trigger.retry_count,
+            max_retry_count=trigger.max_retry_count,
+            priority=trigger.priority,
+            created_by=trigger.submitted_by,
+            created_at=trigger.created_at,
+            started_at=effective_started_at,
+            finished_at=effective_finished_at,
+            message=effective_message,
+            latest_execution_id=trigger.latest_execution_id or (str(latest_execution.id) if latest_execution is not None else None),
+            run_name=run_locator["run_name"],
+            runs_root=run_locator["runs_root"],
+            run_path=run_locator["run_path"],
+            run=latest_run,
+            latest_run=latest_run,
+            auto_report_vulnerabilities=auto_report_enabled,
+            vuln_report_status=report_status,
+        )
+
+    def _effective_scan_task_runtime_state(
+        self,
+        *,
+        trigger: TriggerTask,
+        execution: WorkflowExecution | None,
+        run_summary: dict[str, Any] | None,
+    ) -> tuple[str, str | None, datetime | None, datetime | None]:
+        trigger_status = str(trigger.status or "").strip().lower()
+        trigger_message = str(trigger.message or "").strip() or None
+        trigger_started_at = trigger.started_at
+        trigger_finished_at = trigger.finished_at
+
+        execution_status = str(execution.status or "").strip().lower() if execution is not None else ""
+        dispatch_status = str(execution.dispatch_status or "").strip().lower() if execution is not None else ""
+        execution_message = str(execution.message or "").strip() if execution is not None else ""
+        execution_started_at = execution.started_at if execution is not None else None
+        execution_finished_at = execution.finished_at if execution is not None else None
+
+        run_summary = run_summary or {}
+        run_status = str(run_summary.get("status") or "").strip().lower()
+
+        effective_status = trigger_status or execution_status or run_status or "pending"
+        effective_message = trigger_message or execution_message or None
+        effective_started_at = trigger_started_at or execution_started_at
+        effective_finished_at = trigger_finished_at or execution_finished_at
+
+        if effective_status == "pending":
+            if dispatch_status in {"queued", "dispatching"}:
+                effective_status = "queued"
+                effective_message = execution_message or trigger_message or effective_message
+            elif execution_status in {"queued", "running", "cancel_requested", "delete_requested"}:
+                effective_status = execution_status
+                effective_message = execution_message or trigger_message or effective_message
+                effective_started_at = execution_started_at or effective_started_at
+                effective_finished_at = execution_finished_at or effective_finished_at
+            elif run_status in {"queued", "running", "cancel_requested", "delete_requested"}:
+                effective_status = "running" if run_status == "running" else run_status
+                effective_message = execution_message or trigger_message or effective_message
+
+        if effective_status in {"running", "cancel_requested", "delete_requested"}:
+            effective_started_at = execution_started_at or trigger_started_at or effective_started_at
+            effective_finished_at = execution_finished_at if effective_status not in {"running"} else None
+        elif effective_status == "queued":
+            effective_started_at = execution_started_at or trigger_started_at or effective_started_at
+            effective_finished_at = None
+
+        return effective_status, effective_message, effective_started_at, effective_finished_at
 
     def _scan_task_detail(self, db: Session, trigger: TriggerTask) -> ScanTaskDetailResponse:
         response = self._scan_task_response(db, trigger)

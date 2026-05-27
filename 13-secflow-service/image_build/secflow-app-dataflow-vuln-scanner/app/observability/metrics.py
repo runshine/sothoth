@@ -21,6 +21,7 @@ from app.models.database import (
     WorkflowExecutionEvent,
     get_db_session,
 )
+from app.observability.service_ops import emit_service_operation_metrics
 from app.services.execution_service import _ACTIVE_RUN_INDEX_STATUSES
 from app.services.run_index_service import _load_externalized_json_payload, _load_externalized_mapping_payload
 from app.services.scheduler import ACTIVE_JOB_STATUSES, get_scheduler_service
@@ -181,6 +182,11 @@ def build_metrics_response() -> Response:
     )
     try:
         _http_metrics.emit(builder)
+        emit_service_operation_metrics(
+            builder,
+            "secflow_dataflow_service_operation_duration_seconds",
+            "secflow_dataflow_service_operation_total",
+        )
         _collect_runtime_metrics(builder)
         builder.sample("secflow_dataflow_metrics_scrape_success", 1)
     except Exception as exc:
@@ -227,6 +233,7 @@ def _collect_runtime_metrics(builder: MetricsBuilder) -> None:
     try:
         _collect_task_and_execution_metrics(db, builder)
         _collect_scheduler_metrics(db, builder)
+        _collect_scheduler_snapshot_metrics(builder)
         _collect_run_summary_metrics(db, builder)
         _collect_cycle_metrics(db, builder)
         _collect_plugin_metrics(db, builder)
@@ -375,6 +382,42 @@ def _collect_scheduler_metrics(db: Session, builder: MetricsBuilder) -> None:
         ),
         {"kind": "scheduler_active_queue"},
     )
+
+
+def _collect_scheduler_snapshot_metrics(builder: MetricsBuilder) -> None:
+    builder.metric(
+        "secflow_dataflow_cluster_capacity_summary_snapshot_total",
+        "counter",
+        "Cluster capacity summary snapshot events observed by this process.",
+    )
+    builder.metric(
+        "secflow_dataflow_cluster_capacity_summary_snapshot_state",
+        "gauge",
+        "Current cluster capacity summary snapshot state for this process.",
+    )
+    scheduler = get_scheduler_service()
+    snapshot_metrics = scheduler.cluster_capacity_summary_snapshot_metrics()
+    builder.sample(
+        "secflow_dataflow_cluster_capacity_summary_snapshot_total",
+        snapshot_metrics.get("hits_total", 0),
+        {"result": "hit"},
+    )
+    builder.sample(
+        "secflow_dataflow_cluster_capacity_summary_snapshot_total",
+        snapshot_metrics.get("misses_total", 0),
+        {"result": "miss"},
+    )
+    builder.sample(
+        "secflow_dataflow_cluster_capacity_summary_snapshot_total",
+        snapshot_metrics.get("refresh_failures_total", 0),
+        {"result": "refresh_failure"},
+    )
+    for field in ("last_refresh_duration_seconds", "age_seconds", "available", "stale", "refreshing"):
+        builder.sample(
+            "secflow_dataflow_cluster_capacity_summary_snapshot_state",
+            snapshot_metrics.get(field, 0),
+            {"field": field},
+        )
 
 
 def _collect_run_summary_metrics(db: Session, builder: MetricsBuilder) -> None:

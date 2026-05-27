@@ -273,6 +273,9 @@ class BinarySecurityReducerEventPageResponse(BaseModel):
 
 class BinarySecurityTaskListResponse(BaseModel):
     total: int
+    page: int = 1
+    page_size: int = 50
+    total_pages: int = 1
     running_count: int = 0
     queued_count: int = 0
     max_concurrent_tasks: int = 50

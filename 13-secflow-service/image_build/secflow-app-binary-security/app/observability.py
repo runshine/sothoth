@@ -202,6 +202,26 @@ TASK_DURATION_SECONDS = Histogram(
     buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 900, 1800, 3600, 7200),
 )
 
+TASK_LIST_QUERIES_TOTAL = Counter(
+    "secflow_binary_security_task_list_queries_total",
+    "Total task list query executions.",
+    labelnames=("result", "task_type"),
+)
+
+TASK_LIST_QUERY_DURATION_SECONDS = Histogram(
+    "secflow_binary_security_task_list_query_duration_seconds",
+    "Task list query duration in seconds.",
+    labelnames=("result", "task_type"),
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30),
+)
+
+TASK_LIST_QUERY_STAGE_DURATION_SECONDS = Histogram(
+    "secflow_binary_security_task_list_query_stage_duration_seconds",
+    "Task list query stage duration in seconds.",
+    labelnames=("stage", "task_type"),
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30),
+)
+
 TASK_ERRORS_TOTAL = Counter(
     "secflow_binary_security_task_errors_total",
     "Total classified task and downstream errors.",
@@ -434,6 +454,24 @@ def observe_task_duration(*, phase: str, duration_seconds: float | None, status:
         status=str(status or "unknown"),
         task_type=str(task_type or "unknown"),
     ).observe(max(0.0, float(duration_seconds)))
+
+
+def observe_task_list_query(*, result: str, task_type: str, duration_seconds: float | None) -> None:
+    result_value = str(result or "unknown")
+    task_type_value = str(task_type or "all")
+    TASK_LIST_QUERIES_TOTAL.labels(result=result_value, task_type=task_type_value).inc()
+    if duration_seconds is not None:
+        TASK_LIST_QUERY_DURATION_SECONDS.labels(result=result_value, task_type=task_type_value).observe(max(0.0, float(duration_seconds)))
+
+
+def observe_task_list_query_stage(*, stage: str, task_type: str, duration_seconds: float | None) -> None:
+    stage_value = str(stage or "unknown")
+    task_type_value = str(task_type or "all")
+    if duration_seconds is not None:
+        TASK_LIST_QUERY_STAGE_DURATION_SECONDS.labels(
+            stage=stage_value,
+            task_type=task_type_value,
+        ).observe(max(0.0, float(duration_seconds)))
 
 
 def observe_task_error(category: str, *, stage: str | None = None, result: str | None = None) -> None:
