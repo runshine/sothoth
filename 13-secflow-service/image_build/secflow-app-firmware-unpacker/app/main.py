@@ -26,7 +26,7 @@ from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
 from app.logging_utils import configure_container_logging
 from app.runtime import start_runtime, stop_runtime
-from app.services.observability import record_api_request
+from app.services.observability import normalize_http_route, record_http_request, record_http_request_inflight
 
 
 configure_container_logging("secflow-app-firmware-unpacker")
@@ -119,19 +119,22 @@ app.add_middleware(
 async def prometheus_http_middleware(request: FastAPIRequest, call_next):
     started = time.perf_counter()
     status_code = 500
+    route = request.scope.get("route")
+    path = getattr(route, "path", None) or request.url.path
+    normalized_route = normalize_http_route(str(path))
+    record_http_request_inflight(method=request.method, path=normalized_route, delta=1)
     try:
         response = await call_next(request)
         status_code = response.status_code
         return response
     finally:
-        route = request.scope.get("route")
-        path = getattr(route, "path", None) or request.url.path
-        record_api_request(
+        record_http_request(
             method=request.method,
             path=str(path),
             status_code=status_code,
             duration_seconds=time.perf_counter() - started,
         )
+        record_http_request_inflight(method=request.method, path=normalized_route, delta=-1)
 
 
 setup_exception_handlers(app)

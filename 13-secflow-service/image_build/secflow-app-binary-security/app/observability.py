@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+import re
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -60,6 +61,9 @@ except ImportError:  # pragma: no cover - exercised indirectly in current dev en
         def inc(self, value: float = 1.0) -> None:
             self.metric._inc(self.key, value)
 
+        def dec(self, value: float = 1.0) -> None:
+            self.metric._inc(self.key, -float(value))
+
         def set(self, value: float) -> None:
             self.metric._set(self.key, value)
 
@@ -90,17 +94,21 @@ except ImportError:  # pragma: no cover - exercised indirectly in current dev en
         return ("\n".join(payload) + "\n").encode("utf-8")
 
 
-API_REQUESTS_TOTAL = Counter(
-    "secflow_binary_security_api_requests_total",
-    "Total HTTP requests handled by the Binary Security service.",
-    labelnames=("method", "path", "status"),
+HTTP_REQUESTS_TOTAL = Counter(
+    "secflow_binary_security_http_requests_total",
+    "Total normalized HTTP requests handled by the Binary Security service.",
+    labelnames=("method", "route", "status_class", "status_code"),
 )
-
-API_REQUEST_DURATION_SECONDS = Histogram(
-    "secflow_binary_security_api_request_duration_seconds",
-    "HTTP request duration in seconds.",
-    labelnames=("method", "path"),
-    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30),
+HTTP_REQUEST_DURATION_SECONDS = Histogram(
+    "secflow_binary_security_http_request_duration_seconds",
+    "Normalized HTTP request duration in seconds.",
+    labelnames=("method", "route"),
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60),
+)
+HTTP_REQUEST_INFLIGHT = Gauge(
+    "secflow_binary_security_http_request_inflight",
+    "Current inflight HTTP requests.",
+    labelnames=("method", "route"),
 )
 
 SCHEDULER_LOOP_ITERATIONS_TOTAL = Counter(
@@ -393,15 +401,43 @@ DOWNSTREAM_RECONCILE_OBSERVATIONS_TOTAL = Counter(
     labelnames=("stage", "service", "result"),
 )
 
+_PATH_ID_SEGMENT_RE = re.compile(r"/(?:\d+|[0-9a-f]{8,}|[0-9a-f]{8}-[0-9a-f-]{27,})(?=/|$)", re.IGNORECASE)
+
+
+def normalize_http_route(path: str | None) -> str:
+    raw = str(path or "/").strip() or "/"
+    return _PATH_ID_SEGMENT_RE.sub("/{id}", raw)
+
+
+def http_status_class(status_code: int | str | None) -> str:
+    try:
+        code = int(status_code or 500)
+    except (TypeError, ValueError):
+        code = 500
+    if code < 0:
+        return "cancelled"
+    return f"{code // 100}xx"
+
+
+def observe_http_request_inflight(method: str, route: str, delta: int) -> None:
+    HTTP_REQUEST_INFLIGHT.labels(method=str(method or "GET").upper(), route=normalize_http_route(route)).inc(delta)
+
 
 def render_metrics() -> tuple[bytes, str]:
     return generate_latest(), CONTENT_TYPE_LATEST
 
 
-def observe_api_request(method: str, path: str, status_code: int, duration_seconds: float) -> None:
+def observe_http_request(method: str, path: str, status_code: int, duration_seconds: float) -> None:
     status = str(int(status_code))
-    API_REQUESTS_TOTAL.labels(method=method, path=path, status=status).inc()
-    API_REQUEST_DURATION_SECONDS.labels(method=method, path=path).observe(max(0.0, duration_seconds))
+    normalized_method = str(method or "GET").upper()
+    normalized_route = normalize_http_route(path)
+    HTTP_REQUESTS_TOTAL.labels(
+        method=normalized_method,
+        route=normalized_route,
+        status_class=http_status_class(status_code),
+        status_code=status,
+    ).inc()
+    HTTP_REQUEST_DURATION_SECONDS.labels(method=normalized_method, route=normalized_route).observe(max(0.0, duration_seconds))
 
 
 @contextmanager

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from collections import defaultdict
@@ -31,6 +32,24 @@ def _safe_float(value: Any) -> float:
         return float(value)
     except Exception:
         return 0.0
+
+
+_PATH_ID_SEGMENT_RE = re.compile(r"/(?:\d+|[0-9a-f]{8,}|[0-9a-f]{8}-[0-9a-f-]{27,})(?=/|$)", re.IGNORECASE)
+
+
+def normalize_http_route(path: str | None) -> str:
+    raw = str(path or "/").strip() or "/"
+    return _PATH_ID_SEGMENT_RE.sub("/{id}", raw)
+
+
+def http_status_class(status_code: int | str | None) -> str:
+    try:
+        code = int(status_code or 500)
+    except Exception:
+        code = 500
+    if code < 0:
+        return "cancelled"
+    return f"{code // 100}xx"
 
 
 class PromMetrics:
@@ -81,14 +100,27 @@ class B2SObservability:
     async def http_middleware(self, request: Request, call_next: Callable):
         started = time.perf_counter()
         status_code = 500
+        route = request.scope.get("route")
+        path = getattr(route, "path", None) or request.url.path
+        normalized_route = normalize_http_route(str(path))
+        self.prom.inc("http_request_inflight", method=request.method.upper(), route=normalized_route)
         try:
             response = await call_next(request)
             status_code = response.status_code
             return response
         finally:
             duration = max(0.0, time.perf_counter() - started)
-            self.prom.inc("http_requests", method=request.method, path=request.url.path, status=str(status_code))
-            self.prom.observe("http_request_duration", duration, method=request.method, path=request.url.path)
+            self.prom.inc("http_requests", method=request.method, path=str(path), status=str(status_code))
+            self.prom.observe("http_request_duration", duration, method=request.method, path=str(path))
+            self.prom.inc(
+                "http_requests_normalized",
+                method=request.method.upper(),
+                route=normalized_route,
+                status_class=http_status_class(status_code),
+                status_code=str(status_code),
+            )
+            self.prom.observe("http_request_duration_normalized", duration, method=request.method.upper(), route=normalized_route)
+            self.prom.inc("http_request_inflight", amount=-1.0, method=request.method.upper(), route=normalized_route)
 
     def record_task_created(self, item_count: int) -> None:
         self.prom.inc("tasks_created")
