@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, status
 from sqlalchemy.orm import Session
 
+from app.build_info import build_service_meta
 from app.database import get_db
 from app.dependencies import get_current_super_admin
 from app.auth import create_access_token, decode_access_token, verify_machine_token, create_human_token, create_human_token_with_session, get_password_hash
@@ -92,7 +93,7 @@ def _build_machine_user_payload(
 
 @router.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", **build_service_meta()}
 
 
 @router.post("/login", response_model=TokenResponse)

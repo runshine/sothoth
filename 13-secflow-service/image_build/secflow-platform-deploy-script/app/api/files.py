@@ -14,6 +14,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 import aiofiles
 from aiofiles import os as aio_os
 
+from app.build_info import build_service_meta
 from app.config import get_config
 from app.exception import NotFoundError, ValidationError, UnauthorizedError
 from app.services.auth import get_auth_service, TokenInvalidError
@@ -154,7 +155,7 @@ async def get_current_user(
 @router.get("/health")
 async def health_check():
     """健康检查接口"""
-    return {"status": "ok", "service": "secflow-deploy-script-service"}
+    return {"status": "ok", "service": "secflow-deploy-script-service", **build_service_meta()}
 
 
 @router.get("/ready")
@@ -164,9 +165,9 @@ async def ready_check():
     if not file_root.exists():
         return JSONResponse(
             status_code=503,
-            content={"status": "not_ready", "reason": "file_root not exists"}
+            content={"status": "not_ready", "reason": "file_root not exists", **build_service_meta()}
         )
-    return {"status": "ready"}
+    return {"status": "ready", **build_service_meta()}
 
 
 # ============ 文件列表 ============

@@ -1,5 +1,6 @@
 # Secflow Input Management Service Dockerfile
 FROM python:3.11-slim-bookworm
+ARG SECFLOW_BUILD_VERSION=""
 
 # 设置工作目录
 WORKDIR /app
@@ -34,6 +35,7 @@ COPY start.py /app/start.py
 
 # 复制配置文件
 COPY config.yaml /app/config.yaml
+RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
 # 暴露端口（使用配置文件中指定的端口）
 EXPOSE 10002

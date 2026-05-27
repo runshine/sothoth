@@ -1,4 +1,5 @@
 FROM python:3.11-slim
+ARG SECFLOW_BUILD_VERSION=""
 
 # 设置工作目录
 WORKDIR /app
@@ -24,6 +25,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # 复制应用代码
 COPY app/ /app/app/
+RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
 # 创建配置目录
 RUN mkdir -p /app/config

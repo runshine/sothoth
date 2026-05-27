@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from sqlalchemy.orm import Session, joinedload
 
 from app.config import get_config
+from app.build_info import build_service_meta
 from app.exception import NotFoundError, ValidationError, ConflictError
 from app.model import (
     get_db, get_db_session, generate_id, CodeServer, Task,
@@ -216,7 +217,8 @@ async def health_check():
     """
     return {
         "status": "ok",
-        "service": "code-server-manager"
+        "service": "code-server-manager",
+        **build_service_meta(),
     }
 
 

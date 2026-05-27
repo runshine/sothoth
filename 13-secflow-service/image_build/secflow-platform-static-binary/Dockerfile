@@ -1,4 +1,5 @@
 FROM python:3.11-alpine
+ARG SECFLOW_BUILD_VERSION=""
 
 WORKDIR /app
 
@@ -20,6 +21,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt \
     && apk del .build-deps
 
 COPY . .
+RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
 # 默认使用默认配置文件，可以通过环境变量覆盖
 ENV CONFIG_PATH=/app/config.yaml

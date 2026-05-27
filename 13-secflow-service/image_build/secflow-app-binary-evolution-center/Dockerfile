@@ -1,4 +1,5 @@
 FROM public.ecr.aws/docker/library/python:3.11-slim
+ARG SECFLOW_BUILD_VERSION=""
 
 WORKDIR /app
 
@@ -17,6 +18,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app/ /app/app/
 COPY config.yaml /app/config.yaml
+RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
 EXPOSE 8080
 

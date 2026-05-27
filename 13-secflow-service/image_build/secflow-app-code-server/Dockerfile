@@ -1,5 +1,6 @@
 # Code Server Manager Dockerfile
 FROM python:3.11-slim
+ARG SECFLOW_BUILD_VERSION=""
 
 WORKDIR /app
 
@@ -20,6 +21,7 @@ COPY config.yaml /app/
 
 # 复制应用代码
 COPY app/ /app/app/
+RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
 # 暴露端口 (默认8080，可在config.yaml中配置)
 EXPOSE 8080

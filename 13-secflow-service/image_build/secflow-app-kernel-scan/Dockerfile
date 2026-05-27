@@ -4,6 +4,7 @@ ARG PYTHON_BASE_IMAGE=swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library
 FROM ${NODE_BASE_IMAGE} AS node_runtime
 
 FROM ${PYTHON_BASE_IMAGE}
+ARG SECFLOW_BUILD_VERSION=""
 
 ARG DEBIAN_MIRROR=https://repo.huaweicloud.com/repository/debian
 ARG DEBIAN_SECURITY_MIRROR=https://repo.huaweicloud.com/repository/debian-security
@@ -107,6 +108,7 @@ COPY config.example.yaml /app/config.example.yaml
 COPY entrypoint.sh /app/entrypoint.sh
 COPY .claude.json /app/claude.json.template
 COPY settings.json /app/settings.json.template
+RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
 RUN useradd -m -s /bin/bash -u 1000 scanner \
  && chmod +x /app/entrypoint.sh \

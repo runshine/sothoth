@@ -32,6 +32,7 @@ from sqlalchemy import or_, func
 
 # 导入配置和注册服务
 from config import load_config, get_config
+from build_info import build_service_meta
 from registry import get_registry_service
 
 
@@ -1851,13 +1852,15 @@ def health_check():
             'database': 'connected',
             'storage': 'available',
             'original_storage': 'available',
-            'timestamp': datetime.utcnow().isoformat()
+            'timestamp': datetime.utcnow().isoformat(),
+            **build_service_meta(),
         })
 
     except Exception as e:
         return jsonify({
             'status': 'unhealthy',
-            'error': str(e)
+            'error': str(e),
+            **build_service_meta(),
         }), 500
 
 

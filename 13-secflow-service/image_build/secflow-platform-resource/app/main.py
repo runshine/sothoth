@@ -20,6 +20,8 @@ from fastapi.responses import FileResponse
 from sqlalchemy import text
 from starlette.responses import StreamingResponse
 
+from app.build_info import build_service_meta
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -397,11 +399,11 @@ def create_app(config: dict = None) -> FastAPI:
         return {
             "status": overall_status,
             "service": "secflow-resource-management",
-            "version": "2.1.0",
             "dependencies": {
                 "kubernetes": "healthy" if k8s_healthy else "unhealthy",
                 "database": "healthy" if db_healthy else "unhealthy"
-            }
+            },
+            **build_service_meta(),
         }
 
     # 就绪检查端点

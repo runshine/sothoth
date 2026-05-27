@@ -16,7 +16,11 @@ jobs:
     steps:
       - name: Generate date tag
         id: date
-        run: echo "date_tag=$(date +'%Y%m%d')-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+        env:
+          MAIN_REPO_SHA: ${{ github.sha }}
+        run: |
+          SHORT_SHA="${MAIN_REPO_SHA::7}"
+          echo "date_tag=$(date +'%Y%m%d-%H%M%S')-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
   build-amd64:
     needs: prepare
@@ -38,6 +42,7 @@ jobs:
       - name: Build amd64 image
         run: |
           docker build \
+            --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --file 13-secflow-service/image_build/secflow-platform-system-analysis/Dockerfile \
             --tag ghcr.io/runshine/secflow-platform-system-analysis:amd64-latest \
             --tag ghcr.io/runshine/secflow-platform-system-analysis:amd64-${{ needs.prepare.outputs.date_tag }} \
@@ -70,6 +75,7 @@ jobs:
       - name: Build arm64 image
         run: |
           docker build \
+            --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --file 13-secflow-service/image_build/secflow-platform-system-analysis/Dockerfile \
             --tag ghcr.io/runshine/secflow-platform-system-analysis:arm64-latest \
             --tag ghcr.io/runshine/secflow-platform-system-analysis:arm64-${{ needs.prepare.outputs.date_tag }} \

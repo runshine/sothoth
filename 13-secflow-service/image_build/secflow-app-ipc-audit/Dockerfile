@@ -1,6 +1,7 @@
 FROM node:22-bookworm-slim AS node_runtime
 
 FROM python:3.11-slim-bookworm
+ARG SECFLOW_BUILD_VERSION=""
 
 ARG DEBIAN_MIRROR=https://repo.huaweicloud.com/repository/debian
 ARG DEBIAN_SECURITY_MIRROR=https://repo.huaweicloud.com/repository/debian-security
@@ -57,6 +58,7 @@ COPY app /app/app
 COPY config.example.yaml /app/config.example.yaml
 COPY scripts/ipc-audit-qemu.sh /usr/local/bin/ipc-audit-qemu
 RUN chmod +x /usr/local/bin/ipc-audit-qemu
+RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
 RUN mkdir -p \
     /var/lib/secflow-ipc-audit \

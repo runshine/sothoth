@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from app.build_info import build_service_meta
 from app.exception import ConflictError, NotFoundError, ValidationError
 from app.model import LlmProvider, get_db
 from app.schemas import (
@@ -125,7 +126,7 @@ def apply_payload(provider: LlmProvider, payload: LlmProviderCreateRequest | Llm
 
 @router.get("/health")
 async def health():
-    return {"status": "ok", "service": "secflow-platform-configcenter"}
+    return {"status": "ok", "service": "secflow-platform-configcenter", **build_service_meta()}
 
 
 @router.get("/admin/llm/providers", response_model=LlmProviderListResponse)

@@ -1,5 +1,6 @@
 # 使用官方Python运行时作为基础镜像
 FROM python:3.9-slim
+ARG SECFLOW_BUILD_VERSION=""
 
 # 设置环境变量
 ENV PYTHONUNBUFFERED=1 \
@@ -32,6 +33,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # 复制应用程序代码
 COPY . .
+RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
 # 创建必要的目录
 RUN mkdir -p \
