@@ -32,6 +32,9 @@ class _FakeDb:
     def add(self, obj):
         self.added.append(obj)
 
+    def flush(self):
+        return None
+
     def query(self, _model):
         return _FakeQuery(self.rows)
 
@@ -73,6 +76,43 @@ def test_set_terminal_state_records_abnormal_reason_event() -> None:
     abnormal_events = [item for item in db.added if isinstance(item, WorkflowExecutionEvent) and item.event_type == "abnormal_reason_recorded"]
     assert len(abnormal_events) == 1
     assert abnormal_events[0].payload_json["reason"]["code"] == "dispatch_failed"
+
+
+def test_apply_terminal_state_mutation_clears_active_dispatch_marker() -> None:
+    service = ExecutionService()
+    db = _FakeDb()
+    trigger = TriggerTask(
+        id="tt-apply-1",
+        workflow_definition_id="wf-1",
+        workflow_definition_version_id="wfver-1",
+        project_id="proj-1",
+        trigger_type="manual",
+        input_tasks_json={"tasks": []},
+        status="running",
+        message="running",
+    )
+    execution = WorkflowExecution(
+        id="exec-apply-1",
+        trigger_task_id="tt-apply-1",
+        workflow_definition_id="wf-1",
+        workflow_definition_version_id="wfver-1",
+        project_id="proj-1",
+        attempt_no=1,
+        status="running",
+        dispatch_status="running",
+    )
+
+    service._apply_terminal_state_mutation(
+        db,
+        execution=execution,
+        trigger=trigger,
+        terminal_status="failed",
+        message="worker exited",
+    )
+
+    assert execution.status == "failed"
+    assert execution.dispatch_status == "failed"
+    assert execution.dispatch_error == "worker exited"
 
 
 def test_abnormal_reason_history_reads_recorded_events() -> None:

@@ -741,3 +741,38 @@ def test_worker_capacity_runtime_config_applies_to_heartbeat_and_capacity_view(
         assert target.available_slots == 3
     finally:
         db.close()
+
+
+def test_cleanup_once_releases_terminal_executions_from_active_capacity(
+    service_config_path: Path,
+    framework_config_payload: dict,
+):
+    config = get_config()
+    config.scheduler.enabled = True
+
+    db = get_db_session()
+    try:
+        _create_pending_execution(
+            db,
+            framework_config_payload,
+            suffix="terminal-capacity-leak",
+            status="failed",
+            trigger_status="failed",
+            owner_pod_id="worker-terminal-leak",
+            dispatch_status="running",
+        )
+    finally:
+        db.close()
+
+    scheduler = SchedulerService()
+    scheduler._cleanup_once()
+
+    db = get_db_session()
+    try:
+        execution = db.get(WorkflowExecution, "exec-sched-terminal-capacity-leak")
+        assert execution is not None
+        assert execution.status == "failed"
+        assert execution.dispatch_status == "failed"
+        assert execution.dispatch_error
+    finally:
+        db.close()

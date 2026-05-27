@@ -1235,6 +1235,9 @@ class SchedulerService:
             execution.owner_pod_id = self.pod_id
             execution.worker_url = worker_url or execution.worker_url
             execution.worker_job_id = execution.worker_job_id or execution.id
+            execution.status = "dispatching"
+            execution.public_status = "dispatching"
+            execution.control_state = "none"
             execution.dispatch_status = "queued"
             execution.dispatch_error = None
             reservation = (
@@ -1246,6 +1249,9 @@ class SchedulerService:
                 reservation.status = "accepted"
                 db.add(reservation)
             execution.message = f"queued on worker {self.pod_id}"
+            trigger.status = "dispatching"
+            trigger.public_status = "dispatching"
+            trigger.control_state = "none"
             trigger.message = execution.message
             db.add(execution)
             db.add(trigger)
@@ -1274,14 +1280,18 @@ class SchedulerService:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="job not found")
             trigger = db.get(TriggerTask, execution.trigger_task_id)
             now = now_local()
-            if execution.status == "pending":
+            if execution.status in {"pending", "dispatching"}:
                 execution.status = "cancelled"
+                execution.public_status = "cancelled"
+                execution.control_state = "none"
                 execution.finished_at = now
                 execution.dispatch_status = "cancelled"
                 execution.process_status = "not_started"
                 execution.message = "cancelled before worker start"
-                if trigger is not None and trigger.status == "pending":
+                if trigger is not None and trigger.status in {"pending", "dispatching"}:
                     trigger.status = "cancelled"
+                    trigger.public_status = "cancelled"
+                    trigger.control_state = "none"
                     trigger.finished_at = now
                     trigger.message = execution.message
                     db.add(trigger)
@@ -1289,14 +1299,18 @@ class SchedulerService:
                 db.commit()
                 return self._job_payload(execution)
 
-            if execution.status == "running":
+            if execution.status in {"dispatching", "running"}:
                 requested_status = "cancel_requested"
                 execution.status = "running"
+                execution.public_status = "running"
+                execution.control_state = "cancel_requested"
                 execution.dispatch_status = requested_status
                 execution.process_status = "stop_requested"
                 execution.message = "cancel requested"
-                if trigger is not None and trigger.status == "running":
+                if trigger is not None and trigger.status in {"dispatching", "running"}:
                     trigger.status = "running"
+                    trigger.public_status = "running"
+                    trigger.control_state = "cancel_requested"
                     trigger.message = execution.message
                     db.add(trigger)
                 db.add(execution)
@@ -1446,6 +1460,7 @@ class SchedulerService:
                 db.delete(worker)
 
             self._backfill_execution_owner_bindings(db)
+            self._cleanup_terminal_dispatch_markers(db)
             self._cleanup_stale_reservations(db, now)
             self._requeue_stuck_dispatches(db, now)
 
@@ -1454,6 +1469,29 @@ class SchedulerService:
             db.commit()
         finally:
             db.close()
+
+    def _cleanup_terminal_dispatch_markers(self, db: Session) -> int:
+        executions = (
+            db.query(WorkflowExecution)
+            .filter(
+                WorkflowExecution.status.in_(tuple(TERMINAL_EXECUTION_STATUSES)),
+                WorkflowExecution.dispatch_status.in_(tuple(ACTIVE_JOB_STATUSES)),
+            )
+            .all()
+        )
+        repaired = 0
+        for execution in executions:
+            terminal_status = str(execution.status or "").strip().lower()
+            if not terminal_status:
+                continue
+            execution.dispatch_status = terminal_status
+            if terminal_status in {"succeeded", "cancelled"}:
+                execution.dispatch_error = None
+            elif not str(execution.dispatch_error or "").strip():
+                execution.dispatch_error = execution.message or terminal_status
+            db.add(execution)
+            repaired += 1
+        return repaired
 
     def _backfill_execution_owner_bindings(self, db: Session, *, limit: int = 200) -> int:
         executions = (
