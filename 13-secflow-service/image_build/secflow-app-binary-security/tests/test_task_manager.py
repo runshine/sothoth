@@ -11204,6 +11204,37 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(11, response.rerun_count)
         self.assertEqual(1, response.auto_retry_count)
 
+    def test_stage_item_response_exposes_system_analysis_downstream_summary(self):
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="system_analysis",
+            item_key="mod1",
+            status="success",
+        )
+        item.result = {
+            "system_analysis_result": {
+                "summary": {
+                    "high_risk_module_count": 3,
+                    "medium_risk_module_count": 2,
+                    "low_risk_module_count": 1,
+                },
+            },
+        }
+
+        response = self.manager._stage_item_response(item)
+
+        self.assertEqual(
+            {
+                "high_risk_module_count": 3,
+                "medium_risk_module_count": 2,
+                "low_risk_module_count": 1,
+            },
+            response.downstream_summary,
+        )
+
     def test_stage_worker_terminal_event_rebuilds_system_analysis_from_items(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)

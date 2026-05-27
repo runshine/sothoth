@@ -10401,6 +10401,7 @@ class TaskManager:
             auto_retry_count=int(item.retry_count or 0),
             downstream_service=item.downstream_service,
             downstream_task_id=item.downstream_task_id,
+            downstream_summary=self._stage_item_downstream_summary(item, result=result),
             input_ref=item.input_ref,
             output_ref=item.output_ref,
             result=result,
@@ -10417,6 +10418,47 @@ class TaskManager:
             started_at=item.started_at,
             finished_at=item.finished_at,
         )
+
+    def _stage_item_downstream_summary(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        result: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        candidates: list[dict[str, Any]] = []
+        result_payload = dict(result or item.result or {})
+        output_ref = dict(item.output_ref or {})
+        for payload in (
+            result_payload,
+            output_ref,
+            dict(result_payload.get("summary") or {}),
+            dict(output_ref.get("summary") or {}),
+            dict(result_payload.get("system_analysis_result") or {}),
+            dict((result_payload.get("system_analysis_result") or {}).get("summary") or {}),
+            dict(output_ref.get("system_analysis_result") or {}),
+            dict((output_ref.get("system_analysis_result") or {}).get("summary") or {}),
+        ):
+            if payload:
+                candidates.append(payload)
+
+        summary: dict[str, Any] = {}
+        metric_keys = (
+            "high_risk_module_count",
+            "medium_risk_module_count",
+            "low_risk_module_count",
+            "entry_count",
+        )
+        for key in metric_keys:
+            for payload in candidates:
+                value = payload.get(key)
+                if value is None or value == "":
+                    continue
+                try:
+                    summary[key] = int(value)
+                    break
+                except (TypeError, ValueError):
+                    continue
+        return summary or None
 
     def _stage_run_summary_path(self, task: BinarySecurityTask, stage_run: BinarySecurityStageRun) -> Path:
         return Path(task.workspace_root) / "run" / "stage-summaries" / f"{int(stage_run.sequence_no or 0):02d}_{stage_run.stage_name}.json"
