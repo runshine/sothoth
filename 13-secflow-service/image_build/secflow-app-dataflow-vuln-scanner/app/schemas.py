@@ -292,6 +292,7 @@ class ScanTaskListResponse(BaseModel):
     total: int = 0
     page: int = 1
     per_page: int = 100
+    page_size: int = 100
 
 
 class ScanTaskStatsResponse(BaseModel):
