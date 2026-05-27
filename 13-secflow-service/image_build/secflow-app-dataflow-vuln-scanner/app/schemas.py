@@ -224,6 +224,10 @@ class ScanTaskResponse(BaseModel):
     finished_at: Optional[datetime]
     message: Optional[str]
     latest_execution_id: Optional[str]
+    owner_pod_id: Optional[str] = None
+    dispatch_status: Optional[str] = None
+    slot_binding_state: Optional[str] = None
+    slot_binding_reason: Optional[str] = None
     run_name: Optional[str] = None
     runs_root: Optional[str] = None
     run_path: Optional[str] = None
@@ -254,6 +258,8 @@ class ScanTaskAttemptResponse(BaseModel):
     worker_url: Optional[str] = None
     worker_job_id: Optional[str] = None
     dispatch_status: Optional[str] = None
+    slot_binding_state: Optional[str] = None
+    slot_binding_reason: Optional[str] = None
     dispatch_error: Optional[str] = None
     process_pid: Optional[int] = None
     process_host: Optional[str] = None

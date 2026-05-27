@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from app.models.database import TriggerTask, WorkflowExecution, get_db_session
+from datetime import timedelta
+
+from app.models.database import SchedulerWorker, SchedulerWorkerSlotReservation, TriggerTask, WorkflowExecution, get_db_session
 from app.schemas import ScanProfileCreateRequest, ScanTaskCreateRequest
 from app.services.execution_service import get_execution_service
 from app.services.scheduler import SchedulerService
 from app.services.workflow_service import get_workflow_service
+from app.time_utils import now_local
 
 
 def _create_profile(db):
@@ -85,5 +88,124 @@ def test_cleanup_does_not_mutate_running_execution(service_config_path):
         assert trigger.retry_count == 0
         assert trigger.latest_execution_id == executions[0].id
         assert trigger.status == "running"
+    finally:
+        db.close()
+
+
+def test_cleanup_backfills_missing_owner_from_reservation(service_config_path):
+    db = get_db_session()
+    try:
+        execution_id = "exec-recover-owner-from-reservation"
+        db.add(
+            SchedulerWorker(
+                pod_id="worker-recover-a",
+                host_name="worker-recover-a",
+                capacity=2,
+                running_count=0,
+                status="active",
+                metadata_json={"advertise_url": "http://worker-recover-a:8080"},
+            )
+        )
+        trigger = TriggerTask(
+            id="tt-recover-owner-from-reservation",
+            workflow_definition_id="wfd-recover-owner-from-reservation",
+            project_id="default",
+            trigger_type="manual",
+            input_tasks_json={"tasks": []},
+            priority=100,
+            status="pending",
+            submitted_by="tester",
+            retry_count=0,
+            max_retry_count=3,
+            latest_execution_id=execution_id,
+        )
+        execution = WorkflowExecution(
+            id=execution_id,
+            trigger_task_id=trigger.id,
+            workflow_definition_id=trigger.workflow_definition_id,
+            project_id="default",
+            attempt_no=1,
+            status="pending",
+            owner_pod_id=None,
+            worker_url="http://worker-recover-a:8080",
+            worker_job_id="job-recover-owner-a",
+            dispatch_status="queued",
+        )
+        reservation = SchedulerWorkerSlotReservation(
+            id="resv-recover-owner-a",
+            worker_pod_id="worker-recover-a",
+            execution_id=execution_id,
+            status="accepted",
+            lease_expires_at=now_local() + timedelta(minutes=5),
+        )
+        db.add_all([trigger, execution, reservation])
+        db.commit()
+    finally:
+        db.close()
+
+    scheduler = SchedulerService()
+    scheduler._cleanup_once()
+
+    db = get_db_session()
+    try:
+        execution = db.get(WorkflowExecution, execution_id)
+        assert execution is not None
+        assert execution.owner_pod_id == "worker-recover-a"
+    finally:
+        db.close()
+
+
+def test_cleanup_backfills_missing_owner_from_worker_url(service_config_path):
+    db = get_db_session()
+    try:
+        execution_id = "exec-recover-owner-from-url"
+        db.add(
+            SchedulerWorker(
+                pod_id="worker-recover-b",
+                host_name="worker-recover-b",
+                capacity=2,
+                running_count=0,
+                status="active",
+                metadata_json={"advertise_url": "http://worker-recover-b:8080"},
+            )
+        )
+        trigger = TriggerTask(
+            id="tt-recover-owner-from-url",
+            workflow_definition_id="wfd-recover-owner-from-url",
+            project_id="default",
+            trigger_type="manual",
+            input_tasks_json={"tasks": []},
+            priority=100,
+            status="pending",
+            submitted_by="tester",
+            retry_count=0,
+            max_retry_count=3,
+            latest_execution_id=execution_id,
+        )
+        execution = WorkflowExecution(
+            id=execution_id,
+            trigger_task_id=trigger.id,
+            workflow_definition_id=trigger.workflow_definition_id,
+            project_id="default",
+            attempt_no=1,
+            status="pending",
+            owner_pod_id=None,
+            worker_url="http://worker-recover-b:8080",
+            worker_job_id="job-recover-owner-b",
+            dispatch_status="queued",
+        )
+        db.add_all([trigger, execution])
+        db.commit()
+    finally:
+        db.close()
+
+    scheduler = SchedulerService()
+    scheduler._cleanup_once()
+
+    db = get_db_session()
+    try:
+        execution = db.get(WorkflowExecution, execution_id)
+        assert execution is not None
+        assert execution.owner_pod_id == "worker-recover-b"
     finally:
         db.close()
