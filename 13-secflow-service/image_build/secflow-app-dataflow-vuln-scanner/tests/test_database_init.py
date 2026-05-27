@@ -53,7 +53,7 @@ def test_init_database_uses_mysql_advisory_lock(monkeypatch):
     monkeypatch.setattr(database.Base.metadata, "create_all", lambda bind: events.append(("create_all", bind)))
     monkeypatch.setattr(database, "run_auto_migrations", lambda connection=None: events.append(("migrate", connection)))
 
-    database.init_database()
+    assert database.init_database() is True
 
     assert events[0] == ("enter", None)
     assert events[1][0] == "get_lock"
@@ -103,7 +103,7 @@ def test_init_database_skips_create_all_when_mysql_tables_exist(monkeypatch):
     monkeypatch.setattr(database.Base.metadata, "create_all", lambda bind: events.append("create_all"))
     monkeypatch.setattr(database, "run_auto_migrations", lambda connection=None: events.append("migrate"))
 
-    database.init_database()
+    assert database.init_database() is True
 
     assert events == ["migrate", "commit"]
 
@@ -140,19 +140,56 @@ def test_init_database_retries_mysql_concurrent_ddl(monkeypatch):
         def __init__(self):
             self.args = (1684, "Table is being modified by concurrent DDL statement")
 
-    def fake_init():
+    def fake_init(timeout_seconds=120):
         attempts.append("call")
         if attempts.count("call") < 3:
             raise OperationalError("DESCRIBE test", None, FakeOrig())
+        return True
 
     fake_engine = SimpleNamespace(dialect=SimpleNamespace(name="mysql"))
     monkeypatch.setattr(database, "get_engine", lambda: fake_engine)
     monkeypatch.setattr(database, "_init_database_with_mysql_lock", fake_init)
     monkeypatch.setattr(database.time, "sleep", lambda seconds: attempts.append(f"sleep:{seconds}"))
 
-    database.init_database()
+    assert database.init_database() is True
 
     assert attempts == ["call", "sleep:1.0", "call", "sleep:2.0", "call"]
+
+
+def test_init_database_returns_false_when_lock_unavailable_and_non_strict(monkeypatch):
+    class FakeResult:
+        def __init__(self, value):
+            self._value = value
+
+        def scalar(self):
+            return self._value
+
+    class FakeConnection:
+        dialect = SimpleNamespace(name="mysql")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, stmt, params=None):
+            sql = str(stmt)
+            if "GET_LOCK" in sql:
+                return FakeResult(0)
+            if "RELEASE_LOCK" in sql:
+                raise AssertionError("release should not run when lock was not acquired")
+            return FakeResult(None)
+
+    class FakeEngine:
+        dialect = SimpleNamespace(name="mysql")
+
+        def connect(self):
+            return FakeConnection()
+
+    monkeypatch.setattr(database, "get_engine", lambda: FakeEngine())
+
+    assert database.init_database(lock_timeout_seconds=1, raise_on_lock_unavailable=False) is False
 
 
 def test_run_auto_migrations_expands_worker_pod_id_column(monkeypatch):

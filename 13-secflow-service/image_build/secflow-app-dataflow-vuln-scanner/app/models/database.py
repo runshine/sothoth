@@ -1200,16 +1200,16 @@ def _is_mysql_concurrent_ddl_error(exc: Exception) -> bool:
     return code == 1684 or "concurrent DDL statement" in message
 
 
-def _init_database_with_mysql_lock() -> None:
+def _init_database_with_mysql_lock(timeout_seconds: int = 120) -> bool:
     engine = get_engine()
     with engine.connect() as connection:
         lock_name = _database_init_lock_name()
         lock_row = connection.execute(
             text("SELECT GET_LOCK(:lock_name, :timeout_seconds)"),
-            {"lock_name": lock_name, "timeout_seconds": 120},
+            {"lock_name": lock_name, "timeout_seconds": timeout_seconds},
         ).scalar()
         if int(lock_row or 0) != 1:
-            raise RuntimeError(f"failed to acquire database init lock: {lock_name}")
+            return False
         try:
             if not _mysql_core_tables_exist(connection):
                 Base.metadata.create_all(bind=connection)
@@ -1220,9 +1220,13 @@ def _init_database_with_mysql_lock() -> None:
                 text("SELECT RELEASE_LOCK(:lock_name)"),
                 {"lock_name": lock_name},
             )
+    return True
 
 
-def init_database() -> None:
+def init_database(
+    lock_timeout_seconds: int = 120,
+    raise_on_lock_unavailable: bool = True,
+) -> bool:
     engine = get_engine()
     if engine.dialect.name == "mysql":
         retry_delays = (0.0, 1.0, 2.0, 4.0, 8.0)
@@ -1231,17 +1235,22 @@ def init_database() -> None:
             if delay_seconds > 0:
                 time.sleep(delay_seconds)
             try:
-                _init_database_with_mysql_lock()
-                return
+                acquired = _init_database_with_mysql_lock(lock_timeout_seconds)
+                if acquired:
+                    return True
+                if not raise_on_lock_unavailable:
+                    return False
+                raise RuntimeError(f"failed to acquire database init lock: {_database_init_lock_name()}")
             except Exception as exc:
                 if not _is_mysql_concurrent_ddl_error(exc):
                     raise
                 last_error = exc
         if last_error is not None:
             raise last_error
-        return
+        return False
     Base.metadata.create_all(bind=engine)
     run_auto_migrations()
+    return True
 
 
 def get_db():

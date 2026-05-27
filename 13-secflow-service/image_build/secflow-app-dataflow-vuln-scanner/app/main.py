@@ -19,6 +19,7 @@ from app.pi_vuln_core.config.loader import ConfigValidationError
 from app.pi_vuln_core.runner import load_framework_config_from_path, run_framework_config
 from app.pi_vuln_core.utils.win_compat import ensure_event_loop_policy
 from app.observability import build_metrics_response, observe_http_request, observe_http_request_inflight
+from app.runtime_bootstrap import get_runtime_bootstrap
 from app.services.auth import get_auth_service
 from app.services.llm_provider_sync import sync_providers_to_pi
 from app.services.project import get_project_service
@@ -40,15 +41,19 @@ async def lifespan(app: FastAPI):
     role = get_scheduler_service().role
     logger.info("secflow dataflow vuln scanner role=%s", role)
     sync_providers_to_pi()
-    init_database()
-    with get_engine().connect() as conn:
-        conn.exec_driver_sql("SELECT 1")
-    await get_auth_service().startup_validate()
-    get_project_service().startup_validate()
-    if role != "worker":
-        await get_registry_service().start()
-    await get_scheduler_service().start()
+
+    async def _after_db_ready() -> None:
+        with get_engine().connect() as conn:
+            conn.exec_driver_sql("SELECT 1")
+        await get_auth_service().startup_validate()
+        get_project_service().startup_validate()
+        if role != "worker":
+            await get_registry_service().start()
+        await get_scheduler_service().start()
+
+    await get_runtime_bootstrap().start(_after_db_ready)
     yield
+    await get_runtime_bootstrap().stop()
     await get_scheduler_service().stop()
     if role != "worker":
         await get_registry_service().stop()

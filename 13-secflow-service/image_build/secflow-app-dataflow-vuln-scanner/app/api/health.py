@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from app.build_info import build_service_meta
 from app.models.database import get_engine
+from app.runtime_state import build_runtime_status
 from app.schemas import HealthResponse, SuccessResponse
 from app.services.auth import get_auth_service
 from app.services.project import ProjectServiceError, get_project_service
@@ -17,11 +18,23 @@ logger = logging.getLogger(__name__)
 
 @router.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    return HealthResponse.model_validate({**get_scheduler_service().health_payload(), **build_service_meta()})
+    return HealthResponse.model_validate(
+        {
+            **get_scheduler_service().health_payload(),
+            **build_runtime_status(),
+            **build_service_meta(),
+        }
+    )
 
 
 @router.get("/ready", response_model=SuccessResponse)
 async def ready() -> SuccessResponse:
+    runtime_status = build_runtime_status()
+    if not bool(runtime_status.get("ready")):
+        raise HTTPException(
+            status_code=503,
+            detail=f"runtime bootstrap incomplete: {runtime_status.get('last_error') or 'waiting for db init'}",
+        )
     with get_engine().connect() as conn:
         conn.exec_driver_sql("SELECT 1")
     await get_auth_service().startup_validate()
