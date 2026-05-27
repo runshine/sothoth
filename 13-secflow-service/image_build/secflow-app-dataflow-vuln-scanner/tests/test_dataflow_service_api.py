@@ -573,7 +573,7 @@ def test_business_dataflow_task_materializes_inputs_and_runs(service_config_path
     payload = detail.json()
     assert "漏洞挖掘任务" in payload["task_markdown"]
     cli_plan = payload["task_metadata"]["dataflow_cli"]
-    expected_run_name = task_id
+    expected_run_name = "business-scan"
     assert cli_plan["launcher"] == "run_vuln_scan.py"
     assert cli_plan["data_flow_dir"] == str(data_flow_dir.resolve())
     assert cli_plan["data_flow_files"] == [str((data_flow_dir / "data_flow.md").resolve())]
@@ -653,7 +653,7 @@ def test_business_dataflow_task_ignores_selected_runs_root_for_standard_task_lay
     assert task.status_code == 201
     created_payload = task.json()
     task_id = created_payload["task_id"]
-    expected_run_name = task_id
+    expected_run_name = "business-scan-custom-workspace"
     service_root = Path(project_root) / "files" / "default" / "app" / "secflow-app-dataflow-vuln-scanner"
     assert created_payload["run_name"] == expected_run_name
     assert created_payload["runs_root"] == str(service_root.resolve())

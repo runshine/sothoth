@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi.encoders import jsonable_encoder
 from fastapi import HTTPException, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.artifacts.io import abs_path, ensure_dir, sanitize_name, write_json, write_task_manifest, write_text
@@ -37,6 +38,7 @@ from app.models.database import (
     RunIndexResultReview,
     RunIndexSession,
     TriggerTask,
+    VulnReportSubmission,
     WorkflowDefinition,
     WorkflowDefinitionVersion,
     WorkflowExecution,
@@ -57,6 +59,7 @@ from app.schemas import (
     ScanTaskAttemptResponse,
     ScanTaskCreateRequest,
     ScanTaskDetailResponse,
+    ScanTaskListResponse,
     ScanTaskResponse,
     TriggerTaskInputTask,
 )
@@ -99,6 +102,15 @@ def _log_api_timing(endpoint: str, **fields: Any) -> None:
 _TASK_PURPOSE_LABELS = {
     "normal": "正常任务",
     "evolution": "进化任务",
+}
+
+_TASK_LIST_SORT_COLUMNS = {
+    "created_at": TriggerTask.created_at,
+    "updated_at": TriggerTask.updated_at,
+    "started_at": TriggerTask.started_at,
+    "finished_at": TriggerTask.finished_at,
+    "status": TriggerTask.status,
+    "priority": TriggerTask.priority,
 }
 
 
@@ -363,6 +375,152 @@ class ExecutionService:
     def _task_derivation_metadata(self, metadata: dict[str, Any] | None) -> dict[str, Any]:
         payload = metadata.get("derivation") if isinstance(metadata, dict) else None
         return dict(payload) if isinstance(payload, dict) else {}
+
+    def _first_manifest_task_payload(self, trigger: TriggerTask | None) -> dict[str, Any]:
+        if trigger is None:
+            return {}
+        payload = trigger.input_tasks_json
+        if not isinstance(payload, dict):
+            return {}
+        tasks = payload.get("tasks")
+        if not isinstance(tasks, list):
+            return {}
+        first_task = next((item for item in tasks if isinstance(item, dict)), None)
+        return dict(first_task or {})
+
+    @staticmethod
+    def _task_metadata_from_manifest_payload(first_task: dict[str, Any] | None) -> dict[str, Any]:
+        metadata = first_task.get("metadata") if isinstance(first_task, dict) else None
+        return dict(metadata) if isinstance(metadata, dict) else {}
+
+    @staticmethod
+    def _task_title_from_manifest_payload(first_task: dict[str, Any] | None, fallback: str) -> str:
+        if isinstance(first_task, dict):
+            title = str(first_task.get("title") or "").strip()
+            if title:
+                return title
+        return fallback
+
+    @staticmethod
+    def _task_origin_label(task_origin_type: str | None, parent_task_type: str | None) -> str:
+        normalized_origin = str(task_origin_type or "").strip() or "manual"
+        normalized_parent_type = str(parent_task_type or "").strip() or None
+        if normalized_origin == "binary_security" and normalized_parent_type == "source":
+            return "二进制安全-源码扫描"
+        if normalized_origin == "binary_security":
+            return "二进制安全-二进制类扫描"
+        return "手动任务"
+
+    @staticmethod
+    def _extract_review_profile_from_config(config: dict[str, Any] | None) -> str:
+        payload = config if isinstance(config, dict) else {}
+        for workflow in ((payload.get("workflows") or {}).get("atomic") or []):
+            if not isinstance(workflow, dict):
+                continue
+            engine = workflow.get("engine")
+            if isinstance(engine, dict) and (engine.get("review_profile") or workflow.get("id") == "vuln_scan"):
+                return str(engine.get("review_profile") or "").strip()
+        return ""
+
+    @staticmethod
+    def _extract_worker_runtime_defaults(config: dict[str, Any] | None) -> tuple[str, str]:
+        payload = config if isinstance(config, dict) else {}
+        for agent in payload.get("agents") or []:
+            if not isinstance(agent, dict):
+                continue
+            if str(agent.get("id") or "").strip() != "pi-worker":
+                continue
+            runtime_config = agent.get("runtime_config") if isinstance(agent.get("runtime_config"), dict) else {}
+            sdk_specific = runtime_config.get("sdk_specific") if isinstance(runtime_config.get("sdk_specific"), dict) else {}
+            return (
+                str(runtime_config.get("model") or "").strip(),
+                str(sdk_specific.get("thinking") or "").strip(),
+            )
+        return "", ""
+
+    @staticmethod
+    def _extract_max_review_cycles_from_config(config: dict[str, Any] | None) -> int:
+        payload = config if isinstance(config, dict) else {}
+        global_cycles = (payload.get("global") or {}).get("max_review_cycles")
+        try:
+            parsed = int(global_cycles)
+        except (TypeError, ValueError):
+            parsed = 0
+        return parsed if parsed > 0 else 0
+
+    def _planned_run_root_from_task_metadata(self, *, project_id: str, metadata: dict[str, Any] | None) -> Path | None:
+        payload = metadata if isinstance(metadata, dict) else {}
+        plan = payload.get("dataflow_cli") if isinstance(payload.get("dataflow_cli"), dict) else {}
+        raw_run_dir = str(plan.get("run_dir") or "").strip()
+        if not raw_run_dir:
+            request = payload.get("dataflow_scan_request") if isinstance(payload.get("dataflow_scan_request"), dict) else {}
+            raw_run_dir = str(request.get("resume_run_dir") or "").strip()
+        if not raw_run_dir:
+            return None
+        candidate = Path(raw_run_dir)
+        if not candidate.is_absolute():
+            return None
+        try:
+            return self._ensure_path_within(path=candidate, root=self._project_files_root(project_id), label="run_dir")
+        except Exception:
+            return None
+
+    def _run_locator_from_task_context(
+        self,
+        *,
+        project_id: str,
+        metadata: dict[str, Any] | None,
+        execution: WorkflowExecution | None,
+        run_index: RunIndex | None,
+    ) -> dict[str, str | None]:
+        if run_index is not None:
+            run_path = str(run_index.run_root_path or "").strip()
+            if run_path:
+                return {
+                    "run_name": str(run_index.run_name or Path(run_path).name),
+                    "runs_root": str(Path(run_path).parent),
+                    "run_path": run_path,
+                }
+        if execution is not None and execution.workspace_root:
+            run_root = Path(execution.workspace_root).resolve()
+        else:
+            run_root = self._planned_run_root_from_task_metadata(project_id=project_id, metadata=metadata)
+        if run_root is None:
+            return {"run_name": None, "runs_root": None, "run_path": None}
+        return {
+            "run_name": run_root.name,
+            "runs_root": str(run_root.parent),
+            "run_path": str(run_root),
+        }
+
+    @staticmethod
+    def _vuln_report_status_from_counts(*, enabled: bool, counts: dict[str, int] | None) -> dict[str, Any]:
+        if not enabled:
+            return {"status": "disabled", "enabled": False, "total": 0, "reported": 0, "failed": 0, "pending": 0, "items": []}
+        bucket = counts or {}
+        total = int(bucket.get("total") or 0)
+        reported = int(bucket.get("reported") or 0)
+        failed = int(bucket.get("failed") or 0)
+        pending = int(bucket.get("pending") or 0)
+        if total == 0:
+            status_text = "not_started"
+        elif failed and reported:
+            status_text = "partial_failed"
+        elif failed:
+            status_text = "failed"
+        elif reported == total:
+            status_text = "reported"
+        else:
+            status_text = "pending"
+        return {
+            "enabled": True,
+            "status": status_text,
+            "total": total,
+            "reported": reported,
+            "failed": failed,
+            "pending": pending,
+            "items": [],
+        }
 
     def _task_effective_profile_id(self, trigger: TriggerTask) -> str:
         return str(trigger.profile_id or trigger.workflow_definition_id or "").strip()
@@ -1617,7 +1775,7 @@ class ExecutionService:
         if not isinstance(request, dict):
             return None, None
         # Dataflow vulnerability scan tasks use the standard task-root layout:
-        # <project>/app/secflow-app-dataflow-vuln-scanner/<task_id>/{input,output,run}.
+        # <project>/app/secflow-app-dataflow-vuln-scanner/<run_name>/{input,output,run}.
         # User-provided workspace/output refs are treated as input metadata only
         # and must not move runtime or final artifacts outside the task root.
         return None, None
@@ -1647,25 +1805,44 @@ class ExecutionService:
     def _resolve_dataflow_cli_runs_root(self, *, project_id: str, request: dict[str, Any]) -> Path:
         # Keep every dataflow-vuln task under the service task root. A
         # workspace_dir request may still be stored in input metadata, but it
-        # must not redirect the task directory outside app/<service>/<task_id>.
+        # must not redirect the task directory outside app/<service>/<run_name>.
         return ensure_dir(self._default_dataflow_cli_runs_root(project_id)).resolve()
 
     def _build_dataflow_cli_run_name(
         self,
         *,
         trigger_id: str,
+        request: dict[str, Any],
         runs_root: Path,
     ) -> str:
-        run_name = sanitize_name(trigger_id)
-        if not run_name:
+        options = request.get("options") if isinstance(request.get("options"), dict) else {}
+        requested_run_name = str(options.get("run_name") or "").strip()
+        base_name = _sanitize_dataflow_run_name(requested_run_name or trigger_id)
+        if not base_name:
+            base_name = sanitize_name(trigger_id)
+        if not base_name:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="invalid trigger task id")
-        candidate = runs_root / run_name
-        if candidate.exists() and not candidate.is_dir():
+
+        candidate = runs_root / base_name
+        if not candidate.exists():
+            return base_name
+        if not candidate.is_dir():
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"task directory path is occupied by a non-directory: {candidate}",
             )
-        return run_name
+
+        suffix = sanitize_name(trigger_id)[-8:] or uuid.uuid4().hex[:8]
+        fallback = f"{base_name}_{suffix}"
+        fallback_candidate = runs_root / fallback
+        if not fallback_candidate.exists():
+            return fallback
+        if not fallback_candidate.is_dir():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"task directory path is occupied by a non-directory: {fallback_candidate}",
+            )
+        return f"{fallback}_{uuid.uuid4().hex[:6]}"
 
     def _build_dataflow_cli_resume_plan(
         self,
@@ -1729,6 +1906,7 @@ class ExecutionService:
         runs_root = self._resolve_dataflow_cli_runs_root(project_id=project_id, request=request)
         run_name = self._build_dataflow_cli_run_name(
             trigger_id=trigger_id,
+            request=request,
             runs_root=runs_root,
         )
         run_dir = runs_root / run_name
@@ -2867,6 +3045,320 @@ class ExecutionService:
             agent_state_dirs=task_payload.agent_state_dirs,
         )
 
+    def _list_scan_tasks_query(
+        self,
+        db: Session,
+        principal: dict,
+        *,
+        project_id: str | None = None,
+        status_filter: str | None = None,
+        profile_id: str | None = None,
+        mode: str | None = None,
+        parent_task_id: str | None = None,
+        sort_by: str | None = None,
+        sort_order: str | None = None,
+    ):
+        project_ids = _project_ids(principal)
+        query = db.query(TriggerTask)
+        if project_id:
+            self._ensure_project_access(principal, project_id)
+            query = query.filter(TriggerTask.project_id == project_id)
+        elif project_ids:
+            query = query.filter(TriggerTask.project_id.in_(project_ids))
+        if status_filter:
+            query = query.filter(TriggerTask.status == status_filter)
+        if profile_id:
+            query = query.filter(TriggerTask.profile_id == profile_id)
+        normalized_mode = str(mode or "").strip().lower()
+        if normalized_mode == "manual":
+            query = query.filter(
+                (TriggerTask.task_origin_type.is_(None)) | (TriggerTask.task_origin_type != "binary_security")
+            )
+        elif normalized_mode == "binary":
+            query = query.filter(
+                TriggerTask.task_origin_type == "binary_security",
+                (TriggerTask.parent_task_type.is_(None)) | (TriggerTask.parent_task_type != "source"),
+            )
+        elif normalized_mode == "source":
+            query = query.filter(
+                TriggerTask.task_origin_type == "binary_security",
+                TriggerTask.parent_task_type == "source",
+            )
+        normalized_parent_task_id = str(parent_task_id or "").strip()
+        if normalized_parent_task_id:
+            query = query.filter(TriggerTask.parent_task_id == normalized_parent_task_id)
+        sort_column = _TASK_LIST_SORT_COLUMNS.get(str(sort_by or "").strip(), TriggerTask.created_at)
+        order_expr = sort_column.asc() if str(sort_order or "").lower() == "asc" else sort_column.desc()
+        return query.order_by(order_expr, TriggerTask.id.desc())
+
+    def _build_light_scan_task_responses(self, db: Session, triggers: list[TriggerTask]) -> list[ScanTaskResponse]:
+        if not triggers:
+            return []
+
+        trigger_ids = [str(item.id) for item in triggers]
+        first_task_payload_by_trigger: dict[str, dict[str, Any]] = {}
+        task_metadata_by_trigger: dict[str, dict[str, Any]] = {}
+        for trigger in triggers:
+            first_task_payload = self._first_manifest_task_payload(trigger)
+            first_task_payload_by_trigger[trigger.id] = first_task_payload
+            task_metadata_by_trigger[trigger.id] = self._task_metadata_from_manifest_payload(first_task_payload)
+
+        version_by_id: dict[str, WorkflowDefinitionVersion] = {}
+        explicit_version_ids = [
+            str(item.workflow_definition_version_id)
+            for item in triggers
+            if item.workflow_definition_version_id
+        ]
+        if explicit_version_ids:
+            rows = (
+                db.query(WorkflowDefinitionVersion)
+                .filter(WorkflowDefinitionVersion.id.in_(explicit_version_ids))
+                .all()
+            )
+            version_by_id = {str(row.id): row for row in rows}
+
+        latest_version_by_definition: dict[str, WorkflowDefinitionVersion] = {}
+        fallback_definition_ids = {
+            str(item.workflow_definition_id)
+            for item in triggers
+            if not item.workflow_definition_version_id and item.workflow_definition_id
+        }
+        if fallback_definition_ids:
+            rows = (
+                db.query(WorkflowDefinitionVersion)
+                .filter(WorkflowDefinitionVersion.workflow_definition_id.in_(fallback_definition_ids))
+                .order_by(
+                    WorkflowDefinitionVersion.workflow_definition_id.asc(),
+                    WorkflowDefinitionVersion.version_no.desc(),
+                )
+                .all()
+            )
+            for row in rows:
+                latest_version_by_definition.setdefault(str(row.workflow_definition_id), row)
+
+        execution_by_id: dict[str, WorkflowExecution] = {}
+        latest_execution_ids = {
+            str(item.latest_execution_id)
+            for item in triggers
+            if item.latest_execution_id
+        }
+        if latest_execution_ids:
+            rows = db.query(WorkflowExecution).filter(WorkflowExecution.id.in_(latest_execution_ids)).all()
+            execution_by_id = {str(row.id): row for row in rows}
+
+        latest_execution_by_trigger: dict[str, WorkflowExecution] = {}
+        fallback_trigger_ids: list[str] = []
+        for trigger in triggers:
+            execution = execution_by_id.get(str(trigger.latest_execution_id or ""))
+            if execution is not None:
+                latest_execution_by_trigger[trigger.id] = execution
+            else:
+                fallback_trigger_ids.append(trigger.id)
+        if fallback_trigger_ids:
+            rows = (
+                db.query(WorkflowExecution)
+                .filter(WorkflowExecution.trigger_task_id.in_(fallback_trigger_ids))
+                .order_by(
+                    WorkflowExecution.trigger_task_id.asc(),
+                    WorkflowExecution.attempt_no.desc(),
+                    WorkflowExecution.created_at.desc(),
+                )
+                .all()
+            )
+            for row in rows:
+                latest_execution_by_trigger.setdefault(str(row.trigger_task_id), row)
+
+        run_index_by_execution: dict[str, RunIndex] = {}
+        execution_ids = [str(item.id) for item in latest_execution_by_trigger.values() if item.id]
+        if execution_ids:
+            rows = (
+                db.query(RunIndex)
+                .filter(RunIndex.linked_execution_id.in_(execution_ids))
+                .order_by(
+                    RunIndex.linked_execution_id.asc(),
+                    RunIndex.started_at.desc(),
+                    RunIndex.created_at.desc(),
+                )
+                .all()
+            )
+            for row in rows:
+                if row.linked_execution_id is not None:
+                    run_index_by_execution.setdefault(str(row.linked_execution_id), row)
+
+        run_index_by_task: dict[str, RunIndex] = {}
+        rows = (
+            db.query(RunIndex)
+            .filter(RunIndex.linked_task_id.in_(trigger_ids))
+            .order_by(
+                RunIndex.linked_task_id.asc(),
+                RunIndex.started_at.desc(),
+                RunIndex.created_at.desc(),
+            )
+            .all()
+        )
+        for row in rows:
+            if row.linked_task_id is not None:
+                run_index_by_task.setdefault(str(row.linked_task_id), row)
+
+        latest_execution_id_by_task = {
+            task_id: str(execution.id)
+            for task_id, execution in latest_execution_by_trigger.items()
+            if execution is not None and execution.id
+        }
+        report_counts_by_task: dict[str, dict[str, int]] = {task_id: {"total": 0, "reported": 0, "failed": 0, "pending": 0} for task_id in trigger_ids}
+        if latest_execution_id_by_task:
+            report_rows = (
+                db.query(
+                    VulnReportSubmission.task_id,
+                    VulnReportSubmission.execution_id,
+                    VulnReportSubmission.status,
+                    func.count(VulnReportSubmission.id),
+                )
+                .filter(VulnReportSubmission.execution_id.in_(list(latest_execution_id_by_task.values())))
+                .group_by(VulnReportSubmission.task_id, VulnReportSubmission.execution_id, VulnReportSubmission.status)
+                .all()
+            )
+            for task_id, execution_id, status_value, count_value in report_rows:
+                task_key = str(task_id)
+                if latest_execution_id_by_task.get(task_key) != str(execution_id):
+                    continue
+                bucket = report_counts_by_task.setdefault(task_key, {"total": 0, "reported": 0, "failed": 0, "pending": 0})
+                normalized_status = str(status_value or "").strip().lower()
+                count_int = int(count_value or 0)
+                bucket["total"] = int(bucket.get("total") or 0) + count_int
+                if normalized_status in {"reported", "failed", "pending"}:
+                    bucket[normalized_status] = int(bucket.get(normalized_status) or 0) + count_int
+
+        responses: list[ScanTaskResponse] = []
+        for trigger in triggers:
+            first_task_payload = first_task_payload_by_trigger.get(trigger.id, {})
+            task_metadata = task_metadata_by_trigger.get(trigger.id, {})
+            derivation = self._task_derivation_metadata(task_metadata)
+            task_origin_type = str(trigger.task_origin_type or "").strip() or "manual"
+            parent_task_type = str(trigger.parent_task_type or "").strip() or None
+            origin_label = self._task_origin_label(task_origin_type, parent_task_type)
+            task_purpose = self._normalize_task_purpose(getattr(trigger, "task_purpose", None) or task_metadata.get("task_purpose"))
+            version = (
+                version_by_id.get(str(trigger.workflow_definition_version_id or ""))
+                if trigger.workflow_definition_version_id
+                else latest_version_by_definition.get(str(trigger.workflow_definition_id or ""))
+            )
+            compiled_config = (
+                version.compiled_config_json or version.definition_json or {}
+                if version is not None
+                else {}
+            )
+            request_payload = task_metadata.get("dataflow_scan_request") if isinstance(task_metadata.get("dataflow_scan_request"), dict) else {}
+            default_model, default_thinking = self._extract_worker_runtime_defaults(compiled_config)
+            review_profile = str(request_payload.get("review_profile") or self._extract_review_profile_from_config(compiled_config) or "").strip()
+            max_review_cycles = request_payload.get("max_review_cycles")
+            try:
+                max_review_cycles_value = int(max_review_cycles)
+            except (TypeError, ValueError):
+                max_review_cycles_value = self._extract_max_review_cycles_from_config(compiled_config)
+            latest_execution = latest_execution_by_trigger.get(trigger.id)
+            run_index = run_index_by_execution.get(str(latest_execution.id)) if latest_execution is not None else None
+            if run_index is None:
+                run_index = run_index_by_task.get(trigger.id)
+            run_locator = self._run_locator_from_task_context(
+                project_id=trigger.project_id,
+                metadata=task_metadata,
+                execution=latest_execution,
+                run_index=run_index,
+            )
+            effective_model = str((run_index.model if run_index is not None else None) or request_payload.get("model") or default_model or "").strip()
+            effective_provider = str((run_index.provider if run_index is not None else None) or request_payload.get("provider") or "").strip()
+            effective_thinking = str((run_index.thinking if run_index is not None else None) or default_thinking or "").strip()
+            run_summary: dict[str, Any] = {
+                "status": str(run_index.status or "") if run_index is not None else "",
+                "model": effective_model,
+                "provider": effective_provider,
+                "thinking": effective_thinking,
+                "review_profile": review_profile,
+                "max_cycles": int(run_index.max_cycles or 0) if run_index is not None else max(max_review_cycles_value, 0),
+                "cycles_used": int(run_index.cycles_used or 0) if run_index is not None else 0,
+                "result_count": int(run_index.result_count or 0) if run_index is not None else 0,
+                "passed_count": int(run_index.passed_count or 0) if run_index is not None else 0,
+                "failed_count": int(run_index.failed_count or 0) if run_index is not None else 0,
+                "workflow_mode": str(run_index.workflow_mode or "") if run_index is not None else "",
+                "start_time": isoformat_local(run_index.started_at) if run_index is not None and run_index.started_at else "",
+                "start_epoch": int(run_index.started_at.replace(tzinfo=UTC_PLUS_8).timestamp()) if run_index is not None and run_index.started_at else 0,
+                "duration_seconds": int(run_index.duration_seconds or 0) if run_index is not None else 0,
+                "last_activity": isoformat_local(run_index.last_activity_at) if run_index is not None else "",
+                "updated_at": isoformat_local(run_index.last_synced_at) if run_index is not None else None,
+            }
+            if run_locator.get("run_name") and run_locator.get("runs_root"):
+                run_summary.update(
+                    {
+                        "name": run_locator.get("run_name"),
+                        "root_path": run_locator.get("runs_root"),
+                        "path": run_locator.get("run_path"),
+                        "linked_task_id": trigger.id,
+                        "linked_execution_id": latest_execution.id if latest_execution is not None else None,
+                        "run_id": run_index.id if run_index is not None else None,
+                    }
+                )
+
+            auto_report_enabled = bool(task_metadata.get("auto_report_vulnerabilities", True))
+            abnormal_reason = dict(trigger.latest_abnormal_reason_json) if isinstance(trigger.latest_abnormal_reason_json, dict) else None
+            responses.append(
+                ScanTaskResponse(
+                    task_id=trigger.id,
+                    project_id=trigger.project_id,
+                    task_purpose=task_purpose,
+                    agent_state_dirs={
+                        key: DataflowAgentStateDirResponse.model_validate(value)
+                        for key, value in self._agent_state_dirs_from_metadata(
+                            project_id=trigger.project_id,
+                            compiled_config=compiled_config,
+                            metadata=task_metadata,
+                        ).items()
+                    },
+                    derived_from_task_id=str(derivation.get("source_task_id") or "").strip() or None,
+                    derived_from_execution_id=str(derivation.get("source_execution_id") or "").strip() or None,
+                    derived_from_run_id=str(derivation.get("source_run_id") or "").strip() or None,
+                    derivation_kind="evolution_replay" if str(derivation.get("kind") or "").strip() == "evolution_replay" else None,
+                    task_origin_type=task_origin_type,
+                    parent_project_id=trigger.parent_project_id,
+                    parent_task_id=trigger.parent_task_id,
+                    parent_task_type=parent_task_type,
+                    parent_stage_name=trigger.parent_stage_name,
+                    parent_stage_item_id=trigger.parent_stage_item_id,
+                    parent_stage_item_key=trigger.parent_stage_item_key,
+                    origin_label=origin_label,
+                    parent_task_display=trigger.parent_task_id,
+                    profile_id=self._task_effective_profile_id(trigger),
+                    profile_version=int(version.version_no if version is not None else 0),
+                    title=self._task_title_from_manifest_payload(first_task_payload, trigger.id),
+                    status=trigger.status,
+                    latest_attempt_no=latest_execution.attempt_no if latest_execution is not None else 0,
+                    retry_count=trigger.retry_count,
+                    max_retry_count=trigger.max_retry_count,
+                    priority=trigger.priority,
+                    created_by=trigger.submitted_by,
+                    created_at=trigger.created_at,
+                    started_at=trigger.started_at,
+                    finished_at=trigger.finished_at,
+                    message=trigger.message,
+                    latest_execution_id=(latest_execution.id if latest_execution is not None else trigger.latest_execution_id),
+                    run_name=run_locator.get("run_name"),
+                    runs_root=run_locator.get("runs_root"),
+                    run_path=run_locator.get("run_path"),
+                    run=run_summary,
+                    latest_run=run_summary,
+                    auto_report_vulnerabilities=auto_report_enabled,
+                    vuln_report_status=self._vuln_report_status_from_counts(
+                        enabled=auto_report_enabled,
+                        counts=report_counts_by_task.get(trigger.id),
+                    ),
+                    abnormal_reason_title=str(abnormal_reason.get("title") or "").strip() or None if abnormal_reason else None,
+                    abnormal_reason_code=str(abnormal_reason.get("code") or "").strip() or None if abnormal_reason else None,
+                    abnormal_reason_category=str(abnormal_reason.get("category") or "").strip() or None if abnormal_reason else None,
+                    abnormal_reason=abnormal_reason,
+                )
+            )
+        return responses
+
     def list_scan_tasks(
         self,
         db: Session,
@@ -2877,26 +3369,43 @@ class ExecutionService:
         profile_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
-    ) -> List[ScanTaskResponse]:
-        project_ids = _project_ids(principal)
-        query = db.query(TriggerTask).order_by(TriggerTask.created_at.desc())
-        if project_id:
-            self._ensure_project_access(principal, project_id)
-            query = query.filter(TriggerTask.project_id == project_id)
-        elif project_ids:
-            query = query.filter(TriggerTask.project_id.in_(project_ids))
-        if status_filter:
-            query = query.filter(TriggerTask.status == status_filter)
-        if profile_id:
-            query = query.filter(TriggerTask.profile_id == profile_id)
-        safe_limit = max(1, min(int(limit or 100), 500))
-        safe_offset = max(0, int(offset or 0))
-        # Keep list rendering lightweight.  Full run indexing / filesystem
-        # inspection can be expensive on NFS and previously made the async API
-        # worker miss health probes under task-list load, producing nginx 502s.
-        # The list only needs the run locator; detail/run endpoints hydrate the
-        # full run summary on demand.
-        return [self._scan_task_response(db, item, include_run_summary=False) for item in query.offset(safe_offset).limit(safe_limit).all()]
+        page: int | None = None,
+        per_page: int | None = None,
+        mode: str | None = None,
+        parent_task_id: str | None = None,
+        sort_by: str | None = None,
+        sort_order: str | None = None,
+        paged: bool = False,
+    ) -> List[ScanTaskResponse] | ScanTaskListResponse:
+        query = self._list_scan_tasks_query(
+            db,
+            principal,
+            project_id=project_id,
+            status_filter=status_filter,
+            profile_id=profile_id,
+            mode=mode,
+            parent_task_id=parent_task_id,
+            sort_by=sort_by,
+            sort_order=sort_order,
+        )
+        if not paged:
+            safe_limit = max(1, min(int(limit or 100), 500))
+            safe_offset = max(0, int(offset or 0))
+            return [
+                self._scan_task_response(db, item, include_run_summary=False)
+                for item in query.offset(safe_offset).limit(safe_limit).all()
+            ]
+
+        safe_page = max(1, int(page or 1))
+        safe_per_page = max(1, min(int(per_page or 100), 500))
+        total = query.count()
+        rows = query.offset((safe_page - 1) * safe_per_page).limit(safe_per_page).all()
+        return ScanTaskListResponse(
+            items=self._build_light_scan_task_responses(db, rows),
+            total=total,
+            page=safe_page,
+            per_page=safe_per_page,
+        )
 
     def get_scan_task(self, db: Session, task_id: str, principal: dict) -> ScanTaskDetailResponse:
         request_started = time.perf_counter()

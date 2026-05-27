@@ -237,6 +237,13 @@ class ScanTaskResponse(BaseModel):
     abnormal_reason: Optional[Dict[str, Any]] = None
 
 
+class ScanTaskListResponse(BaseModel):
+    items: List[ScanTaskResponse] = Field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    per_page: int = 100
+
+
 class ScanTaskAttemptResponse(BaseModel):
     execution_id: str
     task_id: str

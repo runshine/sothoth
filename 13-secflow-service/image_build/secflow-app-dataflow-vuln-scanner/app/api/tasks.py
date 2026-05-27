@@ -30,6 +30,7 @@ from app.schemas import (
     ScanTaskCreateRequest,
     WorkerClusterCapacityResponse,
     ScanTaskDetailResponse,
+    ScanTaskListResponse,
     ScanTaskPriorityUpdateRequest,
     ScanTaskResponse,
     SuccessResponse,
@@ -104,19 +105,29 @@ async def create_task(
     return get_execution_service().get_scan_task_summary(db, created.task_id, principal)
 
 
-@router.get("/tasks", response_model=List[ScanTaskResponse])
+@router.get("/tasks", response_model=List[ScanTaskResponse] | ScanTaskListResponse)
 async def list_tasks(
     project_id: Optional[str] = Query(None),
     status_filter: Optional[str] = Query(None, alias="status"),
     profile_id: Optional[str] = Query(None),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    page: Optional[int] = Query(None, ge=1),
+    per_page: Optional[int] = Query(None, ge=1, le=500),
+    mode: Optional[str] = Query(None),
+    parent_task_id: Optional[str] = Query(None),
+    sort_by: Optional[str] = Query(None),
+    sort_order: Optional[str] = Query(None),
     subject=Depends(get_current_or_machine_subject),
     db: Session = Depends(get_db),
 ):
     principal, token = subject
     if project_id:
         await ensure_project_access(project_id, token)
+    use_paged_response = any(
+        value is not None and str(value).strip() != ""
+        for value in (page, per_page, mode, parent_task_id, sort_by, sort_order)
+    )
     return get_execution_service().list_scan_tasks(
         db,
         principal,
@@ -125,6 +136,13 @@ async def list_tasks(
         profile_id=profile_id,
         limit=limit,
         offset=offset,
+        page=page,
+        per_page=per_page,
+        mode=mode,
+        parent_task_id=parent_task_id,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        paged=use_paged_response,
     )
 
 
