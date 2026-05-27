@@ -473,7 +473,7 @@ def _collect_scheduler_metrics(db: Session, builder: MetricsBuilder) -> None:
         "secflow_dataflow_queue_depth",
         (
             db.query(func.count(WorkflowExecution.id))
-            .filter(WorkflowExecution.status.in_(tuple(ACTIVE_JOB_STATUSES & {"pending", "queued"})))
+            .filter(WorkflowExecution.status == "pending")
             .scalar()
             or 0
         ),
