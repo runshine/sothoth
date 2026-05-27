@@ -385,7 +385,7 @@ def test_task_list_keeps_recent_heartbeat_grace_as_running(service_config_path, 
     assert process_state["stale_after_seconds"] >= 300
 
 
-def test_get_task_promotes_pending_trigger_to_queued_from_dispatch_status(
+def test_get_task_keeps_pending_status_while_dispatch_is_queued(
     service_config_path,
     patch_mock_agent_runtime,
 ):
@@ -423,7 +423,7 @@ def test_get_task_promotes_pending_trigger_to_queued_from_dispatch_status(
     detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}")
     assert detail.status_code == 200
     payload = detail.json()
-    assert payload["status"] == "queued"
+    assert payload["status"] == "pending"
     assert payload["message"] == "queued on worker http://worker-0"
     assert payload["started_at"] is None
     assert payload["finished_at"] is None

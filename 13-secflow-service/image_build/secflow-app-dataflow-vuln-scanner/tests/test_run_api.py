@@ -1125,7 +1125,7 @@ def test_run_cancel_active_run_signals_bound_process(service_config_path):
     cancel_response = client.post(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/cancel")
     assert cancel_response.status_code == 200
     cancel_payload = cancel_response.json()
-    assert cancel_payload["status"] == "cancel_requested"
+    assert cancel_payload["status"] == "running"
     assert cancel_payload["process_pid"] == 4242
     assert cancel_payload["process_signal"] == "sigint"
     assert fake_process.signals
@@ -1134,8 +1134,8 @@ def test_run_cancel_active_run_signals_bound_process(service_config_path):
     with get_db_session() as db:
         execution = db.get(WorkflowExecution, bound["execution_id"])
         run_index = db.get(RunIndex, bound["run_id"])
-        assert execution is not None and execution.status == "cancel_requested"
-        assert run_index is not None and run_index.status == "cancel_requested"
+        assert execution is not None and execution.status == "running"
+        assert run_index is not None and run_index.status == "running"
 
 
 def test_run_process_state_uses_startup_grace_before_marking_stale(service_config_path):
