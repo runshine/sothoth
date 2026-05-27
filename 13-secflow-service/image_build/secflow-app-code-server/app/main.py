@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import load_config, get_config
+from app.build_info import build_service_meta
 from app.exception import setup_exception_handlers
 from app.model import init_database
 from app.services.k8s import get_k8s_service
@@ -269,7 +270,8 @@ async def health_check_alias():
     """兼容 menu 健康探测路径。"""
     return {
         "status": "ok",
-        "service": "code-server-manager"
+        "service": "code-server-manager",
+        **build_service_meta(),
     }
 
 

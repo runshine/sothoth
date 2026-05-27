@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Header
 from sqlalchemy.orm import Session
 
 from app.model import get_db
+from app.build_info import build_service_meta
 from app.schemas import (
     EvolutionApplyResponse,
     EvolutionPreviewRequest,
@@ -30,12 +31,19 @@ async def get_subject(authorization: str | None = Header(default=None)) -> tuple
 
 @router.get("/health")
 async def health():
-    return get_scheduler_service().health_payload()
+    return {
+        **get_scheduler_service().health_payload(),
+        **build_service_meta(),
+    }
 
 
 @router.get("/ready")
 async def ready():
-    return {"status": "ready", "service": "secflow-app-binary-evolution-center"}
+    return {
+        "status": "ready",
+        "service": "secflow-app-binary-evolution-center",
+        **build_service_meta(),
+    }
 
 
 @router.post("/projects/{project_id}/tasks/preview", response_model=EvolutionPreviewResponse)

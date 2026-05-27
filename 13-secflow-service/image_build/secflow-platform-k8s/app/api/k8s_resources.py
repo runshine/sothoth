@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, Header, Query, status, WebSocket, WebSoc
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
+from app.build_info import build_service_meta
 from app.config import get_config
 from app.exception import NotFoundError, ForbiddenError, ValidationError
 from app.models.database import (
@@ -280,13 +281,13 @@ def _ensure_namespace_exists(namespace: str) -> None:
 @router.get("/health", summary="健康检查")
 async def health_check():
     """服务健康检查"""
-    return {"status": "healthy"}
+    return {"status": "healthy", **build_service_meta()}
 
 
 @router.get("/ready", summary="就绪检查")
 async def readiness_check():
     """服务就绪检查"""
-    return {"status": "ready"}
+    return {"status": "ready", **build_service_meta()}
 
 
 @router.get("/platform/deployments", summary="获取平台微服务 Deployment 概览")

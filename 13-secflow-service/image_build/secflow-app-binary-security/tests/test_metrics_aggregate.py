@@ -21,8 +21,8 @@ class MetricsAggregateTests(unittest.TestCase):
         api_1 = ScrapeResult(
             target=PodTarget(pod_name="api-1", role="api", ip="10.0.0.1"),
             raw_text=(
-                "# TYPE secflow_binary_security_api_requests_total counter\n"
-                "secflow_binary_security_api_requests_total{method=\"GET\",path=\"/x\",status=\"200\"} 5\n"
+                "# TYPE secflow_binary_security_http_requests_total counter\n"
+                "secflow_binary_security_http_requests_total{method=\"GET\",route=\"/x\",status_class=\"2xx\",status_code=\"200\"} 5\n"
                 "# TYPE secflow_binary_security_active_workers gauge\n"
                 "secflow_binary_security_active_workers{kind=\"task\"} 2\n"
             ),
@@ -30,20 +30,20 @@ class MetricsAggregateTests(unittest.TestCase):
         api_2 = ScrapeResult(
             target=PodTarget(pod_name="api-2", role="api", ip="10.0.0.2"),
             raw_text=(
-                "# TYPE secflow_binary_security_api_requests_total counter\n"
-                "secflow_binary_security_api_requests_total{method=\"GET\",path=\"/x\",status=\"200\"} 7\n"
+                "# TYPE secflow_binary_security_http_requests_total counter\n"
+                "secflow_binary_security_http_requests_total{method=\"GET\",route=\"/x\",status_class=\"2xx\",status_code=\"200\"} 7\n"
                 "# TYPE secflow_binary_security_active_workers gauge\n"
                 "secflow_binary_security_active_workers{kind=\"task\"} 3\n"
             ),
         )
 
         aggregated = aggregate_prometheus_samples([api_1, api_2])
-        request_series = aggregated["secflow_binary_security_api_requests_total"]
+        request_series = aggregated["secflow_binary_security_http_requests_total"]
         worker_series = aggregated["secflow_binary_security_active_workers"]
 
         self.assertEqual(
             12.0,
-            request_series.samples[((("method", "GET"), ("path", "/x"), ("status", "200")))],
+            request_series.samples[((("method", "GET"), ("route", "/x"), ("status_class", "2xx"), ("status_code", "200")))],
         )
         self.assertEqual(5.0, worker_series.samples[((("kind", "task"),))])
 

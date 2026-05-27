@@ -10,6 +10,9 @@ ExecutorMode = Literal["mock", "codex_cli", "opencode_cli", "agentflow_cli"]
 class HealthResponse(BaseModel):
     status: str
     service: str
+    service_id: str | None = None
+    service_name: str | None = None
+    build_version: str | None = None
 
 
 class ReadyResponse(BaseModel):
@@ -17,6 +20,9 @@ class ReadyResponse(BaseModel):
     service: str
     ready: bool
     checks: dict[str, bool]
+    service_id: str | None = None
+    service_name: str | None = None
+    build_version: str | None = None
 
 
 class CapabilityResponse(BaseModel):

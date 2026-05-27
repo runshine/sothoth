@@ -32,7 +32,6 @@ def _default_payload() -> dict[str, Any]:
             "worker_timeout_seconds": config.scheduler.worker_timeout_seconds,
             "worker_retention_seconds": config.scheduler.worker_retention_seconds,
             "cleanup_interval_seconds": config.scheduler.cleanup_interval_seconds,
-            "discovery_mode": config.scheduler.discovery_mode,
             "reservation_lease_seconds": config.scheduler.reservation_lease_seconds,
             "worker_queue_depth": config.scheduler.worker_queue_depth,
             "dispatch_batch_size": config.scheduler.dispatch_batch_size,
@@ -41,8 +40,6 @@ def _default_payload() -> dict[str, Any]:
             "cluster_capacity_summary_stale_after_seconds": 15,
         },
         "dataflow_worker": {
-            "base_url": config.dataflow_worker.base_url,
-            "worker_urls": list(config.dataflow_worker.worker_urls or []),
             "worker_url_template": config.dataflow_worker.worker_url_template,
             "advertise_url_template": config.dataflow_worker.advertise_url_template,
             "timeout": config.dataflow_worker.timeout,

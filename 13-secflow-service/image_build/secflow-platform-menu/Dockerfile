@@ -2,6 +2,7 @@
 
 # 使用官方 Python 基础镜像
 FROM python:3.11-slim
+ARG SECFLOW_BUILD_VERSION=""
 
 # 维护者信息
 LABEL maintainer="sothoth-dev"
@@ -24,6 +25,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 复制应用代码
 COPY app.py .
 COPY config.yaml .
+RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
 # 暴露端口
 EXPOSE 5000

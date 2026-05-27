@@ -18,7 +18,7 @@ from app.models.database import get_engine, init_database
 from app.pi_vuln_core.config.loader import ConfigValidationError
 from app.pi_vuln_core.runner import load_framework_config_from_path, run_framework_config
 from app.pi_vuln_core.utils.win_compat import ensure_event_loop_policy
-from app.observability import build_metrics_response, observe_http_request
+from app.observability import build_metrics_response, observe_http_request, observe_http_request_inflight
 from app.services.auth import get_auth_service
 from app.services.llm_provider_sync import sync_providers_to_pi
 from app.services.project import get_project_service
@@ -87,15 +87,17 @@ def create_app() -> FastAPI:
     async def metrics_http_middleware(request: Request, call_next):
         started = time.perf_counter()
         response = None
+        route = request.scope.get("route")
+        route_path = getattr(route, "path", None) or request.url.path
+        observe_http_request_inflight(request.method, str(route_path), 1)
         try:
             response = await call_next(request)
             return response
         finally:
             duration_seconds = max(time.perf_counter() - started, 0.0)
-            route = request.scope.get("route")
-            route_path = getattr(route, "path", None) or request.url.path
             status_code = response.status_code if response is not None else 500
             observe_http_request(request.method, route_path, status_code, duration_seconds)
+            observe_http_request_inflight(request.method, str(route_path), -1)
 
     app.add_middleware(
         CORSMiddleware,

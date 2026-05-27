@@ -1,4 +1,5 @@
 FROM python:3.11-slim
+ARG SECFLOW_BUILD_VERSION=""
 
 # 设置工作目录
 WORKDIR /app
@@ -30,6 +31,7 @@ COPY config.yaml /app/
 
 # 复制资源目录（默认文件根目录）
 COPY resource/ /app/resource/
+RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
 # 暴露端口
 EXPOSE 8080

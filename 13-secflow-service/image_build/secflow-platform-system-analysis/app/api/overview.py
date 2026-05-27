@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
+from app.build_info import build_service_meta
 from app.api.deps import ensure_project_access, get_current_user
 from app.model import get_db
 from app.schemas import AnalysisOverviewResponse, MessageResponse, ProjectAnalysisCapabilitiesResponse
@@ -16,7 +17,7 @@ router = APIRouter()
 
 @router.get("/health", response_model=MessageResponse)
 async def health() -> MessageResponse:
-    return MessageResponse(message="ok")
+    return MessageResponse(message="ok", **build_service_meta())
 
 
 @router.get("/capabilities/nodes", response_model=ProjectAnalysisCapabilitiesResponse)
@@ -38,4 +39,3 @@ async def get_overview(
     _, token = user_and_token
     await ensure_project_access(project_id, token)
     return await get_overview_service().get_overview(db, project_id, token=token)
-

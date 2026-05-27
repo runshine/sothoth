@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import shutil
 import subprocess
@@ -39,6 +40,8 @@ from app.unpacker_engine_config import (
     TOOLS_ROOT_DIR,
     TOOLS_STORE_DIR,
     VAL_AGENT_DEF,
+    VAL_LLM_PROMPT_TMPL,
+    VAL_TOOL_PROMPT_TMPL,
     VAL_PROMPT_TMPL,
     build_settings_json as _build_settings_json,
     get_max_retries as _get_max_retries,
@@ -86,6 +89,8 @@ RECURSIVE_ARCHIVE_FORMATS = {
     "7zip",
     "cab",
 }
+REDUNDANT_ZLIB_BASENAME_RE = re.compile(r"^[0-9A-Fa-f]{6,}\.zlib$")
+REDUNDANT_ZLIB_MIN_BYTES = 1024 * 1024
 
 
 def _safe_relpath(path: Path, root: Path) -> str:
@@ -129,6 +134,44 @@ def _count_tree_entries(path: Path) -> int:
     for _root, dirs, files in os.walk(path, followlinks=False):
         total += len(dirs) + len(files)
     return total
+
+
+def _cleanup_redundant_zlib_blobs(output_path: str) -> dict[str, Any]:
+    output_root = Path(output_path)
+    deleted_files: list[str] = []
+    deleted_bytes = 0
+    failed_files: list[dict[str, str]] = []
+    if not output_root.exists():
+        return {
+            "deleted_count": 0,
+            "deleted_bytes": 0,
+            "deleted_files": deleted_files,
+            "failed_files": failed_files,
+        }
+    for path in output_root.rglob("*.zlib"):
+        if not path.is_file():
+            continue
+        if not REDUNDANT_ZLIB_BASENAME_RE.match(path.name):
+            continue
+        try:
+            size_bytes = int(path.stat().st_size)
+        except Exception as exc:
+            failed_files.append({"path": str(path), "error": str(exc)})
+            continue
+        if size_bytes < REDUNDANT_ZLIB_MIN_BYTES:
+            continue
+        try:
+            path.unlink()
+            deleted_files.append(str(path))
+            deleted_bytes += size_bytes
+        except Exception as exc:
+            failed_files.append({"path": str(path), "error": str(exc)})
+    return {
+        "deleted_count": len(deleted_files),
+        "deleted_bytes": deleted_bytes,
+        "deleted_files": deleted_files,
+        "failed_files": failed_files,
+    }
 
 
 def _run_recursive_expand_command(
@@ -495,6 +538,7 @@ def _run_reviewer(
     activity_callback: Optional[Callable[[str], None]] = None,
     reviewer: PiRpcClient | None = None,
     session_artifacts_override: dict[str, Any] | None = None,
+    review_kind: str = "llm",
 ) -> tuple[bool, str, dict[str, Any]]:
     stage_log_dir = _get_round_dir(log_dir, 0)
     _append_stage_log(
@@ -544,12 +588,13 @@ def _run_reviewer(
 
         started_at = datetime.utcnow().isoformat()
         started_monotonic = time.perf_counter()
-        review_prompt = render_prompt(VAL_PROMPT_TMPL, firmware_path, output_path)
+        prompt_template = VAL_TOOL_PROMPT_TMPL if str(review_kind).strip().lower() == "tool" else VAL_LLM_PROMPT_TMPL
+        review_prompt = render_prompt(prompt_template, firmware_path, output_path)
         recursive_manifest_path = round_dir / "recursive_expand_manifest.json" if round_dir is not None else None
-        if recursive_manifest_path is not None and recursive_manifest_path.exists():
+        if str(review_kind).strip().lower() == "tool" and recursive_manifest_path is not None and recursive_manifest_path.exists():
             review_prompt += (
                 "\n\nRecursive expansion context:\n"
-                f"- Read `{recursive_manifest_path}` if you need machine-readable recursive expansion details.\n"
+                f"- You must read `{recursive_manifest_path}` before judging completeness for tool-stage review.\n"
             )
         verify_result = validator.prompt(
             review_prompt,
@@ -646,6 +691,7 @@ def _run_skill_unpack(
             llm_binding_snapshot=llm_binding_snapshot,
             bind_cancel_client=bind_cancel_client,
             activity_callback=activity_callback,
+            review_kind="tool",
         )
         result = {
             "success": passed,
@@ -957,6 +1003,7 @@ def _run_generic_unpack(
                 activity_callback=activity_callback,
                 reviewer=reviewer,
                 session_artifacts_override=reviewer_session_artifacts,
+                review_kind="llm",
             )
             log_event(
                 log,
@@ -1283,6 +1330,15 @@ def _run_cleaner(
         "starting cleanup",
         output_path=output_path,
     )
+    redundant_zlib_cleanup = _cleanup_redundant_zlib_blobs(output_path)
+    _append_stage_log(
+        log_dir,
+        "cleaner.log",
+        "pre-cleaned redundant zlib blobs",
+        deleted_count=redundant_zlib_cleanup.get("deleted_count"),
+        deleted_bytes=redundant_zlib_cleanup.get("deleted_bytes"),
+        failed_count=len(list(redundant_zlib_cleanup.get("failed_files") or [])),
+    )
     clean_def = load_agent_def(CLEAN_AGENT_DEF)
     clean_sp = "/tmp/firmware-extract-cleanup.md"
     Path(clean_sp).write_text(clean_def["system_prompt"])
@@ -1320,7 +1376,11 @@ def _run_cleaner(
                 "开始执行清理收尾",
                 stage_key="cleanup",
                 status="running",
-                detail={"output_path": output_path},
+                detail={
+                    "output_path": output_path,
+                    "redundant_zlib_deleted_count": redundant_zlib_cleanup.get("deleted_count"),
+                    "redundant_zlib_deleted_bytes": redundant_zlib_cleanup.get("deleted_bytes"),
+                },
             )
         def _stream_cleanup_event(_event: dict[str, Any]) -> None:
             _append_stream_delta(
@@ -1345,6 +1405,8 @@ def _run_cleaner(
             "cleaner.log",
             "cleanup completed",
             response_preview=_preview_text(result),
+            redundant_zlib_deleted_count=redundant_zlib_cleanup.get("deleted_count"),
+            redundant_zlib_deleted_bytes=redundant_zlib_cleanup.get("deleted_bytes"),
         )
         if event_callback:
             event_callback(
@@ -1352,7 +1414,11 @@ def _run_cleaner(
                 "清理收尾已完成",
                 stage_key="cleanup",
                 status="success",
-                detail={"response_preview": _preview_text(result)},
+                detail={
+                    "response_preview": _preview_text(result),
+                    "redundant_zlib_deleted_count": redundant_zlib_cleanup.get("deleted_count"),
+                    "redundant_zlib_deleted_bytes": redundant_zlib_cleanup.get("deleted_bytes"),
+                },
             )
         return result
     finally:
@@ -1604,6 +1670,7 @@ def run_unpack(
                     llm_binding_snapshot=llm_binding_snapshot,
                     bind_cancel_client=_bind_cancel_client,
                     activity_callback=_report_activity,
+                    review_kind="tool",
                 )
                 final_round = 0 if passed else final_round
                 last_reason = review_result

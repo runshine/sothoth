@@ -15,9 +15,20 @@ jobs:
     outputs:
       date_tag: ${{ steps.date.outputs.date_tag }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
       - name: Generate date tag
         id: date
-        run: echo "date_tag=$(date +'%Y%m%d')-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+        env:
+          MAIN_REPO_SHA: ${{ github.sha }}
+        run: |
+          SHORT_SHA="${MAIN_REPO_SHA::7}"
+          COMMIT_TS="$(git show -s --format=%ct "${MAIN_REPO_SHA}")"
+          DATE_TAG="$(TZ=Asia/Shanghai date -d "@${COMMIT_TS}" +'%Y%m%d-%H%M%S')-${SHORT_SHA}"
+          echo "date_tag=${DATE_TAG}" >> "$GITHUB_OUTPUT"
 
   build-amd64:
     needs: prepare
@@ -37,6 +48,7 @@ jobs:
       - name: Build amd64 image
         run: |
           docker build \
+            --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --file 13-secflow-service/image_build/secflow-platform-vuln/Dockerfile \
             --tag ghcr.io/runshine/secflow-platform-vuln:amd64-latest \
             --tag ghcr.io/runshine/secflow-platform-vuln:amd64-${{ needs.prepare.outputs.date_tag }} \
@@ -66,6 +78,7 @@ jobs:
       - name: Build arm64 image
         run: |
           docker build \
+            --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --file 13-secflow-service/image_build/secflow-platform-vuln/Dockerfile \
             --tag ghcr.io/runshine/secflow-platform-vuln:arm64-latest \
             --tag ghcr.io/runshine/secflow-platform-vuln:arm64-${{ needs.prepare.outputs.date_tag }} \

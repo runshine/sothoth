@@ -67,5 +67,16 @@ Rules:
 16. For fixed-offset extraction, use Python `seek/read` or large-block copy helpers. Do not use `dd bs=1`; if shell `dd` is used, use a large block size and avoid byte-at-a-time copying.
 
 17. Do not execute the tool yourself. The backend will validate and execute the returned tool path.
+18. Your final response must be exactly one line containing only the final absolute tool path.
+19. Do not include any explanation, markdown, code fences, labels, quotes, backticks, or trailing text.
+20. Do not translate or rewrite path segments. In particular, `/data/...` must stay `/data/...`; never output localized variants such as `/数据/...`.
+21. The returned line must start with `/` and end with `.py`.
+22. If you modified the existing working tool in place, return that same path exactly as given. If you created a new tool under `working_tool/`, return that new absolute path exactly.
 
-Your final response must contain only the absolute path of the generated or updated tool file.
+Valid final response example:
+/data/files/.../working_tool/huawei-cc-00000002-v1-20260526164526.py
+
+Invalid final response examples:
+- The updated tool is `/data/files/.../working_tool/tool.py`
+- `/数据/files/.../working_tool/tool.py`
+- `/data/files/.../working_tool/tool.py` updated

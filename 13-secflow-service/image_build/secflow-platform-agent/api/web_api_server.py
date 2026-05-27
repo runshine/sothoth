@@ -23,6 +23,7 @@ from typing import Dict, List, Any, Optional, Tuple, Union, Set
 from datetime import datetime, timedelta
 import json
 
+from build_info import build_service_meta
 from model.connection import ConnectionChecker
 from model.redis_manager import RedisManager
 from model.db import DatabaseManager, DatabaseConnection
@@ -3552,7 +3553,8 @@ class WebAPIServer:
                 'database_type': self.config['database'].get('type', 'sqlite'),
                 'probe_mode': 'shallow',
                 'components': components,
-                'supported_formats': self.config.get('supported_formats', SUPPORTED_FORMATS)
+                'supported_formats': self.config.get('supported_formats', SUPPORTED_FORMATS),
+                **build_service_meta(),
             })
 
         @self.app.route('/api/agent/system/connections', methods=['GET'])

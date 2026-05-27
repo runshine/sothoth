@@ -1,4 +1,5 @@
 FROM python:3.11-slim-bookworm
+ARG SECFLOW_BUILD_VERSION=""
 
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
@@ -18,6 +19,7 @@ RUN pip install -r /app/requirements.txt
 
 COPY app/ /app/app/
 COPY start.py /app/start.py
+RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
 EXPOSE 8081
 

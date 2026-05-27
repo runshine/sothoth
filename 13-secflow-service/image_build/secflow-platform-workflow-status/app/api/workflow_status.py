@@ -9,6 +9,7 @@ from typing import Optional
 from fastapi import APIRouter, Body, Depends, Header, Query
 from sqlalchemy.orm import Session
 
+from app.build_info import build_service_meta
 from app.config import get_config
 from app.exception import InternalError, NotFoundError, UnauthorizedError, ValidationError
 from app.models.database import (
@@ -76,13 +77,13 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
 @router.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy"}
+    return {"status": "healthy", **build_service_meta()}
 
 
 @router.get("/ready")
 async def readiness_check():
     """Readiness check endpoint."""
-    return {"status": "ready"}
+    return {"status": "ready", **build_service_meta()}
 
 
 @router.get(

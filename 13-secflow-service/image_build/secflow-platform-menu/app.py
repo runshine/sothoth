@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from enum import Enum
 import logging
+from build_info import build_service_meta
 
 try:
     import redis
@@ -897,7 +898,7 @@ def get_menu_manager() -> MenuManager:
 @menu_bp.route('/health', methods=['GET'])
 def health_check():
     """健康检查"""
-    return jsonify({"status": "ok", "service": "secflow-menu"})
+    return jsonify({"status": "ok", "service": "secflow-menu", **build_service_meta()})
 
 
 @menu_bp.route('/menu', methods=['GET'])

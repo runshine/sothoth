@@ -22,6 +22,9 @@ AnalysisType = Literal[
 
 class MessageResponse(BaseModel):
     message: str
+    service_id: Optional[str] = None
+    service_name: Optional[str] = None
+    build_version: Optional[str] = None
 
 
 class AiAgentOption(BaseModel):
@@ -327,4 +330,3 @@ class AnalysisServiceConfigRequest(BaseModel):
 
 class AnalysisServiceConfigResponse(AnalysisServiceConfigRequest):
     updated_at: Optional[datetime] = None
-

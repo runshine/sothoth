@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi import APIRouter
 
+from app.build_info import build_service_meta
 from app.core.config import get_config, resolve_agentflow_root
 from app.db.database import get_database
 from app.schemas import HealthResponse, ReadyResponse
@@ -60,7 +61,7 @@ def _validate_agentflow_root(agentflow_python_bin: str) -> bool:
 
 @router.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
-    return HealthResponse(status="ok", service="secflow-app-ipc-audit")
+    return HealthResponse(status="ok", service="secflow-app-ipc-audit", **build_service_meta())
 
 
 @router.get("/ready", response_model=ReadyResponse)
@@ -124,4 +125,5 @@ def ready() -> ReadyResponse:
         service="secflow-app-ipc-audit",
         ready=all(critical_checks),
         checks=checks,
+        **build_service_meta(),
     )

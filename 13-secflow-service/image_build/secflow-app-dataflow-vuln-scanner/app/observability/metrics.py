@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 import threading
 from collections import defaultdict
 from dataclasses import dataclass
@@ -28,6 +29,8 @@ from app.services.scheduler import ACTIVE_JOB_STATUSES, get_scheduler_service
 
 PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 HTTP_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, math.inf)
+NORMALIZED_HTTP_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, math.inf)
+_PATH_ID_SEGMENT_RE = re.compile(r"/(?:\d+|[0-9a-f]{8,}|[0-9a-f]{8}-[0-9a-f-]{27,})(?=/|$)", re.IGNORECASE)
 
 
 def _sanitize_label_value(value: Any) -> str:
@@ -43,6 +46,21 @@ def _format_value(value: float | int) -> str:
     if math.isinf(value):
         return "+Inf" if value > 0 else "-Inf"
     return f"{float(value):.12g}"
+
+
+def normalize_http_route(path: str | None) -> str:
+    raw = str(path or "/").strip() or "/"
+    return _PATH_ID_SEGMENT_RE.sub("/{id}", raw)
+
+
+def http_status_class(status_code: int | str | None) -> str:
+    try:
+        code = int(status_code or 500)
+    except (TypeError, ValueError):
+        code = 500
+    if code < 0:
+        return "cancelled"
+    return f"{code // 100}xx"
 
 
 class MetricsBuilder:
@@ -106,13 +124,23 @@ class HttpMetrics:
         self._buckets = buckets
         self._lock = threading.Lock()
         self._request_counts: dict[tuple[str, str, str], int] = defaultdict(int)
+        self._normalized_request_counts: dict[tuple[str, str, str, str], int] = defaultdict(int)
         self._duration_counts: dict[tuple[str, str], int] = defaultdict(int)
         self._duration_sums: dict[tuple[str, str], float] = defaultdict(float)
         self._duration_buckets: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0] * len(self._buckets))
+        self._normalized_duration_counts: dict[tuple[str, str], int] = defaultdict(int)
+        self._normalized_duration_sums: dict[tuple[str, str], float] = defaultdict(float)
+        self._normalized_duration_buckets: dict[tuple[str, str], list[int]] = defaultdict(
+            lambda: [0] * len(NORMALIZED_HTTP_DURATION_BUCKETS)
+        )
+        self._inflight: dict[tuple[str, str], int] = defaultdict(int)
 
     def observe(self, method: str, path: str, status: int, duration_seconds: float) -> None:
         request_key = (str(method or "UNKNOWN").upper(), str(path or "/"), str(status))
         duration_key = (request_key[0], request_key[1])
+        normalized_route = normalize_http_route(path)
+        normalized_request_key = (request_key[0], normalized_route, http_status_class(status), str(status))
+        normalized_duration_key = (request_key[0], normalized_route)
         with self._lock:
             self._request_counts[request_key] += 1
             self._duration_counts[duration_key] += 1
@@ -121,6 +149,20 @@ class HttpMetrics:
             for index, upper_bound in enumerate(self._buckets):
                 if duration_seconds <= upper_bound:
                     buckets[index] += 1
+            self._normalized_request_counts[normalized_request_key] += 1
+            self._normalized_duration_counts[normalized_duration_key] += 1
+            self._normalized_duration_sums[normalized_duration_key] += max(float(duration_seconds), 0.0)
+            normalized_buckets = self._normalized_duration_buckets[normalized_duration_key]
+            for index, upper_bound in enumerate(NORMALIZED_HTTP_DURATION_BUCKETS):
+                if duration_seconds <= upper_bound:
+                    normalized_buckets[index] += 1
+
+    def observe_inflight(self, method: str, path: str, delta: int) -> None:
+        key = (str(method or "UNKNOWN").upper(), normalize_http_route(path))
+        with self._lock:
+            self._inflight[key] += int(delta)
+            if self._inflight[key] < 0:
+                self._inflight[key] = 0
 
     def emit(self, builder: MetricsBuilder) -> None:
         builder.metric(
@@ -164,6 +206,57 @@ class HttpMetrics:
                 self._duration_counts[key],
                 {"method": method, "path": path},
             )
+        builder.metric(
+            "secflow_dataflow_vuln_http_requests_total",
+            "counter",
+            "Total normalized HTTP requests served by this process.",
+        )
+        for (method, route, status_class, status_code), count in sorted(self._normalized_request_counts.items()):
+            builder.sample(
+                "secflow_dataflow_vuln_http_requests_total",
+                count,
+                {"method": method, "route": route, "status_class": status_class, "status_code": status_code},
+            )
+        builder.family(
+            "secflow_dataflow_vuln_http_request_duration_seconds",
+            "histogram",
+            "Normalized HTTP request latency in seconds for this process.",
+        )
+        for key in sorted(self._normalized_duration_counts):
+            method, route = key
+            cumulative = 0
+            buckets = self._normalized_duration_buckets[key]
+            for index, upper_bound in enumerate(NORMALIZED_HTTP_DURATION_BUCKETS):
+                cumulative += buckets[index]
+                builder.family_sample(
+                    "secflow_dataflow_vuln_http_request_duration_seconds",
+                    "secflow_dataflow_vuln_http_request_duration_seconds_bucket",
+                    cumulative,
+                    {"method": method, "route": route, "le": _format_value(upper_bound)},
+                )
+            builder.family_sample(
+                "secflow_dataflow_vuln_http_request_duration_seconds",
+                "secflow_dataflow_vuln_http_request_duration_seconds_sum",
+                self._normalized_duration_sums[key],
+                {"method": method, "route": route},
+            )
+            builder.family_sample(
+                "secflow_dataflow_vuln_http_request_duration_seconds",
+                "secflow_dataflow_vuln_http_request_duration_seconds_count",
+                self._normalized_duration_counts[key],
+                {"method": method, "route": route},
+            )
+        builder.metric(
+            "secflow_dataflow_vuln_http_request_inflight",
+            "gauge",
+            "Current inflight normalized HTTP requests.",
+        )
+        for (method, route), value in sorted(self._inflight.items()):
+            builder.sample(
+                "secflow_dataflow_vuln_http_request_inflight",
+                value,
+                {"method": method, "route": route},
+            )
 
 
 _http_metrics = HttpMetrics(HTTP_DURATION_BUCKETS)
@@ -171,6 +264,10 @@ _http_metrics = HttpMetrics(HTTP_DURATION_BUCKETS)
 
 def observe_http_request(method: str, path: str, status_code: int, duration_seconds: float) -> None:
     _http_metrics.observe(method, path, status_code, duration_seconds)
+
+
+def observe_http_request_inflight(method: str, path: str, delta: int) -> None:
+    _http_metrics.observe_inflight(method, path, delta)
 
 
 def build_metrics_response() -> Response:

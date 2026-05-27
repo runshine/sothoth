@@ -28,7 +28,6 @@ from app.schemas import (
     RunVulnReportRequest,
     RunVulnReportResponse,
     ScanTaskCreateRequest,
-    ScanTaskListPageResponse,
     WorkerClusterCapacityResponse,
     WorkerClusterCapacitySummaryResponse,
     ScanTaskDetailResponse,

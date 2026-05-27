@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from app import main
-from app.observability import observe_api_request
+from app.observability import observe_http_request
 
 
 class MainRoleTests(unittest.TestCase):
@@ -47,12 +47,12 @@ class MainRoleTests(unittest.TestCase):
             self.assertFalse(main._registry_enabled())
 
     def test_metrics_endpoint_exposes_prometheus_payload(self):
-        observe_api_request("GET", "/health", 200, 0.01)
+        observe_http_request("GET", "/health", 200, 0.01)
         response = asyncio.run(main.metrics_endpoint())
         self.assertEqual(200, response.status_code)
         self.assertIn("text/plain", response.media_type or "")
         body = response.body.decode("utf-8", errors="ignore")
-        self.assertIn("secflow_binary_security_api_requests_total", body)
+        self.assertIn("secflow_binary_security_http_requests_total", body)
 
     def test_reducer_metrics_endpoint_reads_snapshot_when_running_as_api(self):
         fake_store = SimpleNamespace(
@@ -84,7 +84,7 @@ class MainRoleTests(unittest.TestCase):
         self.assertIn("text/plain", response.media_type or "")
         fallback_payload = fake_store.render_metrics.await_args.kwargs.get("fallback_payload")
         self.assertIsInstance(fallback_payload, str)
-        self.assertIn("secflow_binary_security_api_requests_total", fallback_payload)
+        self.assertIn("secflow_binary_security_http_requests_total", fallback_payload)
 
     def test_ready_route_returns_503_when_checks_fail(self):
         async def fake_collect():

@@ -23,7 +23,9 @@ from app.exception import setup_exception_handlers
 from app.metrics_aggregate import get_metrics_aggregator
 from app.model import get_engine, init_database
 from app.observability import (
-    observe_api_request,
+    normalize_http_route,
+    observe_http_request,
+    observe_http_request_inflight,
     observe_auth_token_validation,
     observe_downstream_request,
     render_metrics,
@@ -227,19 +229,22 @@ async def prometheus_http_middleware(request: FastAPIRequest, call_next):
 
     started = time.perf_counter()
     status_code = 500
+    route = request.scope.get("route")
+    path = getattr(route, "path", None) or request.url.path
+    normalized_route = normalize_http_route(str(path))
+    observe_http_request_inflight(request.method, normalized_route, 1)
     try:
         response = await call_next(request)
         status_code = response.status_code
         return response
     finally:
-        route = request.scope.get("route")
-        path = getattr(route, "path", None) or request.url.path
-        observe_api_request(
+        observe_http_request(
             method=request.method,
             path=str(path),
             status_code=status_code,
             duration_seconds=time.perf_counter() - started,
         )
+        observe_http_request_inflight(request.method, normalized_route, -1)
 
 
 @app.get("/metrics", include_in_schema=False)

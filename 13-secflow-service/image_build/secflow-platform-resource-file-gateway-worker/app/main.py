@@ -16,6 +16,8 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, 
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from app.build_info import build_service_meta
+
 ROOT_PATH = Path(os.environ.get("PVC_MOUNT_PATH", "/data/pvc")).resolve()
 INTERNAL_TOKEN = os.environ.get("FILE_GATEWAY_INTERNAL_TOKEN", "")
 MAX_UPLOAD_BYTES = int(os.environ.get("FILE_GATEWAY_MAX_UPLOAD_BYTES", str(1024 * 1024 * 1024)))
@@ -146,7 +148,7 @@ def _stream_upload_to_target(file: UploadFile, target: Path) -> int:
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "root": str(ROOT_PATH)}
+    return {"status": "ok", "root": str(ROOT_PATH), **build_service_meta()}
 
 
 @app.get("/fs/children")

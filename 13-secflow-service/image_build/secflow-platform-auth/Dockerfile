@@ -1,4 +1,5 @@
 FROM python:3.11-slim
+ARG SECFLOW_BUILD_VERSION=""
 
 WORKDIR /app
 
@@ -23,6 +24,7 @@ COPY app/start.py /app/app/
 
 # 复制应用代码
 COPY app/ /app/app/
+RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
 EXPOSE 8080
 

@@ -18,8 +18,10 @@ class DataflowWorkerClient:
 
     @property
     def base_url(self) -> str:
-        cfg = get_config().dataflow_worker
-        return (self._base_url or os.environ.get("DATAFLOW_WORKER_URL") or cfg.base_url).rstrip("/")
+        base_url = (self._base_url or os.environ.get("DATAFLOW_WORKER_URL") or "").rstrip("/")
+        if not base_url:
+            raise DataflowWorkerError("dataflow worker base url is required")
+        return base_url
 
     @property
     def api_key(self) -> str | None:

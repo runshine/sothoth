@@ -14,9 +14,8 @@ def _read_build_version() -> str | None:
         payload = json.loads(BUILD_META_PATH.read_text(encoding="utf-8"))
     except Exception:
         return None
-    value = payload.get("build_version")
-    normalized = str(value or "").strip()
-    return normalized or None
+    value = str(payload.get("build_version") or "").strip()
+    return value or None
 
 
 def build_service_meta() -> dict[str, str | None]:

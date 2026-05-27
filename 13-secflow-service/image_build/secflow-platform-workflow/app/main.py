@@ -19,6 +19,7 @@ from app.api.template_tags import router as template_tag_router
 from app.api.workflow_instances import router as workflow_instance_router
 from app.api.app_workflows import router as app_workflow_router
 from app.api.terminal_proxy import router as terminal_proxy_router
+from app.build_info import build_service_meta
 from app.config import load_config, get_config
 from app.exception import setup_exception_handlers
 from app.models import create_tables, get_engine
@@ -157,7 +158,7 @@ async def health_check():
     Health check endpoint
     """
     return JSONResponse(
-        content={"status": "ok", "service": "secflow-workflow-service"},
+        content={"status": "ok", "service": "secflow-workflow-service", **build_service_meta()},
         status_code=200
     )
 
@@ -168,7 +169,7 @@ async def ready_check():
     Readiness check endpoint
     """
     return JSONResponse(
-        content={"status": "ready"},
+        content={"status": "ready", **build_service_meta()},
         status_code=200
     )
 

@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.build_info import build_service_meta
 from app.concurrency import get_queue_class, get_queue_controller, get_request_id
 from app.config import get_config, get_data_nfs_base_path, get_data_nfs_server, get_data_pvc_name
 from app.exception import ConflictError, ForbiddenError, NotFoundError, UnauthorizedError, ValidationError
@@ -110,12 +111,12 @@ async def _safe_ws_send_json(websocket: WebSocket, payload: dict[str, Any]) -> b
 
 @router.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "secflow-platform-fileserver"}
+    return {"status": "ok", "service": "secflow-platform-fileserver", **build_service_meta()}
 
 
 @router.get("/ready")
 async def ready_check():
-    return {"status": "ready"}
+    return {"status": "ready", **build_service_meta()}
 
 
 @router.get("/metrics/queue")

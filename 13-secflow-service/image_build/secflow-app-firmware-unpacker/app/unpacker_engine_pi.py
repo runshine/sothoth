@@ -493,15 +493,21 @@ class PiRpcClient:
         return None
 
     def get_token_stats(self):
-        self.send({"id": "req-stats", "type": "get_session_stats"})
-        assert self.proc.stdout is not None
-        for line in self.proc.stdout:
-            event = json.loads(line.strip())
-            if (
-                event.get("type") == "response"
-                and event.get("command") == "get_session_stats"
-            ):
-                return event["data"]
+        try:
+            self.send({"id": "req-stats", "type": "get_session_stats"})
+            assert self.proc.stdout is not None
+            for line in self.proc.stdout:
+                event = json.loads(line.strip())
+                if event.get("type") == "error" and event.get("command") == "get_session_stats":
+                    return None
+                if (
+                    event.get("type") == "response"
+                    and event.get("command") == "get_session_stats"
+                ):
+                    data = event.get("data")
+                    return data if isinstance(data, dict) else None
+        except Exception:
+            return None
         return None
 
     def close(self):

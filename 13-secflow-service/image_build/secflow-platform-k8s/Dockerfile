@@ -1,4 +1,5 @@
 FROM python:3.11-slim
+ARG SECFLOW_BUILD_VERSION=""
 
 # 设置工作目录
 WORKDIR /app
@@ -25,6 +26,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # 复制应用代码
 COPY app/ /app/app/
 COPY config.yaml /app/config.yaml
+RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
 # 暴露端口
 EXPOSE 10005

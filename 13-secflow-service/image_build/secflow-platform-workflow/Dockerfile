@@ -1,4 +1,5 @@
 FROM python:3.11-slim
+ARG SECFLOW_BUILD_VERSION=""
 
 WORKDIR /app
 
@@ -16,6 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY app/ ./app/
 COPY config.yaml .
+RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
 # Expose port (configurable via config.yaml, default is 8080)
 EXPOSE 8080

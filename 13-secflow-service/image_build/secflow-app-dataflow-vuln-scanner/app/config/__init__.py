@@ -150,13 +150,12 @@ class SchedulerConfig(BaseModel):
     pod_id: str = Field(default_factory=lambda: os.getenv("POD_ID") or os.getenv("HOSTNAME") or "local-pod")
     host_name: str = Field(default_factory=lambda: os.getenv("HOSTNAME") or "localhost")
     # worker_capacity <= 0 means no scheduler-side concurrency limit.
-    worker_capacity: int = 0
+    worker_capacity: int = 5
     poll_interval_seconds: int = 2
     heartbeat_interval_seconds: int = 5
     worker_timeout_seconds: int = 300
     worker_retention_seconds: int = 1800
     cleanup_interval_seconds: int = 10
-    discovery_mode: str = "registry"
     reservation_lease_seconds: int = 30
     worker_queue_depth: int = 0
     dispatch_batch_size: int = 8
@@ -164,8 +163,6 @@ class SchedulerConfig(BaseModel):
 
 
 class DataflowWorkerConfig(BaseModel):
-    base_url: str = "http://secflow-app-dataflow-vuln-scanner-worker:8080"
-    worker_urls: list[str] = Field(default_factory=list)
     worker_url_template: str = ""
     advertise_url_template: str = ""
     api_key: Optional[str] = None

@@ -7,6 +7,8 @@ from fastapi.testclient import TestClient
 from app.config import get_config
 from app.main import create_app
 from app.models.database import SchedulerWorker, SchedulerWorkerSlotReservation, TriggerTask, WorkflowDefinition, WorkflowExecution, get_db_session
+from app.services.dataflow_worker_client import DataflowWorkerError
+from app.services.runtime_config_service import get_runtime_config_service
 from app.services.scheduler import SchedulerService
 
 
@@ -205,6 +207,19 @@ def test_worker_role_registers_single_capacity_worker(service_config_path: Path)
         db.close()
 
 
+def test_worker_capacity_default_is_five(service_config_path: Path):
+    config = get_config()
+    assert config.scheduler.worker_capacity == 5
+
+    db = get_db_session()
+    try:
+        runtime_config = get_runtime_config_service().get_config(db)
+    finally:
+        db.close()
+
+    assert runtime_config["scheduler"]["worker_capacity"] == 5
+
+
 def test_start_execution_now_allows_unlimited_worker_capacity(
     service_config_path: Path,
     framework_config_payload: dict,
@@ -294,11 +309,19 @@ def test_manager_dispatches_execution_to_dataflow_worker(
 ):
     config = get_config()
     config.scheduler.role = "manager"
-    config.dataflow_worker.worker_urls = ["http://worker-a"]
 
     db = get_db_session()
     try:
+        db.add(SchedulerWorker(
+            pod_id="worker-a",
+            host_name="worker-a",
+            capacity=2,
+            running_count=0,
+            status="active",
+            metadata_json={"advertise_url": "http://worker-a"},
+        ))
         execution_id = _create_pending_execution(db, framework_config_payload, suffix="manager-dispatch")
+        db.commit()
     finally:
         db.close()
 
@@ -319,7 +342,7 @@ def test_manager_dispatches_execution_to_dataflow_worker(
 
     scheduler = SchedulerService()
     assert scheduler.start_execution_now(execution_id) is True
-    assert calls == [("http://worker-a", {"execution_id": execution_id, "worker_url": "http://worker-a", "worker_pod_id": "http://worker-a"})]
+    assert calls == [("http://worker-a", {"execution_id": execution_id, "worker_url": "http://worker-a", "worker_pod_id": "worker-a"})]
 
     db = get_db_session()
     try:
@@ -343,7 +366,6 @@ def test_manager_dispatch_uses_registry_worker_and_creates_reservation(
 ):
     config = get_config()
     config.scheduler.role = "manager"
-    config.dataflow_worker.worker_urls = []
 
     db = get_db_session()
     try:
@@ -395,28 +417,35 @@ def test_manager_chooses_lowest_load_worker_with_db_supplement(
 ):
     config = get_config()
     config.scheduler.role = "manager"
-    config.dataflow_worker.worker_urls = ["http://worker-a", "http://worker-b", "http://worker-c"]
-
-    remote_jobs = {
-        "http://worker-a": [{"status": "queued"}, {"status": "running"}],
-        "http://worker-b": [],
-        "http://worker-c": [],
-    }
-
-    class FakeClient:
-        def __init__(self, base_url: str):
-            self.base_url = base_url
-
-        def list_jobs(self) -> list[dict]:
-            return remote_jobs[self.base_url]
-
-    monkeypatch.setattr(
-        "app.services.scheduler.get_dataflow_worker_client",
-        lambda base_url=None: FakeClient(base_url or ""),
-    )
 
     db = get_db_session()
     try:
+        db.add_all([
+            SchedulerWorker(
+                pod_id="worker-a-pod",
+                host_name="worker-a",
+                capacity=4,
+                running_count=0,
+                status="active",
+                metadata_json={"advertise_url": "http://worker-a"},
+            ),
+            SchedulerWorker(
+                pod_id="worker-b-pod",
+                host_name="worker-b",
+                capacity=4,
+                running_count=0,
+                status="active",
+                metadata_json={"advertise_url": "http://worker-b"},
+            ),
+            SchedulerWorker(
+                pod_id="worker-c-pod",
+                host_name="worker-c",
+                capacity=4,
+                running_count=0,
+                status="active",
+                metadata_json={"advertise_url": "http://worker-c"},
+            ),
+        ])
         execution_id = _create_pending_execution(db, framework_config_payload, suffix="choose-pending")
         _create_pending_execution(
             db,
@@ -428,7 +457,42 @@ def test_manager_chooses_lowest_load_worker_with_db_supplement(
             worker_job_id="job-active",
             owner_pod_id="worker-b-pod",
         )
-        assert SchedulerService()._choose_dataflow_worker(db, execution_id) == ("http://worker-c", "http://worker-c")
+        _create_pending_execution(
+            db,
+            framework_config_payload,
+            suffix="choose-active-a",
+            status="running",
+            trigger_status="running",
+            worker_url="http://worker-a",
+            worker_job_id="job-active-a",
+            owner_pod_id="worker-a-pod",
+        )
+        db.commit()
+        assert SchedulerService()._choose_dataflow_worker(db, execution_id) == ("worker-c-pod", "http://worker-c")
+    finally:
+        db.close()
+
+
+def test_manager_dispatch_requires_registry_worker(
+    service_config_path: Path,
+    framework_config_payload: dict,
+):
+    config = get_config()
+    config.scheduler.role = "manager"
+
+    db = get_db_session()
+    try:
+        execution_id = _create_pending_execution(db, framework_config_payload, suffix="manager-no-worker")
+    finally:
+        db.close()
+
+    db = get_db_session()
+    try:
+        try:
+            SchedulerService()._choose_dataflow_worker(db, execution_id)
+            raise AssertionError("expected DataflowWorkerError when no registry workers are available")
+        except DataflowWorkerError as exc:
+            assert "no healthy registry worker" in str(exc)
     finally:
         db.close()
 
@@ -534,7 +598,6 @@ def test_cluster_capacity_api_returns_worker_jobs(
     config.scheduler.pod_id = "worker-capacity-pod"
     config.scheduler.host_name = "worker-capacity-host"
     config.scheduler.worker_capacity = 4
-    config.dataflow_worker.worker_urls = ["http://worker-capacity"]
 
     scheduler = SchedulerService()
     scheduler._heartbeat_once()
@@ -595,7 +658,6 @@ def test_cluster_capacity_api_degrades_when_worker_probe_fails(
     config.scheduler.pod_id = "worker-capacity-fail-pod"
     config.scheduler.host_name = "worker-capacity-fail-host"
     config.scheduler.worker_capacity = 2
-    config.dataflow_worker.worker_urls = ["http://worker-capacity-fail"]
 
     scheduler = SchedulerService()
     scheduler._heartbeat_once()
@@ -618,3 +680,47 @@ def test_cluster_capacity_api_degrades_when_worker_probe_fails(
     assert target["healthy"] is False
     assert target["active_jobs"] == []
     assert "probe failed" in (target["error"] or "")
+
+
+def test_worker_capacity_runtime_config_applies_to_heartbeat_and_capacity_view(
+    service_config_path: Path,
+):
+    config = get_config()
+    config.scheduler.enabled = True
+    config.scheduler.role = "worker"
+    config.scheduler.pod_id = "worker-runtime-capacity-pod"
+    config.scheduler.host_name = "worker-runtime-capacity-host"
+    config.scheduler.worker_capacity = 1
+
+    scheduler = SchedulerService()
+    scheduler._heartbeat_once()
+
+    db = get_db_session()
+    try:
+        worker = db.get(SchedulerWorker, "worker-runtime-capacity-pod")
+        assert worker is not None
+        assert worker.capacity == 1
+
+        saved = get_runtime_config_service().save_config(db, {
+            "scheduler": {
+                "worker_capacity": 3,
+            },
+        })
+        assert saved["scheduler"]["worker_capacity"] == 3
+    finally:
+        db.close()
+
+    scheduler._heartbeat_once()
+
+    db = get_db_session()
+    try:
+        worker = db.get(SchedulerWorker, "worker-runtime-capacity-pod")
+        assert worker is not None
+        assert worker.capacity == 3
+
+        payload = scheduler.get_cluster_capacity_summary(db)
+        target = next(item for item in payload.workers if item.worker_id == "worker-runtime-capacity-pod")
+        assert target.max_concurrent_jobs == 3
+        assert target.available_slots == 3
+    finally:
+        db.close()

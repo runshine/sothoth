@@ -11,6 +11,7 @@ from typing import List, Optional, Set
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, status
 from sqlalchemy.orm import Session, joinedload
 
+from app.build_info import build_service_meta
 from app.config import get_config
 from app.exception import (
     ForbiddenError,
@@ -58,14 +59,14 @@ ORDINARY_ADMIN_ROLE_NAME = "ordinary_admin"
 @router.get("/health")
 async def health_check():
     """健康检查接口"""
-    return {"status": "ok", "service": "secflow-project-service"}
+    return {"status": "ok", "service": "secflow-project-service", **build_service_meta()}
 
 
 # 就绪检查
 @router.get("/ready")
 async def ready_check():
     """就绪检查接口"""
-    return {"status": "ready"}
+    return {"status": "ready", **build_service_meta()}
 
 
 def generate_project_id(name: str) -> str:

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from fastapi import APIRouter
 
+from app.build_info import build_service_meta
 from app.core.config import get_config
 from app.db.database import get_database
 from app.workers.scheduler import get_scheduler_service
@@ -14,7 +15,7 @@ router = APIRouter()
 
 @router.get("/health")
 def health():
-    return {"status": "ok", "service": "secflow-app-kernel-scan"}
+    return {"status": "ok", "service": "secflow-app-kernel-scan", **build_service_meta()}
 
 
 @router.get("/ready")
@@ -48,4 +49,5 @@ def ready():
         "service": "secflow-app-kernel-scan",
         "ready": all(checks.values()),
         "checks": checks,
+        **build_service_meta(),
     }

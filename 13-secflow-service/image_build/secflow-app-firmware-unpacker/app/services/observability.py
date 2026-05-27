@@ -100,11 +100,6 @@ API_REQUEST_DURATION_SECONDS = Histogram(
     ("method", "path"),
     buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30),
 )
-AUTH_TOKEN_CACHE_TOTAL = Counter(
-    "firmware_unpacker_auth_token_cache_total",
-    "Auth token cache lookups by result.",
-    ("result",),
-)
 TASK_LIFECYCLE_TOTAL = Counter(
     "firmware_unpacker_task_lifecycle_total",
     "Total task lifecycle transitions.",
@@ -218,10 +213,6 @@ def record_db_retry(operation: str) -> None:
 
 def record_db_operation_result(operation: str, result: str) -> None:
     DB_OPERATION_RESULTS_TOTAL.labels(operation=operation, result=result).inc()
-
-
-def record_auth_token_cache(result: str) -> None:
-    AUTH_TOKEN_CACHE_TOTAL.labels(result=result).inc()
 
 
 def record_claim_result(*, claimed_count: int, duration_seconds: float, result: str) -> None:
