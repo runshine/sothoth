@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from fastapi.testclient import TestClient
 
 FRAMEWORK_ROOT = Path(__file__).resolve().parent.parent
 if str(FRAMEWORK_ROOT) not in sys.path:
@@ -43,6 +44,24 @@ def patch_mock_agent_runtime(monkeypatch: pytest.MonkeyPatch):
     AgentRuntimeRegistry.RUNTIME_MAP.update(original)
 
 
+@pytest.fixture(autouse=True)
+def auto_close_test_clients(monkeypatch: pytest.MonkeyPatch):
+    created_clients: list[TestClient] = []
+    original_init = TestClient.__init__
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        created_clients.append(self)
+
+    monkeypatch.setattr(TestClient, "__init__", patched_init)
+    yield
+    for client in reversed(created_clients):
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
 @pytest.fixture()
 def service_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     config_path = tmp_path / "config.yaml"
@@ -63,7 +82,7 @@ def service_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
             "enabled": False,
             "pod_id": "test-pod",
             "host_name": "test-host",
-            "worker_capacity": 2,
+            "worker_capacity": 5,
             "poll_interval_seconds": 1,
             "heartbeat_interval_seconds": 1,
             "worker_timeout_seconds": 2,

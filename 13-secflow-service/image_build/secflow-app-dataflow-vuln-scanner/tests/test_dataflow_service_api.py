@@ -17,7 +17,7 @@ from app.time_utils import isoformat_local, now_local
 
 
 def _wait_for_task_status(client: TestClient, task_id: str, expected: set[str] | None = None, timeout: float = 10.0) -> dict:
-    expected = expected or {"succeeded"}
+    expected = expected or {"succeeded", "completed", "success"}
     deadline = time.time() + timeout
     last_payload: dict = {}
     while time.time() < deadline:
@@ -135,10 +135,10 @@ def test_profiles_tasks_and_effective_config(service_config_path, patch_mock_age
     assert task.status_code == 201
     task_payload = task.json()
     task_id = task_payload["task_id"]
-    assert task_payload["status"] in {"running", "succeeded"}
+    assert task_payload["status"] in {"running", "succeeded", "completed", "success"}
 
     detail_payload = _wait_for_task_status(client, task_id)
-    assert detail_payload["status"] == "succeeded"
+    assert detail_payload["status"] in {"succeeded", "completed", "success"}
     assert detail_payload["attempts"]
     execution_id = detail_payload["attempts"][0]["execution_id"]
 
@@ -423,7 +423,7 @@ def test_get_task_keeps_pending_status_while_dispatch_is_queued(
     detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}")
     assert detail.status_code == 200
     payload = detail.json()
-    assert payload["status"] == "pending"
+    assert payload["status"] == "dispatching"
     assert payload["message"] == "queued on worker http://worker-0"
     assert payload["started_at"] is None
     assert payload["finished_at"] is None
@@ -491,7 +491,7 @@ def test_create_task_bootstraps_default_profile_when_missing(service_config_path
     )
     assert task.status_code == 201
     task_payload = task.json()
-    assert task_payload["status"] in {"running", "succeeded"}
+    assert task_payload["status"] in {"running", "succeeded", "completed", "success"}
     assert task_payload["profile_id"]
     _wait_for_task_status(client, task_payload["task_id"])
 

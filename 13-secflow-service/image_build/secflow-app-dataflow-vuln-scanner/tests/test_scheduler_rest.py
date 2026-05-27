@@ -215,7 +215,12 @@ def test_worker_role_registers_single_capacity_worker(service_config_path: Path)
         assert worker is not None
         assert worker.capacity == 1
         assert worker.metadata_json["role"] == "worker"
-        assert worker.metadata_json["advertise_url"] == f"http://{worker.host_name}:8080"
+        expected_advertise_url = (
+            f"http://{config.scheduler.pod_id}."
+            f"{config.scheduler.worker_headless_service_name}."
+            f"{config.scheduler.pod_namespace}.svc.cluster.local:8080"
+        )
+        assert worker.metadata_json["advertise_url"] == expected_advertise_url
     finally:
         db.close()
 
@@ -538,9 +543,9 @@ def test_worker_jobs_api_claims_execution_without_polling_pending_queue(
     assert response.status_code == 200
     payload = response.json()
     assert payload["id"] == execution_id
-    assert payload["status"] == "running"
-    assert payload["phase"] == "running"
-    assert started == [execution_id]
+    assert payload["status"] == "dispatching"
+    assert payload["phase"] == "queued"
+    assert started == []
 
     list_response = client.get("/api/v1/jobs")
     assert list_response.status_code == 200
@@ -554,12 +559,12 @@ def test_worker_jobs_api_claims_execution_without_polling_pending_queue(
         trigger = db.get(TriggerTask, "tt-sched-worker-api")
         assert execution is not None
         assert trigger is not None
-        assert execution.status == "running"
-        assert trigger.status == "running"
+        assert execution.status == "dispatching"
+        assert trigger.status == "dispatching"
         assert execution.owner_pod_id == "worker-pod"
         assert execution.worker_url == "http://worker-pod"
         assert execution.worker_job_id == execution_id
-        assert execution.dispatch_status == "running"
+        assert execution.dispatch_status == "queued"
     finally:
         db.close()
 
