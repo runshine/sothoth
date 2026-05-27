@@ -917,6 +917,8 @@ class ExecutionService:
         normalized_task_id = str(task_id or "").strip()
         if not normalized_task_id:
             return
+        if not hasattr(db, "get"):
+            return
         trigger = db.get(TriggerTask, normalized_task_id)
         if trigger is None:
             db.query(DfvsTaskListProjection).filter(DfvsTaskListProjection.task_id == normalized_task_id).delete()
@@ -4364,6 +4366,7 @@ class ExecutionService:
             total=total,
             page=safe_page,
             per_page=safe_per_page,
+            page_size=safe_per_page,
         )
 
     def get_scan_task_stats(
