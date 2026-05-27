@@ -69,4 +69,20 @@ Never assume or guess these paths. Always derive them from the task prompt.
 
 ## Output format when task finished
 
-Your final response must contain only the absolute path of the generated or updated tool file and nothing after it.
+Your final response must be exactly one line containing only the absolute path of the generated or updated tool file.
+
+Hard requirements:
+- Do not include any explanation, reasoning, status text, markdown, code fences, bullets, labels, quotes, or backticks.
+- Do not prepend or append any text before or after the path.
+- Do not translate, localize, normalize, or paraphrase any path segment. Return the path byte-for-byte as it exists on disk.
+- The line must start with `/` and must point to a `.py` file inside the current `working_tool/` directory.
+- If you updated the existing working tool, return that exact existing path unchanged.
+
+Valid example:
+/data/files/.../working_tool/huawei-cc-00000002-v1-20260526164526.py
+
+Invalid examples:
+- `The updated tool is: /data/files/.../tool.py`
+- ``/data/files/.../tool.py``
+- `/数据/files/.../tool.py`
+- `/data/files/.../tool.py (updated)`

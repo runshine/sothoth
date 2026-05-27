@@ -16,7 +16,6 @@ from sqlalchemy import or_
 from sqlalchemy.orm import load_only
 
 from app.api.dependencies import ensure_project_access, get_current_subject
-from app.build_info import build_service_meta
 from app.exception import ForbiddenError, InternalError, NotFoundError, ValidationError
 from app.model import FirmwareEvolutionJob, FirmwareEvolutionRound, ServiceConfig, TaskStatus, UnpackTask, UnpackTaskEvent, get_db_session
 from app.schemas import (
@@ -194,10 +193,13 @@ def _list_runtime_root_files(limit: int = RUNTIME_FILE_LIST_LIMIT, root: Optiona
 def _resolve_runtime_root_entry(relative_path: str, root: Optional[str] = None) -> Path:
     root_path = _resolve_runtime_root(root)
     normalized = str(relative_path or "").strip().lstrip("/")
-    target = (root_path / normalized).resolve()
+    raw_target = root_path / normalized
+    target = raw_target.resolve()
     try:
         target.relative_to(root_path)
     except Exception as exc:
+        if raw_target.is_symlink():
+            raise ValidationError("当前运行时文件为指向 runtime 根目录外部的链接，暂不支持直接预览") from exc
         raise ValidationError("非法 runtime 文件路径") from exc
     if not target.exists():
         raise NotFoundError("运行时文件", normalized or "/")
@@ -484,7 +486,7 @@ def _get_task_progress(task_id: str) -> dict:
     round_dirs = _llm_round_dirs(run_dir)
     executor_logs = [path / "executor_messages.json" for path in round_dirs if (path / "executor_messages.json").exists()]
     verifier_logs = [path / "reviewer_messages.json" for path in round_dirs if (path / "reviewer_messages.json").exists()]
-    has_tool_review = tool_reviewer_messages.exists() or tool_reviewer_transcript.exists() or stage4_llm_review_log.exists() or stage4_path.exists()
+    has_tool_review = tool_reviewer_messages.exists() or tool_reviewer_transcript.exists()
 
     def _cleaner_session_closed() -> bool:
         session_index = _read_json_file(run_dir / "sessions" / "index.json")
@@ -593,10 +595,7 @@ def _get_task_progress(task_id: str) -> dict:
         transcript_duration = _log_duration_seconds(tool_reviewer_transcript)
         if transcript_duration is not None:
             return transcript_duration
-        stage4_duration = _log_duration_seconds(stage4_llm_review_log)
-        if stage4_duration is not None:
-            return stage4_duration
-        started_at, _ = _log_time_bounds(stage4_llm_review_log)
+        started_at, _ = _log_time_bounds(tool_reviewer_transcript)
         message_updated_at = _parse_iso_datetime(_mtime_iso_text(tool_reviewer_messages))
         if started_at is not None and message_updated_at is not None:
             return max(0, int(round((ensure_local(message_updated_at) - ensure_local(started_at)).total_seconds())))
@@ -805,11 +804,34 @@ def _get_task_progress(task_id: str) -> dict:
                 review_detail = "工具执行后的评审未通过"
             tool_review_phase = _phase_payload(
                 "llm_review_tool",
-                "LLM 评审（工具阶段）",
+                "tool评审",
                 review_status,
                 review_detail,
-                _mtime_iso_text(tool_reviewer_messages) or _mtime_iso_text(stage4_llm_review_log),
+                _mtime_iso_text(tool_reviewer_messages),
                 duration_seconds=_tool_review_duration_seconds(),
+            )
+        elif not matched_tool and (
+            executor_logs
+            or verifier_logs
+            or round_items
+            or task_current_stage in {"llm_unpack", "review", "cleanup"}
+            or fallback_to_llm
+            or task_status in {"success", "failed", "cancelled"}
+        ):
+            tool_review_phase = _phase_payload(
+                "llm_review_tool",
+                "tool评审",
+                "skipped",
+                "未进入工具执行链路，跳过 tool 评审",
+                _mtime_iso_text(stage2_path),
+            )
+        elif matched_tool and not fallback_to_llm:
+            tool_review_phase = _phase_payload(
+                "llm_review_tool",
+                "tool评审",
+                "pending",
+                "等待工具执行及工具后递归解包完成后进入评审",
+                None,
             )
 
         if started_rounds > 0:
@@ -931,6 +953,8 @@ def _get_task_progress(task_id: str) -> dict:
                 llm_phases.append(tool_review_phase)
             else:
                 llm_phases.append(_phase_payload("llm_review", "LLM 评审", "not_executed", "工具执行成功后，LLM 评审未执行"))
+        elif tool_review_phase is not None:
+            llm_phases.append(tool_review_phase)
 
         phases.extend(llm_phases)
 
@@ -2373,7 +2397,7 @@ def _list_llm_config_file_summaries() -> dict:
 @router.get("/health", response_model=HealthResponse)
 @router.get("/api/app/firmware-unpacker/health", response_model=HealthResponse)
 async def health_check():
-    return {"status": "ok", "owner_id": get_worker_id(), **build_service_meta()}
+    return {"status": "ok", "owner_id": get_worker_id()}
 
 
 @router.get("/ready", response_model=ReadyResponse)

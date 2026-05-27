@@ -108,7 +108,7 @@ class ConfigServiceTests(unittest.TestCase):
         result = service.get_config(db, "p1")
 
         self.assertEqual(8, result["concurrency"])
-        self.assertEqual("fast", result["default_mode"])
+        self.assertEqual("turbo", result["default_mode"])
 
     def test_save_config_normalizes_default_mode(self):
         service = ConfigService()
@@ -160,7 +160,9 @@ class ConfigServiceTests(unittest.TestCase):
 
 class TaskProviderResolutionTests(unittest.TestCase):
     def test_create_task_uses_project_default_provider_and_freezes_metadata(self):
-        db = _FakeDb()
+        row = B2SProjectConfig(project_id="p1")
+        row.config = {"default_mode": "fast"}
+        db = _FakeDb(project_configs=[row])
         fake_pi = _FakePiClient()
         cache_service = SimpleNamespace(
             try_apply_cache_hit=mock.Mock(return_value=SimpleNamespace(hit=False)),

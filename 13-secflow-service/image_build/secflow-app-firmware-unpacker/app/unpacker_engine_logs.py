@@ -205,6 +205,15 @@ def save_agent_log(client: Any, log, log_dir: Path | None, name: str) -> dict[st
             (log_dir / f"{name}_tokens.json").write_text(
                 json.dumps(token_stats, indent=2)
             )
+        elif stats:
+            log_event(
+                log,
+                30,
+                "unexpected token stats payload",
+                event="token_stats_unexpected",
+                name=name,
+                payload_type=type(stats).__name__,
+            )
     except Exception as exc:
         log_event(
             log,

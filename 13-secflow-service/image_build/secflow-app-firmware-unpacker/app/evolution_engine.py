@@ -17,13 +17,10 @@ from typing import Any, Callable, Optional
 from app.preprocess import detect_format
 from app.subprocess_utils import StreamingLineSink, run_streaming_process
 from app.tool_dispatcher import (
-    activate_tool_version,
     build_versioned_tool_path as _repo_build_versioned_tool_path,
-    ensure_dispatcher_environment,
     next_tool_version as _repo_next_tool_version,
     parse_tool_version,
     resolve_active_tool_target,
-    upsert_dispatcher_rule,
 )
 from app.tool_store import compute_family_id, parse_tool_metadata
 from app.unpacker_engine_config import (
@@ -48,7 +45,8 @@ from app.unpacker_engine_logs import (
     write_json_log as _write_json_log,
 )
 from app.unpacker_engine_pi import PiRpcClient
-from app.unpacker_engine_session import build_session_artifacts
+from app.unpacker_engine_config import utc_now_iso
+from app.unpacker_engine_session import build_session_artifacts, update_session_index
 
 
 log = logging.getLogger("unpacker.evolution")
@@ -609,7 +607,7 @@ def _save_generated_tool_to_run(
     return str(target), None, True
 
 
-def _publish_tool_to_repo(
+def _publish_tool_to_store(
     *,
     firmware_path: str,
     working_tool: Path,
@@ -624,26 +622,7 @@ def _publish_tool_to_repo(
     target = _build_versioned_tool_path(TOOLS_STORE_DIR, family_id, version)
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(working_tool, target)
-    info = detect_format(firmware_path)
-    magic_hex = str((info.get("magic") or b"").hex())[:8].lower()
-    description = str(parse_tool_metadata(working_tool).get("description") or "").strip()
-    active_path = activate_tool_version(
-        tools_store_dir=TOOLS_STORE_DIR,
-        tools_active_dir=TOOLS_ACTIVE_DIR,
-        family_id=family_id,
-        target_path=target,
-        magic_hex=magic_hex,
-        source="evolution",
-    )
-    if magic_hex:
-        upsert_dispatcher_rule(
-            dispatcher_rules_path=DISPATCHER_RULES_PATH,
-            family_id=family_id,
-            magic_hex=magic_hex,
-            tool_path=active_path,
-            description=description,
-        )
-    return str(active_path)
+    return str(target)
 
 
 def _review_passed(review_result: str) -> bool:
@@ -758,6 +737,22 @@ def _write_tool_execution_failure(output_dir: Path, error: str) -> str:
     return json.dumps({"result": "fail", "reason": str(output_dir / "reason.txt")}, ensure_ascii=False)
 
 
+def _write_execution_feedback(round_dir: Path, payload: dict[str, Any]) -> Path:
+    feedback_path = round_dir / "backend_execution_feedback.json"
+    feedback_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return feedback_path
+
+
+def _read_execution_feedback(feedback_path: Path | None) -> dict[str, Any]:
+    if feedback_path is None or not feedback_path.exists():
+        return {}
+    try:
+        payload = json.loads(feedback_path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
 def _run_working_tool(
     *,
     firmware_path: str,
@@ -765,7 +760,7 @@ def _run_working_tool(
     job_root: Path,
     round_dir: Path,
     working_tool: Path,
-) -> str:
+) -> dict[str, Any]:
     manifest_path = job_root / "tool_manifest.json"
     log_path = workspace_output / "tool.log"
     manifest_path.write_text(
@@ -800,6 +795,7 @@ def _run_working_tool(
     )
     lines: list[str] = []
     timeout_seconds = 1800
+    started_at = time.monotonic()
     line_sink = StreamingLineSink(
         lambda text: (
             lines.append(text),
@@ -820,17 +816,30 @@ def _run_working_tool(
         return_code = result.returncode
     finally:
         line_sink.flush()
+    duration_seconds = max(0.0, time.monotonic() - started_at)
     response = "\n".join(lines).strip()
     _append_stage_log(
         round_dir,
         "evolution_executor.log",
         "backend python tool execution completed",
         return_code=return_code,
+        duration_seconds=round(duration_seconds, 3),
         response_preview=response[:1000],
     )
+    payload = {
+        "tool_path": str(working_tool),
+        "manifest_path": str(manifest_path),
+        "log_path": str(log_path),
+        "return_code": int(return_code),
+        "duration_seconds": round(duration_seconds, 3),
+        "stdout_preview": response[:4000],
+        "summary_path": str(workspace_output / "summary.md") if (workspace_output / "summary.md").exists() else None,
+        "reason_path": str(workspace_output / "reason.md") if (workspace_output / "reason.md").exists() else None,
+    }
+    _write_execution_feedback(round_dir, payload)
     if return_code != 0:
         raise RuntimeError(f"工具执行失败: return_code={return_code}; output={response[:1000]}")
-    return response
+    return payload
 
 
 def _load_token_stats(round_dir: Path, agent_name: str) -> dict[str, Any]:
@@ -912,7 +921,23 @@ def _build_evolution_execute_prompt(
     workspace_output: Path,
     working_tool: Path,
     started_without_matched_skill: bool,
+    previous_feedback_path: Path | None,
 ) -> str:
+    previous_feedback = _read_execution_feedback(previous_feedback_path)
+    previous_feedback_text = ""
+    if previous_feedback_path is not None:
+        previous_feedback_text = "\n".join(
+            [
+                "",
+                f"上一轮后端工具执行反馈文件：`{previous_feedback_path}`。",
+                f"上一轮工具执行耗时：`{previous_feedback.get('duration_seconds', '-')}` 秒。",
+                f"上一轮工具退出码：`{previous_feedback.get('return_code', '-')}`。",
+                f"上一轮工具日志：`{previous_feedback.get('log_path') or '-'}`。",
+                f"上一轮 summary：`{previous_feedback.get('summary_path') or '-'}`。",
+                f"上一轮 reason：`{previous_feedback.get('reason_path') or '-'}`。",
+                "你必须基于这份后端执行反馈以及对应 summary/reason 来决定如何继续改进工具。",
+            ]
+        )
     if int(round_id) <= 1 and started_without_matched_skill:
         return "\n".join(
             [
@@ -929,7 +954,7 @@ def _build_evolution_execute_prompt(
                 "5. 工具自身在被执行时必须写出 `summary.txt`，并同步更新 `summary.md`。内容至少包含使用的工具路径、关键步骤、主要产物、剩余问题、本轮耗时。",
                 "6. 最终回复只能输出本轮生成或更新后的 Python 工具绝对路径。",
             ]
-        )
+        ) + previous_feedback_text
     if int(round_id) <= 1:
         return "\n".join(
             [
@@ -949,7 +974,7 @@ def _build_evolution_execute_prompt(
                 "   - 本轮耗时和 token 数量（若无法精确得出，也要预留该字段）",
                 "4. 最终回复只能输出本轮使用或更新后的 Python 工具绝对路径。",
             ]
-        )
+        ) + previous_feedback_text
     return "\n".join(
         [
             "上一轮评审未通过，请先阅读当前输出目录下的 `reason.txt` 和 `reason.md`。",
@@ -965,7 +990,7 @@ def _build_evolution_execute_prompt(
             "   - 本轮耗时和 token 数量（若无法精确得出，也要预留该字段）",
             "4. 最终回复只能输出本轮更新后的 Python 工具绝对路径。",
         ]
-    )
+    ) + previous_feedback_text
 
 
 def _create_client(
@@ -1003,6 +1028,79 @@ def _create_client(
         session_round=session_artifacts["round"],
         session_skill_name=session_artifacts["skill_name"],
         task_id=task_id,
+    )
+
+
+def _write_backend_reviewer_session(
+    *,
+    job_root: Path,
+    round_id: int,
+    review_result: str,
+    summary_path: Path | None,
+    reason_path: Path | None,
+    detail: str,
+) -> None:
+    session_artifacts = build_session_artifacts(
+        job_root,
+        role="reviewer",
+        name=f"round-{round_id}",
+        provider_role="backend_reviewer",
+        phase="review",
+        round_id=round_id,
+    )
+    session_path = session_artifacts["session_path"]
+    now = utc_now_iso()
+    payload = {
+        "type": "message",
+        "id": f"backend-reviewer-round-{round_id}",
+        "timestamp": now,
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "\n".join(
+                        [
+                            "后端评审结论：未通过",
+                            "",
+                            detail,
+                            "",
+                            f"review_result: {review_result}",
+                            f"summary_path: {summary_path if summary_path and summary_path.exists() else '-'}",
+                            f"reason_path: {reason_path if reason_path and reason_path.exists() else '-'}",
+                        ]
+                    ),
+                }
+            ],
+        },
+    }
+    if not session_path.exists() or session_path.stat().st_size == 0:
+        session_path.write_text(
+            json.dumps(
+                {
+                    "type": "session",
+                    "version": 1,
+                    "id": f"backend-reviewer-{round_id}",
+                    "timestamp": now,
+                    "cwd": str(job_root),
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    with session_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    update_session_index(
+        session_artifacts["session_dir"],
+        role=session_artifacts["session_role"],
+        name=session_artifacts["session_name"],
+        session_file=session_path.name,
+        provider_role=session_artifacts["provider_role"],
+        phase=session_artifacts["phase"],
+        status="closed",
+        round_id=session_artifacts["round"],
+        skill_name=session_artifacts["skill_name"],
     )
 
 
@@ -1073,6 +1171,10 @@ def run_evolution_job(
                 progress_callback(round_id, "evolution_execute")
             tool_round_started_at = time.monotonic()
             tool_elapsed_seconds = 0.0
+            previous_feedback_path = (
+                evolution_round_dir(job_root, round_id - 1) / "backend_execution_feedback.json"
+                if round_id > 1 else None
+            )
             if seeded_initial_tool and int(round_id) == 1:
                 tool_result = str(working_tool)
                 token_stats = {}
@@ -1094,6 +1196,7 @@ def run_evolution_job(
                     workspace_output=workspace_output,
                     working_tool=working_tool,
                     started_without_matched_skill=started_without_matched_skill,
+                    previous_feedback_path=previous_feedback_path,
                 )
                 rendered_evolution_prompt = render_template(
                     EVOLUTION_IMPROVER_PROMPT_TMPL,
@@ -1179,6 +1282,14 @@ def run_evolution_job(
                 tool_changed = before_text != (working_tool.read_text(encoding="utf-8") if working_tool.exists() else "")
                 summary_path = workspace_output / "summary.md"
                 reason_path = workspace_output / "reason.md"
+                _write_backend_reviewer_session(
+                    job_root=job_root,
+                    round_id=round_id,
+                    review_result=review_result,
+                    summary_path=summary_path,
+                    reason_path=reason_path,
+                    detail="工具泛化检查未通过。系统已将该后端评审结果归档为评审器会话。",
+                )
                 round_item = {
                     "round": round_id,
                     "status": "review_failed",
@@ -1227,24 +1338,25 @@ def run_evolution_job(
                 continue
 
             try:
-                tool_output = _run_working_tool(
+                tool_execution = _run_working_tool(
                     firmware_path=firmware_path,
                     workspace_output=workspace_output,
                     job_root=job_root,
                     round_dir=round_dir,
                     working_tool=working_tool,
                 )
-                if tool_output:
-                    tool_result = f"{tool_result}\n\n[backend_tool_output]\n{tool_output}".strip()
+                if tool_execution:
+                    tool_result = f"{tool_result}\n\n[backend_tool_execution]\n{json.dumps(tool_execution, ensure_ascii=False, indent=2)}".strip()
+                tool_elapsed_seconds = round(max(0.0, float(tool_execution.get('duration_seconds') or 0.0)), 3)
                 _augment_tool_summary(
                     output_dir=workspace_output,
-                    elapsed_seconds=time.monotonic() - tool_round_started_at,
+                    elapsed_seconds=tool_elapsed_seconds,
                     token_stats=token_stats or _load_token_stats(round_dir, "evolution_executor"),
                 )
-                tool_elapsed_seconds = time.monotonic() - tool_round_started_at
                 _sync_report_aliases(workspace_output)
             except Exception as exc:
-                tool_elapsed_seconds = time.monotonic() - tool_round_started_at
+                feedback = _read_execution_feedback(round_dir / "backend_execution_feedback.json")
+                tool_elapsed_seconds = round(max(0.0, float(feedback.get("duration_seconds") or 0.0)), 3)
                 review_result = _write_tool_execution_failure(workspace_output, str(exc))
                 review_round_passed = False
                 _append_stage_log(
@@ -1266,6 +1378,14 @@ def run_evolution_job(
                 tool_changed = before_text != (working_tool.read_text(encoding="utf-8") if working_tool.exists() else "")
                 summary_path = workspace_output / "summary.md"
                 reason_path = workspace_output / "reason.md"
+                _write_backend_reviewer_session(
+                    job_root=job_root,
+                    round_id=round_id,
+                    review_result=review_result,
+                    summary_path=summary_path,
+                    reason_path=reason_path,
+                    detail=f"工具执行失败。系统已将失败原因归档为评审器会话。错误：{exc}",
+                )
                 round_item = {
                     "round": round_id,
                     "status": "review_failed",
@@ -1422,7 +1542,7 @@ def run_evolution_job(
                     working_tool=working_tool,
                     source_tool=source_tool,
                 )
-                final_tool_path = _publish_tool_to_repo(
+                final_tool_path = _publish_tool_to_store(
                     firmware_path=firmware_path,
                     working_tool=working_tool,
                     source_tool=source_tool,
@@ -1439,7 +1559,7 @@ def run_evolution_job(
                     "published evolution tool result",
                     round=round_id,
                     run_tool_path=run_tool_path,
-                    final_tool_path=final_tool_path,
+                    store_tool_path=final_tool_path,
                     replaced_tool_path=replaced_tool_path,
                     generated_new_tool=generated_new_tool,
                 )
@@ -1462,14 +1582,7 @@ def run_evolution_job(
         evolution_client.close()
 
     final_status = "success" if review_passed else "failed"
-    replacement_required = bool(
-        review_passed
-        and generated_new_tool
-        and source_tool is not None
-        and final_tool_path
-        and replaced_tool_path
-        and str(final_tool_path).strip() != str(replaced_tool_path).strip()
-    )
+    replacement_required = bool(review_passed and final_tool_path)
     payload = {
         "status": final_status,
         "review_passed": review_passed,
@@ -1491,11 +1604,7 @@ def run_evolution_job(
         "generated_new_tool": generated_new_tool,
         "replacement_required": replacement_required,
         "replacement_confirmed": not replacement_required,
-        "effective_tool_path": (
-            str(replaced_tool_path)
-            if replacement_required and replaced_tool_path
-            else str(final_tool_path or replaced_tool_path or "")
-        ) or None,
+        "effective_tool_path": str(final_tool_path or replaced_tool_path or "") or None,
     }
     (job_root / "evolution_result.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return payload

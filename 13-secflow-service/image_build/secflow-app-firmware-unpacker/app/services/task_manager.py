@@ -34,8 +34,11 @@ from app.services.observability import (
     record_task_stage_transition,
 )
 from app.time_utils import isoformat_local, now_local
-from app.unpacker_engine_config import get_max_retries_reached_action
+from app.unpacker_engine_config import DISPATCHER_RULES_PATH, TOOLS_ACTIVE_DIR, TOOLS_STORE_DIR, get_max_retries_reached_action
 from app.unpacker_engine_logs import TASK_RESULT_CACHE_FILENAME, atomic_write_json, scan_output_tree
+from app.preprocess import detect_format
+from app.tool_dispatcher import activate_tool_version, dispatch_tool_by_magic, find_dispatcher_rule, upsert_dispatcher_rule
+from app.tool_store import parse_tool_metadata
 
 
 logger = logging.getLogger(__name__)
@@ -2336,6 +2339,35 @@ def _resolve_evolution_source_tool_path(task: Any, latest_job: Any | None = None
     return None
 
 
+def _resolve_evolution_dispatcher_tool_path(task: Any) -> str | None:
+    firmware_path = str(getattr(task, "firmware_path", "") or "").strip()
+    if not firmware_path:
+        return None
+    path = Path(firmware_path)
+    if not path.exists():
+        return None
+    try:
+        info = detect_format(firmware_path)
+    except Exception:
+        return None
+    magic_bytes = info.get("magic") or b""
+    features = {
+        "filename": path.name,
+        "fmt": str(info.get("fmt") or "").strip().lower(),
+        "ext": str(info.get("ext") or "").strip().lower(),
+        "ext2": str(info.get("ext2") or "").strip().lower(),
+        "magic_hex": str(magic_bytes.hex() if isinstance(magic_bytes, (bytes, bytearray)) else "").strip().lower()[:8],
+    }
+    if not features["magic_hex"]:
+        return None
+    try:
+        tool_meta, _ = dispatch_tool_by_magic(features, DISPATCHER_RULES_PATH)
+    except Exception:
+        return None
+    resolved = str((tool_meta or {}).get("path") or "").strip()
+    return resolved if resolved and Path(resolved).exists() else None
+
+
 def _normalize_evolution_token_metrics(payload: Any) -> dict[str, int]:
     data = payload if isinstance(payload, dict) else {}
     return {
@@ -2416,6 +2448,60 @@ def _normalize_evolution_round_metrics(item: dict[str, Any]) -> dict[str, Any]:
         "reviewer_tokens": reviewer_tokens,
         "total_tokens": total_tokens,
     }
+
+
+def _load_evolution_rounds_from_run_dir(
+    job_root: Path,
+    *,
+    enriched: dict[str, Any],
+) -> list[dict[str, Any]]:
+    rounds: list[dict[str, Any]] = []
+    for round_dir in sorted(job_root.glob("round_*")):
+        if not round_dir.is_dir():
+            continue
+        round_json_path = round_dir / "evolution_round.json"
+        if not round_json_path.exists():
+            continue
+        try:
+            loaded = json.loads(round_json_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(loaded, dict):
+            continue
+        metrics = _normalize_evolution_round_metrics(loaded)
+        round_id = int(loaded.get("round") or 0)
+        rounds.append(
+            {
+                "id": str(loaded.get("id") or "").strip() or f"{str(enriched.get('id') or '').strip()}-{round_id}",
+                "job_id": str(loaded.get("job_id") or enriched.get("id") or "").strip(),
+                "round": round_id,
+                "status": str(loaded.get("status") or "failed"),
+                "tool_skill_path_before": str(loaded.get("tool_skill_path_before") or "").strip() or None,
+                "tool_skill_path_after": str(loaded.get("tool_skill_path_after") or "").strip() or None,
+                "tool_path_before": str(loaded.get("tool_path_before") or loaded.get("tool_skill_path_before") or "").strip() or None,
+                "tool_path_after": str(loaded.get("tool_path_after") or loaded.get("tool_skill_path_after") or "").strip() or None,
+                "tool_changed": bool(loaded.get("tool_changed")),
+                "review_result": str(loaded.get("review_result") or "").strip() or None,
+                "summary_path": str(loaded.get("summary_path") or "").strip() or None,
+                "reason_path": str(loaded.get("reason_path") or "").strip() or None,
+                "source_skill_path": str(loaded.get("source_skill_path") or enriched.get("source_skill_path") or "").strip() or None,
+                "source_tool_path": str(loaded.get("source_tool_path") or enriched.get("source_tool_path") or "").strip() or None,
+                "started_without_matched_skill": bool(loaded.get("started_without_matched_skill")),
+                "generated_new_skill": bool(loaded.get("generated_new_skill")),
+                "generated_new_tool": bool(loaded.get("generated_new_tool", loaded.get("generated_new_skill"))),
+                "executed_tool": bool(loaded.get("executed_tool")),
+                "tool_response_preview": str(loaded.get("tool_response_preview") or "").strip() or None,
+                "metrics": metrics,
+                "tool_unpack_duration_seconds": metrics["tool_unpack_duration_seconds"],
+                "evolution_executor_tokens": metrics["evolution_executor_tokens"],
+                "reviewer_tokens": metrics["reviewer_tokens"],
+                "total_tokens": metrics["total_tokens"],
+                "created_at": str(loaded.get("created_at") or "").strip() or _mtime_iso_text(round_json_path),
+                "completed_at": str(loaded.get("completed_at") or "").strip() or _mtime_iso_text(round_json_path),
+            }
+        )
+    rounds.sort(key=lambda item: int(item.get("round") or 0))
+    return rounds
 
 
 def _guess_running_working_tool_path(job_root: Path) -> str | None:
@@ -2499,7 +2585,11 @@ def _enrich_evolution_job_payload(
     job_root: Path | None,
 ) -> dict[str, Any]:
     enriched = dict(payload or {})
-    source_skill_path = str(getattr(task, "matched_skill", "") or "").strip() or None
+    enriched["run_root"] = str(job_root) if job_root is not None else None
+    enriched["session_root"] = str(job_root / "sessions") if job_root is not None else None
+    enriched["task_output_path"] = str(getattr(task, "output_path", "") or "").strip() or None
+    dispatcher_source_path = _resolve_evolution_dispatcher_tool_path(task) if task is not None else None
+    source_skill_path = dispatcher_source_path or str(getattr(task, "matched_skill", "") or "").strip() or None
     enriched["source_skill_path"] = source_skill_path
     enriched["source_tool_path"] = source_skill_path
     enriched["started_without_matched_skill"] = not bool(source_skill_path)
@@ -2573,6 +2663,8 @@ def _enrich_evolution_job_payload(
                     }
                 )
     rounds_list = list(enriched.get("rounds") or [])
+    if not rounds_list:
+        rounds_list = _load_evolution_rounds_from_run_dir(job_root, enriched=enriched)
     running_round = _build_running_evolution_round(enriched, job_root=job_root)
     if running_round is not None and not any(int(item.get("round") or 0) == int(running_round.get("round") or 0) for item in rounds_list):
         rounds_list.append(running_round)
@@ -2580,6 +2672,23 @@ def _enrich_evolution_job_payload(
     if rounds_list:
         enriched["rounds"] = rounds_list
         enriched["round_count"] = len(rounds_list)
+        first_round = next((item for item in rounds_list if int(item.get("round") or 0) == 1), rounds_list[0])
+        runtime_source_tool = str(first_round.get("source_tool_path") or first_round.get("source_skill_path") or "").strip() or None
+        if runtime_source_tool is not None or bool(first_round.get("started_without_matched_skill")):
+            enriched["source_skill_path"] = runtime_source_tool
+            enriched["source_tool_path"] = runtime_source_tool
+            enriched["started_without_matched_skill"] = bool(first_round.get("started_without_matched_skill"))
+        latest_round = rounds_list[-1]
+        runtime_working_tool = str(
+            latest_round.get("tool_path_after")
+            or latest_round.get("tool_skill_path_after")
+            or enriched.get("working_tool_path")
+            or enriched.get("working_skill_path")
+            or ""
+        ).strip() or None
+        if runtime_working_tool:
+            enriched["working_skill_path"] = runtime_working_tool
+            enriched["working_tool_path"] = runtime_working_tool
     return enriched
 
 
@@ -2813,7 +2922,7 @@ def submit_evolution_job(task_id: str, *, created_by: str = "task_manager") -> d
             .order_by(FirmwareEvolutionJob.created_at.desc())
             .first()
         )
-        source_tool_path = _resolve_evolution_source_tool_path(task, latest_job)
+        source_tool_path = _resolve_evolution_dispatcher_tool_path(task) or _resolve_evolution_source_tool_path(task, latest_job)
         job_id = generate_id()
         job = FirmwareEvolutionJob(
             id=job_id,
@@ -3021,7 +3130,7 @@ def retry_evolution_job(job_id: str) -> dict[str, Any]:
         if existing is not None:
             raise ValueError("当前主任务已有运行中的进化任务")
         db.query(FirmwareEvolutionRound).filter(FirmwareEvolutionRound.job_id == job.id).delete()
-        source_tool_path = _resolve_evolution_source_tool_path(task, job)
+        source_tool_path = _resolve_evolution_dispatcher_tool_path(task) or _resolve_evolution_source_tool_path(task, job)
         job.status = EVOLUTION_PENDING
         job.current_round = 0
         job.current_stage = "evolution_execute"
@@ -3185,7 +3294,6 @@ def confirm_evolution_tool_replacement(job_id: str) -> dict[str, Any]:
             raise ValueError("进化结果格式非法")
 
         final_tool_path = Path(str(payload.get("final_tool_path") or payload.get("final_skill_path") or "").strip())
-        replaced_tool_path = Path(str(payload.get("replaced_tool_path") or payload.get("replaced_skill_path") or "").strip())
         replacement_required = bool(payload.get("replacement_required"))
         replacement_confirmed = bool(payload.get("replacement_confirmed", not replacement_required))
 
@@ -3195,17 +3303,43 @@ def confirm_evolution_tool_replacement(job_id: str) -> dict[str, Any]:
             raise ValueError("当前进化结果已确认替换")
         if not final_tool_path.exists():
             raise ValueError("新工具文件不存在")
-        if not replaced_tool_path:
-            raise ValueError("原工具路径不存在")
-        replaced_tool_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(final_tool_path, replaced_tool_path)
+        info = detect_format(str(task.firmware_path or ""))
+        magic_hex = str((info.get("magic") or b"").hex())[:8].lower()
+        meta = parse_tool_metadata(final_tool_path)
+        description = str(meta.get("description") or "").strip()
+        family_id = str(meta.get("format_id") or meta.get("name") or final_tool_path.stem or "").strip()
+        if not family_id:
+            raise ValueError("无法从新工具中解析 family_id")
+        active_path = activate_tool_version(
+            tools_store_dir=TOOLS_STORE_DIR,
+            tools_active_dir=TOOLS_ACTIVE_DIR,
+            family_id=family_id,
+            target_path=final_tool_path,
+            magic_hex=magic_hex,
+            source="evolution_confirm",
+        )
+        current_rule = find_dispatcher_rule(
+            dispatcher_rules_path=DISPATCHER_RULES_PATH,
+            family_id=family_id,
+            magic_hex=magic_hex,
+        )
+        if current_rule is None and magic_hex:
+            upsert_dispatcher_rule(
+                dispatcher_rules_path=DISPATCHER_RULES_PATH,
+                family_id=family_id,
+                magic_hex=magic_hex,
+                tool_path=active_path,
+                description=description,
+            )
 
         payload["replacement_confirmed"] = True
-        payload["effective_tool_path"] = str(replaced_tool_path)
+        payload["replaced_skill_path"] = str(active_path)
+        payload["replaced_tool_path"] = str(active_path)
+        payload["effective_tool_path"] = str(active_path)
         result_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        job.replaced_skill_path = str(replaced_tool_path)
-        task.latest_evolution_final_skill_path = str(replaced_tool_path)
+        job.replaced_skill_path = str(active_path)
+        task.latest_evolution_final_skill_path = str(final_tool_path)
         db.commit()
 
         _record_task_event_from_row(
@@ -3217,7 +3351,7 @@ def confirm_evolution_tool_replacement(job_id: str) -> dict[str, Any]:
             detail={
                 "job_id": job.id,
                 "new_tool_path": str(final_tool_path),
-                "replaced_tool_path": str(replaced_tool_path),
+                "replaced_tool_path": str(active_path),
             },
             created_by="task_manager",
         )
@@ -3297,7 +3431,7 @@ def process_evolution_jobs(limit: int = 1) -> int:
                 .order_by(FirmwareEvolutionJob.created_at.desc())
                 .first()
             )
-            active_skill_path = _resolve_evolution_source_tool_path(task, latest_job) or ""
+            active_skill_path = _resolve_evolution_dispatcher_tool_path(task) or _resolve_evolution_source_tool_path(task, latest_job) or ""
             llm_binding_snapshot = _parse_llm_binding_snapshot(task.llm_binding_snapshot)
             max_rounds = int(job.max_rounds or EVOLUTION_MAX_ROUNDS)
         finally:
