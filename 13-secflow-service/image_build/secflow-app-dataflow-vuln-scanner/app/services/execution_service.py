@@ -5119,17 +5119,15 @@ class ExecutionService:
             if latest_execution is not None and latest_execution.worker_url and latest_execution.worker_job_id
             else None
         )
-        now = now_local()
         if trigger.status == "pending":
-            trigger.status = "cancelled"
-            trigger.finished_at = now
-            trigger.message = "cancelled before dispatch"
-            if latest_execution is not None and latest_execution.status == "pending":
-                latest_execution.status = "cancelled"
-                latest_execution.finished_at = now
-                latest_execution.message = "cancelled before dispatch"
-                db.add(latest_execution)
-            self._sync_trigger_abnormal_reason(db, trigger=trigger, execution=latest_execution)
+            self._apply_terminal_state_mutation(
+                db,
+                execution=latest_execution if latest_execution is not None and latest_execution.status == "pending" else None,
+                trigger=trigger,
+                terminal_status="cancelled",
+                message="cancelled before dispatch",
+                process_status="not_started",
+            )
         elif _canonical_task_status(trigger.status) == "running":
             trigger.status = "running"
             trigger.message = "cancel requested"
