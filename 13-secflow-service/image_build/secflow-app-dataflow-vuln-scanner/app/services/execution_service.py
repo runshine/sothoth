@@ -860,6 +860,11 @@ class ExecutionService:
                 **run_summary,
             }
         abnormal_reason = self._task_abnormal_reason(trigger, latest_execution, run_summary)
+        effective_task_status, effective_task_message, effective_started_at, effective_finished_at = self._effective_scan_task_runtime_state(
+            trigger=trigger,
+            execution=latest_execution,
+            run_summary=run_summary,
+        )
         return ScanTaskResponse(
             task_id=trigger.id,
             project_id=trigger.project_id,
@@ -888,16 +893,16 @@ class ExecutionService:
                 ).items()
             },
             title=self._trigger_title(trigger),
-            status=trigger.status,
+            status=effective_task_status,
             latest_attempt_no=latest_execution.attempt_no if latest_execution else 0,
             retry_count=trigger.retry_count,
             max_retry_count=trigger.max_retry_count,
             priority=trigger.priority,
             created_by=trigger.submitted_by,
             created_at=trigger.created_at,
-            started_at=trigger.started_at,
-            finished_at=trigger.finished_at,
-            message=trigger.message,
+            started_at=effective_started_at,
+            finished_at=effective_finished_at,
+            message=effective_task_message,
             latest_execution_id=trigger.latest_execution_id,
             run_name=run_locator["run_name"],
             runs_root=run_locator["runs_root"],
@@ -917,6 +922,54 @@ class ExecutionService:
             abnormal_reason_category=abnormal_reason.get("category") if abnormal_reason else None,
             abnormal_reason=abnormal_reason,
         )
+
+    def _effective_scan_task_runtime_state(
+        self,
+        *,
+        trigger: TriggerTask,
+        execution: WorkflowExecution | None,
+        run_summary: dict[str, Any] | None,
+    ) -> tuple[str, str | None, datetime | None, datetime | None]:
+        trigger_status = str(trigger.status or "").strip().lower()
+        trigger_message = str(trigger.message or "").strip() or None
+        trigger_started_at = trigger.started_at
+        trigger_finished_at = trigger.finished_at
+
+        execution_status = str(execution.status or "").strip().lower() if execution is not None else ""
+        dispatch_status = str(execution.dispatch_status or "").strip().lower() if execution is not None else ""
+        execution_message = str(execution.message or "").strip() if execution is not None else ""
+        execution_started_at = execution.started_at if execution is not None else None
+        execution_finished_at = execution.finished_at if execution is not None else None
+
+        run_summary = run_summary or {}
+        run_status = str(run_summary.get("status") or "").strip().lower()
+
+        effective_status = trigger_status or execution_status or run_status or "pending"
+        effective_message = trigger_message or execution_message or None
+        effective_started_at = trigger_started_at or execution_started_at
+        effective_finished_at = trigger_finished_at or execution_finished_at
+
+        if effective_status == "pending":
+            if dispatch_status in {"queued", "dispatching"}:
+                effective_status = "queued"
+                effective_message = execution_message or trigger_message or effective_message
+            elif execution_status in {"queued", "running", "cancel_requested", "delete_requested"}:
+                effective_status = execution_status
+                effective_message = execution_message or trigger_message or effective_message
+                effective_started_at = execution_started_at or effective_started_at
+                effective_finished_at = execution_finished_at or effective_finished_at
+            elif run_status in {"queued", "running", "cancel_requested", "delete_requested"}:
+                effective_status = "running" if run_status == "running" else run_status
+                effective_message = execution_message or trigger_message or effective_message
+
+        if effective_status in {"running", "cancel_requested", "delete_requested"}:
+            effective_started_at = execution_started_at or trigger_started_at or effective_started_at
+            effective_finished_at = execution_finished_at if effective_status not in {"running"} else None
+        elif effective_status == "queued":
+            effective_started_at = execution_started_at or trigger_started_at or effective_started_at
+            effective_finished_at = None
+
+        return effective_status, effective_message, effective_started_at, effective_finished_at
 
     def _scan_task_detail(self, db: Session, trigger: TriggerTask) -> ScanTaskDetailResponse:
         response = self._scan_task_response(db, trigger)

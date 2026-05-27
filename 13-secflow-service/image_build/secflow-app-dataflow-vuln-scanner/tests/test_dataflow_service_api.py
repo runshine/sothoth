@@ -372,6 +372,95 @@ def test_task_list_keeps_recent_heartbeat_grace_as_running(service_config_path, 
     assert process_state["stale_after_seconds"] >= 300
 
 
+def test_get_task_promotes_pending_trigger_to_queued_from_dispatch_status(
+    service_config_path,
+    patch_mock_agent_runtime,
+):
+    app = create_app()
+    client = TestClient(app)
+
+    create_profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload())
+    assert create_profile.status_code == 201
+    profile_id = create_profile.json()["profile_id"]
+
+    created = _create_business_dataflow_task(
+        client,
+        profile_id=profile_id,
+        case_name="queued-task-status",
+        title="queued task status",
+    )
+    task_id = created["task_id"]
+
+    with get_db_session() as db:
+        trigger = db.get(TriggerTask, task_id)
+        execution = db.get(WorkflowExecution, created["latest_execution_id"])
+        assert trigger is not None and execution is not None
+        trigger.status = "pending"
+        trigger.started_at = None
+        trigger.finished_at = None
+        trigger.message = "dispatch pending"
+        execution.status = "pending"
+        execution.dispatch_status = "queued"
+        execution.message = "queued on worker http://worker-0"
+        execution.started_at = None
+        execution.finished_at = None
+        db.add_all([trigger, execution])
+        db.commit()
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}")
+    assert detail.status_code == 200
+    payload = detail.json()
+    assert payload["status"] == "queued"
+    assert payload["message"] == "queued on worker http://worker-0"
+    assert payload["started_at"] is None
+    assert payload["finished_at"] is None
+
+
+def test_get_task_promotes_pending_trigger_to_running_from_execution_status(
+    service_config_path,
+    patch_mock_agent_runtime,
+):
+    app = create_app()
+    client = TestClient(app)
+
+    create_profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload())
+    assert create_profile.status_code == 201
+    profile_id = create_profile.json()["profile_id"]
+
+    created = _create_business_dataflow_task(
+        client,
+        profile_id=profile_id,
+        case_name="running-task-status",
+        title="running task status",
+    )
+    task_id = created["task_id"]
+    started_at = now_local()
+
+    with get_db_session() as db:
+        trigger = db.get(TriggerTask, task_id)
+        execution = db.get(WorkflowExecution, created["latest_execution_id"])
+        assert trigger is not None and execution is not None
+        trigger.status = "pending"
+        trigger.started_at = None
+        trigger.finished_at = None
+        trigger.message = "pending start"
+        execution.status = "running"
+        execution.dispatch_status = "running"
+        execution.message = "run_vuln_scan.py running"
+        execution.started_at = started_at
+        execution.finished_at = None
+        db.add_all([trigger, execution])
+        db.commit()
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}")
+    assert detail.status_code == 200
+    payload = detail.json()
+    assert payload["status"] == "running"
+    assert payload["message"] == "run_vuln_scan.py running"
+    assert payload["started_at"].startswith(started_at.strftime("%Y-%m-%dT%H:%M:%S"))
+    assert payload["finished_at"] is None
+
+
 
 def test_create_task_bootstraps_default_profile_when_missing(service_config_path, patch_mock_agent_runtime):
     app = create_app()
