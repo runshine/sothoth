@@ -8530,16 +8530,21 @@ class TaskManager:
             return True
         return bool(option.get("enabled", True))
 
-    def _b2s_execution_mode(self, task: BinarySecurityTask) -> tuple[str, str]:
+    def _b2s_execution_mode(self, task: BinarySecurityTask) -> tuple[str | None, str | None]:
         policy = task.policy or {}
         stage_options = policy.get("stage_options", {}) if isinstance(policy.get("stage_options"), dict) else {}
         option = stage_options.get("binary_to_source") if isinstance(stage_options.get("binary_to_source"), dict) else {}
-        mode = str(option.get("mode") or policy.get("b2s_mode") or "fast").strip().lower()
+        raw_mode = option.get("mode") or policy.get("b2s_mode")
+        mode = str(raw_mode or "").strip().lower()
+        if not mode:
+            return None, None
         if mode == "turbo":
             return "turbo", "turbo"
-        if mode == "deep":
+        if mode in {"deep", "agent"}:
             return "deep", "agent"
-        return "fast", "hybrid"
+        if mode in {"fast", "hybrid"}:
+            return "fast", "hybrid"
+        return None, None
 
     def _pipeline_mode(self, task: BinarySecurityTask | dict[str, Any] | None) -> str:
         if isinstance(task, dict):

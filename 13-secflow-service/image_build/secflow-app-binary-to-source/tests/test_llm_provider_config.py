@@ -108,6 +108,15 @@ class ConfigServiceTests(unittest.TestCase):
         result = service.get_config(db, "p1")
 
         self.assertEqual(8, result["concurrency"])
+        self.assertEqual("fast", result["default_mode"])
+
+    def test_save_config_normalizes_default_mode(self):
+        service = ConfigService()
+        db = _FakeDb()
+
+        saved = service.save_config(db, "p1", {"default_mode": "agent"})
+
+        self.assertEqual("deep", saved["default_mode"])
 
     def test_save_config_normalizes_concurrency_range(self):
         service = ConfigService()
@@ -217,6 +226,104 @@ class TaskProviderResolutionTests(unittest.TestCase):
         self.assertTrue(db.task_items[0].extra_metadata["reuse_cache"])
         cache_service.try_apply_cache_hit.assert_called_once()
         cache_service.prepare_cache_metadata.assert_not_called()
+
+    def test_create_task_uses_project_default_mode_when_request_missing(self):
+        row = B2SProjectConfig(project_id="p1")
+        row.config = {"default_mode": "turbo"}
+        db = _FakeDb(project_configs=[row])
+        cache_service = SimpleNamespace(
+            try_apply_cache_hit=mock.Mock(return_value=SimpleNamespace(hit=False)),
+            prepare_cache_metadata=mock.Mock(),
+            store_success_cache=mock.Mock(return_value=False),
+            delete_caches_for_source_task=mock.Mock(),
+        )
+        req = TaskCreate(
+            task_id="task-project-mode",
+            name="demo-project-mode",
+            elf_tasks=[ElfTaskInput(elf_path="/tmp/demo.elf")],
+        )
+
+        with (
+            mock.patch.object(task_service, "ensure_path_in_project", return_value=Path("/tmp/demo.elf")),
+            mock.patch.object(task_service, "prepare_input_file", return_value=Path("/tmp/input/demo.elf")),
+            mock.patch.object(task_service, "safe_output_dir", return_value=Path("/tmp/output")),
+            mock.patch.object(task_service, "_project_default_llm_provider_key", return_value=None),
+            mock.patch.object(task_service, "get_cache_service", return_value=cache_service),
+            mock.patch.object(
+                task_service,
+                "get_config",
+                return_value=SimpleNamespace(
+                    pi_re_agent=SimpleNamespace(
+                        batch_size=8192,
+                        max_retries=3,
+                        concurrency=8,
+                        agent_run_timeout_seconds=3600,
+                        agent_timeout_retry_enabled=True,
+                        agent_timeout_max_retries=3,
+                        engine="hybrid",
+                        model=None,
+                    ),
+                    configcenter_service=SimpleNamespace(enabled=False),
+                ),
+            ),
+        ):
+            asyncio.run(task_service.create_task(db, "p1", req, "tester"))
+
+        self.assertEqual("turbo", db.task_items[0].extra_metadata["mode"])
+        self.assertEqual("turbo", db.task_items[0].extra_metadata["engine"])
+        self.assertFalse(db.task_items[0].extra_metadata["llm_used"])
+
+    def test_create_task_request_mode_overrides_project_default_mode(self):
+        row = B2SProjectConfig(project_id="p1")
+        row.config = {"default_mode": "turbo"}
+        db = _FakeDb(project_configs=[row])
+        cache_service = SimpleNamespace(
+            try_apply_cache_hit=mock.Mock(return_value=SimpleNamespace(hit=False)),
+            prepare_cache_metadata=mock.Mock(),
+            store_success_cache=mock.Mock(return_value=False),
+            delete_caches_for_source_task=mock.Mock(),
+        )
+        req = TaskCreate(
+            task_id="task-request-mode",
+            name="demo-request-mode",
+            mode="deep",
+            elf_tasks=[ElfTaskInput(elf_path="/tmp/demo.elf")],
+        )
+
+        with (
+            mock.patch.object(task_service, "ensure_path_in_project", return_value=Path("/tmp/demo.elf")),
+            mock.patch.object(task_service, "prepare_input_file", return_value=Path("/tmp/input/demo.elf")),
+            mock.patch.object(task_service, "safe_output_dir", return_value=Path("/tmp/output")),
+            mock.patch.object(task_service, "_project_default_llm_provider_key", return_value="team_codex"),
+            mock.patch.object(task_service, "get_cache_service", return_value=cache_service),
+            mock.patch.object(
+                task_service,
+                "get_config",
+                return_value=SimpleNamespace(
+                    pi_re_agent=SimpleNamespace(
+                        batch_size=8192,
+                        max_retries=3,
+                        concurrency=8,
+                        agent_run_timeout_seconds=3600,
+                        agent_timeout_retry_enabled=True,
+                        agent_timeout_max_retries=3,
+                        engine="hybrid",
+                        model=None,
+                    ),
+                    configcenter_service=SimpleNamespace(enabled=True),
+                ),
+            ),
+            mock.patch.object(
+                task_service,
+                "materialize_llm_provider",
+                return_value={"provider_key": "team_codex", "model": "gpt-5.4"},
+            ),
+        ):
+            asyncio.run(task_service.create_task(db, "p1", req, "tester"))
+
+        self.assertEqual("deep", db.task_items[0].extra_metadata["mode"])
+        self.assertEqual("agent", db.task_items[0].extra_metadata["engine"])
+        self.assertTrue(db.task_items[0].extra_metadata["llm_used"])
 
     def test_create_task_uses_project_default_concurrency_when_request_missing(self):
         row = B2SProjectConfig(project_id="p1")
