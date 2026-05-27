@@ -108,6 +108,31 @@ def test_init_database_skips_create_all_when_mysql_tables_exist(monkeypatch):
     assert events == ["migrate", "commit"]
 
 
+def test_mysql_core_tables_include_runtime_config_and_reservation():
+    class FakeInspector:
+        def get_table_names(self):
+            return [
+                database.WorkflowDefinition.__tablename__,
+                database.WorkflowDefinitionVersion.__tablename__,
+                database.TriggerTask.__tablename__,
+                database.WorkflowExecution.__tablename__,
+                database.RunIndex.__tablename__,
+                database.SchedulerWorker.__tablename__,
+                database.SchedulerWorkerSlotReservation.__tablename__,
+                database.ServiceRuntimeConfig.__tablename__,
+            ]
+
+    class FakeConnection:
+        pass
+
+    original_inspect = database.inspect
+    try:
+        database.inspect = lambda connection: FakeInspector()
+        assert database._mysql_core_tables_exist(FakeConnection()) is True
+    finally:
+        database.inspect = original_inspect
+
+
 def test_init_database_retries_mysql_concurrent_ddl(monkeypatch):
     attempts: list[str] = []
 

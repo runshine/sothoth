@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import ProgrammingError
 
 from app.config import Config, get_config
 from app.models.database import ServiceRuntimeConfig
@@ -51,7 +52,13 @@ def _default_payload() -> dict[str, Any]:
 
 class RuntimeConfigService:
     def get_config(self, db: Session) -> dict[str, Any]:
-        row = db.get(ServiceRuntimeConfig, SERVICE_RUNTIME_CONFIG_KEY)
+        try:
+            row = db.get(ServiceRuntimeConfig, SERVICE_RUNTIME_CONFIG_KEY)
+        except ProgrammingError as exc:
+            if "doesn't exist" in str(exc).lower() and ServiceRuntimeConfig.__tablename__ in str(exc):
+                db.rollback()
+                return _default_payload()
+            raise
         payload = row.config_json if row and isinstance(row.config_json, dict) else {}
         return _deep_merge(_default_payload(), payload)
 

@@ -1047,6 +1047,8 @@ def _mysql_core_tables_exist(connection: Connection) -> bool:
         WorkflowExecution.__tablename__,
         RunIndex.__tablename__,
         SchedulerWorker.__tablename__,
+        SchedulerWorkerSlotReservation.__tablename__,
+        ServiceRuntimeConfig.__tablename__,
     }
     return required_tables.issubset(table_names)
 
