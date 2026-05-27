@@ -246,6 +246,7 @@ def test_run_auto_migrations_expands_worker_pod_id_column(monkeypatch):
     monkeypatch.setattr(database, "_column_exists", lambda inspector, table_name, column_name: any(col["name"] == column_name for col in inspector.get_columns(table_name)))
     monkeypatch.setattr(database, "_column_type_name", lambda inspector, table_name, column_name: "VARCHAR(128)" if table_name == database.SchedulerWorkerSlotReservation.__tablename__ and column_name == "worker_pod_id" else "")
     monkeypatch.setattr(database, "_index_exists", lambda inspector, table_name, index_name: True)
+    monkeypatch.setattr(database.Base.metadata, "create_all", lambda **kwargs: None)
 
     database.run_auto_migrations()
 
@@ -253,3 +254,75 @@ def test_run_auto_migrations_expands_worker_pod_id_column(monkeypatch):
         "MODIFY COLUMN worker_pod_id VARCHAR(512) NOT NULL" in sql
         for sql in executed_sql
     )
+
+
+def test_run_auto_migrations_creates_missing_projection_table(monkeypatch):
+    create_all_calls: list[tuple[object, list[str]]] = []
+
+    class FakeDialect:
+        name = "mysql"
+
+    class FakeConnection:
+        dialect = FakeDialect()
+
+        def execute(self, stmt, params=None):
+            return None
+
+        def commit(self):
+            return None
+
+        def rollback(self):
+            return None
+
+        def close(self):
+            return None
+
+    class FakeEngine:
+        dialect = FakeDialect()
+
+        def connect(self):
+            return FakeConnection()
+
+    class FakeInspector:
+        def get_table_names(self):
+            return [
+                database.WorkflowDefinition.__tablename__,
+                database.WorkflowDefinitionVersion.__tablename__,
+                database.TriggerTask.__tablename__,
+                database.WorkflowExecution.__tablename__,
+                database.WorkflowExecutionEvent.__tablename__,
+                database.RunIndex.__tablename__,
+                database.RunIndexCycle.__tablename__,
+                database.RunIndexGlobalReview.__tablename__,
+                database.RunIndexResult.__tablename__,
+                database.RunIndexResultReview.__tablename__,
+                database.RunIndexRemovedResult.__tablename__,
+                database.RunIndexSession.__tablename__,
+                database.RunIndexFile.__tablename__,
+                database.VulnReportSubmission.__tablename__,
+                database.SchedulerWorker.__tablename__,
+                database.SchedulerWorkerSlotReservation.__tablename__,
+                database.ServiceRuntimeConfig.__tablename__,
+            ]
+
+        def get_columns(self, table_name):
+            return []
+
+        def get_indexes(self, table_name):
+            return []
+
+    fake_engine = FakeEngine()
+    monkeypatch.setattr(database, "get_engine", lambda: fake_engine)
+    monkeypatch.setattr(database, "inspect", lambda connection: FakeInspector())
+
+    def fake_create_all(*, bind, tables):
+        create_all_calls.append((bind, [table.name for table in tables]))
+
+    monkeypatch.setattr(database.Base.metadata, "create_all", fake_create_all)
+    monkeypatch.setattr(database, "_migrate_legacy_run_tables", lambda connection, inspector: None)
+
+    database.run_auto_migrations()
+
+    assert len(create_all_calls) == 1
+    _, created_tables = create_all_calls[0]
+    assert created_tables == [database.DfvsTaskListProjection.__tablename__]

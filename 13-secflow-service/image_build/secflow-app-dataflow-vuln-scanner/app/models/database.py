@@ -627,6 +627,17 @@ def _index_exists(inspector, table_name: str, index_name: str) -> bool:
     return any(index.get("name") == index_name for index in inspector.get_indexes(table_name))
 
 
+def _create_missing_model_tables(connection: Connection, inspector) -> None:
+    existing_tables = set(inspector.get_table_names())
+    missing_tables = [
+        cls.__table__
+        for cls in MODEL_CLASSES
+        if cls.__tablename__ not in existing_tables
+    ]
+    if missing_tables:
+        Base.metadata.create_all(bind=connection, tables=missing_tables)
+
+
 def _column_sql(dialect: str, sqltype: str) -> str:
     if dialect == "sqlite" and sqltype == "JSON":
         return "TEXT"
@@ -1000,6 +1011,8 @@ def run_auto_migrations(connection: Connection | None = None) -> None:
     ]
 
     try:
+        inspector = inspect(active_connection)
+        _create_missing_model_tables(active_connection, inspector)
         inspector = inspect(active_connection)
         for table_name, column_name, sql in column_migrations:
             if table_name not in inspector.get_table_names():
