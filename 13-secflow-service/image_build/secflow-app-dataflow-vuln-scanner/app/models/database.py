@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import JSON, Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, String, Text, create_engine, inspect, text
+from sqlalchemy.engine import Connection
 from sqlalchemy.dialects.mysql import DOUBLE, MEDIUMTEXT
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
@@ -861,9 +862,11 @@ def _migrate_legacy_run_tables(connection, inspector) -> None:
     _drop_legacy_run_tables(connection, inspector)
 
 
-def run_auto_migrations() -> None:
+def run_auto_migrations(connection: Connection | None = None) -> None:
     engine = get_engine()
-    dialect = engine.dialect.name
+    managed_connection = connection is None
+    active_connection = connection or engine.connect()
+    dialect = active_connection.dialect.name
     tables = {
         "workflow_definition": WorkflowDefinition.__tablename__,
         "workflow_definition_version": WorkflowDefinitionVersion.__tablename__,
@@ -914,45 +917,45 @@ def run_auto_migrations() -> None:
         for table_name, index_name, sql_template in INDEX_DEFINITIONS
     ]
 
-    with engine.begin() as connection:
-        inspector = inspect(connection)
+    try:
+        inspector = inspect(active_connection)
         for table_name, column_name, sql in column_migrations:
             if table_name not in inspector.get_table_names():
                 continue
             if _column_exists(inspector, table_name, column_name):
                 continue
-            connection.execute(text(sql))
-            inspector = inspect(connection)
+            active_connection.execute(text(sql))
+            inspector = inspect(active_connection)
 
         # Backfill newly added columns for old rows.
         if tables["workflow_definition"] in inspector.get_table_names():
             if _column_exists(inspector, tables["workflow_definition"], "config_payload_json"):
-                connection.execute(text(
+                active_connection.execute(text(
                     f"UPDATE {tables['workflow_definition']} "
                     "SET config_payload_json = definition_json "
                     "WHERE config_payload_json IS NULL"
                 ))
             if _column_exists(inspector, tables["workflow_definition"], "template_kind"):
-                connection.execute(text(
+                active_connection.execute(text(
                     f"UPDATE {tables['workflow_definition']} "
                     "SET template_kind = 'vuln_scan_default' "
                     "WHERE template_kind IS NULL OR template_kind = ''"
                 ))
             if _column_exists(inspector, tables['workflow_definition'], 'max_retry_count'):
-                connection.execute(text(
+                active_connection.execute(text(
                     f"UPDATE {tables['workflow_definition']} "
                     "SET max_retry_count = 0 WHERE max_retry_count IS NULL OR max_retry_count < 0"
                 ))
 
         if tables["workflow_definition_version"] in inspector.get_table_names():
             if _column_exists(inspector, tables["workflow_definition_version"], "config_payload_json"):
-                connection.execute(text(
+                active_connection.execute(text(
                     f"UPDATE {tables['workflow_definition_version']} "
                     "SET config_payload_json = definition_json "
                     "WHERE config_payload_json IS NULL"
                 ))
             if _column_exists(inspector, tables["workflow_definition_version"], "compiled_config_json"):
-                connection.execute(text(
+                active_connection.execute(text(
                     f"UPDATE {tables['workflow_definition_version']} "
                     "SET compiled_config_json = definition_json "
                     "WHERE compiled_config_json IS NULL"
@@ -960,13 +963,13 @@ def run_auto_migrations() -> None:
 
         if tables["trigger_task"] in inspector.get_table_names():
             if _column_exists(inspector, tables["trigger_task"], "profile_id"):
-                connection.execute(text(
+                active_connection.execute(text(
                     f"UPDATE {tables['trigger_task']} "
                     "SET profile_id = workflow_definition_id "
                     "WHERE profile_id IS NULL OR profile_id = ''"
                 ))
             if _column_exists(inspector, tables["trigger_task"], "latest_execution_id"):
-                connection.execute(text(
+                active_connection.execute(text(
                     f"UPDATE {tables['trigger_task']} "
                     "SET latest_execution_id = ("
                     f"SELECT e.id FROM {tables['workflow_execution']} e "
@@ -978,7 +981,7 @@ def run_auto_migrations() -> None:
 
         if tables["workflow_execution"] in inspector.get_table_names():
             if _column_exists(inspector, tables["workflow_execution"], "attempt_no"):
-                connection.execute(text(
+                active_connection.execute(text(
                     f"UPDATE {tables['workflow_execution']} "
                     "SET attempt_no = 1 WHERE attempt_no IS NULL OR attempt_no = 0"
                 ))
@@ -986,41 +989,79 @@ def run_auto_migrations() -> None:
         if dialect == "mysql" and RunIndex.__tablename__ in inspector.get_table_names():
             if _column_exists(inspector, RunIndex.__tablename__, "log_tail_text"):
                 if _column_type_name(inspector, RunIndex.__tablename__, "log_tail_text") != "MEDIUMTEXT":
-                    connection.execute(text(
+                    active_connection.execute(text(
                         f"ALTER TABLE {RunIndex.__tablename__} "
                         "MODIFY COLUMN log_tail_text MEDIUMTEXT NULL"
                     ))
-                    inspector = inspect(connection)
+                    inspector = inspect(active_connection)
             if _column_exists(inspector, RunIndex.__tablename__, "source_mtime"):
                 if "DOUBLE" not in _column_type_name(inspector, RunIndex.__tablename__, "source_mtime"):
-                    connection.execute(text(
+                    active_connection.execute(text(
                         f"ALTER TABLE {RunIndex.__tablename__} "
                         "MODIFY COLUMN source_mtime DOUBLE NOT NULL DEFAULT 0"
                     ))
-                    inspector = inspect(connection)
+                    inspector = inspect(active_connection)
 
         if tables["trigger_task"] in inspector.get_table_names() and _column_exists(inspector, tables["trigger_task"], "task_purpose"):
-            connection.execute(text(
+            active_connection.execute(text(
                 f"UPDATE {tables['trigger_task']} "
                 "SET task_purpose = 'normal' "
                 "WHERE task_purpose IS NULL OR task_purpose = ''"
             ))
 
-        inspector = inspect(connection)
-        _migrate_legacy_run_tables(connection, inspector)
+        inspector = inspect(active_connection)
+        _migrate_legacy_run_tables(active_connection, inspector)
 
-        inspector = inspect(connection)
+        inspector = inspect(active_connection)
         for table_name, index_name, sql in index_migrations:
             if table_name not in inspector.get_table_names():
                 continue
             if _index_exists(inspector, table_name, index_name):
                 continue
-            connection.execute(text(sql))
-            inspector = inspect(connection)
+            active_connection.execute(text(sql))
+            inspector = inspect(active_connection)
+        if managed_connection:
+            active_connection.commit()
+    except Exception:
+        if managed_connection:
+            active_connection.rollback()
+        raise
+    finally:
+        if managed_connection:
+            active_connection.close()
+
+
+def _database_init_lock_name() -> str:
+    return f"{_prefix('schema_init')}_lock"
+
+
+def _init_database_with_mysql_lock() -> None:
+    engine = get_engine()
+    with engine.connect() as connection:
+        lock_name = _database_init_lock_name()
+        lock_row = connection.execute(
+            text("SELECT GET_LOCK(:lock_name, :timeout_seconds)"),
+            {"lock_name": lock_name, "timeout_seconds": 120},
+        ).scalar()
+        if int(lock_row or 0) != 1:
+            raise RuntimeError(f"failed to acquire database init lock: {lock_name}")
+        try:
+            Base.metadata.create_all(bind=connection)
+            run_auto_migrations(connection)
+            connection.commit()
+        finally:
+            connection.execute(
+                text("SELECT RELEASE_LOCK(:lock_name)"),
+                {"lock_name": lock_name},
+            )
 
 
 def init_database() -> None:
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+    if engine.dialect.name == "mysql":
+        _init_database_with_mysql_lock()
+        return
+    Base.metadata.create_all(bind=engine)
     run_auto_migrations()
 
 
