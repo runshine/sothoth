@@ -153,3 +153,66 @@ def test_init_database_retries_mysql_concurrent_ddl(monkeypatch):
     database.init_database()
 
     assert attempts == ["call", "sleep:1.0", "call", "sleep:2.0", "call"]
+
+
+def test_run_auto_migrations_expands_worker_pod_id_column(monkeypatch):
+    executed_sql: list[str] = []
+
+    class FakeDialect:
+        name = "mysql"
+
+    class FakeConnection:
+        dialect = FakeDialect()
+
+        def execute(self, stmt, params=None):
+            executed_sql.append(str(stmt))
+
+        def commit(self):
+            return None
+
+        def rollback(self):
+            return None
+
+        def close(self):
+            return None
+
+    class FakeEngine:
+        dialect = FakeDialect()
+
+        def connect(self):
+            return FakeConnection()
+
+    class FakeInspector:
+        def get_table_names(self):
+            return [
+                database.WorkflowDefinition.__tablename__,
+                database.WorkflowDefinitionVersion.__tablename__,
+                database.TriggerTask.__tablename__,
+                database.WorkflowExecution.__tablename__,
+                database.RunIndex.__tablename__,
+                database.SchedulerWorker.__tablename__,
+                database.SchedulerWorkerSlotReservation.__tablename__,
+                database.ServiceRuntimeConfig.__tablename__,
+            ]
+
+        def get_columns(self, table_name):
+            if table_name == database.SchedulerWorkerSlotReservation.__tablename__:
+                return [{"name": "worker_pod_id", "type": "VARCHAR(128)"}]
+            return []
+
+        def get_indexes(self, table_name):
+            return []
+
+    monkeypatch.setattr(database, "get_engine", lambda: FakeEngine())
+    monkeypatch.setattr(database, "inspect", lambda connection: FakeInspector())
+    monkeypatch.setattr(database, "_migrate_legacy_run_tables", lambda connection, inspector: None)
+    monkeypatch.setattr(database, "_column_exists", lambda inspector, table_name, column_name: any(col["name"] == column_name for col in inspector.get_columns(table_name)))
+    monkeypatch.setattr(database, "_column_type_name", lambda inspector, table_name, column_name: "VARCHAR(128)" if table_name == database.SchedulerWorkerSlotReservation.__tablename__ and column_name == "worker_pod_id" else "")
+    monkeypatch.setattr(database, "_index_exists", lambda inspector, table_name, index_name: True)
+
+    database.run_auto_migrations()
+
+    assert any(
+        "MODIFY COLUMN worker_pod_id VARCHAR(512) NOT NULL" in sql
+        for sql in executed_sql
+    )

@@ -388,7 +388,7 @@ class SchedulerWorkerSlotReservation(Base):
     __tablename__ = _prefix("scheduler_worker_slot_reservation")
 
     id = Column(String(64), primary_key=True)
-    worker_pod_id = Column(String(128), ForeignKey(f"{SchedulerWorker.__tablename__}.pod_id"), nullable=False)
+    worker_pod_id = Column(String(512), ForeignKey(f"{SchedulerWorker.__tablename__}.pod_id"), nullable=False)
     execution_id = Column(String(64), ForeignKey(f"{WorkflowExecution.__tablename__}.id"), nullable=False, unique=True)
     status = Column(String(32), nullable=False, default="reserved")
     lease_expires_at = Column(DateTime, nullable=False)
@@ -876,6 +876,8 @@ def run_auto_migrations(connection: Connection | None = None) -> None:
         "workflow_execution": WorkflowExecution.__tablename__,
         "run_index": RunIndex.__tablename__,
         "scheduler_worker": SchedulerWorker.__tablename__,
+        "scheduler_worker_slot_reservation": SchedulerWorkerSlotReservation.__tablename__,
+        "service_runtime_config": ServiceRuntimeConfig.__tablename__,
     }
 
     column_migrations = [
@@ -1001,6 +1003,19 @@ def run_auto_migrations(connection: Connection | None = None) -> None:
                     active_connection.execute(text(
                         f"ALTER TABLE {RunIndex.__tablename__} "
                         "MODIFY COLUMN source_mtime DOUBLE NOT NULL DEFAULT 0"
+                    ))
+                    inspector = inspect(active_connection)
+        if dialect == "mysql" and tables["scheduler_worker_slot_reservation"] in inspector.get_table_names():
+            if _column_exists(inspector, tables["scheduler_worker_slot_reservation"], "worker_pod_id"):
+                worker_pod_type = _column_type_name(
+                    inspector,
+                    tables["scheduler_worker_slot_reservation"],
+                    "worker_pod_id",
+                )
+                if "VARCHAR(512)" not in worker_pod_type:
+                    active_connection.execute(text(
+                        f"ALTER TABLE {tables['scheduler_worker_slot_reservation']} "
+                        "MODIFY COLUMN worker_pod_id VARCHAR(512) NOT NULL"
                     ))
                     inspector = inspect(active_connection)
 
