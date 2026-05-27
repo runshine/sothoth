@@ -1254,6 +1254,9 @@ class TaskManagerTests(unittest.TestCase):
                 output_root=str(Path(tmp) / "output"),
                 workspace_root=tmp,
                 started_at=_now(),
+                dispatcher_instance_id=self.manager.instance_id,
+                dispatch_started_at=_now(),
+                lease_expires_at=_now() + timedelta(minutes=1),
                 policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
             )
             stage_run = BinarySecurityStageRun(
@@ -1319,6 +1322,9 @@ class TaskManagerTests(unittest.TestCase):
                 output_root=str(Path(tmp) / "output"),
                 workspace_root=tmp,
                 started_at=_now(),
+                dispatcher_instance_id=self.manager.instance_id,
+                dispatch_started_at=_now(),
+                lease_expires_at=_now() + timedelta(minutes=1),
                 policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
             )
             entry_run = BinarySecurityStageRun(
@@ -1402,6 +1408,9 @@ class TaskManagerTests(unittest.TestCase):
 
             self.assertEqual("running", task.status)
             self.assertEqual("dataflow_analysis", task.current_stage)
+            self.assertEqual(self.manager.instance_id, task.dispatcher_instance_id)
+            self.assertIsNotNone(task.dispatch_started_at)
+            self.assertIsNotNone(task.lease_expires_at)
 
     def test_streaming_reducer_sequence_applies_terminal_then_downstream_status(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -1418,6 +1427,9 @@ class TaskManagerTests(unittest.TestCase):
                 output_root=str(Path(tmp) / "output"),
                 workspace_root=tmp,
                 started_at=_now(),
+                dispatcher_instance_id=self.manager.instance_id,
+                dispatch_started_at=_now(),
+                lease_expires_at=_now() + timedelta(minutes=1),
                 policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
             )
             system_run = BinarySecurityStageRun(
@@ -8362,6 +8374,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 firmware_path="/src",
                 output_root=str(Path(tmp) / "output"),
                 workspace_root=tmp,
+                dispatcher_instance_id=self.manager.instance_id,
+                dispatch_started_at=_now(),
+                lease_expires_at=_now() + timedelta(minutes=1),
                 policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
             )
             task.summary = {}
@@ -8410,6 +8425,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(["entry-a"], [row.get("entries", [{}])[0].get("entry_key") for row in task.summary.get("entry_results") or []])
             self.assertEqual("dataflow_analysis", task.current_stage)
             self.assertEqual("pending", task.status)
+            self.assertEqual(self.manager.instance_id, task.dispatcher_instance_id)
+            self.assertIsNotNone(task.dispatch_started_at)
+            self.assertIsNotNone(task.lease_expires_at)
 
     def test_sync_streaming_task_tail_state_keeps_current_stage_on_earliest_incomplete_tail_before_finalize(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -8425,6 +8443,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 firmware_path="/src",
                 output_root=str(Path(tmp) / "output"),
                 workspace_root=tmp,
+                dispatcher_instance_id=self.manager.instance_id,
+                dispatch_started_at=_now(),
+                lease_expires_at=_now() + timedelta(minutes=1),
                 policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
             )
             runs = [
