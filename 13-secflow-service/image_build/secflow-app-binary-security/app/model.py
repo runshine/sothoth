@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from sqlalchemy import Column, DateTime, Integer, String, Text, UniqueConstraint, create_engine, inspect, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -494,6 +495,26 @@ def init_database() -> None:
 
 
 def _ensure_compat_columns(engine) -> None:
+    def _execute_compat_statements(statements: list[str]) -> None:
+        if not statements:
+            return
+        with engine.begin() as conn:
+            for statement in statements:
+                try:
+                    conn.execute(text(statement))
+                except OperationalError as exc:
+                    orig = getattr(exc, "orig", None)
+                    errno = None
+                    if orig is not None:
+                        args = getattr(orig, "args", ())
+                        if args:
+                            errno = args[0]
+                    # MySQL duplicate-key-on-create-index should be treated as
+                    # idempotent during multi-pod startup.
+                    if int(errno or 0) == 1061:
+                        continue
+                    raise
+
     inspector = inspect(engine)
     task_table = BinarySecurityTask.__tablename__
     if inspector.has_table(task_table):
@@ -563,9 +584,7 @@ def _ensure_compat_columns(engine) -> None:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN latest_abnormal_reason_json TEXT NULL"
             )
-        with engine.begin() as conn:
-            for statement in statements:
-                conn.execute(text(statement))
+        _execute_compat_statements(statements)
         indexes = {index["name"] for index in inspector.get_indexes(task_table)}
         index_statements = []
         if "ix_bst_project_type_created_id" not in indexes:
@@ -580,9 +599,7 @@ def _ensure_compat_columns(engine) -> None:
             index_statements.append(
                 f"CREATE INDEX ix_bst_operation_lock_expires ON {task_table} (operation_lock_expires_at)"
             )
-        with engine.begin() as conn:
-            for statement in index_statements:
-                conn.execute(text(statement))
+        _execute_compat_statements(index_statements)
     stage_item_table = BinarySecurityStageItem.__tablename__
     if inspector.has_table(stage_item_table):
         column_defs = {column["name"]: column for column in inspector.get_columns(stage_item_table)}
@@ -604,9 +621,7 @@ def _ensure_compat_columns(engine) -> None:
             statements.append(
                 f"ALTER TABLE {stage_item_table} MODIFY COLUMN result_json MEDIUMTEXT NULL"
             )
-        with engine.begin() as conn:
-            for statement in statements:
-                conn.execute(text(statement))
+        _execute_compat_statements(statements)
         indexes = {index["name"] for index in inspector.get_indexes(stage_item_table)}
         index_statements = []
         if "ix_bssi_task_stage_identity_created" not in indexes:
@@ -614,9 +629,7 @@ def _ensure_compat_columns(engine) -> None:
                 f"CREATE INDEX ix_bssi_task_stage_identity_created ON {stage_item_table} "
                 "(task_id, stage_name, item_identity_key, created_at)"
             )
-        with engine.begin() as conn:
-            for statement in index_statements:
-                conn.execute(text(statement))
+        _execute_compat_statements(index_statements)
     archive_job_table = BinarySecurityArchiveJob.__tablename__
     if inspector.has_table(archive_job_table):
         columns = {column["name"] for column in inspector.get_columns(archive_job_table)}
@@ -625,9 +638,7 @@ def _ensure_compat_columns(engine) -> None:
             statements.append(
                 f"ALTER TABLE {archive_job_table} ADD COLUMN job_dedupe_key VARCHAR(255) NULL"
             )
-        with engine.begin() as conn:
-            for statement in statements:
-                conn.execute(text(statement))
+        _execute_compat_statements(statements)
         indexes = {index["name"] for index in inspector.get_indexes(archive_job_table)}
         index_statements = []
         if "ix_bsaj_task_stage_dedupe_status" not in indexes:
@@ -635,9 +646,7 @@ def _ensure_compat_columns(engine) -> None:
                 f"CREATE INDEX ix_bsaj_task_stage_dedupe_status ON {archive_job_table} "
                 "(task_id, stage_name, job_dedupe_key, archive_status)"
             )
-        with engine.begin() as conn:
-            for statement in index_statements:
-                conn.execute(text(statement))
+        _execute_compat_statements(index_statements)
     state_event_table = BinarySecurityStateEvent.__tablename__
     if inspector.has_table(state_event_table):
         columns = {column["name"] for column in inspector.get_columns(state_event_table)}
@@ -662,9 +671,7 @@ def _ensure_compat_columns(engine) -> None:
             statements.append(
                 f"ALTER TABLE {state_event_table} ADD COLUMN last_error_message TEXT NULL"
             )
-        with engine.begin() as conn:
-            for statement in statements:
-                conn.execute(text(statement))
+        _execute_compat_statements(statements)
         indexes = {index["name"] for index in inspector.get_indexes(state_event_table)}
         index_statements = []
         if "ix_bsst_status_updated_id" not in indexes:
@@ -679,9 +686,7 @@ def _ensure_compat_columns(engine) -> None:
             index_statements.append(
                 f"CREATE INDEX ix_bsst_event_type_status_created ON {state_event_table} (event_type, status, created_at)"
             )
-        with engine.begin() as conn:
-            for statement in index_statements:
-                conn.execute(text(statement))
+        _execute_compat_statements(index_statements)
 
 
 def get_db():
