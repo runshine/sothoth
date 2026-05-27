@@ -4916,12 +4916,11 @@ class ExecutionService:
                 )
             status_text = "running"
             message = "Run cancel requested"
-            if latest_execution is None or latest_execution.status == "cancelled":
+            effective_trigger_status = _canonical_task_status(trigger.status) if trigger is not None else ""
+            effective_execution_status = _canonical_task_status(latest_execution.status) if latest_execution is not None else ""
+            if effective_trigger_status == "cancelled" or effective_execution_status == "cancelled" or latest_execution is None:
                 status_text = "cancelled"
-                message = "Run cancelled before dispatch"
-            elif latest_execution.status == "pending":
-                status_text = "cancelled"
-                message = "Run cancelled before dispatch"
+                message = str(trigger.message or (latest_execution.message if latest_execution is not None else "") or "cancelled before dispatch")
             self._write_run_control_state(run_index.run_root_path, status_text=status_text, message=message)
             run_index = get_run_index_service().bind_runtime_state(
                 db,
