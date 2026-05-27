@@ -3208,7 +3208,17 @@ def list_evolution_rounds(job_id: str) -> list[dict[str, Any]]:
             .order_by(FirmwareEvolutionRound.round.asc())
             .all()
         )
-        return [row.to_dict() for row in rows]
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            payload = row.to_dict()
+            metrics = _normalize_evolution_round_metrics(payload)
+            payload["metrics"] = metrics
+            payload["tool_unpack_duration_seconds"] = metrics["tool_unpack_duration_seconds"]
+            payload["evolution_executor_tokens"] = metrics["evolution_executor_tokens"]
+            payload["reviewer_tokens"] = metrics["reviewer_tokens"]
+            payload["total_tokens"] = metrics["total_tokens"]
+            items.append(payload)
+        return items
     finally:
         db.close()
 
