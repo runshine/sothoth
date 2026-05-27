@@ -32,7 +32,7 @@ class TaskCreate(BaseModel):
     agent_run_timeout_seconds: Optional[int] = None
     agent_timeout_retry_enabled: Optional[bool] = None
     agent_timeout_max_retries: Optional[int] = None
-    mode: Optional[Literal["turbo", "fast", "deep"]] = None
+    mode: Optional[Literal["turbo", "fast", "deep", "hybrid", "agent"]] = None
     engine: Optional[Literal["turbo", "hybrid", "agent"]] = None
     reuse_cache: Optional[bool] = None
     task_origin_type: Optional[str] = None
@@ -49,6 +49,7 @@ class B2SServiceConfig(BaseModel):
     project_id: str
     budget_exhausted_action: Literal["treat_as_passed", "treat_as_failed"] = "treat_as_passed"
     concurrency: int = 8
+    default_mode: Literal["turbo", "fast", "deep"] = "fast"
     llm_provider_key: Optional[str] = None
     effective_llm_provider: Optional["LlmProviderSummary"] = None
     updated_at: Optional[str] = None

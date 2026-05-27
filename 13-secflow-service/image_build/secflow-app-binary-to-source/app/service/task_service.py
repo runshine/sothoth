@@ -79,7 +79,7 @@ from app.schemas import (
     TaskResultSummary,
 )
 from app.service.cache_service import get_cache_service
-from app.service.config_service import get_config_service, normalize_budget_exhausted_action, normalize_concurrency
+from app.service.config_service import get_config_service, normalize_b2s_mode, normalize_budget_exhausted_action, normalize_concurrency
 from app.service.llm_provider import materialize_llm_provider
 from app.service.pi_cluster import get_pi_cluster_monitor
 from app.service.pi_re_agent import get_pi_client
@@ -2091,11 +2091,14 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
 
     cfg = get_config()
     pi_cfg = cfg.pi_re_agent
+    project_config = get_config_service().get_config(db, project_id)
     mode_engine_map = {"turbo": "turbo", "fast": "hybrid", "deep": "agent"}
     engine_mode_map = {"turbo": "turbo", "hybrid": "fast", "agent": "deep"}
-    job_mode = req.mode or (engine_mode_map.get(req.engine or "") if req.engine else None)
-    job_engine = mode_engine_map.get(job_mode or "") or req.engine or pi_cfg.engine
-    job_mode = job_mode or engine_mode_map.get(job_engine) or "fast"
+    requested_mode = normalize_b2s_mode(req.mode) if req.mode else None
+    requested_engine_mode = engine_mode_map.get(str(req.engine or "").strip().lower()) if req.engine else None
+    default_mode = normalize_b2s_mode(project_config.get("default_mode"))
+    job_mode = requested_mode or requested_engine_mode or default_mode
+    job_engine = mode_engine_map.get(job_mode) or req.engine or pi_cfg.engine
     request_provider_key = _normalize_llm_provider_key(req.llm_provider_key)
     project_provider_key = _project_default_llm_provider_key(db, project_id)
     effective_provider_key = request_provider_key or project_provider_key

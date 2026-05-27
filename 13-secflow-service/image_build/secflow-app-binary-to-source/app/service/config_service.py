@@ -13,9 +13,16 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "budget_exhausted_action": "treat_as_passed",
     "concurrency": 8,
     "llm_provider_key": None,
+    "default_mode": "fast",
 }
 
 _VALID_ACTIONS = {"treat_as_passed", "treat_as_failed"}
+_VALID_MODES = {"turbo", "fast", "deep"}
+_LEGACY_MODE_MAP = {
+    "hybrid": "fast",
+    "agent": "deep",
+    "ida_only": "turbo",
+}
 
 
 def normalize_budget_exhausted_action(value: str | None) -> str:
@@ -33,6 +40,14 @@ def normalize_concurrency(value: Any) -> int:
     return max(1, min(16, normalized))
 
 
+def normalize_b2s_mode(value: Any) -> str:
+    candidate = str(value or "").strip().lower()
+    candidate = _LEGACY_MODE_MAP.get(candidate, candidate)
+    if candidate in _VALID_MODES:
+        return candidate
+    return "fast"
+
+
 class ConfigService:
     def get_config(self, db: Session, project_id: str) -> dict:
         row = db.query(B2SProjectConfig).filter_by(project_id=project_id).first()
@@ -44,6 +59,7 @@ class ConfigService:
             data.get("budget_exhausted_action")
         )
         data["concurrency"] = normalize_concurrency(data.get("concurrency"))
+        data["default_mode"] = normalize_b2s_mode(data.get("default_mode"))
         data["llm_provider_key"] = _normalize_provider_key(data.get("llm_provider_key"))
         data["project_id"] = project_id
         data["updated_at"] = row.updated_at.isoformat() if (row and row.updated_at) else None
@@ -55,6 +71,7 @@ class ConfigService:
             blob.get("budget_exhausted_action")
         )
         blob["concurrency"] = normalize_concurrency(blob.get("concurrency"))
+        blob["default_mode"] = normalize_b2s_mode(blob.get("default_mode"))
         blob["llm_provider_key"] = _normalize_provider_key(blob.get("llm_provider_key"))
         row = db.query(B2SProjectConfig).filter_by(project_id=project_id).first()
         if row:
@@ -70,6 +87,7 @@ class ConfigService:
             result.get("budget_exhausted_action")
         )
         result["concurrency"] = normalize_concurrency(result.get("concurrency"))
+        result["default_mode"] = normalize_b2s_mode(result.get("default_mode"))
         result["llm_provider_key"] = _normalize_provider_key(result.get("llm_provider_key"))
         result["project_id"] = project_id
         result["updated_at"] = row.updated_at.isoformat() if row.updated_at else None
