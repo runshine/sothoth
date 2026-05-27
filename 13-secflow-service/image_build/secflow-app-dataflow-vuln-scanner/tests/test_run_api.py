@@ -997,6 +997,7 @@ def test_run_retry_queue_cancel_and_delete(service_config_path, monkeypatch):
     cancel_response = client.post(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/cancel")
     assert cancel_response.status_code == 200
     assert cancel_response.json()["status"] == "cancelled"
+    assert cancel_response.json()["message"] == "cancelled before dispatch"
 
     delete_response = client.delete(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
     assert delete_response.status_code == 200

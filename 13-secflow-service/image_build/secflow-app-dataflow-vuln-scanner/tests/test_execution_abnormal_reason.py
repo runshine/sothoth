@@ -131,3 +131,37 @@ def test_abnormal_reason_history_reads_recorded_events() -> None:
     assert len(history) == 1
     assert history[0]["event_id"] == "evt-1"
     assert history[0]["reason"]["code"] == "dispatch_failed"
+
+
+def test_task_abnormal_reason_ignores_control_messages() -> None:
+    service = ExecutionService()
+    trigger = TriggerTask(
+        id="tt-1",
+        workflow_definition_id="wf-1",
+        workflow_definition_version_id="wfver-1",
+        project_id="proj-1",
+        trigger_type="manual",
+        input_tasks_json={"tasks": []},
+        status="failed",
+        message="cancel requested",
+    )
+    execution = WorkflowExecution(
+        id="exec-1",
+        trigger_task_id="tt-1",
+        workflow_definition_id="wf-1",
+        workflow_definition_version_id="wfver-1",
+        project_id="proj-1",
+        attempt_no=1,
+        status="failed",
+        dispatch_status="failed",
+        dispatch_error="worker lease claim failed",
+        message="execution running",
+    )
+
+    reason = service._task_abnormal_reason(trigger, execution, {"status": "failed", "error": ""})
+
+    assert reason is not None
+    assert reason["code"] == "dispatch_failed"
+    assert reason["message"] == "worker lease claim failed"
+    evidence = {item["key"]: item["value"] for item in reason["evidence"]}
+    assert evidence["error"] == "worker lease claim failed"
