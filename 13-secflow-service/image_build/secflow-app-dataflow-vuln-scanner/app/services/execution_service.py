@@ -2792,17 +2792,38 @@ class ExecutionService:
             return False
         if trigger is not None and _public_task_status(trigger.status) != "pending":
             return False
-        if str(execution.owner_pod_id or "").strip() or str(execution.worker_job_id or "").strip():
-            return False
         dispatch_status = str(execution.dispatch_status or "").strip().lower()
-        if dispatch_status in {"queued", "dispatching", "running"}:
+        updated_at = execution.updated_at or (trigger.updated_at if trigger is not None else None)
+        threshold = self._legacy_dispatch_failure_reconcile_threshold()
+        if updated_at is None or updated_at > threshold:
             return False
+        if dispatch_status == "running":
+            return False
+        if dispatch_status in {"queued", "dispatching"}:
+            if dispatch_status != "dispatching":
+                return False
+            message = str(execution.message or "").strip() or "stale dispatching execution assumed failed"
+            self.mark_dispatch_failure_terminal(
+                db,
+                execution=execution,
+                trigger=trigger,
+                error=message,
+            )
+            self.record_event(
+                db,
+                execution_id=execution.id,
+                event_type="stale_dispatching_reconciled",
+                message=message,
+                level="warning",
+                payload_json={
+                    "reason": "stale_dispatching",
+                    "updated_at": isoformat_local(updated_at) if updated_at else None,
+                },
+            )
+            return True
         trigger_message = str(trigger.message or "").strip() if trigger is not None else ""
         message = str(execution.message or trigger_message or "").strip()
         if not message.lower().startswith("worker dispatch failed:"):
-            return False
-        updated_at = execution.updated_at or (trigger.updated_at if trigger is not None else None)
-        if updated_at is None or updated_at > self._legacy_dispatch_failure_reconcile_threshold():
             return False
 
         error = message.split(":", 1)[1].strip() if ":" in message else message
