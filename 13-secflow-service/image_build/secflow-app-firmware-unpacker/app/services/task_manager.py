@@ -3200,6 +3200,25 @@ def delete_evolution_job(job_id: str) -> dict[str, Any]:
 def list_evolution_rounds(job_id: str) -> list[dict[str, Any]]:
     from app.model import FirmwareEvolutionRound, get_db_session
 
+    fallback_items: list[dict[str, Any]] = []
+    fallback = get_evolution_job(job_id)
+    if isinstance(fallback, dict):
+        raw_rounds = fallback.get("rounds")
+        if isinstance(raw_rounds, list):
+            for item in raw_rounds:
+                if not isinstance(item, dict):
+                    continue
+                metrics = _normalize_evolution_round_metrics(item)
+                payload = dict(item)
+                payload["metrics"] = metrics
+                payload["tool_unpack_duration_seconds"] = metrics["tool_unpack_duration_seconds"]
+                payload["evolution_executor_tokens"] = metrics["evolution_executor_tokens"]
+                payload["reviewer_tokens"] = metrics["reviewer_tokens"]
+                payload["total_tokens"] = metrics["total_tokens"]
+                fallback_items.append(payload)
+            if fallback_items:
+                fallback_items.sort(key=lambda item: int(item.get("round") or 0))
+
     db = get_db_session()
     try:
         rows = (
@@ -3218,6 +3237,15 @@ def list_evolution_rounds(job_id: str) -> list[dict[str, Any]]:
             payload["reviewer_tokens"] = metrics["reviewer_tokens"]
             payload["total_tokens"] = metrics["total_tokens"]
             items.append(payload)
+        if fallback_items:
+            if not items:
+                return fallback_items
+            if len(fallback_items) >= len(items):
+                return fallback_items
+        if items:
+            return items
+        if fallback_items:
+            return fallback_items
         return items
     finally:
         db.close()

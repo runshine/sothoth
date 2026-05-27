@@ -644,6 +644,17 @@ def _sync_report_aliases(output_dir: Path) -> None:
             canonical_path.write_text(alias_path.read_text(encoding="utf-8"), encoding="utf-8")
 
 
+def _snapshot_round_report(round_dir: Path, source_path: Path, target_name: str) -> str | None:
+    if not source_path.exists() or not source_path.is_file():
+        return None
+    target = round_dir / target_name
+    try:
+        shutil.copy2(source_path, target)
+    except Exception:
+        return str(source_path)
+    return str(target)
+
+
 def _validate_tool_generality(tool_path: Path) -> list[str]:
     try:
         source = tool_path.read_text(encoding="utf-8")
@@ -1282,6 +1293,8 @@ def run_evolution_job(
                 tool_changed = before_text != (working_tool.read_text(encoding="utf-8") if working_tool.exists() else "")
                 summary_path = workspace_output / "summary.md"
                 reason_path = workspace_output / "reason.md"
+                round_summary_path = _snapshot_round_report(round_dir, summary_path, "summary.md")
+                round_reason_path = _snapshot_round_report(round_dir, reason_path, "reason.md")
                 _write_backend_reviewer_session(
                     job_root=job_root,
                     round_id=round_id,
@@ -1299,8 +1312,8 @@ def run_evolution_job(
                     "tool_path_after": str(working_tool),
                     "tool_changed": tool_changed,
                     "review_result": review_result,
-                    "summary_path": str(summary_path) if summary_path.exists() else None,
-                    "reason_path": str(reason_path) if reason_path.exists() else None,
+                    "summary_path": round_summary_path,
+                    "reason_path": round_reason_path,
                     "log_root": str(round_dir),
                     "log_files": {
                         "evolution_executor": str(round_dir / "evolution_executor_transcript.log"),
@@ -1378,6 +1391,8 @@ def run_evolution_job(
                 tool_changed = before_text != (working_tool.read_text(encoding="utf-8") if working_tool.exists() else "")
                 summary_path = workspace_output / "summary.md"
                 reason_path = workspace_output / "reason.md"
+                round_summary_path = _snapshot_round_report(round_dir, summary_path, "summary.md")
+                round_reason_path = _snapshot_round_report(round_dir, reason_path, "reason.md")
                 _write_backend_reviewer_session(
                     job_root=job_root,
                     round_id=round_id,
@@ -1395,8 +1410,8 @@ def run_evolution_job(
                     "tool_path_after": str(working_tool),
                     "tool_changed": tool_changed,
                     "review_result": review_result,
-                    "summary_path": str(summary_path) if summary_path.exists() else None,
-                    "reason_path": str(reason_path) if reason_path.exists() else None,
+                    "summary_path": round_summary_path,
+                    "reason_path": round_reason_path,
                     "log_root": str(round_dir),
                     "log_files": {
                         "evolution_executor": str(round_dir / "evolution_executor_transcript.log"),
@@ -1500,6 +1515,8 @@ def run_evolution_job(
 
             summary_path = workspace_output / "summary.md"
             reason_path = workspace_output / "reason.md"
+            round_summary_path = _snapshot_round_report(round_dir, summary_path, "summary.md")
+            round_reason_path = _snapshot_round_report(round_dir, reason_path, "reason.md")
             round_status = "review_passed" if review_round_passed else "review_failed"
             round_item: dict[str, Any] = {
                 "round": round_id,
@@ -1510,8 +1527,8 @@ def run_evolution_job(
                 "tool_path_after": str(working_tool),
                 "tool_changed": tool_changed,
                 "review_result": review_result,
-                "summary_path": str(summary_path) if summary_path.exists() else None,
-                "reason_path": str(reason_path) if reason_path.exists() else None,
+                "summary_path": round_summary_path,
+                "reason_path": round_reason_path,
                 "log_root": str(round_dir),
                 "log_files": {
                     "evolution_executor": str(round_dir / "evolution_executor_transcript.log"),

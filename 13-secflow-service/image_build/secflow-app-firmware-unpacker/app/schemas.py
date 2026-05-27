@@ -379,6 +379,11 @@ class EvolutionRoundResponse(BaseModel):
     generated_new_tool: bool = False
     executed_tool: bool = False
     tool_response_preview: Optional[str] = None
+    metrics: Optional[dict[str, Any]] = None
+    tool_unpack_duration_seconds: Optional[float] = None
+    evolution_executor_tokens: Optional[dict[str, Any]] = None
+    reviewer_tokens: Optional[dict[str, Any]] = None
+    total_tokens: Optional[dict[str, Any]] = None
     created_at: Optional[str] = None
     completed_at: Optional[str] = None
 
