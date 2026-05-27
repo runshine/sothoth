@@ -2770,6 +2770,61 @@ class ExecutionService:
             db.add(trigger)
         db.flush()
 
+    def _legacy_dispatch_failure_reconcile_threshold(self) -> datetime:
+        cfg = get_config()
+        dispatch_window = max(
+            10,
+            int(cfg.scheduler.requeue_stuck_dispatch_after_seconds or 60),
+            int(cfg.dataflow_worker.dispatch_max_retries or 1) * max(1, int(cfg.dataflow_worker.dispatch_retry_interval_seconds or 0)),
+        )
+        return now_local() - timedelta(seconds=dispatch_window)
+
+    def _reconcile_legacy_dispatch_failure(
+        self,
+        db: Session,
+        *,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+    ) -> bool:
+        if execution is None:
+            return False
+        if _public_task_status(execution.status) != "pending":
+            return False
+        if trigger is not None and _public_task_status(trigger.status) != "pending":
+            return False
+        if str(execution.owner_pod_id or "").strip() or str(execution.worker_job_id or "").strip():
+            return False
+        dispatch_status = str(execution.dispatch_status or "").strip().lower()
+        if dispatch_status in {"queued", "dispatching", "running"}:
+            return False
+        trigger_message = str(trigger.message or "").strip() if trigger is not None else ""
+        message = str(execution.message or trigger_message or "").strip()
+        if not message.lower().startswith("worker dispatch failed:"):
+            return False
+        updated_at = execution.updated_at or (trigger.updated_at if trigger is not None else None)
+        if updated_at is None or updated_at > self._legacy_dispatch_failure_reconcile_threshold():
+            return False
+
+        error = message.split(":", 1)[1].strip() if ":" in message else message
+        self.mark_dispatch_failure_terminal(
+            db,
+            execution=execution,
+            trigger=trigger,
+            error=error or message,
+        )
+        self.record_event(
+            db,
+            execution_id=execution.id,
+            event_type="legacy_dispatch_failure_reconciled",
+            message=message,
+            level="warning",
+            payload_json={
+                "reason": "legacy_dispatch_failure",
+                "updated_at": isoformat_local(updated_at) if updated_at else None,
+            },
+        )
+        return True
+
     def _create_execution_attempt(
         self,
         db: Session,
@@ -4689,6 +4744,14 @@ class ExecutionService:
         )
         for execution in rows:
             trigger = db.get(TriggerTask, execution.trigger_task_id)
+            if self._reconcile_legacy_dispatch_failure(
+                db,
+                trigger=trigger,
+                execution=execution,
+            ):
+                reconciled += 1
+                db.commit()
+                continue
             run_index = self._ensure_run_index_for_execution(db, execution, trigger)
             if self._reconcile_stale_runtime(
                 db,
