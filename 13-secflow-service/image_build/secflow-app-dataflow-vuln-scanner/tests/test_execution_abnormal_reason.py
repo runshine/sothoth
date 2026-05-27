@@ -71,6 +71,8 @@ def test_set_terminal_state_records_abnormal_reason_event() -> None:
         message="dispatcher crashed",
     )
 
+    assert execution.dispatch_status == "failed"
+    assert execution.dispatch_error == "dispatcher crashed"
     assert trigger.latest_abnormal_reason_json is not None
     assert trigger.latest_abnormal_reason_json["code"] == "dispatch_failed"
     abnormal_events = [item for item in db.added if isinstance(item, WorkflowExecutionEvent) and item.event_type == "abnormal_reason_recorded"]

@@ -11,7 +11,7 @@ import json
 from typing import Any, Dict, List
 
 from fastapi import HTTPException, status
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app.config import get_config
@@ -255,6 +255,16 @@ class SchedulerService:
         )
         return workers, worker_timeout_at, reservation_counts, queued_jobs
 
+    @staticmethod
+    def _active_execution_filter():
+        return and_(
+            ~WorkflowExecution.status.in_(tuple(TERMINAL_EXECUTION_STATUSES)),
+            or_(
+                WorkflowExecution.status.in_(tuple(ACTIVE_JOB_STATUSES)),
+                WorkflowExecution.dispatch_status.in_(tuple(ACTIVE_JOB_STATUSES)),
+            ),
+        )
+
     def _compute_cluster_capacity_summary(self, db: Session) -> WorkerClusterCapacitySummaryResponse:
         started = time.perf_counter()
         workers, worker_timeout_at, reservation_counts, queued_jobs = self._cluster_capacity_base(db)
@@ -267,7 +277,7 @@ class SchedulerService:
         for worker in workers:
             heartbeat_healthy = bool(worker.last_heartbeat_at and worker.last_heartbeat_at >= worker_timeout_at and worker.status == "active")
             capacity = max(int(worker.capacity or 0), 0)
-            running_jobs = max(int(worker.running_count or 0), 0)
+            running_jobs = self._running_count_for_worker(db, str(worker.pod_id))
             available_slots = max(capacity - running_jobs - reservation_counts.get(str(worker.pod_id), 0), 0)
             healthy = heartbeat_healthy
             if healthy:
@@ -411,10 +421,7 @@ class SchedulerService:
             .join(TriggerTask, WorkflowExecution.trigger_task_id == TriggerTask.id)
             .outerjoin(RunIndex, RunIndex.linked_execution_id == WorkflowExecution.id)
             .filter(
-                or_(
-                    WorkflowExecution.status.in_(tuple(ACTIVE_JOB_STATUSES)),
-                    WorkflowExecution.dispatch_status.in_(tuple(ACTIVE_JOB_STATUSES)),
-                )
+                self._active_execution_filter()
             )
             .all()
         )
@@ -518,10 +525,7 @@ class SchedulerService:
                 db.query(WorkflowExecution)
                 .filter(
                     WorkflowExecution.owner_pod_id == worker.pod_id,
-                    or_(
-                        WorkflowExecution.status.in_(tuple(ACTIVE_JOB_STATUSES)),
-                        WorkflowExecution.dispatch_status.in_(tuple(ACTIVE_JOB_STATUSES)),
-                    ),
+                    self._active_execution_filter(),
                 )
                 .all()
             )
@@ -1039,10 +1043,7 @@ class SchedulerService:
             db.query(WorkflowExecution)
             .filter(
                 WorkflowExecution.owner_pod_id == worker_pod_id,
-                or_(
-                    WorkflowExecution.status.in_(tuple(ACTIVE_JOB_STATUSES)),
-                    WorkflowExecution.dispatch_status.in_(tuple(ACTIVE_JOB_STATUSES)),
-                ),
+                self._active_execution_filter(),
             )
             .count()
         )

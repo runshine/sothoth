@@ -776,3 +776,51 @@ def test_cleanup_once_releases_terminal_executions_from_active_capacity(
         assert execution.dispatch_error
     finally:
         db.close()
+
+
+def test_cluster_capacity_summary_ignores_stale_worker_running_count(
+    service_config_path: Path,
+    framework_config_payload: dict,
+):
+    config = get_config()
+    config.scheduler.enabled = True
+    config.scheduler.role = "worker"
+    config.scheduler.pod_id = "worker-summary-pod"
+    config.scheduler.host_name = "worker-summary-host"
+    config.scheduler.worker_capacity = 3
+
+    scheduler = SchedulerService()
+    scheduler._heartbeat_once()
+
+    db = get_db_session()
+    try:
+        _create_pending_execution(
+            db,
+            framework_config_payload,
+            suffix="summary-active",
+            status="running",
+            trigger_status="running",
+            owner_pod_id="worker-summary-pod",
+            dispatch_status="running",
+        )
+        _create_pending_execution(
+            db,
+            framework_config_payload,
+            suffix="summary-terminal",
+            status="failed",
+            trigger_status="failed",
+            owner_pod_id="worker-summary-pod",
+            dispatch_status="running",
+        )
+        worker = db.get(SchedulerWorker, "worker-summary-pod")
+        assert worker is not None
+        worker.running_count = 7
+        db.add(worker)
+        db.commit()
+
+        payload = scheduler.get_cluster_capacity_summary(db)
+        target = next(item for item in payload.workers if item.worker_id == "worker-summary-pod")
+        assert target.running_jobs == 1
+        assert target.available_slots == 2
+    finally:
+        db.close()

@@ -55,6 +55,9 @@ from app.schemas import (
     CreateEvolutionTaskRequest,
     DataflowAgentStateDirResponse,
     DataflowInputRef,
+    DataflowTaskTimelineActionResponse,
+    DataflowTaskTimelineEvent,
+    DataflowTaskTimelineResponse,
     ReplayReadyResponse,
     RunRetryRequest,
     ScanTaskAttemptResponse,
@@ -124,6 +127,42 @@ _TASK_LIST_SORT_COLUMNS = {
     "status": TriggerTask.status,
     "priority": TriggerTask.priority,
 }
+
+_TIMELINE_STAGE_LABELS = {
+    "dispatch": "调度/分发",
+    "worker_dispatch": "调度/分发",
+    "worker_dispatch_prepare": "调度/分发",
+    "worker_dispatch_result": "调度/分发",
+    "prepare": "运行准备",
+    "bootstrap": "运行准备",
+    "initialization": "运行准备",
+    "atomic_cycle": "原子分析循环",
+    "cycle": "原子分析循环",
+    "summary": "Summary",
+    "plugin": "Plugin",
+    "global_review": "Global Review",
+    "result_review": "Result Review",
+    "completion": "完成/收尾",
+    "cancel": "取消",
+    "abnormal": "异常",
+}
+
+
+def _normalize_timeline_stage_name(stage_key: str | None, payload: dict[str, Any] | None = None) -> str | None:
+    raw_stage = str(stage_key or "").strip()
+    payload_dict = payload if isinstance(payload, dict) else {}
+    payload_stage = (
+        str(payload_dict.get("stage_name") or payload_dict.get("stage") or payload_dict.get("stage_id") or "").strip()
+    )
+    if payload_stage:
+        return payload_stage
+    if not raw_stage:
+        return None
+    lowered = raw_stage.lower()
+    for prefix, label in _TIMELINE_STAGE_LABELS.items():
+        if lowered == prefix or lowered.startswith(f"{prefix}_"):
+            return label
+    return raw_stage
 
 
 def _abnormal_evidence(key: str, label: str, value: object) -> dict | None:
@@ -2676,7 +2715,7 @@ class ExecutionService:
         execution.output_manifest_path = output_manifest_path
         execution.output_task_count = output_task_count
         execution.current_stage_id = None
-        execution.dispatch_status = str(execution_status or "").strip().lower() or execution.status
+        execution.dispatch_status = str(execution.status or execution_status or "").strip().lower()
         execution.dispatch_error = None if execution.status in {"succeeded", "cancelled"} else message
         if execution.process_status in {"running", "stop_requested", "delete_requested"}:
             execution.process_status = "exited"
@@ -3967,6 +4006,87 @@ class ExecutionService:
             total_ms=_perf_elapsed_ms(request_started),
         )
         return payload
+
+    def get_scan_task_timeline(self, db: Session, task_id: str, principal: dict) -> DataflowTaskTimelineResponse:
+        trigger = self._trigger_or_404(db, task_id)
+        self._ensure_project_access(principal, trigger.project_id)
+        executions = (
+            db.query(WorkflowExecution)
+            .filter(WorkflowExecution.trigger_task_id == trigger.id)
+            .order_by(WorkflowExecution.attempt_no.asc(), WorkflowExecution.created_at.asc(), WorkflowExecution.id.asc())
+            .all()
+        )
+        execution_ids = [row.id for row in executions]
+        if not execution_ids:
+            return DataflowTaskTimelineResponse(task_id=trigger.id, items=[])
+        attempt_by_execution = {row.id: row.attempt_no for row in executions}
+        events = (
+            db.query(WorkflowExecutionEvent)
+            .filter(WorkflowExecutionEvent.execution_id.in_(execution_ids))
+            .order_by(WorkflowExecutionEvent.created_at.asc(), WorkflowExecutionEvent.id.asc())
+            .all()
+        )
+        items = [
+            DataflowTaskTimelineEvent(
+                id=event.id,
+                task_id=trigger.id,
+                project_id=trigger.project_id,
+                execution_id=event.execution_id,
+                attempt_no=attempt_by_execution.get(event.execution_id),
+                stage_key=str(event.stage_id or "").strip() or None,
+                stage_name=_normalize_timeline_stage_name(event.stage_id, event.payload_json if isinstance(event.payload_json, dict) else None),
+                event_type=event.event_type,
+                level=str(event.level or "info").strip() or "info",
+                message=event.message,
+                payload=event.payload_json if isinstance(event.payload_json, dict) else {},
+                created_at=event.created_at,
+            )
+            for event in events
+        ]
+        return DataflowTaskTimelineResponse(task_id=trigger.id, items=items)
+
+    def clear_scan_task_timeline(self, db: Session, task_id: str, principal: dict) -> DataflowTaskTimelineActionResponse:
+        trigger = self._trigger_or_404(db, task_id)
+        self._ensure_project_access(principal, trigger.project_id)
+        execution_ids = [
+            row[0]
+            for row in db.query(WorkflowExecution.id).filter(WorkflowExecution.trigger_task_id == trigger.id).all()
+        ]
+        deleted = 0
+        if execution_ids:
+            deleted = (
+                db.query(WorkflowExecutionEvent)
+                .filter(WorkflowExecutionEvent.execution_id.in_(execution_ids))
+                .delete(synchronize_session=False)
+            ) or 0
+            db.commit()
+        return DataflowTaskTimelineActionResponse(
+            task_id=trigger.id,
+            message="task timeline cleared",
+            deleted_event_count=int(deleted or 0),
+        )
+
+    def delete_scan_task_timeline_event(self, db: Session, task_id: str, event_id: str, principal: dict) -> DataflowTaskTimelineActionResponse:
+        trigger = self._trigger_or_404(db, task_id)
+        self._ensure_project_access(principal, trigger.project_id)
+        event = (
+            db.query(WorkflowExecutionEvent)
+            .join(WorkflowExecution, WorkflowExecution.id == WorkflowExecutionEvent.execution_id)
+            .filter(
+                WorkflowExecutionEvent.id == event_id,
+                WorkflowExecution.trigger_task_id == trigger.id,
+            )
+            .first()
+        )
+        if event is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="timeline event not found")
+        db.delete(event)
+        db.commit()
+        return DataflowTaskTimelineActionResponse(
+            task_id=trigger.id,
+            message="task timeline event deleted",
+            deleted_event_count=1,
+        )
 
     def get_scan_task_summary(self, db: Session, task_id: str, principal: dict) -> ScanTaskResponse:
         trigger = self._trigger_or_404(db, task_id)

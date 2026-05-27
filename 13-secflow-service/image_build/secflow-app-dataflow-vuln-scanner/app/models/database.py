@@ -97,6 +97,8 @@ class TriggerTask(Base):
     input_tasks_json = Column(JSON, nullable=False)
     priority = Column(Integer, nullable=False, default=100)
     status = Column(String(32), nullable=False, default="pending")
+    public_status = Column(String(32), nullable=False, default="pending")
+    control_state = Column(String(32), nullable=False, default="none")
     submitted_by = Column(String(128), nullable=False)
     retry_count = Column(Integer, nullable=False, default=0)
     max_retry_count = Column(Integer, nullable=False, default=0)
@@ -119,6 +121,8 @@ class WorkflowExecution(Base):
     project_id = Column(String(64), nullable=False)
     attempt_no = Column(Integer, nullable=False, default=1)
     status = Column(String(32), nullable=False, default="pending")
+    public_status = Column(String(32), nullable=False, default="pending")
+    control_state = Column(String(32), nullable=False, default="none")
     recovery_reason = Column(String(255))
     workspace_root = Column(String(1024))
     output_manifest_path = Column(String(1024))
@@ -436,8 +440,10 @@ INDEX_DEFINITIONS = [
     (TriggerTask.__tablename__, "ix_dfvs_task_profile", "CREATE INDEX ix_dfvs_task_profile ON {table} (profile_id)"),
     (TriggerTask.__tablename__, "ix_dfvs_task_project", "CREATE INDEX ix_dfvs_task_project ON {table} (project_id)"),
     (TriggerTask.__tablename__, "ix_dfvs_task_status", "CREATE INDEX ix_dfvs_task_status ON {table} (status)"),
+    (TriggerTask.__tablename__, "ix_dfvs_task_public_status", "CREATE INDEX ix_dfvs_task_public_status ON {table} (public_status)"),
     (TriggerTask.__tablename__, "ix_dfvs_task_project_created", "CREATE INDEX ix_dfvs_task_project_created ON {table} (project_id, created_at)"),
     (TriggerTask.__tablename__, "ix_dfvs_task_project_status_created", "CREATE INDEX ix_dfvs_task_project_status_created ON {table} (project_id, status, created_at)"),
+    (TriggerTask.__tablename__, "ix_dfvs_task_project_public_status_created", "CREATE INDEX ix_dfvs_task_project_public_status_created ON {table} (project_id, public_status, created_at)"),
     (TriggerTask.__tablename__, "ix_dfvs_task_project_profile_created", "CREATE INDEX ix_dfvs_task_project_profile_created ON {table} (project_id, profile_id, created_at)"),
     (TriggerTask.__tablename__, "ix_dfvs_task_latest_exec", "CREATE INDEX ix_dfvs_task_latest_exec ON {table} (latest_execution_id)"),
     (TriggerTask.__tablename__, "ix_dfvs_task_def_status", "CREATE INDEX ix_dfvs_task_def_status ON {table} (workflow_definition_id, status)"),
@@ -446,6 +452,7 @@ INDEX_DEFINITIONS = [
     (WorkflowExecution.__tablename__, "ix_dfvs_exec_defver", "CREATE INDEX ix_dfvs_exec_defver ON {table} (workflow_definition_version_id)"),
     (WorkflowExecution.__tablename__, "ix_dfvs_exec_project", "CREATE INDEX ix_dfvs_exec_project ON {table} (project_id)"),
     (WorkflowExecution.__tablename__, "ix_dfvs_exec_status", "CREATE INDEX ix_dfvs_exec_status ON {table} (status)"),
+    (WorkflowExecution.__tablename__, "ix_dfvs_exec_public_status", "CREATE INDEX ix_dfvs_exec_public_status ON {table} (public_status)"),
     (WorkflowExecution.__tablename__, "ix_dfvs_exec_owner", "CREATE INDEX ix_dfvs_exec_owner ON {table} (owner_pod_id)"),
     (WorkflowExecution.__tablename__, "ix_dfvs_exec_worker_job", "CREATE INDEX ix_dfvs_exec_worker_job ON {table} (worker_job_id)"),
     (WorkflowExecution.__tablename__, "ix_dfvs_exec_dispatch_status", "CREATE INDEX ix_dfvs_exec_dispatch_status ON {table} (dispatch_status)"),
@@ -901,9 +908,13 @@ def run_auto_migrations(connection: Connection | None = None) -> None:
         (tables["trigger_task"], "max_retry_count", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN max_retry_count INTEGER NOT NULL DEFAULT 0"),
         (tables["trigger_task"], "latest_execution_id", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN latest_execution_id VARCHAR(64) NULL"),
         (tables["trigger_task"], "latest_abnormal_reason_json", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN latest_abnormal_reason_json {_column_sql(dialect, 'JSON')} NULL"),
+        (tables["trigger_task"], "public_status", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN public_status VARCHAR(32) NOT NULL DEFAULT 'pending'"),
+        (tables["trigger_task"], "control_state", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN control_state VARCHAR(32) NOT NULL DEFAULT 'none'"),
         (tables["workflow_execution"], "workflow_definition_version_id", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN workflow_definition_version_id VARCHAR(64) NULL"),
         (tables["workflow_execution"], "attempt_no", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN attempt_no INTEGER NOT NULL DEFAULT 1"),
         (tables["workflow_execution"], "recovery_reason", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN recovery_reason VARCHAR(255) NULL"),
+        (tables["workflow_execution"], "public_status", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN public_status VARCHAR(32) NOT NULL DEFAULT 'pending'"),
+        (tables["workflow_execution"], "control_state", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN control_state VARCHAR(32) NOT NULL DEFAULT 'none'"),
         (tables["workflow_execution"], "worker_url", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN worker_url VARCHAR(1024) NULL"),
         (tables["workflow_execution"], "worker_job_id", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN worker_job_id VARCHAR(128) NULL"),
         (tables["workflow_execution"], "dispatch_status", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN dispatch_status VARCHAR(32) NULL"),
@@ -982,12 +993,54 @@ def run_auto_migrations(connection: Connection | None = None) -> None:
                     ") "
                     "WHERE latest_execution_id IS NULL"
                 ))
+            if _column_exists(inspector, tables["trigger_task"], "public_status"):
+                active_connection.execute(text(
+                    f"UPDATE {tables['trigger_task']} "
+                    "SET public_status = CASE "
+                    "WHEN LOWER(COALESCE(status, '')) IN ('success', 'succeeded', 'completed', 'passed') THEN 'success' "
+                    "WHEN LOWER(COALESCE(status, '')) IN ('cancelled', 'canceled', 'interrupted', 'stopped', 'deleted') THEN 'cancelled' "
+                    "WHEN LOWER(COALESCE(status, '')) IN ('failed', 'error', 'failure', 'review_error', 'review_plateau', 'summary_incomplete', 'runtime_output_limit', 'runtime_timeout', 'blocked_context_window', 'blocked_quota', 'provider_rate_limited', 'model_contract_violation', 'blocked_external_source', 'no_workspace') THEN 'failed' "
+                    "WHEN LOWER(COALESCE(status, '')) IN ('dispatching', 'queued', 'accepted') THEN 'dispatching' "
+                    "WHEN LOWER(COALESCE(status, '')) IN ('running', 'processing', 'in_progress', 'started', 'cancel_requested', 'delete_requested', 'stop_requested', 'timeout_requested', 'created', 'start_plugins', 'worker', 'reflect', 'summary', 'global_review', 'result_review', 'end_plugins') THEN 'running' "
+                    "ELSE 'pending' END "
+                    "WHERE public_status IS NULL OR public_status = '' OR public_status = 'pending'"
+                ))
+            if _column_exists(inspector, tables["trigger_task"], "control_state"):
+                active_connection.execute(text(
+                    f"UPDATE {tables['trigger_task']} "
+                    "SET control_state = CASE "
+                    "WHEN LOWER(COALESCE(message, '')) LIKE '%delete requested%' THEN 'delete_requested' "
+                    "WHEN LOWER(COALESCE(message, '')) LIKE '%cancel requested%' THEN 'cancel_requested' "
+                    "ELSE 'none' END "
+                    "WHERE control_state IS NULL OR control_state = ''"
+                ))
 
         if tables["workflow_execution"] in inspector.get_table_names():
             if _column_exists(inspector, tables["workflow_execution"], "attempt_no"):
                 active_connection.execute(text(
                     f"UPDATE {tables['workflow_execution']} "
                     "SET attempt_no = 1 WHERE attempt_no IS NULL OR attempt_no = 0"
+                ))
+            if _column_exists(inspector, tables["workflow_execution"], "public_status"):
+                active_connection.execute(text(
+                    f"UPDATE {tables['workflow_execution']} "
+                    "SET public_status = CASE "
+                    "WHEN LOWER(COALESCE(status, '')) IN ('success', 'succeeded', 'completed', 'passed') THEN 'success' "
+                    "WHEN LOWER(COALESCE(status, '')) IN ('cancelled', 'canceled', 'interrupted', 'stopped', 'deleted') THEN 'cancelled' "
+                    "WHEN LOWER(COALESCE(status, '')) IN ('failed', 'error', 'failure', 'review_error', 'review_plateau', 'summary_incomplete', 'runtime_output_limit', 'runtime_timeout', 'blocked_context_window', 'blocked_quota', 'provider_rate_limited', 'model_contract_violation', 'blocked_external_source', 'no_workspace') THEN 'failed' "
+                    "WHEN LOWER(COALESCE(dispatch_status, '')) IN ('queued', 'dispatching', 'accepted') OR LOWER(COALESCE(status, '')) IN ('dispatching', 'queued', 'accepted') THEN 'dispatching' "
+                    "WHEN LOWER(COALESCE(status, '')) IN ('running', 'processing', 'in_progress', 'started', 'cancel_requested', 'delete_requested', 'stop_requested', 'timeout_requested', 'created', 'start_plugins', 'worker', 'reflect', 'summary', 'global_review', 'result_review', 'end_plugins') THEN 'running' "
+                    "ELSE 'pending' END "
+                    "WHERE public_status IS NULL OR public_status = '' OR public_status = 'pending'"
+                ))
+            if _column_exists(inspector, tables["workflow_execution"], "control_state"):
+                active_connection.execute(text(
+                    f"UPDATE {tables['workflow_execution']} "
+                    "SET control_state = CASE "
+                    "WHEN LOWER(COALESCE(dispatch_status, '')) = 'delete_requested' OR LOWER(COALESCE(process_status, '')) = 'delete_requested' OR LOWER(COALESCE(message, '')) LIKE '%delete requested%' THEN 'delete_requested' "
+                    "WHEN LOWER(COALESCE(dispatch_status, '')) = 'cancel_requested' OR LOWER(COALESCE(process_status, '')) = 'stop_requested' OR LOWER(COALESCE(message, '')) LIKE '%cancel requested%' THEN 'cancel_requested' "
+                    "ELSE 'none' END "
+                    "WHERE control_state IS NULL OR control_state = ''"
                 ))
 
         if dialect == "mysql" and RunIndex.__tablename__ in inspector.get_table_names():

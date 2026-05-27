@@ -10,6 +10,8 @@ from app.config import get_config
 from app.models.database import WorkflowExecution
 from app.schemas import (
     CreateEvolutionTaskRequest,
+    DataflowTaskTimelineActionResponse,
+    DataflowTaskTimelineResponse,
     ProjectFilesystemChildrenResponse,
     ProjectFilesystemRootResponse,
     ReplayReadyResponse,
@@ -167,6 +169,29 @@ async def get_worker_cluster_capacity(
 async def get_task(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().get_scan_task(db, task_id, principal)
+
+
+@router.get("/tasks/{task_id}/timeline", response_model=DataflowTaskTimelineResponse)
+async def get_task_timeline(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
+    principal, _ = subject
+    return get_execution_service().get_scan_task_timeline(db, task_id, principal)
+
+
+@router.delete("/tasks/{task_id}/timeline", response_model=DataflowTaskTimelineActionResponse)
+async def clear_task_timeline(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
+    principal, _ = subject
+    return get_execution_service().clear_scan_task_timeline(db, task_id, principal)
+
+
+@router.delete("/tasks/{task_id}/timeline/{event_id}", response_model=DataflowTaskTimelineActionResponse)
+async def delete_task_timeline_event(
+    task_id: str,
+    event_id: str,
+    subject=Depends(get_current_or_machine_subject),
+    db: Session = Depends(get_db),
+):
+    principal, _ = subject
+    return get_execution_service().delete_scan_task_timeline_event(db, task_id, event_id, principal)
 
 
 @router.get("/tasks/{task_id}/replay-ready", response_model=ReplayReadyResponse)

@@ -214,6 +214,7 @@ class ScanTaskResponse(BaseModel):
     profile_version: int
     title: str = ""
     status: str
+    control_state: str = "none"
     latest_attempt_no: int
     retry_count: int
     max_retry_count: int
@@ -291,6 +292,33 @@ class ScanTaskDetailResponse(ScanTaskResponse):
     workspace_root: Optional[str] = None
     attempts: List[ScanTaskAttemptResponse] = Field(default_factory=list)
     abnormal_reason_history: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class DataflowTaskTimelineEvent(BaseModel):
+    id: str
+    task_id: str
+    project_id: str
+    execution_id: str
+    attempt_no: Optional[int] = None
+    stage_name: Optional[str] = None
+    stage_key: Optional[str] = None
+    event_type: str
+    level: str = "info"
+    message: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class DataflowTaskTimelineResponse(BaseModel):
+    task_id: str
+    items: List[DataflowTaskTimelineEvent] = Field(default_factory=list)
+
+
+class DataflowTaskTimelineActionResponse(BaseModel):
+    status: str = "success"
+    task_id: str
+    message: str
+    deleted_event_count: int = 0
 
 
 class ProjectEffectiveConfigResponse(BaseModel):
@@ -460,6 +488,7 @@ class RunMutationResponse(BaseModel):
     run_id: str
     project_id: str
     status: str
+    control_state: str = "none"
     message: str
     linked_task_id: Optional[str] = None
     linked_execution_id: Optional[str] = None
