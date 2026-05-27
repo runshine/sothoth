@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -8,6 +9,7 @@ from sqlalchemy import JSON, Boolean, Column, DateTime, Float, ForeignKey, Index
 from sqlalchemy.engine import Connection
 from sqlalchemy.dialects.mysql import DOUBLE, MEDIUMTEXT
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.exc import OperationalError
 
 from app.config import get_config
 from app.time_utils import now_local
@@ -1035,6 +1037,18 @@ def _database_init_lock_name() -> str:
     return f"{_prefix('schema_init')}_lock"
 
 
+def _is_mysql_concurrent_ddl_error(exc: Exception) -> bool:
+    if not isinstance(exc, OperationalError):
+        return False
+    original = getattr(exc, "orig", None)
+    if original is None:
+        return False
+    args = getattr(original, "args", ())
+    code = args[0] if args else None
+    message = str(args[1] if len(args) > 1 else original)
+    return code == 1684 or "concurrent DDL statement" in message
+
+
 def _init_database_with_mysql_lock() -> None:
     engine = get_engine()
     with engine.connect() as connection:
@@ -1059,7 +1073,20 @@ def _init_database_with_mysql_lock() -> None:
 def init_database() -> None:
     engine = get_engine()
     if engine.dialect.name == "mysql":
-        _init_database_with_mysql_lock()
+        retry_delays = (0.0, 1.0, 2.0, 4.0, 8.0)
+        last_error: Exception | None = None
+        for delay_seconds in retry_delays:
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+            try:
+                _init_database_with_mysql_lock()
+                return
+            except Exception as exc:
+                if not _is_mysql_concurrent_ddl_error(exc):
+                    raise
+                last_error = exc
+        if last_error is not None:
+            raise last_error
         return
     Base.metadata.create_all(bind=engine)
     run_auto_migrations()

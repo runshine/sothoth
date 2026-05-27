@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from sqlalchemy.exc import OperationalError
+
 from app.models import database
 
 
@@ -58,3 +60,25 @@ def test_init_database_uses_mysql_advisory_lock(monkeypatch):
     assert events[3][0] == "migrate"
     assert events[4] == ("commit", None)
     assert events[5][0] == "release_lock"
+
+
+def test_init_database_retries_mysql_concurrent_ddl(monkeypatch):
+    attempts: list[str] = []
+
+    class FakeOrig(Exception):
+        def __init__(self):
+            self.args = (1684, "Table is being modified by concurrent DDL statement")
+
+    def fake_init():
+        attempts.append("call")
+        if attempts.count("call") < 3:
+            raise OperationalError("DESCRIBE test", None, FakeOrig())
+
+    fake_engine = SimpleNamespace(dialect=SimpleNamespace(name="mysql"))
+    monkeypatch.setattr(database, "get_engine", lambda: fake_engine)
+    monkeypatch.setattr(database, "_init_database_with_mysql_lock", fake_init)
+    monkeypatch.setattr(database.time, "sleep", lambda seconds: attempts.append(f"sleep:{seconds}"))
+
+    database.init_database()
+
+    assert attempts == ["call", "sleep:1.0", "call", "sleep:2.0", "call"]
