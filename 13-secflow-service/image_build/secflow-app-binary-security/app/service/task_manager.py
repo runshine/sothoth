@@ -16820,9 +16820,6 @@ class TaskManager:
                 item.error_message = error
                 session.commit()
                 return {"status": "archive_blocked", "error": error, "item": entry, "archive_blocked": True}
-            archived_dataflow_dir = self._resolve_dataflow_directory(archived_dir)
-            if archived_dataflow_dir is None:
-                raise ValidationError(f"数据流分析归档产物缺少 dataflow 目录: {archived_dir}")
             archived_data_flow_file = self._find_first(archived_dir, [r"final_report\.md", r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"])
             result = self._build_dataflow_output_contract(
                 entry,
@@ -16833,7 +16830,7 @@ class TaskManager:
                 source_dir=source_root_path,
                 source_file=self._compress_source_file_hint(normalized_source_file),
                 data_flow_file="",
-                dataflow_dir=str(archived_dataflow_dir),
+                dataflow_dir=str(archived_dir),
             )
             result["downstream"] = self._lightweight_downstream_payload(payload)
             item.result = self._compact_result_for_storage(stage_run.stage_name, result)

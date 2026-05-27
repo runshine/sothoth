@@ -4302,8 +4302,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                         "line_no": "10",
                         "source_dir": "/tmp/archive/openssl",
                         "data_flow_file": "/tmp/archive/openssl/dataflow.md",
-                        "dataflow_dir": "/tmp/archive/openssl/dataflow",
-                        "artifact_root": "/tmp/archive/openssl/dataflow",
+                        "dataflow_dir": "/tmp/archive/openssl",
+                        "artifact_root": "/tmp/archive/openssl",
                         "downstream": {"items": [{"blob": "z" * 4000}]},
                     },
                 }
@@ -4314,7 +4314,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         stored = task.summary["dataflow_results"][0]
         self.assertEqual("/tmp/archive/openssl/dataflow.md", stored["data_flow_file"])
         self.assertEqual("/tmp/archive/openssl", stored["source_dir"])
-        self.assertEqual("/tmp/archive/openssl/dataflow", stored["dataflow_dir"])
+        self.assertEqual("/tmp/archive/openssl", stored["dataflow_dir"])
         self.assertNotIn("downstream", stored)
 
     def test_vuln_results_store_only_archive_summary(self):
@@ -14359,7 +14359,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             "module_name": "module-1",
             "data_flow_file": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1/final_report.md",
             "primary_report_path": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1/final_report.md",
-            "dataflow_dir": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1/dataflow",
+            "dataflow_dir": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1",
             "source_dir": ".",
             "source_root_path": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/binary-to-source/modules/module-1",
             "module_input_path": "/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/binary-to-source/modules/module-1",
@@ -14401,7 +14401,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("success", result["status"])
         self.assertEqual(1, len(create_calls))
-        self.assertEqual("/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1/dataflow", create_calls[0]["data_flow_path"])
+        self.assertEqual("/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1", create_calls[0]["data_flow_path"])
 
     def test_validate_dataflow_output_contract_requires_dataflow_dir(self):
         payload = {
