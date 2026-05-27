@@ -6023,7 +6023,7 @@ class ExecutionService:
             linked_execution=execution,
             linked_task=trigger,
             profile_id=definition.id,
-            status_text="queued",
+            status_text="pending",
         )
         db.commit()
         self.record_event(
@@ -6043,7 +6043,7 @@ class ExecutionService:
             run_id=run_index.id,
             project_id=run_index.project_id,
             status_text=_canonical_task_status(run_index.status),
-            message="Run resume started",
+            message="Run resume queued",
             linked_task_id=trigger.id,
             linked_execution_id=execution.id,
             control_state="none",

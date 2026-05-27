@@ -961,7 +961,6 @@ def test_run_detail_latest_issues_prefers_latest_review_feedback(tmp_path):
 def test_run_retry_queue_cancel_and_delete(service_config_path, monkeypatch):
     app = create_app()
     client = TestClient(app)
-    monkeypatch.setattr(get_scheduler_service(), "start_execution_now", lambda execution_id: False)
     monkeypatch.setattr(
         type(get_execution_service()),
         "_preflight_run_resume",
@@ -977,6 +976,7 @@ def test_run_retry_queue_cancel_and_delete(service_config_path, monkeypatch):
     assert completed_retry_response.status_code == 202
     retry_payload = completed_retry_response.json()
     assert retry_payload["status"] == "pending"
+    assert retry_payload["message"] == "Run resume queued"
     assert retry_payload["linked_task_id"]
     assert retry_payload["linked_execution_id"]
 

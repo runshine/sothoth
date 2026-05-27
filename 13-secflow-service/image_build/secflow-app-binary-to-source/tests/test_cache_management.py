@@ -248,8 +248,7 @@ def test_delete_cache_entry_cleans_orphan_record(db_session, monkeypatch):
     assert session.query(B2SAnalysisCache).filter(B2SAnalysisCache.cache_key == row.cache_key).first() is None
 
 
-@pytest.mark.asyncio
-async def test_cache_routes_support_list_detail_and_batch_delete(db_session, monkeypatch):
+def test_cache_routes_support_list_detail_and_batch_delete(db_session, monkeypatch):
     session, tmp_path = db_session
     service = B2SCacheService()
     monkeypatch.setattr("app.service.cache_service.get_config", lambda: SimpleNamespace(cache=SimpleNamespace(enabled=True, root_dir=str(tmp_path), materialize_mode="copy")))
@@ -260,19 +259,28 @@ async def test_cache_routes_support_list_detail_and_batch_delete(db_session, mon
     session.add_all([row_a, row_b])
     session.commit()
 
-    listing = await tasks_api.list_b2s_cache(
+    listing = tasks_api.list_b2s_cache(
         "p1",
+        limit=100,
+        offset=0,
         include_all_projects=False,
+        mode=None,
+        status="ready",
+        cache_key=None,
+        elf_basename=None,
+        source_task_id=None,
+        source_item_id=None,
+        has_hits=None,
         _=user,
         db=session,
     )
     assert listing.total == 1
     assert listing.items[0].cache_key == row_a.cache_key
 
-    detail = await tasks_api.get_b2s_cache_detail("p1", row_a.cache_key, _=user, db=session)
+    detail = tasks_api.get_b2s_cache_detail("p1", row_a.cache_key, _=user, db=session)
     assert detail.cache_key == row_a.cache_key
 
-    batch = await tasks_api.batch_delete_b2s_cache_entries(
+    batch = tasks_api.batch_delete_b2s_cache_entries(
         "p1",
         payload=B2SCacheBatchDeleteRequest(cache_keys=[row_a.cache_key, "bad-key"]),
         _=user,
@@ -283,4 +291,4 @@ async def test_cache_routes_support_list_detail_and_batch_delete(db_session, mon
     assert any(item.status == "invalid_key" for item in batch.results)
 
     with pytest.raises(NotFoundError):
-        await tasks_api.get_b2s_cache_detail("p1", row_a.cache_key, _=user, db=session)
+        tasks_api.get_b2s_cache_detail("p1", row_a.cache_key, _=user, db=session)

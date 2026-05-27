@@ -62,7 +62,7 @@ class SchedulerService:
     @property
     def role(self) -> str:
         role = str(get_config().scheduler.role or "standalone").strip().lower()
-        return role if role in {"standalone", "manager", "worker"} else "standalone"
+        return role if role in {"standalone", "api", "manager", "worker"} else "standalone"
 
     @property
     def is_worker_role(self) -> bool:
@@ -74,7 +74,7 @@ class SchedulerService:
 
     @property
     def is_manager_role(self) -> bool:
-        return self.role == "manager"
+        return self.role in {"standalone", "manager"}
 
     @property
     def runs_worker(self) -> bool:
@@ -908,7 +908,15 @@ class SchedulerService:
     def start_execution_now(self, execution_id: str | None) -> bool:
         if not execution_id or execution_id in self._running_tasks:
             return False
-        if self.is_manager_role:
+        if self.role == "standalone":
+            if self._worker_status != "active" or not self.has_available_capacity():
+                return False
+            claimed_execution_id = self._claim_execution_now(execution_id)
+            if not claimed_execution_id:
+                return False
+            self._schedule_execution_thread(claimed_execution_id)
+            return True
+        if self.role == "manager":
             return self._dispatch_execution_to_worker(execution_id)
         if self.role == "worker":
             return False

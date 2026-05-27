@@ -38,7 +38,9 @@ def _default_workers() -> int:
 def build_gunicorn_argv() -> list[str]:
     config = get_config()
     workers = _env_int("GUNICORN_WORKERS", _default_workers())
-    threads = _env_int("GUNICORN_THREADS", 512)
+    # Keep request concurrency high enough for list/query APIs while avoiding
+    # the runaway memory and context-switch overhead of the historical 512-thread default.
+    threads = _env_int("GUNICORN_THREADS", 128)
     timeout = _env_int("GUNICORN_TIMEOUT", 600)
     keepalive = _env_int("GUNICORN_KEEPALIVE", 10)
 

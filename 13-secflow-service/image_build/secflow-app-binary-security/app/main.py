@@ -247,6 +247,33 @@ async def prometheus_http_middleware(request: FastAPIRequest, call_next):
         observe_http_request_inflight(request.method, normalized_route, -1)
 
 
+@app.middleware("http")
+async def service_role_route_guard(request: FastAPIRequest, call_next):
+    role = _service_role()
+    if role in {"worker", "reducer"}:
+        path = request.url.path
+        allowed = (
+            path in {
+                "/api/app/binary-security/health",
+                "/api/app/binary-security/ready",
+                "/api/app/binary-security/metrics",
+                "/api/app/binary-security/metrics/aggregate",
+                "/api/app/binary-security/metrics/reducer",
+                "/metrics",
+                "/openapi.json",
+            }
+            or path.startswith("/docs")
+            or path.startswith("/redoc")
+        )
+        if not allowed:
+            return Response(
+                content=json.dumps({"detail": "not found"}),
+                media_type="application/json",
+                status_code=404,
+            )
+    return await call_next(request)
+
+
 @app.get("/metrics", include_in_schema=False)
 @app.get("/api/app/binary-security/metrics", include_in_schema=False)
 async def metrics_endpoint():

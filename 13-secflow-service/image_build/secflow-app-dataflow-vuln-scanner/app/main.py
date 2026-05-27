@@ -47,15 +47,17 @@ async def lifespan(app: FastAPI):
             conn.exec_driver_sql("SELECT 1")
         await get_auth_service().startup_validate()
         get_project_service().startup_validate()
-        if role != "worker":
+        if role in {"standalone", "api"}:
             await get_registry_service().start()
-        await get_scheduler_service().start()
+        if role != "api":
+            await get_scheduler_service().start()
 
     await get_runtime_bootstrap().start(_after_db_ready)
     yield
     await get_runtime_bootstrap().stop()
-    await get_scheduler_service().stop()
-    if role != "worker":
+    if role != "api":
+        await get_scheduler_service().stop()
+    if role in {"standalone", "api"}:
         await get_registry_service().stop()
 
 
@@ -69,21 +71,36 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def worker_role_route_guard(request, call_next):
-        if get_scheduler_service().role == "worker":
+        role = get_scheduler_service().role
+        if role in {"worker", "manager"}:
             path = request.url.path
-            allowed = (
-                path.startswith("/api/v1/jobs")
-                or path in {
-                    "/api/dataflow-vuln-scanner/health",
-                    "/api/dataflow-vuln-scanner/ready",
-                    "/api/dataflow-vuln-scanner/workers/cluster-capacity",
-                    "/api/app/dataflow-vuln-scanner/metrics",
-                    "/metrics",
-                    "/openapi.json",
-                }
-                or path.startswith("/docs")
-                or path.startswith("/redoc")
-            )
+            if role == "worker":
+                allowed = (
+                    path.startswith("/api/v1/jobs")
+                    or path in {
+                        "/api/dataflow-vuln-scanner/health",
+                        "/api/dataflow-vuln-scanner/ready",
+                        "/api/dataflow-vuln-scanner/workers/cluster-capacity",
+                        "/api/app/dataflow-vuln-scanner/metrics",
+                        "/metrics",
+                        "/openapi.json",
+                    }
+                    or path.startswith("/docs")
+                    or path.startswith("/redoc")
+                )
+            else:
+                allowed = (
+                    path.startswith("/api/dataflow-vuln-scanner/admin")
+                    or path in {
+                        "/api/dataflow-vuln-scanner/health",
+                        "/api/dataflow-vuln-scanner/ready",
+                        "/api/app/dataflow-vuln-scanner/metrics",
+                        "/metrics",
+                        "/openapi.json",
+                    }
+                    or path.startswith("/docs")
+                    or path.startswith("/redoc")
+                )
             if not allowed:
                 return JSONResponse(status_code=404, content={"detail": "not found"})
         return await call_next(request)

@@ -132,7 +132,12 @@ async def _effective_llm_provider_summary(provider_key: str | None) -> dict | No
 
 @router.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "secflow-app-binary-to-source", **build_service_meta()}
+    return {
+        "status": "ok",
+        "service": "secflow-app-binary-to-source",
+        "role": str(__import__("os").environ.get("SECFLOW_B2S_ROLE") or "all").strip().lower() or "all",
+        **build_service_meta(),
+    }
 
 
 @router.get("/ready")
@@ -195,7 +200,7 @@ async def save_b2s_config(
 
 
 @router.get("/projects/{project_id}/cache", response_model=B2SCacheListResponse)
-async def list_b2s_cache(
+def list_b2s_cache(
     project_id: str,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
@@ -228,7 +233,7 @@ async def list_b2s_cache(
 
 
 @router.get("/projects/{project_id}/cache/{cache_key}", response_model=B2SCacheDetailResponse)
-async def get_b2s_cache_detail(
+def get_b2s_cache_detail(
     project_id: str,
     cache_key: str,
     _: TokenUser = Depends(get_current_context),
@@ -245,7 +250,7 @@ async def get_b2s_cache_detail(
 
 
 @router.delete("/projects/{project_id}/cache/{cache_key}", response_model=B2SCacheDeleteResponse)
-async def delete_b2s_cache_entry(
+def delete_b2s_cache_entry(
     project_id: str,
     cache_key: str,
     _: TokenUser = Depends(get_current_context),
@@ -265,7 +270,7 @@ async def delete_b2s_cache_entry(
 
 
 @router.post("/projects/{project_id}/cache/batch-delete", response_model=B2SCacheBatchDeleteResponse)
-async def batch_delete_b2s_cache_entries(
+def batch_delete_b2s_cache_entries(
     project_id: str,
     payload: B2SCacheBatchDeleteRequest,
     _: TokenUser = Depends(get_current_context),
@@ -280,7 +285,7 @@ async def batch_delete_b2s_cache_entries(
 
 
 @router.get("/projects/{project_id}/tasks", response_model=TaskListResponse)
-async def list_tasks(
+def list_tasks(
     project_id: str,
     status: Optional[str] = Query(None),
     parent_task_id: Optional[str] = Query(None),
@@ -426,7 +431,7 @@ def _merge_worker_error(worker_error: str | None, detail_error: str | None) -> s
 
 
 @router.post("/projects/{project_id}/tasks/prepare", response_model=TaskPrepareResponse)
-async def prepare_b2s_task(
+def prepare_b2s_task(
     project_id: str,
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
@@ -446,7 +451,7 @@ async def create_b2s_task(
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}", response_model=TaskDetailResponse)
-async def get_b2s_task(
+def get_b2s_task(
     project_id: str,
     task_id: str,
     _: TokenUser = Depends(get_current_context),
@@ -457,7 +462,7 @@ async def get_b2s_task(
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/timeline", response_model=B2STaskTimelineResponse)
-async def get_b2s_task_timeline(
+def get_b2s_task_timeline(
     project_id: str,
     task_id: str,
     _: TokenUser = Depends(get_current_context),
@@ -468,7 +473,7 @@ async def get_b2s_task_timeline(
 
 
 @router.delete("/projects/{project_id}/tasks/{task_id}/timeline", response_model=ActionResponse)
-async def clear_b2s_task_timeline(
+def clear_b2s_task_timeline(
     project_id: str,
     task_id: str,
     _: TokenUser = Depends(get_current_context),
@@ -481,7 +486,7 @@ async def clear_b2s_task_timeline(
 
 
 @router.delete("/projects/{project_id}/tasks/{task_id}/timeline/{event_id}", response_model=ActionResponse)
-async def delete_b2s_task_timeline_event(
+def delete_b2s_task_timeline_event(
     project_id: str,
     task_id: str,
     event_id: str,
@@ -495,7 +500,7 @@ async def delete_b2s_task_timeline_event(
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/sessions", response_model=SessionIndexResponse)
-async def get_b2s_task_sessions(
+def get_b2s_task_sessions(
     project_id: str,
     task_id: str,
     _: TokenUser = Depends(get_current_context),
@@ -506,7 +511,7 @@ async def get_b2s_task_sessions(
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/sessions/file", response_model=SessionFileResponse)
-async def get_b2s_task_session_file(
+def get_b2s_task_session_file(
     project_id: str,
     task_id: str,
     path: str = Query(...),
@@ -523,7 +528,7 @@ async def get_b2s_task_session_file(
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/agent-sessions/runtime", response_model=B2SAgentSessionRuntimeResponse)
-async def get_b2s_task_agent_sessions_runtime(
+def get_b2s_task_agent_sessions_runtime(
     project_id: str,
     task_id: str,
     _: TokenUser = Depends(get_current_context),
@@ -535,7 +540,7 @@ async def get_b2s_task_agent_sessions_runtime(
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/relationships", response_model=TaskRelationshipResponse)
-async def get_b2s_task_relationships(
+def get_b2s_task_relationships(
     project_id: str,
     task_id: str,
     _: TokenUser = Depends(get_current_context),
@@ -547,7 +552,7 @@ async def get_b2s_task_relationships(
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/result", response_model=TaskResultSummary)
-async def get_b2s_task_result(
+def get_b2s_task_result(
     project_id: str,
     task_id: str,
     _: TokenUser = Depends(get_current_context),
@@ -559,7 +564,7 @@ async def get_b2s_task_result(
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/observability", response_model=TaskObservabilitySummary)
-async def get_b2s_task_observability(
+def get_b2s_task_observability(
     project_id: str,
     task_id: str,
     _: TokenUser = Depends(get_current_context),
@@ -571,7 +576,7 @@ async def get_b2s_task_observability(
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/items/{item_id}/observability", response_model=TaskObservabilitySummary)
-async def get_b2s_task_item_observability(
+def get_b2s_task_item_observability(
     project_id: str,
     task_id: str,
     item_id: str,
@@ -584,7 +589,7 @@ async def get_b2s_task_item_observability(
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/items/{item_id}/advanced", response_model=TaskItemAdvancedResponse)
-async def get_b2s_task_item_advanced(
+def get_b2s_task_item_advanced(
     project_id: str,
     task_id: str,
     item_id: str,
@@ -598,7 +603,7 @@ async def get_b2s_task_item_advanced(
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/items/{item_id}/artifacts", response_model=TaskItemArtifactsResponse)
-async def get_b2s_task_item_artifacts(
+def get_b2s_task_item_artifacts(
     project_id: str,
     task_id: str,
     item_id: str,
@@ -611,7 +616,7 @@ async def get_b2s_task_item_artifacts(
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/items/{item_id}/artifacts/{artifact_id}/content", response_model=B2SArtifactContentResponse)
-async def get_b2s_task_item_artifact_content(
+def get_b2s_task_item_artifact_content(
     project_id: str,
     task_id: str,
     item_id: str,
@@ -627,7 +632,7 @@ async def get_b2s_task_item_artifact_content(
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/items/{item_id}/review-analytics", response_model=ReviewAnalyticsResponse)
-async def get_b2s_task_item_review_analytics(
+def get_b2s_task_item_review_analytics(
     project_id: str,
     task_id: str,
     item_id: str,

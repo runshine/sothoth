@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import os
 import tempfile
 import unittest
@@ -214,15 +213,12 @@ class AgentSessionRuntimeApiTests(unittest.TestCase):
         item = _item(1, status="queued")
         response = task_service.build_task_agent_session_runtime([item])
 
-        async def _run():
-            with (
-                mock.patch.object(task_api, "get_task_or_404", return_value=task),
-                mock.patch.object(task_api, "query_items", return_value=[item]),
-                mock.patch.object(task_api, "build_task_agent_session_runtime", return_value=response),
-            ):
-                return await task_api.get_b2s_task_agent_sessions_runtime("project-1", "task-1", _token(), mock.Mock())
-
-        payload = asyncio.run(_run())
+        with (
+            mock.patch.object(task_api, "get_task_or_404", return_value=task),
+            mock.patch.object(task_api, "query_items", return_value=[item]),
+            mock.patch.object(task_api, "build_task_agent_session_runtime", return_value=response),
+        ):
+            payload = task_api.get_b2s_task_agent_sessions_runtime("project-1", "task-1", _token(), mock.Mock())
         self.assertEqual("task-1", payload.task_id)
         self.assertEqual(response.summary.total_sessions, payload.summary.total_sessions)
 

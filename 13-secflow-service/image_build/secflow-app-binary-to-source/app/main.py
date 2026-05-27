@@ -32,6 +32,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _service_role() -> str:
+    raw_role = os.environ.get("SECFLOW_B2S_ROLE") or ""
+    normalized = str(raw_role).strip().lower()
+    return normalized if normalized in {"api", "worker"} else "all"
+
+
+def _api_enabled() -> bool:
+    return _service_role() in {"all", "api"}
+
+
+def _worker_enabled() -> bool:
+    return _service_role() in {"all", "worker"}
+
+
 def verify_auth_service_or_exit() -> None:
     """Verify inter-service machine token before accepting traffic."""
     cfg = get_config().auth_service
@@ -84,18 +98,22 @@ async def lifespan(_: FastAPI):
             conn.exec_driver_sql("SELECT 1")
         verify_auth_service_or_exit()
         await materialize_llm_provider()
-        await get_registry_service().start()
-        get_dispatcher().start()
-        get_task_syncer().start()
+        if _api_enabled():
+            await get_registry_service().start()
+        if _worker_enabled():
+            get_dispatcher().start()
+            get_task_syncer().start()
     except Exception as exc:
         logger.exception("B2S服务启动失败: %s", exc)
         sys.exit(1)
     logger.info("SecFlow B2S后端适配服务启动成功")
     yield
     try:
-        await get_task_syncer().stop()
-        await get_dispatcher().stop()
-        await get_registry_service().stop()
+        if _worker_enabled():
+            await get_task_syncer().stop()
+            await get_dispatcher().stop()
+        if _api_enabled():
+            await get_registry_service().stop()
     except Exception as exc:
         logger.warning("注销Menu注册中心失败: %s", exc)
     logger.info("SecFlow B2S后端适配服务已关闭")
@@ -116,6 +134,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.middleware("http")(get_observability().http_middleware)
+
+
+@app.middleware("http")
+async def worker_role_route_guard(request, call_next):
+    if _service_role() == "worker":
+        path = request.url.path
+        allowed = (
+            path in {
+                "/api/app/binary-to-source/health",
+                "/api/app/binary-to-source/ready",
+                "/api/app/binary-to-source/metrics",
+                "/metrics",
+                "/openapi.json",
+            }
+            or path.startswith("/docs")
+            or path.startswith("/redoc")
+        )
+        if not allowed:
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(status_code=404, content={"detail": "not found"})
+    return await call_next(request)
 
 setup_exception_handlers(app)
 app.include_router(router)

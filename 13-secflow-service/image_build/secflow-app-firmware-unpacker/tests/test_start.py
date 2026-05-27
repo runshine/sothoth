@@ -10,7 +10,7 @@ from app.start import build_gunicorn_argv
 
 
 class StartScriptTests(unittest.TestCase):
-    def test_build_gunicorn_argv_defaults_to_512_threads(self):
+    def test_build_gunicorn_argv_defaults_to_128_threads(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_path = root / "config.yaml"
@@ -33,7 +33,7 @@ class StartScriptTests(unittest.TestCase):
                 if old_value is not None:
                     os.environ["GUNICORN_THREADS"] = old_value
 
-        self.assertEqual("512", argv[argv.index("--threads") + 1])
+        self.assertEqual("128", argv[argv.index("--threads") + 1])
 
     def test_build_gunicorn_argv_uses_gthread_wsgi_entrypoint(self):
         with tempfile.TemporaryDirectory() as tmp:

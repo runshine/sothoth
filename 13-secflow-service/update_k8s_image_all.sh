@@ -128,84 +128,47 @@ resolve_target_image() {
   echo "$(image_repo "${current_image}"):${requested}"
 }
 
-image_exists() {
-  local image="${1:-}"
-  [[ -n "${image}" ]] || return 1
-
-  if command -v docker >/dev/null 2>&1; then
-    docker manifest inspect "${image}" >/dev/null 2>&1 && return 0
-  fi
-
-  if command -v crane >/dev/null 2>&1; then
-    crane manifest "${image}" >/dev/null 2>&1 && return 0
-  fi
-
-  if command -v skopeo >/dev/null 2>&1; then
-    skopeo inspect "docker://${image}" >/dev/null 2>&1 && return 0
-  fi
-
-  return 1
-}
-
-assert_image_exists() {
-  local image="${1:-}"
-  local source_label="${2:-image}"
-  [[ -n "${image}" ]] || return 0
-
-  if [[ -n "${VALIDATED_IMAGES[${image}]+x}" ]]; then
-    return 0
-  fi
-
-  echo "[INFO] Validating ${source_label}: ${image}"
-  if ! image_exists "${image}"; then
-    echo "[ERROR] Image not found or registry metadata is unreachable: ${image}"
-    echo "        Refusing to continue before mutating Kubernetes resources."
-    echo "        Hint: confirm the image tag exists in GHCR, or pass an explicit image/tag that has been built."
-    exit 1
-  fi
-
-  VALIDATED_IMAGES["${image}"]=1
-}
-
-update_deployment_container() {
-  local deployment="${1:-}"
-  local container="${2:-}"
-  local current_image="${3:-}"
-  local requested="${4:-}"
+update_workload_container() {
+  local workload_kind="${1:-}"
+  local workload_name="${2:-}"
+  local container="${3:-}"
+  local current_image="${4:-}"
+  local requested="${5:-}"
   local target_image
   target_image="$(resolve_target_image "${current_image}" "${requested}")"
   if [[ "${target_image}" == "${current_image}" ]]; then
-    echo "[INFO] ${deployment}/${container} already uses ${current_image}"
+    echo "[INFO] ${workload_name}/${container} already uses ${current_image}"
     return 0
   fi
-  assert_image_exists "${target_image}" "${deployment}/${container}"
-  echo "[INFO] Updating ${deployment}/${container}"
+  echo "[INFO] Updating ${workload_name}/${container}"
   echo "       ${current_image} -> ${target_image}"
-  kubectl -n "${NAMESPACE}" set image deployment/"${deployment}" "${container}"="${target_image}" >/dev/null
+  kubectl -n "${NAMESPACE}" set image "${workload_kind}/${workload_name}" "${container}"="${target_image}" >/dev/null
 }
 
-deployment_exists() {
-  local deployment="${1:-}"
-  kubectl -n "${NAMESPACE}" get deployment "${deployment}" >/dev/null 2>&1
+workload_exists() {
+  local workload_kind="${1:-}"
+  local workload_name="${2:-}"
+  kubectl -n "${NAMESPACE}" get "${workload_kind}" "${workload_name}" >/dev/null 2>&1
 }
 
 maybe_set_explicit_image() {
-  local deployment="${1:-}"
+  local workload_name="${1:-}"
   local container="${2:-}"
   local target_image="${3:-}"
-  [[ -n "${deployment}" && -n "${container}" && -n "${target_image}" ]] || return 0
-  deployment_exists "${deployment}" || return 0
+  local workload_kind="${4:-deployment}"
+  [[ -n "${workload_name}" && -n "${container}" && -n "${target_image}" ]] || return 0
+  workload_exists "${workload_kind}" "${workload_name}" || return 0
   local current_image
-  current_image="$(kubectl -n "${NAMESPACE}" get deployment "${deployment}" -o jsonpath="{.spec.template.spec.containers[?(@.name=='${container}')].image}" 2>/dev/null || true)"
+  current_image="$(kubectl -n "${NAMESPACE}" get "${workload_kind}" "${workload_name}" -o jsonpath="{.spec.template.spec.containers[?(@.name=='${container}')].image}" 2>/dev/null || true)"
   [[ -n "${current_image}" ]] || return 0
-  update_deployment_container "${deployment}" "${container}" "${current_image}" "${target_image}"
+  update_workload_container "${workload_kind}" "${workload_name}" "${container}" "${current_image}" "${target_image}"
 }
 
 scale_deployment_if_exists() {
   local deployment="${1:-}"
   local replicas="${2:-}"
   [[ -n "${deployment}" && -n "${replicas}" ]] || return 0
-  deployment_exists "${deployment}" || return 0
+  workload_exists "deployment" "${deployment}" || return 0
   echo "[INFO] Scaling ${deployment} to ${replicas} replicas"
   kubectl -n "${NAMESPACE}" scale deployment "${deployment}" --replicas="${replicas}" >/dev/null
 }
@@ -297,8 +260,6 @@ RESOURCE_IMAGE="$(resolve_image "${RESOURCE_IMAGE_ARG}" "${RESOURCE_IMAGE_REPO}"
 GATEWAY_WORKER_IMAGE="$(resolve_image "${GATEWAY_WORKER_IMAGE_ARG}" "${GATEWAY_WORKER_IMAGE_REPO}")"
 FW_UNPACKER_IMAGE="$(resolve_image "${FW_UNPACKER_IMAGE_ARG}" "${FW_UNPACKER_IMAGE_REPO}")"
 
-declare -A VALIDATED_IMAGES=()
-
 if [[ -f "${SCRIPT_DIR}/images.env" ]]; then
   # shellcheck disable=SC1091
   source "${SCRIPT_DIR}/images.env"
@@ -347,10 +308,10 @@ maybe_set_explicit_image "secflow-app-firmware-unpacker-api" "secflow-app-firmwa
 maybe_set_explicit_image "secflow-app-firmware-unpacker-dispatcher" "secflow-app-firmware-unpacker" "${FW_UNPACKER_IMAGE}"
 maybe_set_explicit_image "secflow-app-firmware-unpacker-cleanup" "secflow-app-firmware-unpacker" "${FW_UNPACKER_IMAGE}"
 
-echo "[INFO] Scanning deployments in namespace: ${NAMESPACE}"
-while IFS=$'\t' read -r deployment containers; do
-  [[ -n "${deployment}" ]] || continue
-  [[ "${deployment}" == secflow-* ]] || continue
+echo "[INFO] Scanning workloads in namespace: ${NAMESPACE}"
+while IFS=$'\t' read -r workload_kind workload_name containers; do
+  [[ -n "${workload_name}" ]] || continue
+  [[ "${workload_name}" == secflow-* ]] || continue
   IFS=';' read -ra pairs <<< "${containers}"
   for pair in "${pairs[@]}"; do
     [[ -n "${pair}" ]] || continue
@@ -361,7 +322,7 @@ while IFS=$'\t' read -r deployment containers; do
       continue
     fi
     requested_tag="${GLOBAL_TAG}"
-    case "${deployment}:${container}" in
+    case "${workload_name}:${container}" in
       "${B2S_MANAGER_DEPLOYMENT}:${B2S_MANAGER_CONTAINER}"|"${B2S_WORKER_DEPLOYMENT}:${B2S_WORKER_CONTAINER}")
         [[ -n "${B2S_IMAGE}" ]] && requested_tag="${B2S_IMAGE}"
         ;;
@@ -390,27 +351,37 @@ while IFS=$'\t' read -r deployment containers; do
         [[ -n "${FW_UNPACKER_IMAGE}" ]] && requested_tag="${FW_UNPACKER_IMAGE}"
         ;;
     esac
-    update_deployment_container "${deployment}" "${container}" "${current_image}" "${requested_tag}"
+    update_workload_container "${workload_kind}" "${workload_name}" "${container}" "${current_image}" "${requested_tag}"
   done
 done < <(
-  kubectl -n "${NAMESPACE}" get deploy \
-    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.template.spec.containers[*]}{.name}{"="}{.image}{";"}{end}{"\n"}{end}'
+  {
+    kubectl -n "${NAMESPACE}" get deploy \
+      -o jsonpath='{range .items[*]}{"deployment"}{"\t"}{.metadata.name}{"\t"}{range .spec.template.spec.containers[*]}{.name}{"="}{.image}{";"}{end}{"\n"}{end}'
+    kubectl -n "${NAMESPACE}" get sts \
+      -o jsonpath='{range .items[*]}{"statefulset"}{"\t"}{.metadata.name}{"\t"}{range .spec.template.spec.containers[*]}{.name}{"="}{.image}{";"}{end}{"\n"}{end}'
+  }
 )
 
-echo "[INFO] Forcing rollout restart for secflow deployments"
-while IFS= read -r deployment; do
-  [[ -n "${deployment}" ]] || continue
-  kubectl -n "${NAMESPACE}" rollout restart "deployment/${deployment}"
+echo "[INFO] Forcing rollout restart for secflow workloads"
+while IFS=$'\t' read -r workload_kind workload_name; do
+  [[ -n "${workload_name}" ]] || continue
+  kubectl -n "${NAMESPACE}" rollout restart "${workload_kind}/${workload_name}"
 done < <(
-  kubectl -n "${NAMESPACE}" get deploy -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep '^secflow-'
+  {
+    kubectl -n "${NAMESPACE}" get deploy -o jsonpath='{range .items[*]}{"deployment"}{"\t"}{.metadata.name}{"\n"}{end}'
+    kubectl -n "${NAMESPACE}" get sts -o jsonpath='{range .items[*]}{"statefulset"}{"\t"}{.metadata.name}{"\n"}{end}'
+  } | grep $'^.*\tsecflow-'
 )
 
-echo "[INFO] Waiting for secflow deployments to finish rollout"
-while IFS= read -r deployment; do
-  [[ -n "${deployment}" ]] || continue
-  kubectl -n "${NAMESPACE}" rollout status "deployment/${deployment}" --timeout=300s
+echo "[INFO] Waiting for secflow workloads to finish rollout"
+while IFS=$'\t' read -r workload_kind workload_name; do
+  [[ -n "${workload_name}" ]] || continue
+  kubectl -n "${NAMESPACE}" rollout status "${workload_kind}/${workload_name}" --timeout=300s
 done < <(
-  kubectl -n "${NAMESPACE}" get deploy -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep '^secflow-'
+  {
+    kubectl -n "${NAMESPACE}" get deploy -o jsonpath='{range .items[*]}{"deployment"}{"\t"}{.metadata.name}{"\n"}{end}'
+    kubectl -n "${NAMESPACE}" get sts -o jsonpath='{range .items[*]}{"statefulset"}{"\t"}{.metadata.name}{"\n"}{end}'
+  } | grep $'^.*\tsecflow-'
 )
 
 echo "[INFO] Done"
