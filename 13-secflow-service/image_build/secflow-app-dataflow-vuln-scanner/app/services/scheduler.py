@@ -94,7 +94,8 @@ class SchedulerService:
 
     @property
     def capacity(self) -> int:
-        return get_config().scheduler.worker_capacity
+        scheduler_cfg = self.runtime_config.get("scheduler") or {}
+        return int(scheduler_cfg.get("worker_capacity") or get_config().scheduler.worker_capacity or 0)
 
     @property
     def has_unlimited_capacity(self) -> bool:
@@ -177,11 +178,6 @@ class SchedulerService:
             db.close()
 
     @property
-    def discovery_mode(self) -> str:
-        mode = str((self.runtime_config.get("scheduler") or {}).get("discovery_mode") or get_config().scheduler.discovery_mode or "registry").strip().lower()
-        return mode if mode in {"registry", "static_urls", "hybrid"} else "registry"
-
-    @property
     def reservation_lease_seconds(self) -> int:
         return max(5, int((self.runtime_config.get("scheduler") or {}).get("reservation_lease_seconds") or get_config().scheduler.reservation_lease_seconds or 30))
 
@@ -209,16 +205,6 @@ class SchedulerService:
             self.cluster_capacity_summary_refresh_interval_seconds,
             int(scheduler_cfg.get("cluster_capacity_summary_stale_after_seconds") or 15),
         )
-
-    def configured_worker_urls(self) -> list[str]:
-        cfg = get_config().dataflow_worker
-        runtime_cfg = self.runtime_config.get("dataflow_worker") or {}
-        configured_urls = runtime_cfg.get("worker_urls")
-        workers = [url.rstrip("/") for url in (cfg.worker_urls or []) if url and url.strip()]
-        if isinstance(configured_urls, list):
-            workers = [str(url).rstrip("/") for url in configured_urls if str(url).strip()]
-        base_url = str(runtime_cfg.get("base_url") or cfg.base_url or "").rstrip("/")
-        return workers or ([base_url] if base_url else [])
 
     def advertise_url(self) -> str:
         runtime_cfg = self.runtime_config.get("dataflow_worker") or {}
@@ -510,31 +496,11 @@ class SchedulerService:
 
     def _list_worker_jobs_for_capacity(self, worker: SchedulerWorker) -> list[dict[str, Any]]:
         jobs_from_db = self._active_jobs_from_db(worker)
-        worker_url = self._resolve_worker_url(worker, jobs_from_db)
+        worker_url = self._worker_url_from_registry(worker)
         if not worker_url:
             return jobs_from_db
         jobs = get_dataflow_worker_client(worker_url).list_jobs()
         return [job for job in jobs if isinstance(job, dict)]
-
-    def _resolve_worker_url(self, worker: SchedulerWorker, jobs_from_db: list[dict[str, Any]]) -> str | None:
-        urls = self.configured_worker_urls()
-        if not urls:
-            return None
-        if len(urls) == 1:
-            return urls[0]
-        for job in jobs_from_db:
-            worker_url = str(job.get("worker_url") or "").strip().rstrip("/")
-            if worker_url:
-                return worker_url
-        host_name = str(worker.host_name or "").strip().lower()
-        pod_id = str(worker.pod_id or "").strip().lower()
-        for url in urls:
-            normalized = url.lower()
-            if host_name and host_name in normalized:
-                return url
-            if pod_id and pod_id in normalized:
-                return url
-        return urls[0]
 
     def _active_jobs_from_db(self, worker: SchedulerWorker) -> list[dict[str, Any]]:
         db = get_db_session()
@@ -607,8 +573,11 @@ class SchedulerService:
         return str(trigger.id)
 
     async def _heartbeat_loop(self) -> None:
-        interval = get_config().scheduler.heartbeat_interval_seconds
         while True:
+            interval = max(
+                1,
+                int((self.runtime_config.get("scheduler") or {}).get("heartbeat_interval_seconds") or get_config().scheduler.heartbeat_interval_seconds or 5),
+            )
             await asyncio.sleep(interval)
             await asyncio.to_thread(self._heartbeat_once)
 
@@ -656,12 +625,24 @@ class SchedulerService:
             db.add(worker)
             db.commit()
             self._heartbeat_published = True
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "failed to publish scheduler worker heartbeat: pod_id=%s host_name=%s advertise_url=%s",
+                self.pod_id,
+                self.host_name,
+                self.advertise_url(),
+            )
+            raise
         finally:
             db.close()
 
     async def _dispatch_loop(self) -> None:
-        interval = get_config().scheduler.poll_interval_seconds
         while True:
+            interval = max(
+                1,
+                int((self.runtime_config.get("scheduler") or {}).get("poll_interval_seconds") or get_config().scheduler.poll_interval_seconds or 2),
+            )
             await asyncio.sleep(interval)
             if not self.runs_worker:
                 continue
@@ -674,14 +655,20 @@ class SchedulerService:
                 self._schedule_execution(execution_id)
 
     async def _assigned_dispatch_loop(self) -> None:
-        interval = get_config().scheduler.poll_interval_seconds
         while True:
+            interval = max(
+                1,
+                int((self.runtime_config.get("scheduler") or {}).get("poll_interval_seconds") or get_config().scheduler.poll_interval_seconds or 2),
+            )
             await asyncio.sleep(interval)
             await asyncio.to_thread(self._start_assigned_jobs)
 
     async def _manager_dispatch_loop(self) -> None:
-        interval = get_config().scheduler.poll_interval_seconds
         while True:
+            interval = max(
+                1,
+                int((self.runtime_config.get("scheduler") or {}).get("poll_interval_seconds") or get_config().scheduler.poll_interval_seconds or 2),
+            )
             await asyncio.sleep(interval)
             await asyncio.to_thread(self._dispatch_pending_to_workers_once)
 
@@ -997,10 +984,6 @@ class SchedulerService:
         return False
 
     def _choose_dataflow_worker(self, db: Session, execution_id: str) -> tuple[str, str]:
-        if self.discovery_mode == "static_urls":
-            worker_url = self._choose_dataflow_worker_from_urls(db, execution_id)
-            return worker_url, worker_url
-
         workers = self._healthy_registry_workers(db)
         if workers:
             reservations = self._reservation_counts(db)
@@ -1020,35 +1003,7 @@ class SchedulerService:
                 candidates.sort(key=lambda item: (item[0], (hash(item[1]) - salt)))
                 _, worker_pod_id, worker_url = candidates[0]
                 return worker_pod_id, worker_url
-
-        worker_url = self._choose_dataflow_worker_from_urls(db, execution_id)
-        return worker_url, worker_url
-
-    def _choose_dataflow_worker_from_urls(self, db: Session, execution_id: str) -> str:
-        workers = self.configured_worker_urls()
-        if len(workers) == 1:
-            return workers[0]
-
-        counts = {worker: 0 for worker in workers}
-        for worker in workers:
-            try:
-                jobs = get_dataflow_worker_client(worker).list_jobs()
-                counts[worker] += sum(1 for job in jobs if str(job.get("status") or "") in ACTIVE_JOB_STATUSES)
-            except Exception:
-                counts[worker] += 1_000_000
-
-        active_executions = (
-            db.query(WorkflowExecution)
-            .filter(WorkflowExecution.status.in_(list(ACTIVE_JOB_STATUSES)))
-            .all()
-        )
-        for execution in active_executions:
-            worker_url = str(execution.worker_url or "").rstrip("/")
-            if worker_url in counts:
-                counts[worker_url] += 1
-
-        salt = int(hashlib.sha256(execution_id.encode("utf-8")).hexdigest(), 16)
-        return min(enumerate(workers), key=lambda item: (counts[item[1]], (item[0] - salt) % len(workers)))[1]
+        raise DataflowWorkerError("no healthy registry worker with advertise_url is available")
 
     def _healthy_registry_workers(self, db: Session) -> list[SchedulerWorker]:
         timeout_seconds = int((self.runtime_config.get("scheduler") or {}).get("worker_timeout_seconds") or get_config().scheduler.worker_timeout_seconds or 300)
@@ -1068,17 +1023,6 @@ class SchedulerService:
         advertise_url = str(metadata.get("advertise_url") or "").strip()
         if advertise_url:
             return advertise_url.rstrip("/")
-        urls = self.configured_worker_urls()
-        host_name = str(worker.host_name or "").strip().lower()
-        pod_id = str(worker.pod_id or "").strip().lower()
-        for url in urls:
-            normalized = url.lower()
-            if host_name and host_name in normalized:
-                return url
-            if pod_id and pod_id in normalized:
-                return url
-        if self.discovery_mode == "hybrid" and urls:
-            return urls[0]
         return None
 
     def _running_count_for_worker(self, db: Session, worker_pod_id: str) -> int:
@@ -1445,8 +1389,11 @@ class SchedulerService:
         }
 
     async def _cleanup_loop(self) -> None:
-        interval = get_config().scheduler.cleanup_interval_seconds
         while True:
+            interval = max(
+                1,
+                int((self.runtime_config.get("scheduler") or {}).get("cleanup_interval_seconds") or get_config().scheduler.cleanup_interval_seconds or 10),
+            )
             await asyncio.sleep(interval)
             await asyncio.to_thread(self._cleanup_once)
 
