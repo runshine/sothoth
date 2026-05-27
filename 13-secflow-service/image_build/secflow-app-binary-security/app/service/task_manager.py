@@ -4574,9 +4574,6 @@ class TaskManager:
                 task.status = "running"
                 task.current_stage = next_active_stage
                 task.finished_at = None
-                task.dispatcher_instance_id = None
-                task.dispatch_started_at = None
-                task.lease_expires_at = None
                 db.commit()
                 return
             tail_runs = {
@@ -4616,9 +4613,6 @@ class TaskManager:
                 else:
                     task.status = "running"
                     task.finished_at = None
-                task.dispatcher_instance_id = None
-                task.dispatch_started_at = None
-                task.lease_expires_at = None
                 db.commit()
                 return
             self._finalize_task(db, task)
@@ -8200,6 +8194,30 @@ class TaskManager:
         task.dispatch_started_at = None
         task.lease_expires_at = None
         self._last_task_heartbeat_at.pop(task.id, None)
+
+    def _task_has_active_streaming_stage_workers(self, task_id: str) -> bool:
+        active_worker_item_ids = {
+            str(item_id or "")
+            for item_id, worker in self._stage_item_workers.items()
+            if not worker.done() and str(item_id or "").strip()
+        }
+        if not active_worker_item_ids:
+            return False
+        session = get_session_factory()()
+        try:
+            active_item_ids = {
+                str(row.id)
+                for row in session.query(BinarySecurityStageItem).filter(
+                    BinarySecurityStageItem.task_id == task_id,
+                    BinarySecurityStageItem.stage_name.in_(list(STREAMING_TAIL_STAGES)),
+                    BinarySecurityStageItem.status.in_(list(STREAMING_ACTIVE_ITEM_STATUSES)),
+                ).all()
+            }
+        finally:
+            session.close()
+        if not active_item_ids:
+            return False
+        return bool(active_worker_item_ids.intersection(active_item_ids))
 
     def _task_operation_token(self) -> str:
         return uuid.uuid4().hex
