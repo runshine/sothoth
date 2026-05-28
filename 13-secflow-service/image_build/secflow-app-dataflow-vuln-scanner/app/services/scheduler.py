@@ -737,7 +737,7 @@ class SchedulerService:
                     WorkflowExecution.status.in_(["pending", "dispatching"]),
                     WorkflowExecution.owner_pod_id == self.pod_id,
                     WorkflowExecution.worker_job_id.isnot(None),
-                    WorkflowExecution.dispatch_status == "queued",
+                    WorkflowExecution.dispatch_status.in_(["queued", "dispatching"]),
                     TriggerTask.status.in_(["pending", "dispatching"]),
                 )
                 .order_by(TriggerTask.priority.desc(), TriggerTask.created_at.asc())
@@ -758,7 +758,7 @@ class SchedulerService:
                 WorkflowExecution.id == execution.id,
                 WorkflowExecution.status.in_(["pending", "dispatching"]),
                 WorkflowExecution.owner_pod_id == self.pod_id,
-                WorkflowExecution.dispatch_status == "queued",
+                WorkflowExecution.dispatch_status.in_(["queued", "dispatching"]),
             )
             .update(
                 {

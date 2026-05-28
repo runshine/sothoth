@@ -320,6 +320,52 @@ def test_worker_capacity_zero_starts_all_assigned_jobs(
         db.close()
 
 
+def test_worker_claims_already_dispatching_assigned_job(
+    service_config_path: Path,
+    framework_config_payload: dict,
+    monkeypatch,
+):
+    config = get_config()
+    config.scheduler.enabled = True
+    config.scheduler.role = "worker"
+    config.scheduler.pod_id = "worker-pod"
+    config.scheduler.worker_capacity = 1
+
+    db = get_db_session()
+    try:
+        execution_id = _create_pending_execution(
+            db,
+            framework_config_payload,
+            suffix="assigned-dispatching",
+            status="dispatching",
+            trigger_status="dispatching",
+            worker_url="http://worker-pod",
+            worker_job_id="job-assigned-dispatching",
+            owner_pod_id="worker-pod",
+            dispatch_status="dispatching",
+        )
+    finally:
+        db.close()
+
+    started: list[str] = []
+    monkeypatch.setattr(SchedulerService, "_schedule_execution_thread", lambda self, execution_id: started.append(execution_id))
+
+    SchedulerService()._start_assigned_jobs()
+    assert started == [execution_id]
+
+    db = get_db_session()
+    try:
+        execution = db.get(WorkflowExecution, execution_id)
+        trigger = db.get(TriggerTask, "tt-sched-assigned-dispatching")
+        assert execution is not None
+        assert trigger is not None
+        assert execution.status == "running"
+        assert trigger.status == "running"
+        assert execution.dispatch_status == "running"
+    finally:
+        db.close()
+
+
 def test_manager_dispatches_execution_to_dataflow_worker(
     service_config_path: Path,
     framework_config_payload: dict,
