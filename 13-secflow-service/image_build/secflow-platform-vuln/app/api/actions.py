@@ -20,6 +20,7 @@ from app.services.lifecycle_engine import (
     set_lifecycle_state,
     apply_action_result,
 )
+from app.services.reporting import build_result_report_markdown, write_case_report_document
 
 router = APIRouter(prefix="/api/vuln/actions", tags=["actions"])
 
@@ -242,7 +243,7 @@ async def action_callback(
         action.started_at = action.created_at
     action.completed_at = datetime.utcnow()
 
-    db.add(Result(
+    result = Result(
         id=uuid4().hex,
         case_id=case.id,
         action_execution_id=action.id,
@@ -256,9 +257,25 @@ async def action_callback(
         artifact_refs_json=json.dumps(request.artifact_refs, ensure_ascii=False),
         suggested_stage=request.suggested_stage,
         suggested_decision=request.suggested_decision,
-    ))
+    )
+    db.add(result)
 
     apply_action_result(db, case, request)
+    db.flush()
+    write_case_report_document(
+        case,
+        report_id=f"result-{result.id}",
+        title=f"{result.result_type} 报告",
+        report_kind="verification" if action.stage == MAIN_STAGE_VALIDATION else "analysis",
+        render_format="markdown",
+        stage=action.stage or case.current_stage,
+        markdown=build_result_report_markdown(case, result, action=action),
+        generated_by=result.source_service_id or action.target_service_id or "vuln-engine",
+        generated_at=result.created_at.isoformat(),
+        source_service_id=result.source_service_id,
+        result_id=result.id,
+        set_as_current=True,
+    )
     db.commit()
     return {"status": "ok", "action_id": action_id}
 

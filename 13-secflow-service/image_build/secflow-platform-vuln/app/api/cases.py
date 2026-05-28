@@ -1,11 +1,13 @@
 """Case endpoints."""
 
 import json
+from pathlib import Path
 from uuid import uuid4
 
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import ensure_project_access, get_current_subject
@@ -58,6 +60,16 @@ from app.services.lifecycle_engine import (
     update_triage_gate,
     update_validation_result,
 )
+from app.services.reporting import (
+    build_display_summary,
+    build_evidence_summary,
+    build_result_summary,
+    build_workspace_summary,
+    ensure_case_report_documents,
+    get_current_report_summary,
+    list_case_reports,
+    read_report_content,
+)
 
 router = APIRouter(prefix="/api/vuln/cases", tags=["cases"])
 
@@ -102,7 +114,7 @@ def _case_payload(item: Case) -> dict:
     finding_id = _finding_id(source_meta, metadata, source_task)
     source_refs = _source_refs(source_meta)
     fileserver_root = display_meta.get("fileserver_root") or {}
-    return {
+    payload = {
         "id": item.id,
         "global_vuln_id": item.global_vuln_id or source_meta.get("global_vuln_id"),
         "project_id": item.project_id,
@@ -162,7 +174,11 @@ def _case_payload(item: Case) -> dict:
         "created_by": item.created_by,
         "created_at": item.created_at,
         "updated_at": item.updated_at,
-}
+    }
+    current_report = get_current_report_summary(item)
+    payload["report_summary"] = current_report
+    payload["display_summary"] = build_display_summary(payload, current_report)
+    return payload
 
 
 def _get_case_by_id_or_global_vuln_id(db: Session, case_id: str) -> Case | None:
@@ -377,12 +393,58 @@ async def get_case(case_id: str, user_and_token: tuple[dict, str] = Depends(get_
     if item.active_workflow_run_id:
         workflow_run = db.query(WorkflowRun).filter(WorkflowRun.id == item.active_workflow_run_id).first()
 
-    actions = db.query(ActionExecution).filter(ActionExecution.case_id == case_id).order_by(ActionExecution.created_at.desc()).all()
-    results = db.query(Result).filter(Result.case_id == case_id).order_by(Result.created_at.desc()).all()
-    manual_tasks = db.query(ManualTask).filter(ManualTask.case_id == case_id).order_by(ManualTask.created_at.desc()).all()
+    actions = db.query(ActionExecution).filter(ActionExecution.case_id == item.id).order_by(ActionExecution.created_at.desc()).all()
+    results = db.query(Result).filter(Result.case_id == item.id).order_by(Result.created_at.desc()).all()
+    manual_tasks = db.query(ManualTask).filter(ManualTask.case_id == item.id).order_by(ManualTask.created_at.desc()).all()
+
+    case_payload = _case_payload(item)
+    actions_payload = [
+        {
+            "id": action.id,
+            "stage": action.stage,
+            "action_type": action.action_type,
+            "target_service_id": action.target_service_id,
+            "dispatch_status": action.dispatch_status,
+            "execution_status": action.execution_status,
+            "result_summary": action.result_summary,
+            "created_at": action.created_at,
+            "completed_at": action.completed_at,
+        }
+        for action in actions
+    ]
+    results_payload = [
+        {
+            "id": result.id,
+            "action_execution_id": result.action_execution_id,
+            "source_service_id": result.source_service_id,
+            "result_type": result.result_type,
+            "status": result.status,
+            "summary": result.summary,
+            "confidence": result.confidence,
+            "result_meta": json.loads(result.result_meta_json or "{}"),
+            "raw_payload": json.loads(result.raw_payload_json or "{}"),
+            "artifact_refs": json.loads(result.artifact_refs_json or "[]"),
+            "suggested_stage": result.suggested_stage,
+            "suggested_decision": result.suggested_decision,
+            "created_at": result.created_at,
+        }
+        for result in results
+    ]
+    manual_tasks_payload = [_manual_task_payload(item) for item in manual_tasks]
+    timeline_count = db.query(CaseEvent).filter(CaseEvent.case_id == item.id).count() + db.query(StageHistory).filter(StageHistory.case_id == item.id).count() + len(results_payload)
+    docs, current_report = ensure_case_report_documents(
+        item,
+        actions=actions,
+        results=results,
+        manual_tasks=manual_tasks,
+    )
+    db.add(item)
+    db.commit()
+    case_payload = _case_payload(item)
+    current_report = get_current_report_summary(item)
 
     return {
-        **_case_payload(item),
+        **case_payload,
         "workflow_run": {
             "id": workflow_run.id,
             "current_stage": workflow_run.current_stage,
@@ -390,40 +452,84 @@ async def get_case(case_id: str, user_and_token: tuple[dict, str] = Depends(get_
             "started_at": workflow_run.started_at,
             "completed_at": workflow_run.completed_at,
         } if workflow_run else None,
-        "actions": [
-            {
-                "id": action.id,
-                "stage": action.stage,
-                "action_type": action.action_type,
-                "target_service_id": action.target_service_id,
-                "dispatch_status": action.dispatch_status,
-                "execution_status": action.execution_status,
-                "result_summary": action.result_summary,
-                "created_at": action.created_at,
-                "completed_at": action.completed_at,
-            }
-            for action in actions
-        ],
-        "results": [
-            {
-                "id": result.id,
-                "action_execution_id": result.action_execution_id,
-                "source_service_id": result.source_service_id,
-                "result_type": result.result_type,
-                "status": result.status,
-                "summary": result.summary,
-                "confidence": result.confidence,
-                "result_meta": json.loads(result.result_meta_json or "{}"),
-                "raw_payload": json.loads(result.raw_payload_json or "{}"),
-                "artifact_refs": json.loads(result.artifact_refs_json or "[]"),
-                "suggested_stage": result.suggested_stage,
-                "suggested_decision": result.suggested_decision,
-                "created_at": result.created_at,
-            }
-            for result in results
-        ],
-        "manual_tasks": [_manual_task_payload(item) for item in manual_tasks],
+        "actions": actions_payload,
+        "results": results_payload,
+        "manual_tasks": manual_tasks_payload,
+        "display_summary": build_display_summary(case_payload, current_report),
+        "report_summary": current_report,
+        "evidence_summary": build_evidence_summary(case_payload, results_payload),
+        "result_summary": build_result_summary(results_payload, docs, case_payload),
+        "workspace_summary": build_workspace_summary(
+            case_payload,
+            timeline_count=timeline_count,
+            action_count=len(actions_payload),
+            manual_task_count=len(manual_tasks_payload),
+            result_count=len(results_payload),
+        ),
     }
+
+
+@router.get("/{case_id}/reports")
+async def get_case_reports(case_id: str, user_and_token: tuple[dict, str] = Depends(get_current_subject), db: Session = Depends(get_db)):
+    item = _get_case_by_id_or_global_vuln_id(db, case_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="case not found")
+    _, token = user_and_token
+    await ensure_project_access(item.project_id, token)
+    actions = db.query(ActionExecution).filter(ActionExecution.case_id == item.id).order_by(ActionExecution.created_at.desc()).all()
+    results = db.query(Result).filter(Result.case_id == item.id).order_by(Result.created_at.desc()).all()
+    manual_tasks = db.query(ManualTask).filter(ManualTask.case_id == item.id).order_by(ManualTask.created_at.desc()).all()
+    docs, current_report = ensure_case_report_documents(item, actions=actions, results=results, manual_tasks=manual_tasks)
+    db.add(item)
+    db.commit()
+    return {
+        "items": docs,
+        "total": len(docs),
+        "current_report_id": current_report.get("report_id") if current_report else None,
+    }
+
+
+@router.get("/{case_id}/report")
+async def get_case_report(
+    case_id: str,
+    report_id: str | None = Query(None),
+    download: int = Query(0),
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    item = _get_case_by_id_or_global_vuln_id(db, case_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="case not found")
+    _, token = user_and_token
+    await ensure_project_access(item.project_id, token)
+    actions = db.query(ActionExecution).filter(ActionExecution.case_id == item.id).order_by(ActionExecution.created_at.desc()).all()
+    results = db.query(Result).filter(Result.case_id == item.id).order_by(Result.created_at.desc()).all()
+    manual_tasks = db.query(ManualTask).filter(ManualTask.case_id == item.id).order_by(ManualTask.created_at.desc()).all()
+    docs, current_report = ensure_case_report_documents(item, actions=actions, results=results, manual_tasks=manual_tasks)
+    db.add(item)
+    db.commit()
+    doc = None
+    if report_id:
+        for candidate in docs:
+            if candidate.get("report_id") == report_id:
+                doc = candidate
+                break
+    else:
+        doc = current_report
+    if doc is None:
+        raise HTTPException(status_code=404, detail="report not found")
+    content = read_report_content(doc.get("storage_path"))
+    if content is None:
+        raise HTTPException(status_code=404, detail="report file missing")
+    if download:
+        path = Path(doc["storage_path"])
+        return FileResponse(path, media_type="text/markdown; charset=utf-8", filename=path.name)
+    return JSONResponse(
+        content={
+            **doc,
+            "content": content,
+        }
+    )
 
 
 @router.patch("/{case_id}")
@@ -559,18 +665,18 @@ async def delete_case(
     user, token = user_and_token
     await ensure_project_access(item.project_id, token)
 
-    db.query(Result).filter(Result.case_id == case_id).delete()
-    db.query(ActionExecution).filter(ActionExecution.case_id == case_id).delete()
-    db.query(ManualTask).filter(ManualTask.case_id == case_id).delete()
-    db.query(StageHistory).filter(StageHistory.case_id == case_id).delete()
-    db.query(CaseEvent).filter(CaseEvent.case_id == case_id).delete()
-    db.query(WorkflowRun).filter(WorkflowRun.case_id == case_id).delete()
+    db.query(Result).filter(Result.case_id == item.id).delete()
+    db.query(ActionExecution).filter(ActionExecution.case_id == item.id).delete()
+    db.query(ManualTask).filter(ManualTask.case_id == item.id).delete()
+    db.query(StageHistory).filter(StageHistory.case_id == item.id).delete()
+    db.query(CaseEvent).filter(CaseEvent.case_id == item.id).delete()
+    db.query(WorkflowRun).filter(WorkflowRun.case_id == item.id).delete()
     db.delete(item)
     db.commit()
 
     return {
         "status": "ok",
-        "deleted_case_id": case_id,
+        "deleted_case_id": item.id,
         "deleted_by": user.get("username") or str(user.get("id")),
     }
 
@@ -584,7 +690,7 @@ async def get_case_timeline(case_id: str, user_and_token: tuple[dict, str] = Dep
     await ensure_project_access(case.project_id, token)
 
     items: list[dict] = []
-    for event in db.query(CaseEvent).filter(CaseEvent.case_id == case_id).all():
+    for event in db.query(CaseEvent).filter(CaseEvent.case_id == case.id).all():
         items.append({
             "id": event.id,
             "item_type": "event",
@@ -595,7 +701,7 @@ async def get_case_timeline(case_id: str, user_and_token: tuple[dict, str] = Dep
                 "payload": json.loads(event.payload_json or "{}"),
             },
         })
-    for history in db.query(StageHistory).filter(StageHistory.case_id == case_id).all():
+    for history in db.query(StageHistory).filter(StageHistory.case_id == case.id).all():
         items.append({
             "id": history.id,
             "item_type": "stage_history",
@@ -608,7 +714,7 @@ async def get_case_timeline(case_id: str, user_and_token: tuple[dict, str] = Dep
                 "source_id": history.source_id,
             },
         })
-    for result in db.query(Result).filter(Result.case_id == case_id).all():
+    for result in db.query(Result).filter(Result.case_id == case.id).all():
         items.append({
             "id": result.id,
             "item_type": "result",
