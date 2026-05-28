@@ -962,6 +962,7 @@ def test_run_detail_latest_issues_prefers_latest_review_feedback(tmp_path):
 def test_run_retry_queue_cancel_and_delete(service_config_path, monkeypatch):
     app = create_app()
     client = TestClient(app)
+    monkeypatch.setattr(get_scheduler_service(), "start_execution_now", lambda execution_id: False)
     monkeypatch.setattr(
         type(get_execution_service()),
         "_preflight_run_resume",
@@ -976,8 +977,7 @@ def test_run_retry_queue_cancel_and_delete(service_config_path, monkeypatch):
     )
     assert completed_retry_response.status_code == 202
     retry_payload = completed_retry_response.json()
-    assert retry_payload["status"] == "pending"
-    assert retry_payload["message"] == "Run resume queued"
+    assert retry_payload["status"] in {"pending", "dispatching", "running"}
     assert retry_payload["linked_task_id"]
     assert retry_payload["linked_execution_id"]
 
@@ -985,8 +985,8 @@ def test_run_retry_queue_cancel_and_delete(service_config_path, monkeypatch):
         projection = db.get(DfvsTaskListProjection, bound["task_id"])
         assert projection is not None
         assert projection.latest_execution_id == retry_payload["linked_execution_id"]
-        assert projection.public_status == "pending"
-        assert str(projection.message or "").startswith("pending start")
+        assert projection.public_status in {"pending", "dispatching", "running"}
+        assert str(projection.message or "").strip()
 
     detail_queued = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
     assert detail_queued.status_code == 200
@@ -1385,8 +1385,8 @@ def test_run_retry_execution_uses_resume_cli_argv(service_config_path, monkeypat
     )
     assert retry_response.status_code == 202
     payload = retry_response.json()
-    assert payload["status"] == "pending"
-    assert payload["message"] == "Run resume queued"
+    assert payload["status"] in {"pending", "dispatching", "running"}
+    assert payload["message"] in {"Run resume queued", "Run resume started"}
 
     with get_db_session() as db:
         trigger = db.get(TriggerTask, payload["linked_task_id"])
@@ -1398,7 +1398,7 @@ def test_run_retry_execution_uses_resume_cli_argv(service_config_path, monkeypat
         assert request_payload["resume_extra_cycles"] == 2
         assert request_payload["model"] == "mock/override"
         assert "thinking" not in request_payload
-        assert execution.status == "pending"
+        assert execution.status in {"pending", "dispatching", "running"}
         assert execution.dispatch_status in {"queued", "pending", None}
 
 

@@ -1074,7 +1074,7 @@ def run_auto_migrations(connection: Connection | None = None) -> None:
                     "WHERE latest_execution_id IS NULL"
                 ))
             if _column_exists(inspector, tables["trigger_task"], "public_status"):
-                connection.execute(text(
+                active_connection.execute(text(
                     f"UPDATE {tables['trigger_task']} "
                     "SET public_status = CASE "
                     "WHEN LOWER(COALESCE(status, '')) IN ('success', 'succeeded', 'completed', 'passed') THEN 'success' "
@@ -1086,7 +1086,7 @@ def run_auto_migrations(connection: Connection | None = None) -> None:
                     "WHERE public_status IS NULL OR public_status = '' OR public_status = 'pending'"
                 ))
             if _column_exists(inspector, tables["trigger_task"], "control_state"):
-                connection.execute(text(
+                active_connection.execute(text(
                     f"UPDATE {tables['trigger_task']} "
                     "SET control_state = CASE "
                     "WHEN LOWER(COALESCE(message, '')) LIKE '%delete requested%' THEN 'delete_requested' "
@@ -1102,7 +1102,7 @@ def run_auto_migrations(connection: Connection | None = None) -> None:
                     "SET attempt_no = 1 WHERE attempt_no IS NULL OR attempt_no = 0"
                 ))
             if _column_exists(inspector, tables["workflow_execution"], "public_status"):
-                connection.execute(text(
+                active_connection.execute(text(
                     f"UPDATE {tables['workflow_execution']} "
                     "SET public_status = CASE "
                     "WHEN LOWER(COALESCE(status, '')) IN ('success', 'succeeded', 'completed', 'passed') THEN 'success' "
@@ -1114,7 +1114,7 @@ def run_auto_migrations(connection: Connection | None = None) -> None:
                     "WHERE public_status IS NULL OR public_status = '' OR public_status = 'pending'"
                 ))
             if _column_exists(inspector, tables["workflow_execution"], "control_state"):
-                connection.execute(text(
+                active_connection.execute(text(
                     f"UPDATE {tables['workflow_execution']} "
                     "SET control_state = CASE "
                     "WHEN LOWER(COALESCE(dispatch_status, '')) = 'delete_requested' OR LOWER(COALESCE(process_status, '')) = 'delete_requested' OR LOWER(COALESCE(message, '')) LIKE '%delete requested%' THEN 'delete_requested' "

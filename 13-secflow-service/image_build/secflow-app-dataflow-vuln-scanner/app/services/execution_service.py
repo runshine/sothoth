@@ -121,6 +121,14 @@ _TASK_PURPOSE_LABELS = {
     "evolution": "进化任务",
 }
 
+_RUNTIME_RECONCILED_FAILURE_MESSAGES = {
+    "stale active runtime assumed failed",
+    "runtime heartbeat lost; assumed failed",
+}
+
+
+def _is_runtime_reconciled_failure_message(message: str | None) -> bool:
+    return str(message or "").strip().lower() in _RUNTIME_RECONCILED_FAILURE_MESSAGES
 _CANONICAL_TASK_STATUSES = {"pending", "running", "succeeded", "failed", "cancelled"}
 
 _TASK_LIST_SORT_COLUMNS = {
@@ -151,16 +159,6 @@ _TIMELINE_STAGE_LABELS = {
     "cancel": "取消",
     "abnormal": "异常",
 }
-
-_RUNTIME_RECONCILED_FAILURE_MESSAGES = {
-    "stale active runtime assumed failed",
-    "runtime heartbeat lost; assumed failed",
-}
-
-
-def _is_runtime_reconciled_failure_message(message: str | None) -> bool:
-    return str(message or "").strip().lower() in _RUNTIME_RECONCILED_FAILURE_MESSAGES
-
 
 def _normalize_timeline_stage_name(stage_key: str | None, payload: dict[str, Any] | None = None) -> str | None:
     raw_stage = str(stage_key or "").strip()
@@ -225,16 +223,51 @@ _RETRYABLE_RUN_INDEX_STATUSES = {
     "error",
 }
 
-_ACTIVE_RUN_INDEX_STATUSES = {
-    "pending",
-    "queued",
-    "dispatching",
-    "running",
-    "cancel_requested",
-    "delete_requested",
-    "stop_requested",
-    "timeout_requested",
-}
+
+def _canonical_task_status(value: str | None) -> str:
+    return normalize_canonical_task_status(value)
+
+
+def _public_task_status(value: str | None) -> str:
+    return normalize_public_task_status(value)
+
+
+def _is_control_message(message: str | None) -> bool:
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    return text in {
+        "cancel requested",
+        "run cancel requested",
+        "delete requested",
+        "delete requested; stopping run_vuln_scan.py",
+        "run delete requested; worker unreachable",
+        "run_vuln_scan.py running",
+        "execution running",
+        "running",
+    } or text.endswith("before dispatch")
+
+
+def _preferred_abnormal_message(
+    *,
+    trigger_message: str | None,
+    execution_message: str | None,
+    dispatch_error: str | None,
+    run_error: str | None,
+) -> str:
+    for candidate in (
+        dispatch_error,
+        run_error,
+        execution_message,
+        trigger_message,
+    ):
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        if _is_control_message(text):
+            continue
+        return text
+    return ""
 
 
 def _canonical_task_status(value: str | None) -> str:
@@ -6058,7 +6091,7 @@ class ExecutionService:
             linked_execution=execution,
             linked_task=trigger,
             profile_id=definition.id,
-            status_text="pending",
+            status_text="queued",
         )
         if trigger is not None:
             self._refresh_task_list_projection_for_task_id(db, trigger.id)
@@ -6082,7 +6115,7 @@ class ExecutionService:
             run_id=run_index.id,
             project_id=run_index.project_id,
             status_text=_canonical_task_status(run_index.status),
-            message="Run resume queued",
+            message="Run resume started",
             linked_task_id=trigger.id,
             linked_execution_id=execution.id,
             control_state="none",

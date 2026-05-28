@@ -46,7 +46,7 @@ _RUN_SUCCESS_STATUSES = {"success", "succeeded", "completed", "passed"}
 _DISPATCH_ACTIVE_STATUSES = {"queued", "dispatching", "accepted"}
 _RUNNING_ALIASES = {"running", "processing", "in_progress", "started"}
 _PENDING_ALIASES = {"pending", "ready", "ready_to_start", "not_started", "unassigned"}
-_RUNTIME_RECONCILED_FAILURE_MARKERS = {
+_RUNTIME_RECONCILED_FAILURE_MESSAGES = {
     "stale active runtime assumed failed",
     "runtime heartbeat lost; assumed failed",
 }
@@ -138,11 +138,8 @@ def public_task_status_matches_filter(status: str | None, status_filter: str | N
     return normalize_public_task_status(status) == normalized_filter
 
 
-def _looks_like_runtime_reconciled_failure(message: str | None) -> bool:
-    normalized = str(message or "").strip().lower()
-    if not normalized:
-        return False
-    return normalized in _RUNTIME_RECONCILED_FAILURE_MARKERS
+def _is_runtime_reconciled_failure_message(message: str | None) -> bool:
+    return str(message or "").strip().lower() in _RUNTIME_RECONCILED_FAILURE_MESSAGES
 
 
 def resolve_public_task_state(
@@ -168,22 +165,25 @@ def resolve_public_task_state(
     dispatch_public = normalize_public_task_status(dispatch_status)
     effective_started_at = execution_started_at or trigger_started_at
 
-    if run_public == "success" and run_finished_at is not None:
-        trigger_reconciled_failure = trigger_public == "failed" and _looks_like_runtime_reconciled_failure(trigger_message)
-        execution_reconciled_failure = execution_public == "failed" and _looks_like_runtime_reconciled_failure(execution_message)
-        if trigger_reconciled_failure or execution_reconciled_failure:
-            return ResolvedPublicTaskState(
-                status="success",
-                message=run_message or None,
-                started_at=run_started_at or effective_started_at,
-                finished_at=run_finished_at,
-                source="run_reconciled_success",
-            )
+    trigger_runtime_reconciled_failure = (
+        trigger_public == "failed" and _is_runtime_reconciled_failure_message(trigger_message)
+    )
+    execution_runtime_reconciled_failure = (
+        execution_public == "failed" and _is_runtime_reconciled_failure_message(execution_message)
+    )
+    if run_public == "success" and (trigger_runtime_reconciled_failure or execution_runtime_reconciled_failure):
+        return ResolvedPublicTaskState(
+            status="success",
+            message=run_message or "run index reconciled to success",
+            started_at=run_started_at or effective_started_at,
+            finished_at=run_finished_at or execution_finished_at or trigger_finished_at,
+            source="run_reconciled_success",
+        )
 
     for source, status, message, started_at, finished_at in (
         ("trigger", trigger_public, trigger_message, trigger_started_at, trigger_finished_at),
         ("execution", execution_public, execution_message, execution_started_at or trigger_started_at, execution_finished_at or trigger_finished_at),
-        ("run", run_public, run_message, execution_started_at or trigger_started_at, execution_finished_at or trigger_finished_at),
+        ("run", run_public, run_message, run_started_at or execution_started_at or trigger_started_at, run_finished_at or execution_finished_at or trigger_finished_at),
     ):
         if status in PUBLIC_TASK_TERMINAL_STATUSES:
             return ResolvedPublicTaskState(
