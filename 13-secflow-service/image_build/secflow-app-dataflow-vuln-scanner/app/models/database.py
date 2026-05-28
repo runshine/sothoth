@@ -1180,7 +1180,6 @@ def run_auto_migrations(connection: Connection | None = None) -> None:
         if managed_connection:
             active_connection.close()
 
-
 def _database_init_lock_name() -> str:
     return f"{_prefix('schema_init')}_lock"
 
@@ -1239,7 +1238,16 @@ def _init_database_with_mysql_lock(timeout_seconds: int = 120) -> bool:
 def init_database(
     lock_timeout_seconds: int = 120,
     raise_on_lock_unavailable: bool = True,
+    db_init_lock_timeout_seconds: int | None = None,
+    skip_advisory_lock: bool | None = None,
 ) -> bool:
+    if db_init_lock_timeout_seconds is not None:
+        lock_timeout_seconds = int(db_init_lock_timeout_seconds)
+    if skip_advisory_lock is True:
+        engine = get_engine()
+        Base.metadata.create_all(bind=engine)
+        run_auto_migrations()
+        return True
     engine = get_engine()
     if engine.dialect.name == "mysql":
         retry_delays = (0.0, 1.0, 2.0, 4.0, 8.0)
