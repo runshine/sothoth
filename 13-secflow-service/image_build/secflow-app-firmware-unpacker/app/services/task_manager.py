@@ -550,6 +550,26 @@ def _record_task_event_from_row(
     )
 
 
+def _record_task_action_event_from_row(
+    task,
+    *,
+    event_type: str,
+    summary: str,
+    detail: Optional[dict] = None,
+    created_by: Optional[str] = None,
+) -> None:
+    _record_task_event_from_row(
+        task,
+        event_type=event_type,
+        summary=summary,
+        stage_key=getattr(task, "current_stage", None),
+        status=getattr(task, "status", None),
+        detail=detail,
+        owner_id=getattr(task, "owner_id", None),
+        created_by=created_by,
+    )
+
+
 def _trigger_cancel_hook(task_id: str) -> None:
     with _active_cancel_hooks_lock:
         hook = _active_cancel_hooks.get(task_id)
@@ -1391,6 +1411,7 @@ def submit_unpack_task(
     parent_stage_name: Optional[str] = None,
     parent_stage_item_id: Optional[str] = None,
     parent_stage_item_key: Optional[str] = None,
+    created_by: str = "task_manager",
 ) -> dict[str, str]:
     """Insert a pending task into the shared database."""
     from app.model import TaskStatus, UnpackTask, generate_id, get_db_session
@@ -1442,7 +1463,7 @@ def submit_unpack_task(
                 "task_origin_type": normalized_origin_type,
                 "llm_binding_snapshot_frozen_at": effective_snapshot.get("frozen_at") if isinstance(effective_snapshot, dict) else None,
             },
-            created_by="task_manager",
+            created_by=created_by,
         )
         record_task_lifecycle(
             event="created",
@@ -1461,7 +1482,7 @@ def submit_unpack_task(
     }
 
 
-def cancel_task(task_id: str) -> tuple[bool, str]:
+def cancel_task(task_id: str, *, created_by: str = "task_manager") -> tuple[bool, str]:
     from app.model import TaskStatus, UnpackTask, get_db_session
     from app.services.worker import get_worker_id
 
@@ -1496,7 +1517,7 @@ def cancel_task(task_id: str) -> tuple[bool, str]:
                 stage_key=task.current_stage,
                 status=TaskStatus.CANCELLING.value,
                 detail={"owner_id": task.owner_id},
-                created_by="task_manager",
+                created_by=created_by,
             )
             _record_task_event_from_row(
                 task,
@@ -1505,7 +1526,7 @@ def cancel_task(task_id: str) -> tuple[bool, str]:
                 stage_key=task.current_stage,
                 status=task.status,
                 detail={"reason": "Task was cancelled before execution"},
-                created_by="task_manager",
+                created_by=created_by,
             )
             record_task_error(category="cancel", status=task.status, task_origin=_task_origin(task))
             record_task_lifecycle(event="finished", status=task.status, task_origin=_task_origin(task))
@@ -1536,7 +1557,7 @@ def cancel_task(task_id: str) -> tuple[bool, str]:
             stage_key=task.current_stage,
             status=task.status,
             detail={"owner_id": task.owner_id},
-            created_by="task_manager",
+            created_by=created_by,
         )
         if trigger_runtime_cancel:
             if str(task.owner_id or "").strip() == get_worker_id() and task.runner_pid:
@@ -1552,7 +1573,7 @@ def cancel_task(task_id: str) -> tuple[bool, str]:
         db.close()
 
 
-def retry_task(task_id: str) -> tuple[bool, Optional[str], str]:
+def retry_task(task_id: str, *, created_by: str = "task_manager") -> tuple[bool, Optional[str], str]:
     from app.model import TaskStatus, UnpackTask, get_db_session
 
     db = get_db_session()
@@ -1599,7 +1620,7 @@ def retry_task(task_id: str) -> tuple[bool, Optional[str], str]:
             stage_key="retry_preparing",
             status=TaskStatus.RETRY_PREPARING.value,
             detail={"retry_mode": "inplace_async"},
-            created_by="task_manager",
+            created_by=created_by,
         )
         try:
             enqueue_workspace_cleanup(
@@ -1616,7 +1637,7 @@ def retry_task(task_id: str) -> tuple[bool, Optional[str], str]:
         db.close()
 
 
-def delete_tasks(task_ids: list[str]) -> tuple[int, list[str]]:
+def delete_tasks(task_ids: list[str], *, created_by: str = "task_manager") -> tuple[int, list[str]]:
     from app.model import TaskStatus, UnpackTask, get_db_session
 
     deleted_count = 0
@@ -1671,7 +1692,7 @@ def delete_tasks(task_ids: list[str]) -> tuple[int, list[str]]:
                 status=payload.get("status"),
                 detail=payload.get("detail"),
                 owner_id=payload.get("owner_id"),
-                created_by="task_manager",
+                created_by=created_by,
             )
         for task_id, project_id in cleanup_candidates:
             enqueue_workspace_cleanup(
@@ -3627,7 +3648,7 @@ def _run_task_result_cache_refresh(task_id: str) -> None:
             _active_result_cache_refreshes.discard(task_id)
 
 
-def request_task_result_cache_refresh(task_id: str) -> tuple[bool, str]:
+def request_task_result_cache_refresh(task_id: str, *, created_by: str = "task_manager") -> tuple[bool, str]:
     from app.model import UnpackTask, get_db_session
 
     db = get_db_session()
@@ -3639,13 +3660,12 @@ def request_task_result_cache_refresh(task_id: str) -> tuple[bool, str]:
             if task_id in _active_result_cache_refreshes:
                 return True, "结果缓存刷新已在后台执行中"
             _active_result_cache_refreshes.add(task_id)
-        _record_task_event_from_row(
+        _record_task_action_event_from_row(
             task,
             event_type="task_result_cache_refresh_requested",
             summary="任务结果缓存刷新已受理",
-            stage_key=task.current_stage,
-            status=task.status,
-            created_by="task_manager",
+            detail={"requested_by": created_by},
+            created_by=created_by,
         )
     finally:
         db.close()

@@ -1,11 +1,40 @@
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+if "prometheus_client" not in sys.modules:
+    fake_prometheus = types.ModuleType("prometheus_client")
+
+    class _Metric:
+        def labels(self, *args, **kwargs):
+            return self
+
+        def inc(self, *args, **kwargs):
+            return None
+
+        def set(self, *args, **kwargs):
+            return None
+
+        def observe(self, *args, **kwargs):
+            return None
+
+    fake_prometheus.CONTENT_TYPE_LATEST = "text/plain"
+    fake_prometheus.Counter = lambda *args, **kwargs: _Metric()
+    fake_prometheus.Gauge = lambda *args, **kwargs: _Metric()
+    fake_prometheus.Histogram = lambda *args, **kwargs: _Metric()
+    fake_prometheus.generate_latest = lambda *args, **kwargs: b""
+    sys.modules["prometheus_client"] = fake_prometheus
 
 from app.config import reload_config
 from app.model import TaskStatus, UnpackTask, UnpackTaskEvent, WorkerInstance, WorkspaceCleanupJob, get_db_session, init_database
@@ -79,14 +108,12 @@ class TaskManagerWorkspaceTests(unittest.TestCase):
             self.assertEqual(str(firmware), prepared["input_path"])
             self.assertTrue(manifest_path.is_file())
             self.assertFalse(copied_firmware.exists())
-            self.assertEqual(
-                {
-                    "input_path": str(firmware),
-                    "output_path": prepared["output_path"],
-                    "log_path": prepared["run_path"],
-                },
-                json.loads(manifest_path.read_text(encoding="utf-8")),
-            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(str(firmware), manifest["input_path"])
+            self.assertEqual(prepared["output_path"], manifest["output_path"])
+            self.assertEqual(prepared["run_path"], manifest["run_path"])
+            self.assertEqual(str(Path(prepared["run_path"]) / "tool.log"), manifest["log_path"])
+            self.assertEqual(manifest["log_path"], manifest["log_file_path"])
 
     def test_resolve_task_runtime_paths_refreshes_manifest_and_uses_original_input(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -205,7 +232,7 @@ class TaskManagerLeaseTests(unittest.TestCase):
         db = get_db_session()
         try:
             task = db.query(UnpackTask).filter(UnpackTask.id == "t-claim").first()
-            self.assertEqual(TaskStatus.RUNNING.value, task.status)
+            self.assertEqual(TaskStatus.CLAIMED.value, task.status)
             self.assertEqual("pod-a:123:owner", task.owner_id)
             self.assertEqual("queued", task.current_stage)
             self.assertIsNone(task.lease_expires_at)
@@ -253,7 +280,7 @@ class TaskManagerLeaseTests(unittest.TestCase):
     def test_retry_success_task_enqueues_async_workspace_reset(self):
         self._add_task("t-success-retry", status=TaskStatus.SUCCESS.value)
 
-        ok, retried_task_id, message = task_manager_module.retry_task("t-success-retry")
+        ok, retried_task_id, message = task_manager_module.retry_task("t-success-retry", created_by="alice")
 
         self.assertTrue(ok)
         self.assertEqual("t-success-retry", retried_task_id)
@@ -274,6 +301,8 @@ class TaskManagerLeaseTests(unittest.TestCase):
                 .first()
             )
             self.assertEqual("task_retry_requested", event.event_type)
+            self.assertEqual("alice", event.created_by)
+            self.assertEqual({"retry_mode": "inplace_async"}, json.loads(event.detail_json))
         finally:
             db.close()
 
@@ -298,7 +327,7 @@ class TaskManagerLeaseTests(unittest.TestCase):
             db.close()
 
         with patch("app.services.task_manager._signal_runner_process", return_value=True) as mocked_signal:
-            ok, message = task_manager_module.cancel_task("t-cancel-running")
+            ok, message = task_manager_module.cancel_task("t-cancel-running", created_by="alice")
 
         self.assertTrue(ok)
         self.assertIn("取消", message)
@@ -311,6 +340,17 @@ class TaskManagerLeaseTests(unittest.TestCase):
             self.assertIsNotNone(task.cancel_requested_at)
             self.assertIsNotNone(task.cancel_grace_deadline)
             self.assertIsNotNone(task.cancel_force_deadline)
+            event = (
+                db.query(UnpackTaskEvent)
+                .filter(
+                    UnpackTaskEvent.task_id == "t-cancel-running",
+                    UnpackTaskEvent.event_type == "cancel_requested",
+                )
+                .order_by(UnpackTaskEvent.created_at.desc())
+                .first()
+            )
+            self.assertIsNotNone(event)
+            self.assertEqual("alice", event.created_by)
         finally:
             db.close()
 
@@ -475,7 +515,7 @@ class TaskManagerLeaseTests(unittest.TestCase):
                 db.close()
 
             with patch("app.services.task_manager.remove_task_workspace") as mocked_remove:
-                deleted_count, skipped_ids = task_manager_module.delete_tasks(["t-delete"])
+                deleted_count, skipped_ids = task_manager_module.delete_tasks(["t-delete"], created_by="alice")
 
             self.assertEqual(1, deleted_count)
             self.assertEqual([], skipped_ids)
@@ -490,8 +530,40 @@ class TaskManagerLeaseTests(unittest.TestCase):
                 self.assertEqual(1, len(jobs))
                 self.assertEqual("pending", jobs[0].status)
                 self.assertEqual("task_deleted", jobs[0].reason)
+                events = db.query(UnpackTaskEvent).filter(UnpackTaskEvent.task_id == "t-delete").all()
+                self.assertEqual(1, len(events))
+                self.assertEqual("task_deleted", events[0].event_type)
+                self.assertEqual("alice", events[0].created_by)
             finally:
                 db.close()
+
+    def test_delete_running_task_does_not_record_rejected_delete_event(self):
+        db = get_db_session()
+        try:
+            db.add(
+                UnpackTask(
+                    id="t-delete-running",
+                    project_id="p1",
+                    firmware_path="/tmp/fw.bin",
+                    output_path="/tmp/output",
+                    status=TaskStatus.RUNNING.value,
+                    current_stage="llm_unpack",
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        deleted_count, skipped_ids = task_manager_module.delete_tasks(["t-delete-running"], created_by="alice")
+
+        self.assertEqual(0, deleted_count)
+        self.assertEqual(["t-delete-running"], skipped_ids)
+        db = get_db_session()
+        try:
+            events = db.query(UnpackTaskEvent).filter(UnpackTaskEvent.task_id == "t-delete-running").all()
+            self.assertEqual([], events)
+        finally:
+            db.close()
 
     def test_process_workspace_cleanup_jobs_removes_only_task_workspace(self):
         firmware = self.root / "firmware.bin"
@@ -564,12 +636,28 @@ class TaskManagerLeaseTests(unittest.TestCase):
         fake_executor = _FakeExecutor()
         with patch("app.services.task_manager.get_executor", return_value=fake_executor), \
              patch("app.services.task_manager._write_task_result_cache", side_effect=AssertionError("should not run inline")):
-            ok, message = task_manager_module.request_task_result_cache_refresh("t-refresh-cache")
+            ok, message = task_manager_module.request_task_result_cache_refresh("t-refresh-cache", created_by="alice")
 
         self.assertTrue(ok)
         self.assertIn("后台", message)
         self.assertEqual(1, len(fake_executor.calls))
         self.assertEqual("t-refresh-cache", fake_executor.calls[0][1][0])
+        db = get_db_session()
+        try:
+            event = (
+                db.query(UnpackTaskEvent)
+                .filter(
+                    UnpackTaskEvent.task_id == "t-refresh-cache",
+                    UnpackTaskEvent.event_type == "task_result_cache_refresh_requested",
+                )
+                .order_by(UnpackTaskEvent.created_at.desc())
+                .first()
+            )
+            self.assertIsNotNone(event)
+            self.assertEqual("alice", event.created_by)
+            self.assertEqual({"requested_by": "alice"}, json.loads(event.detail_json))
+        finally:
+            db.close()
 
 
 class TaskManagerMaxRetriesReachedActionTests(unittest.TestCase):
@@ -726,6 +814,8 @@ class TaskManagerLlmSnapshotTests(unittest.TestCase):
             "llm_config_file_key_cleaner": "provider-cleaner-v1",
             "llm_config_file_key_skill_author": "provider-author-v1",
             "llm_config_file_key_skill_executor": "provider-skill-v1",
+            "llm_config_file_key_evolution_improver": "provider-evolution-improver-v1",
+            "llm_config_file_key_evolution_reviewer": "provider-evolution-reviewer-v1",
         }
         provider_payloads = {
             provider_key: {
@@ -777,6 +867,7 @@ class TaskManagerLlmSnapshotTests(unittest.TestCase):
             created = submit_unpack_task(
                 firmware_path=str(self.firmware),
                 project_id="p1",
+                created_by="alice",
             )
 
         db = get_db_session()
@@ -787,6 +878,8 @@ class TaskManagerLlmSnapshotTests(unittest.TestCase):
             self.assertEqual("provider-reviewer-v1", snapshot["roles"]["reviewer"]["provider_key"])
             created_events = db.query(UnpackTaskEvent).filter(UnpackTaskEvent.task_id == created["task_id"]).all()
             self.assertTrue(any(event.event_type == "task_created" for event in created_events))
+            created_event = next(event for event in created_events if event.event_type == "task_created")
+            self.assertEqual("alice", created_event.created_by)
 
             row = db.query(ServiceConfig).filter(ServiceConfig.key == "llm_config_file_key_executor").first()
             row.value = "provider-executor-v2"
@@ -809,6 +902,8 @@ class TaskManagerLlmSnapshotTests(unittest.TestCase):
             "llm_config_file_key_cleaner": "provider-cleaner-v1",
             "llm_config_file_key_skill_author": "provider-author-v1",
             "llm_config_file_key_skill_executor": "provider-skill-v1",
+            "llm_config_file_key_evolution_improver": "provider-evolution-improver-v1",
+            "llm_config_file_key_evolution_reviewer": "provider-evolution-reviewer-v1",
         }
 
         class _FakeClient:
@@ -849,12 +944,14 @@ class TaskManagerLlmSnapshotTests(unittest.TestCase):
                 project_id="p1",
             )
 
-        ok, _ = task_manager_module.cancel_task(created["task_id"])
+        ok, _ = task_manager_module.cancel_task(created["task_id"], created_by="alice")
         self.assertTrue(ok)
         events = list_task_events(created["task_id"])
         event_types = [item["event_type"] for item in events["items"]]
         self.assertIn("cancel_requested", event_types)
         self.assertIn("task_cancelled", event_types)
+        cancel_requested = next(item for item in events["items"] if item["event_type"] == "cancel_requested")
+        self.assertEqual("alice", cancel_requested["created_by"])
 
 
 class PiSessionRecordingTests(unittest.TestCase):
