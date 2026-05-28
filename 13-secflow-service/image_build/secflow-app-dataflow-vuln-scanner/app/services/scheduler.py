@@ -734,11 +734,11 @@ class SchedulerService:
                 db.query(WorkflowExecution, TriggerTask)
                 .join(TriggerTask, WorkflowExecution.trigger_task_id == TriggerTask.id)
                 .filter(
-                    WorkflowExecution.status == "pending",
+                    WorkflowExecution.status.in_(["pending", "dispatching"]),
                     WorkflowExecution.owner_pod_id == self.pod_id,
                     WorkflowExecution.worker_job_id.isnot(None),
                     WorkflowExecution.dispatch_status == "queued",
-                    TriggerTask.status == "pending",
+                    TriggerTask.status.in_(["pending", "dispatching"]),
                 )
                 .order_by(TriggerTask.priority.desc(), TriggerTask.created_at.asc())
                 .first()
@@ -756,7 +756,7 @@ class SchedulerService:
             db.query(WorkflowExecution)
             .filter(
                 WorkflowExecution.id == execution.id,
-                WorkflowExecution.status == "pending",
+                WorkflowExecution.status.in_(["pending", "dispatching"]),
                 WorkflowExecution.owner_pod_id == self.pod_id,
                 WorkflowExecution.dispatch_status == "queued",
             )
@@ -773,7 +773,7 @@ class SchedulerService:
         )
         updated_trigger = (
             db.query(TriggerTask)
-            .filter(TriggerTask.id == trigger.id, TriggerTask.status == "pending")
+            .filter(TriggerTask.id == trigger.id, TriggerTask.status.in_(["pending", "dispatching"]))
             .update(
                 {
                     TriggerTask.status: "running",

@@ -519,7 +519,7 @@ def test_manager_dispatch_requires_registry_worker(
         db.close()
 
 
-def test_worker_jobs_api_claims_execution_without_polling_pending_queue(
+def test_worker_jobs_api_claims_and_starts_assigned_execution(
     service_config_path: Path,
     framework_config_payload: dict,
     monkeypatch,
@@ -543,9 +543,9 @@ def test_worker_jobs_api_claims_execution_without_polling_pending_queue(
     assert response.status_code == 200
     payload = response.json()
     assert payload["id"] == execution_id
-    assert payload["status"] == "dispatching"
-    assert payload["phase"] == "queued"
-    assert started == []
+    assert payload["status"] == "running"
+    assert payload["phase"] == "running"
+    assert started == [execution_id]
 
     list_response = client.get("/api/v1/jobs")
     assert list_response.status_code == 200
@@ -559,12 +559,12 @@ def test_worker_jobs_api_claims_execution_without_polling_pending_queue(
         trigger = db.get(TriggerTask, "tt-sched-worker-api")
         assert execution is not None
         assert trigger is not None
-        assert execution.status == "dispatching"
-        assert trigger.status == "dispatching"
+        assert execution.status == "running"
+        assert trigger.status == "running"
         assert execution.owner_pod_id == "worker-pod"
         assert execution.worker_url == "http://worker-pod"
         assert execution.worker_job_id == execution_id
-        assert execution.dispatch_status == "queued"
+        assert execution.dispatch_status == "running"
     finally:
         db.close()
 

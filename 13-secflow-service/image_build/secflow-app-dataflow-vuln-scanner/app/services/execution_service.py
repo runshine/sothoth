@@ -225,6 +225,17 @@ _RETRYABLE_RUN_INDEX_STATUSES = {
     "error",
 }
 
+_ACTIVE_RUN_INDEX_STATUSES = {
+    "pending",
+    "queued",
+    "dispatching",
+    "running",
+    "cancel_requested",
+    "delete_requested",
+    "stop_requested",
+    "timeout_requested",
+}
+
 
 def _canonical_task_status(value: str | None) -> str:
     return normalize_canonical_task_status(value)

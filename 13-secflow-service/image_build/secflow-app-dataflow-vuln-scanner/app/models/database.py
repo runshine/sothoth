@@ -391,7 +391,7 @@ class SchedulerWorker(Base):
 class SchedulerWorkerSlotReservation(Base):
     __tablename__ = _prefix("scheduler_worker_slot_reservation")
 
-    id = Column(String(64), primary_key=True)
+    reservation_id = Column(String(64), primary_key=True)
     worker_pod_id = Column(String(512), ForeignKey(f"{SchedulerWorker.__tablename__}.pod_id"), nullable=False)
     execution_id = Column(String(64), ForeignKey(f"{WorkflowExecution.__tablename__}.id"), nullable=False, unique=True)
     status = Column(String(32), nullable=False, default="reserved")
@@ -1074,7 +1074,7 @@ def run_auto_migrations(connection: Connection | None = None) -> None:
                     "WHERE latest_execution_id IS NULL"
                 ))
             if _column_exists(inspector, tables["trigger_task"], "public_status"):
-                active_connection.execute(text(
+                connection.execute(text(
                     f"UPDATE {tables['trigger_task']} "
                     "SET public_status = CASE "
                     "WHEN LOWER(COALESCE(status, '')) IN ('success', 'succeeded', 'completed', 'passed') THEN 'success' "
@@ -1086,7 +1086,7 @@ def run_auto_migrations(connection: Connection | None = None) -> None:
                     "WHERE public_status IS NULL OR public_status = '' OR public_status = 'pending'"
                 ))
             if _column_exists(inspector, tables["trigger_task"], "control_state"):
-                active_connection.execute(text(
+                connection.execute(text(
                     f"UPDATE {tables['trigger_task']} "
                     "SET control_state = CASE "
                     "WHEN LOWER(COALESCE(message, '')) LIKE '%delete requested%' THEN 'delete_requested' "
@@ -1102,7 +1102,7 @@ def run_auto_migrations(connection: Connection | None = None) -> None:
                     "SET attempt_no = 1 WHERE attempt_no IS NULL OR attempt_no = 0"
                 ))
             if _column_exists(inspector, tables["workflow_execution"], "public_status"):
-                active_connection.execute(text(
+                connection.execute(text(
                     f"UPDATE {tables['workflow_execution']} "
                     "SET public_status = CASE "
                     "WHEN LOWER(COALESCE(status, '')) IN ('success', 'succeeded', 'completed', 'passed') THEN 'success' "
@@ -1114,7 +1114,7 @@ def run_auto_migrations(connection: Connection | None = None) -> None:
                     "WHERE public_status IS NULL OR public_status = '' OR public_status = 'pending'"
                 ))
             if _column_exists(inspector, tables["workflow_execution"], "control_state"):
-                active_connection.execute(text(
+                connection.execute(text(
                     f"UPDATE {tables['workflow_execution']} "
                     "SET control_state = CASE "
                     "WHEN LOWER(COALESCE(dispatch_status, '')) = 'delete_requested' OR LOWER(COALESCE(process_status, '')) = 'delete_requested' OR LOWER(COALESCE(message, '')) LIKE '%delete requested%' THEN 'delete_requested' "
