@@ -427,11 +427,13 @@ class _AsyncBinaryToSourceClientStub:
 
 
 class _AsyncEntryAnalyseClientStub:
-    def __init__(self, *, listed=None, fetched=None, fail_on_create=False):
+    def __init__(self, *, listed=None, fetched=None, fail_on_create=False, delete_result=None):
         self.listed = listed or {"items": []}
         self.fetched = fetched or {}
         self.fail_on_create = fail_on_create
+        self.delete_result = {"success": True} if delete_result is None else delete_result
         self.created = 0
+        self.deleted: list[str] = []
 
     async def list_tasks(self, *args, **kwargs):
         del args, kwargs
@@ -447,6 +449,14 @@ class _AsyncEntryAnalyseClientStub:
         if self.fail_on_create:
             raise AssertionError("create_task should not be called")
         return {"task_id": "eat-created"}
+
+    async def delete_task(self, task_id, token=None):
+        del token
+        self.deleted.append(task_id)
+        result = self.delete_result
+        if isinstance(result, Exception):
+            raise result
+        return dict(result)
 
 
 class _AsyncFirmwareUnpackerClientStub:
@@ -15824,6 +15834,103 @@ def _test_manual_cancel_noop_retries_orphan_downstream_cancel(self):
 
 TaskManagerTests.test_manual_cancel_collects_dispatching_and_orphan_downstream_refs = _test_manual_cancel_collects_dispatching_and_orphan_downstream_refs
 TaskManagerTests.test_manual_cancel_noop_retries_orphan_downstream_cancel = _test_manual_cancel_noop_retries_orphan_downstream_cancel
+
+
+def _test_delete_downstream_refs_treats_entry_delete_500_with_absent_task_as_success(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="binary",
+        status="retry_preparing",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/tmp/out",
+        workspace_root="/tmp/ws",
+    )
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="IPSEC",
+        status="cancelled",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat_x",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+    client = _AsyncEntryAnalyseClientStub(delete_result=UpstreamError("500 Internal Server Error"))
+
+    async def _missing_task(task_id, token):
+        del task_id, token
+        raise NotFoundError("任务不存在")
+
+    client.get_task = _missing_task
+
+    with patch.object(task_manager_module, "get_entry_analyse_client", return_value=client):
+        deleted = asyncio.run(
+            self.manager._delete_downstream_refs(
+                db,
+                task,
+                [{"service": "entry_analyse", "task_id": "eat_x", "stage_name": "entry_analysis"}],
+                "token",
+            )
+        )
+
+    self.assertEqual(1, deleted)
+    event_types = [getattr(event, "event_type", "") for event in db.added]
+    self.assertIn("downstream_delete_requested", event_types)
+    self.assertIn("downstream_delete_verified_absent", event_types)
+    self.assertIn("downstream_delete_failed_but_ignored", event_types)
+
+
+def _test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exists(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="binary",
+        status="retry_preparing",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/tmp/out",
+        workspace_root="/tmp/ws",
+    )
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="IPSEC",
+        status="cancelled",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat_x",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+    client = _AsyncEntryAnalyseClientStub(delete_result=UpstreamError("500 Internal Server Error"))
+
+    async def _existing_task(task_id, token):
+        del token
+        return {"task_id": task_id, "status": "cancelled"}
+
+    client.get_task = _existing_task
+
+    with patch.object(task_manager_module, "get_entry_analyse_client", return_value=client):
+        with self.assertRaises(ValidationError):
+            asyncio.run(
+                self.manager._delete_downstream_refs(
+                    db,
+                    task,
+                    [{"service": "entry_analyse", "task_id": "eat_x", "stage_name": "entry_analysis"}],
+                    "token",
+                )
+            )
+
+
+TaskManagerTests.test_delete_downstream_refs_treats_entry_delete_500_with_absent_task_as_success = _test_delete_downstream_refs_treats_entry_delete_500_with_absent_task_as_success
+TaskManagerTests.test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exists = _test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exists
 
 
 if __name__ == "__main__":

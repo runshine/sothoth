@@ -14126,6 +14126,29 @@ class TaskManager:
                 payload=ref,
             )
 
+        async def verify_deleted(ref: dict[str, str], exc: Exception | None) -> tuple[bool, dict[str, object]]:
+            verification: dict[str, object] = {
+                "verified_absent": False,
+                "verified_deleted": False,
+                "verification_error": None,
+            }
+            service = str(ref.get("service") or "").strip()
+            task_id = str(ref.get("task_id") or "").strip()
+            if not task_id:
+                return False, verification
+            try:
+                if service == "entry_analyse":
+                    await get_entry_analyse_client().get_task(task_id, token or "")
+                else:
+                    return False, verification
+            except NotFoundError:
+                verification["verified_absent"] = True
+                return True, verification
+            except Exception as verify_exc:
+                verification["verification_error"] = str(verify_exc)
+                return False, verification
+            return False, verification
+
         async def do_delete(ref: dict[str, str]) -> bool:
             try:
                 if ref["service"] == "firmware_unpacker":
@@ -14166,17 +14189,57 @@ class TaskManager:
                 continue
             if isinstance(exc, ConflictError):
                 raise ValidationError(f"旧下游任务仍在运行，不能安全删除: {ref['service']}:{ref['task_id']}") from exc
+            verified_ok, verification = await verify_deleted(ref, exc)
+            if verified_ok:
+                success_count += 1
+                event_item = self._event_item_for_downstream_ref(db, task, ref)
+                self._record_downstream_item_disposition(
+                    db,
+                    task,
+                    event_item,
+                    event_type="downstream_delete_verified_absent",
+                    message=f"下游删除报错但已确认不存在: {ref['service']}:{ref['task_id']}",
+                    payload={
+                        **ref,
+                        "delete_error": str(exc),
+                        "delete_verified_absent": True,
+                        "delete_verified_deleted": bool(verification.get("verified_deleted")),
+                    },
+                )
+                self._record_event(
+                    db,
+                    task,
+                    "downstream_delete_failed_but_ignored",
+                    f"下游删除报错但已确认资源不存在，继续重排: {ref['service']}:{ref['task_id']}",
+                    stage_name=ref.get("stage_name"),
+                    item=event_item,
+                    level="warning",
+                    payload={
+                        **ref,
+                        "delete_error": str(exc),
+                        "delete_verified_absent": True,
+                        "delete_verified_deleted": bool(verification.get("verified_deleted")),
+                    },
+                )
+                continue
             event_item = self._event_item_for_downstream_ref(db, task, ref)
             self._record_event(
                 db,
                 task,
-                "downstream_delete_failed",
-                f"下游删除失败: {ref['service']}:{ref['task_id']} - {exc}",
+                "downstream_delete_failed_blocking",
+                f"下游删除失败且资源仍存在: {ref['service']}:{ref['task_id']} - {exc}",
                 stage_name=ref.get("stage_name"),
                 item=event_item,
                 level="warning",
-                payload={**ref, "error": str(exc)},
+                payload={
+                    **ref,
+                    "delete_error": str(exc),
+                    "delete_verified_absent": bool(verification.get("verified_absent")),
+                    "delete_verified_deleted": bool(verification.get("verified_deleted")),
+                    "verification_error": verification.get("verification_error"),
+                },
             )
+            raise ValidationError(f"下游删除失败且无法确认已删除: {ref['service']}:{ref['task_id']}") from exc
         db.commit()
         return success_count
 
