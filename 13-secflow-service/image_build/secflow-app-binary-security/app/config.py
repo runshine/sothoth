@@ -48,6 +48,13 @@ class ProjectServiceConfig(BaseModel):
         return f"http://{self.host}:{self.port}"
 
 
+class HttpClientConfig(BaseModel):
+    keepalive_expiry_seconds: int = 15
+    max_keepalive_connections: int = 20
+    max_connections: int = 100
+    retry_count: int = 1
+
+
 class RegistryMenuLevelConfig(BaseModel):
     name: Optional[str] = None
     name_en: Optional[str] = None
@@ -125,6 +132,7 @@ class AppConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8080
     debug: bool = False
+    timeout_keep_alive_seconds: int = 30
 
 
 class LoggingConfig(BaseModel):
@@ -181,6 +189,7 @@ class Config(BaseModel):
     queue: QueueConfig = Field(default_factory=QueueConfig)
     runtime_policy: RuntimePolicyConfig = Field(default_factory=RuntimePolicyConfig)
     services: ServicesConfig = Field(default_factory=ServicesConfig)
+    http_client: HttpClientConfig = Field(default_factory=HttpClientConfig)
     app: AppConfig = Field(default_factory=AppConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 

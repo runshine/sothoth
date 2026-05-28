@@ -80,6 +80,17 @@ class InternalError(AppException):
         )
 
 
+class DependencyUnavailableError(AppException):
+    """依赖服务暂时不可用"""
+    def __init__(self, message: str = "依赖服务暂时不可用", details: dict = None):
+        super().__init__(
+            status_code=502,
+            code="DEPENDENCY_UNAVAILABLE",
+            message=message,
+            details=details
+        )
+
+
 from starlette.responses import JSONResponse
 
 

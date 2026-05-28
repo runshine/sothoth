@@ -14,6 +14,7 @@ app:
   host: "0.0.0.0"
   port: 10003
   debug: false
+  timeout_keep_alive_seconds: 30
 
 # JWT配置
 jwt:

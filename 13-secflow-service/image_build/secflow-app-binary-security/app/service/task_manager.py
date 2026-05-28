@@ -3147,12 +3147,19 @@ class TaskManager:
             item_downstream_service = item.downstream_service
             item_downstream_task_id = item.downstream_task_id
             before_status = item.status
+            observed_apply_state = bool(apply_state)
             try:
                 if exc is not None:
                     raise exc
                 assert isinstance(payload, dict)
                 downstream_status = str(payload.get("status") or "").lower()
                 mapped_status = self._map_downstream_status(downstream_status)
+                if not observed_apply_state and stage_name and not item_id:
+                    observed_apply_state = bool(
+                        force
+                        or str(before_status or "").strip().lower() in {"queued", "running", "dispatching"}
+                        or mapped_status == "downstream_missing"
+                    )
                 observe_downstream_reconcile_observation(
                     stage=item_stage_name,
                     service=item_downstream_service,
@@ -3192,7 +3199,7 @@ class TaskManager:
                 terminal_status = mapped_status in {"success", "partial_success", "failed", "cancelled", "downstream_missing"}
                 if terminal_status:
                     if mapped_status == "downstream_missing":
-                        should_apply = apply_state and (mapped_status != before_status or force)
+                        should_apply = observed_apply_state and (mapped_status != before_status or force)
                         if should_apply:
                             self._enqueue_downstream_terminal_event(
                                 db,
@@ -3260,7 +3267,7 @@ class TaskManager:
                         continue
                     if mapped_status not in ARCHIVE_SUCCESS_MAPPED_STATUSES:
                         error_message = payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message
-                        should_apply = apply_state and (mapped_status != before_status or force)
+                        should_apply = observed_apply_state and (mapped_status != before_status or force)
                         if should_apply:
                             self._enqueue_downstream_terminal_event(
                                 db,
@@ -3426,7 +3433,7 @@ class TaskManager:
                     touched_stages.add(item.stage_name)
                     skipped_count += 1
                     continue
-                should_apply = apply_state and mapped_status != before_status
+                should_apply = observed_apply_state and mapped_status != before_status
                 if should_apply:
                     self._enqueue_downstream_status_event(
                         db,
@@ -5479,22 +5486,30 @@ class TaskManager:
             return
         mapped_status = self._map_downstream_status(mapped_status) or mapped_status
         downstream_payload = dict(payload.get("downstream_payload") or {})
-        item.status = mapped_status
-        item.error_message = None if mapped_status in {"queued", "running", "success"} else (
-            payload.get("error_message")
-            or downstream_payload.get("error")
-            or downstream_payload.get("error_message")
-            or downstream_payload.get("message")
-            or item.error_message
+        self._apply_child_task_status_change(
+            db,
+            task=task,
+            item=item,
+            change_source="state_reducer",
+            after_status=mapped_status,
+            downstream_payload=downstream_payload,
+            sync_status="synced",
+            downstream_status_raw=self._string_or_none(payload.get("status_raw") or payload.get("downstream_status")),
+            downstream_status_mapped=mapped_status,
+            downstream_status=self._string_or_none(payload.get("downstream_status") or downstream_payload.get("status")),
+            state_applied=True,
+            error_message=(
+                payload.get("error_message")
+                or downstream_payload.get("error")
+                or downstream_payload.get("error_message")
+                or downstream_payload.get("message")
+                or item.error_message
+            ),
+            error_type=self._string_or_none(payload.get("error_type")),
+            http_status=self._int_or_none(payload.get("http_status")),
+            state_event_id=event.id,
+            extra_payload={"downstream_payload": self._lightweight_downstream_payload(downstream_payload)},
         )
-        item.started_at = item.started_at or _now()
-        item.finished_at = None if mapped_status in {"queued", "running"} else (item.finished_at or _now())
-        item.result = {
-            **(item.result or {}),
-            "downstream": self._lightweight_downstream_payload(downstream_payload),
-            "downstream_status_synced_at": _now().isoformat(),
-            "downstream_status": self._string_or_none(downstream_payload.get("status")),
-        }
         self._reconcile_stage_and_task_state_after_item_update(db, task, item.stage_name)
         self._record_event(
             db,
@@ -5528,19 +5543,20 @@ class TaskManager:
         downstream_payload: dict[str, Any] | None,
         error_message: str | None,
     ) -> None:
-        normalized_status = self._map_downstream_status(mapped_status) or mapped_status
-        current_result = dict(item.result or {})
-        item.status = normalized_status
-        item.error_message = None if normalized_status in {"queued", "running", "success"} else error_message
-        item.started_at = item.started_at or _now()
-        item.finished_at = None if normalized_status in {"queued", "running"} else (item.finished_at or _now())
-        item.result = {
-            **current_result,
-            "downstream": self._lightweight_downstream_payload(downstream_payload or {}),
-            "downstream_status_synced_at": _now().isoformat(),
-            "downstream_status": self._string_or_none((downstream_payload or {}).get("status")),
-            "sync_status": "synced",
-        }
+        self._apply_child_task_status_change(
+            None,
+            task=None,
+            item=item,
+            change_source="downstream_sync",
+            after_status=mapped_status,
+            downstream_payload=downstream_payload,
+            sync_status="synced",
+            downstream_status_raw=self._string_or_none((downstream_payload or {}).get("status")),
+            downstream_status_mapped=self._map_downstream_status(mapped_status) or mapped_status,
+            downstream_status=self._string_or_none((downstream_payload or {}).get("status")),
+            state_applied=True,
+            error_message=error_message,
+        )
 
     def _mark_stage_item_sync_observation(
         self,
@@ -5556,28 +5572,18 @@ class TaskManager:
         downstream_status: str | None = None,
         state_applied: bool | None = None,
     ) -> None:
-        current_result = dict(item.result or {})
-        sync_observation = dict(current_result.get("sync_observation") or {})
-        sync_observation.update(
-            {
-                "sync_status": sync_status,
-                "last_synced_at": (synced_at or _now()).isoformat(),
-                "error_message": error_message,
-                "http_status": http_status,
-                "error_type": error_type,
-                "status_raw": status_raw,
-                "mapped_status": mapped_status,
-                "downstream_status": downstream_status,
-                "state_applied": state_applied,
-            }
+        self._apply_child_task_sync_observation(
+            item,
+            sync_status=sync_status,
+            synced_at=synced_at,
+            error_message=error_message,
+            http_status=http_status,
+            error_type=error_type,
+            downstream_status_raw=status_raw,
+            downstream_status_mapped=mapped_status,
+            downstream_status=downstream_status,
+            state_applied=state_applied,
         )
-        item.result = {
-            **current_result,
-            "sync_status": sync_status,
-            "downstream_status_synced_at": sync_observation["last_synced_at"],
-            "downstream_status": downstream_status or current_result.get("downstream_status"),
-            "sync_observation": sync_observation,
-        }
 
     def _apply_stage_worker_start_requested_locked(self, db: Session, event: BinarySecurityStateEvent) -> None:
         payload = dict(event.payload or {})
@@ -8971,6 +8977,297 @@ class TaskManager:
         )
         db.add(event)
 
+    @staticmethod
+    def _preserved_child_result_keys() -> tuple[str, ...]:
+        return (
+            "sync_status",
+            "downstream_status_synced_at",
+            "downstream_status",
+            "sync_observation",
+            "downstream",
+            "archive_copy_stats",
+            "archive_root",
+            "artifact_root",
+        )
+
+    def _preserve_child_result_metadata(self, result: dict[str, Any] | None) -> dict[str, Any]:
+        current_result = dict(result or {})
+        preserved: dict[str, Any] = {}
+        for key in self._preserved_child_result_keys():
+            if key in current_result:
+                preserved[key] = current_result.get(key)
+        return preserved
+
+    def _reset_child_runtime_payload(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        payload: dict[str, Any] | None = None,
+        keep_error: bool = False,
+        reset_started_at: bool = False,
+        reset_finished_at: bool = True,
+    ) -> list[str]:
+        preserved_result = self._preserve_child_result_metadata(item.result)
+        preserved_keys = list(preserved_result.keys())
+        item.payload = dict(payload or {})
+        item.result = preserved_result
+        if not keep_error:
+            item.error_message = None
+        if reset_started_at:
+            item.started_at = None
+        if reset_finished_at:
+            item.finished_at = None
+        return preserved_keys
+
+    def _build_child_status_event_payload(
+        self,
+        *,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        change_source: str,
+        before_status: str | None,
+        after_status: str | None,
+        sync_status: str | None = None,
+        downstream_status_raw: str | None = None,
+        downstream_status_mapped: str | None = None,
+        downstream_status: str | None = None,
+        state_applied: bool | None = None,
+        error_message: str | None = None,
+        error_type: str | None = None,
+        http_status: int | None = None,
+        archive_job_id: str | None = None,
+        state_event_id: str | None = None,
+        preserved_result_keys: list[str] | None = None,
+        task_status_after_reconcile: str | None = None,
+        stage_status_after_reconcile: str | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "change_source": change_source,
+            "before_status": before_status,
+            "after_status": after_status,
+            "downstream_service": item.downstream_service,
+            "downstream_task_id": item.downstream_task_id,
+            "downstream_status_raw": downstream_status_raw,
+            "downstream_status_mapped": downstream_status_mapped,
+            "downstream_status": downstream_status,
+            "state_applied": state_applied,
+            "sync_status": sync_status,
+            "http_status": http_status,
+            "error_type": error_type,
+            "error_message": error_message,
+            "archive_job_id": archive_job_id,
+            "state_event_id": state_event_id,
+            "preserved_result_keys": preserved_result_keys or [],
+            "task_status_after_reconcile": task_status_after_reconcile or task.status,
+            "stage_status_after_reconcile": stage_status_after_reconcile,
+        }
+        if extra_payload:
+            payload.update(extra_payload)
+        return payload
+
+    def _child_status_event_message(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        event_type: str,
+        before_status: str | None,
+        after_status: str | None,
+        change_source: str,
+    ) -> str:
+        item_label = str(item.item_key or item.item_name or item.id or "-")
+        stage_label = str(item.stage_name or "unknown")
+        if event_type == "child_sync_observed":
+            return f"{stage_label} 子任务同步观测完成: {item_label}"
+        if event_type == "child_sync_failed":
+            return f"{stage_label} 子任务同步失败: {item_label}"
+        if event_type == "child_archive_status_changed":
+            return f"{stage_label} 子任务归档状态推进: {item_label} {before_status or '-'} -> {after_status or '-'}"
+        return f"{stage_label} 子任务状态变更: {item_label} {before_status or '-'} -> {after_status or '-'} ({change_source})"
+
+    def _log_child_status_event(
+        self,
+        db: Session,
+        *,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        event_type: str,
+        change_source: str,
+        before_status: str | None,
+        after_status: str | None,
+        sync_status: str | None = None,
+        downstream_status_raw: str | None = None,
+        downstream_status_mapped: str | None = None,
+        downstream_status: str | None = None,
+        state_applied: bool | None = None,
+        error_message: str | None = None,
+        error_type: str | None = None,
+        http_status: int | None = None,
+        archive_job_id: str | None = None,
+        state_event_id: str | None = None,
+        preserved_result_keys: list[str] | None = None,
+        stage_status_after_reconcile: str | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
+        level = "warning" if event_type in {"child_sync_failed", "child_archive_status_changed"} or str(after_status or "") in {"failed", "cancelled", "downstream_missing"} else "info"
+        self._record_event(
+            db,
+            task,
+            event_type,
+            self._child_status_event_message(
+                item,
+                event_type=event_type,
+                before_status=before_status,
+                after_status=after_status,
+                change_source=change_source,
+            ),
+            level=level,
+            stage_name=item.stage_name,
+            item=item,
+            payload=self._build_child_status_event_payload(
+                task=task,
+                item=item,
+                change_source=change_source,
+                before_status=before_status,
+                after_status=after_status,
+                sync_status=sync_status,
+                downstream_status_raw=downstream_status_raw,
+                downstream_status_mapped=downstream_status_mapped,
+                downstream_status=downstream_status,
+                state_applied=state_applied,
+                error_message=error_message,
+                error_type=error_type,
+                http_status=http_status,
+                archive_job_id=archive_job_id,
+                state_event_id=state_event_id,
+                preserved_result_keys=preserved_result_keys,
+                stage_status_after_reconcile=stage_status_after_reconcile,
+                extra_payload=extra_payload,
+            ),
+        )
+
+    def _apply_child_task_sync_observation(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        sync_status: str,
+        synced_at: datetime | None = None,
+        error_message: str | None = None,
+        http_status: int | None = None,
+        error_type: str | None = None,
+        downstream_status_raw: str | None = None,
+        downstream_status_mapped: str | None = None,
+        downstream_status: str | None = None,
+        state_applied: bool | None = None,
+        downstream_payload: dict[str, Any] | None = None,
+        archive_root: str | None = None,
+        archive_copy_stats: dict[str, Any] | None = None,
+    ) -> list[str]:
+        current_result = dict(item.result or {})
+        preserved_keys = [key for key in self._preserved_child_result_keys() if key in current_result]
+        sync_observation = dict(current_result.get("sync_observation") or {})
+        sync_observation.update(
+            {
+                "sync_status": sync_status,
+                "last_synced_at": (synced_at or _now()).isoformat(),
+                "error_message": error_message,
+                "http_status": http_status,
+                "error_type": error_type,
+                "status_raw": downstream_status_raw,
+                "mapped_status": downstream_status_mapped,
+                "downstream_status": downstream_status,
+                "state_applied": state_applied,
+            }
+        )
+        merged_result = {
+            **current_result,
+            "sync_status": sync_status,
+            "downstream_status_synced_at": sync_observation["last_synced_at"],
+            "downstream_status": downstream_status or current_result.get("downstream_status"),
+            "sync_observation": sync_observation,
+        }
+        if downstream_payload is not None:
+            merged_result["downstream"] = self._lightweight_downstream_payload(downstream_payload or {})
+        if archive_root is not None:
+            merged_result["archive_root"] = archive_root
+        if archive_copy_stats is not None:
+            merged_result["archive_copy_stats"] = dict(archive_copy_stats or {})
+        item.result = merged_result
+        return preserved_keys
+
+    def _apply_child_task_status_change(
+        self,
+        db: Session | None,
+        *,
+        task: BinarySecurityTask | None,
+        item: BinarySecurityStageItem,
+        change_source: str,
+        after_status: str,
+        downstream_payload: dict[str, Any] | None = None,
+        sync_status: str | None = None,
+        downstream_status_raw: str | None = None,
+        downstream_status_mapped: str | None = None,
+        downstream_status: str | None = None,
+        state_applied: bool | None = None,
+        error_message: str | None = None,
+        error_type: str | None = None,
+        http_status: int | None = None,
+        archive_job_id: str | None = None,
+        state_event_id: str | None = None,
+        synced_at: datetime | None = None,
+        extra_payload: dict[str, Any] | None = None,
+        event_type: str = "child_status_changed",
+    ) -> list[str]:
+        normalized_status = self._map_downstream_status(after_status) or after_status
+        before_status = str(item.status or "").strip().lower() or None
+        item.status = normalized_status
+        keep_active_error = (
+            bool(error_message)
+            and normalized_status in {"queued", "running"}
+            and (change_source == "transport_error" or sync_status == "transport_error")
+        )
+        item.error_message = error_message if keep_active_error else (
+            None if normalized_status in {"queued", "running", "success"} else error_message
+        )
+        item.started_at = item.started_at or _now()
+        item.finished_at = None if normalized_status in {"queued", "running"} else (item.finished_at or _now())
+        preserved_keys = self._apply_child_task_sync_observation(
+            item,
+            sync_status=sync_status or ("synced" if state_applied else "observed"),
+            synced_at=synced_at,
+            error_message=error_message,
+            http_status=http_status,
+            error_type=error_type,
+            downstream_status_raw=downstream_status_raw,
+            downstream_status_mapped=downstream_status_mapped or normalized_status,
+            downstream_status=downstream_status,
+            state_applied=state_applied,
+            downstream_payload=downstream_payload,
+        )
+        if db is not None and task is not None:
+            self._log_child_status_event(
+                db,
+                task=task,
+                item=item,
+                event_type=event_type,
+                change_source=change_source,
+                before_status=before_status,
+                after_status=normalized_status,
+                sync_status=sync_status or ("synced" if state_applied else "observed"),
+                downstream_status_raw=downstream_status_raw,
+                downstream_status_mapped=downstream_status_mapped or normalized_status,
+                downstream_status=downstream_status,
+                state_applied=state_applied,
+                error_message=error_message,
+                error_type=error_type,
+                http_status=http_status,
+                archive_job_id=archive_job_id,
+                state_event_id=state_event_id,
+                preserved_result_keys=preserved_keys,
+                extra_payload=extra_payload,
+            )
+        return preserved_keys
+
     def _enqueue_state_event(
         self,
         db: Session,
@@ -11967,12 +12264,15 @@ class TaskManager:
             keep_existing_active = preserve_active_status and self._should_preserve_streaming_item_status(item)
             item.status = item.status if keep_existing_active else running_status
             item.downstream_service = downstream_service
-            item.error_message = None
-            item.finished_at = None
+            self._reset_child_runtime_payload(
+                item,
+                payload={},
+                keep_error=False,
+                reset_started_at=False,
+                reset_finished_at=True,
+            )
             if not keep_existing_active:
                 item.started_at = self._stage_item_started_at(running_status)
-            item.payload = {}
-            item.result = {}
             if retrying:
                 item.rerun_count = int(item.rerun_count or 0) + 1
             if auto_retrying:
@@ -12004,12 +12304,15 @@ class TaskManager:
                 keep_existing_active = preserve_active_status and self._should_preserve_streaming_item_status(existing)
                 existing.status = existing.status if keep_existing_active else running_status
                 existing.downstream_service = downstream_service
-                existing.error_message = None
-                existing.finished_at = None
+                self._reset_child_runtime_payload(
+                    existing,
+                    payload={},
+                    keep_error=False,
+                    reset_started_at=False,
+                    reset_finished_at=True,
+                )
                 if not keep_existing_active:
                     existing.started_at = self._stage_item_started_at(running_status)
-                existing.payload = {}
-                existing.result = {}
                 existing.input_ref = input_ref
                 if output_ref is not None:
                     existing.output_ref = output_ref
@@ -12416,11 +12719,13 @@ class TaskManager:
                             item.item_identity_key = identity_key
                             item.status = "queued"
                             item.downstream_service = downstream_service
-                            item.error_message = None
-                            item.started_at = None
-                            item.finished_at = None
-                            item.payload = {}
-                            item.result = {}
+                            self._reset_child_runtime_payload(
+                                item,
+                                payload={},
+                                keep_error=False,
+                                reset_started_at=True,
+                                reset_finished_at=True,
+                            )
                         item.input_ref = input_ref
                         item.output_ref = output_ref(input_item)
                     db.commit()
@@ -12512,13 +12817,21 @@ class TaskManager:
         item: BinarySecurityStageItem,
         token: str | None,
     ) -> dict[str, Any]:
-        return await self._downstream_tasks().control_existing_child(
-            None,
-            stage_name=stage_name,
-            task=task,
-            item=item,
-            token=token,
-        )
+        try:
+            return await self._downstream_tasks().control_existing_child(
+                None,
+                stage_name=stage_name,
+                task=task,
+                item=item,
+                token=token,
+            )
+        except UpstreamError as exc:
+            return {
+                "outcome": "transport_error",
+                "retry_outcome": "transport_error",
+                "error_message": self._extract_downstream_error_text(exc) or str(exc),
+                "http_status": self._extract_http_status_from_exception(exc),
+            }
 
     def _record_downstream_item_disposition(
         self,
@@ -12638,10 +12951,27 @@ class TaskManager:
     ) -> dict[str, Any]:
         has_downstream_ref = bool(str(item.downstream_task_id or "").strip())
         deferred_mode = "reconcile" if has_downstream_ref else "redispatch"
-        item.status = "running" if has_downstream_ref else "queued"
-        item.error_message = str(exc)
-        item.started_at = item.started_at or _now()
-        item.finished_at = None
+        deferred_status = "running" if has_downstream_ref else "queued"
+        self._apply_child_task_status_change(
+            session,
+            task=task,
+            item=item,
+            change_source="transport_error",
+            after_status=deferred_status,
+            sync_status="transport_error",
+            downstream_status_raw=None,
+            downstream_status_mapped=deferred_status,
+            downstream_status=None,
+            state_applied=False,
+            error_message=str(exc),
+            error_type=self._classify_downstream_sync_error(exc),
+            http_status=self._extract_http_status_from_exception(exc),
+            event_type="child_sync_failed",
+            extra_payload={
+                "operation": operation,
+                "deferred_mode": deferred_mode,
+            },
+        )
         session.commit()
         self._record_downstream_item_disposition(
             session,

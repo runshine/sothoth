@@ -1,14 +1,17 @@
 import unittest
 from unittest.mock import patch
 
+import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from types import SimpleNamespace
 
 import app.api.tasks as tasks_api_module
 from app.api.tasks import get_current_context, get_current_user
 from app.api.tasks import router as tasks_router
-from app.exception import setup_exception_handlers
+from app.exception import UpstreamError, setup_exception_handlers
 from app.model import get_db
+from app.service.project import ProjectService
 from app.schemas import (
     BinarySecurityProjectConfigPayload,
     BinarySecurityProjectConfigResponse,
@@ -283,6 +286,73 @@ class TaskApiRouteTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(12, payload["config"]["max_concurrent_tasks"])
         self.assertEqual(("get_service_config", fake_db), manager.calls[0])
+
+    def test_get_task_detail_route_returns_502_when_project_service_disconnects(self):
+        app = FastAPI()
+        app.include_router(tasks_router)
+        setup_exception_handlers(app)
+
+        fake_db = object()
+
+        class _AuthStub:
+            async def validate_token(self, token):
+                del token
+                return {"user_id": "u1", "username": "tester", "token_type": "user"}
+
+        class _ProjectStub:
+            async def require_access(self, token, project_id):
+                del token, project_id
+                raise UpstreamError("Project 服务请求失败: Server disconnected without sending a response")
+
+        def _db_override():
+            yield fake_db
+
+        app.dependency_overrides[get_db] = _db_override
+
+        with patch.object(tasks_api_module, "get_auth_service", return_value=_AuthStub()), patch.object(
+            tasks_api_module, "get_project_service", return_value=_ProjectStub()
+        ):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/app/binary-security/projects/p1/tasks/t1",
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(502, response.status_code)
+        self.assertIn("Project 服务请求失败", response.json()["error"])
+
+    def test_project_service_require_access_retries_once_after_request_error(self):
+        service = ProjectService()
+
+        class _ClientStub:
+            def __init__(self):
+                self.calls = 0
+
+            async def get(self, url, headers=None):
+                del url, headers
+                self.calls += 1
+                if self.calls == 1:
+                    request = SimpleNamespace(url="http://secflow-platform-project/api/project/p1")
+                    raise httpx.RemoteProtocolError(
+                        "Server disconnected without sending a response", request=request
+                    )
+                return SimpleNamespace(status_code=200, json=lambda: {"id": "p1"})
+
+        client = _ClientStub()
+
+        async def _client_factory(name, timeout=None):
+            del name, timeout
+            return client
+
+        async def _run():
+            with patch("app.service.project.get_shared_async_client", side_effect=_client_factory):
+                result = await service.require_access("token", "p1")
+            self.assertEqual({"id": "p1"}, result)
+            self.assertEqual(2, client.calls)
+
+        import asyncio
+
+        asyncio.run(_run())
 
 
 if __name__ == "__main__":

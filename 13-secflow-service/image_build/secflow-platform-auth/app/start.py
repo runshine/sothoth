@@ -316,9 +316,11 @@ if __name__ == "__main__":
 
     host = config.get("app", {}).get("host", "0.0.0.0")
     port = config.get("app", {}).get("port", 8080)
+    timeout_keep_alive = config.get("app", {}).get("timeout_keep_alive_seconds", 30)
     uvicorn.run(
         app,
         host=host,
         port=port,
-        reload=False
+        reload=False,
+        timeout_keep_alive=timeout_keep_alive,
     )

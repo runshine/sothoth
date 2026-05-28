@@ -341,4 +341,10 @@ if __name__ == "__main__":
     import uvicorn
 
     config = get_config()
-    uvicorn.run("app.main:app", host=config.app.host, port=config.app.port, reload=config.app.debug)
+    uvicorn.run(
+        "app.main:app",
+        host=config.app.host,
+        port=config.app.port,
+        reload=config.app.debug,
+        timeout_keep_alive=config.app.timeout_keep_alive_seconds,
+    )

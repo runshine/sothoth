@@ -22,6 +22,12 @@ project_service:
   get_project_path: "/api/project"
   timeout: 10
 
+http_client:
+  keepalive_expiry_seconds: 15
+  max_keepalive_connections: 20
+  max_connections: 100
+  retry_count: 1
+
 storage:
   project_root_template: "/data/files/{project_id}"
   app_root_name: "app/secflow-app-binary-security"
@@ -117,6 +123,7 @@ app:
   host: "0.0.0.0"
   port: 8080
   debug: false
+  timeout_keep_alive_seconds: 30
 
 logging:
   level: "INFO"

@@ -165,4 +165,5 @@ if __name__ == "__main__":
         host=config.app.host,
         port=config.app.port,
         reload=config.app.debug,
+        timeout_keep_alive=config.app.timeout_keep_alive_seconds,
     )

@@ -16262,5 +16262,138 @@ TaskManagerTests.test_stage_item_response_exposes_downstream_status_from_sync_ob
 TaskManagerTests.test_build_stage_summaries_and_overview_preserve_orchestration_and_downstream_statuses = _test_build_stage_summaries_and_overview_preserve_orchestration_and_downstream_statuses
 
 
+def _test_apply_child_task_status_change_records_timeline_and_sync_metadata(self):
+    task = BinarySecurityTask(id="t1", project_id="p1", name="demo", status="running")
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="IPSEC",
+        status="pending",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+    self.manager._apply_child_task_status_change(
+        db,
+        task=task,
+        item=item,
+        change_source="downstream_sync",
+        after_status="running",
+        downstream_payload={"status": "running", "task_id": "eat-1"},
+        sync_status="synced",
+        downstream_status_raw="running",
+        downstream_status_mapped="running",
+        downstream_status="running",
+        state_applied=True,
+    )
+
+    self.assertEqual("running", item.status)
+    self.assertEqual("synced", item.result.get("sync_status"))
+    self.assertEqual("running", item.result.get("downstream_status"))
+    self.assertIn("sync_observation", item.result)
+    child_events = [event for event in db.events if event.event_type == "child_status_changed"]
+    self.assertTrue(child_events)
+    self.assertEqual("downstream_sync", child_events[-1].payload.get("change_source"))
+    self.assertEqual("pending", child_events[-1].payload.get("before_status"))
+    self.assertEqual("running", child_events[-1].payload.get("after_status"))
+
+
+def _test_defer_item_after_downstream_transport_error_records_child_sync_failed(self):
+    task = BinarySecurityTask(id="t1", project_id="p1", name="demo", status="running")
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="IPSEC",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+    result = self.manager._defer_item_after_downstream_transport_error(
+        db,
+        task,
+        item,
+        operation="entry_analysis",
+        exc=UpstreamError("timeout"),
+        response_item={"module_key": "IPSEC"},
+    )
+
+    self.assertEqual("running", item.status)
+    self.assertEqual("transport_error", item.result.get("sync_status"))
+    child_events = [event for event in db.events if event.event_type == "child_sync_failed"]
+    self.assertTrue(child_events)
+    self.assertEqual("transport_error", child_events[-1].payload.get("sync_status"))
+    self.assertEqual("reconcile", child_events[-1].payload.get("deferred_mode"))
+    self.assertEqual("running", result["status"])
+
+
+def _test_upsert_stage_item_preserves_sync_metadata_on_refresh(self):
+    task = BinarySecurityTask(id="t1", project_id="p1", name="demo", status="running")
+    stage_run = BinarySecurityStageRun(
+        id="sr-entry",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        sequence_no=1,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si-entry",
+        task_id="t1",
+        project_id="p1",
+        stage_run_id="sr-old",
+        stage_name="entry_analysis",
+        item_key="IPSEC",
+        item_name="IPSEC",
+        parent_key="module-input",
+        item_identity_key="IPSEC::module-input",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    item.result = {
+        "sync_status": "synced",
+        "downstream_status_synced_at": _now().isoformat(),
+        "downstream_status": "running",
+        "sync_observation": {
+            "status_raw": "running",
+            "mapped_status": "running",
+            "downstream_status": "running",
+            "state_applied": True,
+        },
+    }
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item])
+
+    refreshed = self.manager._upsert_stage_item(
+        db,
+        task=task,
+        stage_run=stage_run,
+        stage_name="entry_analysis",
+        item_key="IPSEC",
+        item_name="IPSEC",
+        parent_key="module-input",
+        downstream_service="entry_analyse",
+        input_ref={"module_key": "IPSEC"},
+        output_ref={},
+        retrying=False,
+        running_status="pending",
+    )
+
+    self.assertEqual("synced", refreshed.result.get("sync_status"))
+    self.assertIn("sync_observation", refreshed.result)
+    self.assertEqual("running", refreshed.result.get("downstream_status"))
+
+
+TaskManagerTests.test_apply_child_task_status_change_records_timeline_and_sync_metadata = _test_apply_child_task_status_change_records_timeline_and_sync_metadata
+TaskManagerTests.test_defer_item_after_downstream_transport_error_records_child_sync_failed = _test_defer_item_after_downstream_transport_error_records_child_sync_failed
+TaskManagerTests.test_upsert_stage_item_preserves_sync_metadata_on_refresh = _test_upsert_stage_item_preserves_sync_metadata_on_refresh
+
+
 if __name__ == "__main__":
     unittest.main()

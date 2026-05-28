@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.build_info import build_service_meta
 from app.config import get_config
 from app.exception import (
+    DependencyUnavailableError,
     ForbiddenError,
     InternalError,
     NotFoundError,
@@ -41,7 +42,7 @@ from app.schemas import (
     ProjectResourcesResponse,
     PodLogResponse,
 )
-from app.service.auth import get_auth_service, TokenInvalidError
+from app.service.auth import AuthServiceError, get_auth_service, TokenInvalidError
 from app.service.k8s import get_k8s_client
 
 logger = logging.getLogger(__name__)
@@ -332,6 +333,8 @@ async def get_current_user(
         return user
     except TokenInvalidError:
         raise UnauthorizedError("Token无效或已过期")
+    except AuthServiceError as exc:
+        raise DependencyUnavailableError("认证服务暂时不可用", details={"reason": str(exc)})
 
 
 async def get_current_user_sync(
@@ -356,6 +359,8 @@ async def get_current_user_sync(
         return user
     except TokenInvalidError:
         raise UnauthorizedError("Token无效或已过期")
+    except AuthServiceError as exc:
+        raise DependencyUnavailableError("认证服务暂时不可用", details={"reason": str(exc)})
 
 
 def make_project_response(

@@ -38,10 +38,27 @@ class AuthService:
 
     def __init__(self):
         self.config = get_config().auth_service
-        self.client = httpx.Client(timeout=self.config.timeout)
+        self.client = httpx.Client(
+            timeout=self.config.timeout,
+            limits=httpx.Limits(
+                max_connections=max(1, int(self.config.max_connections)),
+                max_keepalive_connections=max(0, int(self.config.max_keepalive_connections)),
+                keepalive_expiry=max(0.0, float(self.config.keepalive_expiry_seconds)),
+            ),
+        )
         self._token_cache: Dict[str, TokenCacheEntry] = {}
         self._cache_enabled = self.config.token_cache_enabled
         self._cache_ttl_seconds = self.config.token_cache_ttl_minutes * 60
+
+    def _async_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            timeout=self.config.timeout,
+            limits=httpx.Limits(
+                max_connections=max(1, int(self.config.max_connections)),
+                max_keepalive_connections=max(0, int(self.config.max_keepalive_connections)),
+                keepalive_expiry=max(0.0, float(self.config.keepalive_expiry_seconds)),
+            ),
+        )
 
     def _get_cache_key(self, token: str, project_id: Optional[str] = None) -> str:
         return f"{token}::{project_id or ''}"
@@ -95,34 +112,51 @@ class AuthService:
         if cached_user is not None:
             return cached_user
 
-        # 缓存未命中，调用认证服务
-        try:
-            headers = {"Authorization": f"Bearer {token}"}
-            response = self.client.post(
-                self.config.validate_url,
-                headers=headers,
-                params={"project_id": project_id} if project_id else None
-            )
-
-            if response.status_code == 401:
-                raise TokenInvalidError("Token已过期或无效")
-
-            if response.status_code != 200:
-                raise AuthServiceError(
-                    f"认证服务返回异常状态码: {response.status_code}"
+        headers = {"Authorization": f"Bearer {token}"}
+        params = {"project_id": project_id} if project_id else None
+        retry_count = max(0, int(self.config.retry_count))
+        last_error: httpx.RequestError | None = None
+        for attempt in range(retry_count + 1):
+            try:
+                response = self.client.post(self.config.validate_url, headers=headers, params=params)
+                if response.status_code == 401:
+                    raise TokenInvalidError("Token已过期或无效")
+                if response.status_code != 200:
+                    raise AuthServiceError(f"认证服务返回异常状态码: {response.status_code}")
+                data = response.json()
+                self._set_cached_user(token, data, project_id)
+                if attempt > 0:
+                    logger.warning(
+                        "auth_service request recovered after retry",
+                        extra={"target_service": "auth_service", "operation": "validate_token", "retried": True, "final_result": "retry_success"},
+                    )
+                return data
+            except httpx.TimeoutException:
+                logger.warning(
+                    "auth_service timeout",
+                    extra={"target_service": "auth_service", "operation": "validate_token", "exception_type": "TimeoutException", "retried": False, "final_result": "timeout"},
                 )
-
-            data = response.json()
-
-            # 缓存验证结果
-            self._set_cached_user(token, data, project_id)
-
-            return data
-
-        except httpx.TimeoutException:
-            raise AuthServiceError("认证服务请求超时")
-        except httpx.ConnectError as e:
-            raise AuthServiceError(f"无法连接到认证服务: {e}")
+                raise AuthServiceError("认证服务请求超时")
+            except httpx.ConnectError as e:
+                logger.warning(
+                    "auth_service connect error",
+                    extra={"target_service": "auth_service", "operation": "validate_token", "exception_type": type(e).__name__, "retried": False, "final_result": "connect_error"},
+                )
+                raise AuthServiceError(f"无法连接到认证服务: {e}")
+            except httpx.RequestError as e:
+                last_error = e
+                if attempt < retry_count:
+                    logger.warning(
+                        "auth_service transient request error, retrying",
+                        extra={"target_service": "auth_service", "operation": "validate_token", "exception_type": type(e).__name__, "retried": True, "final_result": "retrying"},
+                    )
+                    continue
+                logger.warning(
+                    "auth_service request failed after retries",
+                    extra={"target_service": "auth_service", "operation": "validate_token", "exception_type": type(e).__name__, "retried": retry_count > 0, "final_result": "retry_failed"},
+                )
+                raise AuthServiceError(f"认证服务请求失败: {e}")
+        raise AuthServiceError(f"认证服务请求失败: {last_error}")
 
     async def validate_token_async(self, token: str, project_id: Optional[str] = None) -> dict:
         """
@@ -139,35 +173,52 @@ class AuthService:
         if cached_user is not None:
             return cached_user
 
-        # 缓存未命中，调用认证服务
-        async with httpx.AsyncClient(timeout=self.config.timeout) as client:
-            try:
-                headers = {"Authorization": f"Bearer {token}"}
-                response = await client.post(
-                    self.config.validate_url,
-                    headers=headers,
-                    params={"project_id": project_id} if project_id else None
-                )
-
-                if response.status_code == 401:
-                    raise TokenInvalidError("Token已过期或无效")
-
-                if response.status_code != 200:
-                    raise AuthServiceError(
-                        f"认证服务返回异常状态码: {response.status_code}"
+        headers = {"Authorization": f"Bearer {token}"}
+        params = {"project_id": project_id} if project_id else None
+        retry_count = max(0, int(self.config.retry_count))
+        last_error: httpx.RequestError | None = None
+        async with self._async_client() as client:
+            for attempt in range(retry_count + 1):
+                try:
+                    response = await client.post(self.config.validate_url, headers=headers, params=params)
+                    if response.status_code == 401:
+                        raise TokenInvalidError("Token已过期或无效")
+                    if response.status_code != 200:
+                        raise AuthServiceError(f"认证服务返回异常状态码: {response.status_code}")
+                    data = response.json()
+                    self._set_cached_user(token, data, project_id)
+                    if attempt > 0:
+                        logger.warning(
+                            "auth_service async request recovered after retry",
+                            extra={"target_service": "auth_service", "operation": "validate_token_async", "retried": True, "final_result": "retry_success"},
+                        )
+                    return data
+                except httpx.TimeoutException:
+                    logger.warning(
+                        "auth_service async timeout",
+                        extra={"target_service": "auth_service", "operation": "validate_token_async", "exception_type": "TimeoutException", "retried": False, "final_result": "timeout"},
                     )
-
-                data = response.json()
-
-                # 缓存验证结果
-                self._set_cached_user(token, data, project_id)
-
-                return data
-
-            except httpx.TimeoutException:
-                raise AuthServiceError("认证服务请求超时")
-            except httpx.ConnectError as e:
-                raise AuthServiceError(f"无法连接到认证服务: {e}")
+                    raise AuthServiceError("认证服务请求超时")
+                except httpx.ConnectError as e:
+                    logger.warning(
+                        "auth_service async connect error",
+                        extra={"target_service": "auth_service", "operation": "validate_token_async", "exception_type": type(e).__name__, "retried": False, "final_result": "connect_error"},
+                    )
+                    raise AuthServiceError(f"无法连接到认证服务: {e}")
+                except httpx.RequestError as e:
+                    last_error = e
+                    if attempt < retry_count:
+                        logger.warning(
+                            "auth_service async transient request error, retrying",
+                            extra={"target_service": "auth_service", "operation": "validate_token_async", "exception_type": type(e).__name__, "retried": True, "final_result": "retrying"},
+                        )
+                        continue
+                    logger.warning(
+                        "auth_service async request failed after retries",
+                        extra={"target_service": "auth_service", "operation": "validate_token_async", "exception_type": type(e).__name__, "retried": retry_count > 0, "final_result": "retry_failed"},
+                    )
+                    raise AuthServiceError(f"认证服务请求失败: {e}")
+        raise AuthServiceError(f"认证服务请求失败: {last_error}")
 
     def ensure_project_token(self, project_id: str, project_name: Optional[str] = None) -> dict:
         """通知认证服务为项目创建项目级Token。"""
@@ -191,6 +242,8 @@ class AuthService:
             raise AuthServiceError("认证服务请求超时")
         except httpx.ConnectError as e:
             raise AuthServiceError(f"无法连接到认证服务: {e}")
+        except httpx.RequestError as e:
+            raise AuthServiceError(f"认证服务请求失败: {e}")
 
 
 # 单例实例
