@@ -16,16 +16,64 @@ from sqlalchemy.orm import Session
 
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
 from app.model import BinarySecurityStageItem, BinarySecurityTask
-from app.service.binary_to_source import get_binary_to_source_client
-from app.service.dataflow_analyse import get_dataflow_analyse_client
-from app.service.dataflow_vuln_scanner import get_dataflow_vuln_scanner_client
-from app.service.entry_analyse import get_entry_analyse_client
-from app.service.firmware_unpacker import get_firmware_unpacker_client
-from app.service.system_analyse import get_system_analyse_client
 from app.time_utils import now_local
 
 
+def get_binary_to_source_client():
+    from app.service import task_manager as task_manager_module
+
+    return task_manager_module.get_binary_to_source_client()
+
+
+def get_dataflow_analyse_client():
+    from app.service import task_manager as task_manager_module
+
+    return task_manager_module.get_dataflow_analyse_client()
+
+
+def get_dataflow_vuln_scanner_client():
+    from app.service import task_manager as task_manager_module
+
+    return task_manager_module.get_dataflow_vuln_scanner_client()
+
+
+def get_entry_analyse_client():
+    from app.service import task_manager as task_manager_module
+
+    return task_manager_module.get_entry_analyse_client()
+
+
+def get_firmware_unpacker_client():
+    from app.service import task_manager as task_manager_module
+
+    return task_manager_module.get_firmware_unpacker_client()
+
+
+def get_system_analyse_client():
+    from app.service import task_manager as task_manager_module
+
+    return task_manager_module.get_system_analyse_client()
+
+
 class DownstreamTaskGateway:
+    def _binary_to_source_client(self):
+        return get_binary_to_source_client()
+
+    def _dataflow_analyse_client(self):
+        return get_dataflow_analyse_client()
+
+    def _dataflow_vuln_scanner_client(self):
+        return get_dataflow_vuln_scanner_client()
+
+    def _entry_analyse_client(self):
+        return get_entry_analyse_client()
+
+    def _firmware_unpacker_client(self):
+        return get_firmware_unpacker_client()
+
+    def _system_analyse_client(self):
+        return get_system_analyse_client()
+
     def _normalize_service(self, service: str) -> str:
         value = str(service or "").strip()
         if not value:
@@ -35,23 +83,23 @@ class DownstreamTaskGateway:
     async def get_task(self, service: str, *, project_id: str | None, task_id: str, token: str | None) -> dict[str, Any]:
         normalized = self._normalize_service(service)
         if normalized == "firmware_unpacker":
-            return await get_firmware_unpacker_client().get_task(project_id or "", task_id, token or "")
+            return await self._firmware_unpacker_client().get_task(project_id or "", task_id, token or "")
         if normalized == "system_analyse":
-            return await get_system_analyse_client().get_task(task_id)
+            return await self._system_analyse_client().get_task(task_id)
         if normalized == "binary_to_source":
-            return await get_binary_to_source_client().get_task(project_id or "", task_id, token or "")
+            return await self._binary_to_source_client().get_task(project_id or "", task_id, token or "")
         if normalized == "entry_analyse":
-            return await get_entry_analyse_client().get_task(task_id, token or "")
+            return await self._entry_analyse_client().get_task(task_id, token or "")
         if normalized == "dataflow_analyse":
-            return await get_dataflow_analyse_client().get_task(task_id)
+            return await self._dataflow_analyse_client().get_task(task_id)
         if normalized == "dataflow_vuln_scanner":
-            return await get_dataflow_vuln_scanner_client().get_task(task_id, token or "")
+            return await self._dataflow_vuln_scanner_client().get_task(task_id, token or "")
         raise ValidationError(f"未知下游服务: {normalized}")
 
     async def list_tasks(self, service: str, *, project_id: str, token: str | None, **kwargs: Any) -> dict[str, Any]:
         normalized = self._normalize_service(service)
         if normalized == "firmware_unpacker":
-            return await get_firmware_unpacker_client().list_tasks(
+            return await self._firmware_unpacker_client().list_tasks(
                 project_id,
                 token or "",
                 origin_mode=kwargs.get("origin_mode", "linked"),
@@ -59,7 +107,7 @@ class DownstreamTaskGateway:
                 offset=int(kwargs.get("offset", 0) or 0),
             )
         if normalized == "system_analyse":
-            return await get_system_analyse_client().list_tasks(
+            return await self._system_analyse_client().list_tasks(
                 project_id,
                 parent_task_id=kwargs.get("parent_task_id"),
                 page=int(kwargs.get("page", 1) or 1),
@@ -68,7 +116,7 @@ class DownstreamTaskGateway:
                 sort_order=str(kwargs.get("sort_order") or "desc"),
             )
         if normalized == "binary_to_source":
-            return await get_binary_to_source_client().list_tasks(
+            return await self._binary_to_source_client().list_tasks(
                 project_id,
                 token or "",
                 parent_task_id=kwargs.get("parent_task_id"),
@@ -78,7 +126,7 @@ class DownstreamTaskGateway:
                 status=kwargs.get("status"),
             )
         if normalized == "entry_analyse":
-            return await get_entry_analyse_client().list_tasks(
+            return await self._entry_analyse_client().list_tasks(
                 project_id,
                 parent_task_id=kwargs.get("parent_task_id"),
                 parent_stage_item_id=kwargs.get("parent_stage_item_id"),
@@ -89,7 +137,7 @@ class DownstreamTaskGateway:
                 token=token,
             )
         if normalized == "dataflow_analyse":
-            return await get_dataflow_analyse_client().list_tasks(
+            return await self._dataflow_analyse_client().list_tasks(
                 project_id,
                 parent_task_id=kwargs.get("parent_task_id"),
                 parent_stage_item_id=kwargs.get("parent_stage_item_id"),
@@ -99,7 +147,7 @@ class DownstreamTaskGateway:
                 sort_order=str(kwargs.get("sort_order") or "desc"),
             )
         if normalized == "dataflow_vuln_scanner":
-            rows = await get_dataflow_vuln_scanner_client().list_tasks(
+            rows = await self._dataflow_vuln_scanner_client().list_tasks(
                 project_id,
                 token or "",
                 limit=int(kwargs.get("limit", 100) or 100),
@@ -114,14 +162,14 @@ class DownstreamTaskGateway:
     async def create_task(self, service: str, *, project_id: str, token: str | None, **kwargs: Any) -> dict[str, Any]:
         normalized = self._normalize_service(service)
         if normalized == "firmware_unpacker":
-            return await get_firmware_unpacker_client().create_task(
+            return await self._firmware_unpacker_client().create_task(
                 project_id,
                 str(kwargs["firmware_path"]),
                 token or "",
                 kwargs.get("origin"),
             )
         if normalized == "system_analyse":
-            return await get_system_analyse_client().create_task(
+            return await self._system_analyse_client().create_task(
                 project_id,
                 str(kwargs["task_name"]),
                 str(kwargs["input_path"]),
@@ -129,7 +177,7 @@ class DownstreamTaskGateway:
                 analysis_mode=str(kwargs.get("analysis_mode") or "binary"),
             )
         if normalized == "binary_to_source":
-            return await get_binary_to_source_client().create_task(
+            return await self._binary_to_source_client().create_task(
                 project_id,
                 str(kwargs["name"]),
                 list(kwargs["elf_tasks"]),
@@ -140,7 +188,7 @@ class DownstreamTaskGateway:
                 reuse_cache=kwargs.get("reuse_cache"),
             )
         if normalized == "entry_analyse":
-            return await get_entry_analyse_client().create_task(
+            return await self._entry_analyse_client().create_task(
                 project_id,
                 str(kwargs["task_name"]),
                 str(kwargs["input_path"]),
@@ -150,7 +198,7 @@ class DownstreamTaskGateway:
                 kwargs.get("origin"),
             )
         if normalized == "dataflow_analyse":
-            return await get_dataflow_analyse_client().create_task(
+            return await self._dataflow_analyse_client().create_task(
                 project_id,
                 str(kwargs["task_name"]),
                 str(kwargs["module_input_path"]),
@@ -169,7 +217,7 @@ class DownstreamTaskGateway:
                 entry_reason_source=kwargs.get("entry_reason_source"),
             )
         if normalized == "dataflow_vuln_scanner":
-            return await get_dataflow_vuln_scanner_client().create_task(
+            return await self._dataflow_vuln_scanner_client().create_task(
                 project_id,
                 str(kwargs["title"]),
                 token or "",
@@ -190,11 +238,11 @@ class DownstreamTaskGateway:
     ) -> dict[str, Any]:
         normalized = self._normalize_service(service)
         if stage_name == "firmware_unpack" and normalized == "firmware_unpacker":
-            return await get_firmware_unpacker_client().retry_task(task_id, token or "")
+            return await self._firmware_unpacker_client().retry_task(task_id, token or "")
         if stage_name == "system_analysis" and normalized == "system_analyse":
-            return await get_system_analyse_client().restart_task(task_id)
+            return await self._system_analyse_client().restart_task(task_id)
         if stage_name == "binary_to_source" and normalized == "binary_to_source":
-            return await get_binary_to_source_client().rerun_task(
+            return await self._binary_to_source_client().rerun_task(
                 project_id,
                 task_id,
                 token or "",
@@ -202,55 +250,55 @@ class DownstreamTaskGateway:
                 cancel_running=True,
             )
         if stage_name == "entry_analysis" and normalized == "entry_analyse":
-            return await get_entry_analyse_client().restart_task(task_id, token or "")
+            return await self._entry_analyse_client().restart_task(task_id, token or "")
         if stage_name == "dataflow_analysis" and normalized == "dataflow_analyse":
-            return await get_dataflow_analyse_client().restart_task(task_id)
+            return await self._dataflow_analyse_client().restart_task(task_id)
         if stage_name == "vuln_scan" and normalized == "dataflow_vuln_scanner":
-            return await get_dataflow_vuln_scanner_client().retry_task(task_id, token or "")
+            return await self._dataflow_vuln_scanner_client().retry_task(task_id, token or "")
         raise ValidationError(f"阶段 {stage_name} 未配置安全重试接口")
 
     async def cancel_task(self, service: str, *, project_id: str | None, task_id: str, token: str | None) -> dict[str, Any]:
         normalized = self._normalize_service(service)
         if normalized == "firmware_unpacker":
-            return await get_firmware_unpacker_client().cancel_task(task_id, token or "")
+            return await self._firmware_unpacker_client().cancel_task(task_id, token or "")
         if normalized == "system_analyse":
-            return await get_system_analyse_client().cancel_task(task_id)
+            return await self._system_analyse_client().cancel_task(task_id)
         if normalized == "binary_to_source":
-            return await get_binary_to_source_client().cancel_task(project_id or "", task_id, token or "")
+            return await self._binary_to_source_client().cancel_task(project_id or "", task_id, token or "")
         if normalized == "entry_analyse":
-            return await get_entry_analyse_client().cancel_task(task_id, token or "")
+            return await self._entry_analyse_client().cancel_task(task_id, token or "")
         if normalized == "dataflow_analyse":
-            return await get_dataflow_analyse_client().cancel_task(task_id)
+            return await self._dataflow_analyse_client().cancel_task(task_id)
         if normalized == "dataflow_vuln_scanner":
-            return await get_dataflow_vuln_scanner_client().cancel_task(task_id, token or "")
+            return await self._dataflow_vuln_scanner_client().cancel_task(task_id, token or "")
         raise ValidationError(f"未知下游服务: {normalized}")
 
     async def delete_task(self, service: str, *, project_id: str | None, task_id: str, token: str | None) -> dict[str, Any]:
         normalized = self._normalize_service(service)
         if normalized == "firmware_unpacker":
-            return await get_firmware_unpacker_client().delete_task(task_id, token or "")
+            return await self._firmware_unpacker_client().delete_task(task_id, token or "")
         if normalized == "system_analyse":
-            return await get_system_analyse_client().delete_task(task_id)
+            return await self._system_analyse_client().delete_task(task_id)
         if normalized == "binary_to_source":
-            return await get_binary_to_source_client().delete_task(project_id or "", task_id, token or "")
+            return await self._binary_to_source_client().delete_task(project_id or "", task_id, token or "")
         if normalized == "entry_analyse":
-            return await get_entry_analyse_client().delete_task(task_id, token or "")
+            return await self._entry_analyse_client().delete_task(task_id, token or "")
         if normalized == "dataflow_analyse":
-            return await get_dataflow_analyse_client().delete_task(task_id)
+            return await self._dataflow_analyse_client().delete_task(task_id)
         if normalized == "dataflow_vuln_scanner":
-            return await get_dataflow_vuln_scanner_client().delete_task(task_id, token or "")
+            return await self._dataflow_vuln_scanner_client().delete_task(task_id, token or "")
         raise ValidationError(f"未知下游服务: {normalized}")
 
     async def get_task_result(self, service: str, *, task_id: str) -> dict[str, Any]:
         normalized = self._normalize_service(service)
         if normalized == "system_analyse":
-            return await get_system_analyse_client().get_task_result(task_id)
+            return await self._system_analyse_client().get_task_result(task_id)
         raise ValidationError(f"下游服务 {normalized} 不支持结果读取")
 
     async def get_artifacts(self, service: str, *, task_id: str, token: str | None) -> dict[str, Any]:
         normalized = self._normalize_service(service)
         if normalized == "dataflow_vuln_scanner":
-            return await get_dataflow_vuln_scanner_client().get_artifacts(task_id, token or "")
+            return await self._dataflow_vuln_scanner_client().get_artifacts(task_id, token or "")
         raise ValidationError(f"下游服务 {normalized} 不支持产物读取")
 
 

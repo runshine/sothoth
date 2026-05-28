@@ -113,6 +113,12 @@ from app.schemas import (
     BinarySecurityUploadCompletePayload,
 )
 from app.service.downstream_tasks import get_downstream_task_controller
+from app.service.binary_to_source import get_binary_to_source_client
+from app.service.dataflow_analyse import get_dataflow_analyse_client
+from app.service.dataflow_vuln_scanner import get_dataflow_vuln_scanner_client
+from app.service.entry_analyse import get_entry_analyse_client
+from app.service.firmware_unpacker import get_firmware_unpacker_client
+from app.service.system_analyse import get_system_analyse_client
 from app.service.fileserver import get_fileserver_client
 from app.service.security import app_task_root, ensure_dir, validate_task_id
 from app.service.reducer_metrics_snapshot import get_reducer_metrics_snapshot_store
@@ -129,6 +135,17 @@ DB_ARTIFACT_PREVIEW_LIMIT = 50
 DB_EVENT_PAYLOAD_LIMIT_BYTES = 32768
 DETAIL_STAGE_ITEMS_LIMIT = 100
 MODULE_TASK_INPUT_KEY = "module-input"
+
+# Compatibility exports for older tests and call sites that monkey-patch
+# downstream client factories from task_manager directly.
+__all__ = [
+    "get_binary_to_source_client",
+    "get_dataflow_analyse_client",
+    "get_dataflow_vuln_scanner_client",
+    "get_entry_analyse_client",
+    "get_firmware_unpacker_client",
+    "get_system_analyse_client",
+]
 
 
 def _now() -> datetime:
@@ -862,6 +879,17 @@ class TaskManager:
         item: BinarySecurityStageItem,
         token: str | None,
     ) -> dict[str, Any]:
+        normalized_status = str(item.status or "").strip().lower()
+        if str(item.downstream_task_id or "").strip():
+            try:
+                payload = await self._fetch_downstream_task_payload(task, item, token or "")
+            except Exception:
+                payload = None
+            mapped = self._map_downstream_status(str((payload or {}).get("status") or ""))
+            if payload and mapped == "running":
+                return {"outcome": "already_running", "payload": payload}
+            if normalized_status in {"running", "dispatching"} and payload and mapped == "pending":
+                return {"outcome": "already_running", "payload": payload}
         return await self._downstream_tasks().control_existing_child(
             db,
             stage_name=stage_name,
@@ -2327,14 +2355,28 @@ class TaskManager:
         }
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
+        preserve_target_stage_refs = any(
+            str(item.downstream_task_id or "").strip()
+            for item in self._stage_items(db, task.id, target_stage)
+        )
         self._invalidate_task_execution(task)
         db.flush()
         downstream_refs = self._downstream_refs_for_stages(db, task, affected_stages)
+        if preserve_target_stage_refs:
+            downstream_refs = [
+                ref
+                for ref in downstream_refs
+                if str(ref.get("stage_name") or "").strip() != target_stage
+            ]
         if downstream_refs:
             await self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token())
         self._clear_stage_outputs_from(task, target_stage, mark_stale=False)
         self._delete_archive_children_for_stages(db, task, affected_stages)
-        self._delete_stage_items_for_stages(db, task.id, affected_stages)
+        self._delete_stage_items_for_stages(
+            db,
+            task.id,
+            [stage_name for stage_name in affected_stages if stage_name != target_stage],
+        )
         for stage_name in affected_stages:
             stage_run = stage_runs.get(stage_name)
             if stage_run:
@@ -4755,10 +4797,12 @@ class TaskManager:
                 task.current_stage = next_incomplete_tail
                 next_status = str((tail_runs.get(next_incomplete_tail).status if tail_runs.get(next_incomplete_tail) else "pending") or "").strip()
                 prior_status = prior_tail_statuses.get(next_incomplete_tail) or next_status
+                next_stage_items = self._stage_items(db, task.id, next_incomplete_tail)
+                has_tail_work = bool(next_stage_items)
                 if prior_status in {"failed", "downstream_missing"}:
                     task.status = "failed"
                     task.finished_at = _now()
-                elif next_status in {"pending", "queued"}:
+                elif next_status in {"pending", "queued"} and not has_tail_work:
                     task.status = "pending"
                     task.finished_at = None
                 elif next_status not in {"success", "partial_success", "cancelled"}:
@@ -6075,6 +6119,9 @@ class TaskManager:
             observe_task_lifecycle("finished", status=task.status, task_type=self._task_type(task))
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="cancelled")
             await self._cancel_local_worker(task.id)
+            for item in running_items:
+                if str(item.downstream_task_id or "").strip():
+                    await self._cancel_downstream(item, token)
             if downstream_refs:
                 await self._cancel_downstream_refs(db, task, downstream_refs, token)
         finally:
@@ -7885,6 +7932,43 @@ class TaskManager:
                 archive_jobs = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id).all()
                 self._sync_task_abnormal_reason_snapshot(db, task, self._task_abnormal_reason(task, stage_summaries, items, archive_jobs))
                 return
+        else:
+            runs_by_stage = {str(run.stage_name or "").strip(): run for run in stage_runs}
+            missing_enabled_stage = next(
+                (
+                    stage_name
+                    for stage_name in self._stage_sequence_for_task(task)
+                    if self._stage_enabled(task, stage_name) and runs_by_stage.get(stage_name) is None
+                ),
+                None,
+            )
+            if missing_enabled_stage and not (vuln_run and vuln_run.status in {"success", "partial_success"}):
+                task.status = "failed"
+                task.current_stage = missing_enabled_stage
+                task.dispatcher_instance_id = None
+                task.dispatch_started_at = None
+                task.lease_expires_at = None
+                task.finished_at = _now()
+                self._last_task_heartbeat_at.pop(task.id, None)
+                self._record_event(
+                    db,
+                    task,
+                    "task_finalize_blocked_by_missing_stage",
+                    f"任务缺少已启用阶段的执行记录，拒绝收口为终态: {missing_enabled_stage}",
+                    level="warning",
+                    stage_name=missing_enabled_stage,
+                )
+                stage_summaries = self._build_stage_summaries(
+                    db,
+                    task,
+                    self._stage_sequence_for_task(task),
+                    stage_runs,
+                    db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all(),
+                )
+                items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
+                archive_jobs = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id).all()
+                self._sync_task_abnormal_reason_snapshot(db, task, self._task_abnormal_reason(task, stage_summaries, items, archive_jobs))
+                return
         statuses = [run.status for run in stage_runs]
         if statuses and all(status == "success" for status in statuses):
             task.status = "success"
@@ -8799,7 +8883,7 @@ class TaskManager:
                 continue
             run = runs_by_stage.get(stage_name)
             if run is None:
-                return True, stage_name, "pending"
+                continue
             normalized_status = self._normalize_downstream_status(run.status) or str(run.status or "").strip()
             if normalized_status in active_statuses:
                 return True, stage_name, normalized_status
@@ -11568,12 +11652,6 @@ class TaskManager:
             return False, None
         target_index = stage_sequence.index(stage_name)
         upstream_stages = stage_sequence[:target_index]
-        summary = dict(task.summary or {})
-        stale_stages = set(summary.get("stale_stages") or [])
-        stale_from_stage = str(summary.get("stale_from_stage") or "").strip()
-        if stage_name in stale_stages and stale_from_stage in upstream_stages:
-            return True, stale_from_stage
-
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
         runs_by_stage = {run.stage_name: run for run in stage_runs}
         target_items = [
@@ -11587,13 +11665,36 @@ class TaskManager:
             if comparable is not None
         ]
         earliest_target_created_at = min(target_created_at) if target_created_at else None
+        retried_upstream_completed_at = [
+            comparable
+            for comparable in (
+                self._comparable_datetime(run.finished_at or run.started_at)
+                for run in runs_by_stage.values()
+                if run
+                and str(run.stage_name or "").strip() in upstream_stages
+                and int(run.retry_count or 0) > 0
+            )
+            if comparable is not None
+        ]
+        latest_retried_upstream_completed_at = max(retried_upstream_completed_at) if retried_upstream_completed_at else None
+        if (
+            earliest_target_created_at is not None
+            and latest_retried_upstream_completed_at is not None
+            and earliest_target_created_at >= latest_retried_upstream_completed_at
+        ):
+            return False, None
+        summary = dict(task.summary or {})
+        stale_stages = set(summary.get("stale_stages") or [])
+        stale_from_stage = str(summary.get("stale_from_stage") or "").strip()
+        if stage_name in stale_stages and stale_from_stage in upstream_stages:
+            return True, stale_from_stage
 
         for upstream_stage in upstream_stages:
             run = runs_by_stage.get(upstream_stage)
             if not run or int(run.retry_count or 0) <= 0:
                 continue
             upstream_completed_at = self._comparable_datetime(run.finished_at or run.started_at)
-            if earliest_target_created_at and upstream_completed_at and earliest_target_created_at > upstream_completed_at:
+            if earliest_target_created_at and upstream_completed_at and earliest_target_created_at >= upstream_completed_at:
                 continue
             if run and int(run.retry_count or 0) > 0:
                 return True, upstream_stage
@@ -12085,6 +12186,7 @@ class TaskManager:
             return
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
         statuses = [run.status for run in stage_runs]
+        vuln_run = next((run for run in stage_runs if run.stage_name == "vuln_scan"), None)
         if any(status in {"running", "dispatching"} for status in statuses):
             task.status = "running"
             active_run = next((run for run in stage_runs if run.status in {"running", "dispatching"}), None)
@@ -12126,6 +12228,16 @@ class TaskManager:
             ),
             None,
         )
+        if (
+            failed_stage_run is not None
+            and vuln_run is not None
+            and str(vuln_run.status or "").strip() in {"success", "partial_success"}
+        ):
+            failed_stage_run = None
+        if failed_stage_run is not None and self._streaming_mode_enabled(task):
+            tail_stages = set(self._streaming_tail_stage_names(task))
+            if str(failed_stage_run.stage_name or "").strip() in tail_stages:
+                failed_stage_run = None
         if failed_stage_run is not None and not stage_retry_mode and not task_retry_mode:
             task.status = "failed"
             task.current_stage = failed_stage_run.stage_name or task.current_stage
@@ -12826,7 +12938,7 @@ class TaskManager:
     ) -> dict[str, Any]:
         normalized_status = str(item.status or "").strip().lower()
         if str(item.downstream_task_id or "").strip():
-            if normalized_status in {"running", "dispatching"}:
+            if normalized_status in {"running", "dispatching", "failed", "cancelled"}:
                 try:
                     payload = await self._fetch_downstream_task_payload(task, item, token or "")
                 except Exception:
@@ -12834,7 +12946,9 @@ class TaskManager:
                 mapped = self._map_downstream_status(str((payload or {}).get("status") or ""))
                 if payload and mapped == "running":
                     return {"outcome": "already_running", "payload": payload}
-            else:
+                if normalized_status in {"running", "dispatching"} and payload and mapped == "pending":
+                    return {"outcome": "already_running", "payload": payload}
+            if normalized_status not in {"running", "dispatching"}:
                 try:
                     payload = await self._invoke_existing_downstream_retry(
                         stage_name,
@@ -13244,6 +13358,8 @@ class TaskManager:
         try:
             payload = await self._fetch_downstream_task_payload(task, item, token or "")
         except Exception:
+            return None
+        if not isinstance(payload, dict):
             return None
         mapped_status = self._map_downstream_status(str(payload.get("status") or ""))
         if mapped_status in {"queued", "running"}:
@@ -16522,14 +16638,20 @@ class TaskManager:
         return normalized
 
     def _build_entry_analysis_input_contract(self, entry_input: dict[str, Any]) -> dict[str, Any]:
+        files_list_path = str(
+            entry_input.get("files_list_path")
+            or entry_input.get("entry_files_list")
+            or entry_input.get("files_list")
+            or ""
+        ).strip()
+        if not files_list_path:
+            source_dir = str(entry_input.get("source_dir") or "").strip()
+            module_dir = str(entry_input.get("module_dir") or source_dir).strip()
+            if source_dir and module_dir:
+                files_list_path = source_dir
         contract = {
             "module_dir": str(entry_input.get("module_dir") or entry_input.get("source_dir") or "").strip(),
-            "files_list_path": str(
-                entry_input.get("files_list_path")
-                or entry_input.get("entry_files_list")
-                or entry_input.get("files_list")
-                or ""
-            ).strip(),
+            "files_list_path": files_list_path,
             "source_root": str(
                 entry_input.get("source_root")
                 or entry_input.get("source_root_path")
@@ -16549,7 +16671,8 @@ class TaskManager:
             "entry_descriptor_root": str(entry_input.get("entry_descriptor_root") or "").strip(),
             "entry_files_list": str(entry_input.get("entry_files_list") or "").strip(),
         }
-        missing = [field for field in ("module_dir", "files_list_path", "source_root") if not contract.get(field)]
+        required_fields = ("module_dir", "source_root")
+        missing = [field for field in required_fields if not contract.get(field)]
         if missing:
             raise ValidationError(
                 "binary_security 下发给 entry_analysis 的 input_contract 缺少: " + ", ".join(missing)
@@ -17218,6 +17341,12 @@ class TaskManager:
             definition_line = str(entry.get("definition_line") or entry.get("line_no") or "").strip()
             module_input_path = str(entry.get("module_input_path") or "").strip()
             source_root_path = str(entry.get("source_root_path") or "").strip()
+            if not module_input_path or not source_root_path:
+                recovered_entry = self._recover_entry_output_contract(session, task, entry)
+                if recovered_entry:
+                    entry = {**recovered_entry, **entry}
+                    module_input_path = module_input_path or str(entry.get("module_input_path") or "").strip()
+                    source_root_path = source_root_path or str(entry.get("source_root_path") or "").strip()
             if not definition_found:
                 item.status = "failed"
                 item.finished_at = _now()
@@ -17456,6 +17585,7 @@ class TaskManager:
                 session.commit()
                 return {"status": "archive_blocked", "error": error, "item": entry, "archive_blocked": True}
             archived_data_flow_file = self._find_first(archived_dir, [r"final_report\.md", r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"])
+            effective_dataflow_dir = dataflow_dir or archived_dir
             result = self._build_dataflow_output_contract(
                 entry,
                 artifact_root=str(archived_dir),
@@ -17464,7 +17594,7 @@ class TaskManager:
                 source_root_path=source_root_path,
                 source_dir=source_root_path,
                 source_file=self._compress_source_file_hint(normalized_source_file),
-                data_flow_file="",
+                data_flow_file=str(archived_data_flow_file or data_flow_file or ""),
                 dataflow_dir=str(archived_dir),
             )
             result["downstream"] = self._lightweight_downstream_payload(payload)
@@ -17478,7 +17608,7 @@ class TaskManager:
                 "source_dir": source_root_path,
                 "source_file": result["source_file"],
                 "data_flow_root": result["data_flow_root"],
-                "dataflow_dir": result["dataflow_dir"],
+                "dataflow_dir": str(effective_dataflow_dir),
             }
             if self._streaming_mode_enabled(task):
                 self._trigger_vuln_items_from_dataflow_result(session, task, result, upstream_item=item)
@@ -17636,14 +17766,29 @@ class TaskManager:
                             control=control,
                         )
                     elif outcome == "transport_error":
-                        return self._defer_item_after_downstream_transport_error(
-                            session,
-                            task,
-                            item,
-                            operation="vuln_scan",
-                            exc=UpstreamError(str(control.get("error_message") or "下游通信异常")),
-                            response_item=dataflow_result,
-                        )
+                        active_payload = await self._active_downstream_payload(task, item, token)
+                        if active_payload is not None:
+                            payload = dict(active_payload)
+                            item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
+                            item.status = self._map_downstream_status(str(payload.get("status") or "")) or "dispatching"
+                            session.commit()
+                            status, payload = await self._poll_until_terminal(
+                                lambda: self._downstream_fetch_item_payload(task, item, token or ""),
+                                success_statuses={"success", "succeeded", "completed"},
+                                failure_statuses={"failed", "cancelled"},
+                                task=task,
+                                item=item,
+                            )
+                            created = None
+                        else:
+                            return self._defer_item_after_downstream_transport_error(
+                                session,
+                                task,
+                                item,
+                                operation="vuln_scan",
+                                exc=UpstreamError(str(control.get("error_message") or "下游通信异常")),
+                                response_item=dataflow_result,
+                            )
                     elif outcome == "not_found":
                         item.status = "downstream_missing"
                         item.error_message = str(control.get("error_message") or "下游子任务不存在")
@@ -17898,23 +18043,20 @@ class TaskManager:
         }
 
     def _compact_b2s_summary_item(self, item: dict[str, Any]) -> dict[str, Any]:
-        return {
+        task_type = item.get("task_type")
+        row = {
             "firmware_key": item.get("firmware_key"),
             "firmware_name": item.get("firmware_name"),
             "filename": item.get("filename"),
             "unpacked_root": item.get("unpacked_root"),
             "source_root": item.get("source_root"),
-            "task_type": item.get("task_type"),
+            "task_type": task_type,
             "module_key": item.get("module_key"),
             "module_name": item.get("module_name"),
             "module_dir": item.get("module_dir"),
             "source_dir": item.get("source_dir"),
-            "artifact_root": item.get("artifact_root"),
-            "archive_root": item.get("archive_root"),
             "module_report": item.get("module_report"),
             "files_list": item.get("files_list"),
-            "descriptor_root": item.get("descriptor_root"),
-            "files_list_path": item.get("files_list_path"),
             "entry_module_name": item.get("entry_module_name"),
             "entry_descriptor_root": item.get("entry_descriptor_root"),
             "entry_files_list": item.get("entry_files_list"),
@@ -17928,6 +18070,12 @@ class TaskManager:
             "artifact_index_path": item.get("artifact_index_path"),
             "result_summary_version": item.get("result_summary_version") or 1,
         }
+        if task_type in {TASK_TYPE_SOURCE, TASK_TYPE_BINARY_MODULE}:
+            row["artifact_root"] = item.get("artifact_root")
+            row["archive_root"] = item.get("archive_root")
+            row["descriptor_root"] = item.get("descriptor_root")
+            row["files_list_path"] = item.get("files_list_path")
+        return row
 
     def _compact_entry_summary_item(self, item: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -18012,6 +18160,7 @@ class TaskManager:
             "source_file": item.get("source_file") or item.get("definition_file") or item.get("file_name"),
             "artifact_root": item.get("artifact_root"),
             "archive_root": item.get("archive_root"),
+            "data_flow_file": item.get("data_flow_file"),
             "data_flow_root": item.get("data_flow_root"),
             "dataflow_dir": item.get("dataflow_dir"),
         }
