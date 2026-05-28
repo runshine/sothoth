@@ -3133,6 +3133,28 @@ class ExecutionService:
             )
         return items
 
+    def _sync_runtime_state_snapshots(
+        self,
+        *,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+        public_status: str | None = None,
+        control_state: str | None = None,
+    ) -> None:
+        resolved_public_status = normalize_public_task_status(public_status)
+        resolved_control_state = control_state or derive_task_control_state(
+            dispatch_status=execution.dispatch_status if execution is not None else None,
+            process_status=execution.process_status if execution is not None else None,
+            trigger_message=trigger.message if trigger is not None else None,
+            execution_message=execution.message if execution is not None else None,
+        )
+        if trigger is not None:
+            trigger.public_status = resolved_public_status
+            trigger.control_state = resolved_control_state
+        if execution is not None:
+            execution.public_status = resolved_public_status
+            execution.control_state = resolved_control_state
+
     def _set_terminal_state(
         self,
         db: Session,
