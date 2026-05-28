@@ -90,9 +90,12 @@ class BinarySecurityStageSummary(BaseModel):
     total_items: int = 0
     success_items: int = 0
     failed_items: int = 0
+    orchestration_failed_items: int = 0
     downstream_missing_items: int = 0
     skipped_items: int = 0
     running_items: int = 0
+    cancelled_items: int = 0
+    downstream_status_counts: dict[str, int] = Field(default_factory=dict)
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     last_error: Optional[str] = None
@@ -290,12 +293,14 @@ class BinarySecurityStageItemResponse(BaseModel):
     item_key: str
     item_name: Optional[str] = None
     parent_key: Optional[str] = None
+    # Parent-orchestrator status, not the downstream task's authoritative status.
     status: str
     retry_count: int = 0
     rerun_count: int = 0
     auto_retry_count: int = 0
     downstream_service: Optional[str] = None
     downstream_task_id: Optional[str] = None
+    downstream_status: Optional[str] = None
     downstream_summary: Optional[dict[str, Any]] = None
     input_ref: dict[str, Any] = Field(default_factory=dict)
     output_ref: dict[str, Any] = Field(default_factory=dict)
@@ -341,6 +346,7 @@ class BinarySecurityOverviewBusinessDetail(BaseModel):
     total_items: int = 0
     success_items: int = 0
     failed_items: int = 0
+    orchestration_failed_items: int = 0
     downstream_missing_items: int = 0
     skipped_items: int = 0
     running_items: int = 0

@@ -3036,6 +3036,7 @@ class TaskManager:
                         sync_status="skipped",
                         status_raw=downstream_status or None,
                         mapped_status=None,
+                        downstream_status=downstream_status or None,
                         state_applied=False,
                     )
                     skipped_count += 1
@@ -3091,6 +3092,7 @@ class TaskManager:
                                 sync_status="synced",
                                 status_raw=downstream_status,
                                 mapped_status=mapped_status,
+                                downstream_status=downstream_status,
                                 state_applied=True,
                             )
                             touched_stages.add(item.stage_name)
@@ -3101,6 +3103,7 @@ class TaskManager:
                                 sync_status="skipped",
                                 status_raw=downstream_status,
                                 mapped_status=mapped_status,
+                                downstream_status=downstream_status,
                                 state_applied=False,
                             )
                             skipped_count += 1
@@ -3158,6 +3161,7 @@ class TaskManager:
                                 error_message=error_message,
                                 status_raw=downstream_status,
                                 mapped_status=mapped_status,
+                                downstream_status=downstream_status,
                                 state_applied=True,
                             )
                             touched_stages.add(item.stage_name)
@@ -3169,6 +3173,7 @@ class TaskManager:
                                 error_message=error_message,
                                 status_raw=downstream_status,
                                 mapped_status=mapped_status,
+                                downstream_status=downstream_status,
                                 state_applied=False,
                             )
                             skipped_count += 1
@@ -3221,6 +3226,7 @@ class TaskManager:
                                 sync_status="synced",
                                 status_raw=downstream_status,
                                 mapped_status=mapped_status,
+                                downstream_status=downstream_status,
                                 state_applied=True,
                             )
                         touched_stages.add(item.stage_name)
@@ -3232,6 +3238,7 @@ class TaskManager:
                             sync_status="skipped",
                             status_raw=downstream_status,
                             mapped_status=mapped_status,
+                            downstream_status=downstream_status,
                             state_applied=False,
                         )
                         if force or mapped_status != before_status or record_noop_events:
@@ -3265,6 +3272,7 @@ class TaskManager:
                             sync_status="skipped",
                             status_raw=downstream_status,
                             mapped_status=mapped_status,
+                            downstream_status=downstream_status,
                             state_applied=False,
                         )
                         self._record_event(
@@ -3325,6 +3333,7 @@ class TaskManager:
                         ),
                         status_raw=downstream_status,
                         mapped_status=mapped_status,
+                        downstream_status=downstream_status,
                         state_applied=True,
                     )
                     touched_stages.add(item.stage_name)
@@ -3335,6 +3344,7 @@ class TaskManager:
                         sync_status="skipped",
                         status_raw=downstream_status,
                         mapped_status=mapped_status,
+                        downstream_status=downstream_status,
                         state_applied=False,
                     )
                     skipped_count += 1
@@ -3393,6 +3403,7 @@ class TaskManager:
                         error_type="not_found",
                         status_raw="downstream_missing",
                         mapped_status="downstream_missing",
+                        downstream_status="downstream_missing",
                         state_applied=True,
                     )
                     touched_stages.add(item.stage_name)
@@ -3406,6 +3417,7 @@ class TaskManager:
                         error_type="not_found",
                         status_raw="downstream_missing",
                         mapped_status="downstream_missing",
+                        downstream_status="downstream_missing",
                         state_applied=False,
                     )
                     skipped_count += 1
@@ -5353,6 +5365,7 @@ class TaskManager:
             **(item.result or {}),
             "downstream": self._lightweight_downstream_payload(downstream_payload),
             "downstream_status_synced_at": _now().isoformat(),
+            "downstream_status": self._string_or_none(downstream_payload.get("status")),
         }
         self._reconcile_stage_and_task_state_after_item_update(db, task, item.stage_name)
         self._record_event(
@@ -5397,6 +5410,7 @@ class TaskManager:
             **current_result,
             "downstream": self._lightweight_downstream_payload(downstream_payload or {}),
             "downstream_status_synced_at": _now().isoformat(),
+            "downstream_status": self._string_or_none((downstream_payload or {}).get("status")),
             "sync_status": "synced",
         }
 
@@ -5411,6 +5425,7 @@ class TaskManager:
         error_type: str | None = None,
         status_raw: str | None = None,
         mapped_status: str | None = None,
+        downstream_status: str | None = None,
         state_applied: bool | None = None,
     ) -> None:
         current_result = dict(item.result or {})
@@ -5424,6 +5439,7 @@ class TaskManager:
                 "error_type": error_type,
                 "status_raw": status_raw,
                 "mapped_status": mapped_status,
+                "downstream_status": downstream_status,
                 "state_applied": state_applied,
             }
         )
@@ -5431,6 +5447,7 @@ class TaskManager:
             **current_result,
             "sync_status": sync_status,
             "downstream_status_synced_at": sync_observation["last_synced_at"],
+            "downstream_status": downstream_status or current_result.get("downstream_status"),
             "sync_observation": sync_observation,
         }
 
@@ -7915,6 +7932,14 @@ class TaskManager:
             "system_analysis_bypassed": True,
         }
 
+    def _build_binary_module_restart_summary(self, task: BinarySecurityTask, input_files: list[dict[str, Any]]) -> dict[str, Any]:
+        # A binary-module task skips system-analysis and starts from a fixed module input.
+        # Hard restart must preserve that single-module execution context.
+        return {
+            "downstream_task_ids": {},
+            **self._build_binary_module_summary(task, input_files),
+        }
+
     def _is_supported_source_archive(self, filename: str) -> bool:
         lowered = str(filename or "").strip().lower()
         return any(lowered.endswith(ext) for ext in SOURCE_ARCHIVE_FORMATS)
@@ -9543,6 +9568,16 @@ class TaskManager:
         for index, stage_name in enumerate(stage_sequence, start=1):
             run = runs_by_stage.get(stage_name)
             stage_items = items_by_stage.get(stage_name, [])
+            downstream_status_counts: dict[str, int] = {}
+            for item in stage_items:
+                item_result = dict(item.result or {})
+                sync_observation = dict(item_result.get("sync_observation") or {})
+                downstream_status = (
+                    self._string_or_none(sync_observation.get("downstream_status"))
+                    or self._string_or_none(item_result.get("downstream_status"))
+                )
+                display_downstream_status = self._downstream_status_display_value(downstream_status)
+                downstream_status_counts[display_downstream_status] = downstream_status_counts.get(display_downstream_status, 0) + 1
             counts = {
                 "total_items": len(stage_items),
                 "success_items": len([item for item in stage_items if (self._normalize_downstream_status(item.status) or item.status) == "success"]),
@@ -9570,8 +9605,12 @@ class TaskManager:
                 total_items=counts["total_items"],
                 success_items=counts["success_items"],
                 failed_items=counts["failed_items"],
+                orchestration_failed_items=counts["failed_items"] + counts["downstream_missing_items"],
+                downstream_missing_items=counts["downstream_missing_items"],
                 skipped_items=counts["skipped_items"],
                 running_items=counts["running_items"],
+                cancelled_items=len([item for item in stage_items if (self._normalize_downstream_status(item.status) or item.status) == "cancelled"]),
+                downstream_status_counts=downstream_status_counts,
                 started_at=run.started_at if run else None,
                 finished_at=run.finished_at if run else None,
                 last_error=(run.last_error if run and run.last_error else next((item.error_message for item in stage_items if item.error_message), None)),
@@ -9618,16 +9657,23 @@ class TaskManager:
             current_stage_items = items_by_stage.get(stage_name, [])
             downstream_status_counts: dict[str, int] = {}
             for item in current_stage_items:
-                normalized_status = self._normalize_downstream_status(item.status) or item.status or "pending"
-                downstream_status_counts[normalized_status] = downstream_status_counts.get(normalized_status, 0) + 1
+                item_result = dict(item.result or {})
+                sync_observation = dict(item_result.get("sync_observation") or {})
+                raw_downstream_status = (
+                    self._string_or_none(sync_observation.get("downstream_status"))
+                    or self._string_or_none(item_result.get("downstream_status"))
+                )
+                display_status = self._downstream_status_display_value(raw_downstream_status)
+                downstream_status_counts[display_status] = downstream_status_counts.get(display_status, 0) + 1
             business_detail = BinarySecurityOverviewBusinessDetail(
                 total_items=summary.total_items,
                 success_items=summary.success_items,
                 failed_items=summary.failed_items,
+                orchestration_failed_items=summary.orchestration_failed_items or summary.failed_items,
                 downstream_missing_items=summary.downstream_missing_items,
                 skipped_items=summary.skipped_items,
                 running_items=summary.running_items,
-                cancelled_items=downstream_status_counts.get("cancelled", 0),
+                cancelled_items=summary.cancelled_items or downstream_status_counts.get("cancelled", 0),
                 downstream_status_counts=downstream_status_counts,
                 downstream_services=sorted({str(item.downstream_service) for item in current_stage_items if item.downstream_service}),
                 representative_item_key=next((item.item_key for item in current_stage_items if item.item_key), None),
@@ -9722,6 +9768,12 @@ class TaskManager:
                 )
             )
         return nodes
+
+    def _downstream_status_display_value(self, raw_status: str | None) -> str:
+        normalized = str(raw_status or "").strip().lower()
+        if not normalized:
+            return "unknown"
+        return normalized
 
     def _build_project_stats(self, tasks: list[BinarySecurityTask]) -> BinarySecurityProjectStats:
         active_statuses = {
@@ -10117,9 +10169,12 @@ class TaskManager:
                 total_items=int(payload.get("total_items") or 0),
                 success_items=int(payload.get("success_items") or 0),
                 failed_items=int(payload.get("failed_items") or 0),
+                orchestration_failed_items=int(payload.get("orchestration_failed_items") or payload.get("failed_items") or 0),
                 downstream_missing_items=int(payload.get("downstream_missing_items") or 0),
                 skipped_items=int(payload.get("skipped_items") or 0),
                 running_items=int(payload.get("running_items") or 0),
+                cancelled_items=int(payload.get("cancelled_items") or 0),
+                downstream_status_counts=dict(payload.get("downstream_status_counts") or {}),
                 started_at=payload.get("started_at"),
                 finished_at=payload.get("finished_at"),
                 last_error=payload.get("last_error"),
@@ -10383,6 +10438,10 @@ class TaskManager:
     def _stage_item_response(self, item: BinarySecurityStageItem) -> BinarySecurityStageItemResponse:
         result = dict(item.result or {})
         sync_observation = dict(result.get("sync_observation") or {})
+        downstream_status = (
+            self._string_or_none(sync_observation.get("downstream_status"))
+            or self._string_or_none(result.get("downstream_status"))
+        )
         last_synced_at = result.get("downstream_status_synced_at")
         sync_status = result.get("sync_status")
         if not sync_status:
@@ -10408,6 +10467,7 @@ class TaskManager:
             auto_retry_count=int(item.retry_count or 0),
             downstream_service=item.downstream_service,
             downstream_task_id=item.downstream_task_id,
+            downstream_status=downstream_status,
             downstream_summary=self._stage_item_downstream_summary(item, result=result),
             input_ref=item.input_ref,
             output_ref=item.output_ref,
@@ -13614,13 +13674,10 @@ class TaskManager:
             "execution_epoch": int(getattr(task, "execution_epoch", 0) or 0),
         }
         if task_type == TASK_TYPE_BINARY_MODULE:
-            module_input = existing_summary.get("module_input") or {}
-            module_name = str(module_input.get("module_name") or "").strip()
-            if module_name:
-                summary["module_input"] = {
-                    "module_name": module_name,
-                    "file_count": len(normalized_inputs),
-                }
+            summary = {
+                **summary,
+                **self._build_binary_module_restart_summary(task, normalized_inputs),
+            }
         return summary
 
     def _base_task_metrics(self, task: BinarySecurityTask, *, input_files: list[dict[str, Any]]) -> dict[str, Any]:
@@ -13657,6 +13714,8 @@ class TaskManager:
         task.metrics = self._base_task_metrics(task, input_files=input_files)
         task.stage_summary = {}
         task.cleanup_snapshot = {}
+        if self._task_type(task) == TASK_TYPE_BINARY_MODULE and not list((task.summary or {}).get("selected_modules") or []):
+            raise ValidationError("binary_module 硬重启后缺少已选模块上下文")
 
     def _delete_task_summary_file(self, task: BinarySecurityTask) -> None:
         summary_path = Path(task.workspace_root) / BinarySecurityTask.SUMMARY_FILENAME
@@ -17476,7 +17535,9 @@ class TaskManager:
                 "cancelled_items": [],
                 "success_count": len(compact_success),
                 "failed_count": 0,
+                "orchestration_failed_count": 0,
                 "downstream_missing_count": 0,
+                "downstream_status_counts": {},
                 "entry_count": self._entry_count_for_summary(summary_key, compact_success),
                 "vuln_result_count": len(compact_success) if summary_key == "vuln_results" else 0,
                 "items_truncated": len(db_success) < len(compact_success),
@@ -17490,6 +17551,14 @@ class TaskManager:
         downstream_missing_all = [self._lightweight_stage_failure(result) for result in results if result.get("status") == "downstream_missing"]
         cancelled_all = [self._lightweight_stage_failure(result) for result in results if result.get("status") == "cancelled"]
         failed_like_all = failed_all + downstream_missing_all
+        downstream_status_counts: dict[str, int] = {}
+        for result in results:
+            item_payload = dict(result.get("item") or {})
+            downstream = dict(item_payload.get("downstream") or {})
+            raw_downstream_status = str(downstream.get("status") or "").strip().lower()
+            if not raw_downstream_status:
+                continue
+            downstream_status_counts[raw_downstream_status] = downstream_status_counts.get(raw_downstream_status, 0) + 1
         failed = failed_like_all[:DB_FAILURE_ITEM_LIMIT]
         cancelled = cancelled_all[:DB_FAILURE_ITEM_LIMIT]
         running_active = [result for result in active_results if result.get("status") == "running" or result.get("deferred_mode") == "reconcile"]
@@ -17521,8 +17590,10 @@ class TaskManager:
             "cancelled_items": cancelled,
             "success_count": len(compact_success),
             "failed_count": len(failed_like_all),
+            "orchestration_failed_count": len(failed_like_all),
             "downstream_missing_count": len(downstream_missing_all),
             "cancelled_count": len(cancelled_all),
+            "downstream_status_counts": downstream_status_counts,
             "running_count": len(running_active),
             "dispatching_count": len(dispatching_active),
             "pending_count": len(pending_active),

@@ -15933,5 +15933,119 @@ TaskManagerTests.test_delete_downstream_refs_treats_entry_delete_500_with_absent
 TaskManagerTests.test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exists = _test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exists
 
 
+def _test_stage_item_response_exposes_downstream_status_from_sync_observation(self):
+    item = BinarySecurityStageItem(
+        id="si-entry",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="module-a",
+        item_name="module-a",
+        status="failed",
+        downstream_service="entry_analyse",
+        downstream_task_id="ea-1",
+    )
+    item.result = {
+        "downstream_status_synced_at": _now().isoformat(),
+        "sync_observation": {
+            "status_raw": "passed",
+            "mapped_status": "success",
+            "downstream_status": "passed",
+            "state_applied": False,
+        },
+    }
+
+    response = self.manager._stage_item_response(item)
+
+    self.assertEqual("failed", response.status)
+    self.assertEqual("passed", response.downstream_status)
+    self.assertEqual("passed", response.downstream_raw_status)
+    self.assertEqual("success", response.downstream_mapped_status)
+
+
+def _test_build_stage_summaries_and_overview_preserve_orchestration_and_downstream_statuses(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="source",
+        status="failed",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/tmp/out",
+        workspace_root="/tmp/ws",
+    )
+    entry_run = BinarySecurityStageRun(
+        id="sr-entry",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        sequence_no=2,
+        status="failed",
+        started_at=_now(),
+    )
+    failed_snapshot_item = BinarySecurityStageItem(
+        id="si-entry",
+        task_id="t1",
+        project_id="p1",
+        stage_run_id="sr-entry",
+        stage_name="entry_analysis",
+        item_key="module-a",
+        item_name="module-a",
+        status="failed",
+        downstream_service="entry_analyse",
+        downstream_task_id="ea-1",
+    )
+    failed_snapshot_item.result = {
+        "sync_observation": {
+            "downstream_status": "passed",
+            "status_raw": "passed",
+            "mapped_status": "success",
+        }
+    }
+    missing_item = BinarySecurityStageItem(
+        id="si-entry-missing",
+        task_id="t1",
+        project_id="p1",
+        stage_run_id="sr-entry",
+        stage_name="entry_analysis",
+        item_key="module-b",
+        item_name="module-b",
+        status="downstream_missing",
+        downstream_service="entry_analyse",
+        downstream_task_id="ea-2",
+    )
+    missing_item.result = {
+        "sync_observation": {
+            "downstream_status": "downstream_missing",
+            "status_raw": "downstream_missing",
+            "mapped_status": "downstream_missing",
+        }
+    }
+
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[entry_run], stage_items=[failed_snapshot_item, missing_item])
+
+    summaries = self.manager._build_stage_summaries(db, task, ["system_analysis", "entry_analysis"], [entry_run], [failed_snapshot_item, missing_item])
+    entry_summary = next(summary for summary in summaries if summary.stage_name == "entry_analysis")
+    self.assertEqual(1, entry_summary.failed_items)
+    self.assertEqual(2, entry_summary.orchestration_failed_items)
+    self.assertEqual(1, entry_summary.downstream_missing_items)
+    self.assertEqual(1, entry_summary.downstream_status_counts.get("passed"))
+    self.assertEqual(1, entry_summary.downstream_status_counts.get("downstream_missing"))
+
+    overview_nodes = self.manager._build_stage_overview_nodes(db, task, summaries, [], [failed_snapshot_item, missing_item])
+    entry_node = next(node for node in overview_nodes if node.stage_name == "entry_analysis" and node.node_type == "business")
+    detail = entry_node.detail
+    self.assertEqual(2, detail.orchestration_failed_items)
+    self.assertEqual(1, detail.downstream_missing_items)
+    self.assertEqual(1, detail.downstream_status_counts.get("passed"))
+    self.assertEqual(1, detail.downstream_status_counts.get("downstream_missing"))
+
+
+TaskManagerTests.test_stage_item_response_exposes_downstream_status_from_sync_observation = _test_stage_item_response_exposes_downstream_status_from_sync_observation
+TaskManagerTests.test_build_stage_summaries_and_overview_preserve_orchestration_and_downstream_statuses = _test_build_stage_summaries_and_overview_preserve_orchestration_and_downstream_statuses
+
+
 if __name__ == "__main__":
     unittest.main()
