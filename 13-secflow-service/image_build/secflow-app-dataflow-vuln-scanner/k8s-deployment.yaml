@@ -1,6 +1,109 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  name: secflow-app-dataflow-vuln-scanner-api
+  namespace: secflow-ns
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: secflow-app-dataflow-vuln-scanner
+      role: api
+  template:
+    metadata:
+      labels:
+        app: secflow-app-dataflow-vuln-scanner
+        role: api
+        name: secflow-app-dataflow-vuln-scanner-api
+    spec:
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: secflow-app-dataflow-vuln-scanner
+            role: api
+      containers:
+      - name: secflow-app-dataflow-vuln-scanner-api
+        image: ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:20260513-7d01e0f
+        imagePullPolicy: Always
+        env:
+        - name: TZ
+          value: Asia/Shanghai
+        - name: CONFIG_PATH
+          value: /app/config.yaml
+        - name: SECFLOW_DATAFLOW_ROLE
+          value: api
+        - name: PI_MODELS_JSON
+          value: /root/.pi/agent/models.json
+        - name: PI_CODING_AGENT_DIR
+          value: /root/.pi/agent
+        - name: QT_QPA_PLATFORM
+          value: offscreen
+        - name: POD_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: SECFLOW_DATAFLOW_DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: secflow-app-dataflow-vuln-scanner-secret
+              key: db-password
+        - name: SECFLOW_DATAFLOW_SERVICE_MACHINE_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: secflow-app-dataflow-vuln-scanner-secret
+              key: service-machine-token
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: secflow-app-dataflow-vuln-scanner-config
+          mountPath: /app/config.yaml
+          subPath: config.yaml
+        - name: secflow-platform-fileserver-data
+          mountPath: /data
+        resources:
+          requests:
+            memory: "16Gi"
+            cpu: "4"
+          limits:
+            memory: "16Gi"
+            cpu: "4"
+        readinessProbe:
+          httpGet:
+            path: /api/dataflow-vuln-scanner/ready
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 6
+        livenessProbe:
+          httpGet:
+            path: /api/dataflow-vuln-scanner/health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 6
+      volumes:
+      - name: secflow-app-dataflow-vuln-scanner-config
+        configMap:
+          name: secflow-app-dataflow-vuln-scanner-config
+          items:
+          - key: config.yaml
+            path: config.yaml
+      - name: secflow-platform-fileserver-data
+        persistentVolumeClaim:
+          claimName: secflow-platform-fileserver-data-nfs-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
   name: secflow-app-dataflow-vuln-scanner-manager
   namespace: secflow-ns
 spec:
@@ -222,6 +325,21 @@ apiVersion: v1
 kind: Service
 metadata:
   name: secflow-app-dataflow-vuln-scanner
+  namespace: secflow-ns
+spec:
+  type: ClusterIP
+  selector:
+    app: secflow-app-dataflow-vuln-scanner
+    role: api
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: secflow-app-dataflow-vuln-scanner-manager
   namespace: secflow-ns
 spec:
   type: ClusterIP

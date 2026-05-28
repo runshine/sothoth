@@ -87,6 +87,7 @@ data:
       process_heartbeat_stale_after_seconds: 300
       trigger_retry_limit: 0
       public_api_prefix: "/api/dataflow-vuln-scanner"
+      admin_proxy_prefix: "/api/dataflow-vuln-scanner-admin-proxy"
       default_entry_task_type: "package_list"
       default_artifact_subdir: "assets"
       default_profile_template_kind: "vuln_scan_default"
@@ -94,6 +95,8 @@ data:
 
     scheduler:
       enabled: true
+      manager_service_name: "secflow-app-dataflow-vuln-scanner-manager"
+      manager_service_port: 80
       worker_capacity: 5
       poll_interval_seconds: 2
       heartbeat_interval_seconds: 5

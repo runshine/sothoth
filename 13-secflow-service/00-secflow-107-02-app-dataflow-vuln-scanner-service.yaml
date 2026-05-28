@@ -7,12 +7,28 @@ spec:
   type: ClusterIP
   selector:
     app: secflow-app-dataflow-vuln-scanner
-    role: manager
+    role: api
   ports:
     - port: 80
       targetPort: 8080
       protocol: TCP
       name: secflow-app-dataflow-vuln-scanner
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: secflow-app-dataflow-vuln-scanner-manager
+  namespace: secflow-ns
+spec:
+  type: ClusterIP
+  selector:
+    app: secflow-app-dataflow-vuln-scanner
+    role: manager
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: secflow-app-dataflow-vuln-scanner-manager
 ---
 apiVersion: v1
 kind: Service

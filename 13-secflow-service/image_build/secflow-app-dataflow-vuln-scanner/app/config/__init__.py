@@ -136,6 +136,7 @@ class ServiceConfig(BaseModel):
     process_heartbeat_stale_after_seconds: int = 300
     trigger_retry_limit: int = 0
     public_api_prefix: str = "/api/dataflow-vuln-scanner"
+    admin_proxy_prefix: str = "/api/dataflow-vuln-scanner-admin-proxy"
     default_entry_task_type: str = "package_list"
     default_artifact_subdir: str = "assets"
     default_profile_template_kind: str = "vuln_scan_default"
@@ -152,6 +153,8 @@ class SchedulerConfig(BaseModel):
     host_name: str = Field(default_factory=lambda: os.getenv("HOSTNAME") or "localhost")
     pod_namespace: str = Field(default_factory=lambda: os.getenv("POD_NAMESPACE") or "secflow-ns")
     worker_headless_service_name: str = "secflow-app-dataflow-vuln-scanner-worker-headless"
+    manager_service_name: str = "secflow-app-dataflow-vuln-scanner-manager"
+    manager_service_port: int = 80
     # worker_capacity <= 0 means no scheduler-side concurrency limit.
     worker_capacity: int = 5
     poll_interval_seconds: int = 2
