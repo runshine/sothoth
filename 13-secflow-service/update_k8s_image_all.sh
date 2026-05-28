@@ -56,10 +56,10 @@ Examples:
   ./update_k8s_image_all.sh latest
   ./update_k8s_image_all.sh --tag 20260508-abcdef0
   ./update_k8s_image_all.sh --binary-evolution-image 20260512-abcdef0
-  ./update_k8s_image_all.sh --entry-analyse-image ghcr.io/runshine/secflow-app-entry-analyse:20260513
+  ./update_k8s_image_all.sh --entry-analyse-image ghcr.io/runshine/secflow-app-entry-analyse:latest
   ./update_k8s_image_all.sh --binary-security-image 20260513-af453b4
   ./update_k8s_image_all.sh --resource-image 20260403
-  ./update_k8s_image_all.sh --gateway-worker-image ghcr.io/runshine/secflow-platform-resource-file-gateway-worker:20260403
+  ./update_k8s_image_all.sh --gateway-worker-image ghcr.io/runshine/secflow-platform-resource-file-gateway-worker:latest
   ./update_k8s_image_all.sh --firmware-unpacker-image 20260428
 
 Behavior:
