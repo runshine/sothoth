@@ -19,4 +19,4 @@
 	url = git@github.com:ict-bin/entry_analyse.git
 [submodule "13-secflow-service/image_build/secflow-app-dataflow-analyse"]
 	path = 13-secflow-service/image_build/secflow-app-dataflow-analyse
-	url = git@github.com:ict-bin/data_flow_analyse.git
+	url = https://github.com/ict-bin/data_flow_analyse.git
