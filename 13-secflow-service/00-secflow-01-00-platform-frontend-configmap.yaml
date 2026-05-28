@@ -37,7 +37,25 @@ data:
     
             # 修正：正确的指令名称是 client_max_body_size
             client_max_body_size 500m;
-    
+
+            location ^~ /api/dataflow-vuln-scanner-admin-proxy/ {
+                proxy_pass http://secflow-app-dataflow-vuln-scanner;
+                proxy_http_version 1.1;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+            }
+
+            location ^~ /api/dataflow-vuln-scanner/ {
+                proxy_pass http://secflow-app-dataflow-vuln-scanner;
+                proxy_http_version 1.1;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+            }
+
             # 处理React Router的路由问题（主应用）
             location / {
                 try_files $uri $uri/ /index.html;
