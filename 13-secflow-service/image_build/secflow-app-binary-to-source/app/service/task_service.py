@@ -77,6 +77,7 @@ from app.schemas import (
     TaskResponse,
     TaskResultItemSummary,
     TaskResultSummary,
+    TokenUser,
 )
 from app.service.cache_service import get_cache_service
 from app.service.config_service import get_config_service, normalize_b2s_mode, normalize_budget_exhausted_action, normalize_concurrency
@@ -236,6 +237,63 @@ def _event_dedupe_key(*parts: object) -> str:
     prefix_len = max(0, TASK_EVENT_DEDUPE_KEY_MAX_LEN - len(digest) - 1)
     prefix = raw[:prefix_len].rstrip("|")
     return f"{prefix}|{digest}" if prefix else digest
+
+
+def _normalize_operator(operator: TokenUser | str | None) -> dict[str, str | None]:
+    if isinstance(operator, TokenUser):
+        return {
+            "user_id": str(operator.user_id or "").strip() or None,
+            "username": str(operator.username or "").strip() or None,
+        }
+    text = str(operator or "").strip()
+    return {
+        "user_id": None,
+        "username": text or None,
+    }
+
+
+def _task_context_payload(task: B2STask) -> dict[str, Any]:
+    return {
+        "task_id": task.id,
+        "project_id": task.project_id,
+        "name": str(task.name or "").strip() or None,
+        "task_origin_type": str(task.task_origin_type or "").strip() or None,
+        "status": str(task.status or "").strip() or None,
+    }
+
+
+def _record_task_operation_event(
+    db: Session,
+    *,
+    task: B2STask,
+    event_type: str,
+    operation: str,
+    message: str,
+    operator: TokenUser | str | None,
+    request_payload: dict[str, Any] | None = None,
+    level: str = "info",
+    status: str | None = None,
+    dedupe_parts: tuple[object, ...] = (),
+) -> None:
+    payload = {
+        "operation": operation,
+        "trigger": "api",
+        "operator": _normalize_operator(operator),
+        "request": request_payload or {},
+        "task_context": _task_context_payload(task),
+    }
+    _safe_create_task_event(
+        db,
+        task_id=task.id,
+        project_id=task.project_id,
+        source=TASK_EVENT_SOURCE_B2S,
+        level=level,
+        event_type=event_type,
+        status=status or task.status,
+        message=message,
+        payload=payload,
+        dedupe_key=_event_dedupe_key(task.id, event_type, operation, *dedupe_parts),
+    )
 
 
 def _create_task_event(
@@ -2047,13 +2105,15 @@ def prepare_input_file(project_id: str, task_id: str, sequence_no: int, source_p
     return target_path
 
 
-async def create_task(db: Session, project_id: str, req: TaskCreate, created_by: str | None) -> TaskResponse:
+async def create_task(db: Session, project_id: str, req: TaskCreate, operator: TokenUser | str | None) -> TaskResponse:
     if not req.elf_tasks:
         raise ValidationError("elf_tasks不能为空")
 
     task_id = validate_task_id(req.task_id) if req.task_id else generate_task_id(db, project_id)
     if db.query(B2STask).filter(B2STask.project_id == project_id, B2STask.id == task_id).first():
         raise ConflictError("B2S任务ID已存在")
+    normalized_operator = _normalize_operator(operator)
+    created_by = normalized_operator["username"] or normalized_operator["user_id"]
 
     task = B2STask(
         id=task_id,
@@ -2074,19 +2134,23 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
     task.tags = req.tags
     db.add(task)
     db.flush()
-    _safe_create_task_event(
+    _record_task_operation_event(
         db,
-        task_id=task.id,
-        project_id=task.project_id,
+        task=task,
         event_type="task_created",
-        source=TASK_EVENT_SOURCE_B2S,
+        operation="create",
         message=f"任务 {task.name} 已创建",
-        payload={
+        operator=operator,
+        request_payload={
+            "task_id": task.id,
             "name": task.name,
+            "description": task.description,
+            "priority": task.priority,
+            "tags": list(task.tags or []),
             "task_origin_type": task.task_origin_type,
             "input_count": len(req.elf_tasks),
         },
-        dedupe_key=_event_dedupe_key(task.id, "task_created"),
+        dedupe_parts=(task.id,),
     )
 
     cfg = get_config()
@@ -2481,19 +2545,19 @@ async def sync_task(db: Session, task: B2STask) -> None:
         db.refresh(task)
 
 
-async def terminate_task(db: Session, task: B2STask) -> None:
+async def terminate_task(db: Session, task: B2STask, operator: TokenUser | str | None = None) -> None:
     previous_status = str(task.status or "")
-    _safe_create_task_event(
+    _record_task_operation_event(
         db,
-        task_id=task.id,
-        project_id=task.project_id,
-        source=TASK_EVENT_SOURCE_B2S,
-        level="warning",
+        task=task,
         event_type="task_cancel_requested",
-        status=task.status,
+        operation="terminate",
         message="任务收到手工取消请求",
-        payload={},
-        dedupe_key=_event_dedupe_key(task.id, "task_cancel_requested", task.updated_at),
+        operator=operator,
+        request_payload={},
+        level="warning",
+        status=task.status,
+        dedupe_parts=(task.updated_at,),
     )
     for item in query_items(db, task.id):
         previous = _item_event_snapshot(item)
@@ -2583,7 +2647,14 @@ async def delete_task(db: Session, task: B2STask) -> int:
     return deleted_event_count
 
 
-async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, cancel_running: bool = True) -> None:
+async def rerun_task(
+    db: Session,
+    task: B2STask,
+    operator: TokenUser | str | None = None,
+    *,
+    clean_output: bool = True,
+    cancel_running: bool = True,
+) -> None:
     """Fully rerun all items of a task while keeping taskId and input files."""
     if not clean_output:
         raise ValidationError("rerun仅支持清空output后从头重跑")
@@ -2595,16 +2666,16 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
     selected_provider_key = _restart_llm_provider_key(db, task, items)
     provider = await materialize_llm_provider(selected_provider_key) if get_config().configcenter_service.enabled else None
     previous_status = str(task.status or "")
-    _safe_create_task_event(
+    _record_task_operation_event(
         db,
-        task_id=task.id,
-        project_id=task.project_id,
-        source=TASK_EVENT_SOURCE_B2S,
+        task=task,
         event_type="task_rerun_requested",
-        status=task.status,
+        operation="rerun",
         message="任务收到全量重跑请求",
-        payload={"clean_output": clean_output, "cancel_running": cancel_running},
-        dedupe_key=_event_dedupe_key(task.id, "task_rerun_requested", task.updated_at),
+        operator=operator,
+        request_payload={"clean_output": clean_output, "cancel_running": cancel_running},
+        status=task.status,
+        dedupe_parts=(task.updated_at, clean_output, cancel_running),
     )
     db.query(B2STaskBatch).filter(B2STaskBatch.task_id == task.id).delete(synchronize_session=False)
     db.query(B2STaskPhase).filter(B2STaskPhase.task_id == task.id).delete(synchronize_session=False)
@@ -2667,7 +2738,15 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
     get_observability().record_retry("rerun", len(items))
 
 
-async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = None) -> None:
+async def retry_task(
+    db: Session,
+    task: B2STask,
+    operator: TokenUser | str | list[str] | None = None,
+    item_ids: list[str] | None = None,
+) -> None:
+    if item_ids is None and isinstance(operator, list):
+        item_ids = operator
+        operator = None
     items = query_items(db, task.id)
     selected = [i for i in items if item_ids is None or i.id in item_ids]
     if not selected:
@@ -2675,16 +2754,16 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
     selected_provider_key = _restart_llm_provider_key(db, task, selected)
     provider = await materialize_llm_provider(selected_provider_key) if get_config().configcenter_service.enabled else None
     previous_status = str(task.status or "")
-    _safe_create_task_event(
+    _record_task_operation_event(
         db,
-        task_id=task.id,
-        project_id=task.project_id,
-        source=TASK_EVENT_SOURCE_B2S,
+        task=task,
         event_type="task_retry_requested",
-        status=task.status,
+        operation="retry",
         message="任务收到失败项重试请求",
-        payload={"item_ids": item_ids or []},
-        dedupe_key=_event_dedupe_key(task.id, "task_retry_requested", json.dumps(sorted(item_ids or []), ensure_ascii=False), task.updated_at),
+        operator=operator,
+        request_payload={"item_ids": item_ids or []},
+        status=task.status,
+        dedupe_parts=(json.dumps(sorted(item_ids or []), ensure_ascii=False), task.updated_at),
     )
     for item in selected:
         if item.status not in {"failed", "cancelled"}:

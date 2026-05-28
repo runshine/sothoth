@@ -12,7 +12,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.api import tasks as tasks_api
 from app.model import Base, B2STask, B2STaskEvent, B2STaskItem
-from app.schemas import B2SAgentSessionRuntimeSummary, TaskBatchDeleteRequest, TokenUser
+from app.schemas import B2SAgentSessionRuntimeSummary, ElfTaskInput, TaskBatchDeleteRequest, TaskCreate, TokenUser
 from app.service import task_service
 from app.time_utils import now_local
 
@@ -214,6 +214,113 @@ class TimelineServiceTests(unittest.TestCase):
         self.assertIn("function_progress", event_types)
         self.assertNotIn("batch_started", event_types)
         self.assertNotIn("batch_completed", event_types)
+
+    def test_create_task_records_api_operation_payload(self) -> None:
+        req = TaskCreate(
+            task_id="task-create-1",
+            name="timeline-create",
+            description="desc",
+            priority=7,
+            tags=["tag-a"],
+            task_origin_type="manual",
+            elf_tasks=[ElfTaskInput(elf_path="/tmp/demo.elf")],
+        )
+        cache_service = mock.Mock()
+        cache_service.try_apply_cache_hit.return_value = None
+        cache_service.prepare_cache_metadata.return_value = None
+
+        with (
+            mock.patch.object(task_service, "ensure_path_in_project", return_value=Path("/tmp/demo.elf")),
+            mock.patch.object(task_service, "prepare_input_file", return_value=Path("/tmp/input/demo.elf")),
+            mock.patch.object(task_service, "safe_output_dir", return_value=Path("/tmp/output")),
+            mock.patch.object(task_service, "get_cache_service", return_value=cache_service),
+            mock.patch.object(task_service, "refresh_item_function_stats", return_value=False),
+            mock.patch.object(task_service, "recompute_task_status", return_value=None),
+            mock.patch.object(task_service, "_project_default_llm_provider_key", return_value=None),
+            mock.patch.object(task_service, "_project_default_concurrency", return_value=None),
+            mock.patch.object(task_service, "_budget_exhausted_action_for_project", return_value="treat_as_passed"),
+            mock.patch.object(
+                task_service,
+                "get_config",
+                return_value=mock.Mock(
+                    pi_re_agent=mock.Mock(
+                        engine="hybrid",
+                        model=None,
+                        concurrency=4,
+                        agent_run_timeout_seconds=3600,
+                        agent_timeout_retry_enabled=True,
+                        agent_timeout_max_retries=3,
+                    ),
+                    configcenter_service=mock.Mock(enabled=False),
+                ),
+            ),
+            mock.patch.object(task_service, "get_config_service", return_value=mock.Mock(get_config=mock.Mock(return_value={"default_mode": "fast"}))),
+        ):
+            asyncio.run(task_service.create_task(self.db, "project-1", req, _token()))
+
+        event = self.db.query(B2STaskEvent).filter(B2STaskEvent.event_type == "task_created").one()
+        self.assertEqual("create", event.payload["operation"])
+        self.assertEqual("api", event.payload["trigger"])
+        self.assertEqual("tester", event.payload["operator"]["username"])
+        self.assertEqual("task-create-1", event.payload["request"]["task_id"])
+
+    def test_terminate_task_records_api_operation_payload(self) -> None:
+        self.item.pi_job_id = "job-1"
+        self.item.extra_metadata = {"pi_worker_url": "http://worker"}
+
+        with (
+            mock.patch.object(task_service, "query_items", return_value=[self.item]),
+            mock.patch.object(task_service, "get_pi_client", return_value=mock.Mock(cancel_job=mock.AsyncMock(return_value=None))),
+        ):
+            asyncio.run(task_service.terminate_task(self.db, self.task, _token()))
+
+        task_event = self.db.query(B2STaskEvent).filter(B2STaskEvent.event_type == "task_cancel_requested").one()
+        item_event = self.db.query(B2STaskEvent).filter(B2STaskEvent.event_type == "item_cancel_requested").one()
+        self.assertEqual("terminate", task_event.payload["operation"])
+        self.assertEqual("tester", task_event.payload["operator"]["username"])
+        self.assertEqual("job-1", item_event.payload["pi_job_id"])
+
+    def test_rerun_task_records_api_operation_payload(self) -> None:
+        self.item.status = "failed"
+        self.item.phase = "failed"
+        self.item.extra_metadata = {}
+        self.item.output_dir = str(Path(tempfile.gettempdir()) / "timeline-rerun-out")
+
+        with (
+            mock.patch.object(task_service, "query_items", return_value=[self.item]),
+            mock.patch.object(task_service, "_restart_llm_provider_key", return_value=None),
+            mock.patch.object(task_service, "materialize_llm_provider", return_value=None),
+            mock.patch.object(task_service, "get_config", return_value=mock.Mock(configcenter_service=mock.Mock(enabled=False))),
+            mock.patch.object(task_service, "clean_item_output_dir", return_value=Path(self.item.output_dir)),
+        ):
+            asyncio.run(task_service.rerun_task(self.db, self.task, _token(), clean_output=True, cancel_running=True))
+
+        task_event = self.db.query(B2STaskEvent).filter(B2STaskEvent.event_type == "task_rerun_requested").one()
+        item_event = self.db.query(B2STaskEvent).filter(B2STaskEvent.event_type == "item_requeued").one()
+        self.assertEqual("rerun", task_event.payload["operation"])
+        self.assertTrue(task_event.payload["request"]["clean_output"])
+        self.assertTrue(task_event.payload["request"]["cancel_running"])
+        self.assertEqual("rerun", item_event.payload["reason"])
+
+    def test_retry_task_records_api_operation_payload(self) -> None:
+        self.item.status = "failed"
+        self.item.phase = "failed"
+        self.item.extra_metadata = {}
+
+        with (
+            mock.patch.object(task_service, "query_items", return_value=[self.item]),
+            mock.patch.object(task_service, "_restart_llm_provider_key", return_value=None),
+            mock.patch.object(task_service, "materialize_llm_provider", return_value=None),
+            mock.patch.object(task_service, "get_config", return_value=mock.Mock(configcenter_service=mock.Mock(enabled=False))),
+        ):
+            asyncio.run(task_service.retry_task(self.db, self.task, _token(), ["item-1"]))
+
+        task_event = self.db.query(B2STaskEvent).filter(B2STaskEvent.event_type == "task_retry_requested").one()
+        item_event = self.db.query(B2STaskEvent).filter(B2STaskEvent.event_type == "item_requeued").one()
+        self.assertEqual("retry", task_event.payload["operation"])
+        self.assertEqual(["item-1"], task_event.payload["request"]["item_ids"])
+        self.assertEqual("tester", task_event.payload["operator"]["username"])
+        self.assertEqual("retry", item_event.payload["reason"])
 
     def test_delete_task_returns_deleted_event_count(self) -> None:
         self.db.add(self._event("evt-1", "task_created"))

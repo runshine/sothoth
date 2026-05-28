@@ -446,8 +446,7 @@ async def create_b2s_task(
     user: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    created_by = user.username or user.user_id
-    return await create_task(db, project_id, payload, created_by)
+    return await create_task(db, project_id, payload, user)
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}", response_model=TaskDetailResponse)
@@ -648,11 +647,11 @@ def get_b2s_task_item_review_analytics(
 async def terminate_b2s_task(
     project_id: str,
     task_id: str,
-    _: TokenUser = Depends(get_current_context),
+    user: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    await terminate_task(db, task)
+    await terminate_task(db, task, user)
     return ActionResponse(status="ok", task_id=task_id, message="任务已取消")
 
 
@@ -711,7 +710,7 @@ async def rerun_b2s_task(
     project_id: str,
     task_id: str,
     payload: RerunRequest | None = None,
-    _: TokenUser = Depends(get_current_context),
+    user: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
@@ -719,7 +718,7 @@ async def rerun_b2s_task(
         # Keep the request body backward-compatible for older clients, but the
         # backend no longer allows changing rerun semantics.
         pass
-    await rerun_task(db, task, clean_output=True, cancel_running=True)
+    await rerun_task(db, task, user, clean_output=True, cancel_running=True)
     return ActionResponse(status="ok", task_id=task_id, message="任务已清空output并从头重跑")
 
 
@@ -728,9 +727,9 @@ async def retry_b2s_task(
     project_id: str,
     task_id: str,
     payload: RetryRequest,
-    _: TokenUser = Depends(get_current_context),
+    user: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    await retry_task(db, task, payload.item_ids)
+    await retry_task(db, task, user, payload.item_ids)
     return ActionResponse(status="ok", task_id=task_id, message="任务已重新提交")
