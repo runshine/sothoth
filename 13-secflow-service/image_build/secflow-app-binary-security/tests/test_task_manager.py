@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import tempfile
 import unittest
 import zipfile
@@ -39,6 +40,7 @@ from app.schemas import (
     BinarySecurityTaskPolicyUpdatePayload,
     BinarySecurityUploadCompletePayload,
 )
+from app.service import downstream_tasks as downstream_tasks_module
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager, _deduplicate_entry_keys, _now, _seconds_until
 
@@ -427,13 +429,15 @@ class _AsyncBinaryToSourceClientStub:
 
 
 class _AsyncEntryAnalyseClientStub:
-    def __init__(self, *, listed=None, fetched=None, fail_on_create=False, delete_result=None):
+    def __init__(self, *, listed=None, fetched=None, fail_on_create=False, delete_result=None, cancel_result=None):
         self.listed = listed or {"items": []}
         self.fetched = fetched or {}
         self.fail_on_create = fail_on_create
         self.delete_result = {"success": True} if delete_result is None else delete_result
+        self.cancel_result = {"success": True} if cancel_result is None else cancel_result
         self.created = 0
         self.deleted: list[str] = []
+        self.cancelled: list[str] = []
 
     async def list_tasks(self, *args, **kwargs):
         del args, kwargs
@@ -454,6 +458,14 @@ class _AsyncEntryAnalyseClientStub:
         del token
         self.deleted.append(task_id)
         result = self.delete_result
+        if isinstance(result, Exception):
+            raise result
+        return dict(result)
+
+    async def cancel_task(self, task_id, token=None):
+        del token
+        self.cancelled.append(task_id)
+        result = self.cancel_result
         if isinstance(result, Exception):
             raise result
         return dict(result)
@@ -7459,27 +7471,30 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             calls.append("delete")
             return 1
 
-        async def fake_fetch(*args, **kwargs):
+        async def fake_wait(refs_arg, token_arg):
+            del refs_arg, token_arg
             calls.append("fetch")
-            return next(responses)
+            next(responses)
+            calls.append("fetch")
+            next(responses)
 
         async def fake_sleep(*args, **kwargs):
             return None
 
         original_cancel = self.manager._cancel_downstream_refs
         original_delete = self.manager._delete_downstream_refs
-        original_fetch = self.manager._fetch_downstream_ref_payload
+        original_wait = self.manager._downstream_ensure_refs_inactive
         original_sleep = task_manager_module.asyncio.sleep
         self.manager._cancel_downstream_refs = fake_cancel
         self.manager._delete_downstream_refs = fake_delete
-        self.manager._fetch_downstream_ref_payload = fake_fetch
+        self.manager._downstream_ensure_refs_inactive = fake_wait
         task_manager_module.asyncio.sleep = fake_sleep
         try:
             asyncio.run(self.manager._cleanup_downstream_refs(db, task, refs, None))
         finally:
             self.manager._cancel_downstream_refs = original_cancel
             self.manager._delete_downstream_refs = original_delete
-            self.manager._fetch_downstream_ref_payload = original_fetch
+            self.manager._downstream_ensure_refs_inactive = original_wait
             task_manager_module.asyncio.sleep = original_sleep
 
         self.assertEqual(["cancel", "fetch", "fetch", "delete"], calls)
@@ -7502,17 +7517,17 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         async def fake_cancel(*args, **kwargs):
             return 1
 
-        async def fake_fetch(*args, **kwargs):
-            return {"status": "running"}
+        async def fake_wait(*args, **kwargs):
+            raise ValidationError("旧下游任务仍在运行，不能安全继续: system_analyse:sat-1")
 
         async def fake_sleep(*args, **kwargs):
             return None
 
         original_cancel = self.manager._cancel_downstream_refs
-        original_fetch = self.manager._fetch_downstream_ref_payload
+        original_wait = self.manager._downstream_ensure_refs_inactive
         original_sleep = task_manager_module.asyncio.sleep
         self.manager._cancel_downstream_refs = fake_cancel
-        self.manager._fetch_downstream_ref_payload = fake_fetch
+        self.manager._downstream_ensure_refs_inactive = fake_wait
         task_manager_module.asyncio.sleep = fake_sleep
         self.manager.cfg.scheduler.downstream_request_timeout_seconds = 0
         self.manager.cfg.scheduler.stage_poll_interval_seconds = 0
@@ -7521,7 +7536,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 asyncio.run(self.manager._cleanup_downstream_refs(db, task, refs, None))
         finally:
             self.manager._cancel_downstream_refs = original_cancel
-            self.manager._fetch_downstream_ref_payload = original_fetch
+            self.manager._downstream_ensure_refs_inactive = original_wait
             task_manager_module.asyncio.sleep = original_sleep
 
     def test_continue_task_prefers_existing_downstream_tasks(self):
@@ -8993,6 +9008,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 project_id="p1",
                 task_id="s1",
                 stage_name="entry_analysis",
+                apply_state=True,
             ))
         finally:
             self.manager._fetch_downstream_task_payload = original_fetch
@@ -13603,7 +13619,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        with patch.object(task_manager_module, "get_dataflow_analyse_client", return_value=client):
+        with patch.object(downstream_tasks_module, "get_dataflow_analyse_client", return_value=client):
             payload = asyncio.run(self.manager._find_reusable_dataflow_payload(task, item))
 
         self.assertIsNotNone(payload)
@@ -13631,7 +13647,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        with patch.object(task_manager_module, "get_dataflow_analyse_client", return_value=client):
+        with patch.object(downstream_tasks_module, "get_dataflow_analyse_client", return_value=client):
             payload = asyncio.run(self.manager._find_reusable_dataflow_payload(task, item))
 
         self.assertIsNotNone(payload)
@@ -13660,7 +13676,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        with patch.object(task_manager_module, "get_system_analyse_client", return_value=client):
+        with patch.object(downstream_tasks_module, "get_system_analyse_client", return_value=client):
             payload = asyncio.run(self.manager._find_reusable_system_analysis_payload(task, item))
 
         self.assertIsNotNone(payload)
@@ -13689,7 +13705,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        with patch.object(task_manager_module, "get_binary_to_source_client", return_value=client):
+        with patch.object(downstream_tasks_module, "get_binary_to_source_client", return_value=client):
             payload = asyncio.run(self.manager._find_reusable_b2s_payload(task, item, "tok"))
 
         self.assertIsNotNone(payload)
@@ -13717,7 +13733,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        with patch.object(task_manager_module, "get_entry_analyse_client", return_value=client):
+        with patch.object(downstream_tasks_module, "get_entry_analyse_client", return_value=client):
             payload = asyncio.run(self.manager._find_reusable_entry_payload(task, item, "tok"))
 
         self.assertIsNotNone(payload)
@@ -13745,7 +13761,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        with patch.object(task_manager_module, "get_firmware_unpacker_client", return_value=client):
+        with patch.object(downstream_tasks_module, "get_firmware_unpacker_client", return_value=client):
             payload = asyncio.run(self.manager._find_reusable_firmware_unpack_payload(task, item, "tok"))
 
         self.assertIsNotNone(payload)
@@ -13771,7 +13787,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
-        with patch.object(task_manager_module, "get_dataflow_vuln_scanner_client", return_value=client):
+        with patch.object(downstream_tasks_module, "get_dataflow_vuln_scanner_client", return_value=client):
             payload = asyncio.run(self.manager._find_reusable_vuln_payload(task, item, "tok"))
 
         self.assertIsNotNone(payload)
@@ -13800,7 +13816,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        with patch.object(task_manager_module, "get_entry_analyse_client", return_value=client):
+        with patch.object(downstream_tasks_module, "get_entry_analyse_client", return_value=client):
             refs = asyncio.run(
                 self.manager._duplicate_downstream_refs_for_item(
                     task,
@@ -13862,7 +13878,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
-            patch.object(task_manager_module, "get_binary_to_source_client", return_value=client),
+            patch.object(downstream_tasks_module, "get_binary_to_source_client", return_value=client),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_build_module_elf_tasks", return_value=[{"elf_path": "/tmp/mod.so", "file_list": []}]),
             patch.object(self.manager, "_active_downstream_payload", return_value={"id": "b2s-live", "status": "running"}),
@@ -13913,7 +13929,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
-            patch.object(task_manager_module, "get_binary_to_source_client", return_value=client),
+            patch.object(downstream_tasks_module, "get_binary_to_source_client", return_value=client),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_build_module_elf_tasks", return_value=[{"elf_path": "/tmp/mod.so", "file_list": []}]),
             patch.object(self.manager, "_active_downstream_payload", return_value=None),
@@ -13966,7 +13982,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
-            patch.object(task_manager_module, "get_binary_to_source_client", return_value=client),
+            patch.object(downstream_tasks_module, "get_binary_to_source_client", return_value=client),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_build_module_elf_tasks", return_value=[{"elf_path": "/tmp/mod.so", "file_list": []}]),
             patch.object(self.manager, "_active_downstream_payload", return_value={"id": "b2s-live", "status": "running"}),
@@ -14018,7 +14034,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         client = _AsyncBinaryToSourceClientStub(fail_on_create=True)
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
-            patch.object(task_manager_module, "get_binary_to_source_client", return_value=client),
+            patch.object(downstream_tasks_module, "get_binary_to_source_client", return_value=client),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_build_module_elf_tasks", return_value=[{"elf_path": "/tmp/mod.so", "file_list": []}]),
             patch.object(self.manager, "_active_downstream_payload", return_value={"id": "b2s-live", "status": "running"}),
@@ -14092,7 +14108,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_find_reusable_dataflow_payload", return_value=None),
-            patch.object(self.manager, "_control_existing_downstream_task", side_effect=fake_control),
+            patch.object(self.manager, "_downstream_control_existing_task", side_effect=fake_control),
             patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
             patch.object(self.manager, "_service_output_dir", return_value=Path("/tmp")),
             patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
@@ -14165,7 +14181,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_find_reusable_dataflow_payload", return_value=None),
-            patch.object(task_manager_module, "get_dataflow_analyse_client", return_value=SimpleNamespace(create_task=fake_create_task, get_task=lambda *args, **kwargs: None)),
+            patch.object(downstream_tasks_module, "get_dataflow_analyse_client", return_value=SimpleNamespace(create_task=fake_create_task, get_task=lambda *args, **kwargs: None)),
             patch.object(self.manager, "_poll_until_terminal", return_value=("success", {"task_id": "dfa-live", "status": "passed"})),
             patch.object(self.manager, "_service_output_dir", return_value=Path("/tmp")),
             patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
@@ -14190,7 +14206,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("/tmp/repo/src", call_args.args[2]["source_root_path"])
         self.assertEqual("/tmp/repo/src", call_args.args[2]["source_dir"])
         self.assertEqual("main.c", call_args.args[2]["source_file"])
-        self.assertEqual("/tmp/dataflow", call_args.args[2]["dataflow_dir"])
+        self.assertEqual("/tmp", call_args.args[2]["dataflow_dir"])
         self.assertIs(item, call_args.kwargs["upstream_item"])
         self.assertEqual("/tmp/repo/modules/module-1", item.output_ref["module_input_path"])
         self.assertEqual("/tmp/repo/src", item.output_ref["source_root_path"])
@@ -14322,7 +14338,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_find_reusable_dataflow_payload", return_value=None),
-            patch.object(task_manager_module, "get_dataflow_analyse_client", return_value=SimpleNamespace(create_task=fake_create_task, get_task=lambda *args, **kwargs: None)),
+            patch.object(downstream_tasks_module, "get_dataflow_analyse_client", return_value=SimpleNamespace(create_task=fake_create_task, get_task=lambda *args, **kwargs: None)),
             patch.object(self.manager, "_poll_until_terminal", return_value=("success", {"task_id": "dfa-live", "status": "passed"})),
             patch.object(self.manager, "_service_output_dir", return_value=Path("/tmp")),
             patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
@@ -14474,7 +14490,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(
                 self.manager,
-                "_control_existing_downstream_task",
+                "_downstream_control_existing_task",
                 return_value={"outcome": "already_running", "payload": {"task_id": "ea-old", "status": "running"}},
             ),
             patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
@@ -14536,7 +14552,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
-            patch.object(task_manager_module, "get_entry_analyse_client", return_value=client),
+            patch.object(downstream_tasks_module, "get_entry_analyse_client", return_value=client),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_active_downstream_payload", return_value=None),
             patch.object(self.manager, "_find_reusable_entry_payload", return_value={"task_id": "ea-live", "status": "running"}),
@@ -14593,7 +14609,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
-            patch.object(task_manager_module, "get_firmware_unpacker_client", return_value=client),
+            patch.object(downstream_tasks_module, "get_firmware_unpacker_client", return_value=client),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_active_downstream_payload", return_value=None),
             patch.object(self.manager, "_find_reusable_firmware_unpack_payload", return_value={"task_id": "fu-live", "status": "running"}),
@@ -14659,7 +14675,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
-            patch.object(task_manager_module, "get_dataflow_vuln_scanner_client", return_value=client),
+            patch.object(downstream_tasks_module, "get_dataflow_vuln_scanner_client", return_value=client),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_active_downstream_payload", return_value=None),
             patch.object(self.manager, "_find_reusable_vuln_payload", return_value={"task_id": "dfvs-live", "status": "running"}),
@@ -14740,7 +14756,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
-            patch.object(task_manager_module, "get_dataflow_vuln_scanner_client", return_value=_FakeClient()),
+            patch.object(downstream_tasks_module, "get_dataflow_vuln_scanner_client", return_value=_FakeClient()),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_active_downstream_payload", return_value=None),
             patch.object(self.manager, "_find_reusable_vuln_payload", return_value=None),
@@ -14821,7 +14837,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
-            patch.object(task_manager_module, "get_dataflow_vuln_scanner_client", return_value=_FakeClient()),
+            patch.object(downstream_tasks_module, "get_dataflow_vuln_scanner_client", return_value=_FakeClient()),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_active_downstream_payload", return_value=None),
             patch.object(self.manager, "_find_reusable_vuln_payload", return_value=None),
@@ -14856,7 +14872,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
-            patch.object(task_manager_module, "get_dataflow_vuln_scanner_client", return_value=client),
+            patch.object(downstream_tasks_module, "get_dataflow_vuln_scanner_client", return_value=client),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_active_downstream_payload", return_value=None),
             patch.object(self.manager, "_find_reusable_vuln_payload", return_value=None),
@@ -14894,7 +14910,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
-            patch.object(task_manager_module, "get_dataflow_vuln_scanner_client", return_value=client),
+            patch.object(downstream_tasks_module, "get_dataflow_vuln_scanner_client", return_value=client),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_active_downstream_payload", return_value=None),
             patch.object(self.manager, "_find_reusable_vuln_payload", return_value=None),
@@ -14932,7 +14948,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
-            patch.object(task_manager_module, "get_dataflow_vuln_scanner_client", return_value=client),
+            patch.object(downstream_tasks_module, "get_dataflow_vuln_scanner_client", return_value=client),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_active_downstream_payload", return_value=None),
             patch.object(self.manager, "_find_reusable_vuln_payload", return_value=None),
@@ -14970,7 +14986,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
-            patch.object(task_manager_module, "get_dataflow_vuln_scanner_client", return_value=client),
+            patch.object(downstream_tasks_module, "get_dataflow_vuln_scanner_client", return_value=client),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_active_downstream_payload", return_value=None),
             patch.object(self.manager, "_find_reusable_vuln_payload", return_value=None),
@@ -15085,7 +15101,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
                 patch.object(self.manager, "_upsert_stage_item", return_value=item),
-                patch.object(task_manager_module, "get_entry_analyse_client", return_value=SimpleNamespace(create_task=fake_create_task, get_task=lambda *args, **kwargs: None)),
+                patch.object(downstream_tasks_module, "get_entry_analyse_client", return_value=SimpleNamespace(create_task=fake_create_task, get_task=lambda *args, **kwargs: None)),
                 patch.object(self.manager, "_poll_until_terminal", return_value=("success", {"task_id": "ea-new", "status": "passed"})),
                 patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
                 patch.object(self.manager, "_parse_entries", return_value=[]),
@@ -15449,7 +15465,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
-            patch.object(task_manager_module, "get_dataflow_analyse_client", return_value=SimpleNamespace(create_task=fake_create_task)),
+            patch.object(downstream_tasks_module, "get_dataflow_analyse_client", return_value=SimpleNamespace(create_task=fake_create_task)),
             patch.object(self.manager, "_upsert_stage_item", return_value=dataflow_item),
             patch.object(self.manager, "_normalize_dfa_source_file", return_value="libipsec.c"),
             patch.object(self.manager, "_poll_until_terminal", return_value=("success", {"task_id": "dfa-new", "status": "passed"})),
@@ -15577,7 +15593,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
-            patch.object(task_manager_module, "get_entry_analyse_client") as client_factory,
+            patch.object(downstream_tasks_module, "get_entry_analyse_client") as client_factory,
             patch.object(self.manager, "_poll_until_terminal", return_value=("success", {"task_id": "ea-new", "status": "passed"})),
             patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
             patch.object(self.manager, "_parse_entries", return_value=[]),
@@ -15637,7 +15653,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(
                 self.manager,
-                "_control_existing_downstream_task",
+                "_downstream_control_existing_task",
                 return_value={"outcome": "already_running", "payload": {"task_id": "ea-old", "status": "running"}},
             ),
             patch.object(self.manager, "_poll_until_terminal", side_effect=UpstreamError("无法连接下游服务: All connection attempts failed")),
@@ -15695,7 +15711,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(
                 self.manager,
-                "_control_existing_downstream_task",
+                "_downstream_control_existing_task",
                 return_value={"outcome": "transport_error", "error_message": "无法连接下游服务: All connection attempts failed"},
             ),
         ):
@@ -15912,7 +15928,7 @@ def _test_delete_downstream_refs_treats_entry_delete_500_with_absent_task_as_suc
 
     client.get_task = _missing_task
 
-    with patch.object(task_manager_module, "get_entry_analyse_client", return_value=client):
+    with patch.object(downstream_tasks_module, "get_entry_analyse_client", return_value=client):
         deleted = asyncio.run(
             self.manager._delete_downstream_refs(
                 db,
@@ -15924,9 +15940,9 @@ def _test_delete_downstream_refs_treats_entry_delete_500_with_absent_task_as_suc
 
     self.assertEqual(1, deleted)
     event_types = [getattr(event, "event_type", "") for event in db.added]
-    self.assertIn("downstream_delete_requested", event_types)
-    self.assertIn("downstream_delete_verified_absent", event_types)
-    self.assertIn("downstream_delete_failed_but_ignored", event_types)
+    self.assertIn("child_task_delete_requested", event_types)
+    self.assertIn("child_task_delete_verified_absent", event_types)
+    self.assertIn("child_task_delete_failed_but_ignored", event_types)
 
 
 def _test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exists(self):
@@ -15961,7 +15977,7 @@ def _test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exi
 
     client.get_task = _existing_task
 
-    with patch.object(task_manager_module, "get_entry_analyse_client", return_value=client):
+    with patch.object(downstream_tasks_module, "get_entry_analyse_client", return_value=client):
         with self.assertRaises(ValidationError):
             asyncio.run(
                 self.manager._delete_downstream_refs(
@@ -15975,6 +15991,161 @@ def _test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exi
 
 TaskManagerTests.test_delete_downstream_refs_treats_entry_delete_500_with_absent_task_as_success = _test_delete_downstream_refs_treats_entry_delete_500_with_absent_task_as_success
 TaskManagerTests.test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exists = _test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exists
+
+
+def _test_task_manager_does_not_access_downstream_clients_directly(self):
+    source = Path(task_manager_module.__file__).read_text(encoding="utf-8")
+    forbidden = re.findall(
+        r"get_(?:firmware_unpacker|system_analyse|binary_to_source|entry_analyse|dataflow_analyse|dataflow_vuln_scanner)_client\(",
+        source,
+    )
+    self.assertEqual([], forbidden)
+
+
+TaskManagerTests.test_task_manager_does_not_access_downstream_clients_directly = _test_task_manager_does_not_access_downstream_clients_directly
+
+
+def _test_downstream_controller_query_does_not_write_timeline(self):
+    task = BinarySecurityTask(id="t1", project_id="p1", name="source")
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="module-1",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+    client = _AsyncEntryAnalyseClientStub(fetched={"eat-1": {"task_id": "eat-1", "status": "passed"}})
+
+    with patch.object(downstream_tasks_module, "get_entry_analyse_client", return_value=client):
+        payload = asyncio.run(self.manager._downstream_fetch_item_payload(task, item, "token"))
+
+    self.assertEqual("eat-1", payload["task_id"])
+    self.assertEqual([], db.added)
+
+
+def _test_downstream_controller_retry_records_child_task_event(self):
+    task = BinarySecurityTask(id="t1", project_id="p1", name="source")
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="module-1",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+        status="failed",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+    controller = self.manager._downstream_tasks()
+
+    async def fake_invoke_retry_or_restart(**kwargs):
+        del kwargs
+        return {"task_id": "eat-1", "status": "queued"}
+
+    with patch.object(controller, "invoke_retry_or_restart", side_effect=fake_invoke_retry_or_restart):
+        control = asyncio.run(
+            controller.control_existing_child(
+                db,
+                stage_name="entry_analysis",
+                task=task,
+                item=item,
+                token="token",
+            )
+        )
+
+    self.assertEqual("accepted", control["outcome"])
+    event_types = [getattr(event, "event_type", "") for event in db.added]
+    self.assertIn("child_task_retry_requested", event_types)
+    self.assertIn("child_task_retry_accepted", event_types)
+
+
+def _test_downstream_controller_cancel_records_child_task_events(self):
+    task = BinarySecurityTask(id="t1", project_id="p1", name="source")
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="module-1",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+        status="running",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+    client = _AsyncEntryAnalyseClientStub()
+
+    with patch.object(downstream_tasks_module, "get_entry_analyse_client", return_value=client):
+        cancelled = asyncio.run(
+            self.manager._downstream_cancel_refs(
+                db,
+                task,
+                [{"service": "entry_analyse", "task_id": "eat-1", "stage_name": "entry_analysis"}],
+                "token",
+            )
+        )
+
+    self.assertEqual(1, cancelled)
+    event_types = [getattr(event, "event_type", "") for event in db.added]
+    self.assertIn("child_task_cancel_requested", event_types)
+    self.assertIn("child_task_cancel_succeeded", event_types)
+
+
+def _test_downstream_controller_delete_blocking_failure_records_event(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="binary",
+        status="retry_preparing",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/tmp/out",
+        workspace_root="/tmp/ws",
+    )
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="IPSEC",
+        status="cancelled",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat_x",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+    client = _AsyncEntryAnalyseClientStub(delete_result=UpstreamError("500 Internal Server Error"))
+
+    async def _existing_task(task_id, token=None):
+        del token
+        return {"task_id": task_id, "status": "cancelled"}
+
+    client.get_task = _existing_task
+
+    with patch.object(downstream_tasks_module, "get_entry_analyse_client", return_value=client):
+        with self.assertRaises(ValidationError):
+            asyncio.run(
+                self.manager._downstream_delete_refs(
+                    db,
+                    task,
+                    [{"service": "entry_analyse", "task_id": "eat_x", "stage_name": "entry_analysis"}],
+                    "token",
+                )
+            )
+
+    event_types = [getattr(event, "event_type", "") for event in db.added]
+    self.assertIn("child_task_delete_requested", event_types)
+    self.assertIn("child_task_delete_failed_blocking", event_types)
+
+
+TaskManagerTests.test_downstream_controller_query_does_not_write_timeline = _test_downstream_controller_query_does_not_write_timeline
+TaskManagerTests.test_downstream_controller_retry_records_child_task_event = _test_downstream_controller_retry_records_child_task_event
+TaskManagerTests.test_downstream_controller_cancel_records_child_task_events = _test_downstream_controller_cancel_records_child_task_events
+TaskManagerTests.test_downstream_controller_delete_blocking_failure_records_event = _test_downstream_controller_delete_blocking_failure_records_event
 
 
 def _test_stage_item_response_exposes_downstream_status_from_sync_observation(self):

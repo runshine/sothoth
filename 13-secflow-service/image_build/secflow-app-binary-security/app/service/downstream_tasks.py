@@ -1,0 +1,872 @@
+"""Unified child-task access layer for binary-security orchestration.
+
+All downstream child-task operations must go through this module. Business
+orchestration code must not call downstream service clients directly.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+from datetime import timedelta
+from typing import Any
+
+from sqlalchemy.orm import Session
+
+from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
+from app.model import BinarySecurityStageItem, BinarySecurityTask
+from app.service.binary_to_source import get_binary_to_source_client
+from app.service.dataflow_analyse import get_dataflow_analyse_client
+from app.service.dataflow_vuln_scanner import get_dataflow_vuln_scanner_client
+from app.service.entry_analyse import get_entry_analyse_client
+from app.service.firmware_unpacker import get_firmware_unpacker_client
+from app.service.system_analyse import get_system_analyse_client
+from app.time_utils import now_local
+
+
+class DownstreamTaskGateway:
+    def _normalize_service(self, service: str) -> str:
+        value = str(service or "").strip()
+        if not value:
+            raise ValidationError("缺少下游服务标识")
+        return value
+
+    async def get_task(self, service: str, *, project_id: str | None, task_id: str, token: str | None) -> dict[str, Any]:
+        normalized = self._normalize_service(service)
+        if normalized == "firmware_unpacker":
+            return await get_firmware_unpacker_client().get_task(project_id or "", task_id, token or "")
+        if normalized == "system_analyse":
+            return await get_system_analyse_client().get_task(task_id)
+        if normalized == "binary_to_source":
+            return await get_binary_to_source_client().get_task(project_id or "", task_id, token or "")
+        if normalized == "entry_analyse":
+            return await get_entry_analyse_client().get_task(task_id, token or "")
+        if normalized == "dataflow_analyse":
+            return await get_dataflow_analyse_client().get_task(task_id)
+        if normalized == "dataflow_vuln_scanner":
+            return await get_dataflow_vuln_scanner_client().get_task(task_id, token or "")
+        raise ValidationError(f"未知下游服务: {normalized}")
+
+    async def list_tasks(self, service: str, *, project_id: str, token: str | None, **kwargs: Any) -> dict[str, Any]:
+        normalized = self._normalize_service(service)
+        if normalized == "firmware_unpacker":
+            return await get_firmware_unpacker_client().list_tasks(
+                project_id,
+                token or "",
+                origin_mode=kwargs.get("origin_mode", "linked"),
+                limit=int(kwargs.get("limit", 100) or 100),
+                offset=int(kwargs.get("offset", 0) or 0),
+            )
+        if normalized == "system_analyse":
+            return await get_system_analyse_client().list_tasks(
+                project_id,
+                parent_task_id=kwargs.get("parent_task_id"),
+                page=int(kwargs.get("page", 1) or 1),
+                per_page=int(kwargs.get("per_page", 100) or 100),
+                sort_by=str(kwargs.get("sort_by") or "updated_at"),
+                sort_order=str(kwargs.get("sort_order") or "desc"),
+            )
+        if normalized == "binary_to_source":
+            return await get_binary_to_source_client().list_tasks(
+                project_id,
+                token or "",
+                parent_task_id=kwargs.get("parent_task_id"),
+                parent_stage_item_id=kwargs.get("parent_stage_item_id"),
+                limit=int(kwargs.get("limit", 100) or 100),
+                offset=int(kwargs.get("offset", 0) or 0),
+                status=kwargs.get("status"),
+            )
+        if normalized == "entry_analyse":
+            return await get_entry_analyse_client().list_tasks(
+                project_id,
+                parent_task_id=kwargs.get("parent_task_id"),
+                parent_stage_item_id=kwargs.get("parent_stage_item_id"),
+                page=int(kwargs.get("page", 1) or 1),
+                per_page=int(kwargs.get("per_page", 100) or 100),
+                sort_by=str(kwargs.get("sort_by") or "updated_at"),
+                sort_order=str(kwargs.get("sort_order") or "desc"),
+                token=token,
+            )
+        if normalized == "dataflow_analyse":
+            return await get_dataflow_analyse_client().list_tasks(
+                project_id,
+                parent_task_id=kwargs.get("parent_task_id"),
+                parent_stage_item_id=kwargs.get("parent_stage_item_id"),
+                page=int(kwargs.get("page", 1) or 1),
+                per_page=int(kwargs.get("per_page", 100) or 100),
+                sort_by=str(kwargs.get("sort_by") or "updated_at"),
+                sort_order=str(kwargs.get("sort_order") or "desc"),
+            )
+        if normalized == "dataflow_vuln_scanner":
+            rows = await get_dataflow_vuln_scanner_client().list_tasks(
+                project_id,
+                token or "",
+                limit=int(kwargs.get("limit", 100) or 100),
+                offset=int(kwargs.get("offset", 0) or 0),
+                status=kwargs.get("status"),
+            )
+            if isinstance(rows, dict):
+                return rows
+            return {"items": list(rows or [])}
+        raise ValidationError(f"未知下游服务: {normalized}")
+
+    async def create_task(self, service: str, *, project_id: str, token: str | None, **kwargs: Any) -> dict[str, Any]:
+        normalized = self._normalize_service(service)
+        if normalized == "firmware_unpacker":
+            return await get_firmware_unpacker_client().create_task(
+                project_id,
+                str(kwargs["firmware_path"]),
+                token or "",
+                kwargs.get("origin"),
+            )
+        if normalized == "system_analyse":
+            return await get_system_analyse_client().create_task(
+                project_id,
+                str(kwargs["task_name"]),
+                str(kwargs["input_path"]),
+                kwargs.get("origin"),
+                analysis_mode=str(kwargs.get("analysis_mode") or "binary"),
+            )
+        if normalized == "binary_to_source":
+            return await get_binary_to_source_client().create_task(
+                project_id,
+                str(kwargs["name"]),
+                list(kwargs["elf_tasks"]),
+                token or "",
+                kwargs.get("origin"),
+                mode=kwargs.get("mode"),
+                engine=kwargs.get("engine"),
+                reuse_cache=kwargs.get("reuse_cache"),
+            )
+        if normalized == "entry_analyse":
+            return await get_entry_analyse_client().create_task(
+                project_id,
+                str(kwargs["task_name"]),
+                str(kwargs["input_path"]),
+                str(kwargs["module_name"]),
+                token or "",
+                kwargs.get("source_path"),
+                kwargs.get("origin"),
+            )
+        if normalized == "dataflow_analyse":
+            return await get_dataflow_analyse_client().create_task(
+                project_id,
+                str(kwargs["task_name"]),
+                str(kwargs["module_input_path"]),
+                str(kwargs["source_root_path"]),
+                str(kwargs["prompt_content"]),
+                kwargs.get("origin"),
+                source_file=kwargs.get("source_file"),
+                function_name=kwargs.get("function_name"),
+                line_hint=kwargs.get("line_hint"),
+                definition_kind=kwargs.get("definition_kind"),
+                taint_params=kwargs.get("taint_params"),
+                function_description=kwargs.get("function_description"),
+                entry_reason=kwargs.get("entry_reason"),
+                taint_details=kwargs.get("taint_details"),
+                function_description_source=kwargs.get("function_description_source"),
+                entry_reason_source=kwargs.get("entry_reason_source"),
+            )
+        if normalized == "dataflow_vuln_scanner":
+            return await get_dataflow_vuln_scanner_client().create_task(
+                project_id,
+                str(kwargs["title"]),
+                token or "",
+                str(kwargs["data_flow_path"]),
+                str(kwargs["source_dir"]),
+                kwargs.get("origin"),
+            )
+        raise ValidationError(f"未知下游服务: {normalized}")
+
+    async def retry_or_restart_task(
+        self,
+        service: str,
+        *,
+        stage_name: str,
+        project_id: str,
+        task_id: str,
+        token: str | None,
+    ) -> dict[str, Any]:
+        normalized = self._normalize_service(service)
+        if stage_name == "firmware_unpack" and normalized == "firmware_unpacker":
+            return await get_firmware_unpacker_client().retry_task(task_id, token or "")
+        if stage_name == "system_analysis" and normalized == "system_analyse":
+            return await get_system_analyse_client().restart_task(task_id)
+        if stage_name == "binary_to_source" and normalized == "binary_to_source":
+            return await get_binary_to_source_client().rerun_task(
+                project_id,
+                task_id,
+                token or "",
+                clean_output=True,
+                cancel_running=True,
+            )
+        if stage_name == "entry_analysis" and normalized == "entry_analyse":
+            return await get_entry_analyse_client().restart_task(task_id, token or "")
+        if stage_name == "dataflow_analysis" and normalized == "dataflow_analyse":
+            return await get_dataflow_analyse_client().restart_task(task_id)
+        if stage_name == "vuln_scan" and normalized == "dataflow_vuln_scanner":
+            return await get_dataflow_vuln_scanner_client().retry_task(task_id, token or "")
+        raise ValidationError(f"阶段 {stage_name} 未配置安全重试接口")
+
+    async def cancel_task(self, service: str, *, project_id: str | None, task_id: str, token: str | None) -> dict[str, Any]:
+        normalized = self._normalize_service(service)
+        if normalized == "firmware_unpacker":
+            return await get_firmware_unpacker_client().cancel_task(task_id, token or "")
+        if normalized == "system_analyse":
+            return await get_system_analyse_client().cancel_task(task_id)
+        if normalized == "binary_to_source":
+            return await get_binary_to_source_client().cancel_task(project_id or "", task_id, token or "")
+        if normalized == "entry_analyse":
+            return await get_entry_analyse_client().cancel_task(task_id, token or "")
+        if normalized == "dataflow_analyse":
+            return await get_dataflow_analyse_client().cancel_task(task_id)
+        if normalized == "dataflow_vuln_scanner":
+            return await get_dataflow_vuln_scanner_client().cancel_task(task_id, token or "")
+        raise ValidationError(f"未知下游服务: {normalized}")
+
+    async def delete_task(self, service: str, *, project_id: str | None, task_id: str, token: str | None) -> dict[str, Any]:
+        normalized = self._normalize_service(service)
+        if normalized == "firmware_unpacker":
+            return await get_firmware_unpacker_client().delete_task(task_id, token or "")
+        if normalized == "system_analyse":
+            return await get_system_analyse_client().delete_task(task_id)
+        if normalized == "binary_to_source":
+            return await get_binary_to_source_client().delete_task(project_id or "", task_id, token or "")
+        if normalized == "entry_analyse":
+            return await get_entry_analyse_client().delete_task(task_id, token or "")
+        if normalized == "dataflow_analyse":
+            return await get_dataflow_analyse_client().delete_task(task_id)
+        if normalized == "dataflow_vuln_scanner":
+            return await get_dataflow_vuln_scanner_client().delete_task(task_id, token or "")
+        raise ValidationError(f"未知下游服务: {normalized}")
+
+    async def get_task_result(self, service: str, *, task_id: str) -> dict[str, Any]:
+        normalized = self._normalize_service(service)
+        if normalized == "system_analyse":
+            return await get_system_analyse_client().get_task_result(task_id)
+        raise ValidationError(f"下游服务 {normalized} 不支持结果读取")
+
+    async def get_artifacts(self, service: str, *, task_id: str, token: str | None) -> dict[str, Any]:
+        normalized = self._normalize_service(service)
+        if normalized == "dataflow_vuln_scanner":
+            return await get_dataflow_vuln_scanner_client().get_artifacts(task_id, token or "")
+        raise ValidationError(f"下游服务 {normalized} 不支持产物读取")
+
+
+class DownstreamTaskController:
+    def __init__(self, manager: Any) -> None:
+        self.manager = manager
+        self.gateway = DownstreamTaskGateway()
+
+    def _record_event(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        event_type: str,
+        message: str,
+        *,
+        level: str = "info",
+        stage_name: str | None = None,
+        item: BinarySecurityStageItem | dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.manager._record_event(
+            db,
+            task,
+            event_type,
+            message,
+            level=level,
+            stage_name=stage_name,
+            item=item,
+            payload=payload,
+        )
+
+    def _record_downstream_item_disposition(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem | dict[str, Any],
+        *,
+        event_type: str,
+        message: str,
+        level: str = "info",
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.manager._record_downstream_item_disposition(
+            db,
+            task,
+            item,
+            event_type=event_type,
+            message=message,
+            level=level,
+            payload=payload,
+        )
+
+    def _record_control_outcome(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        stage_name: str,
+        control: dict[str, Any],
+    ) -> None:
+        outcome = str(control.get("outcome") or "").strip()
+        payload = {
+            "stage_name": stage_name,
+            "operation": "retry_or_restart",
+            "control_outcome": outcome,
+            "http_status": control.get("http_status"),
+            "error": control.get("error_message"),
+            "payload": control.get("payload"),
+        }
+        if outcome == "accepted":
+            self._record_downstream_item_disposition(
+                db,
+                task,
+                item,
+                event_type="child_task_retry_accepted",
+                message=f"下游子任务已接受重试/重启: {item.downstream_service}:{item.downstream_task_id or '-'}",
+                payload=payload,
+            )
+            return
+        if outcome == "already_running":
+            self._record_downstream_item_disposition(
+                db,
+                task,
+                item,
+                event_type="child_task_dispatch_attached",
+                message=f"复用已在运行的下游子任务: {item.downstream_service}:{item.downstream_task_id or '-'}",
+                payload=payload,
+            )
+            return
+        if outcome == "already_terminal":
+            self._record_downstream_item_disposition(
+                db,
+                task,
+                item,
+                event_type="child_task_retry_rejected",
+                message=f"下游子任务已是终态，未执行重试/重启: {item.downstream_service}:{item.downstream_task_id or '-'}",
+                level="warning",
+                payload=payload,
+            )
+            return
+        if outcome == "transport_error":
+            self._record_downstream_item_disposition(
+                db,
+                task,
+                item,
+                event_type="child_task_dispatch_deferred",
+                message=f"下游控制通信异常，保留当前子任务等待后续自动对账: {item.downstream_service}:{item.downstream_task_id or '-'}",
+                level="warning",
+                payload=payload,
+            )
+            return
+        event_type = "child_task_retry_rejected" if outcome in {"invalid_transition", "not_found"} else "child_task_status_sync_failed"
+        self._record_downstream_item_disposition(
+            db,
+            task,
+            item,
+            event_type=event_type,
+            message=f"下游子任务控制未被接受: {item.downstream_service}:{item.downstream_task_id or '-'}",
+            level="warning",
+            payload=payload,
+        )
+
+    @staticmethod
+    def _task_id_from_payload(payload: dict[str, Any]) -> str | None:
+        return str(payload.get("task_id") or payload.get("id") or "").strip() or None
+
+    async def get_child_task(self, *, service: str, project_id: str | None, task_id: str, token: str | None) -> dict[str, Any]:
+        return await self.gateway.get_task(service, project_id=project_id, task_id=task_id, token=token)
+
+    async def fetch_child_payload(self, task: BinarySecurityTask, item: BinarySecurityStageItem, token: str | None) -> dict[str, Any]:
+        task_id = str(item.downstream_task_id or "").strip()
+        if not task_id:
+            raise ValidationError("缺少下游任务ID")
+        project_id = None
+        if item.downstream_service in {"firmware_unpacker", "binary_to_source"}:
+            project_id = (item.result or {}).get("project_id") or task.project_id
+        return await self.gateway.get_task(
+            str(item.downstream_service or ""),
+            project_id=project_id,
+            task_id=task_id,
+            token=token,
+        )
+
+    async def fetch_child_ref_payload(self, ref: dict[str, str], token: str | None) -> dict[str, Any]:
+        return await self.gateway.get_task(
+            str(ref.get("service") or ""),
+            project_id=str(ref.get("project_id") or "") or None,
+            task_id=str(ref.get("task_id") or ""),
+            token=token,
+        )
+
+    async def fetch_child_result(self, item: BinarySecurityStageItem) -> dict[str, Any]:
+        return await self.gateway.get_task_result(str(item.downstream_service or ""), task_id=str(item.downstream_task_id or ""))
+
+    async def fetch_child_artifacts(self, item: BinarySecurityStageItem, token: str | None) -> dict[str, Any]:
+        return await self.gateway.get_artifacts(
+            str(item.downstream_service or ""),
+            task_id=str(item.downstream_task_id or ""),
+            token=token,
+        )
+
+    async def list_child_tasks(self, *, service: str, project_id: str, token: str | None, **kwargs: Any) -> dict[str, Any]:
+        return await self.gateway.list_tasks(service, project_id=project_id, token=token, **kwargs)
+
+    async def create_child_task(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        service: str,
+        token: str | None,
+        payload: dict[str, Any],
+        event_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self._record_downstream_item_disposition(
+            db,
+            task,
+            item,
+            event_type="child_task_create_requested",
+            message=f"请求创建下游子任务: {service}:{item.item_key or item.id or '-'}",
+            payload={"operation": "create", **(event_payload or {})},
+        )
+        try:
+            created = await self.gateway.create_task(service, project_id=task.project_id, token=token, **payload)
+        except Exception as exc:
+            self._record_downstream_item_disposition(
+                db,
+                task,
+                item,
+                event_type="child_task_create_failed",
+                message=f"创建下游子任务失败: {service}:{item.item_key or item.id or '-'}",
+                level="warning",
+                payload={
+                    "operation": "create",
+                    "error": self.manager._extract_downstream_error_text(exc) or str(exc),
+                    "http_status": self.manager._extract_http_status_from_exception(exc),
+                    **(event_payload or {}),
+                },
+            )
+            raise
+        task_id = self._task_id_from_payload(created)
+        self._record_downstream_item_disposition(
+            db,
+            task,
+            item,
+            event_type="child_task_create_succeeded",
+            message=f"下游子任务创建成功: {service}:{task_id or '-'}",
+            payload={
+                "operation": "create",
+                "downstream_task_id": task_id,
+                "payload": self.manager._lightweight_downstream_payload(created),
+                **(event_payload or {}),
+            },
+        )
+        return created
+
+    async def invoke_retry_or_restart(self, *, stage_name: str, task: BinarySecurityTask, item: BinarySecurityStageItem, token: str | None) -> dict[str, Any]:
+        downstream_task_id = str(item.downstream_task_id or "").strip()
+        if not downstream_task_id:
+            raise ValidationError("缺少下游任务ID，无法安全重试")
+        expected_service = self.manager._stage_expected_service(stage_name)
+        if expected_service and item.downstream_service != expected_service:
+            raise ValidationError(
+                f"下游服务不匹配，无法安全重试: 期望 {expected_service}，实际 {item.downstream_service or '-'}"
+            )
+        return await self.gateway.retry_or_restart_task(
+            str(item.downstream_service or ""),
+            stage_name=stage_name,
+            project_id=task.project_id,
+            task_id=downstream_task_id,
+            token=token,
+        )
+
+    @staticmethod
+    def extract_downstream_error_text(exc: Exception) -> str:
+        raw_message = str(getattr(exc, "message", exc) or "").strip()
+        if not raw_message:
+            return ""
+        try:
+            payload = json.loads(raw_message)
+        except Exception:
+            return raw_message
+        queue: list[Any] = [payload]
+        while queue:
+            current = queue.pop(0)
+            if isinstance(current, dict):
+                for key in ("detail", "error", "message", "msg"):
+                    value = current.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+                queue.extend(value for value in current.values() if isinstance(value, (dict, list)))
+            elif isinstance(current, list):
+                for value in current:
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+                    if isinstance(value, (dict, list)):
+                        queue.append(value)
+        return raw_message
+
+    @staticmethod
+    def is_already_running_control_conflict(message: str) -> bool:
+        normalized = re.sub(r"\s+", "", str(message or "").lower())
+        if not normalized:
+            return False
+        running_tokens = ("仍在运行", "运行中", "已经在运行", "active", "alreadyrunning", "currentlyrunning", "stillrunning")
+        control_tokens = ("重启", "重试", "restart", "retry", "rerun", "cancel", "取消后再", "先取消")
+        return any(token in normalized for token in running_tokens) and any(token in normalized for token in control_tokens)
+
+    async def control_existing_child(
+        self,
+        db: Session | None,
+        *,
+        stage_name: str,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        token: str | None,
+    ) -> dict[str, Any]:
+        if db is not None:
+            self._record_downstream_item_disposition(
+                db,
+                task,
+                item,
+                event_type="child_task_retry_requested",
+                message=f"请求控制下游子任务: {item.downstream_service}:{item.downstream_task_id or '-'}",
+                payload={"operation": "retry_or_restart", "stage_name": stage_name},
+            )
+        if stage_name in {"dataflow_analysis", "vuln_scan"} and self.manager._has_retryable_downstream_task(item):
+            try:
+                payload = await self.fetch_child_payload(task, item, token or "")
+            except NotFoundError:
+                payload = None
+            except Exception as exc:
+                if self.manager._is_retryable_downstream_transport_error(exc):
+                    control = {
+                        "outcome": "transport_error",
+                        "payload": None,
+                        "error_message": self.extract_downstream_error_text(exc) or str(exc),
+                        "http_status": self.manager._extract_http_status_from_exception(exc),
+                    }
+                    if db is not None:
+                        self._record_control_outcome(db, task, item, stage_name=stage_name, control=control)
+                    return control
+                payload = None
+            if isinstance(payload, dict):
+                mapped_status = self.manager._map_downstream_status(str(payload.get("status") or ""))
+                if mapped_status in {"pending", "queued", "dispatching", "running"}:
+                    control = {
+                        "outcome": "already_running",
+                        "payload": payload,
+                        "error_message": None,
+                        "http_status": 200,
+                    }
+                    if db is not None:
+                        self._record_control_outcome(db, task, item, stage_name=stage_name, control=control)
+                    return control
+        try:
+            payload = await self.invoke_retry_or_restart(stage_name=stage_name, task=task, item=item, token=token)
+            control = {"outcome": "accepted", "payload": payload, "error_message": None, "http_status": 200}
+            if db is not None:
+                self._record_control_outcome(db, task, item, stage_name=stage_name, control=control)
+            return control
+        except NotFoundError as exc:
+            control = {
+                "outcome": "not_found",
+                "payload": None,
+                "error_message": self.extract_downstream_error_text(exc) or "下游子任务不存在",
+                "http_status": getattr(exc, "status_code", 404),
+            }
+            if db is not None:
+                self._record_control_outcome(db, task, item, stage_name=stage_name, control=control)
+            return control
+        except (ValidationError, ConflictError) as exc:
+            error_message = self.extract_downstream_error_text(exc) or str(exc)
+            result = {
+                "outcome": "already_running" if self.is_already_running_control_conflict(error_message) else "invalid_transition",
+                "payload": None,
+                "error_message": error_message,
+                "http_status": getattr(exc, "status_code", None),
+            }
+        except UpstreamError as exc:
+            control = {
+                "outcome": "transport_error",
+                "payload": None,
+                "error_message": self.extract_downstream_error_text(exc) or str(exc),
+                "http_status": getattr(exc, "status_code", 502),
+            }
+            if db is not None:
+                self._record_control_outcome(db, task, item, stage_name=stage_name, control=control)
+            return control
+        except Exception as exc:
+            if self.manager._is_retryable_downstream_transport_error(exc):
+                control = {
+                    "outcome": "transport_error",
+                    "payload": None,
+                    "error_message": self.extract_downstream_error_text(exc) or str(exc),
+                    "http_status": self.manager._extract_http_status_from_exception(exc),
+                }
+                if db is not None:
+                    self._record_control_outcome(db, task, item, stage_name=stage_name, control=control)
+                return control
+            control = {
+                "outcome": "fatal_error",
+                "payload": None,
+                "error_message": str(exc),
+                "http_status": None,
+            }
+            if db is not None:
+                self._record_control_outcome(db, task, item, stage_name=stage_name, control=control)
+            return control
+
+        if not self.manager._has_retryable_downstream_task(item):
+            if db is not None:
+                self._record_control_outcome(db, task, item, stage_name=stage_name, control=result)
+            return result
+        try:
+            payload = await self.fetch_child_payload(task, item, token or "")
+        except NotFoundError as exc:
+            control = {
+                "outcome": "not_found",
+                "payload": None,
+                "error_message": self.extract_downstream_error_text(exc) or result["error_message"] or "下游子任务不存在",
+                "http_status": getattr(exc, "status_code", 404),
+            }
+            if db is not None:
+                self._record_control_outcome(db, task, item, stage_name=stage_name, control=control)
+            return control
+        except Exception:
+            if db is not None:
+                self._record_control_outcome(db, task, item, stage_name=stage_name, control=result)
+            return result
+
+        mapped_status = self.manager._map_downstream_status(str(payload.get("status") or ""))
+        if mapped_status in {"queued", "running"}:
+            control = {**result, "outcome": "already_running", "payload": payload, "retry_outcome": result.get("outcome")}
+            if db is not None:
+                self._record_control_outcome(db, task, item, stage_name=stage_name, control=control)
+            return control
+        if mapped_status in {"success", "partial_success", "failed", "cancelled", "downstream_missing"}:
+            control = {**result, "outcome": "already_terminal", "payload": payload, "retry_outcome": result.get("outcome")}
+            if db is not None:
+                self._record_control_outcome(db, task, item, stage_name=stage_name, control=control)
+            return control
+        control = {**result, "payload": payload}
+        if db is not None:
+            self._record_control_outcome(db, task, item, stage_name=stage_name, control=control)
+        return control
+
+    async def cancel_child_task(self, item: BinarySecurityStageItem, token: str | None) -> None:
+        await self.gateway.cancel_task(
+            str(item.downstream_service or ""),
+            project_id=((item.result or {}).get("project_id") or item.project_id) if item.downstream_service == "binary_to_source" else item.project_id,
+            task_id=str(item.downstream_task_id or ""),
+            token=token,
+        )
+
+    async def cancel_child_refs(self, db: Session, task: BinarySecurityTask, refs: list[dict[str, str]], token: str | None) -> int:
+        for ref in refs:
+            event_item = self.manager._event_item_for_downstream_ref(db, task, ref)
+            self._record_event(
+                db,
+                task,
+                "child_task_cancel_requested",
+                f"请求取消下游任务: {ref['service']}:{ref['task_id']}",
+                stage_name=ref.get("stage_name"),
+                item=event_item,
+                payload={**ref, "operation": "cancel"},
+            )
+
+        async def do_cancel(ref: dict[str, str]) -> bool:
+            await self.gateway.cancel_task(
+                str(ref["service"]),
+                project_id=str(ref.get("project_id") or "") or None,
+                task_id=str(ref["task_id"]),
+                token=token,
+            )
+            return True
+
+        db.commit()
+        results = await self.manager._run_with_limits(
+            refs,
+            do_cancel,
+            concurrency=self.manager.cfg.scheduler.downstream_action_concurrency,
+            timeout_seconds=self.manager.cfg.scheduler.downstream_request_timeout_seconds,
+        )
+        success_count = 0
+        for ref, ok, exc in results:
+            event_item = self.manager._event_item_for_downstream_ref(db, task, ref)
+            if exc is None and ok:
+                success_count += 1
+                self._record_downstream_item_disposition(
+                    db,
+                    task,
+                    event_item,
+                    event_type="child_task_cancel_succeeded",
+                    message=f"下游子任务已取消: {ref['service']}:{ref['task_id']}",
+                    payload={**ref, "operation": "cancel"},
+                )
+                continue
+            self._record_event(
+                db,
+                task,
+                "child_task_cancel_failed",
+                f"下游取消失败: {ref['service']}:{ref['task_id']} - {exc}",
+                stage_name=ref.get("stage_name"),
+                item=event_item,
+                level="warning",
+                payload={**ref, "operation": "cancel", "error": str(exc)},
+            )
+        db.commit()
+        return success_count
+
+    async def wait_child_refs_inactive(self, refs: list[dict[str, str]], token: str | None) -> None:
+        timeout_seconds = max(
+            int(self.manager.cfg.scheduler.downstream_request_timeout_seconds or 120),
+            int(self.manager.cfg.scheduler.stage_poll_interval_seconds or 5) * 2,
+        )
+        deadline = now_local() + timedelta(seconds=timeout_seconds)
+        while refs and now_local() <= deadline:
+            active_refs: list[dict[str, str]] = []
+            for ref in refs:
+                try:
+                    payload = await self.fetch_child_ref_payload(ref, token)
+                except NotFoundError:
+                    continue
+                mapped_status = self.manager._map_downstream_status(str(payload.get("status") or "")) or str(payload.get("status") or "").lower()
+                if mapped_status in {"queued", "running", "dispatching", "pending"}:
+                    active_refs.append(ref)
+            if not active_refs:
+                return
+            refs = active_refs
+            await asyncio.sleep(max(1, int(self.manager.cfg.scheduler.stage_poll_interval_seconds or 5)))
+        if refs:
+            ref = refs[0]
+            raise ValidationError(f"旧下游任务仍在运行，不能安全继续: {ref.get('service')}:{ref.get('task_id')}")
+
+    async def ensure_child_refs_inactive(self, refs: list[dict[str, str]], token: str | None) -> None:
+        await self.wait_child_refs_inactive(list(refs), token)
+
+    async def delete_child_task(self, *, service: str, project_id: str | None, task_id: str, token: str | None) -> dict[str, Any]:
+        return await self.gateway.delete_task(service, project_id=project_id, task_id=task_id, token=token)
+
+    async def delete_child_refs(self, db: Session, task: BinarySecurityTask, refs: list[dict[str, str]], token: str | None) -> int:
+        for ref in refs:
+            event_item = self.manager._event_item_for_downstream_ref(db, task, ref)
+            self._record_event(
+                db,
+                task,
+                "child_task_delete_requested",
+                f"请求删除下游任务: {ref['service']}:{ref['task_id']}",
+                stage_name=ref.get("stage_name"),
+                item=event_item,
+                payload={**ref, "operation": "delete"},
+            )
+
+        async def verify_deleted(ref: dict[str, str]) -> tuple[bool, dict[str, object]]:
+            verification: dict[str, object] = {
+                "verified_absent": False,
+                "verified_deleted": False,
+                "verification_error": None,
+            }
+            service = str(ref.get("service") or "").strip()
+            task_id = str(ref.get("task_id") or "").strip()
+            if not task_id:
+                return False, verification
+            try:
+                if service == "entry_analyse":
+                    await self.get_child_task(service=service, project_id=None, task_id=task_id, token=token)
+                else:
+                    return False, verification
+            except NotFoundError:
+                verification["verified_absent"] = True
+                return True, verification
+            except Exception as verify_exc:
+                verification["verification_error"] = str(verify_exc)
+                return False, verification
+            return False, verification
+
+        async def do_delete(ref: dict[str, str]) -> bool:
+            await self.delete_child_task(
+                service=str(ref["service"]),
+                project_id=str(ref.get("project_id") or "") or None,
+                task_id=str(ref["task_id"]),
+                token=token,
+            )
+            return True
+
+        db.commit()
+        results = await self.manager._run_with_limits(
+            refs,
+            do_delete,
+            concurrency=self.manager.cfg.scheduler.downstream_action_concurrency,
+            timeout_seconds=self.manager.cfg.scheduler.downstream_request_timeout_seconds,
+        )
+        success_count = 0
+        for ref, ok, exc in results:
+            event_item = self.manager._event_item_for_downstream_ref(db, task, ref)
+            if exc is None and ok:
+                success_count += 1
+                self._record_downstream_item_disposition(
+                    db,
+                    task,
+                    event_item,
+                    event_type="child_task_delete_succeeded",
+                    message=f"下游子任务已删除: {ref['service']}:{ref['task_id']}",
+                    payload={**ref, "operation": "delete"},
+                )
+                continue
+            if isinstance(exc, ConflictError):
+                raise ValidationError(f"旧下游任务仍在运行，不能安全删除: {ref['service']}:{ref['task_id']}") from exc
+            verified_ok, verification = await verify_deleted(ref)
+            if verified_ok:
+                success_count += 1
+                self._record_downstream_item_disposition(
+                    db,
+                    task,
+                    event_item,
+                    event_type="child_task_delete_verified_absent",
+                    message=f"下游删除报错但已确认不存在: {ref['service']}:{ref['task_id']}",
+                    level="warning",
+                    payload={**ref, **verification, "operation": "delete", "error": str(exc)},
+                )
+                self._record_downstream_item_disposition(
+                    db,
+                    task,
+                    event_item,
+                    event_type="child_task_delete_failed_but_ignored",
+                    message=f"下游删除报错但已降级忽略: {ref['service']}:{ref['task_id']}",
+                    level="warning",
+                    payload={**ref, **verification, "operation": "delete", "error": str(exc)},
+                )
+                continue
+            self._record_event(
+                db,
+                task,
+                "child_task_delete_failed_blocking",
+                f"下游删除失败: {ref['service']}:{ref['task_id']} - {exc}",
+                stage_name=ref.get("stage_name"),
+                item=event_item,
+                level="warning",
+                payload={**ref, **verification, "operation": "delete", "error": str(exc)},
+            )
+            raise ValidationError(str(exc))
+        db.commit()
+        return success_count
+
+    async def cleanup_child_refs(self, db: Session, task: BinarySecurityTask, refs: list[dict[str, str]], token: str | None) -> int:
+        await self.cancel_child_refs(db, task, refs, token)
+        await self.ensure_child_refs_inactive(refs, token)
+        return await self.delete_child_refs(db, task, refs, token)
+
+
+def get_downstream_task_controller(manager: Any) -> DownstreamTaskController:
+    controller = getattr(manager, "_downstream_task_controller", None)
+    if controller is None:
+        controller = DownstreamTaskController(manager)
+        setattr(manager, "_downstream_task_controller", controller)
+    return controller
