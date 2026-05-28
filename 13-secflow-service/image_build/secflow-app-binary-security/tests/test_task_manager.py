@@ -473,12 +473,16 @@ class _AsyncFirmwareUnpackerClientStub:
 
 
 class _AsyncDataflowVulnScannerClientStub:
-    def __init__(self, *, listed=None, fetched=None, artifacts=None, fail_on_create=False):
+    def __init__(self, *, listed=None, fetched=None, artifacts=None, fail_on_create=False, retry_result=None, delete_result=None):
         self.listed = listed or []
         self.fetched = fetched or {}
         self.artifacts = artifacts or {"workspace_root": "/tmp"}
         self.fail_on_create = fail_on_create
+        self.retry_result = retry_result or {"task_id": "dfvs-retried", "status": "dispatching"}
+        self.delete_result = delete_result or {"success": True}
         self.created = 0
+        self.deleted: list[str] = []
+        self.retried: list[str] = []
 
     async def list_tasks(self, *args, **kwargs):
         del args, kwargs
@@ -498,6 +502,22 @@ class _AsyncDataflowVulnScannerClientStub:
         if self.fail_on_create:
             raise AssertionError("create_task should not be called")
         return {"task_id": "dfvs-created"}
+
+    async def retry_task(self, task_id, token):
+        del token
+        self.retried.append(task_id)
+        result = self.retry_result
+        if isinstance(result, Exception):
+            raise result
+        return dict(result)
+
+    async def delete_task(self, task_id, token):
+        del token
+        self.deleted.append(task_id)
+        result = self.delete_result
+        if isinstance(result, Exception):
+            raise result
+        return dict(result)
 
 
 class TaskManagerTests(unittest.TestCase):
@@ -980,7 +1000,6 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("si-df", seeded.input_ref["upstream_item_id"])
 
     def test_reclaim_stale_streaming_stage_items_resets_dispatching_vuln_item(self):
-        original_loader = self.manager._load_service_config
         self.manager._load_service_config = lambda db: SimpleNamespace(dispatch_timeout_seconds=60)
         task = BinarySecurityTask(
             id="t1",
@@ -1012,17 +1031,13 @@ class TaskManagerTests(unittest.TestCase):
         )
         db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
 
-        try:
-            reclaimed = self.manager._reclaim_stale_streaming_stage_items_locked(db)
-        finally:
-            self.manager._load_service_config = original_loader
+        reclaimed = self.manager._reclaim_stale_streaming_stage_items_locked(db)
 
         self.assertTrue(reclaimed)
         self.assertEqual("pending", item.status)
         self.assertTrue(any(event.event_type == "streaming_stage_item_dispatch_reclaimed" for event in db.events))
 
     def test_reclaim_stale_streaming_stage_items_skips_item_with_downstream_task(self):
-        original_loader = self.manager._load_service_config
         self.manager._load_service_config = lambda db: SimpleNamespace(dispatch_timeout_seconds=60)
         task = BinarySecurityTask(
             id="t1",
@@ -1055,10 +1070,7 @@ class TaskManagerTests(unittest.TestCase):
         )
         db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
 
-        try:
-            reclaimed = self.manager._reclaim_stale_streaming_stage_items_locked(db)
-        finally:
-            self.manager._load_service_config = original_loader
+        reclaimed = self.manager._reclaim_stale_streaming_stage_items_locked(db)
 
         self.assertFalse(reclaimed)
         self.assertEqual("dispatching", item.status)
@@ -7307,56 +7319,6 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("already_running", result["outcome"])
         self.assertEqual("dfa-1", result["payload"]["task_id"])
         self.assertEqual("running", result["payload"]["status"])
-
-    def test_control_existing_vuln_dispatching_task_reuses_without_retry(self):
-        task = BinarySecurityTask(
-            id="task1",
-            project_id="p1",
-            name="n",
-            status="running",
-            current_stage="vuln_scan",
-            task_type=TASK_TYPE_BINARY_MODULE,
-            firmware_source="project_filesystem",
-            firmware_path="/fw",
-            output_root="/o",
-            workspace_root="/w",
-        )
-        item = BinarySecurityStageItem(
-            id="item1",
-            task_id="task1",
-            project_id="p1",
-            stage_name="vuln_scan",
-            item_key="entry-1",
-            item_name="entry",
-            parent_key="mod-1",
-            downstream_service="dataflow_vuln_scanner",
-            downstream_task_id="dvs-1",
-            status="running",
-        )
-
-        async def fake_fetch(*args, **kwargs):
-            del args, kwargs
-            return {"task_id": "dvs-1", "status": "dispatching"}
-
-        async def fake_retry(*args, **kwargs):
-            raise AssertionError("retry should not be called for active dispatching vuln task")
-
-        with (
-            patch.object(self.manager, "_fetch_downstream_task_payload", side_effect=fake_fetch),
-            patch.object(self.manager, "_invoke_existing_downstream_retry", side_effect=fake_retry),
-        ):
-            result = asyncio.run(
-                self.manager._control_existing_downstream_task(
-                    "vuln_scan",
-                    task=task,
-                    item=item,
-                    token="tok",
-                )
-            )
-
-        self.assertEqual("already_running", result["outcome"])
-        self.assertEqual("dvs-1", result["payload"]["task_id"])
-        self.assertEqual("dispatching", result["payload"]["status"])
 
     def test_control_existing_downstream_task_marks_transport_error_as_deferred(self):
         task = BinarySecurityTask(
@@ -14817,6 +14779,158 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("success", result["status"])
         self.assertEqual(1, len(create_calls))
         self.assertEqual("/data/files/p1/app/secflow-app-binary-security/5972610d669142ce/output/dataflow-analyse/entry-1", create_calls[0]["data_flow_path"])
+
+    def test_run_vuln_item_retry_attaches_active_downstream_without_retry(self):
+        task = BinarySecurityTask(
+            id="t1", name="scan-task", project_id="p1", workspace_root="/tmp/ws", output_root="/tmp/out", firmware_source="project_filesystem", firmware_path="/tmp/fw",
+        )
+        stage_run = BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="vuln_scan", sequence_no=4, status="running")
+        item = BinarySecurityStageItem(
+            id="si1", task_id="t1", project_id="p1", stage_name="vuln_scan", item_key="entry-1", item_name="main", parent_key="module-1",
+            downstream_service="dataflow_vuln_scanner", downstream_task_id="dfvs-live", status="failed", output_ref={},
+        )
+        dataflow_result = {
+            "entry_key": "entry-1", "function_name": "main", "module_key": "module-1", "dataflow_dir": "/tmp/flow-dir",
+            "source_dir": "/tmp/src", "module_name": "module-1", "source_root_path": "/tmp/src", "module_input_path": "/tmp/src/module-1", "source_file": "main.c",
+        }
+        fake_session = _ModelAwareDb()
+        client = _AsyncDataflowVulnScannerClientStub()
+
+        async def fake_poll(*args, **kwargs):
+            del args, kwargs
+            return "success", {"task_id": "dfvs-live", "status": "completed"}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(task_manager_module, "get_dataflow_vuln_scanner_client", return_value=client),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_active_downstream_payload", return_value=None),
+            patch.object(self.manager, "_find_reusable_vuln_payload", return_value=None),
+            patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp/archive"), None)),
+            patch.object(self.manager, "_fetch_downstream_task_payload", return_value={"task_id": "dfvs-live", "status": "running"}),
+        ):
+            result = asyncio.run(self.manager._run_vuln_item(task, stage_run, dataflow_result, token="tok", retrying=True))
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual([], client.retried)
+        self.assertEqual([], client.deleted)
+        self.assertEqual(0, client.created)
+        self.assertEqual("dfvs-live", item.downstream_task_id)
+
+    def test_run_vuln_item_retry_retries_terminal_downstream_without_recreate(self):
+        task = BinarySecurityTask(
+            id="t1", name="scan-task", project_id="p1", workspace_root="/tmp/ws", output_root="/tmp/out", firmware_source="project_filesystem", firmware_path="/tmp/fw",
+        )
+        stage_run = BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="vuln_scan", sequence_no=4, status="running")
+        item = BinarySecurityStageItem(
+            id="si1", task_id="t1", project_id="p1", stage_name="vuln_scan", item_key="entry-1", item_name="main", parent_key="module-1",
+            downstream_service="dataflow_vuln_scanner", downstream_task_id="dfvs-old", status="failed", output_ref={},
+        )
+        dataflow_result = {
+            "entry_key": "entry-1", "function_name": "main", "module_key": "module-1", "dataflow_dir": "/tmp/flow-dir",
+            "source_dir": "/tmp/src", "module_name": "module-1", "source_root_path": "/tmp/src", "module_input_path": "/tmp/src/module-1", "source_file": "main.c",
+        }
+        fake_session = _ModelAwareDb()
+        client = _AsyncDataflowVulnScannerClientStub(retry_result={"task_id": "dfvs-retried", "status": "dispatching"})
+
+        async def fake_poll(*args, **kwargs):
+            del args, kwargs
+            return "success", {"task_id": "dfvs-retried", "status": "success"}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(task_manager_module, "get_dataflow_vuln_scanner_client", return_value=client),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_active_downstream_payload", return_value=None),
+            patch.object(self.manager, "_find_reusable_vuln_payload", return_value=None),
+            patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp/archive"), None)),
+            patch.object(self.manager, "_fetch_downstream_task_payload", return_value={"task_id": "dfvs-old", "status": "success"}),
+        ):
+            result = asyncio.run(self.manager._run_vuln_item(task, stage_run, dataflow_result, token="tok", retrying=True))
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual(["dfvs-old"], client.retried)
+        self.assertEqual([], client.deleted)
+        self.assertEqual(0, client.created)
+        self.assertEqual("dfvs-retried", item.downstream_task_id)
+
+    def test_run_vuln_item_retry_recreates_when_target_missing(self):
+        task = BinarySecurityTask(
+            id="t1", name="scan-task", project_id="p1", workspace_root="/tmp/ws", output_root="/tmp/out", firmware_source="project_filesystem", firmware_path="/tmp/fw",
+        )
+        stage_run = BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="vuln_scan", sequence_no=4, status="running")
+        item = BinarySecurityStageItem(
+            id="si1", task_id="t1", project_id="p1", stage_name="vuln_scan", item_key="entry-1", item_name="main", parent_key="module-1",
+            downstream_service="dataflow_vuln_scanner", downstream_task_id="dfvs-old", status="failed", output_ref={},
+        )
+        dataflow_result = {
+            "entry_key": "entry-1", "function_name": "main", "module_key": "module-1", "dataflow_dir": "/tmp/flow-dir",
+            "source_dir": "/tmp/src", "module_name": "module-1", "source_root_path": "/tmp/src", "module_input_path": "/tmp/src/module-1", "source_file": "main.c",
+        }
+        fake_session = _ModelAwareDb()
+        client = _AsyncDataflowVulnScannerClientStub(retry_result=NotFoundError("missing"))
+
+        async def fake_poll(*args, **kwargs):
+            del args, kwargs
+            return "success", {"task_id": "dfvs-created", "status": "success"}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(task_manager_module, "get_dataflow_vuln_scanner_client", return_value=client),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_active_downstream_payload", return_value=None),
+            patch.object(self.manager, "_find_reusable_vuln_payload", return_value=None),
+            patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp/archive"), None)),
+            patch.object(self.manager, "_fetch_downstream_task_payload", side_effect=NotFoundError("missing")),
+        ):
+            result = asyncio.run(self.manager._run_vuln_item(task, stage_run, dataflow_result, token="tok", retrying=True))
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual(["dfvs-old"], client.retried)
+        self.assertEqual(["dfvs-old"], client.deleted)
+        self.assertEqual(1, client.created)
+        self.assertEqual("dfvs-created", item.downstream_task_id)
+
+    def test_run_vuln_item_retry_recreates_when_retry_not_supported(self):
+        task = BinarySecurityTask(
+            id="t1", name="scan-task", project_id="p1", workspace_root="/tmp/ws", output_root="/tmp/out", firmware_source="project_filesystem", firmware_path="/tmp/fw",
+        )
+        stage_run = BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="vuln_scan", sequence_no=4, status="running")
+        item = BinarySecurityStageItem(
+            id="si1", task_id="t1", project_id="p1", stage_name="vuln_scan", item_key="entry-1", item_name="main", parent_key="module-1",
+            downstream_service="dataflow_vuln_scanner", downstream_task_id="dfvs-old", status="failed", output_ref={},
+        )
+        dataflow_result = {
+            "entry_key": "entry-1", "function_name": "main", "module_key": "module-1", "dataflow_dir": "/tmp/flow-dir",
+            "source_dir": "/tmp/src", "module_name": "module-1", "source_root_path": "/tmp/src", "module_input_path": "/tmp/src/module-1", "source_file": "main.c",
+        }
+        fake_session = _ModelAwareDb()
+        client = _AsyncDataflowVulnScannerClientStub(retry_result=ValidationError("不支持重试"))
+
+        async def fake_poll(*args, **kwargs):
+            del args, kwargs
+            return "success", {"task_id": "dfvs-created", "status": "success"}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(task_manager_module, "get_dataflow_vuln_scanner_client", return_value=client),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_active_downstream_payload", return_value=None),
+            patch.object(self.manager, "_find_reusable_vuln_payload", return_value=None),
+            patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp/archive"), None)),
+            patch.object(self.manager, "_fetch_downstream_task_payload", return_value={"task_id": "dfvs-old", "status": "failed"}),
+        ):
+            result = asyncio.run(self.manager._run_vuln_item(task, stage_run, dataflow_result, token="tok", retrying=True))
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual(["dfvs-old"], client.retried)
+        self.assertEqual(["dfvs-old"], client.deleted)
+        self.assertEqual(1, client.created)
+        self.assertEqual("dfvs-created", item.downstream_task_id)
 
     def test_validate_dataflow_output_contract_requires_dataflow_dir(self):
         payload = {

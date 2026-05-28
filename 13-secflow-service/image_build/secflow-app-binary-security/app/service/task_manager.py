@@ -12361,7 +12361,7 @@ class TaskManager:
         item: BinarySecurityStageItem,
         token: str | None,
     ) -> dict[str, Any]:
-        if stage_name == "dataflow_analysis" and self._has_retryable_downstream_task(item):
+        if stage_name in {"dataflow_analysis", "vuln_scan"} and self._has_retryable_downstream_task(item):
             try:
                 payload = await self._fetch_downstream_task_payload(task, item, token or "")
             except NotFoundError:
@@ -12440,9 +12440,19 @@ class TaskManager:
 
         mapped_status = self._map_downstream_status(str(payload.get("status") or ""))
         if mapped_status in {"queued", "running"}:
-            return {**result, "outcome": "already_running", "payload": payload}
+            return {
+                **result,
+                "outcome": "already_running",
+                "payload": payload,
+                "retry_outcome": result.get("outcome"),
+            }
         if mapped_status in {"success", "partial_success", "failed", "cancelled", "downstream_missing"}:
-            return {**result, "outcome": "already_terminal", "payload": payload}
+            return {
+                **result,
+                "outcome": "already_terminal",
+                "payload": payload,
+                "retry_outcome": result.get("outcome"),
+            }
         return {**result, "payload": payload}
 
     def _record_downstream_item_disposition(
@@ -12614,6 +12624,160 @@ class TaskManager:
         if not str(item.downstream_task_id or "").strip():
             return False
         return str(item.status or "").strip().lower() != "downstream_missing"
+
+    def _is_vuln_retry_recreate_outcome(self, control: dict[str, Any]) -> bool:
+        outcome = str(control.get("retry_outcome") or control.get("outcome") or "").strip()
+        if outcome == "not_found":
+            return True
+        if outcome != "invalid_transition":
+            return False
+        if control.get("http_status") == 405:
+            return True
+        error_message = str(control.get("error_message") or "").lower()
+        recreate_tokens = (
+            "not support",
+            "unsupported",
+            "not allowed",
+            "cannot be retried",
+            "cannot retry",
+            "retry not supported",
+            "invalid status",
+            "invalid transition",
+            "terminal",
+            "终态",
+            "重试",
+            "不支持重试",
+            "无法重试",
+            "不能重试",
+            "非法状态",
+            "状态迁移",
+        )
+        return any(token in error_message for token in recreate_tokens)
+
+    async def _recreate_vuln_downstream_task(
+        self,
+        session: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        dataflow_result: dict[str, Any],
+        token: str | None,
+        *,
+        control: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        old_task_id = str(item.downstream_task_id or "").strip() or None
+        error_message = str(control.get("error_message") or "").strip() if isinstance(control, dict) else ""
+        http_status = control.get("http_status") if isinstance(control, dict) else None
+        outcome = str(control.get("outcome") or "").strip() if isinstance(control, dict) else ""
+
+        if old_task_id:
+            self._record_downstream_item_disposition(
+                session,
+                task,
+                item,
+                event_type="downstream_retry_fallback_delete_requested",
+                message=f"下游重试不可复用，准备删除旧下游任务并重建: {item.downstream_service}:{old_task_id}",
+                level="warning",
+                payload={
+                    "stage_name": item.stage_name,
+                    "old_downstream_task_id": old_task_id,
+                    "new_downstream_task_id": None,
+                    "control_outcome": outcome or None,
+                    "http_status": http_status,
+                    "error": error_message or None,
+                },
+            )
+            session.commit()
+            try:
+                await get_dataflow_vuln_scanner_client().delete_task(old_task_id, token or "")
+            except NotFoundError:
+                delete_status = 404
+            except Exception as exc:
+                payload_error = self._extract_downstream_error_text(exc) or str(exc)
+                self._record_downstream_item_disposition(
+                    session,
+                    task,
+                    item,
+                    event_type="downstream_retry_fallback_delete_failed",
+                    message=(
+                        f"删除旧下游任务时通信异常，暂不重建: {item.downstream_service}:{old_task_id}"
+                        if self._is_retryable_downstream_transport_error(exc)
+                        else f"删除旧下游任务失败，无法继续重建: {item.downstream_service}:{old_task_id}"
+                    ),
+                    level="warning",
+                    payload={
+                        "stage_name": item.stage_name,
+                        "old_downstream_task_id": old_task_id,
+                        "new_downstream_task_id": None,
+                        "control_outcome": outcome or None,
+                        "http_status": self._extract_http_status_from_exception(exc),
+                        "error": payload_error,
+                    },
+                )
+                session.commit()
+                if self._is_retryable_downstream_transport_error(exc):
+                    raise UpstreamError(payload_error)
+                raise ValidationError(payload_error)
+            else:
+                delete_status = 200
+
+            self._record_downstream_item_disposition(
+                session,
+                task,
+                item,
+                event_type="downstream_retry_fallback_delete_succeeded",
+                message=(
+                    f"旧下游任务已删除，继续重建: {item.downstream_service}:{old_task_id}"
+                    if delete_status == 200 else
+                    f"旧下游任务已不存在，继续重建: {item.downstream_service}:{old_task_id}"
+                ),
+                payload={
+                    "stage_name": item.stage_name,
+                    "old_downstream_task_id": old_task_id,
+                    "new_downstream_task_id": None,
+                    "control_outcome": outcome or None,
+                    "http_status": delete_status,
+                    "error": error_message or None,
+                },
+            )
+            session.commit()
+
+        dataflow_input_dir = self._resolve_vuln_scan_dataflow_input_dir(dataflow_result)
+        source_dir = str(dataflow_result.get("source_root_path") or dataflow_result.get("source_dir") or "")
+        if not dataflow_input_dir:
+            raise ValidationError("数据流漏洞挖掘输入缺少 data_flow_root/dataflow_dir")
+        if not source_dir:
+            raise ValidationError("数据流漏洞挖掘输入缺少 source_dir")
+        created = await get_dataflow_vuln_scanner_client().create_task(
+            task.project_id,
+            f"{task.name}-{dataflow_result['function_name']}-scan",
+            token or "",
+            dataflow_input_dir,
+            source_dir,
+            _downstream_origin_payload(task, item),
+        )
+        new_task_id = str(created.get("task_id") or created.get("id") or "").strip() or None
+        item.downstream_task_id = new_task_id or item.downstream_task_id
+        item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
+        item.started_at = item.started_at or _now()
+        item.finished_at = None
+        item.error_message = None
+        self._record_downstream_item_disposition(
+            session,
+            task,
+            item,
+            event_type="downstream_retry_fallback_recreated",
+            message=f"已重建新的下游任务: {item.downstream_service}:{new_task_id or '-'}",
+            payload={
+                "stage_name": item.stage_name,
+                "old_downstream_task_id": old_task_id,
+                "new_downstream_task_id": new_task_id,
+                "control_outcome": outcome or None,
+                "http_status": 200,
+                "error": error_message or None,
+            },
+        )
+        session.commit()
+        return created
 
     async def _active_downstream_payload(
         self,
@@ -17076,17 +17240,30 @@ class TaskManager:
                         )
                         created = None
                     elif outcome == "already_terminal":
-                        payload = dict(control.get("payload") or {})
-                        item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
-                        session.commit()
-                        status = self._status_from_downstream_payload(payload, success_statuses={"success", "succeeded", "completed"})
-                        created = None
-                    elif outcome == "not_found":
-                        item.status = "downstream_missing"
-                        item.error_message = str(control.get("error_message") or "下游子任务不存在")
-                        item.finished_at = _now()
-                        session.commit()
-                        return {"status": "downstream_missing", "error": item.error_message, "item": dataflow_result}
+                        if stage_run.stage_name == "vuln_scan" and self._is_vuln_retry_recreate_outcome(control):
+                            created = await self._recreate_vuln_downstream_task(
+                                session,
+                                task,
+                                item,
+                                dataflow_result,
+                                token,
+                                control=control,
+                            )
+                        else:
+                            payload = dict(control.get("payload") or {})
+                            item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
+                            session.commit()
+                            status = self._status_from_downstream_payload(payload, success_statuses={"success", "succeeded", "completed"})
+                            created = None
+                    elif stage_run.stage_name == "vuln_scan" and self._is_vuln_retry_recreate_outcome(control):
+                        created = await self._recreate_vuln_downstream_task(
+                            session,
+                            task,
+                            item,
+                            dataflow_result,
+                            token,
+                            control=control,
+                        )
                     elif outcome == "transport_error":
                         return self._defer_item_after_downstream_transport_error(
                             session,
@@ -17096,6 +17273,12 @@ class TaskManager:
                             exc=UpstreamError(str(control.get("error_message") or "下游通信异常")),
                             response_item=dataflow_result,
                         )
+                    elif outcome == "not_found":
+                        item.status = "downstream_missing"
+                        item.error_message = str(control.get("error_message") or "下游子任务不存在")
+                        item.finished_at = _now()
+                        session.commit()
+                        return {"status": "downstream_missing", "error": item.error_message, "item": dataflow_result}
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
