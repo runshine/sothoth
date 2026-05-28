@@ -48,6 +48,7 @@ jobs:
           DOCKER_BUILDKIT=0 docker build \
             -f 100-agent-service-image/02-secflow-agent-service-tetragon-monitor/Dockerfile \
             --build-arg TARGETARCH=${{ matrix.arch }} \
+            --build-arg SECFLOW_BUILD_VERSION=${{ steps.date.outputs.date_tag }} \
             -t ghcr.io/runshine/secflow-agent-service-tetragon-monitor:latest-${{ matrix.arch }} \
             -t ghcr.io/runshine/secflow-agent-service-tetragon-monitor:${{ steps.date.outputs.date_tag }}-${{ matrix.arch }} \
             100-agent-service-image/02-secflow-agent-service-tetragon-monitor/
