@@ -158,6 +158,17 @@ async def get_current_context(project_id: str, authorization: Optional[str] = He
     return TokenUser(**user)
 
 
+async def get_current_user_context(authorization: Optional[str] = Header(None)) -> TokenUser:
+    if not authorization:
+        raise UnauthorizedError("缺少Authorization头")
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise UnauthorizedError("Authorization格式错误，应为 Bearer <token>")
+    token = parts[1]
+    user = await get_auth_service().validate_token(token)
+    return TokenUser(**user)
+
+
 @router.get("/projects/{project_id}/llm-providers", response_model=LlmProviderListResponse)
 async def list_llm_providers(
     project_id: str,
@@ -358,7 +369,7 @@ async def get_pi_cluster_capacity(
 
 @router.get("/pi-cluster", response_model=PiClusterCapacityResponse)
 async def get_global_pi_cluster_capacity(
-    _: TokenUser = Depends(get_current_context),
+    _: TokenUser = Depends(get_current_user_context),
     db: Session = Depends(get_db),
 ):
     snapshot = await get_pi_cluster_monitor().refresh()
