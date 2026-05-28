@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import functools
 import hashlib
 import logging
 import threading
 import time
-from datetime import datetime, timedelta
-import json
+from datetime import timedelta
 from typing import Any, Dict, List
 
 from fastapi import HTTPException, status
@@ -34,12 +32,11 @@ from app.schemas import (
 )
 from app.services.dataflow_worker_client import DataflowWorkerError, get_dataflow_worker_client
 from app.services.execution_service import get_execution_service
-from app.services.runtime_config_service import get_runtime_config_service
 from app.time_utils import now_local
 
 logger = logging.getLogger(__name__)
 
-ACTIVE_JOB_STATUSES = {"queued", "pending", "running"}
+ACTIVE_JOB_STATUSES = {"queued", "pending", "running", "cancel_requested", "delete_requested"}
 TERMINAL_EXECUTION_STATUSES = {"succeeded", "failed", "cancelled"}
 
 
@@ -51,13 +48,8 @@ class SchedulerService:
         self._worker_status = "active"
         self._heartbeat_published = False
         self._cluster_capacity_summary_snapshot: WorkerClusterCapacitySummaryResponse | None = None
-        self._cluster_capacity_summary_snapshot_at: datetime | None = None
-        self._cluster_capacity_summary_refreshing = False
+        self._cluster_capacity_summary_snapshot_at = None
         self._cluster_capacity_summary_lock = threading.Lock()
-        self._cluster_capacity_summary_hits_total = 0
-        self._cluster_capacity_summary_misses_total = 0
-        self._cluster_capacity_summary_refresh_failures_total = 0
-        self._cluster_capacity_summary_last_refresh_duration_seconds = 0.0
 
     @property
     def role(self) -> str:
@@ -94,8 +86,7 @@ class SchedulerService:
 
     @property
     def capacity(self) -> int:
-        scheduler_cfg = self.runtime_config.get("scheduler") or {}
-        return int(scheduler_cfg.get("worker_capacity") or get_config().scheduler.worker_capacity or 0)
+        return get_config().scheduler.worker_capacity
 
     @property
     def has_unlimited_capacity(self) -> bool:
@@ -127,8 +118,6 @@ class SchedulerService:
             self._tasks.append(asyncio.create_task(self._manager_dispatch_loop(), name="scheduler-manager-dispatch"))
         if self.runs_manager or self.runs_worker:
             self._tasks.append(asyncio.create_task(self._cleanup_loop(), name="scheduler-cleanup"))
-            await asyncio.to_thread(functools.partial(self._refresh_cluster_capacity_summary_snapshot, force=True))
-            self._tasks.append(asyncio.create_task(self._cluster_capacity_summary_loop(), name="scheduler-cluster-capacity-summary"))
         logger.info("scheduler started role=%s worker_enabled=%s capacity=%s", self.role, self.runs_worker, self.capacity)
 
     async def stop(self) -> None:
@@ -169,58 +158,10 @@ class SchedulerService:
             "worker_enabled": "true" if self.runs_worker else "false",
         }
 
-    @property
-    def runtime_config(self) -> dict[str, Any]:
-        db = get_db_session()
-        try:
-            return get_runtime_config_service().get_config(db)
-        finally:
-            db.close()
-
-    @property
-    def reservation_lease_seconds(self) -> int:
-        return max(5, int((self.runtime_config.get("scheduler") or {}).get("reservation_lease_seconds") or get_config().scheduler.reservation_lease_seconds or 30))
-
-    @property
-    def worker_queue_depth(self) -> int:
-        return max(0, int((self.runtime_config.get("scheduler") or {}).get("worker_queue_depth") or get_config().scheduler.worker_queue_depth or 0))
-
-    @property
-    def dispatch_batch_size(self) -> int:
-        return max(1, int((self.runtime_config.get("scheduler") or {}).get("dispatch_batch_size") or get_config().scheduler.dispatch_batch_size or 8))
-
-    @property
-    def requeue_stuck_dispatch_after_seconds(self) -> int:
-        return max(10, int((self.runtime_config.get("scheduler") or {}).get("requeue_stuck_dispatch_after_seconds") or get_config().scheduler.requeue_stuck_dispatch_after_seconds or 60))
-
-    @property
-    def cluster_capacity_summary_refresh_interval_seconds(self) -> int:
-        scheduler_cfg = self.runtime_config.get("scheduler") or {}
-        return max(2, int(scheduler_cfg.get("cluster_capacity_summary_refresh_interval_seconds") or 5))
-
-    @property
-    def cluster_capacity_summary_stale_after_seconds(self) -> int:
-        scheduler_cfg = self.runtime_config.get("scheduler") or {}
-        return max(
-            self.cluster_capacity_summary_refresh_interval_seconds,
-            int(scheduler_cfg.get("cluster_capacity_summary_stale_after_seconds") or 15),
-        )
-
-    def advertise_url(self) -> str:
-        runtime_cfg = self.runtime_config.get("dataflow_worker") or {}
-        template = str(runtime_cfg.get("advertise_url_template") or get_config().dataflow_worker.advertise_url_template or "").strip()
-        if template:
-            return template.format(
-                pod_id=self.pod_id,
-                host_name=self.host_name,
-                pod_namespace=get_config().scheduler.pod_namespace,
-                headless_service_name=get_config().scheduler.worker_headless_service_name,
-            )
-        return (
-            f"http://{self.pod_id}."
-            f"{get_config().scheduler.worker_headless_service_name}."
-            f"{get_config().scheduler.pod_namespace}.svc.cluster.local:8080"
-        )
+    def configured_worker_urls(self) -> list[str]:
+        cfg = get_config().dataflow_worker
+        workers = [url.rstrip("/") for url in (cfg.worker_urls or []) if url and url.strip()]
+        return workers or [cfg.base_url.rstrip("/")]
 
     def local_running_count(self) -> int:
         return len(self._running_tasks)
@@ -238,7 +179,7 @@ class SchedulerService:
     def _cluster_capacity_base(
         self,
         db: Session,
-    ) -> tuple[list[SchedulerWorker], datetime, dict[str, int], int]:
+    ) -> tuple[list[SchedulerWorker], Any, dict[str, int], int]:
         workers = db.query(SchedulerWorker).order_by(SchedulerWorker.last_heartbeat_at.desc(), SchedulerWorker.pod_id.asc()).all()
         worker_timeout_at = now_local() - timedelta(seconds=get_config().scheduler.worker_timeout_seconds)
         reservation_counts = self._reservation_counts(db)
@@ -263,6 +204,17 @@ class SchedulerService:
                 WorkflowExecution.status.in_(tuple(ACTIVE_JOB_STATUSES)),
                 WorkflowExecution.dispatch_status.in_(tuple(ACTIVE_JOB_STATUSES)),
             ),
+        )
+
+    def _running_count_for_worker(self, db: Session, pod_id: str) -> int:
+        return int(
+            db.query(WorkflowExecution)
+            .filter(
+                WorkflowExecution.owner_pod_id == pod_id,
+                self._active_execution_filter(),
+            )
+            .count()
+            or 0
         )
 
     def _compute_cluster_capacity_summary(self, db: Session) -> WorkerClusterCapacitySummaryResponse:
@@ -326,7 +278,7 @@ class SchedulerService:
             if self._cluster_capacity_summary_snapshot_at is None:
                 return True
             age = (now_local() - self._cluster_capacity_summary_snapshot_at).total_seconds()
-            return age >= self.cluster_capacity_summary_stale_after_seconds
+            return age >= 30
 
     def _set_cluster_capacity_summary_snapshot(
         self,
@@ -338,91 +290,28 @@ class SchedulerService:
             self._cluster_capacity_summary_snapshot_at = now_local()
         return copied.model_copy(deep=True)
 
-    def cluster_capacity_summary_snapshot_metrics(self) -> dict[str, float]:
-        with self._cluster_capacity_summary_lock:
-            age_seconds = (
-                max((now_local() - self._cluster_capacity_summary_snapshot_at).total_seconds(), 0.0)
-                if self._cluster_capacity_summary_snapshot_at is not None
-                else -1.0
-            )
-            stale = 1.0 if self._cluster_capacity_summary_snapshot_at is not None and age_seconds >= self.cluster_capacity_summary_stale_after_seconds else 0.0
-            return {
-                "hits_total": float(self._cluster_capacity_summary_hits_total),
-                "misses_total": float(self._cluster_capacity_summary_misses_total),
-                "refresh_failures_total": float(self._cluster_capacity_summary_refresh_failures_total),
-                "last_refresh_duration_seconds": float(self._cluster_capacity_summary_last_refresh_duration_seconds or 0.0),
-                "age_seconds": age_seconds,
-                "available": 1.0 if self._cluster_capacity_summary_snapshot is not None else 0.0,
-                "stale": stale,
-                "refreshing": 1.0 if self._cluster_capacity_summary_refreshing else 0.0,
-            }
-
     def _refresh_cluster_capacity_summary_snapshot(
         self,
-        db: Session | None = None,
-        *,
-        force: bool = False,
-    ) -> WorkerClusterCapacitySummaryResponse | None:
-        started = time.perf_counter()
-        with self._cluster_capacity_summary_lock:
-            if self._cluster_capacity_summary_refreshing:
-                snapshot = self._cluster_capacity_summary_snapshot
-                return snapshot.model_copy(deep=True) if snapshot is not None else None
-            if not force and self._cluster_capacity_summary_snapshot_at is not None:
-                age = (now_local() - self._cluster_capacity_summary_snapshot_at).total_seconds()
-                if age < self.cluster_capacity_summary_refresh_interval_seconds:
-                    snapshot = self._cluster_capacity_summary_snapshot
-                    return snapshot.model_copy(deep=True) if snapshot is not None else None
-            self._cluster_capacity_summary_refreshing = True
-
-        owns_db = db is None
-        session = db or get_db_session()
-        try:
-            snapshot = self._compute_cluster_capacity_summary(session)
-            stored = self._set_cluster_capacity_summary_snapshot(snapshot)
-            with self._cluster_capacity_summary_lock:
-                self._cluster_capacity_summary_last_refresh_duration_seconds = max(time.perf_counter() - started, 0.0)
-            return stored
-        except Exception:
-            logger.exception("failed to refresh cluster capacity summary snapshot")
-            with self._cluster_capacity_summary_lock:
-                self._cluster_capacity_summary_refresh_failures_total += 1
-                self._cluster_capacity_summary_last_refresh_duration_seconds = max(time.perf_counter() - started, 0.0)
-                snapshot = self._cluster_capacity_summary_snapshot
-                return snapshot.model_copy(deep=True) if snapshot is not None else None
-        finally:
-            with self._cluster_capacity_summary_lock:
-                self._cluster_capacity_summary_refreshing = False
-            if owns_db:
-                session.close()
+        db: Session,
+    ) -> WorkerClusterCapacitySummaryResponse:
+        return self._set_cluster_capacity_summary_snapshot(self._compute_cluster_capacity_summary(db))
 
     def get_cluster_capacity_summary(self, db: Session) -> WorkerClusterCapacitySummaryResponse:
         snapshot = self._cluster_capacity_summary_snapshot_copy()
         if snapshot is not None and not self._cluster_capacity_summary_snapshot_stale():
-            with self._cluster_capacity_summary_lock:
-                self._cluster_capacity_summary_hits_total += 1
             return snapshot
-        with self._cluster_capacity_summary_lock:
-            self._cluster_capacity_summary_misses_total += 1
-        refreshed = self._refresh_cluster_capacity_summary_snapshot(db, force=bool(snapshot is None))
-        if refreshed is not None:
-            return refreshed
-        if snapshot is not None:
-            return snapshot
-        return self._compute_cluster_capacity_summary(db)
+        refreshed = self._refresh_cluster_capacity_summary_snapshot(db)
+        return refreshed
 
     def get_cluster_capacity(self, db: Session) -> WorkerClusterCapacityResponse:
         started = time.perf_counter()
         workers, worker_timeout_at, reservation_counts, queued_jobs = self._cluster_capacity_base(db)
         worker_rows: list[WorkerClusterWorkerResponse] = []
-
         active_executions = (
             db.query(WorkflowExecution, TriggerTask, RunIndex)
             .join(TriggerTask, WorkflowExecution.trigger_task_id == TriggerTask.id)
             .outerjoin(RunIndex, RunIndex.linked_execution_id == WorkflowExecution.id)
-            .filter(
-                self._active_execution_filter()
-            )
+            .filter(self._active_execution_filter())
             .all()
         )
         execution_map: dict[str, tuple[WorkflowExecution, TriggerTask, RunIndex | None]] = {}
@@ -433,7 +322,6 @@ class SchedulerService:
         total_running = 0
         healthy_workers = 0
         stale_workers = 0
-
         for worker in workers:
             heartbeat_healthy = bool(worker.last_heartbeat_at and worker.last_heartbeat_at >= worker_timeout_at and worker.status == "active")
             try:
@@ -484,21 +372,6 @@ class SchedulerService:
         observe_service_operation("cluster_capacity_detail", max(time.perf_counter() - started, 0.0))
         return response
 
-    def _reservation_counts(self, db: Session) -> dict[str, int]:
-        rows = (
-            db.query(SchedulerWorkerSlotReservation.worker_pod_id)
-            .filter(
-                SchedulerWorkerSlotReservation.status == "reserved",
-                SchedulerWorkerSlotReservation.lease_expires_at >= now_local(),
-            )
-            .all()
-        )
-        counts: dict[str, int] = {}
-        for (worker_pod_id,) in rows:
-            key = str(worker_pod_id)
-            counts[key] = counts.get(key, 0) + 1
-        return counts
-
     def set_worker_status(self, db: Session, pod_id: str, status_value: str) -> None:
         worker = db.get(SchedulerWorker, pod_id)
         if worker is None:
@@ -510,87 +383,9 @@ class SchedulerService:
         if pod_id == self.pod_id:
             self._worker_status = status_value
 
-    def _list_worker_jobs_for_capacity(self, worker: SchedulerWorker) -> list[dict[str, Any]]:
-        jobs_from_db = self._active_jobs_from_db(worker)
-        worker_url = self._worker_url_from_registry(worker)
-        if not worker_url:
-            return jobs_from_db
-        jobs = get_dataflow_worker_client(worker_url).list_jobs()
-        return [job for job in jobs if isinstance(job, dict)]
-
-    def _active_jobs_from_db(self, worker: SchedulerWorker) -> list[dict[str, Any]]:
-        db = get_db_session()
-        try:
-            executions = (
-                db.query(WorkflowExecution)
-                .filter(
-                    WorkflowExecution.owner_pod_id == worker.pod_id,
-                    self._active_execution_filter(),
-                )
-                .all()
-            )
-            return [self._job_payload(execution) for execution in executions]
-        finally:
-            db.close()
-
-    @staticmethod
-    def _job_is_active(job: dict[str, Any]) -> bool:
-        status_text = str(job.get("status") or "").strip().lower()
-        phase_text = str(job.get("phase") or "").strip().lower()
-        return status_text in ACTIVE_JOB_STATUSES or phase_text in ACTIVE_JOB_STATUSES
-
-    @staticmethod
-    def _build_active_job_payload(
-        job: dict[str, Any],
-        execution_map: dict[str, tuple[WorkflowExecution, TriggerTask, RunIndex | None]],
-    ) -> WorkerActiveJobResponse:
-        execution_id = str(job.get("execution_id") or job.get("id") or "")
-        mapped_execution = execution_map.get(execution_id)
-        execution = mapped_execution[0] if mapped_execution else None
-        trigger = mapped_execution[1] if mapped_execution else None
-        run_index = mapped_execution[2] if mapped_execution else None
-        return WorkerActiveJobResponse(
-            execution_id=execution_id,
-            task_id=str(trigger.id) if trigger is not None else None,
-            task_title=SchedulerService._trigger_title_for_capacity(trigger),
-            status=str(job.get("status") or execution.status if execution is not None else "running"),
-            worker_job_id=str(job.get("id") or execution.worker_job_id or execution_id),
-            worker_url=str(job.get("worker_url") or execution.worker_url) if execution is not None or job.get("worker_url") else None,
-            dispatch_status=str(job.get("phase") or execution.dispatch_status or execution.process_status) if execution is not None or job.get("phase") else None,
-            started_at=execution.started_at if execution is not None else None,
-            updated_at=execution.updated_at if execution is not None else None,
-            run_name=str(run_index.run_name) if run_index is not None and getattr(run_index, "run_name", None) else None,
-            run_path=str(run_index.run_root_path) if run_index is not None and getattr(run_index, "run_root_path", None) else None,
-            project_id=str(execution.project_id) if execution is not None else None,
-            mapped=execution is not None and trigger is not None,
-            mapping_reason="matched_execution" if execution is not None and trigger is not None else "orphan_job",
-        )
-
-    @staticmethod
-    def _trigger_title_for_capacity(trigger: TriggerTask | None) -> str | None:
-        if trigger is None:
-            return None
-        payload = trigger.input_tasks_json
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except Exception:
-                payload = {}
-        tasks = payload.get("tasks") if isinstance(payload, dict) else None
-        if isinstance(tasks, list) and tasks:
-            first = tasks[0]
-            if isinstance(first, dict):
-                title = str(first.get("title") or "").strip()
-                if title:
-                    return title
-        return str(trigger.id)
-
     async def _heartbeat_loop(self) -> None:
+        interval = get_config().scheduler.heartbeat_interval_seconds
         while True:
-            interval = max(
-                1,
-                int((self.runtime_config.get("scheduler") or {}).get("heartbeat_interval_seconds") or get_config().scheduler.heartbeat_interval_seconds or 5),
-            )
             await asyncio.sleep(interval)
             await asyncio.to_thread(self._heartbeat_once)
 
@@ -610,11 +405,7 @@ class SchedulerService:
                     running_count=len(self._running_tasks),
                     last_heartbeat_at=now,
                     status=self._worker_status,
-                    metadata_json={
-                        "service": "secflow-app-dataflow-vuln-scanner",
-                        "role": self.role,
-                        "advertise_url": self.advertise_url(),
-                    },
+                    metadata_json={"service": "secflow-app-dataflow-vuln-scanner", "role": self.role},
                 )
             else:
                 # Do not inherit stale DB "draining" on process startup; a restarted
@@ -630,32 +421,16 @@ class SchedulerService:
                 worker.running_count = len(self._running_tasks)
                 worker.last_heartbeat_at = now
                 worker.status = self._worker_status
-                worker.metadata_json = {
-                    "service": "secflow-app-dataflow-vuln-scanner",
-                    "role": self.role,
-                    "advertise_url": self.advertise_url(),
-                }
+                worker.metadata_json = {"service": "secflow-app-dataflow-vuln-scanner", "role": self.role}
             db.add(worker)
             db.commit()
             self._heartbeat_published = True
-        except Exception:
-            db.rollback()
-            logger.exception(
-                "failed to publish scheduler worker heartbeat: pod_id=%s host_name=%s advertise_url=%s",
-                self.pod_id,
-                self.host_name,
-                self.advertise_url(),
-            )
-            raise
         finally:
             db.close()
 
     async def _dispatch_loop(self) -> None:
+        interval = get_config().scheduler.poll_interval_seconds
         while True:
-            interval = max(
-                1,
-                int((self.runtime_config.get("scheduler") or {}).get("poll_interval_seconds") or get_config().scheduler.poll_interval_seconds or 2),
-            )
             await asyncio.sleep(interval)
             if not self.runs_worker:
                 continue
@@ -668,27 +443,21 @@ class SchedulerService:
                 self._schedule_execution(execution_id)
 
     async def _assigned_dispatch_loop(self) -> None:
+        interval = get_config().scheduler.poll_interval_seconds
         while True:
-            interval = max(
-                1,
-                int((self.runtime_config.get("scheduler") or {}).get("poll_interval_seconds") or get_config().scheduler.poll_interval_seconds or 2),
-            )
             await asyncio.sleep(interval)
             await asyncio.to_thread(self._start_assigned_jobs)
 
     async def _manager_dispatch_loop(self) -> None:
+        interval = get_config().scheduler.poll_interval_seconds
         while True:
-            interval = max(
-                1,
-                int((self.runtime_config.get("scheduler") or {}).get("poll_interval_seconds") or get_config().scheduler.poll_interval_seconds or 2),
-            )
             await asyncio.sleep(interval)
             await asyncio.to_thread(self._dispatch_pending_to_workers_once)
 
     def _dispatch_pending_to_workers_once(self) -> None:
         if not self.is_manager_role:
             return
-        for execution_id in self._pending_worker_dispatch_execution_ids(limit=self.dispatch_batch_size):
+        for execution_id in self._pending_worker_dispatch_execution_ids():
             try:
                 self._dispatch_execution_to_worker(execution_id)
             except Exception:
@@ -933,7 +702,6 @@ class SchedulerService:
     def _dispatch_execution_to_worker(self, execution_id: str) -> bool:
         db = get_db_session()
         worker_url = ""
-        worker_pod_id = ""
         last_error = ""
         try:
             execution = db.get(WorkflowExecution, execution_id)
@@ -942,8 +710,7 @@ class SchedulerService:
             trigger = db.get(TriggerTask, execution.trigger_task_id)
             if trigger is None or trigger.status != "pending":
                 return False
-            worker_pod_id, worker_url = self._choose_dataflow_worker(db, execution_id)
-            self._reserve_worker_slot(db, worker_pod_id, execution_id)
+            worker_url = self._choose_dataflow_worker(db, execution_id)
             message = f"dispatching to worker {worker_url}"
             updated_execution = (
                 db.query(WorkflowExecution)
@@ -977,127 +744,167 @@ class SchedulerService:
                 db.rollback()
                 return False
             db.commit()
-        except Exception:
-            db.rollback()
-            raise
         finally:
             db.close()
 
-        attempts = max(1, int((self.runtime_config.get("dataflow_worker") or {}).get("dispatch_max_retries") or get_config().dataflow_worker.dispatch_max_retries or 1))
-        retry_interval = max(0, int((self.runtime_config.get("dataflow_worker") or {}).get("dispatch_retry_interval_seconds") or get_config().dataflow_worker.dispatch_retry_interval_seconds or 0))
+        attempts = max(1, int(get_config().dataflow_worker.dispatch_max_retries or 1))
         for attempt in range(1, attempts + 1):
             try:
                 job = get_dataflow_worker_client(worker_url).create_job(
                     {
                         "execution_id": execution_id,
                         "worker_url": worker_url,
-                        "worker_pod_id": worker_pod_id,
                     }
                 )
-                self._mark_dispatch_success(execution_id, worker_pod_id, worker_url, job)
+                self._mark_dispatch_success(execution_id, worker_url, job)
                 return True
             except DataflowWorkerError as exc:
                 last_error = str(exc)
                 if attempt < attempts:
-                    time.sleep(retry_interval)
+                    time.sleep(max(0, int(get_config().dataflow_worker.dispatch_retry_interval_seconds or 0)))
 
         self._mark_dispatch_failure(execution_id, worker_url, last_error or "dataflow worker dispatch failed")
         return False
 
-    def _choose_dataflow_worker(self, db: Session, execution_id: str) -> tuple[str, str]:
-        workers = self._healthy_registry_workers(db)
-        if workers:
-            reservations = self._reservation_counts(db)
-            candidates: list[tuple[int, str, str]] = []
-            for worker in workers:
-                running_count = self._running_count_for_worker(db, str(worker.pod_id))
-                reserved_count = reservations.get(str(worker.pod_id), 0)
-                capacity = max(int(worker.capacity or 0), 0)
-                if capacity > 0 and running_count + reserved_count >= capacity + self.worker_queue_depth:
-                    continue
-                worker_url = self._worker_url_from_registry(worker)
-                if not worker_url:
-                    continue
-                candidates.append((running_count + reserved_count, str(worker.pod_id), worker_url))
-            if candidates:
-                salt = int(hashlib.sha256(execution_id.encode("utf-8")).hexdigest(), 16)
-                candidates.sort(key=lambda item: (item[0], (hash(item[1]) - salt)))
-                _, worker_pod_id, worker_url = candidates[0]
-                return worker_pod_id, worker_url
-        raise DataflowWorkerError("no healthy registry worker with advertise_url is available")
+    def _choose_dataflow_worker(self, db: Session, execution_id: str) -> str:
+        workers = self.configured_worker_urls()
+        if len(workers) == 1:
+            return workers[0]
 
-    def _healthy_registry_workers(self, db: Session) -> list[SchedulerWorker]:
-        timeout_seconds = int((self.runtime_config.get("scheduler") or {}).get("worker_timeout_seconds") or get_config().scheduler.worker_timeout_seconds or 300)
-        worker_timeout_at = now_local() - timedelta(seconds=timeout_seconds)
-        return (
-            db.query(SchedulerWorker)
-            .filter(
-                SchedulerWorker.status == "active",
-                SchedulerWorker.last_heartbeat_at >= worker_timeout_at,
-            )
-            .order_by(SchedulerWorker.last_heartbeat_at.desc(), SchedulerWorker.pod_id.asc())
+        counts = {worker: 0 for worker in workers}
+        for worker in workers:
+            try:
+                jobs = get_dataflow_worker_client(worker).list_jobs()
+                counts[worker] += sum(1 for job in jobs if str(job.get("status") or "") in ACTIVE_JOB_STATUSES)
+            except Exception:
+                counts[worker] += 1_000_000
+
+        active_executions = (
+            db.query(WorkflowExecution)
+            .filter(WorkflowExecution.status.in_(list(ACTIVE_JOB_STATUSES)))
             .all()
         )
+        for execution in active_executions:
+            worker_url = str(execution.worker_url or "").rstrip("/")
+            if worker_url in counts:
+                counts[worker_url] += 1
 
-    def _worker_url_from_registry(self, worker: SchedulerWorker) -> str | None:
-        metadata = worker.metadata_json if isinstance(worker.metadata_json, dict) else {}
-        advertise_url = str(metadata.get("advertise_url") or "").strip()
+        salt = int(hashlib.sha256(execution_id.encode("utf-8")).hexdigest(), 16)
+        return min(enumerate(workers), key=lambda item: (counts[item[1]], (item[0] - salt) % len(workers)))[1]
+
+    def _reservation_counts(self, db: Session) -> dict[str, int]:
+        rows = (
+            db.query(SchedulerWorkerSlotReservation.worker_pod_id)
+            .filter(
+                SchedulerWorkerSlotReservation.status == "reserved",
+                SchedulerWorkerSlotReservation.lease_expires_at >= now_local(),
+            )
+            .all()
+        )
+        counts: dict[str, int] = {}
+        for (worker_pod_id,) in rows:
+            key = str(worker_pod_id)
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    def _list_worker_jobs_for_capacity(self, worker: SchedulerWorker) -> list[dict[str, Any]]:
+        jobs_from_db = self._active_jobs_from_db(worker)
+        worker_url = self._worker_url_from_registry(worker)
+        if not worker_url:
+            return jobs_from_db
+        jobs = get_dataflow_worker_client(worker_url).list_jobs()
+        return [job for job in jobs if isinstance(job, dict)]
+
+    def _active_jobs_from_db(self, worker: SchedulerWorker) -> list[dict[str, Any]]:
+        db = get_db_session()
+        try:
+            executions = (
+                db.query(WorkflowExecution)
+                .filter(
+                    WorkflowExecution.owner_pod_id == worker.pod_id,
+                    self._active_execution_filter(),
+                )
+                .order_by(WorkflowExecution.started_at.asc(), WorkflowExecution.updated_at.asc())
+                .all()
+            )
+            return [self._job_payload(item) for item in executions]
+        finally:
+            db.close()
+
+    @staticmethod
+    def _worker_url_from_registry(worker: SchedulerWorker) -> str | None:
+        metadata = worker.metadata_json or {}
+        advertise_url = str(metadata.get("advertise_url") or "").strip().rstrip("/")
         if advertise_url:
-            return advertise_url.rstrip("/")
+            return advertise_url
         return None
 
-    def _running_count_for_worker(self, db: Session, worker_pod_id: str) -> int:
-        return (
-            db.query(WorkflowExecution)
-            .filter(
-                WorkflowExecution.owner_pod_id == worker_pod_id,
-                self._active_execution_filter(),
-            )
-            .count()
+    @staticmethod
+    def _job_is_active(job: dict[str, Any]) -> bool:
+        return str(job.get("status") or "").strip().lower() in ACTIVE_JOB_STATUSES
+
+    @staticmethod
+    def _build_active_job_payload(
+        job: dict[str, Any],
+        execution_map: dict[str, tuple[WorkflowExecution, TriggerTask, RunIndex | None]],
+    ) -> WorkerActiveJobResponse:
+        execution_id = str(job.get("execution_id") or job.get("id") or "")
+        mapped = False
+        mapping_reason = "orphan_job"
+        task_id = None
+        task_title = None
+        run_name = None
+        run_path = None
+        project_id = None
+        started_at = None
+        updated_at = None
+        dispatch_status = None
+        worker_url = str(job.get("worker_url") or "") or None
+
+        mapped_tuple = execution_map.get(execution_id)
+        if mapped_tuple is not None:
+            execution, trigger, run_index = mapped_tuple
+            mapped = True
+            mapping_reason = "execution_id"
+            task_id = str(trigger.id)
+            task_title = str(trigger.title or "")
+            project_id = str(trigger.project_id or "")
+            started_at = execution.started_at
+            updated_at = execution.updated_at
+            dispatch_status = execution.dispatch_status
+            worker_url = worker_url or execution.worker_url or None
+            if run_index is not None:
+                run_name = run_index.run_name
+                run_path = run_index.run_path
+
+        return WorkerActiveJobResponse(
+            execution_id=execution_id,
+            task_id=task_id,
+            task_title=task_title,
+            status=str(job.get("status") or "unknown"),
+            worker_job_id=str(job.get("id") or job.get("worker_job_id") or execution_id),
+            worker_url=worker_url,
+            dispatch_status=dispatch_status,
+            started_at=started_at,
+            updated_at=updated_at,
+            run_name=run_name,
+            run_path=run_path,
+            project_id=project_id,
+            mapped=mapped,
+            mapping_reason=mapping_reason,
         )
 
-    def _reserve_worker_slot(self, db: Session, worker_pod_id: str, execution_id: str) -> None:
-        expires_at = now_local() + timedelta(seconds=self.reservation_lease_seconds)
-        reservation = (
-            db.query(SchedulerWorkerSlotReservation)
-            .filter(SchedulerWorkerSlotReservation.execution_id == execution_id)
-            .first()
-        )
-        if reservation is None:
-            reservation = SchedulerWorkerSlotReservation(
-                id=f"resv-{execution_id}",
-                worker_pod_id=worker_pod_id,
-                execution_id=execution_id,
-                status="reserved",
-                lease_expires_at=expires_at,
-            )
-        else:
-            reservation.worker_pod_id = worker_pod_id
-            reservation.status = "reserved"
-            reservation.lease_expires_at = expires_at
-        db.add(reservation)
-
-    def _mark_dispatch_success(self, execution_id: str, worker_pod_id: str, worker_url: str, job: dict[str, Any]) -> None:
+    def _mark_dispatch_success(self, execution_id: str, worker_url: str, job: dict[str, Any]) -> None:
         db = get_db_session()
         try:
             execution = db.get(WorkflowExecution, execution_id)
             if execution is None:
                 return
             job_id = str(job.get("id") or job.get("job_id") or execution.worker_job_id or execution.id)
-            owner_pod_id = str(job.get("owner_pod_id") or worker_pod_id or execution.owner_pod_id or "").strip() or None
             execution.worker_url = worker_url
             execution.worker_job_id = job_id
-            execution.owner_pod_id = owner_pod_id
             execution.dispatch_status = str(job.get("status") or "queued")
             execution.dispatch_error = None
-            reservation = (
-                db.query(SchedulerWorkerSlotReservation)
-                .filter(SchedulerWorkerSlotReservation.execution_id == execution_id)
-                .first()
-            )
-            if reservation is not None:
-                reservation.status = "accepted"
-                db.add(reservation)
             if execution.status == "pending":
                 execution.message = f"queued on worker {worker_url}"
             trigger = db.get(TriggerTask, execution.trigger_task_id)
@@ -1111,11 +918,7 @@ class SchedulerService:
                 execution_id=execution_id,
                 event_type="worker_dispatch_succeeded",
                 message=f"execution dispatched to {worker_url}",
-                payload_json={
-                    "worker_url": worker_url,
-                    "worker_pod_id": owner_pod_id,
-                    "job": job,
-                },
+                payload_json={"worker_url": worker_url, "job": job},
             )
         finally:
             db.close()
@@ -1126,13 +929,11 @@ class SchedulerService:
             execution = db.get(WorkflowExecution, execution_id)
             if execution is None:
                 return
-            reservation = (
-                db.query(SchedulerWorkerSlotReservation)
-                .filter(SchedulerWorkerSlotReservation.execution_id == execution_id)
-                .first()
-            )
-            if reservation is not None:
-                db.delete(reservation)
+            execution.worker_url = worker_url
+            execution.worker_job_id = execution.worker_job_id or execution.id
+            execution.dispatch_status = "failed"
+            execution.dispatch_error = error
+            execution.message = f"worker dispatch failed: {error}"
             trigger = db.get(TriggerTask, execution.trigger_task_id)
             execution.worker_url = None
             execution.worker_job_id = None
@@ -1249,14 +1050,6 @@ class SchedulerService:
             execution.control_state = "none"
             execution.dispatch_status = "queued"
             execution.dispatch_error = None
-            reservation = (
-                db.query(SchedulerWorkerSlotReservation)
-                .filter(SchedulerWorkerSlotReservation.execution_id == execution_id)
-                .first()
-            )
-            if reservation is not None:
-                reservation.status = "accepted"
-                db.add(reservation)
             execution.message = f"queued on worker {self.pod_id}"
             trigger.status = "dispatching"
             trigger.public_status = "dispatching"
@@ -1308,18 +1101,14 @@ class SchedulerService:
                 db.commit()
                 return self._job_payload(execution)
 
-            if execution.status in {"dispatching", "running"}:
-                requested_status = "cancel_requested"
-                execution.status = "running"
-                execution.public_status = "running"
-                execution.control_state = "cancel_requested"
+            if execution.status in {"running", "cancel_requested", "delete_requested"}:
+                requested_status = "delete_requested" if execution.status == "delete_requested" else "cancel_requested"
+                execution.status = requested_status
                 execution.dispatch_status = requested_status
-                execution.process_status = "stop_requested"
-                execution.message = "cancel requested"
-                if trigger is not None and trigger.status in {"dispatching", "running"}:
-                    trigger.status = "running"
-                    trigger.public_status = "running"
-                    trigger.control_state = "cancel_requested"
+                execution.process_status = "delete_requested" if requested_status == "delete_requested" else "stop_requested"
+                execution.message = "delete requested" if requested_status == "delete_requested" else "cancel requested"
+                if trigger is not None and trigger.status in {"running", "cancel_requested", "delete_requested"}:
+                    trigger.status = requested_status
                     trigger.message = execution.message
                     db.add(trigger)
                 db.add(execution)
@@ -1427,27 +1216,16 @@ class SchedulerService:
         }
 
     async def _cleanup_loop(self) -> None:
+        interval = get_config().scheduler.cleanup_interval_seconds
         while True:
-            interval = max(
-                1,
-                int((self.runtime_config.get("scheduler") or {}).get("cleanup_interval_seconds") or get_config().scheduler.cleanup_interval_seconds or 10),
-            )
             await asyncio.sleep(interval)
             await asyncio.to_thread(self._cleanup_once)
-
-    async def _cluster_capacity_summary_loop(self) -> None:
-        while True:
-            await asyncio.sleep(self.cluster_capacity_summary_refresh_interval_seconds)
-            await asyncio.to_thread(self._refresh_cluster_capacity_summary_snapshot)
 
     def _cleanup_once(self) -> None:
         db = get_db_session()
         try:
             now = now_local()
-            worker_timeout_seconds = int((self.runtime_config.get("scheduler") or {}).get("worker_timeout_seconds") or get_config().scheduler.worker_timeout_seconds or 300)
-            worker_retention_seconds = int((self.runtime_config.get("scheduler") or {}).get("worker_retention_seconds") or get_config().scheduler.worker_retention_seconds or 1800)
-            worker_timeout_at = now - timedelta(seconds=worker_timeout_seconds)
-            worker_retention_at = now - timedelta(seconds=worker_retention_seconds)
+            worker_timeout_at = now - timedelta(seconds=get_config().scheduler.worker_timeout_seconds)
             offline_workers = (
                 db.query(SchedulerWorker)
                 .filter(SchedulerWorker.last_heartbeat_at < worker_timeout_at, SchedulerWorker.status != "offline")
@@ -1457,139 +1235,11 @@ class SchedulerService:
                 worker.status = "offline"
                 db.add(worker)
 
-            stale_workers = (
-                db.query(SchedulerWorker)
-                .filter(
-                    SchedulerWorker.status == "offline",
-                    SchedulerWorker.last_heartbeat_at < worker_retention_at,
-                )
-                .all()
-            )
-            for worker in stale_workers:
-                db.delete(worker)
-
-            self._backfill_execution_owner_bindings(db)
-            self._cleanup_terminal_dispatch_markers(db)
-            self._cleanup_stale_reservations(db, now)
-            self._requeue_stuck_dispatches(db, now)
-
             db.commit()
             get_execution_service().reconcile_stale_active_executions(db)
             db.commit()
         finally:
             db.close()
-
-    def _cleanup_terminal_dispatch_markers(self, db: Session) -> int:
-        executions = (
-            db.query(WorkflowExecution)
-            .filter(
-                WorkflowExecution.status.in_(tuple(TERMINAL_EXECUTION_STATUSES)),
-                WorkflowExecution.dispatch_status.in_(tuple(ACTIVE_JOB_STATUSES)),
-            )
-            .all()
-        )
-        repaired = 0
-        for execution in executions:
-            terminal_status = str(execution.status or "").strip().lower()
-            if not terminal_status:
-                continue
-            execution.dispatch_status = terminal_status
-            if terminal_status in {"succeeded", "cancelled"}:
-                execution.dispatch_error = None
-            elif not str(execution.dispatch_error or "").strip():
-                execution.dispatch_error = execution.message or terminal_status
-            db.add(execution)
-            repaired += 1
-        return repaired
-
-    def _backfill_execution_owner_bindings(self, db: Session, *, limit: int = 200) -> int:
-        executions = (
-            db.query(WorkflowExecution)
-            .filter(
-                WorkflowExecution.owner_pod_id.is_(None),
-                WorkflowExecution.worker_job_id.isnot(None),
-                or_(
-                    WorkflowExecution.status.in_(tuple(ACTIVE_JOB_STATUSES)),
-                    WorkflowExecution.dispatch_status.in_(tuple(ACTIVE_JOB_STATUSES)),
-                ),
-            )
-            .order_by(WorkflowExecution.updated_at.asc())
-            .limit(limit)
-            .all()
-        )
-        if not executions:
-            return 0
-
-        reservations = (
-            db.query(SchedulerWorkerSlotReservation)
-            .filter(
-                SchedulerWorkerSlotReservation.execution_id.in_([execution.id for execution in executions])
-            )
-            .all()
-        )
-        reservation_map = {str(item.execution_id): str(item.worker_pod_id) for item in reservations}
-        registry_workers = db.query(SchedulerWorker).all()
-        worker_url_map: dict[str, str] = {}
-        for worker in registry_workers:
-            worker_url = self._worker_url_from_registry(worker)
-            if not worker_url:
-                continue
-            worker_url_map[worker_url.rstrip("/")] = str(worker.pod_id)
-
-        repaired = 0
-        for execution in executions:
-            owner_pod_id = reservation_map.get(str(execution.id))
-            if not owner_pod_id:
-                worker_url = str(execution.worker_url or "").strip().rstrip("/")
-                owner_pod_id = worker_url_map.get(worker_url) if worker_url else None
-            if not owner_pod_id:
-                continue
-            execution.owner_pod_id = owner_pod_id
-            db.add(execution)
-            repaired += 1
-        return repaired
-
-    def _cleanup_stale_reservations(self, db: Session, now: Any) -> None:
-        reservations = (
-            db.query(SchedulerWorkerSlotReservation)
-            .filter(SchedulerWorkerSlotReservation.lease_expires_at < now)
-            .all()
-        )
-        for reservation in reservations:
-            execution = db.get(WorkflowExecution, reservation.execution_id)
-            if execution is not None and execution.status == "pending" and execution.owner_pod_id is None:
-                execution.dispatch_status = None
-                execution.dispatch_error = "reservation expired"
-                execution.worker_url = None
-                execution.worker_job_id = None
-                db.add(execution)
-            db.delete(reservation)
-
-    def _requeue_stuck_dispatches(self, db: Session, now: Any) -> None:
-        threshold = now - timedelta(seconds=self.requeue_stuck_dispatch_after_seconds)
-        executions = (
-            db.query(WorkflowExecution)
-            .filter(
-                WorkflowExecution.status == "pending",
-                WorkflowExecution.owner_pod_id.is_(None),
-                WorkflowExecution.dispatch_status == "dispatching",
-                WorkflowExecution.updated_at < threshold,
-            )
-            .all()
-        )
-        for execution in executions:
-            execution.dispatch_status = None
-            execution.dispatch_error = "dispatch timeout requeued"
-            execution.worker_url = None
-            execution.worker_job_id = None
-            db.add(execution)
-            reservation = (
-                db.query(SchedulerWorkerSlotReservation)
-                .filter(SchedulerWorkerSlotReservation.execution_id == execution.id)
-                .first()
-            )
-            if reservation is not None:
-                db.delete(reservation)
 
 
 _scheduler_service: SchedulerService | None = None
