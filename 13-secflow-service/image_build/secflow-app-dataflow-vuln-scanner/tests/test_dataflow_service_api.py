@@ -233,6 +233,19 @@ def test_task_retry_refreshes_projection_latest_execution(service_config_path, p
         assert projection.latest_execution_id == next_execution_id
         assert projection.public_status in {"pending", "dispatching", "running"}
         assert str(projection.message or "").strip()
+        retry_event = (
+            db.query(WorkflowExecutionEvent)
+            .filter(
+                WorkflowExecutionEvent.execution_id == next_execution_id,
+                WorkflowExecutionEvent.event_type == "task_retry_queued",
+            )
+            .order_by(WorkflowExecutionEvent.created_at.desc())
+            .first()
+        )
+        assert retry_event is not None
+        assert retry_event.payload_json["task_id"] == task_id
+        assert retry_event.payload_json["attempt_no"] == 2
+        assert retry_event.payload_json["request"]["extra_cycles"] == 1
 
 
 def test_task_apis_accept_machine_subject(service_config_path, patch_mock_agent_runtime, monkeypatch):
@@ -1237,6 +1250,7 @@ def test_create_evolution_task_from_normal_task_inherits_defaults_and_derivation
         assert event.payload_json["source_execution_id"] == source_execution_id
         assert event.payload_json["source_run_id"] == source_run_id
         assert event.payload_json["created_task_id"] == detail["task_id"]
+        assert event.payload_json["task_purpose"] == "evolution"
     finally:
         db.close()
 
@@ -1400,6 +1414,94 @@ def test_create_evolution_task_applies_overrides_and_agent_state_roots(service_c
     assert request_payload["timeout_retry_interval_seconds"] == 0
     assert request_payload["result_review_concurrency"] == 2
     assert request_payload["options"]["custom_option"] == "enabled"
+
+
+def test_task_mutation_timeline_records_create_cancel_priority_and_projection(service_config_path, patch_mock_agent_runtime, monkeypatch):
+    _disable_scheduler_start(monkeypatch)
+    app = create_app()
+    client = TestClient(app)
+    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
+
+    created = _create_business_dataflow_task(
+        client,
+        profile_id=profile["profile_id"],
+        case_name="case-task-mutation-timeline",
+        title="timeline mutation scan",
+    )
+    task_id = created["task_id"]
+
+    timeline = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/timeline")
+    assert timeline.status_code == 200
+    items = timeline.json()["items"]
+    task_created = next((item for item in items if item["event_type"] == "task_created"), None)
+    execution_queued = next((item for item in items if item["event_type"] == "execution_queued"), None)
+    assert task_created is not None
+    assert execution_queued is not None
+    assert task_created["payload"]["task_id"] == task_id
+    assert task_created["payload"]["project_id"] == "default"
+    assert task_created["payload"]["task_purpose"] == "normal"
+    assert task_created["payload"]["dataflow_cli_task"] is True
+
+    priority_response = client.post(
+        f"/api/dataflow-vuln-scanner/tasks/{task_id}/priority",
+        json={"priority": 77},
+    )
+    assert priority_response.status_code == 200
+    projection_response = client.post(f"/api/dataflow-vuln-scanner/tasks/{task_id}/projection/rebuild")
+    assert projection_response.status_code == 200
+    cancel_response = client.post(f"/api/dataflow-vuln-scanner/tasks/{task_id}/cancel")
+    assert cancel_response.status_code == 200
+
+    timeline = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/timeline")
+    assert timeline.status_code == 200
+    items = timeline.json()["items"]
+    priority_event = next((item for item in items if item["event_type"] == "task_priority_updated"), None)
+    projection_event = next((item for item in items if item["event_type"] == "task_projection_rebuilt"), None)
+    cancel_event = next((item for item in items if item["event_type"] == "task_cancel_requested"), None)
+    assert priority_event is not None
+    assert priority_event["payload"]["old_priority"] == 120
+    assert priority_event["payload"]["new_priority"] == 77
+    assert projection_event is not None
+    assert projection_event["payload"]["task_id"] == task_id
+    assert cancel_event is not None
+    assert cancel_event["payload"]["task_id"] == task_id
+    assert cancel_event["payload"]["signal_process"] is True
+    assert cancel_event["payload"]["status_before"] == "pending"
+
+
+def test_timeline_clear_and_delete_do_not_create_extra_events(service_config_path, patch_mock_agent_runtime, monkeypatch):
+    _disable_scheduler_start(monkeypatch)
+    app = create_app()
+    client = TestClient(app)
+    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
+
+    created = _create_business_dataflow_task(
+        client,
+        profile_id=profile["profile_id"],
+        case_name="case-timeline-clear-delete",
+        title="timeline clear delete scan",
+    )
+    task_id = created["task_id"]
+
+    timeline = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/timeline")
+    assert timeline.status_code == 200
+    first_items = timeline.json()["items"]
+    assert len(first_items) >= 2
+    first_event_id = first_items[0]["id"]
+
+    delete_one = client.delete(f"/api/dataflow-vuln-scanner/tasks/{task_id}/timeline/{first_event_id}")
+    assert delete_one.status_code == 200
+    after_delete = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/timeline")
+    assert after_delete.status_code == 200
+    after_delete_items = after_delete.json()["items"]
+    assert all(item["event_type"] != "timeline_event_deleted" for item in after_delete_items)
+
+    clear_response = client.delete(f"/api/dataflow-vuln-scanner/tasks/{task_id}/timeline")
+    assert clear_response.status_code == 200
+    assert clear_response.json()["deleted_event_count"] == len(after_delete_items)
+    final_timeline = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/timeline")
+    assert final_timeline.status_code == 200
+    assert final_timeline.json()["items"] == []
 
 
 def test_project_filesystem_browser_uses_local_project_tree(service_config_path):

@@ -1145,6 +1145,81 @@ def test_run_cancel_active_run_signals_bound_process(service_config_path):
         run_index = db.get(RunIndex, bound["run_id"])
         assert execution is not None and execution.status == "running"
         assert run_index is not None and run_index.status == "running"
+        cancel_event = (
+            db.query(WorkflowExecutionEvent)
+            .filter(
+                WorkflowExecutionEvent.execution_id == bound["execution_id"],
+                WorkflowExecutionEvent.event_type == "run_cancel_requested",
+            )
+            .order_by(WorkflowExecutionEvent.created_at.desc())
+            .first()
+        )
+        assert cancel_event is not None
+        assert cancel_event.payload_json["run_id"] == bound["run_id"]
+        assert cancel_event.payload_json["linked_task_id"] == bound["task_id"]
+        assert cancel_event.payload_json["status_before"] == "running"
+
+
+def test_run_delete_records_request_event_before_runtime_cleanup(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_delete_timeline_20260508_010203"
+    bound = _create_execution_bound_run(client, run_root)
+    service = get_execution_service()
+    original_record_event = service.record_event
+    recorded_event_types: list[str] = []
+
+    def recording_wrapper(db, **kwargs):
+        recorded_event_types.append(str(kwargs.get("event_type") or ""))
+        return original_record_event(db, **kwargs)
+
+    service.record_event = recording_wrapper  # type: ignore[method-assign]
+    try:
+        delete_response = client.delete(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
+    finally:
+        service.record_event = original_record_event  # type: ignore[method-assign]
+
+    assert delete_response.status_code == 200
+    assert delete_response.json()["status"] == "deleted"
+    assert "run_delete_requested" in recorded_event_types
+
+    with get_db_session() as db:
+        events = (
+            db.query(WorkflowExecutionEvent)
+            .filter(WorkflowExecutionEvent.execution_id == bound["execution_id"])
+            .all()
+        )
+        assert events == []
+
+
+def test_report_run_vulnerabilities_records_manual_timeline_event(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_report_vuln_timeline_20260508_010203"
+    bound = _create_execution_bound_run(client, run_root)
+
+    response = client.post(
+        f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/report-vulnerabilities",
+        json={"result_files": ["result_001.md"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] in {"reported", "success", "partial_failed", "failed", "skipped", "disabled"}
+
+    with get_db_session() as db:
+        event = (
+            db.query(WorkflowExecutionEvent)
+            .filter(
+                WorkflowExecutionEvent.execution_id == bound["execution_id"],
+                WorkflowExecutionEvent.event_type == "vuln_report_manual",
+            )
+            .order_by(WorkflowExecutionEvent.created_at.desc())
+            .first()
+        )
+        assert event is not None
+        assert event.payload_json["result_files"] == ["result_001.md"]
+        assert event.payload_json["status"] == payload["status"]
+
 
 
 def test_run_process_state_uses_startup_grace_before_marking_stale(service_config_path):

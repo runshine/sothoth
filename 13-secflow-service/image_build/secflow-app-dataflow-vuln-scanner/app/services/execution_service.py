@@ -987,6 +987,81 @@ class ExecutionService:
             return
         self._refresh_task_list_projection_for_task_id(db, execution.trigger_task_id)
 
+    def _resolve_task_timeline_execution(
+        self,
+        db: Session,
+        *,
+        task_id: str | None = None,
+        trigger: TriggerTask | None = None,
+        execution: WorkflowExecution | None = None,
+    ) -> tuple[TriggerTask | None, WorkflowExecution | None]:
+        resolved_execution = execution
+        resolved_trigger = trigger
+        if resolved_trigger is None and resolved_execution is not None and resolved_execution.trigger_task_id:
+            resolved_trigger = db.get(TriggerTask, resolved_execution.trigger_task_id)
+        if resolved_trigger is None and str(task_id or "").strip():
+            resolved_trigger = db.get(TriggerTask, str(task_id).strip())
+        if resolved_execution is None and resolved_trigger is not None:
+            resolved_execution = self._latest_execution_for_trigger(db, resolved_trigger.id)
+        return resolved_trigger, resolved_execution
+
+    def _record_task_mutation_event(
+        self,
+        db: Session,
+        *,
+        event_type: str,
+        message: str,
+        payload_json: dict[str, Any] | None = None,
+        level: str = "info",
+        task_id: str | None = None,
+        trigger: TriggerTask | None = None,
+        execution: WorkflowExecution | None = None,
+        stage_id: str | None = None,
+        round_no: int | None = None,
+    ) -> WorkflowExecutionEvent | None:
+        resolved_trigger, resolved_execution = self._resolve_task_timeline_execution(
+            db,
+            task_id=task_id,
+            trigger=trigger,
+            execution=execution,
+        )
+        if resolved_execution is None:
+            logger.warning(
+                "skip timeline mutation event event_type=%s task_id=%s trigger_id=%s message=%s",
+                event_type,
+                str(task_id or ""),
+                resolved_trigger.id if resolved_trigger is not None else "",
+                message,
+            )
+            return None
+        return self.record_event(
+            db,
+            execution_id=resolved_execution.id,
+            event_type=event_type,
+            message=message,
+            stage_id=stage_id,
+            round_no=round_no,
+            level=level,
+            payload_json=payload_json,
+        )
+
+    def _log_task_mutation(
+        self,
+        *,
+        action: str,
+        principal: dict | None = None,
+        level: str = "info",
+        **fields: Any,
+    ) -> None:
+        log_fn = logger.warning if str(level).lower() == "warning" else logger.info
+        safe_fields = {key: jsonable_encoder(value) for key, value in fields.items()}
+        safe_fields["action"] = action
+        principal_id = _principal_id(principal or {})
+        if principal_id:
+            safe_fields["principal_id"] = principal_id
+        rendered = " ".join(f"{key}={safe_fields[key]!r}" for key in sorted(safe_fields))
+        log_fn("task mutation log %s", rendered)
+
     def rebuild_single_scan_task_projection(
         self,
         db: Session,
@@ -997,6 +1072,16 @@ class ExecutionService:
         self._ensure_project_access(principal, trigger.project_id)
         self._rebuild_task_list_projections(db, [trigger])
         db.commit()
+        self._record_task_mutation_event(
+            db,
+            event_type="task_projection_rebuilt",
+            message="task list projection rebuilt",
+            trigger=trigger,
+            payload_json={
+                "task_id": trigger.id,
+                "project_id": trigger.project_id,
+            },
+        )
         return ScanTaskProjectionRepairResponse(
             task_id=trigger.id,
             project_id=trigger.project_id,
@@ -1022,6 +1107,12 @@ class ExecutionService:
         triggers = query.order_by(TriggerTask.created_at.desc(), TriggerTask.id.desc()).all()
         self._rebuild_task_list_projections(db, triggers)
         db.commit()
+        self._log_task_mutation(
+            action="task_projection_batch_rebuilt",
+            principal=principal,
+            project_id=project_id,
+            repaired_count=len(triggers),
+        )
         return ScanTaskProjectionRepairResponse(
             project_id=project_id,
             repaired_count=len(triggers),
@@ -3979,6 +4070,22 @@ class ExecutionService:
             db.commit()
             db.refresh(trigger)
         if latest_execution is not None:
+            self._record_task_mutation_event(
+                db,
+                event_type="task_created",
+                message="scan task created",
+                trigger=trigger,
+                execution=latest_execution,
+                payload_json={
+                    "task_id": trigger.id,
+                    "project_id": trigger.project_id,
+                    "task_origin_type": str(trigger.task_origin_type or "").strip() or "manual",
+                    "task_purpose": self._normalize_task_purpose(trigger.task_purpose),
+                    "priority": trigger.priority,
+                    "attempt_no": latest_execution.attempt_no,
+                    "dataflow_cli_task": self._is_dataflow_cli_task_metadata(self._trigger_task_metadata(trigger)),
+                },
+            )
             self.record_event(
                 db,
                 execution_id=latest_execution.id,
@@ -4026,6 +4133,7 @@ class ExecutionService:
                     "source_execution_id": source_execution.id if source_execution is not None else None,
                     "source_run_id": extra_metadata.get("derivation", {}).get("source_run_id"),
                     "created_task_id": created.task_id,
+                    "task_purpose": created.task_purpose,
                 },
             )
         return created
@@ -4592,6 +4700,12 @@ class ExecutionService:
                 .delete(synchronize_session=False)
             ) or 0
             db.commit()
+        self._log_task_mutation(
+            action="timeline_cleared",
+            principal=principal,
+            task_id=trigger.id,
+            deleted_event_count=int(deleted or 0),
+        )
         return DataflowTaskTimelineActionResponse(
             task_id=trigger.id,
             message="task timeline cleared",
@@ -4614,6 +4728,12 @@ class ExecutionService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="timeline event not found")
         db.delete(event)
         db.commit()
+        self._log_task_mutation(
+            action="timeline_event_deleted",
+            principal=principal,
+            task_id=trigger.id,
+            event_id=event_id,
+        )
         return DataflowTaskTimelineActionResponse(
             task_id=trigger.id,
             message="task timeline event deleted",
@@ -5618,6 +5738,21 @@ class ExecutionService:
                     status_code=status.HTTP_409_CONFLICT,
                     detail="active run is not linked to a managed execution and still appears to be running; retry delete after it stops",
                 )
+        self._record_task_mutation_event(
+            db,
+            event_type="run_delete_requested",
+            message="run delete requested",
+            trigger=trigger,
+            execution=execution,
+            task_id=linked_task_id,
+            payload_json={
+                "run_id": run_index.id,
+                "linked_task_id": linked_task_id,
+                "linked_execution_id": linked_execution_id,
+                "workspace_roots": [path for path in {run_index.run_root_path, *(([execution.workspace_root] if execution and execution.workspace_root else []))} if str(path or "").strip()],
+                "run_index_ids": [run_index.id],
+            },
+        )
         if execution is not None and execution.status == "pending":
             self._apply_terminal_state_mutation(
                 db,
@@ -5752,6 +5887,14 @@ class ExecutionService:
         self._delete_linked_runtime_records(db, linked_task_id=linked_task_id, linked_execution_id=linked_execution_id)
         get_run_index_service().delete_run_index(db, run_index, allow_active=True)
         db.commit()
+        self._log_task_mutation(
+            action="run_deleted",
+            principal=principal,
+            run_id=run_index_id,
+            project_id=project_id,
+            linked_task_id=linked_task_id,
+            linked_execution_id=linked_execution_id,
+        )
         return self._run_mutation_response(
             run_id=run_index_id,
             project_id=project_id,
@@ -5905,6 +6048,22 @@ class ExecutionService:
     def cancel_run(self, db: Session, run_index_id: str, principal: dict) -> dict[str, Any]:
         run_index = self._run_index_or_404(db, run_index_id, principal)
         if run_index.linked_task_id:
+            linked_execution = db.get(WorkflowExecution, run_index.linked_execution_id) if run_index.linked_execution_id else None
+            self._record_task_mutation_event(
+                db,
+                event_type="run_cancel_requested",
+                message="run cancel requested",
+                task_id=run_index.linked_task_id,
+                execution=linked_execution,
+                payload_json={
+                    "run_id": run_index.id,
+                    "linked_task_id": run_index.linked_task_id,
+                    "linked_execution_id": run_index.linked_execution_id,
+                    "process_signal": None,
+                    "worker_job_id": linked_execution.worker_job_id if linked_execution is not None else None,
+                    "status_before": _canonical_task_status(run_index.status),
+                },
+            )
             self.cancel_scan_task(db, run_index.linked_task_id, principal, signal_process=False)
             trigger = self._trigger_or_404(db, run_index.linked_task_id)
             latest_execution = self._latest_execution_for_trigger(db, trigger.id)
@@ -6127,6 +6286,7 @@ class ExecutionService:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
         latest_execution = self._latest_execution_for_trigger(db, trigger.id)
+        status_before = _canonical_task_status(trigger.status)
         worker_bound_execution = (
             latest_execution
             if latest_execution is not None and latest_execution.worker_url and latest_execution.worker_job_id
@@ -6167,6 +6327,21 @@ class ExecutionService:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="task is not cancelable")
         db.add(trigger)
         db.commit()
+        self._record_task_mutation_event(
+            db,
+            event_type="task_cancel_requested",
+            message="task cancel requested",
+            trigger=trigger,
+            execution=latest_execution,
+            payload_json={
+                "task_id": trigger.id,
+                "execution_id": latest_execution.id if latest_execution is not None else None,
+                "signal_process": bool(signal_process),
+                "worker_job_id": worker_bound_execution.worker_job_id if worker_bound_execution is not None else None,
+                "worker_url": worker_bound_execution.worker_url if worker_bound_execution is not None else None,
+                "status_before": status_before,
+            },
+        )
         if signal_process and latest_execution is not None:
             self._write_run_control_state(latest_execution.workspace_root, status_text=trigger.status, message=trigger.message or "cancel requested")
             if worker_bound_execution is not None:
@@ -6217,6 +6392,14 @@ class ExecutionService:
 
         self._delete_linked_runtime_records(db, linked_task_id=trigger.id, linked_execution_id=None)
         db.commit()
+        self._log_task_mutation(
+            action="task_deleted",
+            principal=principal,
+            task_id=trigger.id,
+            project_id=trigger.project_id,
+            execution_count=len(executions),
+            run_index_count=len(run_index_ids),
+        )
 
         for path in workspace_roots:
             if path:
@@ -6228,11 +6411,25 @@ class ExecutionService:
         self._ensure_project_access(principal, trigger.project_id)
         if trigger.status in {"succeeded", "failed", "cancelled"}:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="finished task priority cannot be updated")
+        old_priority = trigger.priority
         trigger.priority = priority
         trigger.message = f"priority updated to {priority}"
         db.add(trigger)
         self._refresh_task_list_projection_for_task_id(db, trigger.id)
         db.commit()
+        latest_execution = self._latest_execution_for_trigger(db, trigger.id)
+        self._record_task_mutation_event(
+            db,
+            event_type="task_priority_updated",
+            message="task priority updated",
+            trigger=trigger,
+            execution=latest_execution,
+            payload_json={
+                "task_id": trigger.id,
+                "old_priority": old_priority,
+                "new_priority": priority,
+            },
+        )
         db.refresh(trigger)
         return self._scan_task_response(db, trigger)
 
