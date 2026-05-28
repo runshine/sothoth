@@ -10395,6 +10395,50 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(["core/ipsec_main.so", "plugins/ipsec_helper.so"], (input_dir / "module-files.list").read_text(encoding="utf-8").splitlines())
             self.assertTrue(summary["system_analysis_bypassed"])
 
+    def test_reset_task_for_hard_restart_rebuilds_binary_module_selected_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            input_dir = workspace / "input"
+            input_dir.mkdir(parents=True)
+            task = BinarySecurityTask(
+                id="m1",
+                project_id="p1",
+                name="module-task",
+                task_type=TASK_TYPE_BINARY_MODULE,
+                status="failed",
+                current_stage="binary_to_source",
+                execution_epoch=1,
+                firmware_source="project_filesystem",
+                firmware_path=str(input_dir),
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            task.summary = {
+                "input_dir": str(input_dir),
+                "input_files": [
+                    {"filename": "ipsec_main.so", "relative_path": "core/ipsec_main.so"},
+                    {"filename": "ipsec_helper.so", "relative_path": "plugins/ipsec_helper.so"},
+                ],
+                "module_input": {
+                    "module_name": "ipsec",
+                },
+                "candidate_modules": [],
+                "selected_modules": [],
+            }
+
+            self.manager._reset_task_for_hard_restart(task)
+
+            self.assertEqual(2, task.execution_epoch)
+            self.assertEqual("binary_to_source", task.current_stage)
+            self.assertEqual(1, len(task.summary["selected_modules"]))
+            self.assertEqual(1, len(task.summary["candidate_modules"]))
+            self.assertEqual("ipsec", task.summary["selected_modules"][0]["module_name"])
+            self.assertEqual(TASK_TYPE_BINARY_MODULE, task.summary["selected_modules"][0]["task_type"])
+            self.assertEqual(
+                ["core/ipsec_main.so", "plugins/ipsec_helper.so"],
+                (input_dir / "module-files.list").read_text(encoding="utf-8").splitlines(),
+            )
+
     def test_entry_analysis_inputs_rebuild_from_binary_to_source_stage_items(self):
         task = BinarySecurityTask(
             id="t1",
