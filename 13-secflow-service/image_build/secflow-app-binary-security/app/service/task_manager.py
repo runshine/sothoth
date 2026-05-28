@@ -7326,6 +7326,13 @@ class TaskManager:
         for item in stale_rows:
             if item.id in local_workers:
                 continue
+            if str(item.downstream_task_id or "").strip():
+                # Streaming tail items that already own a downstream task must
+                # be reconciled against the child service instead of being
+                # locally re-queued by an elapsed-time heuristic. Otherwise a
+                # still-pending child can be recreated repeatedly while the
+                # downstream task remains valid.
+                continue
             reference_time = item.updated_at or item.started_at or item.created_at
             elapsed_seconds = _elapsed_seconds_since(reference_time)
             if elapsed_seconds is None or elapsed_seconds < timeout_seconds:

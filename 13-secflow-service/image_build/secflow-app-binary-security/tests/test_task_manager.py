@@ -980,7 +980,8 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("si-df", seeded.input_ref["upstream_item_id"])
 
     def test_reclaim_stale_streaming_stage_items_resets_dispatching_vuln_item(self):
-        self.manager.cfg.service.dispatch_timeout_seconds = 60
+        original_loader = self.manager._load_service_config
+        self.manager._load_service_config = lambda db: SimpleNamespace(dispatch_timeout_seconds=60)
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -1011,11 +1012,57 @@ class TaskManagerTests(unittest.TestCase):
         )
         db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
 
-        reclaimed = self.manager._reclaim_stale_streaming_stage_items_locked(db)
+        try:
+            reclaimed = self.manager._reclaim_stale_streaming_stage_items_locked(db)
+        finally:
+            self.manager._load_service_config = original_loader
 
         self.assertTrue(reclaimed)
         self.assertEqual("pending", item.status)
         self.assertTrue(any(event.event_type == "streaming_stage_item_dispatch_reclaimed" for event in db.events))
+
+    def test_reclaim_stale_streaming_stage_items_skips_item_with_downstream_task(self):
+        original_loader = self.manager._load_service_config
+        self.manager._load_service_config = lambda db: SimpleNamespace(dispatch_timeout_seconds=60)
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        item = BinarySecurityStageItem(
+            id="si-vuln",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-vuln",
+            stage_name="vuln_scan",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="dispatching",
+            downstream_service="dataflow_vuln_scanner",
+            downstream_task_id="tt-existing",
+            started_at=_now() - timedelta(seconds=180),
+            updated_at=_now() - timedelta(seconds=180),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+        try:
+            reclaimed = self.manager._reclaim_stale_streaming_stage_items_locked(db)
+        finally:
+            self.manager._load_service_config = original_loader
+
+        self.assertFalse(reclaimed)
+        self.assertEqual("dispatching", item.status)
+        self.assertFalse(any(event.event_type == "streaming_stage_item_dispatch_reclaimed" for event in db.events))
 
     def test_task_needs_downstream_reconcile_skips_streaming_tail_task(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
