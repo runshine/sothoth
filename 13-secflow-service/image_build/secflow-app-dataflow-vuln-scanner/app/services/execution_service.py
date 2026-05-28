@@ -4653,6 +4653,7 @@ class ExecutionService:
         trigger.retry_count = int(trigger.retry_count or 0) + 1
         trigger.latest_abnormal_reason_json = None
         db.add(trigger)
+        self._refresh_task_list_projection_for_task_id(db, trigger.id)
         db.commit()
         self.record_event(
             db,
@@ -6026,6 +6027,10 @@ class ExecutionService:
             profile_id=definition.id,
             status_text="pending",
         )
+        if trigger is not None:
+            self._refresh_task_list_projection_for_task_id(db, trigger.id)
+        else:
+            self._refresh_task_list_projection_for_execution(db, execution)
         db.commit()
         self.record_event(
             db,

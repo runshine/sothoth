@@ -11,7 +11,7 @@ from fastapi import HTTPException
 from app.config import get_config
 from app.main import create_app
 from app.artifacts.io import write_json
-from app.models.database import RunIndex, TriggerTask, WorkflowDefinitionVersion, WorkflowExecution, WorkflowExecutionEvent, get_db_session
+from app.models.database import DfvsTaskListProjection, RunIndex, TriggerTask, WorkflowDefinitionVersion, WorkflowExecution, WorkflowExecutionEvent, get_db_session
 from app.services.execution_service import get_execution_service
 from app.time_utils import isoformat_local, now_local
 
@@ -168,6 +168,71 @@ def test_profiles_tasks_and_effective_config(service_config_path, patch_mock_age
     assert retry.status_code == 202
     assert retry.json()["latest_execution_id"] != execution_id
     _wait_for_task_status(client, task_id)
+
+def test_task_retry_refreshes_projection_latest_execution(service_config_path, patch_mock_agent_runtime, monkeypatch):
+    _disable_scheduler_start(monkeypatch)
+    app = create_app()
+    client = TestClient(app)
+
+    create_profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload())
+    assert create_profile.status_code == 201
+    profile_id = create_profile.json()["profile_id"]
+
+    task = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile_id,
+            "title": "projection retry demo",
+            "task_markdown": "# Package List\n\n- demo.tar.gz\n",
+            "artifact_refs": [],
+            "runtime_overrides": {},
+        },
+    )
+    assert task.status_code == 201
+    task_payload = task.json()
+    task_id = task_payload["task_id"]
+    initial_execution_id = task_payload["latest_execution_id"]
+
+    with get_db_session() as db:
+        trigger = db.get(TriggerTask, task_id)
+        execution = db.get(WorkflowExecution, initial_execution_id)
+        projection = db.get(DfvsTaskListProjection, task_id)
+        assert trigger is not None and execution is not None and projection is not None
+
+        finished_at = now_local()
+        trigger.status = "succeeded"
+        trigger.public_status = "succeeded"
+        trigger.message = "done"
+        trigger.finished_at = finished_at
+        execution.status = "succeeded"
+        execution.public_status = "succeeded"
+        execution.dispatch_status = "succeeded"
+        execution.message = "done"
+        execution.finished_at = finished_at
+        db.add_all([trigger, execution])
+        get_execution_service()._refresh_task_list_projection_for_task_id(db, task_id)
+        db.commit()
+
+        projection = db.get(DfvsTaskListProjection, task_id)
+        assert projection is not None
+        assert projection.latest_execution_id == initial_execution_id
+        assert projection.public_status == "success"
+
+    retry = client.post(f"/api/dataflow-vuln-scanner/tasks/{task_id}/retry", json={"extra_cycles": 1})
+    assert retry.status_code == 202
+    retry_payload = retry.json()
+    next_execution_id = retry_payload["latest_execution_id"]
+    assert next_execution_id != initial_execution_id
+
+    with get_db_session() as db:
+        trigger = db.get(TriggerTask, task_id)
+        projection = db.get(DfvsTaskListProjection, task_id)
+        assert trigger is not None and projection is not None
+        assert trigger.latest_execution_id == next_execution_id
+        assert projection.latest_execution_id == next_execution_id
+        assert projection.public_status == "pending"
+        assert str(projection.message or "").startswith("pending start")
 
 
 def test_task_apis_accept_machine_subject(service_config_path, patch_mock_agent_runtime, monkeypatch):

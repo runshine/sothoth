@@ -12,6 +12,7 @@ from sqlalchemy import inspect, text
 from app.config import get_config
 from app.main import create_app
 from app.models.database import (
+    DfvsTaskListProjection,
     RunIndex,
     RunIndexCycle,
     TriggerTask,
@@ -979,6 +980,13 @@ def test_run_retry_queue_cancel_and_delete(service_config_path, monkeypatch):
     assert retry_payload["message"] == "Run resume queued"
     assert retry_payload["linked_task_id"]
     assert retry_payload["linked_execution_id"]
+
+    with get_db_session() as db:
+        projection = db.get(DfvsTaskListProjection, bound["task_id"])
+        assert projection is not None
+        assert projection.latest_execution_id == retry_payload["linked_execution_id"]
+        assert projection.public_status == "pending"
+        assert str(projection.message or "").startswith("pending start")
 
     detail_queued = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
     assert detail_queued.status_code == 200
