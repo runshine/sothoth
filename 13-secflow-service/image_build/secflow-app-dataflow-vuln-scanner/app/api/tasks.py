@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.api.dependencies import ensure_project_access, get_current_or_machine_subject, get_current_subject, get_db
 from app.config import get_config
+from app.models.database import WorkflowExecution
 from app.schemas import (
     CreateEvolutionTaskRequest,
     DataflowTaskTimelineActionResponse,
@@ -104,6 +105,7 @@ async def create_task(
     principal, token = subject
     await ensure_project_access(payload.project_id, token)
     created = get_execution_service().create_scan_task(db, payload, principal, authorization_token=token)
+    get_scheduler_service().start_execution_now(created.latest_execution_id)
     db.expire_all()
     return get_execution_service().get_scan_task_summary(db, created.task_id, principal)
 
@@ -214,25 +216,25 @@ def get_task(task_id: str, subject=Depends(get_current_or_machine_subject), db: 
 
 
 @router.post("/tasks/{task_id}/projection/rebuild", response_model=ScanTaskProjectionRepairResponse)
-def rebuild_task_projection(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
+async def rebuild_task_projection(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().rebuild_single_scan_task_projection(db, task_id, principal)
 
 
 @router.get("/tasks/{task_id}/timeline", response_model=DataflowTaskTimelineResponse)
-def get_task_timeline(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
+async def get_task_timeline(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().get_scan_task_timeline(db, task_id, principal)
 
 
 @router.delete("/tasks/{task_id}/timeline", response_model=DataflowTaskTimelineActionResponse)
-def clear_task_timeline(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
+async def clear_task_timeline(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().clear_scan_task_timeline(db, task_id, principal)
 
 
 @router.delete("/tasks/{task_id}/timeline/{event_id}", response_model=DataflowTaskTimelineActionResponse)
-def delete_task_timeline_event(
+async def delete_task_timeline_event(
     task_id: str,
     event_id: str,
     subject=Depends(get_current_or_machine_subject),
@@ -263,6 +265,7 @@ async def create_evolution_task(
         principal=principal,
         authorization_token=token,
     )
+    get_scheduler_service().start_execution_now(created.latest_execution_id)
     db.expire_all()
     return get_execution_service().get_scan_task_summary(db, created.task_id, principal)
 
@@ -286,7 +289,8 @@ async def retry_task(
 ):
     principal, _ = subject
     result = get_execution_service().retry_scan_task(db, task_id, principal, payload)
-    db.expire_all()
+    if get_scheduler_service().start_execution_now(result.get("linked_execution_id")):
+        db.expire_all()
     return get_execution_service().get_scan_task_summary(db, task_id, principal)
 
 
@@ -334,25 +338,25 @@ async def resolve_run_by_task(
 
 
 @router.get("/runs/{run_id}", response_model=RunOverviewResponse)
-def get_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+async def get_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().get_run(db, run_id, principal)
 
 
 @router.get("/runs/{run_id}/overview", response_model=RunOverviewResponse)
-def get_run_overview(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+async def get_run_overview(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().get_run_overview(db, run_id, principal)
 
 
 @router.get("/runs/{run_id}/detail", response_model=RunDetailResponse)
-def get_run_detail(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+async def get_run_detail(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().get_run_detail_full(db, run_id, principal)
 
 
 @router.post("/runs/{run_id}/report-vulnerabilities", response_model=RunVulnReportResponse)
-def report_run_vulnerabilities(
+async def report_run_vulnerabilities(
     run_id: str,
     payload: RunVulnReportRequest,
     subject=Depends(get_current_subject),
@@ -363,7 +367,7 @@ def report_run_vulnerabilities(
 
 
 @router.get("/runs/{run_id}/cycles/{cycle}", response_model=RunCycleResponse)
-def get_run_cycle(
+async def get_run_cycle(
     run_id: str,
     cycle: int,
     subject=Depends(get_current_subject),
@@ -374,13 +378,13 @@ def get_run_cycle(
 
 
 @router.get("/runs/{run_id}/sessions", response_model=List[RunSessionResponse])
-def list_run_sessions(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+async def list_run_sessions(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().list_run_sessions(db, run_id, principal)
 
 
 @router.get("/runs/{run_id}/files", response_model=List[RunFileResponse])
-def list_run_files(
+async def list_run_files(
     run_id: str,
     limit: int = Query(default=1200, ge=1, le=5000),
     subject=Depends(get_current_subject),
@@ -391,7 +395,7 @@ def list_run_files(
 
 
 @router.get("/runs/{run_id}/file", response_model=RunFileContentResponse)
-def get_run_file(
+async def get_run_file(
     run_id: str,
     path: str = Query(...),
     subject=Depends(get_current_subject),
@@ -402,7 +406,7 @@ def get_run_file(
 
 
 @router.get("/runs/{run_id}/session-file", response_model=Dict[str, Any])
-def get_run_session_file(
+async def get_run_session_file(
     run_id: str,
     path: str = Query(...),
     subject=Depends(get_current_subject),
@@ -413,7 +417,7 @@ def get_run_session_file(
 
 
 @router.get("/runs/{run_id}/log", response_model=RunLogResponse)
-def get_run_log(
+async def get_run_log(
     run_id: str,
     lines: int = Query(default=300, ge=1, le=2000),
     subject=Depends(get_current_subject),
@@ -424,25 +428,25 @@ def get_run_log(
 
 
 @router.delete("/runs/{run_id}", response_model=RunMutationResponse)
-def delete_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+async def delete_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().delete_run(db, run_id, principal)
 
 
 @router.post("/runs/{run_id}/cancel", response_model=RunMutationResponse)
-def cancel_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+async def cancel_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().cancel_run(db, run_id, principal)
 
 
 @router.post("/runs/{run_id}/adopt", response_model=RunMutationResponse)
-def adopt_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+async def adopt_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().adopt_run(db, run_id, principal)
 
 
 @router.post("/runs/{run_id}/retry/preview", response_model=RunResumePreviewResponse)
-def preview_retry_run(
+async def preview_retry_run(
     run_id: str,
     payload: RunRetryRequest | None = Body(default=None),
     subject=Depends(get_current_subject),
@@ -457,7 +461,7 @@ def preview_retry_run(
     response_model=RunMutationResponse,
     status_code=status.HTTP_202_ACCEPTED,
 )
-def retry_run(
+async def retry_run(
     run_id: str,
     payload: RunRetryRequest,
     subject=Depends(get_current_subject),
@@ -465,24 +469,40 @@ def retry_run(
 ):
     principal, _ = subject
     result = get_execution_service().retry_run(db, run_id, principal, payload)
-    db.expire_all()
+    if get_scheduler_service().start_execution_now(result.get("linked_execution_id")):
+        db.expire_all()
+        execution = db.get(WorkflowExecution, result.get("linked_execution_id"))
+        if execution is not None and execution.status == "running":
+            result["status"] = "running"
+            result["message"] = "Run resume started"
+        elif execution is not None and execution.dispatch_status in {"queued", "dispatching"}:
+            result["status"] = "queued"
+            result["message"] = "Run resume queued"
     return result
 
 
 @router.post("/tasks/{task_id}/cancel", response_model=ScanTaskResponse)
+<<<<<<< HEAD
 def cancel_task(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
+=======
+async def cancel_task(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
+>>>>>>> 928593d2 (fix(dfvs): restore new task api contracts on v2.1)
     principal, _ = subject
     return get_execution_service().cancel_scan_task(db, task_id, principal)
 
 
 @router.delete("/tasks/{task_id}", response_model=SuccessResponse)
+<<<<<<< HEAD
 def delete_task(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
+=======
+async def delete_task(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
+>>>>>>> 928593d2 (fix(dfvs): restore new task api contracts on v2.1)
     principal, _ = subject
     return get_execution_service().delete_scan_task(db, task_id, principal)
 
 
 @router.post("/tasks/{task_id}/priority", response_model=ScanTaskResponse)
-def update_task_priority(
+async def update_task_priority(
     task_id: str,
     payload: ScanTaskPriorityUpdateRequest,
     subject=Depends(get_current_or_machine_subject),

@@ -302,6 +302,7 @@ class ScanTaskStatsResponse(BaseModel):
     succeeded: int = 0
     failed: int = 0
     cancelled: int = 0
+
 class ScanTaskProjectionRepairResponse(BaseModel):
     status: str = "success"
     task_id: Optional[str] = None
