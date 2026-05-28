@@ -3508,7 +3508,13 @@ class TaskManager:
                 # The exception is raised by downstream fetch only. Rolling the
                 # whole session back here would also discard already-synced
                 # sibling items from earlier loop iterations.
-                if apply_state:
+                notfound_apply_state = bool(apply_state)
+                if not notfound_apply_state and stage_name and not item_id:
+                    notfound_apply_state = bool(
+                        force
+                        or str(before_status or "").strip().lower() in {"queued", "running", "dispatching"}
+                    )
+                if notfound_apply_state:
                     self._enqueue_downstream_terminal_event(
                         db,
                         task=task,
@@ -3559,8 +3565,8 @@ class TaskManager:
                 self._record_event(
                     db,
                     task,
-                    "downstream_status_synced" if apply_state else "downstream_status_sync_skipped",
-                    "下游子任务不存在，已投递 reducer 串行更新事件" if apply_state else "下游子任务不存在，本次仅观测未写回状态",
+                    "downstream_status_synced" if notfound_apply_state else "downstream_status_sync_skipped",
+                    "下游子任务不存在，已投递 reducer 串行更新事件" if notfound_apply_state else "下游子任务不存在，本次仅观测未写回状态",
                     level="warning",
                     stage_name=item_stage_name,
                     item=item,
@@ -3571,7 +3577,7 @@ class TaskManager:
                         "error_type": "not_found",
                         "status_raw": "downstream_missing",
                         "mapped_status": "downstream_missing",
-                        "state_applied": bool(apply_state),
+                        "state_applied": bool(notfound_apply_state),
                         "before_status": before_status,
                         "downstream_status": "downstream_missing",
                         "after_status": "downstream_missing",
@@ -3617,10 +3623,11 @@ class TaskManager:
             self._refresh_task_status_after_sync(db, task)
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
         db.commit()
+        response_synced_count = synced_count if apply_state else min(synced_count, len(touched_stages))
         return BinarySecurityActionResponse(
             task_id=task.id,
-            message=f"下游状态同步完成：更新 {synced_count} 个，跳过 {skipped_count} 个，失败 {failed_count} 个",
-            synced_downstream_count=synced_count,
+            message=f"下游状态同步完成：更新 {response_synced_count} 个，跳过 {skipped_count} 个，失败 {failed_count} 个",
+            synced_downstream_count=response_synced_count,
             skipped_downstream_count=skipped_count,
             failed_downstream_count=failed_count,
         )
@@ -12817,6 +12824,48 @@ class TaskManager:
         item: BinarySecurityStageItem,
         token: str | None,
     ) -> dict[str, Any]:
+        normalized_status = str(item.status or "").strip().lower()
+        if str(item.downstream_task_id or "").strip():
+            if normalized_status in {"running", "dispatching"}:
+                try:
+                    payload = await self._fetch_downstream_task_payload(task, item, token or "")
+                except Exception:
+                    payload = None
+                mapped = self._map_downstream_status(str((payload or {}).get("status") or ""))
+                if payload and mapped == "running":
+                    return {"outcome": "already_running", "payload": payload}
+            else:
+                try:
+                    payload = await self._invoke_existing_downstream_retry(
+                        stage_name,
+                        task=task,
+                        item=item,
+                        token=token,
+                    )
+                    return {"outcome": "accepted", "payload": payload}
+                except ValidationError as exc:
+                    message = self._extract_downstream_error_text(exc) or str(exc)
+                    if self._is_already_running_control_conflict(message):
+                        try:
+                            active_payload = await self._fetch_downstream_task_payload(task, item, token or "")
+                        except Exception:
+                            active_payload = None
+                        mapped = self._map_downstream_status(str((active_payload or {}).get("status") or ""))
+                        if active_payload and mapped == "running":
+                            return {"outcome": "already_running", "payload": active_payload}
+                    return {
+                        "outcome": "invalid_transition",
+                        "retry_outcome": "invalid_transition",
+                        "error_message": message,
+                        "http_status": self._extract_http_status_from_exception(exc),
+                    }
+                except UpstreamError as exc:
+                    return {
+                        "outcome": "transport_error",
+                        "retry_outcome": "transport_error",
+                        "error_message": self._extract_downstream_error_text(exc) or str(exc),
+                        "http_status": self._extract_http_status_from_exception(exc),
+                    }
         try:
             return await self._downstream_tasks().control_existing_child(
                 None,
