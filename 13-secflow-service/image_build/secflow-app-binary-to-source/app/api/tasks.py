@@ -356,6 +356,53 @@ async def get_pi_cluster_capacity(
     )
 
 
+@router.get("/pi-cluster", response_model=PiClusterCapacityResponse)
+async def get_global_pi_cluster_capacity(
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    snapshot = await get_pi_cluster_monitor().refresh()
+    active_jobs_by_worker, worker_job_errors = await _load_worker_active_jobs(snapshot.workers)
+    item_by_job_id, task_by_id = _load_pi_job_item_mapping(
+        db,
+        project_id=None,
+        pi_job_ids=[
+            job.pi_job_id
+            for jobs in active_jobs_by_worker.values()
+            for job in jobs
+            if job.pi_job_id
+        ],
+    )
+    workers = []
+    for worker in snapshot.workers:
+        detail_error = worker_job_errors.get(worker.worker_id)
+        active_jobs = [
+            _build_active_job_response(job, item_by_job_id=item_by_job_id, task_by_id=task_by_id)
+            for job in active_jobs_by_worker.get(worker.worker_id, [])
+        ] if worker.healthy and not detail_error else []
+        workers.append(PiWorkerCapacityResponse(
+            worker_id=worker.worker_id,
+            url=worker.url,
+            healthy=worker.healthy,
+            max_concurrent_jobs=worker.max_concurrent_jobs,
+            running_jobs=worker.running_jobs,
+            queued_jobs=worker.queued_jobs,
+            available_slots=max(0, worker.max_concurrent_jobs - worker.running_jobs) if worker.healthy else 0,
+            source=worker.source,
+            error=_merge_worker_error(worker.error, detail_error),
+            active_jobs=active_jobs,
+        ))
+    return PiClusterCapacityResponse(
+        worker_count=snapshot.worker_count,
+        total_capacity=snapshot.total_capacity,
+        running_jobs=snapshot.running_jobs,
+        queued_jobs=snapshot.queued_jobs,
+        available_slots=snapshot.available_slots,
+        updated_at=snapshot.updated_at,
+        workers=workers,
+    )
+
+
 async def _load_worker_active_jobs(workers: list[PiWorkerSnapshot]) -> tuple[dict[str, list[PiWorkerActiveJobSnapshot]], dict[str, str]]:
     healthy_workers = [worker for worker in workers if worker.healthy]
     results = await asyncio.gather(*(fetch_worker_active_jobs(worker) for worker in healthy_workers), return_exceptions=True)
@@ -370,14 +417,14 @@ async def _load_worker_active_jobs(workers: list[PiWorkerSnapshot]) -> tuple[dic
     return active_jobs_by_worker, worker_errors
 
 
-def _load_pi_job_item_mapping(db: Session, *, project_id: str, pi_job_ids: list[str]) -> tuple[dict[str, B2STaskItem], dict[str, B2STask]]:
+def _load_pi_job_item_mapping(db: Session, *, project_id: str | None, pi_job_ids: list[str]) -> tuple[dict[str, B2STaskItem], dict[str, B2STask]]:
     normalized_job_ids = sorted({str(job_id or "").strip() for job_id in pi_job_ids if str(job_id or "").strip()})
     if not normalized_job_ids:
         return {}, {}
-    items = db.query(B2STaskItem).filter(
-        B2STaskItem.project_id == project_id,
-        B2STaskItem.pi_job_id.in_(normalized_job_ids),
-    ).all()
+    query = db.query(B2STaskItem).filter(B2STaskItem.pi_job_id.in_(normalized_job_ids))
+    if str(project_id or "").strip():
+        query = query.filter(B2STaskItem.project_id == project_id)
+    items = query.all()
     item_by_job_id = {
         str(item.pi_job_id or "").strip(): item
         for item in items
