@@ -647,6 +647,7 @@ class ExecutionService:
             "passed_count": row.run_passed_count,
             "failed_count": row.run_failed_count,
             "workflow_mode": row.run_workflow_mode,
+            "review_profile": "",
             "duration_seconds": row.run_duration_seconds,
             "start_epoch": row.run_start_epoch,
             "name": row.run_name,

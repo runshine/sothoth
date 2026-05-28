@@ -75,6 +75,20 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _extract_review_profile(config: dict[str, Any] | None) -> str:
+    payload = config if isinstance(config, dict) else {}
+    direct = str(payload.get("review_profile") or "").strip()
+    if direct:
+        return direct
+    for workflow in ((payload.get("workflows") or {}).get("atomic") or []):
+        if not isinstance(workflow, dict):
+            continue
+        engine = workflow.get("engine")
+        if isinstance(engine, dict) and (engine.get("review_profile") or workflow.get("id") == "vuln_scan"):
+            return str(engine.get("review_profile") or "").strip()
+    return ""
+
+
 def _parse_datetime(value: str | None) -> datetime | None:
     text = str(value or "").strip()
     if not text:
@@ -1352,7 +1366,7 @@ class RunIndexService:
             "model": run_index.model,
             "provider": run_index.provider,
             "thinking": run_index.thinking,
-            "review_profile": str(config.get("review_profile") or ""),
+            "review_profile": _extract_review_profile(config),
             "max_cycles": run_index.max_cycles,
             "cycles_used": run_index.cycles_used,
             "result_count": run_index.result_count,
@@ -1553,6 +1567,11 @@ class RunIndexService:
             command = []
         command_display = str(cli_payload.get("command_display") or raw_summary.get("command_display") or "")
 
+        persisted_cycles = {
+            int(item.get("cycle") or 0): dict(item)
+            for item in self._cycle_payloads(db, run_index)
+            if int(item.get("cycle") or 0) > 0
+        }
         cached_new_result_counts = {
             int(item.cycle or 0): _safe_int((item.raw_json or {}).get("new_result_count"), 0)
             for item in (
@@ -1565,9 +1584,16 @@ class RunIndexService:
         for cycle in overview.get("cycles") or []:
             item = dict(cycle or {})
             cycle_no = int(item.get("cycle") or 0)
+            persisted = persisted_cycles.get(cycle_no, {})
+            if persisted:
+                for key, value in persisted.items():
+                    if key not in item or item.get(key) in (None, "", [], {}, 0):
+                        item[key] = value
             if _safe_int(item.get("new_result_count"), 0) <= 0 and cached_new_result_counts.get(cycle_no, 0) > 0:
                 item["new_result_count"] = cached_new_result_counts[cycle_no]
             cycles.append(item)
+        if not cycles and persisted_cycles:
+            cycles = [persisted_cycles[key] for key in sorted(persisted_cycles)]
 
         config = dict(overview.get("config") or {})
         payload = {
@@ -1593,7 +1619,7 @@ class RunIndexService:
             "model": str(overview.get("model") or config.get("model") or run_index.model or ""),
             "provider": str(overview.get("provider") or config.get("provider") or run_index.provider or ""),
             "thinking": str(overview.get("thinking") or config.get("thinking") or run_index.thinking or ""),
-            "review_profile": str(overview.get("review_profile") or config.get("review_profile") or ""),
+            "review_profile": str(overview.get("review_profile") or _extract_review_profile(config) or ""),
             "max_cycles": int(overview.get("max_cycles") or config.get("max_review_cycles") or 0),
             "cycles_used": int(overview.get("cycles_used") or 0),
             "result_count": int(overview.get("result_count") or 0),
@@ -1786,7 +1812,12 @@ class RunIndexService:
         return payload
 
     def get_run_cycle(self, db: Session, run_index: RunIndex, cycle: int) -> dict[str, Any]:
-        run_index = self.refresh_run_index(db, run_index, include_runtime_assets=False)
+        run_index = self.refresh_run_index(
+            db,
+            run_index,
+            include_runtime_assets=True,
+            force_runtime_assets=True,
+        )
         cycle_row = (
             db.query(RunIndexCycle)
             .filter(RunIndexCycle.run_index_id == run_index.id, RunIndexCycle.cycle == cycle)

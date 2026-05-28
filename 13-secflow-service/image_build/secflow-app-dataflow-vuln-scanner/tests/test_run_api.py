@@ -1371,29 +1371,27 @@ def test_run_retry_execution_uses_resume_cli_argv(service_config_path, monkeypat
         db.add(run_index)
         db.commit()
 
-    captured: dict[str, list[str]] = {}
-
-    def fake_invoke(self, *, argv, db, execution, trigger):
-        captured["argv"] = list(argv)
-        return 0
-
-    monkeypatch.setattr(type(get_execution_service()), "_invoke_run_vuln_scan_cli", fake_invoke)
-
     retry_response = client.post(
         f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/retry",
         json={"extra_cycles": 2, "model": "mock/override", "thinking": "low"},
     )
     assert retry_response.status_code == 202
+    payload = retry_response.json()
+    assert payload["status"] == "pending"
+    assert payload["message"] == "Run resume queued"
 
-    deadline = time.time() + 5
-    while "argv" not in captured and time.time() < deadline:
-        time.sleep(0.05)
-    assert "argv" in captured
-
-    assert captured["argv"][:4] == ["--resume-run-dir", str(run_root.resolve()), "--extra-cycles", "2"]
-    assert "--model" in captured["argv"]
-    assert "mock/override" in captured["argv"]
-    assert "--thinking" not in captured["argv"]
+    with get_db_session() as db:
+        trigger = db.get(TriggerTask, payload["linked_task_id"])
+        execution = db.get(WorkflowExecution, payload["linked_execution_id"])
+        assert trigger is not None
+        assert execution is not None
+        request_payload = get_execution_service()._trigger_task_metadata(trigger).get("dataflow_scan_request") or {}
+        assert request_payload["resume_run_dir"] == str(run_root.resolve())
+        assert request_payload["resume_extra_cycles"] == 2
+        assert request_payload["model"] == "mock/override"
+        assert "thinking" not in request_payload
+        assert execution.status == "pending"
+        assert execution.dispatch_status in {"queued", "pending", None}
 
 
 def test_run_status_prefers_active_run_meta_over_stale_terminal_state(service_config_path):
