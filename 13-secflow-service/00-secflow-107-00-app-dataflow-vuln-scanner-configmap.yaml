@@ -95,15 +95,24 @@ data:
 
     scheduler:
       enabled: true
+      role: "standalone"
+      pod_namespace: "secflow-ns"
+      worker_headless_service_name: "secflow-app-dataflow-vuln-scanner-worker-headless"
       manager_service_name: "secflow-app-dataflow-vuln-scanner-manager"
       manager_service_port: 80
       worker_capacity: 5
       poll_interval_seconds: 2
       heartbeat_interval_seconds: 5
       worker_timeout_seconds: 300
+      worker_retention_seconds: 1800
       cleanup_interval_seconds: 10
+      reservation_lease_seconds: 30
+      worker_queue_depth: 0
+      dispatch_batch_size: 8
+      requeue_stuck_dispatch_after_seconds: 60
 
     dataflow_worker:
+      advertise_url_template: ""
       api_key: null
       timeout: 30
       dispatch_retry_interval_seconds: 2

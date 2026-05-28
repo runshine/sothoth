@@ -46,6 +46,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             - name: SECFLOW_DATAFLOW_DB_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -153,6 +157,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             - name: SECFLOW_DATAFLOW_DB_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -274,6 +282,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             - name: SECFLOW_DATAFLOW_DB_PASSWORD
               valueFrom:
                 secretKeyRef:

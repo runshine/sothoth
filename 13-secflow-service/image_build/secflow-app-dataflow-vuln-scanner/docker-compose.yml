@@ -1,6 +1,7 @@
 x-dataflow-vuln-scanner-env: &dataflow-vuln-scanner-env
   CONFIG_PATH: /app/config.yaml
   SECFLOW_DATAFLOW_ROLE: ${SECFLOW_DATAFLOW_ROLE:-standalone}
+  POD_NAMESPACE: ${POD_NAMESPACE:-secflow-ns}
   HOME: /root
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}

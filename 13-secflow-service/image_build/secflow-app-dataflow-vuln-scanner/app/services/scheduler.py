@@ -158,10 +158,21 @@ class SchedulerService:
             "worker_enabled": "true" if self.runs_worker else "false",
         }
 
-    def configured_worker_urls(self) -> list[str]:
-        cfg = get_config().dataflow_worker
-        workers = [url.rstrip("/") for url in (cfg.worker_urls or []) if url and url.strip()]
-        return workers or [cfg.base_url.rstrip("/")]
+    def advertise_url(self) -> str:
+        template = str(get_config().dataflow_worker.advertise_url_template or "").strip()
+        scheduler_cfg = get_config().scheduler
+        if template:
+            return template.format(
+                pod_id=self.pod_id,
+                host_name=self.host_name,
+                pod_namespace=scheduler_cfg.pod_namespace,
+                headless_service_name=scheduler_cfg.worker_headless_service_name,
+            ).rstrip("/")
+        return (
+            f"http://{self.pod_id}."
+            f"{scheduler_cfg.worker_headless_service_name}."
+            f"{scheduler_cfg.pod_namespace}.svc.cluster.local:8080"
+        )
 
     def local_running_count(self) -> int:
         return len(self._running_tasks)
@@ -405,7 +416,11 @@ class SchedulerService:
                     running_count=len(self._running_tasks),
                     last_heartbeat_at=now,
                     status=self._worker_status,
-                    metadata_json={"service": "secflow-app-dataflow-vuln-scanner", "role": self.role},
+                    metadata_json={
+                        "service": "secflow-app-dataflow-vuln-scanner",
+                        "role": self.role,
+                        "advertise_url": self.advertise_url(),
+                    },
                 )
             else:
                 # Do not inherit stale DB "draining" on process startup; a restarted
@@ -421,7 +436,11 @@ class SchedulerService:
                 worker.running_count = len(self._running_tasks)
                 worker.last_heartbeat_at = now
                 worker.status = self._worker_status
-                worker.metadata_json = {"service": "secflow-app-dataflow-vuln-scanner", "role": self.role}
+                worker.metadata_json = {
+                    "service": "secflow-app-dataflow-vuln-scanner",
+                    "role": self.role,
+                    "advertise_url": self.advertise_url(),
+                }
             db.add(worker)
             db.commit()
             self._heartbeat_published = True
@@ -710,8 +729,9 @@ class SchedulerService:
             trigger = db.get(TriggerTask, execution.trigger_task_id)
             if trigger is None or trigger.status != "pending":
                 return False
-            worker_url = self._choose_dataflow_worker(db, execution_id)
+            worker_pod_id, worker_url = self._choose_dataflow_worker(db, execution_id)
             message = f"dispatching to worker {worker_url}"
+            lease_expires_at = now_local() + timedelta(seconds=max(1, int(get_config().scheduler.reservation_lease_seconds or 30)))
             updated_execution = (
                 db.query(WorkflowExecution)
                 .filter(
@@ -723,6 +743,7 @@ class SchedulerService:
                 )
                 .update(
                     {
+                        WorkflowExecution.owner_pod_id: worker_pod_id,
                         WorkflowExecution.worker_url: worker_url,
                         WorkflowExecution.worker_job_id: execution.id,
                         WorkflowExecution.dispatch_status: "dispatching",
@@ -743,6 +764,15 @@ class SchedulerService:
             if updated_trigger != 1:
                 db.rollback()
                 return False
+            db.add(
+                SchedulerWorkerSlotReservation(
+                    reservation_id=f"rsv-{execution_id}",
+                    worker_pod_id=worker_pod_id,
+                    execution_id=execution_id,
+                    status="accepted",
+                    lease_expires_at=lease_expires_at,
+                )
+            )
             db.commit()
         finally:
             db.close()
@@ -754,6 +784,7 @@ class SchedulerService:
                     {
                         "execution_id": execution_id,
                         "worker_url": worker_url,
+                        "worker_pod_id": worker_pod_id,
                     }
                 )
                 self._mark_dispatch_success(execution_id, worker_url, job)
@@ -766,18 +797,35 @@ class SchedulerService:
         self._mark_dispatch_failure(execution_id, worker_url, last_error or "dataflow worker dispatch failed")
         return False
 
-    def _choose_dataflow_worker(self, db: Session, execution_id: str) -> str:
-        workers = self.configured_worker_urls()
+    def _choose_dataflow_worker(self, db: Session, execution_id: str) -> tuple[str, str]:
+        workers = self._healthy_registry_workers(db)
+        if not workers:
+            raise DataflowWorkerError("no healthy registry worker available")
         if len(workers) == 1:
-            return workers[0]
+            worker = workers[0]
+            worker_url = self._worker_url_from_registry(worker)
+            if not worker_url:
+                raise DataflowWorkerError("no healthy registry worker available")
+            return str(worker.pod_id), worker_url
 
-        counts = {worker: 0 for worker in workers}
+        registry_worker_urls: dict[str, str] = {}
+        counts: dict[str, int] = {}
         for worker in workers:
+            worker_url = self._worker_url_from_registry(worker)
+            if not worker_url:
+                continue
+            pod_id = str(worker.pod_id)
+            registry_worker_urls[pod_id] = worker_url
+            counts[pod_id] = 0
+        if not counts:
+            raise DataflowWorkerError("no healthy registry worker available")
+
+        for pod_id, worker_url in registry_worker_urls.items():
             try:
-                jobs = get_dataflow_worker_client(worker).list_jobs()
-                counts[worker] += sum(1 for job in jobs if str(job.get("status") or "") in ACTIVE_JOB_STATUSES)
+                jobs = get_dataflow_worker_client(worker_url).list_jobs()
+                counts[pod_id] += sum(1 for job in jobs if str(job.get("status") or "") in ACTIVE_JOB_STATUSES)
             except Exception:
-                counts[worker] += 1_000_000
+                counts[pod_id] += 1_000_000
 
         active_executions = (
             db.query(WorkflowExecution)
@@ -785,12 +833,35 @@ class SchedulerService:
             .all()
         )
         for execution in active_executions:
-            worker_url = str(execution.worker_url or "").rstrip("/")
-            if worker_url in counts:
-                counts[worker_url] += 1
+            owner_pod_id = str(execution.owner_pod_id or "").strip()
+            if owner_pod_id in counts:
+                counts[owner_pod_id] += 1
+
+        for pod_id, reserved_count in self._reservation_counts(db).items():
+            if pod_id in counts:
+                counts[pod_id] += reserved_count
 
         salt = int(hashlib.sha256(execution_id.encode("utf-8")).hexdigest(), 16)
-        return min(enumerate(workers), key=lambda item: (counts[item[1]], (item[0] - salt) % len(workers)))[1]
+        ordered_pod_ids = list(registry_worker_urls.keys())
+        _, best_pod_id = min(
+            enumerate(ordered_pod_ids),
+            key=lambda item: (counts[item[1]], (item[0] - salt) % len(ordered_pod_ids)),
+        )
+        return best_pod_id, registry_worker_urls[best_pod_id]
+
+    def _healthy_registry_workers(self, db: Session) -> list[SchedulerWorker]:
+        worker_timeout_at = now_local() - timedelta(seconds=get_config().scheduler.worker_timeout_seconds)
+        workers = (
+            db.query(SchedulerWorker)
+            .filter(
+                SchedulerWorker.status == "active",
+                SchedulerWorker.last_heartbeat_at.isnot(None),
+                SchedulerWorker.last_heartbeat_at >= worker_timeout_at,
+            )
+            .order_by(SchedulerWorker.last_heartbeat_at.desc(), SchedulerWorker.pod_id.asc())
+            .all()
+        )
+        return [worker for worker in workers if self._worker_url_from_registry(worker)]
 
     def _reservation_counts(self, db: Session) -> dict[str, int]:
         rows = (

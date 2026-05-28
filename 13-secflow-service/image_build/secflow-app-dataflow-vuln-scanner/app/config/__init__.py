@@ -145,9 +145,10 @@ class ServiceConfig(BaseModel):
 
 class SchedulerConfig(BaseModel):
     enabled: bool = True
-    # standalone keeps the historical single-pod behavior. api serves public
-    # management traffic only; manager owns dispatch; worker accepts explicitly
-    # assigned HTTP jobs.
+    # api serves public management traffic only; manager owns registry-based
+    # dispatch; worker accepts explicitly assigned HTTP jobs. standalone keeps a
+    # single-process development topology while still using registry-based
+    # worker discovery/dispatch semantics.
     role: str = Field(default_factory=lambda: os.getenv("SECFLOW_DATAFLOW_ROLE") or os.getenv("ROLE") or "standalone")
     pod_id: str = Field(default_factory=lambda: os.getenv("POD_ID") or os.getenv("HOSTNAME") or "local-pod")
     host_name: str = Field(default_factory=lambda: os.getenv("HOSTNAME") or "localhost")

@@ -20,6 +20,16 @@ def _deep_merge(base: Any, override: Any) -> Any:
     return override if override is not None else base
 
 
+def _prune_to_schema(payload: Any, schema: Any) -> Any:
+    if isinstance(payload, dict) and isinstance(schema, dict):
+        pruned: dict[str, Any] = {}
+        for key, schema_value in schema.items():
+            if key in payload:
+                pruned[key] = _prune_to_schema(payload[key], schema_value)
+        return pruned
+    return payload
+
+
 def _default_payload() -> dict[str, Any]:
     config: Config = get_config()
     return {
@@ -50,16 +60,7 @@ def _default_payload() -> dict[str, Any]:
 
 def _sanitize_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
     data = dict(payload or {})
-    scheduler = dict(data.get("scheduler") or {})
-    scheduler.pop("discovery_mode", None)
-    data["scheduler"] = scheduler
-
-    worker_cfg = dict(data.get("dataflow_worker") or {})
-    worker_cfg.pop("base_url", None)
-    worker_cfg.pop("worker_urls", None)
-    worker_cfg.pop("worker_url_template", None)
-    data["dataflow_worker"] = worker_cfg
-    return data
+    return _prune_to_schema(data, _default_payload())
 
 
 class RuntimeConfigService:

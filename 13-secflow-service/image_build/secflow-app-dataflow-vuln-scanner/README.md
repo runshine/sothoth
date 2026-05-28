@@ -887,6 +887,14 @@ docker run --rm -it --entrypoint bash secflow-app-dataflow-vuln-scanner:latest
 
 ### 9. K8S
 
+调度拓扑说明：
+
+- 当前微服务只支持基于 registry 的 worker 注册、发现与分发。
+- `api` Pod 仅承接外部接口，并通过 manager 代理内部调度管理接口。
+- `manager` Pod 依据 `SchedulerWorker` 心跳和 `advertise_url` 选择健康 worker 下发任务。
+- `worker` Pod 通过心跳注册自身并接受显式分配的 HTTP job。
+- `standalone` 仅用于开发/单机部署形态，但内部仍使用同一套 registry 调度语义。
+
 K8S 模式下，`/root/.pi/agent/models.json` 只由服务启动时的 `sync_providers_to_pi()` 生成；数据来自平台配置中心的 LLM Provider。`local_pi` 的 `models.json` 配置文件注入是最高优先级来源，内容必须是合法 JSON。不要再创建或挂载运行时 Agent home Secret。
 
 服务数据库密码与服务间 machine token 不再写入 ConfigMap，部署前需要先创建 Secret：
@@ -905,6 +913,12 @@ kubectl -n secflow-ns create secret generic secflow-app-dataflow-vuln-scanner-se
 - `13-secflow-service/00-secflow-107-01-app-dataflow-vuln-scanner-deployment.yaml`
 - `13-secflow-service/00-secflow-107-02-app-dataflow-vuln-scanner-service.yaml`
 - `13-secflow-service/image_build/secflow-app-dataflow-vuln-scanner/k8s-deployment.yaml`
+
+这些清单当前统一采用 `api + manager + worker` 三角色部署：
+
+- `api` 对外提供 `/api/dataflow-vuln-scanner`
+- `manager` 负责 registry 调度与管理接口
+- `worker` 通过 headless service 注册并承接执行
 
 历史清单文件也可能仍保留在 `00-secflow-103-*`：
 

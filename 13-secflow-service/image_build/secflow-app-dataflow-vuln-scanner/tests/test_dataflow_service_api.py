@@ -1570,10 +1570,28 @@ def test_service_runtime_config_roundtrip(service_config_path):
     response = client.get("/api/dataflow-vuln-scanner/service/config")
     assert response.status_code == 200
     payload = response.json()
-    assert "discovery_mode" not in payload["config"]["scheduler"]
-    assert "base_url" not in payload["config"]["dataflow_worker"]
-    assert "worker_urls" not in payload["config"]["dataflow_worker"]
-    assert "worker_url_template" not in payload["config"]["dataflow_worker"]
+    assert set(payload["config"]["scheduler"].keys()) == {
+        "enabled",
+        "role",
+        "worker_capacity",
+        "poll_interval_seconds",
+        "heartbeat_interval_seconds",
+        "worker_timeout_seconds",
+        "worker_retention_seconds",
+        "cleanup_interval_seconds",
+        "reservation_lease_seconds",
+        "worker_queue_depth",
+        "dispatch_batch_size",
+        "requeue_stuck_dispatch_after_seconds",
+        "cluster_capacity_summary_refresh_interval_seconds",
+        "cluster_capacity_summary_stale_after_seconds",
+    }
+    assert set(payload["config"]["dataflow_worker"].keys()) == {
+        "advertise_url_template",
+        "timeout",
+        "dispatch_retry_interval_seconds",
+        "dispatch_max_retries",
+    }
 
     save_response = client.put(
         "/api/dataflow-vuln-scanner/service/config",
@@ -1594,3 +1612,44 @@ def test_service_runtime_config_roundtrip(service_config_path):
     saved = save_response.json()
     assert saved["config"]["scheduler"]["worker_capacity"] == 3
     assert saved["config"]["dataflow_worker"]["advertise_url_template"] == "http://{pod_id}.{headless_service_name}.{pod_namespace}.svc.cluster.local:8080"
+
+
+def test_service_runtime_config_drops_legacy_registry_incompatible_fields(service_config_path):
+    from app.models.database import ServiceRuntimeConfig, get_db_session
+    from app.services.runtime_config_service import SERVICE_RUNTIME_CONFIG_KEY
+
+    db = get_db_session()
+    try:
+        db.merge(
+            ServiceRuntimeConfig(
+                config_key=SERVICE_RUNTIME_CONFIG_KEY,
+                config_json={
+                    "scheduler": {
+                        "enabled": True,
+                        "worker_capacity": 2,
+                        "discovery_mode": "legacy-mixed",
+                    },
+                    "dataflow_worker": {
+                        "timeout": 15,
+                        "base_url": "http://legacy-worker",
+                        "worker_urls": ["http://legacy-a", "http://legacy-b"],
+                        "worker_url_template": "http://legacy-{pod_id}",
+                    },
+                },
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    app = create_app()
+    client = TestClient(app)
+    response = client.get("/api/dataflow-vuln-scanner/service/config")
+    assert response.status_code == 200
+    payload = response.json()["config"]
+    assert payload["scheduler"]["worker_capacity"] == 2
+    assert "discovery_mode" not in payload["scheduler"]
+    assert payload["dataflow_worker"]["timeout"] == 15
+    assert "base_url" not in payload["dataflow_worker"]
+    assert "worker_urls" not in payload["dataflow_worker"]
+    assert "worker_url_template" not in payload["dataflow_worker"]
