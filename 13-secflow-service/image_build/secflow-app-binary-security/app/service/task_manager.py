@@ -12377,7 +12377,7 @@ class TaskManager:
                 payload = None
             if isinstance(payload, dict):
                 mapped_status = self._map_downstream_status(str(payload.get("status") or ""))
-                if mapped_status in {"queued", "running"}:
+                if mapped_status in {"pending", "queued", "dispatching", "running"}:
                     return {
                         "outcome": "already_running",
                         "payload": payload,

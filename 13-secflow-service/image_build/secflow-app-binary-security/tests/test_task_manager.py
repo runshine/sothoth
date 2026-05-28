@@ -7308,6 +7308,56 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("dfa-1", result["payload"]["task_id"])
         self.assertEqual("running", result["payload"]["status"])
 
+    def test_control_existing_vuln_dispatching_task_reuses_without_retry(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            current_stage="vuln_scan",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="item1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="vuln_scan",
+            item_key="entry-1",
+            item_name="entry",
+            parent_key="mod-1",
+            downstream_service="dataflow_vuln_scanner",
+            downstream_task_id="dvs-1",
+            status="running",
+        )
+
+        async def fake_fetch(*args, **kwargs):
+            del args, kwargs
+            return {"task_id": "dvs-1", "status": "dispatching"}
+
+        async def fake_retry(*args, **kwargs):
+            raise AssertionError("retry should not be called for active dispatching vuln task")
+
+        with (
+            patch.object(self.manager, "_fetch_downstream_task_payload", side_effect=fake_fetch),
+            patch.object(self.manager, "_invoke_existing_downstream_retry", side_effect=fake_retry),
+        ):
+            result = asyncio.run(
+                self.manager._control_existing_downstream_task(
+                    "vuln_scan",
+                    task=task,
+                    item=item,
+                    token="tok",
+                )
+            )
+
+        self.assertEqual("already_running", result["outcome"])
+        self.assertEqual("dvs-1", result["payload"]["task_id"])
+        self.assertEqual("dispatching", result["payload"]["status"])
+
     def test_control_existing_downstream_task_marks_transport_error_as_deferred(self):
         task = BinarySecurityTask(
             id="task1",
