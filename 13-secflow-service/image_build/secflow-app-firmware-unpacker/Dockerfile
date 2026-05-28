@@ -150,6 +150,9 @@ COPY start.sh /app/start.sh
 RUN mkdir -p /app/data \
     && chmod +x /app/start.sh
 
+ARG SECFLOW_BUILD_VERSION=dev
+RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
+
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
