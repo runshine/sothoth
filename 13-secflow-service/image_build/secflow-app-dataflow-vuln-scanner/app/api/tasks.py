@@ -482,21 +482,13 @@ async def retry_run(
 
 
 @router.post("/tasks/{task_id}/cancel", response_model=ScanTaskResponse)
-<<<<<<< HEAD
 def cancel_task(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
-=======
-async def cancel_task(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
->>>>>>> 928593d2 (fix(dfvs): restore new task api contracts on v2.1)
     principal, _ = subject
     return get_execution_service().cancel_scan_task(db, task_id, principal)
 
 
 @router.delete("/tasks/{task_id}", response_model=SuccessResponse)
-<<<<<<< HEAD
 def delete_task(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
-=======
-async def delete_task(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
->>>>>>> 928593d2 (fix(dfvs): restore new task api contracts on v2.1)
     principal, _ = subject
     return get_execution_service().delete_scan_task(db, task_id, principal)
 
