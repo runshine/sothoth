@@ -1,6 +1,8 @@
 import asyncio
 import unittest
 
+from redis.exceptions import TimeoutError as RedisTimeoutError
+
 from app.service.task_queue import TaskQueue
 
 
@@ -49,6 +51,20 @@ class _FakeRedis:
         return None
 
 
+class _FakeRedisTimeout(_FakeRedis):
+    def __init__(self):
+        super().__init__()
+        self.closed = False
+
+    async def blpop(self, key, timeout=0):
+        del key, timeout
+        raise RedisTimeoutError("Timeout reading from redis")
+
+    async def aclose(self):
+        self.closed = True
+        return None
+
+
 class TaskQueueTests(unittest.TestCase):
     def test_push_task_dedupes_same_task_id(self):
         queue = TaskQueue()
@@ -71,6 +87,17 @@ class TaskQueueTests(unittest.TestCase):
 
         self.assertEqual("task-1", popped)
         self.assertEqual(set(), fake.sets[f"{queue.config.task_queue_key}:dedupe"])
+
+    def test_pop_task_treats_redis_timeout_as_empty_poll(self):
+        queue = TaskQueue()
+        fake = _FakeRedisTimeout()
+        queue._client = fake
+
+        popped = asyncio.run(queue.pop_task(timeout_seconds=1))
+
+        self.assertIsNone(popped)
+        self.assertTrue(fake.closed)
+        self.assertIsNone(queue._client)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,8 @@ import unittest
 from datetime import timedelta
 from unittest.mock import patch
 
+from redis.exceptions import TimeoutError as RedisTimeoutError
+
 from app.model import BinarySecurityTask, TASK_TYPE_BINARY
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager, _now
@@ -88,6 +90,68 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             await manager._dispatch_loop()
 
         self.assertEqual(["called", "called"], reconcile_calls)
+
+    async def test_dispatch_loop_does_not_log_crash_for_redis_timeout_empty_poll(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.cfg.queue.enabled = True
+        manager.cfg.queue.block_timeout_seconds = 1
+        reconcile_calls = []
+
+        class _Queue:
+            async def pop_task(self, _timeout_seconds):
+                if not reconcile_calls:
+                    return None
+                manager._running = False
+                return None
+
+        async def _reconcile(_db):
+            reconcile_calls.append("called")
+
+        async def _observe(_db):
+            return None
+
+        manager._reconcile_work_queues = _reconcile
+        manager._observe_runtime_metrics = _observe
+
+        with patch("app.service.task_manager.get_task_queue", return_value=_Queue()), patch(
+            "app.service.task_manager.logger.exception"
+        ) as logger_exception:
+            await manager._dispatch_loop()
+
+        self.assertEqual(["called", "called"], reconcile_calls)
+        logger_exception.assert_not_called()
+
+    async def test_action_dispatch_loop_does_not_log_crash_for_redis_timeout_empty_poll(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.cfg.queue.enabled = True
+        manager.cfg.queue.block_timeout_seconds = 1
+        reconcile_calls = []
+
+        class _Queue:
+            async def pop_action(self, _timeout_seconds):
+                if not reconcile_calls:
+                    return None
+                manager._running = False
+                return None
+
+        async def _reconcile(_db):
+            reconcile_calls.append("called")
+
+        async def _observe(_db):
+            return None
+
+        manager._reconcile_work_queues = _reconcile
+        manager._observe_runtime_metrics = _observe
+
+        with patch("app.service.task_manager.get_task_queue", return_value=_Queue()), patch(
+            "app.service.task_manager.logger.exception"
+        ) as logger_exception:
+            await manager._blocking_action_dispatch_loop()
+
+        self.assertEqual(["called", "called"], reconcile_calls)
+        logger_exception.assert_not_called()
 
     async def test_state_reducer_loop_recovers_from_observe_failure(self):
         manager = TaskManager()

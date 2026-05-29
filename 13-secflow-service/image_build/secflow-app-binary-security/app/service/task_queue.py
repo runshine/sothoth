@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Optional
 
 from redis.asyncio import Redis
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from app.config import get_config
+
+
+logger = logging.getLogger(__name__)
 
 
 class TaskQueue:
@@ -20,7 +25,14 @@ class TaskQueue:
     async def _client_or_create(self) -> Redis:
         async with self._lock:
             if self._client is None:
-                self._client = Redis.from_url(self.config.redis_url, decode_responses=True)
+                self._client = Redis.from_url(
+                    self.config.redis_url,
+                    decode_responses=True,
+                    socket_timeout=max(10, int(self.config.block_timeout_seconds) + 5),
+                    socket_connect_timeout=5,
+                    health_check_interval=30,
+                    socket_keepalive=True,
+                )
             return self._client
 
     async def push_task(self, task_id: str) -> None:
@@ -33,19 +45,38 @@ class TaskQueue:
 
     async def pop_task(self, timeout_seconds: int | None = None) -> Optional[str]:
         client = await self._client_or_create()
-        result = await client.blpop(
-            self.config.task_queue_key,
-            timeout=max(1, int(timeout_seconds or self.config.block_timeout_seconds)),
-        )
+        try:
+            result = await client.blpop(
+                self.config.task_queue_key,
+                timeout=max(1, int(timeout_seconds or self.config.block_timeout_seconds)),
+            )
+        except RedisTimeoutError:
+            await self._reset_client_after_timeout("task")
+            return None
         return await self._consume_result(client, self.config.task_queue_key, result)
 
     async def pop_action(self, timeout_seconds: int | None = None) -> Optional[str]:
         client = await self._client_or_create()
-        result = await client.blpop(
-            self.config.action_queue_key,
-            timeout=max(1, int(timeout_seconds or self.config.block_timeout_seconds)),
-        )
+        try:
+            result = await client.blpop(
+                self.config.action_queue_key,
+                timeout=max(1, int(timeout_seconds or self.config.block_timeout_seconds)),
+            )
+        except RedisTimeoutError:
+            await self._reset_client_after_timeout("action")
+            return None
         return await self._consume_result(client, self.config.action_queue_key, result)
+
+    async def _reset_client_after_timeout(self, queue_name: str) -> None:
+        async with self._lock:
+            client = self._client
+            self._client = None
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                logger.debug("failed closing redis client after %s queue timeout", queue_name, exc_info=True)
+        logger.debug("reset redis client after %s queue blocking pop timeout", queue_name)
 
     async def _push_unique(self, client: Redis, queue_key: str, task_id: str) -> None:
         value = str(task_id or "").strip()
