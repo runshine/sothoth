@@ -49,7 +49,7 @@ class ProjectServiceConfig(BaseModel):
 
 
 class HttpClientConfig(BaseModel):
-    keepalive_expiry_seconds: int = 15
+    keepalive_expiry_seconds: int = 5
     max_keepalive_connections: int = 20
     max_connections: int = 100
     retry_count: int = 1

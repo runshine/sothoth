@@ -16383,12 +16383,18 @@ def _test_defer_item_after_downstream_transport_error_records_child_sync_failed(
     )
     db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
 
+    exc = UpstreamError("下游服务 GET 请求失败: Server disconnected without sending a response.")
+    exc.error_type_detail = "connection_reused_stale"
+    exc.transport_error_kind = "connection_reused_stale"
+    exc.retry_attempted = True
+    exc.client_recreated = True
+
     result = self.manager._defer_item_after_downstream_transport_error(
         db,
         task,
         item,
         operation="entry_analysis",
-        exc=UpstreamError("timeout"),
+        exc=exc,
         response_item={"module_key": "IPSEC"},
     )
 
@@ -16398,7 +16404,14 @@ def _test_defer_item_after_downstream_transport_error_records_child_sync_failed(
     self.assertTrue(child_events)
     self.assertEqual("transport_error", child_events[-1].payload.get("sync_status"))
     self.assertEqual("reconcile", child_events[-1].payload.get("deferred_mode"))
+    self.assertEqual("connection_reused_stale", child_events[-1].payload.get("error_type"))
     self.assertEqual("running", result["status"])
+    deferred_events = [event for event in db.events if event.event_type == "downstream_transport_deferred"]
+    self.assertTrue(deferred_events)
+    self.assertEqual("connection_reused_stale", deferred_events[-1].payload.get("error_type"))
+    self.assertEqual("connection_reused_stale", deferred_events[-1].payload.get("error_type_detail"))
+    self.assertTrue(deferred_events[-1].payload.get("retry_attempted"))
+    self.assertTrue(deferred_events[-1].payload.get("client_recreated"))
 
 
 def _test_upsert_stage_item_preserves_sync_metadata_on_refresh(self):

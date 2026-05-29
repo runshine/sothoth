@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import httpx
 
@@ -11,6 +12,7 @@ from app.config import get_config
 
 _CLIENTS: dict[tuple[str, float], httpx.AsyncClient] = {}
 _CLIENTS_LOCK = asyncio.Lock()
+logger = logging.getLogger(__name__)
 
 
 def _normalize_timeout(timeout: int | float | None) -> float:
@@ -37,6 +39,19 @@ async def get_shared_async_client(name: str, *, timeout: int | float | None = No
             )
             _CLIENTS[key] = client
         return client
+
+
+async def invalidate_shared_async_client(name: str, *, timeout: int | float | None = None) -> bool:
+    key = (str(name or "default").strip() or "default", _normalize_timeout(timeout))
+    async with _CLIENTS_LOCK:
+        client = _CLIENTS.pop(key, None)
+    if client is None:
+        return False
+    try:
+        await client.aclose()
+    finally:
+        logger.warning("invalidated shared async client for %s timeout=%s", key[0], key[1])
+    return True
 
 
 async def close_all_async_clients() -> None:

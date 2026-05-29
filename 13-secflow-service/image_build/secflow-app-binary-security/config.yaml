@@ -23,7 +23,7 @@ project_service:
   timeout: 10
 
 http_client:
-  keepalive_expiry_seconds: 15
+  keepalive_expiry_seconds: 5
   max_keepalive_connections: 20
   max_connections: 100
   retry_count: 1

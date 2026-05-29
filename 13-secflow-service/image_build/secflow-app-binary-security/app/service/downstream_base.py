@@ -9,7 +9,7 @@ import httpx
 
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
 from app.observability import observe_downstream_request, observe_task_error
-from app.service.http_client import get_shared_async_client
+from app.service.http_client import get_shared_async_client, invalidate_shared_async_client
 
 
 class JsonHttpClient:
@@ -34,12 +34,72 @@ class JsonHttpClient:
             return "/".join(parts[-2:])
         return parts[-1] if parts else "root"
 
+    def _classify_request_error(self, exc: Exception) -> str:
+        text = str(exc or "").strip().lower()
+        if isinstance(exc, httpx.ConnectError):
+            return "connect_error"
+        if isinstance(exc, httpx.TimeoutException):
+            return "timeout"
+        stale_tokens = {
+            "server disconnected without sending a response",
+            "connection closed",
+            "remote protocol error",
+            "connection reset by peer",
+            "broken pipe",
+        }
+        if any(token in text for token in stale_tokens):
+            return "connection_reused_stale"
+        if any(token in text for token in {"connect", "connection", "disconnected", "socket", "refused"}):
+            return "connection_error"
+        return "request_error"
+
+    def _build_upstream_error(
+        self,
+        message: str,
+        *,
+        error_type_detail: str,
+        retry_attempted: bool = False,
+        client_recreated: bool = False,
+    ) -> UpstreamError:
+        exc = UpstreamError(message)
+        exc.error_type_detail = error_type_detail
+        exc.transport_error_kind = error_type_detail
+        exc.retry_attempted = retry_attempted
+        exc.client_recreated = client_recreated
+        return exc
+
+    async def _perform_get(
+        self,
+        path: str,
+        *,
+        token: str | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> tuple[httpx.Response, bool, bool]:
+        client = await get_shared_async_client(self.base_url, timeout=self.timeout)
+        try:
+            resp = await client.get(f"{self.base_url}{path}", headers=self._headers(token), params=params)
+            return resp, False, False
+        except httpx.RequestError as exc:
+            error_kind = self._classify_request_error(exc)
+            if error_kind != "connection_reused_stale":
+                raise
+            client_recreated = await invalidate_shared_async_client(self.base_url, timeout=self.timeout)
+            retry_client = await get_shared_async_client(self.base_url, timeout=self.timeout)
+            try:
+                resp = await retry_client.get(f"{self.base_url}{path}", headers=self._headers(token), params=params)
+                return resp, True, client_recreated
+            except httpx.RequestError as retry_exc:
+                retry_exc.retry_attempted = True
+                retry_exc.client_recreated = client_recreated
+                retry_exc.error_type_detail = self._classify_request_error(retry_exc)
+                retry_exc.transport_error_kind = retry_exc.error_type_detail
+                raise retry_exc from exc
+
     async def get(self, path: str, *, token: str | None = None, params: dict[str, Any] | None = None) -> dict[str, Any]:
         started = time.perf_counter()
         try:
-            client = await get_shared_async_client(self.base_url, timeout=self.timeout)
-            resp = await client.get(f"{self.base_url}{path}", headers=self._headers(token), params=params)
-        except httpx.TimeoutException:
+            resp, retry_attempted, client_recreated = await self._perform_get(path, token=token, params=params)
+        except httpx.TimeoutException as exc:
             observe_downstream_request(
                 service=self._service_name(),
                 method="GET",
@@ -48,7 +108,12 @@ class JsonHttpClient:
                 duration_seconds=time.perf_counter() - started,
             )
             observe_task_error("timeout", stage=self._service_name(), result="GET")
-            raise UpstreamError(f"下游服务 GET 超时: {self.base_url}{path}")
+            raise self._build_upstream_error(
+                f"下游服务 GET 超时: {self.base_url}{path}",
+                error_type_detail=getattr(exc, "error_type_detail", "timeout"),
+                retry_attempted=bool(getattr(exc, "retry_attempted", False)),
+                client_recreated=bool(getattr(exc, "client_recreated", False)),
+            )
         except httpx.ConnectError as exc:
             observe_downstream_request(
                 service=self._service_name(),
@@ -58,17 +123,28 @@ class JsonHttpClient:
                 duration_seconds=time.perf_counter() - started,
             )
             observe_task_error("downstream_error", stage=self._service_name(), result="GET")
-            raise UpstreamError(f"无法连接下游服务: {exc}")
+            raise self._build_upstream_error(
+                f"无法连接下游服务: {exc}",
+                error_type_detail=getattr(exc, "error_type_detail", "connect_error"),
+                retry_attempted=bool(getattr(exc, "retry_attempted", False)),
+                client_recreated=bool(getattr(exc, "client_recreated", False)),
+            )
         except httpx.RequestError as exc:
+            error_kind = getattr(exc, "error_type_detail", None) or self._classify_request_error(exc)
             observe_downstream_request(
                 service=self._service_name(),
                 method="GET",
                 operation=self._operation_name(path),
-                status="request_error",
+                status=error_kind,
                 duration_seconds=time.perf_counter() - started,
             )
             observe_task_error("downstream_error", stage=self._service_name(), result="GET")
-            raise UpstreamError(f"下游服务 GET 请求失败: {exc}")
+            raise self._build_upstream_error(
+                f"下游服务 GET 请求失败: {exc}",
+                error_type_detail=error_kind,
+                retry_attempted=bool(getattr(exc, "retry_attempted", False)),
+                client_recreated=bool(getattr(exc, "client_recreated", False)),
+            )
         return self._handle(resp, method="GET", path=path, duration_seconds=time.perf_counter() - started)
 
     async def post(self, path: str, *, token: str | None = None, json_body: dict[str, Any] | None = None) -> dict[str, Any]:

@@ -7442,10 +7442,15 @@ class TaskManager:
     def _classify_downstream_sync_error(self, exc: Exception) -> str:
         http_status = self._extract_http_status_from_exception(exc)
         lowered = str(exc or "").strip().lower()
+        detail = str(getattr(exc, "error_type_detail", "") or getattr(exc, "transport_error_kind", "")).strip().lower()
+        if detail == "connection_reused_stale":
+            return "connection_reused_stale"
         if http_status is not None and http_status >= 500:
             return "http_5xx"
         if "timeout" in lowered or "超时" in lowered:
             return "timeout"
+        if "server disconnected without sending a response" in lowered:
+            return "connection_reused_stale"
         if any(token in lowered for token in {"connect", "connection", "连接", "refused"}):
             return "connection_error"
         if any(token in lowered for token in {"auth", "unauthorized", "forbidden", "认证"}):
@@ -13207,6 +13212,10 @@ class TaskManager:
                 "error": str(exc),
                 "http_status": self._extract_http_status_from_exception(exc),
                 "error_type": self._classify_downstream_sync_error(exc),
+                "error_type_detail": getattr(exc, "error_type_detail", None) or getattr(exc, "transport_error_kind", None),
+                "transport_error_kind": getattr(exc, "transport_error_kind", None) or getattr(exc, "error_type_detail", None),
+                "retry_attempted": bool(getattr(exc, "retry_attempted", False)),
+                "client_recreated": bool(getattr(exc, "client_recreated", False)),
                 "state_applied": False,
                 "deferred_mode": deferred_mode,
                 "item_status": item.status,
