@@ -9296,7 +9296,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("timeout", failed_events[-1].payload.get("error_type"))
         self.assertFalse(bool(failed_events[-1].payload.get("state_applied")))
 
-    def test_sync_downstream_status_prioritizes_failed_items_with_downstream_refs(self):
+    def test_sync_downstream_status_prioritizes_active_items_missing_initial_sync(self):
         task = BinarySecurityTask(
             id="s1",
             project_id="p1",
@@ -9376,7 +9376,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._write_task_metadata_async = original_write
             self.manager._enqueue_task = original_enqueue
 
-        self.assertEqual(["si_failed", "si_q0"], fetched_ids)
+        self.assertEqual(["si_q0", "si_q1"], fetched_ids)
         self.assertEqual(1, resp.synced_downstream_count)
 
     def test_sync_downstream_status_unknown_status_is_skipped(self):
@@ -9752,6 +9752,12 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, resp.synced_downstream_count)
         self.assertEqual("running", item1.status)
         self.assertEqual("running", item2.status)
+        self.assertEqual("synced", item1.result.get("sync_status"))
+        self.assertEqual("synced", item2.result.get("sync_status"))
+        self.assertEqual("running", item1.result.get("downstream_status"))
+        self.assertEqual("running", item2.result.get("downstream_status"))
+        self.assertIsNotNone(item1.result.get("downstream_status_synced_at"))
+        self.assertIsNotNone(item2.result.get("downstream_status_synced_at"))
         self.assertEqual("running", run.status)
         self.assertEqual(0, run.counts.get("success_items"))
         self.assertEqual(2, run.counts.get("running_items"))
@@ -12727,6 +12733,68 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         db = _ModelAwareDb(tasks=[task], stage_items=[retry_target_item])
         refs = self.manager._list_tasks_needing_downstream_sync(db)
         self.assertEqual([{"project_id": "p1", "task_id": "task1"}], refs)
+
+    def test_list_tasks_needing_downstream_sync_includes_worker_owned_running_items_without_sync_snapshot(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            current_stage="vuln_scan",
+            dispatcher_instance_id=self.manager.instance_id,
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw.bin",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        running_item = BinarySecurityStageItem(
+            id="si1",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="vuln_scan",
+            item_key="k1",
+            status="running",
+            downstream_service="dataflow_vuln_scanner",
+            downstream_task_id="tt-1",
+        )
+        worker_task = asyncio.Future()
+        self.manager._workers["task1"] = worker_task
+        db = _ModelAwareDb(tasks=[task], stage_items=[running_item])
+        try:
+            refs = self.manager._list_tasks_needing_downstream_sync(db)
+        finally:
+            worker_task.cancel()
+            self.manager._workers.pop("task1", None)
+        self.assertEqual([{"project_id": "p1", "task_id": "task1"}], refs)
+
+    def test_stage_item_in_active_reconcile_scope_includes_success_item_missing_sync_snapshot(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            current_stage="dataflow_analysis",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw.bin",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="dataflow_analysis",
+            item_key="k1",
+            status="success",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa-1",
+            result={},
+        )
+        self.assertTrue(self.manager._stage_item_in_active_reconcile_scope(task, item))
 
     def test_poll_until_terminal_preserves_downstream_cancelled_status(self):
         task = BinarySecurityTask(

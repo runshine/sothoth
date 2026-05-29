@@ -3118,22 +3118,9 @@ class TaskManager:
         if item_id and not items:
             raise NotFoundError("阶段子任务不存在")
         if not item_id and items:
-            status_priority = {
-                "running": 0,
-                "dispatching": 1,
-                "failed": 2,
-                "queued": 3,
-                "pending": 4,
-            }
             items = sorted(
                 items,
-                key=lambda current_item: (
-                    status_priority.get(str(current_item.status or "").strip().lower(), 99),
-                    self._comparable_datetime(current_item.updated_at)
-                    or self._comparable_datetime(current_item.created_at)
-                    or datetime.min,
-                    str(current_item.id or ""),
-                ),
+                key=lambda current_item: self._stage_item_sync_priority(current_item),
             )[:batch_size]
 
         if record_request_event:
@@ -6509,10 +6496,6 @@ class TaskManager:
             db.close()
 
     def _list_tasks_needing_downstream_sync(self, db: Session) -> list[dict[str, str]]:
-        local_workers = {
-            task_id for task_id, worker in self._workers.items()
-            if not worker.done()
-        }
         rows = (
             db.query(BinarySecurityTask)
             .join(BinarySecurityStageItem, BinarySecurityStageItem.task_id == BinarySecurityTask.id)
@@ -6520,7 +6503,9 @@ class TaskManager:
                 BinarySecurityTask.status.in_(["pending", "dispatching", "running", "failed"]),
                 BinarySecurityStageItem.downstream_service.isnot(None),
                 BinarySecurityStageItem.downstream_task_id.isnot(None),
-                BinarySecurityStageItem.status.in_(["pending", "queued", "running", "dispatching", "failed"]),
+                BinarySecurityStageItem.status.in_(
+                    ["pending", "queued", "running", "dispatching", "failed", "success", "cancelled", "downstream_missing", "partial_success"]
+                ),
             )
             .distinct()
             .all()
@@ -6528,7 +6513,7 @@ class TaskManager:
         refs: list[dict[str, str]] = []
         seen: set[str] = set()
         for task in rows:
-            if task.id in seen or task.id in local_workers:
+            if task.id in seen:
                 continue
             if not self._task_has_active_reconcile_items(db, task):
                 continue
@@ -7356,12 +7341,7 @@ class TaskManager:
             return False
         if not str(item.downstream_service or "").strip() or not str(item.downstream_task_id or "").strip():
             return False
-        item_status = str(item.status or "").strip().lower()
-        if item_status in {"pending", "queued", "running", "dispatching"}:
-            return True
-        if item_status == "failed":
-            return str(task.status or "").strip().lower() in {"dispatching", "running", "failed"}
-        return False
+        return self._item_needs_downstream_sync(item, for_task_status=str(task.status or "").strip().lower() or None)
 
     def _task_has_active_reconcile_items(self, db: Session, task: BinarySecurityTask) -> bool:
         active_stage_name = self._active_reconcile_stage_name(task)
@@ -7371,6 +7351,81 @@ class TaskManager:
             self._stage_item_in_active_reconcile_scope(task, item)
             for item in self._stage_items(db, task.id, active_stage_name)
         )
+
+    def _stage_item_sync_status_value(self, item: BinarySecurityStageItem) -> str | None:
+        result = dict(item.result or {})
+        sync_status = result.get("sync_status")
+        if sync_status is None:
+            sync_status = dict(result.get("sync_observation") or {}).get("sync_status")
+        value = str(sync_status or "").strip().lower()
+        return value or None
+
+    def _stage_item_last_synced_at_value(self, item: BinarySecurityStageItem) -> datetime | None:
+        result = dict(item.result or {})
+        raw = result.get("downstream_status_synced_at")
+        if not isinstance(raw, str) or not raw.strip():
+            raw = dict(result.get("sync_observation") or {}).get("last_synced_at")
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    def _item_downstream_sync_stale(self, item: BinarySecurityStageItem, now_value: datetime | None = None) -> bool:
+        item_status = str(item.status or "").strip().lower()
+        if item_status not in {"pending", "queued", "running", "dispatching"}:
+            return False
+        last_synced_at = self._stage_item_last_synced_at_value(item)
+        if last_synced_at is None:
+            return True
+        current_now = now_value or _now()
+        interval_seconds = max(
+            5,
+            int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30) or 30),
+        )
+        return (current_now - last_synced_at).total_seconds() >= interval_seconds
+
+    def _item_needs_initial_downstream_sync(self, item: BinarySecurityStageItem) -> bool:
+        sync_status = self._stage_item_sync_status_value(item)
+        if sync_status in {None, "", "pending", "transport_error"}:
+            return True
+        return self._stage_item_last_synced_at_value(item) is None
+
+    def _item_needs_downstream_sync(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        for_task_status: str | None = None,
+        now_value: datetime | None = None,
+    ) -> bool:
+        if not str(item.downstream_service or "").strip() or not str(item.downstream_task_id or "").strip():
+            return False
+        item_status = str(item.status or "").strip().lower()
+        if item_status in {"pending", "queued", "running", "dispatching"}:
+            return self._item_needs_initial_downstream_sync(item) or self._item_downstream_sync_stale(item, now_value)
+        if item_status == "failed":
+            return (for_task_status or "") in {"dispatching", "running", "failed"} or self._item_needs_initial_downstream_sync(item)
+        if item_status in {"success", "cancelled", "downstream_missing", "partial_success"}:
+            return self._item_needs_initial_downstream_sync(item)
+        return False
+
+    def _stage_item_sync_priority(self, item: BinarySecurityStageItem, now_value: datetime | None = None) -> tuple[int, datetime, str]:
+        item_status = str(item.status or "").strip().lower()
+        sync_status = self._stage_item_sync_status_value(item)
+        last_synced_at = self._stage_item_last_synced_at_value(item) or datetime.min
+        stale = self._item_downstream_sync_stale(item, now_value)
+        if item_status in {"running", "dispatching", "queued", "pending"} and sync_status in {None, "", "pending"}:
+            priority = 0
+        elif item_status in {"running", "dispatching", "queued", "pending"} and stale:
+            priority = 1
+        elif item_status in {"success", "cancelled", "downstream_missing", "partial_success", "failed"} and sync_status in {None, "", "pending"}:
+            priority = 2
+        elif sync_status == "transport_error":
+            priority = 3
+        else:
+            priority = 9
+        return priority, last_synced_at, str(item.id or "")
 
     def _extract_http_status_from_exception(self, exc: Exception) -> int | None:
         message = str(exc or "")
