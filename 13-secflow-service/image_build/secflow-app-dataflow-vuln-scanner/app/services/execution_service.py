@@ -1711,7 +1711,7 @@ class ExecutionService:
                 ).items()
             },
             title=self._trigger_title(trigger),
-            status=effective_task_status,
+            status=normalize_canonical_task_status(effective_task_status),
             control_state=control_state,
             latest_attempt_no=latest_execution.attempt_no if latest_execution else 0,
             retry_count=trigger.retry_count,
