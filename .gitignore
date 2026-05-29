@@ -27,3 +27,4 @@ package-lock.json
 package.json
 openvpn_service
 .plans/nul
+.pi/
