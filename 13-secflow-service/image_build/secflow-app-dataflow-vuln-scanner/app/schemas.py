@@ -485,7 +485,9 @@ class WorkerClusterWorkerResponse(BaseModel):
     healthy: bool
     max_concurrent_jobs: int
     running_jobs: int
+    used_slots: int = 0
     available_slots: int
+    schedulable_slots: int = 0
     source: str = "scheduler_worker"
     last_heartbeat_at: Optional[datetime] = None
     error: Optional[str] = None
@@ -498,8 +500,10 @@ class WorkerClusterCapacityResponse(BaseModel):
     stale_workers: int
     total_capacity: int
     running_jobs: int
+    used_slots: int = 0
     queued_jobs: int
     available_slots: int
+    schedulable_slots: int = 0
     updated_at: datetime
     workers: List[WorkerClusterWorkerResponse] = Field(default_factory=list)
 

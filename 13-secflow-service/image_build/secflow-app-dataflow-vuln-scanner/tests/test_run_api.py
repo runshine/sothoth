@@ -1792,6 +1792,59 @@ def test_run_sync_allows_long_common_prefix_source_keys(service_config_path):
         db.close()
 
 
+def test_get_run_index_by_execution_does_not_refresh_existing_record(service_config_path, monkeypatch):
+    run_root = service_config_path.parent / "existing_run_index_no_refresh"
+    _create_run_workspace(run_root)
+
+    db = get_db_session()
+    try:
+        execution = WorkflowExecution(
+            id="exec-existing-run-index",
+            trigger_task_id="trigger-existing-run-index",
+            workflow_definition_id="wf-existing-run-index",
+            workflow_definition_version_id=None,
+            attempt_no=1,
+            project_id="default",
+            status="running",
+            workspace_root=str(run_root.resolve()),
+        )
+        run_index = RunIndex(
+            id="ri-existing-run-index",
+            project_id="default",
+            source_type="execution_workspace",
+            source_key=str(run_root.resolve()),
+            source_hash=run_source_hash("execution_workspace", str(run_root.resolve())),
+            run_name=run_root.name,
+            run_root_path=str(run_root.resolve()),
+            status="running",
+            linked_execution_id=execution.id,
+            duration_seconds=0,
+            model="",
+            provider="",
+            thinking="",
+            max_cycles=0,
+            cycles_used=0,
+            result_count=0,
+            passed_count=0,
+            failed_count=0,
+            workflow_mode="",
+        )
+        db.add_all([execution, run_index])
+        db.commit()
+
+        service = get_run_index_service()
+
+        def _fail_refresh(*args, **kwargs):
+            raise AssertionError("refresh_run_index should not be called")
+
+        monkeypatch.setattr(service, "refresh_run_index", _fail_refresh)
+        resolved = service.get_run_index_by_execution(db, execution)
+        assert resolved is not None
+        assert resolved.id == run_index.id
+    finally:
+        db.close()
+
+
 def test_run_table_migration_drops_legacy_rows_already_synced_by_hash(service_config_path):
     legacy_base = "history" + "_run"
     legacy_run_table = RunIndex.__tablename__.replace("run_index", legacy_base)

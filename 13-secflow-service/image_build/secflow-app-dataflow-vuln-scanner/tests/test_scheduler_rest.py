@@ -468,11 +468,11 @@ def test_manager_dispatch_uses_registry_worker_and_creates_reservation(
     try:
         reservation = db.query(SchedulerWorkerSlotReservation).filter(SchedulerWorkerSlotReservation.execution_id == execution_id).first()
         execution = db.get(WorkflowExecution, execution_id)
-        assert reservation is not None
+        assert reservation is None
         assert execution is not None
         assert execution.owner_pod_id == "worker-registry-1"
-        assert reservation.worker_pod_id == "worker-registry-1"
-        assert reservation.status == "accepted"
+        assert execution.worker_url == "http://worker-registry-1:8080"
+        assert execution.dispatch_status == "queued"
     finally:
         db.close()
 
@@ -655,6 +655,38 @@ def test_worker_cancel_job_marks_running_execution_stop_requested(
     assert payload["status"] == "running"
 
 
+def test_worker_jobs_api_rejects_when_capacity_exhausted(
+    service_config_path: Path,
+    framework_config_payload: dict,
+):
+    config = get_config()
+    config.scheduler.role = "worker"
+    config.scheduler.pod_id = "worker-capacity-limit-pod"
+    config.scheduler.worker_capacity = 1
+
+    db = get_db_session()
+    try:
+        _create_pending_execution(
+            db,
+            framework_config_payload,
+            suffix="worker-capacity-running",
+            status="running",
+            trigger_status="running",
+            worker_url="http://worker-capacity-limit-pod",
+            worker_job_id="job-worker-capacity-running",
+            owner_pod_id="worker-capacity-limit-pod",
+            dispatch_status="running",
+        )
+        execution_id = _create_pending_execution(db, framework_config_payload, suffix="worker-capacity-pending")
+    finally:
+        db.close()
+
+    client = TestClient(create_app())
+    response = client.post("/api/v1/jobs", json={"execution_id": execution_id, "worker_url": "http://worker-capacity-limit-pod"})
+    assert response.status_code == 409
+    assert response.json()["detail"] == "capacity_exceeded"
+
+
 def test_cluster_capacity_api_returns_worker_jobs(
     service_config_path: Path,
     framework_config_payload: dict,
@@ -708,9 +740,12 @@ def test_cluster_capacity_api_returns_worker_jobs(
     assert payload["worker_count"] == 1
     assert payload["total_capacity"] == 4
     assert payload["running_jobs"] == 1
+    assert payload["used_slots"] == 1
     assert payload["available_slots"] == 3
+    assert payload["schedulable_slots"] == 3
     assert payload["workers"][0]["worker_id"] == "worker-capacity-pod"
     assert payload["workers"][0]["healthy"] is True
+    assert payload["workers"][0]["used_slots"] == 1
     assert payload["workers"][0]["active_jobs"][0]["execution_id"] == execution_id
     assert payload["workers"][0]["active_jobs"][0]["task_id"] == "tt-sched-capacity-view"
     assert payload["workers"][0]["active_jobs"][0]["mapped"] is True

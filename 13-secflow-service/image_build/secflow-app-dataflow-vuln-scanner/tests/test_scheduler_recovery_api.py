@@ -132,10 +132,10 @@ def test_cleanup_backfills_missing_owner_from_reservation(service_config_path):
             dispatch_status="queued",
         )
         reservation = SchedulerWorkerSlotReservation(
-            id="resv-recover-owner-a",
+            reservation_id="resv-recover-owner-a",
             worker_pod_id="worker-recover-a",
             execution_id=execution_id,
-            status="accepted",
+            status="reserved",
             lease_expires_at=now_local() + timedelta(minutes=5),
         )
         db.add_all([trigger, execution, reservation])
@@ -207,5 +207,67 @@ def test_cleanup_backfills_missing_owner_from_worker_url(service_config_path):
         execution = db.get(WorkflowExecution, execution_id)
         assert execution is not None
         assert execution.owner_pod_id == "worker-recover-b"
+    finally:
+        db.close()
+
+
+def test_cleanup_requeues_stuck_dispatch_execution(service_config_path):
+    db = get_db_session()
+    try:
+        execution_id = "exec-stuck-dispatch-timeout"
+        trigger = TriggerTask(
+            id="tt-stuck-dispatch-timeout",
+            workflow_definition_id="wfd-stuck-dispatch-timeout",
+            project_id="default",
+            trigger_type="manual",
+            input_tasks_json={"tasks": []},
+            priority=100,
+            status="dispatching",
+            submitted_by="tester",
+            retry_count=0,
+            max_retry_count=3,
+            latest_execution_id=execution_id,
+        )
+        execution = WorkflowExecution(
+            id=execution_id,
+            trigger_task_id=trigger.id,
+            workflow_definition_id=trigger.workflow_definition_id,
+            project_id="default",
+            attempt_no=1,
+            status="dispatching",
+            owner_pod_id="worker-stuck-timeout",
+            worker_url="http://worker-stuck-timeout:8080",
+            worker_job_id="job-stuck-timeout",
+            dispatch_status="queued",
+            updated_at=now_local() - timedelta(minutes=5),
+        )
+        reservation = SchedulerWorkerSlotReservation(
+            reservation_id="rsv-stuck-dispatch-timeout",
+            worker_pod_id="worker-stuck-timeout",
+            execution_id=execution_id,
+            status="reserved",
+            lease_expires_at=now_local() + timedelta(minutes=5),
+        )
+        db.add_all([trigger, execution, reservation])
+        db.commit()
+    finally:
+        db.close()
+
+    scheduler = SchedulerService()
+    scheduler._cleanup_once()
+
+    db = get_db_session()
+    try:
+        execution = db.get(WorkflowExecution, execution_id)
+        trigger = db.get(TriggerTask, "tt-stuck-dispatch-timeout")
+        reservation = db.query(SchedulerWorkerSlotReservation).filter(SchedulerWorkerSlotReservation.execution_id == execution_id).first()
+        assert execution is not None
+        assert trigger is not None
+        assert execution.status == "pending"
+        assert execution.owner_pod_id is None
+        assert execution.worker_job_id is None
+        assert execution.dispatch_status is None
+        assert trigger.status == "pending"
+        assert reservation is None
     finally:
         db.close()

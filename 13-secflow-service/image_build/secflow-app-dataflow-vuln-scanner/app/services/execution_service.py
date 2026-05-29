@@ -1524,6 +1524,21 @@ class ExecutionService:
                     pass
         if not run_root.is_dir():
             return None
+        existing_run_index = (
+            get_run_index_service().get_run_index_by_execution(db, execution)
+            or (
+                db.query(RunIndex)
+                .filter(RunIndex.linked_execution_id == execution.id)
+                .order_by(RunIndex.last_synced_at.desc(), RunIndex.created_at.desc(), RunIndex.id.desc())
+                .first()
+            )
+        )
+        if existing_run_index is not None:
+            return get_run_index_service().refresh_run_index(
+                db,
+                existing_run_index,
+                include_runtime_assets=False,
+            )
         return get_run_index_service().sync_run_path(
             db,
             project_id=execution.project_id,

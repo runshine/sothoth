@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.config import get_config
@@ -53,6 +53,7 @@ RUN_INDEX_LOG_SUMMARY_MAX_CHARS = 32768
 _SOURCE_MTIME_COMPARE_EPSILON = 1e-6
 _RUN_INDEX_LIGHT_REFRESH_DEBOUNCE_SECONDS = 1.0
 _RUN_INDEX_RUNTIME_REFRESH_DEBOUNCE_SECONDS = 2.0
+_RUN_INDEX_DEADLOCK_RETRY_ATTEMPTS = 3
 
 
 def _perf_elapsed_ms(started_at: float) -> float:
@@ -512,6 +513,18 @@ def _run_index_is_active(record: RunIndex) -> bool:
     return is_run_active(record.status)
 
 
+def _is_mysql_deadlock_error(exc: Exception) -> bool:
+    if not isinstance(exc, OperationalError):
+        return False
+    original = getattr(exc, "orig", None)
+    if original is None:
+        return False
+    args = getattr(original, "args", ())
+    code = args[0] if args else None
+    message = str(args[1] if len(args) > 1 else original)
+    return code == 1213 or "Deadlock found when trying to get lock" in message
+
+
 def _normalize_persisted_run_status(status_text: str | None, *, finished_at: datetime | None = None) -> str:
     run_meta: dict[str, Any] = {}
     if finished_at is not None:
@@ -933,7 +946,7 @@ class RunIndexService:
                     )
                 )
 
-    def sync_run_path(
+    def _sync_run_path_once(
         self,
         db: Session,
         *,
@@ -1137,11 +1150,6 @@ class RunIndexService:
                 db.add(record)
                 db.flush()
         except IntegrityError:
-            # Another manager/worker may have indexed this run concurrently while
-            # the current session was preparing a new RunIndex object.  Roll the
-            # transaction back so the failed INSERT is removed from the identity
-            # map, then update the already-created row instead of surfacing a
-            # duplicate-key failure to the execution runner.
             db.rollback()
             existing = _find_run_by_source(
                 db,
@@ -1184,6 +1192,45 @@ class RunIndexService:
             _perf_elapsed_ms(sync_started),
         )
         return record
+
+    def sync_run_path(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        run_root: Path,
+        source_type: str,
+        linked_execution: WorkflowExecution | None = None,
+        linked_task: TriggerTask | None = None,
+        profile_id: str | None = None,
+        include_runtime_assets: bool = True,
+    ) -> RunIndex:
+        attempts = _RUN_INDEX_DEADLOCK_RETRY_ATTEMPTS
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._sync_run_path_once(
+                    db,
+                    project_id=project_id,
+                    run_root=run_root,
+                    source_type=source_type,
+                    linked_execution=linked_execution,
+                    linked_task=linked_task,
+                    profile_id=profile_id,
+                    include_runtime_assets=include_runtime_assets,
+                )
+            except OperationalError as exc:
+                if not _is_mysql_deadlock_error(exc) or attempt >= attempts:
+                    raise
+                logger.warning(
+                    "run_index_sync_retry_deadlock run=%s source_type=%s include_runtime_assets=%s attempt=%s/%s",
+                    run_root,
+                    source_type,
+                    include_runtime_assets,
+                    attempt,
+                    attempts,
+                )
+                db.rollback()
+                time.sleep(0.05 * attempt)
 
     def sync_execution_run(self, db: Session, execution: WorkflowExecution) -> RunIndex | None:
         if not execution.workspace_root:
@@ -1922,7 +1969,7 @@ class RunIndexService:
             RunIndex.source_type == "execution_workspace",
         ).first()
         if record is not None:
-            return self.refresh_run_index(db, record, include_runtime_assets=False)
+            return record
         source_key = str(Path(execution.workspace_root).resolve())
         record = _find_run_by_source(
             db,
@@ -1931,7 +1978,7 @@ class RunIndexService:
             source_hash=run_source_hash("execution_workspace", source_key),
         )
         if record is not None:
-            return self.refresh_run_index(db, record, include_runtime_assets=False)
+            return record
         if is_run_active(execution.status):
             return None
         record = self.sync_execution_run(db, execution)
