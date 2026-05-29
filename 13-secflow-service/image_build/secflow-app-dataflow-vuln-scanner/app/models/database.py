@@ -391,7 +391,7 @@ class SchedulerWorker(Base):
 class SchedulerWorkerSlotReservation(Base):
     __tablename__ = _prefix("scheduler_worker_slot_reservation")
 
-    reservation_id = Column(String(64), primary_key=True)
+    reservation_id = Column("id", String(64), primary_key=True)
     worker_pod_id = Column(String(512), ForeignKey(f"{SchedulerWorker.__tablename__}.pod_id"), nullable=False)
     execution_id = Column(String(64), ForeignKey(f"{WorkflowExecution.__tablename__}.id"), nullable=False, unique=True)
     status = Column(String(32), nullable=False, default="reserved")
