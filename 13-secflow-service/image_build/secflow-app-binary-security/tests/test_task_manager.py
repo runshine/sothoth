@@ -8001,6 +8001,61 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state["can_retry"])
         self.assertFalse(state["can_retry_failed_items"])
 
+    def test_task_response_exposes_stage_full_retry_for_binary_module_when_upstreams_succeed(self):
+        task = BinarySecurityTask(
+            id="bm1",
+            project_id="p1",
+            name="binary-module",
+            status="failed",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src/module.elf",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        runs = [
+            BinarySecurityStageRun(
+                id="sr-b2s",
+                task_id="bm1",
+                project_id="p1",
+                stage_name="binary_to_source",
+                sequence_no=1,
+                status="success",
+            ),
+            BinarySecurityStageRun(
+                id="sr-entry",
+                task_id="bm1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="downstream_missing",
+            ),
+        ]
+        items = [
+            BinarySecurityStageItem(
+                id="si-entry",
+                task_id="bm1",
+                project_id="p1",
+                stage_run_id="sr-entry",
+                stage_name="entry_analysis",
+                item_key="module-entry",
+                parent_key="module-a",
+                status="downstream_missing",
+                downstream_service="entry_analyse",
+                downstream_task_id="eat-1",
+            ),
+        ]
+        response = self.manager._task_response(
+            _ModelAwareDb(tasks=[task], stage_runs=runs, stage_items=items),
+            task,
+        )
+
+        entry_summary = next(summary for summary in response.stage_summaries if summary.stage_name == "entry_analysis")
+        self.assertTrue(entry_summary.retry_full_supported)
+        self.assertTrue(response.manual_operation_state["can_retry_stage"])
+        self.assertTrue(response.manual_operation_state["can_retry_stage_full"])
+
     def test_retry_stage_clears_archive_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -8919,14 +8974,24 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             output_root="/o",
             workspace_root="/w",
         )
-        run = BinarySecurityStageRun(
-            id="sr1",
-            task_id="s1",
-            project_id="p1",
-            stage_name="entry_analysis",
-            sequence_no=2,
-            status="failed",
-        )
+        runs = [
+            BinarySecurityStageRun(
+                id="sr0",
+                task_id="s1",
+                project_id="p1",
+                stage_name="system_analysis",
+                sequence_no=1,
+                status="success",
+            ),
+            BinarySecurityStageRun(
+                id="sr1",
+                task_id="s1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="failed",
+            ),
+        ]
         item = BinarySecurityStageItem(
             id="si1",
             task_id="s1",
@@ -8937,7 +9002,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             downstream_service="entry_analyse",
             downstream_task_id=None,
         )
-        db = _ModelAwareDb(stage_runs=[run], stage_items=[item])
+        db = _ModelAwareDb(stage_runs=runs, stage_items=[item])
 
         supported, reason = self.manager._stage_retry_support(db, task, "entry_analysis")
 
@@ -10072,14 +10137,24 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             output_root="/o",
             workspace_root="/w",
         )
-        run = BinarySecurityStageRun(
-            id="sr1",
-            task_id="s1",
-            project_id="p1",
-            stage_name="entry_analysis",
-            sequence_no=2,
-            status="failed",
-        )
+        runs = [
+            BinarySecurityStageRun(
+                id="sr0",
+                task_id="s1",
+                project_id="p1",
+                stage_name="system_analysis",
+                sequence_no=1,
+                status="success",
+            ),
+            BinarySecurityStageRun(
+                id="sr1",
+                task_id="s1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="failed",
+            ),
+        ]
         item = BinarySecurityStageItem(
             id="si1",
             task_id="s1",
@@ -10090,7 +10165,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             downstream_service="system_analyse",
             downstream_task_id=None,
         )
-        db = _ModelAwareDb(stage_runs=[run], stage_items=[item])
+        db = _ModelAwareDb(stage_runs=runs, stage_items=[item])
 
         supported, reason = self.manager._stage_retry_support(db, task, "entry_analysis")
 
@@ -10111,14 +10186,32 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             workspace_root="/w",
         )
         task.summary = {}
-        run = BinarySecurityStageRun(
-            id="sr3",
-            task_id="s1",
-            project_id="p1",
-            stage_name="dataflow_analysis",
-            sequence_no=3,
-            status="failed",
-        )
+        runs = [
+            BinarySecurityStageRun(
+                id="sr1",
+                task_id="s1",
+                project_id="p1",
+                stage_name="system_analysis",
+                sequence_no=1,
+                status="success",
+            ),
+            BinarySecurityStageRun(
+                id="sr2",
+                task_id="s1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="success",
+            ),
+            BinarySecurityStageRun(
+                id="sr3",
+                task_id="s1",
+                project_id="p1",
+                stage_name="dataflow_analysis",
+                sequence_no=3,
+                status="failed",
+            ),
+        ]
         entry_item = BinarySecurityStageItem(
             id="si-entry",
             task_id="s1",
@@ -10134,7 +10227,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             "source_dir": "/src/m1",
             "entries_preview": [{"entry_key": "e1", "function_name": "main", "file_name": "main.c", "line_no": 1}],
         }
-        db = _ModelAwareDb(stage_runs=[run])
+        db = _ModelAwareDb(stage_runs=runs)
         original_stage_items = self.manager._stage_items
 
         def fake_stage_items(_db, _task_id, stage_name):
@@ -10149,6 +10242,286 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(supported)
         self.assertIsNone(reason)
         self.assertEqual(1, len(task.summary["entry_results"]))
+
+    def test_stage_retry_support_allows_binary_module_entry_when_b2s_upstream_succeeds(self):
+        task = BinarySecurityTask(
+            id="bm1",
+            project_id="p1",
+            name="binary-module",
+            status="failed",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src/module.elf",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        runs = [
+            BinarySecurityStageRun(
+                id="sr-b2s",
+                task_id="bm1",
+                project_id="p1",
+                stage_name="binary_to_source",
+                sequence_no=1,
+                status="success",
+            ),
+            BinarySecurityStageRun(
+                id="sr-entry",
+                task_id="bm1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="downstream_missing",
+            ),
+        ]
+        item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="bm1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-entry",
+            parent_key="module-a",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-1",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=runs, stage_items=[item])
+
+        supported, reason = self.manager._stage_retry_support(db, task, "entry_analysis")
+
+        self.assertTrue(supported)
+        self.assertIsNone(reason)
+
+    def test_stage_retry_support_rejects_binary_module_entry_when_b2s_upstream_not_success(self):
+        task = BinarySecurityTask(
+            id="bm1",
+            project_id="p1",
+            name="binary-module",
+            status="failed",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src/module.elf",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        runs = [
+            BinarySecurityStageRun(
+                id="sr-b2s",
+                task_id="bm1",
+                project_id="p1",
+                stage_name="binary_to_source",
+                sequence_no=1,
+                status="failed",
+            ),
+            BinarySecurityStageRun(
+                id="sr-entry",
+                task_id="bm1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="downstream_missing",
+            ),
+        ]
+        item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="bm1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-entry",
+            parent_key="module-a",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-1",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=runs, stage_items=[item])
+
+        supported, reason = self.manager._stage_retry_support(db, task, "entry_analysis")
+
+        self.assertFalse(supported)
+        self.assertIn("上游阶段", reason or "")
+        self.assertIn("尚未成功", reason or "")
+
+    def test_stage_retry_support_allows_binary_module_dataflow_when_upstreams_succeed(self):
+        task = BinarySecurityTask(
+            id="bm1",
+            project_id="p1",
+            name="binary-module",
+            status="failed",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="dataflow_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src/module.elf",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        runs = [
+            BinarySecurityStageRun(
+                id="sr-b2s",
+                task_id="bm1",
+                project_id="p1",
+                stage_name="binary_to_source",
+                sequence_no=1,
+                status="success",
+            ),
+            BinarySecurityStageRun(
+                id="sr-entry",
+                task_id="bm1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="success",
+            ),
+            BinarySecurityStageRun(
+                id="sr-df",
+                task_id="bm1",
+                project_id="p1",
+                stage_name="dataflow_analysis",
+                sequence_no=3,
+                status="cancelled",
+            ),
+        ]
+        item = BinarySecurityStageItem(
+            id="si-df",
+            task_id="bm1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            item_key="module-entry",
+            parent_key="module-a",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa-1",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=runs, stage_items=[item])
+
+        supported, reason = self.manager._stage_retry_support(db, task, "dataflow_analysis")
+
+        self.assertTrue(supported)
+        self.assertIsNone(reason)
+
+    def test_stage_retry_support_allows_first_stage_without_stage_run(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="binary",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+
+        supported, reason = self.manager._stage_retry_support(_ModelAwareDb(tasks=[task]), task, "firmware_unpack")
+
+        self.assertTrue(supported)
+        self.assertIsNone(reason)
+
+    def test_stage_retry_support_allows_unexecuted_stage_when_upstreams_succeed(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        runs = [
+            BinarySecurityStageRun(
+                id="sr-system",
+                task_id="s1",
+                project_id="p1",
+                stage_name="system_analysis",
+                sequence_no=1,
+                status="success",
+            ),
+            BinarySecurityStageRun(
+                id="sr-entry",
+                task_id="s1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="success",
+            ),
+        ]
+        entry_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="m1",
+            item_name="m1",
+            status="success",
+        )
+        entry_item.result = {
+            "module_key": "m1",
+            "module_name": "m1",
+            "source_dir": "/src/m1",
+            "entries_preview": [{"entry_key": "e1", "function_name": "main", "file_name": "main.c", "line_no": 1}],
+        }
+        db = _ModelAwareDb(tasks=[task], stage_runs=runs)
+        original_stage_items = self.manager._stage_items
+
+        def fake_stage_items(_db, _task_id, current_stage_name):
+            return [entry_item] if current_stage_name == "entry_analysis" else []
+
+        self.manager._stage_items = fake_stage_items
+        try:
+            supported, reason = self.manager._stage_retry_support(db, task, "dataflow_analysis")
+        finally:
+            self.manager._stage_items = original_stage_items
+
+        self.assertTrue(supported)
+        self.assertIsNone(reason)
+
+    def test_stage_retry_support_rejects_running_task_even_when_upstreams_succeed(self):
+        task = BinarySecurityTask(
+            id="bm1",
+            project_id="p1",
+            name="binary-module",
+            status="running",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src/module.elf",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        runs = [
+            BinarySecurityStageRun(
+                id="sr-b2s",
+                task_id="bm1",
+                project_id="p1",
+                stage_name="binary_to_source",
+                sequence_no=1,
+                status="success",
+            ),
+            BinarySecurityStageRun(
+                id="sr-entry",
+                task_id="bm1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="downstream_missing",
+            ),
+        ]
+        item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="bm1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-entry",
+            parent_key="module-a",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-1",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=runs, stage_items=[item])
+
+        supported, reason = self.manager._stage_retry_support(db, task, "entry_analysis")
+
+        self.assertFalse(supported)
+        self.assertIn("当前任务状态不允许重试", reason or "")
 
     def test_task_continue_support_blocks_streaming_tail_auto_progress(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"

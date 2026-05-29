@@ -14011,10 +14011,15 @@ class TaskManager:
             BinarySecurityStageRun.task_id == task.id,
             BinarySecurityStageRun.stage_name == stage_name,
         ).first()
-        if require_stage_run and not stage_run:
-            return False, "目标阶段尚未执行，不能重试"
-        if stage_run and stage_run.status not in STAGE_RETRY_ALLOWED_STATUSES:
-            return False, f"当前阶段状态不允许重试: {stage_run.status}"
+        upstream_supported, upstream_reason = self._stage_full_retry_upstream_support(
+            db,
+            task,
+            stage_name,
+            require_stage_run=require_stage_run,
+            stage_run=stage_run,
+        )
+        if not upstream_supported:
+            return False, upstream_reason
         items = self._stage_items(db, task.id, stage_name)
         if not items:
             reason = self._continue_stage_input_error(db, task, stage_name)
@@ -14032,6 +14037,32 @@ class TaskManager:
                 return False, (
                     f"阶段 {stage_name} 下游服务不匹配，期望 {expected_service}，实际 {item.downstream_service or '-'}"
                 )
+        return True, None
+
+    def _stage_full_retry_upstream_support(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+        *,
+        require_stage_run: bool,
+        stage_run: BinarySecurityStageRun | None = None,
+    ) -> tuple[bool, str | None]:
+        stage_sequence = self._stage_sequence_for_task(task)
+        if stage_name not in stage_sequence:
+            return False, f"无效阶段: {stage_name}"
+        target_index = stage_sequence.index(stage_name)
+        if target_index == 0:
+            return True, None
+        for upstream_stage in stage_sequence[:target_index]:
+            upstream_run = db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == upstream_stage,
+            ).first()
+            if upstream_run is None:
+                return False, f"上游阶段 {STAGE_TITLES.get(upstream_stage, upstream_stage)} 尚未执行，不能完全重试当前阶段"
+            if str(upstream_run.status or "").strip() != "success":
+                return False, f"上游阶段 {STAGE_TITLES.get(upstream_stage, upstream_stage)} 尚未成功，不能完全重试当前阶段"
         return True, None
 
     def _normalize_cancelled_task_active_children(self, db: Session, task: BinarySecurityTask) -> None:
