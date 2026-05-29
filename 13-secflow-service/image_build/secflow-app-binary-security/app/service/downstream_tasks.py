@@ -826,16 +826,18 @@ class DownstreamTaskController:
             if not task_id:
                 return False, verification
             try:
-                if service == "entry_analyse":
-                    await self.get_child_task(service=service, project_id=None, task_id=task_id, token=token)
-                else:
-                    return False, verification
+                project_id = str(ref.get("project_id") or "") or None
+                payload = await self.get_child_task(service=service, project_id=project_id, task_id=task_id, token=token)
             except NotFoundError:
                 verification["verified_absent"] = True
                 return True, verification
             except Exception as verify_exc:
                 verification["verification_error"] = str(verify_exc)
                 return False, verification
+            payload_status = str((payload or {}).get("status") or "").strip().lower()
+            if payload_status in {"deleted", "cancelled"} and bool((payload or {}).get("is_deleted")):
+                verification["verified_deleted"] = True
+                return True, verification
             return False, verification
 
         async def do_delete(ref: dict[str, str]) -> bool:

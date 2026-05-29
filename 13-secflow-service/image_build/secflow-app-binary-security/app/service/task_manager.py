@@ -4854,6 +4854,11 @@ class TaskManager:
                 .filter(
                     BinarySecurityTask.id == task_id,
                     BinarySecurityTask.status.in_(list(TASK_PREPARING_STATUSES)),
+                    BinarySecurityTask.pending_action.in_(list(TASK_PENDING_ACTIONS)),
+                    BinarySecurityTask.operation_lock_token.isnot(None),
+                    BinarySecurityTask.operation_lock_token != "",
+                    BinarySecurityTask.operation_lock_expires_at.isnot(None),
+                    BinarySecurityTask.operation_lock_expires_at > started_at,
                     self._lease_filter_available(),
                 )
                 .update(
@@ -4886,6 +4891,100 @@ class TaskManager:
             return task_id
         return None
 
+    def _get_current_preparing_operation_state(self, db: Session, task_id: str) -> dict[str, Any] | None:
+        task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
+        if task is None:
+            return None
+        return {
+            "status": str(task.status or "").strip(),
+            "dispatcher_instance_id": str(task.dispatcher_instance_id or "").strip() or None,
+            "lease_active": self._lease_is_active(task),
+            "pending_action": str(task.pending_action or "").strip() or None,
+            "operation_lock_token": str(task.operation_lock_token or "").strip() or None,
+            "operation_lock_owner": str(task.operation_lock_owner or "").strip() or None,
+            "operation_lock_active": bool(task.operation_lock_expires_at and task.operation_lock_expires_at > _now()),
+            "current_stage": str(task.current_stage or "").strip() or None,
+        }
+
+    def _preparing_operation_matches(
+        self,
+        state: dict[str, Any] | None,
+        *,
+        token: str | None,
+        action: str | None,
+    ) -> bool:
+        if not state:
+            return False
+        if state.get("status") not in TASK_PREPARING_STATUSES:
+            return False
+        if state.get("dispatcher_instance_id") != self.instance_id:
+            return False
+        if not state.get("lease_active"):
+            return False
+        if token and state.get("operation_lock_token") != token:
+            return False
+        if action and state.get("pending_action") != action:
+            return False
+        if state.get("operation_lock_owner") != self.instance_id:
+            return False
+        if not state.get("operation_lock_active"):
+            return False
+        return True
+
+    def _ensure_preparing_operation_current(
+        self,
+        db: Session,
+        task_id: str,
+        *,
+        token: str | None,
+        action: str | None,
+    ) -> dict[str, Any]:
+        state = self._get_current_preparing_operation_state(db, task_id)
+        if not self._preparing_operation_matches(state, token=token, action=action):
+            raise ValidationError("任务 preparing 执行权已丢失，当前 worker 不再继续执行")
+        return state or {}
+
+    def _record_preparing_superseded_event(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        action: str | None,
+        token: str | None,
+    ) -> None:
+        state = self._get_current_preparing_operation_state(db, task.id) or {}
+        self._record_event(
+            db,
+            task,
+            "task_retry_prepare_superseded",
+            "后台准备执行权已转移，当前 worker 停止继续清理",
+            level="warning",
+            stage_name=state.get("current_stage") or str(task.current_stage or "").strip() or None,
+            payload={
+                "action": action or None,
+                "operation_token": token,
+                "current_dispatcher_instance_id": state.get("dispatcher_instance_id"),
+                "current_operation_lock_owner": state.get("operation_lock_owner"),
+                "current_operation_lock_token": state.get("operation_lock_token"),
+            },
+        )
+
+    def _preparing_action_needs_requeue(self, task: BinarySecurityTask) -> bool:
+        pending_action = str(task.pending_action or "").strip()
+        if pending_action not in TASK_PENDING_ACTIONS:
+            return False
+        operation_token = str(task.operation_lock_token or "").strip()
+        if not operation_token:
+            return True
+        if not bool(task.operation_lock_expires_at and task.operation_lock_expires_at > _now()):
+            return True
+        dispatcher_instance_id = str(task.dispatcher_instance_id or "").strip()
+        if not dispatcher_instance_id:
+            return True
+        if not self._lease_is_active(task):
+            return True
+        return False
+
     async def _run_preparing_action(self, task_id: str) -> None:
         session_factory = get_session_factory()
         db = session_factory()
@@ -4893,6 +4992,7 @@ class TaskManager:
         action: str | None = None
         heartbeat_task: asyncio.Task | None = None
         lease_heartbeat_task: asyncio.Task | None = None
+        superseded = False
         try:
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
             if (
@@ -4911,6 +5011,7 @@ class TaskManager:
             renewed = self._renew_task_operation_lease(task.id, token=operation_token, operation=action)
             if not renewed:
                 raise ValidationError("任务 preparing 操作锁已失效，请重新发起操作")
+            self._ensure_preparing_operation_current(db, task.id, token=operation_token, action=action)
             heartbeat_task = asyncio.create_task(
                 self._task_operation_lease_heartbeat(task.id, token=operation_token, operation=action),
                 name=f"binary-security-operation-lock-{task.id}",
@@ -4935,6 +5036,7 @@ class TaskManager:
             )
             db.commit()
 
+            self._ensure_preparing_operation_current(db, task.id, token=operation_token, action=action)
             if action == TASK_ACTION_CONTINUE:
                 if not target_stage:
                     raise ValidationError("继续任务缺少目标阶段")
@@ -4970,6 +5072,7 @@ class TaskManager:
             else:
                 raise ValidationError(f"未知 preparing action: {action}")
 
+            self._ensure_preparing_operation_current(db, task.id, token=operation_token, action=action)
             task.status = "pending"
             task.pending_action = None
             task.current_stage = target_stage
@@ -5009,6 +5112,18 @@ class TaskManager:
             if task is not None:
                 action = str(task.pending_action or "").strip()
                 target_stage = str(task.current_stage or "").strip() or None
+                current_state = self._get_current_preparing_operation_state(db, task_id)
+                ownership_lost = bool(operation_token and not self._preparing_operation_matches(current_state, token=operation_token, action=action))
+                if ownership_lost:
+                    superseded = True
+                    self._record_preparing_superseded_event(
+                        db,
+                        task,
+                        action=action,
+                        token=operation_token,
+                    )
+                    db.commit()
+                    return
                 task.status = TASK_STATUS_HARD_RESTART_FAILED if action == TASK_ACTION_RETRY else "failed"
                 task.pending_action = None
                 task.last_error = str(exc)
@@ -5032,7 +5147,7 @@ class TaskManager:
             if heartbeat_task is not None:
                 heartbeat_task.cancel()
                 await asyncio.gather(heartbeat_task, return_exceptions=True)
-            if operation_token:
+            if operation_token and not superseded:
                 self._release_task_operation_lease(db, task_id, token=operation_token)
             async with self._action_worker_lock:
                 self._action_workers.pop(task_id, None)
@@ -12237,7 +12352,7 @@ class TaskManager:
             task.status = _preparing_status_for_action(pending_action)
             task.finished_at = None
             task.last_error = None
-            if current_status in TASK_PREPARING_STATUSES and str(task.dispatcher_instance_id or "").strip():
+            if not self._preparing_action_needs_requeue(task):
                 return
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None

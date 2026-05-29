@@ -471,6 +471,28 @@ class _AsyncEntryAnalyseClientStub:
         return dict(result)
 
 
+class _AsyncDataflowAnalyseClientStub:
+    def __init__(self, *, listed=None, fetched=None, delete_result=None):
+        self.listed = listed or {"items": []}
+        self.fetched = fetched or {}
+        self.delete_result = {"success": True} if delete_result is None else delete_result
+        self.deleted: list[str] = []
+
+    async def list_tasks(self, *args, **kwargs):
+        del args, kwargs
+        return self.listed
+
+    async def get_task(self, task_id):
+        return dict(self.fetched.get(task_id) or {"task_id": task_id, "status": "success"})
+
+    async def delete_task(self, task_id):
+        self.deleted.append(task_id)
+        result = self.delete_result
+        if isinstance(result, Exception):
+            raise result
+        return dict(result)
+
+
 class _AsyncFirmwareUnpackerClientStub:
     def __init__(self, *, listed=None, fetched=None, fail_on_create=False):
         self.listed = listed or {"items": []}
@@ -16214,6 +16236,86 @@ TaskManagerTests.test_downstream_controller_query_does_not_write_timeline = _tes
 TaskManagerTests.test_downstream_controller_retry_records_child_task_event = _test_downstream_controller_retry_records_child_task_event
 TaskManagerTests.test_downstream_controller_cancel_records_child_task_events = _test_downstream_controller_cancel_records_child_task_events
 TaskManagerTests.test_downstream_controller_delete_blocking_failure_records_event = _test_downstream_controller_delete_blocking_failure_records_event
+
+
+def _test_downstream_controller_delete_treats_dfa_delete_500_with_absent_task_as_success(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="binary",
+        status="retry_preparing",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/tmp/out",
+        workspace_root="/tmp/ws",
+    )
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="dataflow_analysis",
+        item_key="IPSEC",
+        status="cancelled",
+        downstream_service="dataflow_analyse",
+        downstream_task_id="dfa_x",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+    client = _AsyncDataflowAnalyseClientStub(delete_result=UpstreamError("500 Internal Server Error"))
+
+    async def _missing_task(task_id):
+        del task_id
+        raise NotFoundError("任务不存在")
+
+    client.get_task = _missing_task
+
+    with patch.object(downstream_tasks_module, "get_dataflow_analyse_client", return_value=client):
+        deleted = asyncio.run(
+            self.manager._downstream_delete_refs(
+                db,
+                task,
+                [{"service": "dataflow_analyse", "task_id": "dfa_x", "project_id": "p1", "stage_name": "dataflow_analysis"}],
+                "token",
+            )
+        )
+
+    self.assertEqual(1, deleted)
+    event_types = [getattr(event, "event_type", "") for event in db.added]
+    self.assertIn("child_task_delete_verified_absent", event_types)
+    self.assertIn("child_task_delete_failed_but_ignored", event_types)
+
+
+def _test_refresh_task_status_after_sync_does_not_reenqueue_active_preparing_owner(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="binary",
+        status="retry_preparing",
+        pending_action="retry_stage_full",
+        dispatcher_instance_id="worker-a",
+        operation_lock_token="op-1",
+        operation_lock_owner="worker-a",
+        lease_expires_at=_now() + timedelta(minutes=5),
+        operation_lock_expires_at=_now() + timedelta(minutes=5),
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/tmp/out",
+        workspace_root="/tmp/ws",
+    )
+    self.manager.instance_id = "worker-a"
+    db = _ModelAwareDb(tasks=[task], stage_items=[], state_events=[])
+    calls: list[str] = []
+    self.manager._enqueue_action = lambda task_id: calls.append(task_id)
+
+    self.manager._refresh_task_status_after_sync(db, task)
+
+    self.assertEqual("retry_preparing", task.status)
+    self.assertEqual([], calls)
+
+
+TaskManagerTests.test_downstream_controller_delete_treats_dfa_delete_500_with_absent_task_as_success = _test_downstream_controller_delete_treats_dfa_delete_500_with_absent_task_as_success
+TaskManagerTests.test_refresh_task_status_after_sync_does_not_reenqueue_active_preparing_owner = _test_refresh_task_status_after_sync_does_not_reenqueue_active_preparing_owner
 
 
 def _test_stage_item_response_exposes_downstream_status_from_sync_observation(self):
