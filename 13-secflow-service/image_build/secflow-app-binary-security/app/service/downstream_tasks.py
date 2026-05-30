@@ -129,7 +129,9 @@ class DownstreamTaskGateway:
             return await self._entry_analyse_client().list_tasks(
                 project_id,
                 parent_task_id=kwargs.get("parent_task_id"),
+                parent_stage_name=kwargs.get("parent_stage_name"),
                 parent_stage_item_id=kwargs.get("parent_stage_item_id"),
+                parent_stage_item_key=kwargs.get("parent_stage_item_key"),
                 page=int(kwargs.get("page", 1) or 1),
                 per_page=int(kwargs.get("per_page", 100) or 100),
                 sort_by=str(kwargs.get("sort_by") or "updated_at"),

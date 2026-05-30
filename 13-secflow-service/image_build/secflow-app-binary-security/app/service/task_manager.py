@@ -13714,6 +13714,8 @@ class TaskManager:
         mapped_status = self._map_downstream_status(downstream_status)
         if mapped_status == "success":
             return "success"
+        if mapped_status in {"pending", "queued", "dispatching", "running"}:
+            return mapped_status
         if mapped_status == "cancelled":
             return "cancelled"
         if mapped_status == "downstream_missing":
@@ -17354,7 +17356,7 @@ class TaskManager:
                         token,
                         keep_task_ids={str(item.downstream_task_id or "").strip()},
                     )
-                    if mapped_reusable_status in {"queued", "running"}:
+                    if mapped_reusable_status in {"pending", "queued", "dispatching", "running"}:
                         item.status = mapped_reusable_status
                         session.commit()
                         status, payload = await self._poll_until_terminal(
@@ -17441,7 +17443,7 @@ class TaskManager:
                 current_downstream_task_id = str(item.downstream_task_id or "").strip()
                 if created_task_id and (not current_downstream_task_id or current_downstream_task_id == created_task_id):
                     item.downstream_task_id = created_task_id
-                item.status = "running"
+                item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
                 session.commit()
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, token or ""),

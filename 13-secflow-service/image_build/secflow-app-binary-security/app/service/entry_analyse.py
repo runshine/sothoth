@@ -47,7 +47,9 @@ class EntryAnalyseClient(JsonHttpClient):
         project_id: str,
         *,
         parent_task_id: str | None = None,
+        parent_stage_name: str | None = None,
         parent_stage_item_id: str | None = None,
+        parent_stage_item_key: str | None = None,
         page: int = 1,
         per_page: int = 100,
         sort_by: str = "updated_at",
@@ -63,8 +65,12 @@ class EntryAnalyseClient(JsonHttpClient):
         }
         if parent_task_id:
             params["parent_task_id"] = parent_task_id
+        if parent_stage_name:
+            params["parent_stage_name"] = parent_stage_name
         if parent_stage_item_id:
             params["parent_stage_item_id"] = parent_stage_item_id
+        elif parent_stage_item_key:
+            params["parent_stage_item_key"] = parent_stage_item_key
         return await self.get(f"{self.API_PREFIX}/tasks", token=token, params=params)
 
     async def cancel_task(self, task_id: str, token: str | None = None) -> dict:

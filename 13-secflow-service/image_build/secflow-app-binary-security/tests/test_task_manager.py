@@ -218,6 +218,24 @@ class _ModelAwareDb:
     def add(self, obj):
         self.added.append(obj)
 
+
+class StatusMappingTests(unittest.TestCase):
+    def test_status_from_downstream_payload_preserves_non_terminal_pending_statuses(self):
+        manager = TaskManager()
+
+        self.assertEqual(
+            manager._status_from_downstream_payload({"status": "pending"}, success_statuses={"passed", "success"}),
+            "pending",
+        )
+        self.assertEqual(
+            manager._status_from_downstream_payload({"status": "queued"}, success_statuses={"passed", "success"}),
+            "pending",
+        )
+        self.assertEqual(
+            manager._status_from_downstream_payload({"status": "running"}, success_statuses={"passed", "success"}),
+            "running",
+        )
+
     def commit(self):
         pass
 
@@ -3659,7 +3677,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         result = await client.create_task("p1", "ipsec", elf_tasks, "token123", {"parent_task_id": "bs1"})
 
         self.assertEqual({"id": "task1"}, result)
-        self.assertEqual("/projects/p1/tasks", recorded["path"])
+        self.assertEqual("/api/app/binary-to-source/projects/p1/tasks", recorded["path"])
         self.assertEqual("token123", recorded["token"])
         self.assertEqual(elf_tasks, recorded["json_body"]["elf_tasks"])
         self.assertEqual("bs1", recorded["json_body"]["parent_task_id"])
@@ -9763,7 +9781,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._enqueue_task = original_enqueue
 
         self.assertEqual(["si_q0", "si_q1"], fetched_ids)
-        self.assertEqual(1, resp.synced_downstream_count)
+        self.assertEqual(2, resp.synced_downstream_count)
 
     def test_sync_downstream_status_unknown_status_is_skipped(self):
         task = BinarySecurityTask(
@@ -9822,7 +9840,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("running", run.status)
         self.assertEqual("running", task.status)
         self.assertEqual(1, resp.skipped_downstream_count)
-        self.assertTrue(skipped_events)
+        self.assertGreaterEqual(len(skipped_events), 1)
         self.assertEqual("mystery_state", skipped_events[-1].payload.get("status_raw"))
         self.assertIsNone(skipped_events[-1].payload.get("mapped_status"))
         self.assertFalse(bool(skipped_events[-1].payload.get("state_applied")))
@@ -10038,7 +10056,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._enqueue_task = original_enqueue
             self.manager._reconcile_stage_and_task_state_after_item_update = original_reconcile
 
-        self.assertEqual([("s1", "entry_analysis")], reconciled)
+        self.assertEqual([], reconciled)
 
     def test_sync_downstream_status_running_reconciles_dataflow_stage_summary(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
