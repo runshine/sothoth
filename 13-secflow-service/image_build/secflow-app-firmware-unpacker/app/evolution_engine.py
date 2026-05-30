@@ -491,6 +491,98 @@ def _extract_path_only(text: str) -> Path | None:
     return None
 
 
+def _coerce_job_sandbox_tool_path(path: Path, job_root: Path) -> Path:
+    raw = str(path or "").strip()
+    if not raw:
+        raise RuntimeError("工具进化器未返回有效的 Python 工具路径")
+    marker = "/data/files/"
+    if marker in raw and not raw.startswith(marker):
+        raw = raw[raw.index(marker):]
+    candidate = Path(raw).resolve()
+    resolved_job_root = job_root.resolve()
+    try:
+        candidate.relative_to(resolved_job_root)
+    except ValueError as exc:
+        raise RuntimeError(f"工具进化器返回了 job 沙箱外的非法路径: {candidate}") from exc
+    if candidate.suffix.lower() != ".py":
+        raise RuntimeError(f"工具进化器返回了非法路径: {candidate}")
+    if not candidate.exists():
+        raise RuntimeError(f"工具进化器返回的工具文件不存在: {candidate}")
+    return candidate
+
+
+def _recover_tool_from_executor_messages(round_dir: Path, candidate: Path) -> bool:
+    messages_path = round_dir / "evolution_executor_messages.json"
+    if not messages_path.exists():
+        return False
+    try:
+        payload = json.loads(messages_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(payload, list):
+        return False
+
+    basename = candidate.name
+    candidate_text: str | None = None
+    for item in reversed(payload):
+        if not isinstance(item, dict) or item.get("role") != "assistant":
+            continue
+        content = item.get("content") or []
+        if not isinstance(content, list):
+            continue
+        for block in reversed(content):
+            if not isinstance(block, dict) or block.get("type") != "toolCall":
+                continue
+            if str(block.get("name") or "").strip() != "write":
+                continue
+            arguments = block.get("arguments") or {}
+            if not isinstance(arguments, dict):
+                continue
+            path = str(arguments.get("path") or "").strip()
+            if not path.endswith(".py"):
+                continue
+            if path != str(candidate) and Path(path).name != basename:
+                continue
+            content_text = arguments.get("content")
+            if isinstance(content_text, str) and content_text.strip():
+                candidate_text = content_text
+                break
+        if candidate_text:
+            break
+
+    if not candidate_text:
+        return False
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    candidate.write_text(candidate_text, encoding="utf-8")
+    return True
+
+
+def _normalize_tool_into_working_dir(
+    *,
+    candidate: Path,
+    working_dir: Path,
+    firmware_path: str,
+    source_tool: Path | None,
+    round_dir: Path,
+) -> Path:
+    if not candidate.exists():
+        _recover_tool_from_executor_messages(round_dir, candidate)
+    if not candidate.exists():
+        raise RuntimeError(f"工具进化器返回的工具文件不存在: {candidate}")
+    canonical_path = _normalize_working_tool_name(
+        working_dir.parent,
+        firmware_path,
+        str(source_tool) if source_tool is not None else None,
+    )
+    if candidate.resolve() == canonical_path.resolve():
+        return canonical_path
+    shutil.copy2(candidate, canonical_path)
+    pycache_dir = working_dir / "__pycache__"
+    if pycache_dir.exists():
+        shutil.rmtree(pycache_dir, ignore_errors=True)
+    return canonical_path
+
+
 def _validate_working_tool_path(path: Path, working_dir: Path) -> Path:
     resolved = path.resolve()
     resolved_working_dir = working_dir.resolve()
@@ -615,8 +707,14 @@ def _publish_tool_to_store(
     tool_changed: bool,
 ) -> str:
     _validate_working_tool_path(working_tool, working_tool.parent)
-    if source_tool is not None and not tool_changed:
-        return str(source_tool)
+    source_target: Path | None = None
+    if source_tool is not None:
+        source_target = resolve_active_tool_target(source_tool)
+        try:
+            if source_target.exists() and working_tool.exists() and source_target.samefile(working_tool) and not tool_changed:
+                return str(source_target)
+        except Exception:
+            pass
     family_id = _derive_family_id(firmware_path, working_tool)
     version = _next_generated_tool_version(TOOLS_STORE_DIR, family_id)
     target = _build_versioned_tool_path(TOOLS_STORE_DIR, family_id, version)
@@ -655,75 +753,113 @@ def _snapshot_round_report(round_dir: Path, source_path: Path, target_name: str)
     return str(target)
 
 
-def _validate_tool_generality(tool_path: Path) -> list[str]:
+def _read_small_text(path: Path | None, limit: int = 4000) -> str:
+    if path is None or not path.exists() or not path.is_file():
+        return ""
     try:
-        source = tool_path.read_text(encoding="utf-8")
-    except Exception as exc:
-        return [f"无法读取工具源码进行通用性检查: {exc}"]
-
-    lowered = source.lower()
-    issues: list[str] = []
-    if "/data/files/" in source:
-        issues.append("工具源码硬编码了 /data/files 运行时路径，必须改为从 manifest/env 获取 input/output/log。")
-    if re.search(r"\b[0-9a-f]{16}\b", lowered):
-        issues.append("工具源码疑似硬编码了项目/任务 ID，不能绑定单个任务或单个样本。")
-    if "ne20e-v800r022c10spc100.cc" in lowered:
-        issues.append("工具源码硬编码了单个固件文件名，必须面向格式族而不是单个文件。")
-    if "v800r022c10spc100" in lowered:
-        issues.append("工具源码硬编码了单个固件版本号，summary 和逻辑都必须从当前输入动态读取版本。")
-
-    offset_literals = re.findall(r"\b(?:0x[0-9a-f]{5,}|\d{6,})\b", lowered)
-    has_known_table = "known_signature" in lowered or "known_offset" in lowered or "known_sections" in lowered
-    large_decimal_literals = [item for item in offset_literals if item.isdigit() and int(item) >= 1_000_000]
-    has_discovery = any(
-        token in lowered
-        for token in (
-            "binwalk",
-            "parse_header",
-            "header table",
-            "find_signature",
-            "scan_signature",
-            "discover",
-            "uimage_magic",
-            "squashfs_magic",
-        )
-    )
-    if (has_known_table or len(set(offset_literals)) >= 6) and not has_discovery:
-        issues.append("工具主要依赖固定 offset/size，但缺少 header/binwalk/signature discovery fallback。")
-    if has_known_table and len(set(large_decimal_literals)) >= 4:
-        issues.append("工具包含大量固定大 offset/size 常量；必须改为从 binwalk/header/uImage/SquashFS 结果动态计算，固定表只能作为校验后的兜底。")
-    if "unsquashfs" in lowered and "-no-xattrs" not in lowered:
-        issues.append("工具调用 unsquashfs 时未使用 -no-xattrs，容器环境可能因 xattr 失败导致解包不完整。")
-    if "f.read()" in lowered or ".read()" in lowered and "read_size" not in lowered and "chunk" not in lowered:
-        issues.append("工具存在无界 read() 风险，处理大固件必须使用 seek/read(size) 或分块读取。")
-    return issues
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n...[truncated]..."
 
 
-def _write_generality_failure(output_dir: Path, issues: list[str]) -> str:
-    reason_lines = [
-        "# Tool Generality Review: FAIL",
+def _write_round_context(
+    *,
+    round_dir: Path,
+    main_run_dir: Path,
+    job_root: Path,
+    firmware_path: str,
+    workspace_output: Path,
+    working_tool: Path,
+    source_tool: Path | None,
+    started_without_matched_skill: bool,
+    previous_feedback_path: Path | None,
+    previous_summary_path: Path | None,
+    previous_reason_path: Path | None,
+    current_feedback_path: Path | None = None,
+    current_summary_path: Path | None = None,
+    current_reason_path: Path | None = None,
+) -> Path:
+    main_sessions_index = main_run_dir / "sessions" / "index.json"
+    evolution_sessions_index = job_root / "sessions" / "index.json"
+    previous_feedback = _read_execution_feedback(previous_feedback_path)
+    lines = [
+        "# Evolution Round Context",
         "",
-        "当前工具不满足“格式族通用工具”要求，不能作为正式进化结果发布。",
+        f"- firmware_path: `{firmware_path}`",
+        f"- workspace_output: `{workspace_output}`",
+        f"- working_tool: `{working_tool}`",
+        f"- source_tool: `{source_tool}`" if source_tool is not None else "- source_tool: <none>",
+        f"- started_without_matched_skill: `{started_without_matched_skill}`",
+        f"- main_sessions_index: `{main_sessions_index}`",
+        f"- evolution_sessions_index: `{evolution_sessions_index}`",
         "",
-        "## Blocking Issues",
+        "## Reading Budget",
+        "",
+        "- Do not read full session transcripts by default.",
+        "- Prefer this file, the previous feedback file, the previous/current summary and reason files, and the current working tool.",
+        "- Only if those are insufficient, read `sessions/index.json` first and then open one targeted session file.",
+        "",
+        "## Previous Round Feedback",
         "",
     ]
-    reason_lines.extend(f"- {issue}" for issue in issues)
-    reason_lines.extend(
-        [
-            "",
-            "## Required Fixes",
-            "",
-            "- 工具必须从 manifest/env 读取 input_path、output_path、log_path，不能写死运行路径。",
-            "- 工具必须面向格式族：通过 header/table、uImage header、SquashFS magic、bounded binwalk 或签名发现来推导 offsets/sizes。",
-            "- 已知 offset 只能作为经过 magic/size 校验的 fast path，必须保留同格式族变体的 fallback。",
-            "- 保持大文件高效处理，禁止全文件无界读取和逐字节全量扫描。",
-        ]
-    )
-    text = "\n".join(reason_lines).strip() + "\n"
-    (output_dir / "reason.md").write_text(text, encoding="utf-8")
-    (output_dir / "reason.txt").write_text(text, encoding="utf-8")
-    return json.dumps({"result": "fail", "reason": str(output_dir / "reason.txt")}, ensure_ascii=False)
+    if previous_feedback_path is not None:
+        lines.extend(
+            [
+                f"- feedback_path: `{previous_feedback_path}`",
+                f"- return_code: `{previous_feedback.get('return_code', '-')}`",
+                f"- duration_seconds: `{previous_feedback.get('duration_seconds', '-')}`",
+                f"- log_path: `{previous_feedback.get('log_path') or '-'}`",
+                "",
+                "### previous stdout preview",
+                "",
+                "```text",
+                str(previous_feedback.get("stdout_preview") or "").strip()[:2000],
+                "```",
+            ]
+        )
+    else:
+        lines.append("- No previous feedback file.")
+
+    def _append_text_block(title: str, path: Path | None) -> None:
+        lines.extend(["", f"## {title}", ""])
+        if path is None or not path.exists():
+            lines.append("- missing")
+            return
+        lines.append(f"- path: `{path}`")
+        body = _read_small_text(path)
+        if body:
+            lines.extend(["```text", body, "```"])
+
+    _append_text_block("Previous Summary", previous_summary_path)
+    _append_text_block("Previous Reason", previous_reason_path)
+    _append_text_block("Current Summary", current_summary_path)
+    _append_text_block("Current Reason", current_reason_path)
+
+    if current_feedback_path is not None and current_feedback_path.exists():
+        current_feedback = _read_execution_feedback(current_feedback_path)
+        lines.extend(
+            [
+                "",
+                "## Current Tool Execution Feedback",
+                "",
+                f"- feedback_path: `{current_feedback_path}`",
+                f"- return_code: `{current_feedback.get('return_code', '-')}`",
+                f"- duration_seconds: `{current_feedback.get('duration_seconds', '-')}`",
+                f"- log_path: `{current_feedback.get('log_path') or '-'}`",
+                "",
+                "```text",
+                str(current_feedback.get("stdout_preview") or "").strip()[:2000],
+                "```",
+            ]
+        )
+
+    target = round_dir / "round_context.md"
+    target.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+    return target
 
 
 def _write_tool_execution_failure(output_dir: Path, error: str) -> str:
@@ -925,13 +1061,11 @@ def _build_evolution_round_metrics(
     }
 
 
-def _build_evolution_execute_prompt(
+def _build_evolution_generate_prompt(
     *,
-    round_id: int,
     firmware_path: str,
     workspace_output: Path,
     working_tool: Path,
-    started_without_matched_skill: bool,
     previous_feedback_path: Path | None,
 ) -> str:
     previous_feedback = _read_execution_feedback(previous_feedback_path)
@@ -949,43 +1083,108 @@ def _build_evolution_execute_prompt(
                 "你必须基于这份后端执行反馈以及对应 summary/reason 来决定如何继续改进工具。",
             ]
         )
+    return "\n".join(
+        [
+            "当前没有命中可用的 Python 解包工具。",
+            "本轮必须先生成首个正式可执行的 Python 解包工具，后端随后会统一执行该工具。",
+            f"目标固件：`{firmware_path}`。",
+            f"输出目录：`{workspace_output}`。",
+            f"建议工具路径：`{working_tool}`。",
+            "",
+            "要求：",
+            "1. 不要生成占位 stub，不要输出只包含 NotImplementedError 的脚本。",
+            "2. 必须直接生成一个可执行的正式 Python 解包工具，而不是只修文案或只写元数据。",
+            "3. 只允许在当前 evolution job 的 `working_tool/` 目录内创建或修改工具文件。",
+            "4. 不要在本轮手工执行解包命令；新的识别、切分、提取、清理逻辑必须沉淀进工具。",
+            "5. 工具自身在被执行时必须写出 `summary.txt`，并同步更新 `summary.md`。内容至少包含使用的工具路径、关键步骤、主要产物、剩余问题、本轮耗时。",
+            "6. 最终回复只能输出本轮生成或更新后的 Python 工具绝对路径。",
+        ]
+    ) + previous_feedback_text
+
+
+def _build_evolution_improve_existing_tool_prompt(
+    *,
+    firmware_path: str,
+    workspace_output: Path,
+    working_tool: Path,
+    previous_feedback_path: Path | None,
+) -> str:
+    previous_feedback = _read_execution_feedback(previous_feedback_path)
+    previous_feedback_text = ""
+    if previous_feedback_path is not None:
+        previous_feedback_text = "\n".join(
+            [
+                "",
+                f"上一轮后端工具执行反馈文件：`{previous_feedback_path}`。",
+                f"上一轮工具执行耗时：`{previous_feedback.get('duration_seconds', '-')}` 秒。",
+                f"上一轮工具退出码：`{previous_feedback.get('return_code', '-')}`。",
+                f"上一轮工具日志：`{previous_feedback.get('log_path') or '-'}`。",
+                f"上一轮 summary：`{previous_feedback.get('summary_path') or '-'}`。",
+                f"上一轮 reason：`{previous_feedback.get('reason_path') or '-'}`。",
+                "你必须基于这份后端执行反馈以及对应 summary/reason 来决定如何继续改进工具。",
+            ]
+        )
+    return "\n".join(
+        [
+            "当前已经命中可用的 Python 解包工具。",
+            "本轮不要从零重新发明新工具，应优先检查、修复并完善当前 working tool；工具执行由后端统一完成。",
+            f"目标固件：`{firmware_path}`。",
+            f"输出目录：`{workspace_output}`。",
+            f"当前 working tool：`{working_tool}`。",
+            "",
+            "要求：",
+            "1. 如发现工具存在问题，可以直接修改该 working tool；只有在确有必要时才新建替代工具。",
+            "2. 不允许在工具之外手工解包；新的识别、切分、提取、清理逻辑必须沉淀进工具。",
+            "3. 目标是完善现有格式族工具，而不是仅针对当前样本做 case by case 修补。",
+            "4. 工具自身在被执行时必须写出 `summary.txt`，并同步更新 `summary.md`。内容至少包含：",
+            "   - 本轮使用的工具路径",
+            "   - 关键执行步骤",
+            "   - 主要输出产物",
+            "   - 剩余问题或可疑缺口",
+            "   - 本轮耗时和 token 数量（若无法精确得出，也要预留该字段）",
+            "5. 最终回复只能输出本轮使用或更新后的 Python 工具绝对路径。",
+        ]
+    ) + previous_feedback_text
+
+
+def _build_evolution_execute_prompt(
+    *,
+    round_id: int,
+    firmware_path: str,
+    workspace_output: Path,
+    working_tool: Path,
+    started_without_matched_skill: bool,
+    previous_feedback_path: Path | None,
+) -> str:
     if int(round_id) <= 1 and started_without_matched_skill:
-        return "\n".join(
-            [
-                "当前没有可用的原始 Python 解包工具。本轮你只需要生成首个正式 Python 工具；工具执行由后端统一完成。",
-                f"目标固件：`{firmware_path}`。",
-                f"输出目录：`{workspace_output}`。",
-                f"建议工具路径：`{working_tool}`。",
-                "",
-                "要求：",
-                "1. 不要生成占位 stub，不要输出只包含 NotImplementedError 的脚本。",
-                "2. 必须直接生成一个可执行的正式 Python 解包工具。",
-                "3. 只允许在当前 evolution job 的 `working_tool/` 目录内创建或修改工具文件。",
-                "4. 不要在本轮手工执行解包命令；新的识别、切分、提取、清理逻辑必须沉淀进工具。",
-                "5. 工具自身在被执行时必须写出 `summary.txt`，并同步更新 `summary.md`。内容至少包含使用的工具路径、关键步骤、主要产物、剩余问题、本轮耗时。",
-                "6. 最终回复只能输出本轮生成或更新后的 Python 工具绝对路径。",
-            ]
-        ) + previous_feedback_text
+        return _build_evolution_generate_prompt(
+            firmware_path=firmware_path,
+            workspace_output=workspace_output,
+            working_tool=working_tool,
+            previous_feedback_path=previous_feedback_path,
+        )
     if int(round_id) <= 1:
-        return "\n".join(
+        return _build_evolution_improve_existing_tool_prompt(
+            firmware_path=firmware_path,
+            workspace_output=workspace_output,
+            working_tool=working_tool,
+            previous_feedback_path=previous_feedback_path,
+        )
+    previous_feedback = _read_execution_feedback(previous_feedback_path)
+    previous_feedback_text = ""
+    if previous_feedback_path is not None:
+        previous_feedback_text = "\n".join(
             [
-                "当前已经存在可用 Python 解包工具。本轮你只需要检查并按需改进当前 working tool；工具执行由后端统一完成。",
-                f"目标固件：`{firmware_path}`。",
-                f"输出目录：`{workspace_output}`。",
-                f"当前 working tool：`{working_tool}`。",
                 "",
-                "要求：",
-                "1. 如发现工具存在问题，可以直接修改该 working tool，但不要执行工具或额外手工解包。",
-                "2. 不允许在工具之外手工解包；新的识别、切分、提取、清理逻辑必须沉淀进工具。",
-                "3. 工具自身在被执行时必须写出 `summary.txt`，并同步更新 `summary.md`。内容至少包含：",
-                "   - 本轮使用的工具路径",
-                "   - 关键执行步骤",
-                "   - 主要输出产物",
-                "   - 剩余问题或可疑缺口",
-                "   - 本轮耗时和 token 数量（若无法精确得出，也要预留该字段）",
-                "4. 最终回复只能输出本轮使用或更新后的 Python 工具绝对路径。",
+                f"上一轮后端工具执行反馈文件：`{previous_feedback_path}`。",
+                f"上一轮工具执行耗时：`{previous_feedback.get('duration_seconds', '-')}` 秒。",
+                f"上一轮工具退出码：`{previous_feedback.get('return_code', '-')}`。",
+                f"上一轮工具日志：`{previous_feedback.get('log_path') or '-'}`。",
+                f"上一轮 summary：`{previous_feedback.get('summary_path') or '-'}`。",
+                f"上一轮 reason：`{previous_feedback.get('reason_path') or '-'}`。",
+                "你必须结合这份后端执行反馈以及 reason.txt / reason.md 一起修复工具，而不是盲改。",
             ]
-        ) + previous_feedback_text
+        )
     return "\n".join(
         [
             "上一轮评审未通过，请先阅读当前输出目录下的 `reason.txt` 和 `reason.md`。",
@@ -1050,6 +1249,7 @@ def _write_backend_reviewer_session(
     summary_path: Path | None,
     reason_path: Path | None,
     detail: str,
+    title: str = "后端评审结论：未通过",
 ) -> None:
     session_artifacts = build_session_artifacts(
         job_root,
@@ -1072,7 +1272,7 @@ def _write_backend_reviewer_session(
                     "type": "text",
                     "text": "\n".join(
                         [
-                            "后端评审结论：未通过",
+                            title,
                             "",
                             detail,
                             "",
@@ -1141,10 +1341,6 @@ def run_evolution_job(
         if source_tool is not None
         else _suggest_initial_working_tool_path(job_root, firmware_path)
     )
-    seeded_initial_tool = False
-    if source_tool is None:
-        _write_seed_python_tool(initial_working_tool)
-        seeded_initial_tool = True
     if source_tool is not None:
         initial_working_tool = _normalize_working_tool_name(job_root, firmware_path, str(source_tool))
     working_tool = initial_working_tool
@@ -1171,7 +1367,7 @@ def run_evolution_job(
             _reset_workspace_output(workspace_output)
             before_path = working_tool
             before_text = before_path.read_text(encoding="utf-8") if before_path.exists() else ""
-            executed_tool = False
+            executor_prompt_ran = False
             tool_result = ""
             token_stats: dict[str, Any] = {}
             review_token_stats: dict[str, Any] = {}
@@ -1186,21 +1382,24 @@ def run_evolution_job(
                 evolution_round_dir(job_root, round_id - 1) / "backend_execution_feedback.json"
                 if round_id > 1 else None
             )
-            if seeded_initial_tool and int(round_id) == 1:
-                tool_result = str(working_tool)
-                token_stats = {}
-                executed_tool = True
-                _append_stage_log(
-                    round_dir,
-                    "evolution_executor.log",
-                    "using backend generated seed python tool",
-                    round=round_id,
-                    source_tool_path=str(source_tool) if source_tool is not None else None,
-                    working_tool_path=str(working_tool),
-                    workspace_output=str(workspace_output),
-                    started_without_matched_skill=started_without_matched_skill,
-                )
-            else:
+            previous_round_dir = evolution_round_dir(job_root, round_id - 1) if round_id > 1 else None
+            previous_summary_path = previous_round_dir / "summary.md" if previous_round_dir is not None else None
+            previous_reason_path = previous_round_dir / "reason.md" if previous_round_dir is not None else None
+            round_context_path = _write_round_context(
+                round_dir=round_dir,
+                main_run_dir=_main_run_dir(unpack_output_path),
+                job_root=job_root,
+                firmware_path=firmware_path,
+                workspace_output=workspace_output,
+                working_tool=working_tool,
+                source_tool=source_tool,
+                started_without_matched_skill=started_without_matched_skill,
+                previous_feedback_path=previous_feedback_path,
+                previous_summary_path=previous_summary_path,
+                previous_reason_path=previous_reason_path,
+            )
+            should_prompt_executor = started_without_matched_skill or round_id > 1
+            if should_prompt_executor:
                 evolution_prompt = _build_evolution_execute_prompt(
                     round_id=round_id,
                     firmware_path=firmware_path,
@@ -1218,6 +1417,7 @@ def run_evolution_job(
                         "$main_run": str(_main_run_dir(unpack_output_path)),
                         "$evolution_run": str(job_root),
                         "$working_tool": str(working_tool),
+                        "$round_context": str(round_context_path),
                     },
                 )
                 try:
@@ -1245,13 +1445,21 @@ def run_evolution_job(
                         stream_callback=_stream_evolution_event,
                     )
                     token_stats = _save_agent_log(evolution_client, log, round_dir, "evolution_executor")
-                    executed_tool = True
+                    executor_prompt_ran = True
                     evolved_path = _extract_path_only(tool_result or "")
                     if evolved_path is None:
                         if not working_tool.exists():
                             raise RuntimeError("工具进化执行器未返回 Python 工具路径，且 working tool 不存在")
                         evolved_path = working_tool
-                    working_tool = _validate_working_tool_path(evolved_path, working_dir)
+                    sandbox_tool = _coerce_job_sandbox_tool_path(evolved_path, job_root)
+                    working_tool = _normalize_tool_into_working_dir(
+                        candidate=sandbox_tool,
+                        working_dir=working_dir,
+                        firmware_path=firmware_path,
+                        source_tool=source_tool,
+                        round_dir=round_dir,
+                    )
+                    working_tool = _validate_working_tool_path(working_tool, working_dir)
                     _append_stage_log(
                         round_dir,
                         "evolution_executor.log",
@@ -1262,93 +1470,24 @@ def run_evolution_job(
                     )
                 finally:
                     pass
-            _augment_tool_summary(
-                output_dir=workspace_output,
-                elapsed_seconds=time.monotonic() - tool_round_started_at,
-                token_stats=token_stats or _load_token_stats(round_dir, "evolution_executor"),
-            )
-            tool_elapsed_seconds = time.monotonic() - tool_round_started_at
-            _sync_report_aliases(workspace_output)
-
-            generality_issues = _validate_tool_generality(working_tool)
-            if generality_issues:
-                review_result = _write_generality_failure(workspace_output, generality_issues)
-                review_round_passed = False
-                _append_stage_log(
-                    round_dir,
-                    "reviewer.log",
-                    "tool generality gate failed before llm review",
-                    round=round_id,
-                    working_tool_path=str(working_tool),
-                    issues=generality_issues,
+                _augment_tool_summary(
+                    output_dir=workspace_output,
+                    elapsed_seconds=time.monotonic() - tool_round_started_at,
+                    token_stats=token_stats or _load_token_stats(round_dir, "evolution_executor"),
                 )
+                tool_elapsed_seconds = time.monotonic() - tool_round_started_at
                 _sync_report_aliases(workspace_output)
-                tool_changed = before_text != (working_tool.read_text(encoding="utf-8") if working_tool.exists() else "")
-                working_tool = _rename_working_tool_if_changed(
-                    firmware_path=firmware_path,
-                    working_tool=working_tool,
-                    source_tool=source_tool,
-                    tool_changed=tool_changed,
-                )
-                tool_changed = before_text != (working_tool.read_text(encoding="utf-8") if working_tool.exists() else "")
-                summary_path = workspace_output / "summary.md"
-                reason_path = workspace_output / "reason.md"
-                round_summary_path = _snapshot_round_report(round_dir, summary_path, "summary.md")
-                round_reason_path = _snapshot_round_report(round_dir, reason_path, "reason.md")
-                _write_backend_reviewer_session(
-                    job_root=job_root,
-                    round_id=round_id,
-                    review_result=review_result,
-                    summary_path=summary_path,
-                    reason_path=reason_path,
-                    detail="工具泛化检查未通过。系统已将该后端评审结果归档为评审器会话。",
-                )
-                round_item = {
-                    "round": round_id,
-                    "status": "review_failed",
-                    "tool_skill_path_before": str(before_path),
-                    "tool_skill_path_after": str(working_tool),
-                    "tool_path_before": str(before_path),
-                    "tool_path_after": str(working_tool),
-                    "tool_changed": tool_changed,
-                    "review_result": review_result,
-                    "summary_path": round_summary_path,
-                    "reason_path": round_reason_path,
-                    "log_root": str(round_dir),
-                    "log_files": {
-                        "evolution_executor": str(round_dir / "evolution_executor_transcript.log"),
-                        "reviewer": str(round_dir / "reviewer_transcript.log"),
-                    },
-                    "source_skill_path": str(source_tool) if source_tool is not None else None,
-                    "source_tool_path": str(source_tool) if source_tool is not None else None,
-                    "started_without_matched_skill": started_without_matched_skill,
-                    "generated_new_skill": False,
-                    "generated_new_tool": False,
-                    "executed_tool": executed_tool,
-                    "tool_response_preview": tool_result[:2000] if tool_result else None,
-                    "evolution_executor_response_preview": tool_result[:2000] if tool_result else None,
-                    "metrics": _build_evolution_round_metrics(
-                        tool_elapsed_seconds=tool_elapsed_seconds,
-                        evolution_executor_tokens=token_stats or _load_token_stats(round_dir, "evolution_executor"),
-                        reviewer_tokens=review_token_stats,
-                    ),
-                    "created_at": datetime.now().isoformat(),
-                    "completed_at": datetime.now().isoformat(),
-                }
-                round_items.append(round_item)
-                _write_json_log(round_dir, "evolution_round.json", round_item)
-                if progress_callback:
-                    progress_callback(round_id, "evolution_execute")
-                if round_id >= max_rounds:
-                    continue
+
+            else:
                 _append_stage_log(
                     round_dir,
-                    "reviewer.log",
-                    "review did not pass, evolution round will continue if budget remains",
+                    "evolution_executor.log",
+                    "matched tool found; skipping executor prompt and running tool directly",
                     round=round_id,
-                    max_rounds=max_rounds,
+                    source_tool_path=str(source_tool) if source_tool is not None else None,
+                    working_tool_path=str(working_tool),
+                    workspace_output=str(workspace_output),
                 )
-                continue
 
             try:
                 tool_execution = _run_working_tool(
@@ -1382,13 +1521,6 @@ def run_evolution_job(
                 )
                 _sync_report_aliases(workspace_output)
                 tool_changed = before_text != (working_tool.read_text(encoding="utf-8") if working_tool.exists() else "")
-                working_tool = _rename_working_tool_if_changed(
-                    firmware_path=firmware_path,
-                    working_tool=working_tool,
-                    source_tool=source_tool,
-                    tool_changed=tool_changed,
-                )
-                tool_changed = before_text != (working_tool.read_text(encoding="utf-8") if working_tool.exists() else "")
                 summary_path = workspace_output / "summary.md"
                 reason_path = workspace_output / "reason.md"
                 round_summary_path = _snapshot_round_report(round_dir, summary_path, "summary.md")
@@ -1400,6 +1532,7 @@ def run_evolution_job(
                     summary_path=summary_path,
                     reason_path=reason_path,
                     detail=f"工具执行失败。系统已将失败原因归档为评审器会话。错误：{exc}",
+                    title="后端工具执行结论：失败",
                 )
                 round_item = {
                     "round": round_id,
@@ -1422,7 +1555,7 @@ def run_evolution_job(
                     "started_without_matched_skill": started_without_matched_skill,
                     "generated_new_skill": False,
                     "generated_new_tool": False,
-                    "executed_tool": executed_tool,
+                    "executed_tool": executor_prompt_ran,
                     "tool_response_preview": tool_result[:2000] if tool_result else None,
                     "evolution_executor_response_preview": tool_result[:2000] if tool_result else None,
                     "metrics": _build_evolution_round_metrics(
@@ -1462,11 +1595,29 @@ def run_evolution_job(
                 session_root=job_root,
             )
             try:
+                review_context_path = _write_round_context(
+                    round_dir=round_dir,
+                    main_run_dir=_main_run_dir(unpack_output_path),
+                    job_root=job_root,
+                    firmware_path=firmware_path,
+                    workspace_output=workspace_output,
+                    working_tool=working_tool,
+                    source_tool=source_tool,
+                    started_without_matched_skill=started_without_matched_skill,
+                    previous_feedback_path=previous_feedback_path,
+                    previous_summary_path=previous_summary_path,
+                    previous_reason_path=previous_reason_path,
+                    current_feedback_path=round_dir / "backend_execution_feedback.json",
+                    current_summary_path=workspace_output / "summary.md",
+                    current_reason_path=workspace_output / "reason.md",
+                )
                 review_prompt = render_template(
                     EVOLUTION_REVIEW_PROMPT_TMPL,
                     {
                         "$input": firmware_path,
                         "$output": str(workspace_output),
+                        "$working_tool": str(working_tool),
+                        "$round_context": str(review_context_path),
                     },
                 )
                 _append_stage_log(
@@ -1505,13 +1656,6 @@ def run_evolution_job(
             _sync_report_aliases(workspace_output)
 
             tool_changed = before_text != (working_tool.read_text(encoding="utf-8") if working_tool.exists() else "")
-            working_tool = _rename_working_tool_if_changed(
-                firmware_path=firmware_path,
-                working_tool=working_tool,
-                source_tool=source_tool,
-                tool_changed=tool_changed,
-            )
-            tool_changed = before_text != (working_tool.read_text(encoding="utf-8") if working_tool.exists() else "")
 
             summary_path = workspace_output / "summary.md"
             reason_path = workspace_output / "reason.md"
@@ -1539,7 +1683,7 @@ def run_evolution_job(
                 "started_without_matched_skill": started_without_matched_skill,
                 "generated_new_skill": False,
                 "generated_new_tool": False,
-                "executed_tool": executed_tool,
+                "executed_tool": executor_prompt_ran,
                 "tool_response_preview": tool_result[:2000] if tool_result else None,
                 "evolution_executor_response_preview": tool_result[:2000] if tool_result else None,
                 "metrics": _build_evolution_round_metrics(

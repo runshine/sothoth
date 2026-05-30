@@ -29,8 +29,8 @@ Never assume or guess these paths. Always derive them from the task prompt.
 - When using `binwalk` only for identification, prefer `binwalk -B`. When using `binwalk` for extraction inside the generated tool, use `binwalk -e` or `binwalk -eM` with `--run-as=root`.
 - You may either:
   - modify the provided `$working_tool`, or
-  - create a brand-new `.py` tool file under the same `working_tool/` directory
-- Do NOT write tools directly into `/data/secflow-app-firmware-unpacker/tools`. Only operate inside the current working directory for this evolution job.
+  - create a brand-new `.py` tool file anywhere under the current evolution job sandbox directory
+- Do NOT write tools directly into `/data/secflow-app-firmware-unpacker/tools`. Only operate inside the current evolution-job sandbox; the backend will normalize the accepted tool into `working_tool/`.
 - Keep the Python tool practical and executable: metadata comment header, tool usage, fallback boundaries, and extraction sequence should all be explicit.
 - The generated Python tool must start with parser-compatible `# key: value` metadata comment lines immediately after the optional shebang. Do not put required metadata only inside a docstring.
 - Required metadata comment keys:
@@ -75,14 +75,16 @@ Hard requirements:
 - Do not include any explanation, reasoning, status text, markdown, code fences, bullets, labels, quotes, or backticks.
 - Do not prepend or append any text before or after the path.
 - Do not translate, localize, normalize, or paraphrase any path segment. Return the path byte-for-byte as it exists on disk.
-- The line must start with `/` and must point to a `.py` file inside the current `working_tool/` directory.
-- If you updated the existing working tool, return that exact existing path unchanged.
+- The line must start with `/` and must point to a `.py` file inside the current evolution-job sandbox directory.
+- If you updated the existing working tool, return that exact existing path unchanged. If you created a new file elsewhere under the sandbox, return that exact sandbox path unchanged.
 
 Valid example:
 /data/files/.../working_tool/huawei-cc-00000002-v1-20260526164526.py
+/data/files/.../round_002/tmp/huawei-cc-00000002-v1-20260526164526.py
 
 Invalid examples:
 - `The updated tool is: /data/files/.../tool.py`
 - ``/data/files/.../tool.py``
 - `/数据/files/.../tool.py`
 - `/data/files/.../tool.py (updated)`
+- `/tmp/tool.py`

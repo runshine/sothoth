@@ -101,16 +101,6 @@ def _normalize_project_id(project_id: Optional[str]) -> Optional[str]:
     return value or None
 
 
-def _subject_actor(subject: Optional[dict[str, Any]]) -> str:
-    if not isinstance(subject, dict):
-        return "anonymous"
-    username = str(subject.get("username") or "").strip()
-    if username:
-        return username
-    subject_id = str(subject.get("id") or "").strip()
-    return subject_id or "anonymous"
-
-
 def _normalize_runtime_path(path: str) -> str:
     value = str(path or "").strip()
     legacy_prefix = "/data/fileserver/files"
@@ -2128,7 +2118,7 @@ async def _get_task_with_access(task_id: str, token: str) -> dict:
     return task
 
 
-def _submit_task(project_id: Optional[str], request: UnpackRequest, *, created_by: str = "task_manager") -> dict:
+def _submit_task(project_id: Optional[str], request: UnpackRequest) -> dict:
     if project_id and not _normalize_project_id(request.project_id):
         request.project_id = project_id
     _ensure_valid_request_payload(request)
@@ -2143,7 +2133,6 @@ def _submit_task(project_id: Optional[str], request: UnpackRequest, *, created_b
             parent_stage_name=request.parent_stage_name,
             parent_stage_item_id=request.parent_stage_item_id,
             parent_stage_item_key=request.parent_stage_item_key,
-            created_by=created_by,
         )
     except ValueError as exc:
         raise ValidationError(str(exc)) from exc
@@ -2550,9 +2539,9 @@ async def create_project_task(
     if request_project_id and request_project_id != project_id:
         raise ValidationError("请求体中的 project_id 与路径参数不一致")
 
-    subject, token = subject_and_token
+    _, token = subject_and_token
     await ensure_project_access(project_id, token)
-    return _submit_task(project_id, request, created_by=_subject_actor(subject))
+    return _submit_task(project_id, request)
 
 
 @router.get(
@@ -2652,12 +2641,12 @@ async def refresh_project_task_result_cache(
     task_id: str,
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
-    subject, token = subject_and_token
+    _, token = subject_and_token
     await ensure_project_access(project_id, token)
     task = _get_task_or_404(task_id)
     if _normalize_project_id(task.get("project_id")) != project_id:
         raise NotFoundError("任务", task_id)
-    ok, message = request_task_result_cache_refresh(task_id, created_by=_subject_actor(subject))
+    ok, message = request_task_result_cache_refresh(task_id)
     if not ok:
         raise ValidationError(message)
     return {"message": message, "task_id": task_id}
@@ -2710,12 +2699,12 @@ async def delete_project_task(
     task_id: str,
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
-    subject, token = subject_and_token
+    _, token = subject_and_token
     await ensure_project_access(project_id, token)
     task = _get_task_or_404(task_id)
     if _normalize_project_id(task.get("project_id")) != project_id:
         raise NotFoundError("任务", task_id)
-    deleted_count, skipped_ids = delete_tasks([task_id], created_by=_subject_actor(subject))
+    deleted_count, skipped_ids = delete_tasks([task_id])
     if deleted_count == 0:
         raise ForbiddenError("运行中的任务不能删除，请先取消")
     return {
@@ -2731,11 +2720,11 @@ async def submit_unpack_legacy(
     request: UnpackRequest,
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
-    subject, token = subject_and_token
+    _, token = subject_and_token
     project_id = _normalize_project_id(request.project_id)
     if project_id:
         await ensure_project_access(project_id, token)
-    return _submit_task(project_id, request, created_by=_subject_actor(subject))
+    return _submit_task(project_id, request)
 
 
 @router.post(
@@ -3087,9 +3076,9 @@ async def refresh_task_result_cache_legacy(
     task_id: str,
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
-    subject, token = subject_and_token
+    _, token = subject_and_token
     await _get_task_with_access(task_id, token)
-    ok, message = request_task_result_cache_refresh(task_id, created_by=_subject_actor(subject))
+    ok, message = request_task_result_cache_refresh(task_id)
     if not ok:
         raise ValidationError(message)
     return {"message": message, "task_id": task_id}
@@ -3114,9 +3103,9 @@ async def delete_task_legacy(
     task_id: str,
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
-    subject, token = subject_and_token
+    _, token = subject_and_token
     await _get_task_with_access(task_id, token)
-    deleted_count, skipped_ids = delete_tasks([task_id], created_by=_subject_actor(subject))
+    deleted_count, skipped_ids = delete_tasks([task_id])
     if deleted_count == 0:
         raise ForbiddenError("运行中的任务不能删除，请先取消")
     return {
@@ -3135,9 +3124,9 @@ async def cancel_task_legacy(
     task_id: str,
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
-    subject, token = subject_and_token
+    _, token = subject_and_token
     await _get_task_with_access(task_id, token)
-    ok, message = cancel_task(task_id, created_by=_subject_actor(subject))
+    ok, message = cancel_task(task_id)
     if not ok:
         raise ValidationError(message)
     return {"message": message, "task_id": task_id}
@@ -3151,9 +3140,9 @@ async def retry_task_legacy(
     task_id: str,
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
-    subject, token = subject_and_token
+    _, token = subject_and_token
     await _get_task_with_access(task_id, token)
-    ok, retried_task_id, message = retry_task(task_id, created_by=_subject_actor(subject))
+    ok, retried_task_id, message = retry_task(task_id)
     if not ok or not retried_task_id:
         raise ValidationError(message)
     return {
@@ -3170,10 +3159,10 @@ async def batch_delete_task_legacy(
     request: BatchDeleteRequest,
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
-    subject, token = subject_and_token
+    _, token = subject_and_token
     for task_id in request.task_ids:
         await _get_task_with_access(task_id, token)
-    deleted_count, skipped_ids = delete_tasks(request.task_ids, created_by=_subject_actor(subject))
+    deleted_count, skipped_ids = delete_tasks(request.task_ids)
     return {
         "message": "批量删除已受理，目录清理将在后台完成",
         "deleted_count": deleted_count,
