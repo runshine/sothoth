@@ -9466,6 +9466,7 @@ class TaskManager:
             return False, None, None
         active_statuses = {"pending", "queued", "running", "dispatching", "applying"}
         runs_by_stage = {run.stage_name: run for run in stage_runs}
+        active_candidates: list[tuple[str, str]] = []
         for stage_name in self._stage_sequence_for_task(task):
             if not self._stage_enabled(task, stage_name):
                 continue
@@ -9473,10 +9474,14 @@ class TaskManager:
                 continue
             run = runs_by_stage.get(stage_name)
             if run is None:
-                return True, stage_name, "pending"
+                active_candidates.append((stage_name, "pending"))
+                continue
             normalized_status = self._normalize_downstream_status(run.status) or str(run.status or "").strip()
             if normalized_status in active_statuses:
-                return True, stage_name, normalized_status
+                active_candidates.append((stage_name, normalized_status))
+        if active_candidates:
+            stage_name, normalized_status = active_candidates[-1]
+            return True, stage_name, normalized_status
         return False, None, None
 
     def _has_any_active_incomplete_stage(
@@ -9486,6 +9491,7 @@ class TaskManager:
     ) -> tuple[bool, str | None, str | None]:
         active_statuses = {"pending", "queued", "running", "dispatching", "applying"}
         runs_by_stage = {run.stage_name: run for run in stage_runs}
+        active_candidates: list[tuple[str, str]] = []
         for stage_name in self._stage_sequence_for_task(task):
             if not self._stage_enabled(task, stage_name):
                 continue
@@ -9494,7 +9500,10 @@ class TaskManager:
                 continue
             normalized_status = self._normalize_downstream_status(run.status) or str(run.status or "").strip()
             if normalized_status in active_statuses:
-                return True, stage_name, normalized_status
+                active_candidates.append((stage_name, normalized_status))
+        if active_candidates:
+            stage_name, normalized_status = active_candidates[-1]
+            return True, stage_name, normalized_status
         return False, None, None
 
     def _is_streaming_active_item_status(self, status: str | None) -> bool:

@@ -18114,6 +18114,94 @@ def _test_streaming_stage_terminal_observed_keeps_task_running_with_active_items
     self.assertTrue(any(row.event_type == "stage_worker_terminal_deferred" for row in db.events))
 
 
+def _test_finalize_task_prefers_furthest_active_streaming_stage(self):
+    task = BinarySecurityTask(
+        id="task1",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/tmp",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    stage_runs = [
+        BinarySecurityStageRun(
+            id="sr-sys",
+            task_id="task1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="success",
+        ),
+        BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+            started_at=_now(),
+        ),
+        BinarySecurityStageRun(
+            id="sr-df",
+            task_id="task1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            sequence_no=3,
+            status="success",
+            started_at=_now(),
+            finished_at=_now(),
+        ),
+        BinarySecurityStageRun(
+            id="sr-vs",
+            task_id="task1",
+            project_id="p1",
+            stage_name="vuln_scan",
+            sequence_no=4,
+            status="running",
+            started_at=_now(),
+        ),
+    ]
+    stage_items = [
+        BinarySecurityStageItem(
+            id="si-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-a",
+            item_identity_key="module-a",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-1",
+        ),
+        BinarySecurityStageItem(
+            id="si-vs",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr-vs",
+            stage_name="vuln_scan",
+            item_key="entry-a",
+            item_identity_key="entry-a",
+            status="running",
+            downstream_service="dataflow_vuln_scanner",
+            downstream_task_id="dfvs-1",
+        ),
+    ]
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=stage_runs, stage_items=stage_items, events=[])
+
+    self.manager._finalize_task(db, task)
+
+    self.assertEqual("running", task.status)
+    self.assertEqual("vuln_scan", task.current_stage)
+    self.assertIsNone(task.finished_at)
+    self.assertTrue(any(row.event_type == "task_finalize_deferred_for_active_stage" for row in db.events))
+
+
 def _test_entry_analyse_client_uses_management_api_prefix(self):
     from app.service.entry_analyse import EntryAnalyseClient
 
@@ -18324,6 +18412,7 @@ TaskManagerTests.test_stage_item_response_falls_back_to_downstream_payload_statu
 TaskManagerTests.test_task_reconcile_candidate_items_scans_all_stages_with_downstream_refs = _test_task_reconcile_candidate_items_scans_all_stages_with_downstream_refs
 TaskManagerTests.test_task_sync_cooldown_elapsed_uses_all_candidate_items = _test_task_sync_cooldown_elapsed_uses_all_candidate_items
 TaskManagerTests.test_streaming_stage_terminal_observed_keeps_task_running_with_active_items = _test_streaming_stage_terminal_observed_keeps_task_running_with_active_items
+TaskManagerTests.test_finalize_task_prefers_furthest_active_streaming_stage = _test_finalize_task_prefers_furthest_active_streaming_stage
 TaskManagerTests.test_entry_analyse_client_uses_management_api_prefix = _test_entry_analyse_client_uses_management_api_prefix
 TaskManagerTests.test_dataflow_analyse_client_uses_management_api_prefix = _test_dataflow_analyse_client_uses_management_api_prefix
 TaskManagerTests.test_system_analyse_client_uses_management_api_prefix = _test_system_analyse_client_uses_management_api_prefix
