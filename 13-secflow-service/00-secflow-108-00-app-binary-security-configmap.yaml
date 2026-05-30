@@ -72,16 +72,16 @@ data:
         base_url: "http://secflow-app-firmware-unpacker"
         timeout: 60
       system_analyse:
-        base_url: "http://secflow-app-system-analyse/api/app/system-analyse"
+        base_url: "http://secflow-app-system-analyse"
         timeout: 60
       binary_to_source:
-        base_url: "http://secflow-app-binary-to-source-manager/api/app/binary-to-source"
+        base_url: "http://secflow-app-binary-to-source-manager"
         timeout: 60
       entry_analyse:
-        base_url: "http://secflow-app-entry-analyse/api/app/entry-analyse"
+        base_url: "http://secflow-app-entry-analyse"
         timeout: 60
       dataflow_analyse:
-        base_url: "http://secflow-app-dataflow-analyse/api/app/dataflow-analyse"
+        base_url: "http://secflow-app-dataflow-analyse"
         timeout: 60
       dataflow_vuln_scanner:
         base_url: "http://secflow-app-dataflow-vuln-scanner"

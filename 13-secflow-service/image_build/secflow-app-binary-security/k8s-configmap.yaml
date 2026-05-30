@@ -45,7 +45,6 @@ data:
       poll_interval_seconds: 5
       task_concurrency: 2
       stage_poll_interval_seconds: 5
-      downstream_reconcile_interval_seconds: 30
       heartbeat_update_interval_seconds: 15
       downstream_reconcile_grace_seconds: 30
       shutdown_grace_seconds: 10
@@ -58,7 +57,7 @@ data:
       enabled: true
       redis_url: "redis://redis.sothothv2-ns.svc.cluster.local:6379/0"
       task_queue_key: "secflow:binary-security:tasks"
-      operation_queue_key: "secflow:binary-security:operations"
+      action_queue_key: "secflow:binary-security:actions"
       block_timeout_seconds: 5
       reconcile_interval_seconds: 30
       seed_batch_size: 20
@@ -73,16 +72,16 @@ data:
         base_url: "http://secflow-app-firmware-unpacker"
         timeout: 60
       system_analyse:
-        base_url: "http://secflow-app-system-analyse/api/app/system-analyse"
+        base_url: "http://secflow-app-system-analyse"
         timeout: 60
       binary_to_source:
-        base_url: "http://secflow-app-binary-to-source-manager/api/app/binary-to-source"
+        base_url: "http://secflow-app-binary-to-source-manager"
         timeout: 60
       entry_analyse:
-        base_url: "http://secflow-app-entry-analyse/api/app/entry-analyse"
+        base_url: "http://secflow-app-entry-analyse"
         timeout: 60
       dataflow_analyse:
-        base_url: "http://secflow-app-dataflow-analyse/api/app/dataflow-analyse"
+        base_url: "http://secflow-app-dataflow-analyse"
         timeout: 60
       dataflow_vuln_scanner:
         base_url: "http://secflow-app-dataflow-vuln-scanner"
