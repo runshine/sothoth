@@ -16,7 +16,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: cloudbeaver
-          image: dbeaver/cloudbeaver:latest
+          image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/dbeaver/cloudbeaver:latest
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8978

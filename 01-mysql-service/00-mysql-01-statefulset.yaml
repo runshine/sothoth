@@ -20,7 +20,7 @@ spec:
       containers:
         # tcp容器
         - name: mysql
-          image: mysql:9.5.0
+          image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/mysql:9.5.0
           imagePullPolicy: IfNotPresent
           env:
             - name: MYSQL_ROOT_PASSWORD
