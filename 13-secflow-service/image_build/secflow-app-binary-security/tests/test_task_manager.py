@@ -12075,6 +12075,64 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("2026-05-29T22:39:20", summary_by_stage["system_analysis"].started_at.isoformat())
         self.assertEqual("2026-05-29T23:47:06", summary_by_stage["system_analysis"].finished_at.isoformat())
 
+    def test_list_tasks_refreshes_active_stage_from_authoritative_items(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source-task",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            execution_mode="streaming",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/output",
+            workspace_root="/workspace",
+        )
+        task.policy = {}
+        task.stage_summary = {
+            "entry_analysis": {
+                "sequence_no": 2,
+                "status": "pending",
+                "total_items": 0,
+                "running_items": 0,
+            }
+        }
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="pending",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="entry_analysis",
+            item_key="mod-a",
+            item_name="mod-a",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat1",
+        )
+        item.result = {
+            "sync_observation": {
+                "downstream_status": "running",
+            }
+        }
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item])
+
+        response = self.manager.list_tasks(db, project_id="p1")
+
+        summary_by_stage = {summary.stage_name: summary for summary in response.items[0].stage_summaries}
+        self.assertEqual("running", summary_by_stage["entry_analysis"].status)
+        self.assertEqual(1, summary_by_stage["entry_analysis"].total_items)
+        self.assertEqual(1, summary_by_stage["entry_analysis"].running_items)
+        self.assertEqual("running", task.stage_summary["entry_analysis"]["status"])
+
     def test_refresh_system_analysis_stage_preserves_failed_item_reason_when_no_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)

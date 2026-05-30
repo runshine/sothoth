@@ -1495,28 +1495,7 @@ class TaskManager:
             )
 
             stage_started = time.perf_counter()
-            stage_runs_by_task: dict[str, list[BinarySecurityStageRun]] = {}
-            stage_items_by_task: dict[str, list[BinarySecurityStageItem]] = {}
-            task_ids = [str(task.id) for task in tasks if getattr(task, "id", None)]
-            if task_ids:
-                stage_runs = (
-                    db.query(BinarySecurityStageRun)
-                    .filter(BinarySecurityStageRun.task_id.in_(task_ids))
-                    .all()
-                )
-                stage_items = (
-                    db.query(BinarySecurityStageItem)
-                    .filter(BinarySecurityStageItem.task_id.in_(task_ids))
-                    .all()
-                )
-                for run in stage_runs:
-                    task_id = str(getattr(run, "task_id", "") or "")
-                    if task_id:
-                        stage_runs_by_task.setdefault(task_id, []).append(run)
-                for item in stage_items:
-                    task_id = str(getattr(item, "task_id", "") or "")
-                    if task_id:
-                        stage_items_by_task.setdefault(task_id, []).append(item)
+            stage_runs_by_task, stage_items_by_task = self._task_list_stage_state_by_task(db, tasks)
             items = [
                 self._task_list_response(
                     db,
@@ -11157,6 +11136,42 @@ class TaskManager:
                 archive.pending_count += job_count
 
         return list(aggregates.values())
+
+    def _task_list_stage_state_by_task(
+        self,
+        db: Session,
+        tasks: list[BinarySecurityTask],
+    ) -> tuple[dict[str, list[BinarySecurityStageRun]], dict[str, list[BinarySecurityStageItem]]]:
+        task_ids = [str(task.id) for task in tasks if getattr(task, "id", None)]
+        if not task_ids:
+            return {}, {}
+
+        for task in tasks:
+            active_stage_name = self._active_reconcile_stage_name(task)
+            if active_stage_name:
+                self._refresh_stage_from_authoritative_items(db, task, active_stage_name)
+
+        stage_runs = (
+            db.query(BinarySecurityStageRun)
+            .filter(BinarySecurityStageRun.task_id.in_(task_ids))
+            .all()
+        )
+        stage_items = (
+            db.query(BinarySecurityStageItem)
+            .filter(BinarySecurityStageItem.task_id.in_(task_ids))
+            .all()
+        )
+        stage_runs_by_task: dict[str, list[BinarySecurityStageRun]] = {}
+        stage_items_by_task: dict[str, list[BinarySecurityStageItem]] = {}
+        for run in stage_runs:
+            task_id = str(getattr(run, "task_id", "") or "")
+            if task_id:
+                stage_runs_by_task.setdefault(task_id, []).append(run)
+        for item in stage_items:
+            task_id = str(getattr(item, "task_id", "") or "")
+            if task_id:
+                stage_items_by_task.setdefault(task_id, []).append(item)
+        return stage_runs_by_task, stage_items_by_task
 
     def _task_list_response(
         self,
