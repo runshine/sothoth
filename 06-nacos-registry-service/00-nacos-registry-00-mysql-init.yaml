@@ -163,7 +163,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: mysql-init
-          image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/mysql:9.5.0
+          image: mysql:9.5.0
           command: ["/bin/sh", "-c"]
           volumeMounts:
             - name: nacos-mysql-init-script
