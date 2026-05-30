@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: secflow-app-ipc-audit
-          image: secflow-app-ipc-audit:latest
+          image: ghcr.io/runshine/secflow-app-ipc-audit:latest
           imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true

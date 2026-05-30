@@ -501,7 +501,7 @@ spec:
     spec:
       containers:
       - name: secflow-menu
-        image: secflow-menu:latest
+        image: ghcr.io/runshine/secflow-platform-menu:latest
         ports:
         - containerPort: 5000
         volumeMounts:

@@ -1091,7 +1091,7 @@ version: '3.8'
 
 services:
   secflow-user:
-    image: secflow-user:latest
+    image: ghcr.io/runshine/secflow-platform-auth:latest
     container_name: secflow-user
     restart: unless-stopped
     ports:

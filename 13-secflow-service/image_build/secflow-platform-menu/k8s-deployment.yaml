@@ -30,7 +30,7 @@ spec:
       # 容器配置
       containers:
       - name: secflow-menu
-        image: secflow-menu:latest
+        image: ghcr.io/runshine/secflow-platform-menu:latest
         imagePullPolicy: IfNotPresent
         env:
           - name: TZ

@@ -100,7 +100,7 @@ spec:
       serviceAccountName: secflow-workflow-sa
       containers:
         - name: secflow-workflow
-          image: registry.example.com/secflow-workflow-service:v1.0.0
+          image: ghcr.io/runshine/secflow-platform-workflow:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8080

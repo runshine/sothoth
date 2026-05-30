@@ -102,7 +102,7 @@ spec:
       serviceAccountName: secflow-project-sa
       containers:
         - name: secflow-project
-          image: registry.example.com/secflow-project-service:v1.0.0
+          image: ghcr.io/runshine/secflow-platform-project:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
