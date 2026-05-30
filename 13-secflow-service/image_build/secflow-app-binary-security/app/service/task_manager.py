@@ -7283,11 +7283,12 @@ class TaskManager:
             if str(item.status or "").strip().lower() == "downstream_missing" and normalized_mapped_status == "failed":
                 normalized_mapped_status = "downstream_missing"
             item.status = normalized_mapped_status
-            item.error_message = None if normalized_mapped_status in {"queued", "running", "success"} else (
+            item.error_message = None if normalized_mapped_status in {"pending", "queued", "dispatching", "running", "success"} else (
                 downstream_payload.get("error") or downstream_payload.get("error_message") or downstream_payload.get("message") or item.error_message
             )
-            item.finished_at = None if normalized_mapped_status in {"queued", "running"} else (item.finished_at or _now())
-            item.started_at = item.started_at or _now()
+            item.finished_at = None if normalized_mapped_status in {"pending", "queued", "dispatching", "running"} else (item.finished_at or _now())
+            if normalized_mapped_status in {"running", "success", "failed", "cancelled", "downstream_missing", "partial_success"}:
+                item.started_at = item.started_at or _now()
             item.result = {
                 **(item.result or {}),
                 "sync_status": "synced",
@@ -9927,10 +9928,11 @@ class TaskManager:
             and (change_source == "transport_error" or sync_status == "transport_error")
         )
         item.error_message = error_message if keep_active_error else (
-            None if normalized_status in {"queued", "running", "success"} else error_message
+            None if normalized_status in {"pending", "queued", "dispatching", "running", "success"} else error_message
         )
-        item.started_at = item.started_at or _now()
-        item.finished_at = None if normalized_status in {"queued", "running"} else (item.finished_at or _now())
+        if normalized_status in {"running", "success", "failed", "cancelled", "downstream_missing", "partial_success"}:
+            item.started_at = item.started_at or _now()
+        item.finished_at = None if normalized_status in {"pending", "queued", "dispatching", "running"} else (item.finished_at or _now())
         preserved_keys = self._apply_child_task_sync_observation(
             item,
             sync_status=sync_status or ("synced" if state_applied else "observed"),
@@ -12706,18 +12708,20 @@ class TaskManager:
             status = self._empty_streaming_stage_run_status(task, stage_run)
         stage_run.status = status
         stage_run.counts = self._stage_counts(db, stage_run)
-        stage_run.last_error = (
-            next(
-                (
-                    item.error_message
-                    for item in items
-                    if item.status in {"failed", "downstream_missing"} and item.error_message
-                ),
-                None,
-            )
-            if items
-            else self._empty_streaming_stage_run_last_error(task, stage_run)
-        )
+        if items:
+            if status in {"failed", "partial_success", "downstream_missing", "cancelled"}:
+                stage_run.last_error = next(
+                    (
+                        item.error_message
+                        for item in items
+                        if item.status in {"failed", "downstream_missing", "cancelled"} and item.error_message
+                    ),
+                    None,
+                )
+            else:
+                stage_run.last_error = None
+        else:
+            stage_run.last_error = self._empty_streaming_stage_run_last_error(task, stage_run)
         self._merge_stage_run_output_summary(
             task,
             stage_run,
@@ -13101,7 +13105,7 @@ class TaskManager:
         return build_stage_item_identity_key(item_key, parent_key)
 
     def _stage_item_started_at(self, status: str) -> datetime | None:
-        return None if status in {"pending", "queued"} else _now()
+        return _now() if status in {"running", "success", "failed", "cancelled", "downstream_missing", "partial_success"} else None
 
     def _find_stage_item(
         self,

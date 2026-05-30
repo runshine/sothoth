@@ -9249,6 +9249,53 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("pending", run.status)
         self.assertIsNotNone(run.started_at)
 
+    def test_refresh_stage_run_from_items_running_stage_does_not_surface_partial_failure_error(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        failed_item = BinarySecurityStageItem(
+            id="si-failed",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="source_project-api",
+            status="failed",
+            error_message="流水线未产生任何外部入口结果",
+        )
+        running_item = BinarySecurityStageItem(
+            id="si-running",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="source_project-cri",
+            status="running",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[failed_item, running_item])
+
+        self.manager._refresh_stage_run_from_items(db, task, "entry_analysis")
+
+        self.assertEqual("running", run.status)
+        self.assertIsNone(run.last_error)
+
     def test_stage_retry_full_terminal_failure_clears_retry_context(self):
         task = BinarySecurityTask(
             id="task1",
@@ -17648,6 +17695,77 @@ def _test_apply_child_task_status_change_records_timeline_and_sync_metadata(self
     self.assertEqual("downstream_sync", child_events[-1].payload.get("change_source"))
     self.assertEqual("pending", child_events[-1].payload.get("before_status"))
     self.assertEqual("running", child_events[-1].payload.get("after_status"))
+    self.assertIsNotNone(item.started_at)
+    self.assertIsNone(item.finished_at)
+
+
+def _test_apply_child_task_status_change_dispatching_preserves_not_started_timestamps(self):
+    task = BinarySecurityTask(id="t1", project_id="p1", name="demo", status="running")
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="IPSEC",
+        status="pending",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+    self.manager._apply_child_task_status_change(
+        db,
+        task=task,
+        item=item,
+        change_source="downstream_sync",
+        after_status="dispatching",
+        downstream_payload={"status": "pending", "task_id": "eat-1"},
+        sync_status="synced",
+        downstream_status_raw="pending",
+        downstream_status_mapped="pending",
+        downstream_status="pending",
+        state_applied=True,
+    )
+
+    self.assertEqual("dispatching", item.status)
+    self.assertIsNone(item.started_at)
+    self.assertIsNone(item.finished_at)
+    self.assertIsNone(item.error_message)
+
+
+def _test_apply_child_task_status_change_terminal_failure_sets_finished_at(self):
+    task = BinarySecurityTask(id="t1", project_id="p1", name="demo", status="running")
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="IPSEC",
+        status="dispatching",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+    self.manager._apply_child_task_status_change(
+        db,
+        task=task,
+        item=item,
+        change_source="downstream_sync",
+        after_status="failed",
+        downstream_payload={"status": "failed", "task_id": "eat-1", "error": "boom"},
+        sync_status="synced",
+        downstream_status_raw="failed",
+        downstream_status_mapped="failed",
+        downstream_status="failed",
+        error_message="boom",
+        state_applied=True,
+    )
+
+    self.assertEqual("failed", item.status)
+    self.assertEqual("boom", item.error_message)
+    self.assertIsNotNone(item.started_at)
+    self.assertIsNotNone(item.finished_at)
 
 
 def _test_defer_item_after_downstream_transport_error_records_child_sync_failed(self):
@@ -17693,6 +17811,10 @@ def _test_defer_item_after_downstream_transport_error_records_child_sync_failed(
     self.assertEqual("connection_reused_stale", deferred_events[-1].payload.get("error_type_detail"))
     self.assertTrue(deferred_events[-1].payload.get("retry_attempted"))
     self.assertTrue(deferred_events[-1].payload.get("client_recreated"))
+
+
+TaskManagerTests.test_apply_child_task_status_change_dispatching_preserves_not_started_timestamps = _test_apply_child_task_status_change_dispatching_preserves_not_started_timestamps
+TaskManagerTests.test_apply_child_task_status_change_terminal_failure_sets_finished_at = _test_apply_child_task_status_change_terminal_failure_sets_finished_at
 
 
 def _test_upsert_stage_item_preserves_sync_metadata_on_refresh(self):
