@@ -24,7 +24,7 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
                 return self._done
 
         self.manager._loop_task = _Task(False)
-        self.manager._action_loop_task = _Task(False)
+        self.manager._operation_loop_task = _Task(False)
         self.manager._archive_loop_task = _Task(True)
         self.manager._stage_item_loop_task = _Task(False)
         self.manager._downstream_reconcile_task = _Task(False)
@@ -38,7 +38,7 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
         self.assertEqual(
             {
                 "task_dispatch": True,
-                "action_dispatch": True,
+                "operation_dispatch": True,
                 "archive_dispatch": False,
                 "stage_item_dispatch": True,
                 "downstream_reconcile": True,
@@ -122,35 +122,33 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["called", "called"], reconcile_calls)
         logger_exception.assert_not_called()
 
-    async def test_action_dispatch_loop_does_not_log_crash_for_redis_timeout_empty_poll(self):
+    async def test_operation_dispatch_loop_does_not_log_crash_for_redis_timeout_empty_poll(self):
         manager = TaskManager()
         manager._running = True
         manager.cfg.queue.enabled = True
         manager.cfg.queue.block_timeout_seconds = 1
-        reconcile_calls = []
+        pop_calls = []
 
         class _Queue:
-            async def pop_action(self, _timeout_seconds):
-                if not reconcile_calls:
+            async def pop_operation(self, _timeout_seconds):
+                pop_calls.append("called")
+                if len(pop_calls) == 1:
                     return None
                 manager._running = False
                 return None
 
-        async def _reconcile(_db):
-            reconcile_calls.append("called")
-
         async def _observe(_db):
             return None
 
-        manager._reconcile_work_queues = _reconcile
         manager._observe_runtime_metrics = _observe
+        manager._requeue_stale_operations = lambda _db: False
 
         with patch("app.service.task_manager.get_task_queue", return_value=_Queue()), patch(
             "app.service.task_manager.logger.exception"
         ) as logger_exception:
-            await manager._blocking_action_dispatch_loop()
+            await manager._operation_dispatch_loop()
 
-        self.assertEqual(["called", "called"], reconcile_calls)
+        self.assertEqual(["called", "called"], pop_calls)
         logger_exception.assert_not_called()
 
     async def test_state_reducer_loop_recovers_from_observe_failure(self):

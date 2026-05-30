@@ -17,7 +17,7 @@ import tarfile
 import time
 import uuid
 import zipfile
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -39,6 +39,7 @@ from app.model import (
     BinarySecurityArchiveJob,
     BinarySecurityProjectConfig,
     BinarySecurityServiceConfig,
+    BinarySecurityTaskOperation,
     BinarySecurityStageItem,
     BinarySecurityStageRun,
     BinarySecurityStateEvent,
@@ -52,6 +53,11 @@ from app.model import (
 from app.observability import (
     observe_archive_action,
     observe_archive_duration,
+    observe_control_operation,
+    observe_control_operation_duration,
+    observe_control_operation_lease_lost,
+    observe_control_operation_step_retry,
+    observe_control_operation_superseded,
     observe_archive_job_statuses,
     observe_downstream_reconcile_observation,
     observe_heartbeat_update,
@@ -107,6 +113,8 @@ from app.schemas import (
     BinarySecurityTaskDetailResponse,
     BinarySecurityTaskEventResponse,
     BinarySecurityTaskListResponse,
+    BinarySecurityTaskOperationPageResponse,
+    BinarySecurityTaskOperationResponse,
     BinarySecurityTaskPolicyUpdatePayload,
     BinarySecurityTaskResponse,
     BinarySecurityTimelineResponse,
@@ -649,11 +657,8 @@ def _no_candidate_modules_failure() -> dict[str, str]:
 STAGE_RETRY_ALLOWED_STATUSES = {"success", "failed", "partial_success", "cancelled"}
 STAGE_RETRY_BLOCKED_TASK_STATUSES = {"pending", "dispatching", "running", "pending_upload", "uploading", "ready_to_start"}
 TASK_STATUS_PENDING_MODULE_CONFIRMATION = "pending_module_confirmation"
-TASK_STATUS_CONTINUE_PREPARING = "continue_preparing"
-TASK_STATUS_RETRY_PREPARING = "retry_preparing"
 TASK_STATUS_HARD_RESTART_FAILED = "hard_restart_failed"
 TASK_STATUS_DELETE_FAILED = "delete_failed"
-TASK_PREPARING_STATUSES = {TASK_STATUS_CONTINUE_PREPARING, TASK_STATUS_RETRY_PREPARING}
 TASK_ACTION_CONTINUE = "continue"
 TASK_ACTION_RETRY = "retry"
 TASK_ACTION_RETRY_FAILED_ITEMS = "retry_failed_items"
@@ -661,6 +666,8 @@ TASK_ACTION_RETRY_STAGE_FAILED_ITEMS = "retry_stage_failed_items"
 TASK_ACTION_RETRY_STAGE_FULL = "retry_stage_full"
 TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS = "retry_archive_failed_items"
 TASK_ACTION_RETRY_ARCHIVE_FULL = "retry_archive_full"
+TASK_ACTION_CANCEL = "cancel"
+TASK_ACTION_DELETE = "delete"
 TASK_PENDING_ACTIONS = {
     TASK_ACTION_CONTINUE,
     TASK_ACTION_RETRY,
@@ -670,6 +677,34 @@ TASK_PENDING_ACTIONS = {
     TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS,
     TASK_ACTION_RETRY_ARCHIVE_FULL,
 }
+TASK_OPERATION_ACTIVE_STATUSES = {"requested", "accepted", "queued", "claimed", "running"}
+TASK_OPERATION_TERMINAL_STATUSES = {"succeeded", "failed", "superseded", "cancelled"}
+TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN = "collect_cleanup_plan"
+TASK_OPERATION_STEP_CANCEL_DOWNSTREAM = "cancel_downstream"
+TASK_OPERATION_STEP_DELETE_DOWNSTREAM = "delete_downstream"
+TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_ABSENT = "verify_downstream_absent"
+TASK_OPERATION_STEP_DELETE_ARCHIVES = "delete_archives"
+TASK_OPERATION_STEP_DELETE_STAGE_ITEMS = "delete_stage_items"
+TASK_OPERATION_STEP_DELETE_STATE_EVENTS = "delete_state_events"
+TASK_OPERATION_STEP_DELETE_STAGE_TIMELINE = "delete_stage_timeline"
+TASK_OPERATION_STEP_REBUILD_UPSTREAM_DERIVED_INPUTS = "rebuild_upstream_derived_inputs"
+TASK_OPERATION_STEP_RESET_STAGE_RUNS = "reset_stage_runs"
+TASK_OPERATION_STEP_REQUEUE_TASK = "requeue_task"
+TASK_OPERATION_STEP_SUCCEEDED = "operation_succeeded"
+TASK_OPERATION_SAGA_STEPS = (
+    TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN,
+    TASK_OPERATION_STEP_CANCEL_DOWNSTREAM,
+    TASK_OPERATION_STEP_DELETE_DOWNSTREAM,
+    TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_ABSENT,
+    TASK_OPERATION_STEP_DELETE_ARCHIVES,
+    TASK_OPERATION_STEP_DELETE_STAGE_ITEMS,
+    TASK_OPERATION_STEP_DELETE_STATE_EVENTS,
+    TASK_OPERATION_STEP_DELETE_STAGE_TIMELINE,
+    TASK_OPERATION_STEP_REBUILD_UPSTREAM_DERIVED_INPUTS,
+    TASK_OPERATION_STEP_RESET_STAGE_RUNS,
+    TASK_OPERATION_STEP_REQUEUE_TASK,
+    TASK_OPERATION_STEP_SUCCEEDED,
+)
 TASK_OPERATION_LOCK_TTL_SECONDS = 1800
 TASK_OPERATION_LOCK_HEARTBEAT_SECONDS = 20
 STATE_EVENT_LEASE_SECONDS = 120
@@ -712,10 +747,6 @@ STAGE_TITLES = {
 FAILED_ITEM_RETRYABLE_STATUSES = {"failed", "cancelled", "downstream_missing", "pending", "queued", "running", "dispatching"}
 ARCHIVE_ACTIVE_STATUSES = {"pending", "running", "archived", "applying"}
 ARCHIVE_SUCCESS_MAPPED_STATUSES = {"success", "partial_success"}
-
-
-def _preparing_status_for_action(action: str) -> str:
-    return TASK_STATUS_CONTINUE_PREPARING if action == TASK_ACTION_CONTINUE else TASK_STATUS_RETRY_PREPARING
 
 
 def _retry_mode_needs_plan(mode: str | None) -> bool:
@@ -800,16 +831,15 @@ class TaskManager:
         self._archive_loop_task: Optional[asyncio.Task] = None
         self._downstream_reconcile_task: Optional[asyncio.Task] = None
         self._readless_reconcile_task: Optional[asyncio.Task] = None
-        self._action_loop_task: Optional[asyncio.Task] = None
         self._state_reducer_loop_task: Optional[asyncio.Task] = None
         self._reducer_metrics_snapshot_loop_task: Optional[asyncio.Task] = None
         self._stage_item_loop_task: Optional[asyncio.Task] = None
         self._workers: dict[str, asyncio.Task] = {}
-        self._action_workers: dict[str, asyncio.Task] = {}
+        self._operation_workers: dict[str, asyncio.Task] = {}
         self._stage_item_workers: dict[str, asyncio.Task] = {}
         self._archive_workers: set[asyncio.Task] = set()
         self._worker_lock = asyncio.Lock()
-        self._action_worker_lock = asyncio.Lock()
+        self._operation_worker_lock = asyncio.Lock()
         self._stage_item_worker_lock = asyncio.Lock()
         self._archive_worker_lock = asyncio.Lock()
         self._last_task_heartbeat_at: dict[str, datetime] = {}
@@ -964,16 +994,16 @@ class TaskManager:
         if self._running:
             return
         self._running = True
-        observe_worker_counts(task_workers=0, action_workers=0, archive_workers=0)
+        observe_worker_counts(task_workers=0, operation_workers=0, archive_workers=0)
         role = str(os.environ.get("SECFLOW_BINARY_SECURITY_ROLE") or "all").strip().lower()
         run_worker_loops = role in {"", "all", "worker"}
         run_reducer_loop = role in {"", "all", "reducer"}
         if run_worker_loops:
             self._loop_task = asyncio.create_task(self._dispatch_loop(), name="binary-security-dispatcher")
             self._archive_loop_task = asyncio.create_task(self._archive_dispatch_loop(), name="binary-security-archive-dispatcher")
-            self._action_loop_task = asyncio.create_task(
-                self._blocking_action_dispatch_loop(),
-                name="binary-security-blocking-action-dispatcher",
+            self._operation_loop_task = asyncio.create_task(
+                self._operation_dispatch_loop(),
+                name="binary-security-operation-dispatcher",
             )
             self._stage_item_loop_task = asyncio.create_task(
                 self._stage_item_dispatch_loop(),
@@ -1013,10 +1043,10 @@ class TaskManager:
                 await self._archive_loop_task
             except asyncio.CancelledError:
                 pass
-        if self._action_loop_task:
-            self._action_loop_task.cancel()
+        if getattr(self, "_operation_loop_task", None):
+            self._operation_loop_task.cancel()
             try:
-                await self._action_loop_task
+                await self._operation_loop_task
             except asyncio.CancelledError:
                 pass
         if self._stage_item_loop_task:
@@ -1059,12 +1089,12 @@ class TaskManager:
             task.cancel()
         if active:
             await asyncio.gather(*active, return_exceptions=True)
-        action_active = list(self._action_workers.values())
-        for task in action_active:
+        operation_active = list(self._operation_workers.values())
+        for task in operation_active:
             task.cancel()
-        if action_active:
-            await asyncio.gather(*action_active, return_exceptions=True)
-        observe_worker_counts(task_workers=0, action_workers=0, archive_workers=0)
+        if operation_active:
+            await asyncio.gather(*operation_active, return_exceptions=True)
+        observe_worker_counts(task_workers=0, operation_workers=0, archive_workers=0)
 
     def prepare_task_id(self, db: Session, project_id: str) -> str:
         for _ in range(10):
@@ -1390,7 +1420,6 @@ class TaskManager:
                     BinarySecurityTask.name,
                     BinarySecurityTask.status,
                     BinarySecurityTask.current_stage,
-                    BinarySecurityTask.pending_action,
                     BinarySecurityTask.firmware_path,
                     BinarySecurityTask.policy_json,
                     BinarySecurityTask.metrics_json,
@@ -1405,10 +1434,6 @@ class TaskManager:
                     BinarySecurityTask.target_stage_name,
                     BinarySecurityTask.latest_abnormal_reason_json,
                     BinarySecurityTask.last_error,
-                    BinarySecurityTask.operation_lock_owner,
-                    BinarySecurityTask.operation_lock_type,
-                    BinarySecurityTask.operation_lock_expires_at,
-                    BinarySecurityTask.operation_lock_heartbeat_at,
                 )
             ).order_by(BinarySecurityTask.created_at.desc()).offset(offset).limit(page_size).all()
             observe_task_list_query_stage(
@@ -1911,8 +1936,8 @@ class TaskManager:
         task_id: str,
         payload: BinarySecurityTaskConcurrencyUpdatePayload,
     ) -> BinarySecurityTaskDetailResponse:
+        task = self._task_or_404(db, project_id, task_id)
         with self._task_operation_lock(db, task_id, operation="update_concurrency"):
-            task = self._task_or_404(db, project_id, task_id)
             stage_sequence = self._stage_sequence_for_task(task)
             allowed_stages = set(stage_sequence)
             requested = payload.stage_parallelism or {}
@@ -1955,8 +1980,18 @@ class TaskManager:
             db.commit()
             return self.get_task_detail(db, project_id=project_id, task_id=task_id)
 
-    def _task_policy_update_support(self, task: BinarySecurityTask) -> tuple[bool, str | None]:
-        blocked_statuses = {"dispatching", "running"} | TASK_PREPARING_STATUSES
+    def _task_policy_update_support(self, task: BinarySecurityTask, db: Session | None = None) -> tuple[bool, str | None]:
+        owns_session = db is None
+        if db is None:
+            db = get_session_factory()()
+        try:
+            active_operation = self._active_operation(db, task.id)
+        finally:
+            if owns_session:
+                db.close()
+        if active_operation is not None:
+            return False, f"当前任务正在执行 {active_operation.operation_type}，暂不允许修改任务策略"
+        blocked_statuses = {"dispatching", "running"}
         if task.status in blocked_statuses:
             return False, f"任务运行中，当前状态不允许修改任务策略: {task.status}"
         return True, None
@@ -1969,12 +2004,11 @@ class TaskManager:
         task_id: str,
         payload: BinarySecurityTaskPolicyUpdatePayload,
     ) -> BinarySecurityTaskDetailResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        supported, reason = self._task_policy_update_support(task, db)
+        if not supported:
+            raise ValidationError(reason or "当前任务不允许修改任务策略")
         with self._task_operation_lock(db, task_id, operation="update_policy"):
-            task = self._task_or_404(db, project_id, task_id)
-            supported, reason = self._task_policy_update_support(task)
-            if not supported:
-                raise ValidationError(reason or "当前任务不允许修改任务策略")
-
             stage_sequence = self._stage_sequence_for_task(task)
             allowed_stages = set(stage_sequence)
             requested_parallelism = payload.stage_parallelism or {}
@@ -2090,39 +2124,78 @@ class TaskManager:
         task_id: str,
         selected_module_keys: list[str],
     ) -> BinarySecurityTaskDetailResponse:
-        operation_token = self._acquire_task_operation_lease(db, task_id, operation="confirm_module_selection")
-        try:
-            task = self._task_or_404(db, project_id, task_id)
-            if task.status != TASK_STATUS_PENDING_MODULE_CONFIRMATION:
-                raise ValidationError("当前任务不处于等待模块确认状态")
-            summary = dict(task.summary or {})
-            candidate_modules = list(summary.get("candidate_modules") or [])
-            if not candidate_modules:
-                raise ValidationError("当前任务没有可确认的候选模块")
-            requested = [str(key or "").strip() for key in selected_module_keys if str(key or "").strip()]
-            if not requested:
-                raise ValidationError("至少选择 1 个模块")
-            candidate_map = {str(module.get("module_key") or ""): dict(module) for module in candidate_modules if str(module.get("module_key") or "").strip()}
-            invalid = [key for key in requested if key not in candidate_map]
-            if invalid:
-                raise ValidationError(f"存在不属于候选集合的模块: {invalid[0]}")
-            self._enqueue_state_event(
-                db,
-                task_id=task.id,
-                project_id=task.project_id,
-                stage_name="system_analysis",
-                event_type="manual_module_selection_confirmed",
-                idempotency_key=f"manual_module_selection_confirmed:{task.id}:{operation_token}:{','.join(requested)}",
-                payload={
-                    "operation_token": operation_token,
-                    "selected_module_keys": requested,
+        task = self._task_or_404(db, project_id, task_id)
+        if task.status != TASK_STATUS_PENDING_MODULE_CONFIRMATION:
+            raise ValidationError("当前任务不处于等待模块确认状态")
+        summary = dict(task.summary or {})
+        candidate_modules = list(summary.get("candidate_modules") or [])
+        if not candidate_modules:
+            raise ValidationError("当前任务没有可确认的候选模块")
+        requested = [str(key or "").strip() for key in selected_module_keys if str(key or "").strip()]
+        if not requested:
+            raise ValidationError("至少选择 1 个模块")
+        candidate_map = {str(module.get("module_key") or ""): dict(module) for module in candidate_modules if str(module.get("module_key") or "").strip()}
+        invalid = [key for key in requested if key not in candidate_map]
+        if invalid:
+            raise ValidationError(f"存在不属于候选集合的模块: {invalid[0]}")
+        selected = self._mark_selected_modules([candidate_map[key] for key in requested], selected_by=MODULE_SELECTION_MODE_MANUAL_CONFIRM)
+        summary["selected_modules"] = selected
+        summary["high_risk_modules"] = selected
+        task.summary = summary
+        task.metrics = {
+            **task.metrics,
+            "selected_module_count": len(selected),
+        }
+        stage_run = db.query(BinarySecurityStageRun).filter(
+            BinarySecurityStageRun.task_id == task.id,
+            BinarySecurityStageRun.stage_name == "system_analysis",
+        ).first()
+        if stage_run:
+            stage_run.status = "success"
+            stage_run.started_at = stage_run.started_at or _now()
+            stage_run.finished_at = stage_run.finished_at or _now()
+            stage_run.last_error = None
+            stage_run.counts = self._stage_counts(db, stage_run)
+            self._merge_stage_run_output_summary(
+                task,
+                stage_run,
+                {
+                    "status": "success",
+                    "sync_status": "success",
+                    "error": None,
+                    "waiting_manual_confirmation": False,
+                    "selected_module_count": len(selected),
+                    "candidate_module_count": len(candidate_modules),
+                    "module_count": len(list(summary.get("system_analysis_modules") or [])),
+                    "high_risk_module_count": len(selected),
+                    "status_synced": True,
                 },
             )
-            db.commit()
-            return self.get_task_detail(db, project_id=project_id, task_id=task_id)
-        except Exception:
-            self._release_task_operation_lease(db, task_id, token=operation_token)
-            raise
+        current_stage = str(task.current_stage or "").strip()
+        task.status = "pending"
+        next_stage = self._next_incomplete_stage(db, task)
+        if next_stage == current_stage or not next_stage:
+            stage_sequence = self._stage_sequence_for_task(task)
+            if current_stage in stage_sequence:
+                current_index = stage_sequence.index(current_stage)
+                if current_index + 1 < len(stage_sequence):
+                    next_stage = stage_sequence[current_index + 1]
+        task.current_stage = next_stage or self._stage_sequence_for_task(task)[0]
+        task.last_error = None
+        self._invalidate_task_execution(task)
+        task.finished_at = None
+        self._record_event(
+            db,
+            task,
+            "module_selection_confirmed",
+            f"已确认 {len(selected)} 个模块，任务继续执行",
+            stage_name="system_analysis",
+            payload={"selected_module_keys": requested},
+        )
+        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+        db.commit()
+        self._enqueue_task(task.id)
+        return self.get_task_detail(db, project_id=project_id, task_id=task_id)
 
     def get_timeline(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTimelineResponse:
         task = self._task_or_404(db, project_id, task_id)
@@ -2143,6 +2216,13 @@ class TaskManager:
                 )
                 for event in events
             ],
+        )
+
+    def get_operations(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskOperationPageResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        return BinarySecurityTaskOperationPageResponse(
+            task_id=task.id,
+            items=[self._operation_response(operation) for operation in self._list_task_operations(db, task.id)],
         )
 
     def clear_timeline(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityActionResponse:
@@ -2265,26 +2345,24 @@ class TaskManager:
                     observe_task_operation("cancel", "already_cancelled")
                     self._release_task_operation_lease(db, task_id, token=operation_token)
                     return BinarySecurityActionResponse(task_id=task_id, message="任务已取消")
-            self._enqueue_state_event(
+            operation = self._queue_task_operation(
                 db,
-                task_id=task.id,
-                project_id=task.project_id,
-                stage_name=task.current_stage,
-                event_type="manual_cancel_requested",
-                idempotency_key=f"manual_cancel_requested:{task.id}:{operation_token}",
-                payload={
-                    "operation_token": operation_token,
-                    "current_stage": task.current_stage,
-                },
+                task,
+                operation_type=TASK_ACTION_CANCEL,
+                target_stage=task.current_stage,
+                requested_by=task.created_by,
+                request_payload={"current_stage": task.current_stage},
+                accepted_event_type="task_cancel_accepted",
+                accepted_message="任务取消已受理，后台正在停止执行并清理下游任务",
             )
-            db.commit()
             observe_task_operation("cancel", "accepted")
             return BinarySecurityActionResponse(
                 task_id=task_id,
+                operation_id=operation.id,
                 accepted=True,
                 action="cancel",
-                status="cancel_requested",
-                message="任务取消已受理，等待 reducer 串行应用",
+                status="accepted",
+                message="任务取消已受理，后台正在停止执行并清理下游任务",
             )
         except Exception:
             self._release_task_operation_lease(db, task_id, token=operation_token)
@@ -2294,31 +2372,29 @@ class TaskManager:
         operation_token = self._acquire_task_operation_lease(db, task_id, operation="delete", ttl_seconds=TASK_OPERATION_LOCK_TTL_SECONDS)
         try:
             task = self._task_or_404(db, project_id, task_id)
-            self._enqueue_state_event(
+            operation = self._queue_task_operation(
                 db,
-                task_id=task.id,
-                project_id=task.project_id,
-                stage_name=task.current_stage,
-                event_type="manual_delete_requested",
-                idempotency_key=f"manual_delete_requested:{task.id}:{operation_token}",
-                payload={
-                    "operation_token": operation_token,
-                    "current_stage": task.current_stage,
-                },
+                task,
+                operation_type=TASK_ACTION_DELETE,
+                target_stage=task.current_stage,
+                requested_by=task.created_by,
+                request_payload={"current_stage": task.current_stage},
+                accepted_event_type="task_delete_accepted",
+                accepted_message="任务删除已受理，后台正在清理下游资源与工作区",
             )
-            db.commit()
             return BinarySecurityActionResponse(
                 task_id=task_id,
+                operation_id=operation.id,
                 accepted=True,
                 action="delete",
-                status="delete_requested",
-                message="任务删除已受理，等待 reducer 串行清理",
+                status="accepted",
+                message="任务删除已受理，后台正在清理下游资源与工作区",
             )
         except Exception:
             self._release_task_operation_lease(db, task_id, token=operation_token)
             raise
 
-    async def continue_task(self, db: Session, *, project_id: str, task_id: str) -> str:
+    async def continue_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskOperation:
         operation_token = self._acquire_task_operation_lease(db, task_id, operation="continue")
         try:
             task = self._task_or_404(db, project_id, task_id)
@@ -2329,18 +2405,18 @@ class TaskManager:
             if not target_stage:
                 observe_task_operation("continue", "rejected")
                 raise ValidationError("当前任务未找到可继续的阶段")
-            self._accept_blocking_action(
+            operation = self._queue_task_operation(
                 db,
                 task,
-                action="continue",
-                preparing_status=TASK_STATUS_CONTINUE_PREPARING,
+                operation_type=TASK_ACTION_CONTINUE,
                 target_stage=target_stage,
-                message=f"继续任务已受理，后台正在准备从阶段 {target_stage} 继续",
-                event_type="task_continue_accepted",
-                event_payload={"target_stage": target_stage},
+                requested_by=task.created_by,
+                request_payload={"target_stage": target_stage},
+                accepted_event_type="task_continue_accepted",
+                accepted_message=f"继续任务已受理，后台正在准备从阶段 {target_stage} 继续",
             )
             observe_task_operation("continue", "accepted")
-            return target_stage
+            return operation
         except Exception:
             self._release_task_operation_lease(db, task_id, token=operation_token)
             raise
@@ -2383,7 +2459,7 @@ class TaskManager:
                 self._reset_stage_run_for_retry(task, stage_run, increment_retry=False)
         return affected_stages
 
-    def retry_task(self, db: Session, *, project_id: str, task_id: str) -> None:
+    def retry_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskOperation:
         operation_token = self._acquire_task_operation_lease(db, task_id, operation="retry")
         try:
             task = self._task_or_404(db, project_id, task_id)
@@ -2393,23 +2469,24 @@ class TaskManager:
                 observe_task_error("retry", stage=str(task.current_stage or "none"), result="rejected")
                 raise ValidationError(reason or "当前任务不支持安全重试")
             first_stage = self._stage_sequence_for_task(task)[0]
-            self._accept_blocking_action(
+            operation = self._queue_task_operation(
                 db,
                 task,
-                action="retry",
-                preparing_status=TASK_STATUS_RETRY_PREPARING,
+                operation_type=TASK_ACTION_RETRY,
                 target_stage=first_stage,
-                message=f"清空并从头开始已受理，后台正在准备从阶段 {first_stage} 重新排队",
-                event_type="task_retry_accepted",
-                event_payload={"target_stage": first_stage},
+                requested_by=task.created_by,
+                request_payload={"target_stage": first_stage},
+                accepted_event_type="task_retry_accepted",
+                accepted_message=f"清空并从头开始已受理，后台正在准备从阶段 {first_stage} 重新排队",
             )
             observe_task_operation("retry", "accepted")
             observe_task_error("retry", stage=first_stage, result="accepted")
+            return operation
         except Exception:
             self._release_task_operation_lease(db, task_id, token=operation_token)
             raise
 
-    def retry_failed_items(self, db: Session, *, project_id: str, task_id: str) -> str:
+    def retry_failed_items(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskOperation:
         operation_token = self._acquire_task_operation_lease(db, task_id, operation=TASK_ACTION_RETRY_FAILED_ITEMS)
         try:
             task = self._task_or_404(db, project_id, task_id)
@@ -2419,18 +2496,18 @@ class TaskManager:
                 if not continue_supported or not continue_stage:
                     observe_task_operation(TASK_ACTION_RETRY_FAILED_ITEMS, "rejected")
                     raise ValidationError(reason or continue_reason or "当前任务不支持重试失败项")
-                self._accept_blocking_action(
+                operation = self._queue_task_operation(
                     db,
                     task,
-                    action="continue",
-                    preparing_status=TASK_STATUS_CONTINUE_PREPARING,
+                    operation_type=TASK_ACTION_CONTINUE,
                     target_stage=continue_stage,
-                    message=f"当前没有失败项，已自动转为继续推进，后台将从阶段 {continue_stage} 重新排队",
-                    event_type="task_retry_failed_items_continue_accepted",
-                    event_payload={"target_stage": continue_stage, "fallback_from": TASK_ACTION_RETRY_FAILED_ITEMS},
+                    requested_by=task.created_by,
+                    request_payload={"target_stage": continue_stage, "fallback_from": TASK_ACTION_RETRY_FAILED_ITEMS},
+                    accepted_event_type="task_retry_failed_items_continue_accepted",
+                    accepted_message=f"当前没有失败项，已自动转为继续推进，后台将从阶段 {continue_stage} 重新排队",
                 )
                 observe_task_operation(TASK_ACTION_RETRY_FAILED_ITEMS, "accepted")
-                return continue_stage
+                return operation
             item_keys = sorted({self._stage_item_identity(item.item_key, item.parent_key) for item in items})
             self._set_retry_plan(
                 task,
@@ -2444,18 +2521,18 @@ class TaskManager:
                     "cleared_archive_stages": [],
                 },
             )
-            self._accept_blocking_action(
+            operation = self._queue_task_operation(
                 db,
                 task,
-                action=TASK_ACTION_RETRY_FAILED_ITEMS,
-                preparing_status=TASK_STATUS_RETRY_PREPARING,
+                operation_type=TASK_ACTION_RETRY_FAILED_ITEMS,
                 target_stage=stage_name,
-                message=f"重试失败项已受理，后台正在准备从阶段 {stage_name} 重新排队",
-                event_type="task_retry_failed_items_accepted",
-                event_payload={"target_stage": stage_name, "retry_item_count": len(item_keys)},
+                requested_by=task.created_by,
+                request_payload={"target_stage": stage_name, "retry_item_keys": item_keys, "retry_item_count": len(item_keys)},
+                accepted_event_type="task_retry_failed_items_accepted",
+                accepted_message=f"重试失败项已受理，后台正在准备从阶段 {stage_name} 重新排队",
             )
             observe_task_operation(TASK_ACTION_RETRY_FAILED_ITEMS, "accepted")
-            return stage_name
+            return operation
         except Exception:
             self._release_task_operation_lease(db, task_id, token=operation_token)
             raise
@@ -2637,7 +2714,7 @@ class TaskManager:
     def retry_stage(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
         self.retry_stage_full(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
 
-    def retry_stage_failed_items(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
+    def retry_stage_failed_items(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> BinarySecurityTaskOperation:
         operation_token = self._acquire_task_operation_lease(db, task_id, operation=TASK_ACTION_RETRY_STAGE_FAILED_ITEMS)
         try:
             task = self._task_or_404(db, project_id, task_id)
@@ -2646,17 +2723,17 @@ class TaskManager:
                 continue_supported, continue_reason, continue_stage = self._task_continue_support(db, task)
                 if not continue_supported or not continue_stage:
                     raise ValidationError(reason or continue_reason or f"阶段 {stage_name} 不支持重试失败项")
-                self._accept_blocking_action(
+                operation = self._queue_task_operation(
                     db,
                     task,
-                    action="continue",
-                    preparing_status=TASK_STATUS_CONTINUE_PREPARING,
+                    operation_type=TASK_ACTION_CONTINUE,
                     target_stage=continue_stage,
-                    message=f"阶段 {stage_name} 当前没有失败项，已自动转为继续推进，后台将从阶段 {continue_stage} 重新排队",
-                    event_type="stage_retry_failed_items_continue_accepted",
-                    event_payload={"target_stage": continue_stage, "requested_stage": stage_name},
+                    requested_by=task.created_by,
+                    request_payload={"target_stage": continue_stage, "requested_stage": stage_name},
+                    accepted_event_type="stage_retry_failed_items_continue_accepted",
+                    accepted_message=f"阶段 {stage_name} 当前没有失败项，已自动转为继续推进，后台将从阶段 {continue_stage} 重新排队",
                 )
-                return
+                return operation
             item_keys = sorted({self._stage_item_identity(item.item_key, item.parent_key) for item in items})
             self._set_retry_plan(
                 task,
@@ -2670,21 +2747,22 @@ class TaskManager:
                     "cleared_archive_stages": [],
                 },
             )
-            self._accept_blocking_action(
+            operation = self._queue_task_operation(
                 db,
                 task,
-                action=TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
-                preparing_status=TASK_STATUS_RETRY_PREPARING,
+                operation_type=TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
                 target_stage=stage_name,
-                message=f"阶段 {stage_name} 的失败项重试已受理，后台正在准备重新排队",
-                event_type="stage_retry_failed_items_accepted",
-                event_payload={"target_stage": stage_name, "retry_item_count": len(item_keys)},
+                requested_by=task.created_by,
+                request_payload={"target_stage": stage_name, "retry_item_keys": item_keys, "retry_item_count": len(item_keys)},
+                accepted_event_type="stage_retry_failed_items_accepted",
+                accepted_message=f"阶段 {stage_name} 的失败项重试已受理，后台正在准备重新排队",
             )
+            return operation
         except Exception:
             self._release_task_operation_lease(db, task_id, token=operation_token)
             raise
 
-    def retry_stage_full(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
+    def retry_stage_full(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> BinarySecurityTaskOperation:
         operation_token = self._acquire_task_operation_lease(db, task_id, operation=TASK_ACTION_RETRY_STAGE_FULL)
         try:
             task = self._task_or_404(db, project_id, task_id)
@@ -2703,25 +2781,26 @@ class TaskManager:
                     "cleared_archive_stages": [],
                 },
             )
-            self._accept_blocking_action(
+            operation = self._queue_task_operation(
                 db,
                 task,
-                action=TASK_ACTION_RETRY_STAGE_FULL,
-                preparing_status=TASK_STATUS_RETRY_PREPARING,
+                operation_type=TASK_ACTION_RETRY_STAGE_FULL,
                 target_stage=stage_name,
-                message=f"阶段 {stage_name} 的完全重试已受理，后台正在清理旧子任务并重建输入",
-                event_type="stage_retry_full_accepted",
-                event_payload={"target_stage": stage_name},
+                requested_by=task.created_by,
+                request_payload={"target_stage": stage_name},
+                accepted_event_type="stage_retry_full_accepted",
+                accepted_message=f"阶段 {stage_name} 的完全重试已受理，后台正在清理旧子任务并重建输入",
             )
+            return operation
         except Exception:
             self._release_task_operation_lease(db, task_id, token=operation_token)
             raise
 
-    def retry_stage_archive(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
-        self.retry_stage_archive_failed_items(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
+    def retry_stage_archive(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> BinarySecurityTaskOperation:
+        return self.retry_stage_archive_failed_items(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
 
-    def retry_stage_archive_failed_items(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
-        operation_token = self._acquire_task_operation_lease(db, task_id, operation="retry_stage_archive")
+    def retry_stage_archive_failed_items(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> BinarySecurityTaskOperation:
+        operation_token = self._acquire_task_operation_lease(db, task_id, operation=TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS)
         try:
             task = self._task_or_404(db, project_id, task_id)
             stage_sequence = self._stage_sequence_for_task(task)
@@ -2732,74 +2811,75 @@ class TaskManager:
             if not supported:
                 observe_archive_action("retry_stage", "rejected")
                 raise ValidationError(reason or f"阶段 {stage_name} 暂无可重试的归档任务")
-            self._enqueue_manual_archive_retry_event(
+            operation = self._queue_task_operation(
                 db,
                 task,
-                mode="failed_items",
-                stage_name=stage_name,
-                operation_token=operation_token,
-                payload={"retryable_job_ids": [job.id for job in jobs]},
+                operation_type=TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS,
+                target_stage=stage_name,
+                requested_by=task.created_by,
+                request_payload={"target_stage": stage_name, "retryable_job_ids": [job.id for job in jobs]},
+                accepted_event_type="archive_stage_retry_accepted",
+                accepted_message=f"阶段 {stage_name} 的归档失败项重试已受理，后台正在重新排队归档任务",
             )
-            db.commit()
             observe_archive_action("retry_stage", "accepted")
+            return operation
         except Exception:
             self._release_task_operation_lease(db, task_id, token=operation_token)
             raise
 
-    def retry_stage_archive_full(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
-        operation_token = self._acquire_task_operation_lease(db, task_id, operation="retry_stage_archive_full")
+    def retry_stage_archive_full(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> BinarySecurityTaskOperation:
+        operation_token = self._acquire_task_operation_lease(db, task_id, operation=TASK_ACTION_RETRY_ARCHIVE_FULL)
         try:
             task = self._task_or_404(db, project_id, task_id)
             supported, reason, jobs, stage_items = self._archive_full_retry_support(db, task, stage_name, ignore_operation_lock=True)
             if not supported:
                 observe_archive_action("retry_stage_full", "rejected")
                 raise ValidationError(reason or f"阶段 {stage_name} 暂无可完全重试的归档任务")
-            self._enqueue_manual_archive_retry_event(
+            operation = self._queue_task_operation(
                 db,
                 task,
-                mode="full",
-                stage_name=stage_name,
-                operation_token=operation_token,
-                payload={
+                operation_type=TASK_ACTION_RETRY_ARCHIVE_FULL,
+                target_stage=stage_name,
+                requested_by=task.created_by,
+                request_payload={
+                    "target_stage": stage_name,
                     "existing_job_ids": [job.id for job in jobs],
                     "stage_item_ids": [item.id for item in stage_items],
                 },
+                accepted_event_type="archive_stage_full_retry_accepted",
+                accepted_message=f"阶段 {stage_name} 的归档全量重试已受理，后台正在清空并重建归档任务",
             )
-            db.commit()
             observe_archive_action("retry_stage_full", "accepted")
+            return operation
         except Exception:
             self._release_task_operation_lease(db, task_id, token=operation_token)
             raise
 
     def retry_archive_job(self, db: Session, *, project_id: str, task_id: str, archive_job_id: str) -> str:
-        operation_token = self._acquire_task_operation_lease(db, task_id, operation="retry_archive_job")
-        try:
-            task = self._task_or_404(db, project_id, task_id)
-            job = db.query(BinarySecurityArchiveJob).filter(
-                BinarySecurityArchiveJob.task_id == task.id,
-                BinarySecurityArchiveJob.id == archive_job_id,
-            ).first()
-            if job is None:
-                observe_archive_action("retry_job", "rejected")
-                raise NotFoundError("归档任务不存在")
-            supported, reason = self._archive_job_retry_support(db, task, job, ignore_operation_lock=True)
-            if not supported:
-                observe_archive_action("retry_job", "rejected")
-                raise ValidationError(reason or "当前归档任务不可重试")
-            self._enqueue_manual_archive_retry_event(
-                db,
-                task,
-                mode="job",
-                stage_name=job.stage_name,
-                archive_job_id=job.id,
-                operation_token=operation_token,
-            )
-            db.commit()
-            observe_archive_action("retry_job", "accepted")
-            return job.stage_name
-        except Exception:
-            self._release_task_operation_lease(db, task_id, token=operation_token)
-            raise
+        task = self._task_or_404(db, project_id, task_id)
+        job = db.query(BinarySecurityArchiveJob).filter(
+            BinarySecurityArchiveJob.task_id == task.id,
+            BinarySecurityArchiveJob.id == archive_job_id,
+        ).first()
+        if job is None:
+            observe_archive_action("retry_job", "rejected")
+            raise NotFoundError("归档任务不存在")
+        supported, reason = self._archive_job_retry_support(db, task, job, ignore_operation_lock=True)
+        if not supported:
+            observe_archive_action("retry_job", "rejected")
+            raise ValidationError(reason or "当前归档任务不可重试")
+        self._requeue_archive_jobs(
+            db,
+            task,
+            [job],
+            stage_name=job.stage_name,
+            event_type="archive_job_retry_requested",
+            event_message="归档任务已重新排队",
+        )
+        self._mark_task_waiting_for_archive_retry(db, task, job.stage_name)
+        db.commit()
+        observe_archive_action("retry_job", "accepted")
+        return job.stage_name
 
     def _run_sync(self, coro):
         return asyncio.run(coro)
@@ -2826,10 +2906,453 @@ class TaskManager:
             return
         self._schedule_coroutine(get_task_queue().push_task(task_id), label=f"enqueue-task:{task_id}")
 
-    def _enqueue_action(self, task_id: str) -> None:
+    def _enqueue_operation(self, operation_id: str) -> None:
         if not self.cfg.queue.enabled:
             return
-        self._schedule_coroutine(get_task_queue().push_action(task_id), label=f"enqueue-action:{task_id}")
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        try:
+            loop.create_task(
+                self._run_scheduled_coroutine(
+                    get_task_queue().push_operation(operation_id),
+                    label=f"enqueue-operation:{operation_id}",
+                )
+            )
+        except Exception:
+            logger.exception("binary-security enqueue operation failed: %s", operation_id)
+
+    def _active_operation(self, db: Session, task_id: str) -> BinarySecurityTaskOperation | None:
+        return (
+            db.query(BinarySecurityTaskOperation)
+            .filter(
+                BinarySecurityTaskOperation.task_id == task_id,
+                BinarySecurityTaskOperation.status.in_(list(TASK_OPERATION_ACTIVE_STATUSES)),
+            )
+            .order_by(BinarySecurityTaskOperation.created_at.desc(), BinarySecurityTaskOperation.id.desc())
+            .first()
+        )
+
+    def _operation_lease_expires_at(self, *, now_value: datetime | None = None, ttl_seconds: int = TASK_OPERATION_LOCK_TTL_SECONDS) -> datetime:
+        base = now_value or _now()
+        return base + timedelta(seconds=max(30, int(ttl_seconds)))
+
+    def _claim_operation_by_id(self, db: Session, operation_id: str) -> BinarySecurityTaskOperation | None:
+        now_value = _now()
+        lease_expires_at = self._operation_lease_expires_at(now_value=now_value)
+        operation = db.query(BinarySecurityTaskOperation).filter(BinarySecurityTaskOperation.id == operation_id).first()
+        if operation is None:
+            return None
+        updated = (
+            db.query(BinarySecurityTaskOperation)
+            .filter(
+                BinarySecurityTaskOperation.id == operation_id,
+                BinarySecurityTaskOperation.status.in_(["accepted", "queued", "claimed", "running"]),
+                or_(
+                    BinarySecurityTaskOperation.owner_instance_id.is_(None),
+                    BinarySecurityTaskOperation.owner_instance_id == self.instance_id,
+                    BinarySecurityTaskOperation.claim_lease_expires_at.is_(None),
+                    BinarySecurityTaskOperation.claim_lease_expires_at < now_value,
+                ),
+            )
+            .update(
+                {
+                    BinarySecurityTaskOperation.status: "running",
+                    BinarySecurityTaskOperation.owner_instance_id: self.instance_id,
+                    BinarySecurityTaskOperation.started_at: operation.started_at or now_value,
+                    BinarySecurityTaskOperation.heartbeat_at: now_value,
+                    BinarySecurityTaskOperation.claim_lease_expires_at: lease_expires_at,
+                    BinarySecurityTaskOperation.updated_at: now_value,
+                },
+                synchronize_session=False,
+            )
+        )
+        if not updated:
+            return None
+        db.commit()
+        return db.query(BinarySecurityTaskOperation).filter(BinarySecurityTaskOperation.id == operation_id).first()
+
+    def _renew_operation_lease(self, db: Session, operation_id: str) -> bool:
+        now_value = _now()
+        lease_expires_at = self._operation_lease_expires_at(now_value=now_value)
+        updated = (
+            db.query(BinarySecurityTaskOperation)
+            .filter(
+                BinarySecurityTaskOperation.id == operation_id,
+                BinarySecurityTaskOperation.owner_instance_id == self.instance_id,
+                BinarySecurityTaskOperation.status == "running",
+            )
+            .update(
+                {
+                    BinarySecurityTaskOperation.heartbeat_at: now_value,
+                    BinarySecurityTaskOperation.claim_lease_expires_at: lease_expires_at,
+                    BinarySecurityTaskOperation.updated_at: now_value,
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated:
+            db.commit()
+        return bool(updated)
+
+    async def _operation_lease_heartbeat(self, operation_id: str) -> None:
+        interval_seconds = max(5, int(TASK_OPERATION_LOCK_TTL_SECONDS / 3))
+        while self._running:
+            db = get_session_factory()()
+            try:
+                renewed = self._renew_operation_lease(db, operation_id)
+                if not renewed:
+                    operation = db.query(BinarySecurityTaskOperation).filter(BinarySecurityTaskOperation.id == operation_id).first()
+                    observe_control_operation_lease_lost(operation.operation_type if operation is not None else "unknown")
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("binary-security operation lease heartbeat failed: %s", operation_id)
+            finally:
+                db.close()
+            await asyncio.sleep(interval_seconds)
+
+    def _requeue_stale_operations(self, db: Session) -> bool:
+        now_value = _now()
+        stale = (
+            db.query(BinarySecurityTaskOperation)
+            .filter(
+                BinarySecurityTaskOperation.status == "running",
+                BinarySecurityTaskOperation.claim_lease_expires_at.isnot(None),
+                BinarySecurityTaskOperation.claim_lease_expires_at < now_value,
+            )
+            .all()
+        )
+        if not stale:
+            return False
+        changed = False
+        for operation in stale:
+            if str(operation.owner_instance_id or "").strip() == self.instance_id and operation.id in self._operation_workers:
+                continue
+            operation.status = "queued"
+            operation.owner_instance_id = None
+            operation.heartbeat_at = None
+            operation.claim_lease_expires_at = None
+            operation.updated_at = now_value
+            operation.error_code = "operation_lease_lost"
+            operation.error_message = "操作执行租约已失效，等待重新接管"
+            observe_control_operation_lease_lost(operation.operation_type)
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == operation.task_id).first()
+            if task is not None:
+                task.current_operation_id = operation.id
+                self._record_operation_event(
+                    db,
+                    task,
+                    operation,
+                    "operation_requeued_after_lease_lost",
+                    f"后台操作租约已失效，等待重新接管: {operation.operation_type}",
+                    level="warning",
+                    stage_name=operation.target_stage,
+                )
+            changed = True
+        if changed:
+            db.commit()
+            for operation in stale:
+                self._enqueue_operation(operation.id)
+        return changed
+
+    def _latest_operation(self, db: Session, task_id: str) -> BinarySecurityTaskOperation | None:
+        return (
+            db.query(BinarySecurityTaskOperation)
+            .filter(BinarySecurityTaskOperation.task_id == task_id)
+            .order_by(BinarySecurityTaskOperation.created_at.desc(), BinarySecurityTaskOperation.id.desc())
+            .first()
+        )
+
+    def _operation_response(self, operation: BinarySecurityTaskOperation) -> BinarySecurityTaskOperationResponse:
+        return BinarySecurityTaskOperationResponse(
+            id=operation.id,
+            task_id=operation.task_id,
+            project_id=operation.project_id,
+            operation_type=operation.operation_type,
+            target_stage=operation.target_stage,
+            requested_by=operation.requested_by,
+            request_source=operation.request_source,
+            status=operation.status,
+            operation_token=operation.operation_token,
+            owner_instance_id=operation.owner_instance_id,
+            claim_lease_expires_at=operation.claim_lease_expires_at,
+            heartbeat_at=operation.heartbeat_at,
+            request_payload=dict(operation.request_payload or {}),
+            result_payload=dict(operation.result_payload or {}),
+            error_code=operation.error_code,
+            error_message=operation.error_message,
+            current_step=operation.current_step,
+            step_attempts=dict(operation.step_attempts or {}),
+            step_payload=dict(operation.step_payload or {}),
+            resume_cursor=dict(operation.resume_cursor or {}),
+            superseded_by_operation_id=operation.superseded_by_operation_id,
+            created_at=operation.created_at,
+            updated_at=operation.updated_at,
+            started_at=operation.started_at,
+            finished_at=operation.finished_at,
+        )
+
+    def _list_task_operations(self, db: Session, task_id: str) -> list[BinarySecurityTaskOperation]:
+        return (
+            db.query(BinarySecurityTaskOperation)
+            .filter(BinarySecurityTaskOperation.task_id == task_id)
+            .order_by(BinarySecurityTaskOperation.created_at.desc(), BinarySecurityTaskOperation.id.desc())
+            .all()
+        )
+
+    def _record_operation_event(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+        event_type: str,
+        message: str,
+        *,
+        level: str = "info",
+        stage_name: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        merged_payload = {
+            "operation_id": operation.id,
+            "operation_type": operation.operation_type,
+            "operation_status": operation.status,
+            "owner_instance_id": operation.owner_instance_id,
+            **dict(payload or {}),
+        }
+        self._record_event(
+            db,
+            task,
+            event_type,
+            message,
+            level=level,
+            stage_name=stage_name or operation.target_stage,
+            payload=merged_payload,
+            operation_id=operation.id,
+        )
+
+    def _set_operation_step_state(
+        self,
+        operation: BinarySecurityTaskOperation,
+        *,
+        step_name: str,
+        status: str,
+        payload: dict[str, Any] | None = None,
+        resume_cursor: dict[str, Any] | None = None,
+        increment_attempt: bool = False,
+    ) -> None:
+        attempts = dict(operation.step_attempts or {})
+        step_payload = dict(operation.step_payload or {})
+        next_resume_cursor = dict(operation.resume_cursor or {})
+        if increment_attempt:
+            attempts[step_name] = int(attempts.get(step_name) or 0) + 1
+        step_payload[step_name] = {
+            **dict(step_payload.get(step_name) or {}),
+            "status": status,
+            "updated_at": _isoformat_or_none(_now()),
+            **({"payload": dict(payload or {})} if payload is not None else {}),
+        }
+        if resume_cursor is not None:
+            next_resume_cursor = dict(resume_cursor)
+        operation.current_step = step_name
+        operation.step_attempts = attempts
+        operation.step_payload = step_payload
+        operation.resume_cursor = next_resume_cursor
+        operation.updated_at = _now()
+
+    def _record_operation_step_started(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+        *,
+        step_name: str,
+        message: str,
+        stage_name: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self._set_operation_step_state(
+            operation,
+            step_name=step_name,
+            status="running",
+            payload=payload,
+            resume_cursor={"current_step": step_name},
+            increment_attempt=True,
+        )
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "operation_step_started",
+            message,
+            stage_name=stage_name,
+            payload={"step_name": step_name, **dict(payload or {})},
+        )
+
+    def _record_operation_step_finished(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+        *,
+        step_name: str,
+        message: str,
+        stage_name: str | None = None,
+        payload: dict[str, Any] | None = None,
+        next_step: str | None = None,
+    ) -> None:
+        self._set_operation_step_state(
+            operation,
+            step_name=step_name,
+            status="succeeded",
+            payload=payload,
+            resume_cursor={"current_step": next_step or step_name},
+        )
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "operation_step_succeeded",
+            message,
+            stage_name=stage_name,
+            payload={"step_name": step_name, "next_step": next_step, **dict(payload or {})},
+        )
+
+    def _record_operation_step_failed(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+        *,
+        step_name: str,
+        error: Exception | str,
+        stage_name: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        error_message = str(error)
+        self._set_operation_step_state(
+            operation,
+            step_name=step_name,
+            status="failed",
+            payload={"error": error_message, **dict(payload or {})},
+            resume_cursor={"current_step": step_name},
+        )
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "operation_step_failed",
+            f"后台操作步骤失败: {step_name}: {error_message}",
+            level="error",
+            stage_name=stage_name,
+            payload={"step_name": step_name, "error": error_message, **dict(payload or {})},
+        )
+
+    def _operation_resume_step(self, operation: BinarySecurityTaskOperation) -> str:
+        cursor = dict(operation.resume_cursor or {})
+        current_step = str(cursor.get("current_step") or operation.current_step or "").strip()
+        if current_step in TASK_OPERATION_SAGA_STEPS:
+            return current_step
+        return TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN
+
+    def _operation_step_snapshot(self, operation: BinarySecurityTaskOperation, step_name: str) -> dict[str, Any]:
+        return dict(dict(operation.step_payload or {}).get(step_name) or {})
+
+    def _is_operation_requeue_state_applied(
+        self,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> bool:
+        target_stage = str(operation.target_stage or task.current_stage or "").strip() or None
+        if str(task.status or "").strip() != "pending":
+            return False
+        if target_stage and str(task.current_stage or "").strip() != target_stage:
+            return False
+        if task.last_error not in {None, ""}:
+            return False
+        return True
+
+    def _create_task_operation(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        operation_type: str,
+        target_stage: str | None,
+        requested_by: str | None,
+        request_source: str = "api",
+        request_payload: dict[str, Any] | None = None,
+    ) -> BinarySecurityTaskOperation:
+        active_operation = self._active_operation(db, task.id)
+        if active_operation is not None:
+            raise ValidationError(f"当前任务已有进行中的操作: {active_operation.operation_type}")
+        operation = BinarySecurityTaskOperation(
+            id=f"op_{uuid.uuid4().hex[:24]}",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type=operation_type,
+            target_stage=target_stage,
+            requested_by=requested_by,
+            request_source=request_source,
+            status="accepted",
+            operation_token=uuid.uuid4().hex[:32],
+            current_step=None,
+            created_at=_now(),
+            updated_at=_now(),
+        )
+        operation.request_payload = dict(request_payload or {})
+        db.add(operation)
+        task.current_operation_id = operation.id
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "operation_accepted",
+            f"操作已受理: {operation_type}",
+            stage_name=target_stage,
+            payload={"request_payload": dict(operation.request_payload or {})},
+        )
+        observe_control_operation(operation_type, "accepted")
+        return operation
+
+    def _queue_task_operation(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        operation_type: str,
+        target_stage: str | None,
+        requested_by: str | None,
+        request_payload: dict[str, Any] | None = None,
+        accepted_event_type: str,
+        accepted_message: str,
+    ) -> BinarySecurityTaskOperation:
+        operation = self._create_task_operation(
+            db,
+            task,
+            operation_type=operation_type,
+            target_stage=target_stage,
+            requested_by=requested_by,
+            request_payload=request_payload,
+        )
+        operation.status = "queued"
+        task.current_operation_id = operation.id
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            accepted_event_type,
+            accepted_message,
+            stage_name=target_stage,
+            payload={"request_payload": dict(operation.request_payload or {})},
+        )
+        db.flush()
+        db.commit()
+        self._enqueue_operation(operation.id)
+        observe_control_operation(operation.operation_type, "queued")
+        return operation
 
     def _stage_items_for_stages(
         self,
@@ -3071,19 +3594,18 @@ class TaskManager:
             .limit(seed_batch)
             .all()
         ]
-        preparing_ids = [
+        operation_ids = [
             row[0]
-            for row in db.query(BinarySecurityTask.id)
-            .filter(BinarySecurityTask.status.in_(list(TASK_PREPARING_STATUSES)))
-            .order_by(BinarySecurityTask.updated_at.asc(), BinarySecurityTask.created_at.asc(), BinarySecurityTask.id.asc())
+            for row in db.query(BinarySecurityTaskOperation.id)
+            .filter(BinarySecurityTaskOperation.status.in_(["accepted", "queued"]))
+            .order_by(BinarySecurityTaskOperation.updated_at.asc(), BinarySecurityTaskOperation.created_at.asc(), BinarySecurityTaskOperation.id.asc())
             .limit(seed_batch)
             .all()
         ]
         for task_id in pending_ids:
             await get_task_queue().push_task(task_id)
-        for task_id in preparing_ids:
-            await get_task_queue().push_action(task_id)
-
+        for operation_id in operation_ids:
+            await get_task_queue().push_operation(operation_id)
     async def sync_downstream_status(
         self,
         db: Session,
@@ -3757,14 +4279,12 @@ class TaskManager:
         self._clear_stage_output_artifacts(task, normalized)
         return self._clear_archive_jobs_for_stages(db, task.id, normalized)
 
-    def _archive_retry_blocked_reason(self, task: BinarySecurityTask) -> str | None:
-        now_value = _now()
-        if task.status in TASK_PREPARING_STATUSES:
-            return f"当前任务正在执行 {task.pending_action or task.status}，暂不可重试归档"
+    def _archive_retry_blocked_reason(self, db: Session, task: BinarySecurityTask) -> str | None:
+        active_operation = self._active_operation(db, task.id)
+        if active_operation is not None:
+            return f"当前任务正在执行 {active_operation.operation_type}，请稍后重试"
         if task.status in {"dispatching", "running"}:
             return f"当前任务正在执行中，当前状态 {task.status} 下不可手工重试归档"
-        if bool(task.operation_lock_expires_at and task.operation_lock_expires_at > now_value):
-            return f"当前任务正在执行 {task.operation_lock_type or task.pending_action or '未知'} 操作，请稍后重试"
         if task.status in {"pending_upload", "uploading", "ready_to_start", "pending"}:
             return f"当前任务状态不允许重试归档: {task.status}"
         return None
@@ -3777,9 +4297,8 @@ class TaskManager:
         *,
         ignore_operation_lock: bool = False,
     ) -> tuple[bool, str | None]:
-        del db
         if not ignore_operation_lock:
-            blocked_reason = self._archive_retry_blocked_reason(task)
+            blocked_reason = self._archive_retry_blocked_reason(db, task)
             if blocked_reason:
                 return False, blocked_reason
         if job.task_id != task.id:
@@ -3800,7 +4319,7 @@ class TaskManager:
         ignore_operation_lock: bool = False,
     ) -> tuple[bool, str | None, list[BinarySecurityArchiveJob]]:
         if not ignore_operation_lock:
-            blocked_reason = self._archive_retry_blocked_reason(task)
+            blocked_reason = self._archive_retry_blocked_reason(db, task)
             if blocked_reason:
                 return False, blocked_reason, []
         jobs = (
@@ -3837,7 +4356,7 @@ class TaskManager:
         ignore_operation_lock: bool = False,
     ) -> tuple[bool, str | None, list[BinarySecurityArchiveJob], list[BinarySecurityStageItem]]:
         if not ignore_operation_lock:
-            blocked_reason = self._archive_retry_blocked_reason(task)
+            blocked_reason = self._archive_retry_blocked_reason(db, task)
             if blocked_reason:
                 return False, blocked_reason, [], []
         jobs = (
@@ -3916,122 +4435,6 @@ class TaskManager:
                 self._refresh_stage_run_from_items(db, task, current_stage)
         self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
 
-    def _enqueue_manual_archive_retry_event(
-        self,
-        db: Session,
-        task: BinarySecurityTask,
-        *,
-        mode: str,
-        stage_name: str,
-        operation_token: str,
-        archive_job_id: str | None = None,
-        payload: dict[str, Any] | None = None,
-    ) -> None:
-        event_payload = {
-            "mode": mode,
-            "stage_name": stage_name,
-            "archive_job_id": archive_job_id,
-            "operation_token": operation_token,
-            **(payload or {}),
-        }
-        self._enqueue_state_event(
-            db,
-            task_id=task.id,
-            project_id=task.project_id,
-            stage_name=stage_name,
-            archive_job_id=archive_job_id,
-            event_type="manual_archive_retry_requested",
-            idempotency_key=f"manual_archive_retry_requested:{task.id}:{mode}:{stage_name}:{archive_job_id or ''}:{operation_token}",
-            payload=event_payload,
-        )
-
-    def _apply_manual_archive_retry_request_locked(self, db: Session, event: BinarySecurityStateEvent) -> None:
-        payload = dict(event.payload or {})
-        mode = str(payload.get("mode") or "").strip()
-        stage_name = str(payload.get("stage_name") or event.stage_name or "").strip()
-        operation_token = str(payload.get("operation_token") or "").strip()
-        task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == event.task_id).first()
-        if task is None:
-            return
-        if operation_token:
-            current_operation_token = str(task.operation_lock_token or "").strip()
-            if current_operation_token and current_operation_token != operation_token:
-                self._record_event(
-                    db,
-                    task,
-                    "manual_archive_retry_ignored",
-                    "归档重试事件已过期，当前任务操作锁已变化",
-                    level="warning",
-                    stage_name=stage_name,
-                    payload={"mode": mode, "state_event_id": event.id},
-                )
-                return
-        try:
-            if mode == "failed_items":
-                supported, reason, jobs = self._archive_retry_support(db, task, stage_name, ignore_operation_lock=True)
-                if not supported:
-                    raise ValidationError(reason or f"阶段 {stage_name} 暂无可重试的归档任务")
-                self._requeue_archive_jobs(
-                    db,
-                    task,
-                    jobs,
-                    stage_name=stage_name,
-                    event_type="archive_stage_retry_requested",
-                    event_message="阶段归档任务已重新排队",
-                )
-                self._mark_task_waiting_for_archive_retry(db, task, stage_name)
-                observe_archive_action("retry_stage", "reduced")
-                return
-            if mode == "full":
-                supported, reason, jobs, stage_items = self._archive_full_retry_support(db, task, stage_name, ignore_operation_lock=True)
-                if not supported:
-                    raise ValidationError(reason or f"阶段 {stage_name} 暂无可完全重试的归档任务")
-                if jobs:
-                    self._clear_archive_jobs_for_stages(db, task.id, [stage_name])
-                rebuilt = self._rebuild_archive_jobs_for_stage(db, task, stage_name, stage_items)
-                self._mark_task_waiting_for_archive_retry(db, task, stage_name)
-                self._record_event(
-                    db,
-                    task,
-                    "archive_stage_full_retry_requested",
-                    "阶段归档任务已清空并重建",
-                    stage_name=stage_name,
-                    payload={
-                        "stage_name": stage_name,
-                        "rebuild_count": rebuilt,
-                        "retry_semantics": "archive_full",
-                        "state_event_id": event.id,
-                    },
-                )
-                observe_archive_action("retry_stage_full", "reduced")
-                return
-            if mode == "job":
-                archive_job_id = str(payload.get("archive_job_id") or event.archive_job_id or "").strip()
-                job = db.query(BinarySecurityArchiveJob).filter(
-                    BinarySecurityArchiveJob.task_id == task.id,
-                    BinarySecurityArchiveJob.id == archive_job_id,
-                ).first()
-                if job is None:
-                    raise NotFoundError("归档任务不存在")
-                supported, reason = self._archive_job_retry_support(db, task, job, ignore_operation_lock=True)
-                if not supported:
-                    raise ValidationError(reason or "当前归档任务不可重试")
-                self._requeue_archive_jobs(
-                    db,
-                    task,
-                    [job],
-                    stage_name=job.stage_name,
-                    event_type="archive_job_retry_requested",
-                    event_message="归档任务已重新排队",
-                )
-                self._mark_task_waiting_for_archive_retry(db, task, job.stage_name)
-                observe_archive_action("retry_job", "reduced")
-                return
-            raise ValidationError(f"不支持的归档重试模式: {mode or '-'}")
-        finally:
-            if operation_token:
-                self._release_task_operation_lease(db, task.id, token=operation_token)
-
     def _retry_failed_archive_jobs_for_stage(
         self,
         db: Session,
@@ -4098,6 +4501,211 @@ class TaskManager:
             stage_name=stage_name,
             payload={"stage_name": stage_name, "retry_semantics": "archive_retry"},
         )
+
+    async def _prepare_archive_retry_failed_items(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        target_stage: str,
+    ) -> list[str]:
+        supported, reason, jobs = self._archive_retry_support(db, task, target_stage, ignore_operation_lock=True)
+        if not supported:
+            raise ValidationError(reason or f"阶段 {target_stage} 暂无可重试的归档任务")
+        self._requeue_archive_jobs(
+            db,
+            task,
+            jobs,
+            stage_name=target_stage,
+            event_type="archive_stage_retry_requested",
+            event_message="阶段归档任务已重新排队",
+        )
+        self._mark_task_waiting_for_archive_retry(db, task, target_stage)
+        return [target_stage]
+
+    async def _prepare_archive_retry_full(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        target_stage: str,
+    ) -> list[str]:
+        supported, reason, jobs, stage_items = self._archive_full_retry_support(db, task, target_stage, ignore_operation_lock=True)
+        if not supported:
+            raise ValidationError(reason or f"阶段 {target_stage} 暂无可完全重试的归档任务")
+        if jobs:
+            self._clear_archive_jobs_for_stages(db, task.id, [target_stage])
+        rebuilt = self._rebuild_archive_jobs_for_stage(db, task, target_stage, stage_items)
+        self._mark_task_waiting_for_archive_retry(db, task, target_stage)
+        self._record_event(
+            db,
+            task,
+            "archive_stage_full_retry_requested",
+            "阶段归档任务已清空并重建",
+            stage_name=target_stage,
+            payload={
+                "stage_name": target_stage,
+                "rebuild_count": rebuilt,
+                "retry_semantics": "archive_full",
+            },
+        )
+        return [target_stage]
+
+    async def _prepare_cancel_task(self, db: Session, task: BinarySecurityTask) -> list[str]:
+        token = self._service_token()
+        target_stage = str(task.current_stage or "").strip() or None
+        if task.status == "cancelled":
+            running_items = db.query(BinarySecurityStageItem).filter(
+                BinarySecurityStageItem.task_id == task.id,
+                BinarySecurityStageItem.status.in_(["pending", "queued", "dispatching", "running"]),
+            ).all()
+            for item in running_items:
+                item.status = "cancelled"
+                item.finished_at = item.finished_at or _now()
+            active_stage_runs = db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.status.in_(["pending", "dispatching", "queued", "running"]),
+            ).all()
+            for stage_run in active_stage_runs:
+                stage_run.status = "cancelled"
+                stage_run.finished_at = stage_run.finished_at or _now()
+            downstream_refs = self._dedupe_downstream_refs(
+                self._collect_downstream_refs(task, running_items)
+                + self._discover_parent_linked_downstream_refs(db, task)
+            )
+            self._record_event(
+                db,
+                task,
+                "manual_cancel_noop",
+                "任务已经是取消状态，已归一化仍活跃的阶段与子任务",
+                stage_name=target_stage,
+                payload={
+                    "cancelled_item_count": len(running_items),
+                    "cancelled_stage_run_count": len(active_stage_runs),
+                    "downstream_ref_count": len(downstream_refs),
+                },
+            )
+            if downstream_refs:
+                await self._cancel_downstream_refs(db, task, downstream_refs, token)
+            return [stage.stage_name for stage in active_stage_runs]
+
+        task.status = "cancelled"
+        self._invalidate_task_execution(task)
+        task.finished_at = _now()
+        running_items = db.query(BinarySecurityStageItem).filter(
+            BinarySecurityStageItem.task_id == task.id,
+            BinarySecurityStageItem.status.in_(["pending", "queued", "dispatching", "running"]),
+        ).all()
+        for item in running_items:
+            item.status = "cancelled"
+            item.finished_at = _now()
+        active_stage_runs = db.query(BinarySecurityStageRun).filter(
+            BinarySecurityStageRun.task_id == task.id,
+            BinarySecurityStageRun.status.in_(["pending", "dispatching", "queued", "running"]),
+        ).all()
+        for stage_run in active_stage_runs:
+            stage_run.status = "cancelled"
+            stage_run.finished_at = stage_run.finished_at or _now()
+        downstream_refs = self._dedupe_downstream_refs(
+            self._collect_downstream_refs(task, running_items)
+            + self._discover_parent_linked_downstream_refs(db, task)
+        )
+        self._record_event(
+            db,
+            task,
+            "task_cancelled",
+            "任务已取消，后台正在停止下游执行",
+            stage_name=target_stage,
+            payload={
+                "cancelled_item_count": len(running_items),
+                "cancelled_downstream_count": len(downstream_refs),
+            },
+        )
+        observe_task_error("cancel", stage=str(task.current_stage or "none"), result="accepted")
+        observe_task_lifecycle("finished", status=task.status, task_type=self._task_type(task))
+        await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="cancelled")
+        await self._cancel_local_worker(task.id)
+        for item in running_items:
+            if str(item.downstream_task_id or "").strip():
+                await self._cancel_downstream(item, token)
+        if downstream_refs:
+            await self._cancel_downstream_refs(db, task, downstream_refs, token)
+        return sorted({str(stage_run.stage_name or "").strip() for stage_run in active_stage_runs if str(stage_run.stage_name or "").strip()})
+
+    async def _prepare_delete_task(self, db: Session, task: BinarySecurityTask) -> list[str]:
+        task.status = "cancelled"
+        self._invalidate_task_execution(task)
+        task.finished_at = task.finished_at or _now()
+        self._record_event(
+            db,
+            task,
+            "task_delete_requested",
+            "任务删除已受理，开始清理下游与工作区",
+            stage_name=task.current_stage,
+        )
+        items = db.query(BinarySecurityStageItem).options(
+            load_only(
+                BinarySecurityStageItem.id,
+                BinarySecurityStageItem.task_id,
+                BinarySecurityStageItem.stage_name,
+                BinarySecurityStageItem.item_key,
+                BinarySecurityStageItem.status,
+                BinarySecurityStageItem.retry_count,
+                BinarySecurityStageItem.downstream_service,
+                BinarySecurityStageItem.downstream_task_id,
+                BinarySecurityStageItem.error_message,
+                BinarySecurityStageItem.started_at,
+                BinarySecurityStageItem.finished_at,
+                BinarySecurityStageItem.created_at,
+            )
+        ).filter(BinarySecurityStageItem.task_id == task.id).all()
+        downstream_refs = self._dedupe_downstream_refs(
+            self._collect_downstream_refs(task, items)
+            + self._discover_parent_linked_downstream_refs(db, task)
+        )
+        for item in items:
+            if item.status in {"pending", "queued", "running"}:
+                item.status = "cancelled"
+                item.finished_at = _now()
+        await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="cancelled")
+        db.flush()
+
+        await self._cancel_local_worker(task.id)
+        token = self._service_token()
+        await self._cancel_downstream_refs(db, task, downstream_refs, token)
+        deleted_downstream_count = await self._delete_downstream_refs(db, task, downstream_refs, token)
+        cleanup_status = await self._cleanup_task_workspace(task, token)
+        if cleanup_status != "deleted":
+            task.status = TASK_STATUS_DELETE_FAILED
+            task.last_error = f"任务目录清理失败: cleanup_status={cleanup_status}"
+            task.cleanup_snapshot = {
+                **dict(task.cleanup_snapshot or {}),
+                "delete_cleanup_status": cleanup_status,
+                "delete_failed_at": _isoformat_or_none(_now()),
+                "workspace_root": task.workspace_root,
+                "downstream_ref_count": len(downstream_refs),
+                "deleted_downstream_count": int(deleted_downstream_count or 0),
+            }
+            self._record_event(
+                db,
+                task,
+                "task_delete_failed",
+                f"任务目录清理失败，任务保留为 delete_failed: {cleanup_status}",
+                stage_name=task.current_stage,
+                level="error",
+                payload={
+                    "cleanup_status": cleanup_status,
+                    "workspace_root": task.workspace_root,
+                    "downstream_ref_count": len(downstream_refs),
+                    "deleted_downstream_count": int(deleted_downstream_count or 0),
+                },
+            )
+            raise ValidationError(f"任务目录清理失败: {cleanup_status}")
+
+        db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).delete(synchronize_session=False)
+        db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).delete(synchronize_session=False)
+        db.query(BinarySecurityEvent).filter(BinarySecurityEvent.task_id == task.id).delete(synchronize_session=False)
+        db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id).delete(synchronize_session=False)
+        db.delete(task)
+        return []
 
     def _ensure_downstream_archive_job(
         self,
@@ -4373,109 +4981,265 @@ class TaskManager:
         db.commit()
         return BinarySecurityServiceConfigResponse(config=payload)
 
-    def _accept_blocking_action(
-        self,
-        db: Session,
-        task: BinarySecurityTask,
-        *,
-        action: str,
-        preparing_status: str,
-        target_stage: str | None,
-        message: str,
-        event_type: str,
-        event_payload: dict[str, Any] | None = None,
-    ) -> None:
-        if action not in TASK_PENDING_ACTIONS:
-            raise ValidationError(f"不支持的任务阻塞动作: {action}")
-        operation_token = str(task.operation_lock_token or "").strip()
-        self._enqueue_state_event(
-            db,
-            task_id=task.id,
-            project_id=task.project_id,
-            stage_name=target_stage,
-            event_type="manual_blocking_action_requested",
-            idempotency_key=f"manual_blocking_action_requested:{task.id}:{action}:{target_stage or ''}:{operation_token}",
-            payload={
-                "action": action,
-                "preparing_status": preparing_status or _preparing_status_for_action(action),
-                "target_stage": target_stage,
-                "message": message,
-                "accepted_event_type": event_type,
-                "event_payload": event_payload or {},
-                "operation_token": operation_token,
-            },
-        )
-        db.commit()
-
-    def _apply_blocking_action_request_locked(self, db: Session, event: BinarySecurityStateEvent) -> None:
-        payload = dict(event.payload or {})
-        action = str(payload.get("action") or "").strip()
-        if action not in TASK_PENDING_ACTIONS:
-            raise ValidationError(f"不支持的任务阻塞动作: {action}")
-        task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == event.task_id).first()
-        if task is None:
-            return
-        target_stage = str(payload.get("target_stage") or "").strip() or None
-        preparing_status = str(payload.get("preparing_status") or "").strip() or _preparing_status_for_action(action)
-        message = str(payload.get("message") or "").strip() or "任务手工操作已受理"
-        accepted_event_type = str(payload.get("accepted_event_type") or "").strip() or "manual_blocking_action_accepted"
-        event_payload = dict(payload.get("event_payload") or {})
-        expected_operation_token = str(payload.get("operation_token") or "").strip()
-        current_operation_token = str(task.operation_lock_token or "").strip()
-        if expected_operation_token and current_operation_token and expected_operation_token != current_operation_token:
-            self._record_event(
-                db,
-                task,
-                "manual_blocking_action_ignored",
-                "手工操作事件已过期，当前任务操作锁已变化",
-                level="warning",
-                stage_name=target_stage,
-                payload={"action": action, "target_stage": target_stage, "state_event_id": event.id},
-            )
-            return
-        self._invalidate_task_execution(task)
-        task.status = preparing_status
-        task.pending_action = action
-        task.current_stage = target_stage or task.current_stage
-        task.last_error = None
-        task.finished_at = None
-        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
-        self._record_event(
-            db,
-            task,
-            accepted_event_type,
-            message,
-            stage_name=target_stage,
-            payload={"action": action, "target_stage": target_stage, "state_event_id": event.id, **event_payload},
-        )
-
-    async def _blocking_action_dispatch_loop(self) -> None:
+    async def _operation_dispatch_loop(self) -> None:
         session_factory = get_session_factory()
         while self._running:
-            task_id = None
+            operation_id = None
             db = session_factory()
             try:
-                with observe_scheduler_loop("action_dispatch"):
-                    task_id = await get_task_queue().pop_action(self.cfg.queue.block_timeout_seconds)
-                    if task_id:
-                        claimed_id = self._claim_preparing_task_by_id(db, task_id)
-                        if claimed_id:
-                            async with self._action_worker_lock:
-                                if claimed_id not in self._action_workers or self._action_workers[claimed_id].done():
-                                    self._action_workers[claimed_id] = asyncio.create_task(
-                                        self._run_preparing_action(claimed_id),
-                                        name=f"binary-security-action-{claimed_id}",
-                                    )
+                with observe_scheduler_loop("operation_dispatch"):
+                    operation_id = await get_task_queue().pop_operation(self.cfg.queue.block_timeout_seconds)
+                    if operation_id:
+                        async with self._operation_worker_lock:
+                            existing = self._operation_workers.get(operation_id)
+                            if existing is None or existing.done():
+                                self._operation_workers[operation_id] = asyncio.create_task(
+                                    self._run_task_operation(operation_id),
+                                    name=f"binary-security-operation-{operation_id}",
+                                )
                     else:
-                        await self._reconcile_work_queues(db)
-                    await self._observe_runtime_metrics(db)
+                        self._requeue_stale_operations(db)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("binary-security action dispatch loop crashed and recovered")
+                logger.exception("binary-security operation dispatch loop crashed and recovered")
                 await asyncio.sleep(1)
             finally:
                 db.close()
+
+    async def _run_task_operation(self, operation_id: str) -> None:
+        session_factory = get_session_factory()
+        db = session_factory()
+        started = time.perf_counter()
+        operation_type = "unknown"
+        task_deleted = False
+        heartbeat_task: asyncio.Task | None = None
+        try:
+            operation = self._claim_operation_by_id(db, operation_id)
+            if operation is None:
+                return
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == operation.task_id).first()
+            if task is None:
+                operation.status = "failed"
+                operation.error_code = "task_not_found"
+                operation.error_message = f"任务不存在: {operation.task_id}"
+                operation.finished_at = _now()
+                db.commit()
+                return
+            operation_type = operation.operation_type
+            task.current_operation_id = operation.id
+            heartbeat_task = asyncio.create_task(
+                self._operation_lease_heartbeat(operation.id),
+                name=f"binary-security-operation-heartbeat-{operation.id}",
+            )
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "operation_started",
+                f"后台操作已开始: {operation.operation_type}",
+                stage_name=operation.target_stage,
+            )
+            db.commit()
+            await self._run_task_operation_steps(db, task, operation)
+            if operation.operation_type == TASK_ACTION_DELETE:
+                task_deleted = db.query(BinarySecurityTask.id).filter(BinarySecurityTask.id == operation.task_id).first() is None
+            operation.heartbeat_at = _now()
+            operation.claim_lease_expires_at = _now()
+            operation.status = "succeeded"
+            operation.current_step = TASK_OPERATION_STEP_SUCCEEDED
+            operation.finished_at = _now()
+            if not task_deleted:
+                task.current_operation_id = None
+                self._record_operation_event(
+                    db,
+                    task,
+                    operation,
+                    "operation_succeeded",
+                    f"后台操作已完成: {operation.operation_type}",
+                    stage_name=operation.target_stage,
+                )
+            db.commit()
+            observe_control_operation(operation_type, "succeeded")
+        except Exception as exc:
+            db.rollback()
+            operation = db.query(BinarySecurityTaskOperation).filter(BinarySecurityTaskOperation.id == operation_id).first()
+            if operation is not None:
+                operation_type = operation.operation_type
+                operation.status = "failed"
+                operation.error_code = "operation_failed"
+                operation.error_message = str(exc)
+                operation.finished_at = _now()
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == getattr(operation, "task_id", None)).first() if operation is not None else None
+            if task is not None:
+                task.current_operation_id = None
+                task.last_error = str(exc)
+                self._record_operation_event(
+                    db,
+                    task,
+                    operation,
+                    "operation_failed",
+                    f"后台操作失败: {exc}",
+                    level="error",
+                    stage_name=operation.target_stage,
+                )
+            db.commit()
+            observe_control_operation(operation_type, "failed")
+        finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat_task
+            async with self._operation_worker_lock:
+                self._operation_workers.pop(operation_id, None)
+            observe_control_operation_duration(
+                operation_type=operation_type,
+                status="finished",
+                duration_seconds=time.perf_counter() - started,
+            )
+            db.close()
+
+    async def _run_task_operation_steps(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> None:
+        prepare_step = TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN
+        resume_step = self._operation_resume_step(operation)
+        if resume_step == prepare_step:
+            self._record_operation_step_started(
+                db,
+                task,
+                operation,
+                step_name=prepare_step,
+                message=f"后台操作开始执行准备步骤: {operation.operation_type}",
+                stage_name=operation.target_stage,
+                payload={"operation_type": operation.operation_type},
+            )
+            db.commit()
+            try:
+                if operation.operation_type == TASK_ACTION_CONTINUE:
+                    await self._prepare_continue_task(db, task, str(operation.target_stage or "").strip())
+                elif operation.operation_type == TASK_ACTION_RETRY:
+                    await self._prepare_retry_task(db, task)
+                elif operation.operation_type == TASK_ACTION_RETRY_FAILED_ITEMS:
+                    await self._prepare_retry_failed_items(db, task, str(operation.target_stage or "").strip())
+                elif operation.operation_type == TASK_ACTION_RETRY_STAGE_FAILED_ITEMS:
+                    await self._prepare_retry_failed_items(db, task, str(operation.target_stage or "").strip())
+                elif operation.operation_type == TASK_ACTION_RETRY_STAGE_FULL:
+                    await self._prepare_retry_stage_full(db, task, str(operation.target_stage or "").strip())
+                elif operation.operation_type == TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS:
+                    await self._prepare_archive_retry_failed_items(db, task, str(operation.target_stage or "").strip())
+                elif operation.operation_type == TASK_ACTION_RETRY_ARCHIVE_FULL:
+                    await self._prepare_archive_retry_full(db, task, str(operation.target_stage or "").strip())
+                elif operation.operation_type == TASK_ACTION_CANCEL:
+                    await self._prepare_cancel_task(db, task)
+                    self._record_operation_step_finished(
+                        db,
+                        task,
+                        operation,
+                        step_name=prepare_step,
+                        message=f"后台操作准备步骤已完成: {operation.operation_type}",
+                        stage_name=operation.target_stage,
+                        next_step=TASK_OPERATION_STEP_SUCCEEDED,
+                    )
+                    operation.current_step = TASK_OPERATION_STEP_SUCCEEDED
+                    db.commit()
+                    return
+                elif operation.operation_type == TASK_ACTION_DELETE:
+                    await self._prepare_delete_task(db, task)
+                    self._record_operation_step_finished(
+                        db,
+                        task,
+                        operation,
+                        step_name=prepare_step,
+                        message=f"后台操作准备步骤已完成: {operation.operation_type}",
+                        stage_name=operation.target_stage,
+                        next_step=TASK_OPERATION_STEP_SUCCEEDED,
+                    )
+                    operation.current_step = TASK_OPERATION_STEP_SUCCEEDED
+                    db.commit()
+                    return
+                else:
+                    raise ValidationError(f"未知操作类型: {operation.operation_type}")
+            except Exception as exc:
+                self._record_operation_step_failed(
+                    db,
+                    task,
+                    operation,
+                    step_name=prepare_step,
+                    error=exc,
+                    stage_name=operation.target_stage,
+                )
+                db.commit()
+                raise
+
+            requeue_required = operation.operation_type not in {TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS, TASK_ACTION_RETRY_ARCHIVE_FULL}
+            next_step = TASK_OPERATION_STEP_REQUEUE_TASK if requeue_required else TASK_OPERATION_STEP_SUCCEEDED
+            self._record_operation_step_finished(
+                db,
+                task,
+                operation,
+                step_name=prepare_step,
+                message=f"后台操作准备步骤已完成: {operation.operation_type}",
+                stage_name=operation.target_stage,
+                next_step=next_step,
+            )
+            if not requeue_required:
+                db.commit()
+                return
+            resume_step = TASK_OPERATION_STEP_REQUEUE_TASK
+
+        if resume_step != TASK_OPERATION_STEP_REQUEUE_TASK:
+            return
+
+        if self._is_operation_requeue_state_applied(task, operation):
+            self._record_operation_step_finished(
+                db,
+                task,
+                operation,
+                step_name=TASK_OPERATION_STEP_REQUEUE_TASK,
+                message=f"后台操作重新排队步骤已确认完成，无需重复执行: {operation.operation_type}",
+                stage_name=operation.target_stage,
+                payload={"idempotent_recovery": True},
+                next_step=TASK_OPERATION_STEP_SUCCEEDED,
+            )
+            db.commit()
+            return
+
+        self._record_operation_step_started(
+            db,
+            task,
+            operation,
+            step_name=TASK_OPERATION_STEP_REQUEUE_TASK,
+            message=f"后台操作进入重新排队步骤: {operation.operation_type}",
+            stage_name=operation.target_stage,
+        )
+        task.status = "pending"
+        task.current_stage = operation.target_stage or task.current_stage
+        task.last_error = None
+        task.finished_at = None
+        self._invalidate_task_execution(task)
+        self._enqueue_task(task.id)
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "task_requeued",
+            f"后台操作完成，任务已重新排队: {operation.operation_type}",
+            stage_name=operation.target_stage,
+        )
+        self._record_operation_step_finished(
+            db,
+            task,
+            operation,
+            step_name=TASK_OPERATION_STEP_REQUEUE_TASK,
+            message=f"后台操作重新排队步骤已完成: {operation.operation_type}",
+            stage_name=operation.target_stage,
+            next_step=TASK_OPERATION_STEP_SUCCEEDED,
+        )
+        db.commit()
 
     async def _dispatch_loop(self) -> None:
         session_factory = get_session_factory()
@@ -4800,353 +5564,6 @@ class TaskManager:
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
             db.commit()
         finally:
-            db.close()
-
-    def _claim_preparing_tasks(self, db: Session) -> list[str]:
-        lease_expires_at = self._next_lease_expiry(db)
-        candidates = (
-            db.query(BinarySecurityTask.id)
-            .filter(
-                BinarySecurityTask.status.in_(list(TASK_PREPARING_STATUSES)),
-                self._lease_filter_available(),
-            )
-            .order_by(BinarySecurityTask.updated_at.asc(), BinarySecurityTask.created_at.asc(), BinarySecurityTask.id.asc())
-            .limit(max(1, int(self.cfg.scheduler.task_concurrency or 2)))
-            .all()
-        )
-        claimed: list[str] = []
-        started_at = _now()
-        for row in candidates:
-            task_id = row[0]
-            updated = (
-                db.query(BinarySecurityTask)
-                .filter(
-                    BinarySecurityTask.id == task_id,
-                    BinarySecurityTask.status.in_(list(TASK_PREPARING_STATUSES)),
-                    self._lease_filter_available(),
-                )
-                .update(
-                    {
-                        BinarySecurityTask.dispatcher_instance_id: self.instance_id,
-                        BinarySecurityTask.dispatch_started_at: started_at,
-                        BinarySecurityTask.lease_expires_at: lease_expires_at,
-                        BinarySecurityTask.updated_at: started_at,
-                    },
-                    synchronize_session=False,
-                )
-            )
-            if updated:
-                claimed.append(task_id)
-        if claimed:
-            db.commit()
-        return claimed
-
-    def _claim_preparing_task_by_id(self, db: Session, task_id: str) -> str | None:
-        started_at = _now()
-        lease_expires_at = self._next_lease_expiry(db, now_value=started_at)
-        try:
-            updated = (
-                db.query(BinarySecurityTask)
-                .filter(
-                    BinarySecurityTask.id == task_id,
-                    BinarySecurityTask.status.in_(list(TASK_PREPARING_STATUSES)),
-                    BinarySecurityTask.pending_action.in_(list(TASK_PENDING_ACTIONS)),
-                    BinarySecurityTask.operation_lock_token.isnot(None),
-                    BinarySecurityTask.operation_lock_token != "",
-                    BinarySecurityTask.operation_lock_expires_at.isnot(None),
-                    BinarySecurityTask.operation_lock_expires_at > started_at,
-                    self._lease_filter_available(),
-                )
-                .update(
-                    {
-                        BinarySecurityTask.dispatcher_instance_id: self.instance_id,
-                        BinarySecurityTask.dispatch_started_at: started_at,
-                        BinarySecurityTask.lease_expires_at: lease_expires_at,
-                        BinarySecurityTask.updated_at: started_at,
-                    },
-                    synchronize_session=False,
-                )
-            )
-        except Exception as exc:
-            if not self._is_retryable_lock_error(exc):
-                raise
-            db.rollback()
-            logger.warning("binary-security preparing task claim hit retryable lock conflict: task=%s", task_id)
-            return None
-        if updated:
-            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
-            if task is not None:
-                wait_seconds = _elapsed_seconds_since(task.created_at)
-                observe_task_duration(
-                    phase="queue_wait",
-                    duration_seconds=wait_seconds,
-                    status="dispatching",
-                    task_type=self._task_type(task),
-                )
-            db.commit()
-            return task_id
-        return None
-
-    def _get_current_preparing_operation_state(self, db: Session, task_id: str) -> dict[str, Any] | None:
-        task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
-        if task is None:
-            return None
-        return {
-            "status": str(task.status or "").strip(),
-            "dispatcher_instance_id": str(task.dispatcher_instance_id or "").strip() or None,
-            "lease_active": self._lease_is_active(task),
-            "pending_action": str(task.pending_action or "").strip() or None,
-            "operation_lock_token": str(task.operation_lock_token or "").strip() or None,
-            "operation_lock_owner": str(task.operation_lock_owner or "").strip() or None,
-            "operation_lock_active": bool(task.operation_lock_expires_at and task.operation_lock_expires_at > _now()),
-            "current_stage": str(task.current_stage or "").strip() or None,
-        }
-
-    def _preparing_operation_matches(
-        self,
-        state: dict[str, Any] | None,
-        *,
-        token: str | None,
-        action: str | None,
-    ) -> bool:
-        if not state:
-            return False
-        if state.get("status") not in TASK_PREPARING_STATUSES:
-            return False
-        if state.get("dispatcher_instance_id") != self.instance_id:
-            return False
-        if not state.get("lease_active"):
-            return False
-        if token and state.get("operation_lock_token") != token:
-            return False
-        if action and state.get("pending_action") != action:
-            return False
-        if state.get("operation_lock_owner") != self.instance_id:
-            return False
-        if not state.get("operation_lock_active"):
-            return False
-        return True
-
-    def _ensure_preparing_operation_current(
-        self,
-        db: Session,
-        task_id: str,
-        *,
-        token: str | None,
-        action: str | None,
-    ) -> dict[str, Any]:
-        state = self._get_current_preparing_operation_state(db, task_id)
-        if not self._preparing_operation_matches(state, token=token, action=action):
-            raise ValidationError("任务 preparing 执行权已丢失，当前 worker 不再继续执行")
-        return state or {}
-
-    def _record_preparing_superseded_event(
-        self,
-        db: Session,
-        task: BinarySecurityTask,
-        *,
-        action: str | None,
-        token: str | None,
-    ) -> None:
-        state = self._get_current_preparing_operation_state(db, task.id) or {}
-        self._record_event(
-            db,
-            task,
-            "task_retry_prepare_superseded",
-            "后台准备执行权已转移，当前 worker 停止继续清理",
-            level="warning",
-            stage_name=state.get("current_stage") or str(task.current_stage or "").strip() or None,
-            payload={
-                "action": action or None,
-                "operation_token": token,
-                "current_dispatcher_instance_id": state.get("dispatcher_instance_id"),
-                "current_operation_lock_owner": state.get("operation_lock_owner"),
-                "current_operation_lock_token": state.get("operation_lock_token"),
-            },
-        )
-
-    def _preparing_action_needs_requeue(self, task: BinarySecurityTask) -> bool:
-        pending_action = str(task.pending_action or "").strip()
-        if pending_action not in TASK_PENDING_ACTIONS:
-            return False
-        operation_token = str(task.operation_lock_token or "").strip()
-        if not operation_token:
-            return True
-        if not bool(task.operation_lock_expires_at and task.operation_lock_expires_at > _now()):
-            return True
-        dispatcher_instance_id = str(task.dispatcher_instance_id or "").strip()
-        if not dispatcher_instance_id:
-            return True
-        if not self._lease_is_active(task):
-            return True
-        return False
-
-    async def _run_preparing_action(self, task_id: str) -> None:
-        session_factory = get_session_factory()
-        db = session_factory()
-        operation_token: str | None = None
-        action: str | None = None
-        heartbeat_task: asyncio.Task | None = None
-        lease_heartbeat_task: asyncio.Task | None = None
-        superseded = False
-        try:
-            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
-            if (
-                task is None
-                or task.status not in TASK_PREPARING_STATUSES
-                or task.dispatcher_instance_id != self.instance_id
-                or not self._lease_is_active(task)
-            ):
-                return
-            action = str(task.pending_action or "").strip()
-            if action not in TASK_PENDING_ACTIONS:
-                raise ValidationError("任务 preparing 状态缺少有效 pending_action")
-            operation_token = str(task.operation_lock_token or "").strip() or None
-            if not operation_token:
-                raise ValidationError("任务 preparing 状态缺少有效 operation lock")
-            renewed = self._renew_task_operation_lease(task.id, token=operation_token, operation=action)
-            if not renewed:
-                raise ValidationError("任务 preparing 操作锁已失效，请重新发起操作")
-            self._ensure_preparing_operation_current(db, task.id, token=operation_token, action=action)
-            heartbeat_task = asyncio.create_task(
-                self._task_operation_lease_heartbeat(task.id, token=operation_token, operation=action),
-                name=f"binary-security-operation-lock-{task.id}",
-            )
-            lease_heartbeat_task = asyncio.create_task(
-                self._task_preparing_lease_heartbeat(task.id),
-                name=f"binary-security-preparing-lease-{task.id}",
-            )
-            target_stage = str(task.current_stage or "").strip() or None
-            started_event = "task_continue_prepare_started" if action == TASK_ACTION_CONTINUE else "task_retry_prepare_started"
-            finished_event = "task_continue_prepare_finished" if action == TASK_ACTION_CONTINUE else "task_retry_prepare_finished"
-            failed_event = "task_continue_prepare_failed" if action == TASK_ACTION_CONTINUE else "task_retry_prepare_failed"
-            requeued_event = "task_continue_requested" if action == TASK_ACTION_CONTINUE else "task_retried"
-
-            self._record_event(
-                db,
-                task,
-                started_event,
-                "后台准备已开始，正在清理旧阶段结果并重建可继续执行状态",
-                stage_name=target_stage,
-                payload={"action": action, "target_stage": target_stage},
-            )
-            db.commit()
-
-            self._ensure_preparing_operation_current(db, task.id, token=operation_token, action=action)
-            if action == TASK_ACTION_CONTINUE:
-                if not target_stage:
-                    raise ValidationError("继续任务缺少目标阶段")
-                affected_stages = await self._prepare_continue_task(db, task, target_stage)
-                task.execution_mode = "task_retry"
-                task.target_stage_name = target_stage
-                requeued_message = f"任务已完成继续准备，将从阶段 {target_stage} 重新排队"
-                retry_semantics = "continue_with_existing_downstream"
-            elif action == TASK_ACTION_RETRY:
-                stage_sequence = await self._prepare_retry_task(db, task)
-                target_stage = stage_sequence[0] if stage_sequence else None
-                affected_stages = stage_sequence
-                task.execution_mode = None
-                task.target_stage_name = None
-                requeued_message = f"任务已完成严格清理，将从第一阶段 {target_stage} 重新排队"
-                retry_semantics = "hard_restart"
-            elif action in {TASK_ACTION_RETRY_FAILED_ITEMS, TASK_ACTION_RETRY_STAGE_FAILED_ITEMS}:
-                if not target_stage:
-                    raise ValidationError("失败项重试缺少目标阶段")
-                affected_stages = await self._prepare_retry_failed_items(db, task, target_stage)
-                task.execution_mode = "task_retry_failed_items" if action == TASK_ACTION_RETRY_FAILED_ITEMS else "stage_retry_failed_items"
-                task.target_stage_name = target_stage
-                requeued_message = f"任务已完成失败项清理，将从阶段 {target_stage} 重新排队"
-                retry_semantics = "retry_failed_items"
-            elif action == TASK_ACTION_RETRY_STAGE_FULL:
-                if not target_stage:
-                    raise ValidationError("阶段完全重试缺少目标阶段")
-                affected_stages = await self._prepare_retry_stage_full(db, task, target_stage)
-                task.execution_mode = "stage_retry_full"
-                task.target_stage_name = target_stage
-                requeued_message = f"阶段 {target_stage} 已完成全量清理，将重新排队"
-                retry_semantics = "stage_retry_full"
-            else:
-                raise ValidationError(f"未知 preparing action: {action}")
-
-            self._ensure_preparing_operation_current(db, task.id, token=operation_token, action=action)
-            task.status = "pending"
-            task.pending_action = None
-            task.current_stage = target_stage
-            task.last_error = None
-            self._clear_task_abnormal_reason_snapshot(db, task)
-            task.finished_at = None
-            self._invalidate_task_execution(task)
-            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
-            self._record_event(
-                db,
-                task,
-                finished_event,
-                "后台准备完成，任务已恢复为待调度状态",
-                stage_name=target_stage,
-                payload={"action": action, "target_stage": target_stage, "cleared_stages": affected_stages},
-            )
-            self._record_event(
-                db,
-                task,
-                requeued_event,
-                requeued_message,
-                stage_name=target_stage,
-                payload={
-                    "target_stage": target_stage,
-                    "cleared_stages": affected_stages,
-                    "retry_semantics": retry_semantics,
-                    "accepted_async": True,
-                },
-            )
-            db.commit()
-            self._enqueue_task(task.id)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            db.rollback()
-            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
-            if task is not None:
-                action = str(task.pending_action or "").strip()
-                target_stage = str(task.current_stage or "").strip() or None
-                current_state = self._get_current_preparing_operation_state(db, task_id)
-                ownership_lost = bool(operation_token and not self._preparing_operation_matches(current_state, token=operation_token, action=action))
-                if ownership_lost:
-                    superseded = True
-                    self._record_preparing_superseded_event(
-                        db,
-                        task,
-                        action=action,
-                        token=operation_token,
-                    )
-                    db.commit()
-                    return
-                task.status = TASK_STATUS_HARD_RESTART_FAILED if action == TASK_ACTION_RETRY else "failed"
-                task.pending_action = None
-                task.last_error = str(exc)
-                task.finished_at = _now()
-                self._invalidate_task_execution(task)
-                await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
-                self._record_event(
-                    db,
-                    task,
-                    "task_continue_prepare_failed" if action == TASK_ACTION_CONTINUE else "task_retry_prepare_failed",
-                    f"后台准备失败: {exc}",
-                    level="error",
-                    stage_name=target_stage,
-                    payload={"action": action or None, "target_stage": target_stage, "error": str(exc)},
-                )
-                db.commit()
-        finally:
-            if lease_heartbeat_task is not None:
-                lease_heartbeat_task.cancel()
-                await asyncio.gather(lease_heartbeat_task, return_exceptions=True)
-            if heartbeat_task is not None:
-                heartbeat_task.cancel()
-                await asyncio.gather(heartbeat_task, return_exceptions=True)
-            if operation_token and not superseded:
-                self._release_task_operation_lease(db, task_id, token=operation_token)
-            async with self._action_worker_lock:
-                self._action_workers.pop(task_id, None)
             db.close()
 
     async def _archive_dispatch_loop(self) -> None:
@@ -5487,26 +5904,6 @@ class TaskManager:
             event_type = event.event_type
             task_id = event.task_id
             event_created_at = event.created_at
-            if event_type == "manual_delete_requested":
-                finished_at = _now()
-                observe_state_event_lag(event_type, (_now() - event_created_at).total_seconds() if event_created_at else None)
-                observe_state_reducer_event(event_type, "processed")
-                observe_state_reducer_health(
-                    pod=self.instance_id,
-                    event_processed_at=time.time(),
-                )
-                event.processing_finished_at = finished_at
-                event.processing_result = "success"
-                event.processed_at = finished_at
-                event.updated_at = finished_at
-                event.last_error_message = None
-                db.expunge(event)
-                db.query(BinarySecurityStateEvent).filter(
-                    BinarySecurityStateEvent.task_id == task_id,
-                ).delete(synchronize_session=False)
-                result = "success"
-                db.commit()
-                return
             event.status = "processed"
             finished_at = _now()
             event.processed_at = finished_at
@@ -5525,10 +5922,6 @@ class TaskManager:
             )
             result = "success"
             db.commit()
-            if event_type == "manual_blocking_action_requested":
-                self._enqueue_action(task_id)
-            if event_type == "manual_module_selection_confirmed":
-                self._enqueue_task(task_id)
         except Exception as exc:
             db.rollback()
             result = "failed"
@@ -5585,21 +5978,6 @@ class TaskManager:
             return
         if event.event_type == "stage_worker_start_requested":
             self._apply_stage_worker_start_requested_locked(db, event)
-            return
-        if event.event_type == "manual_blocking_action_requested":
-            self._apply_blocking_action_request_locked(db, event)
-            return
-        if event.event_type == "manual_archive_retry_requested":
-            self._apply_manual_archive_retry_request_locked(db, event)
-            return
-        if event.event_type == "manual_cancel_requested":
-            await self._apply_manual_cancel_request_locked(db, event)
-            return
-        if event.event_type == "manual_delete_requested":
-            await self._apply_manual_delete_request_locked(db, event)
-            return
-        if event.event_type == "manual_module_selection_confirmed":
-            self._apply_manual_module_selection_confirmed_locked(db, event)
             return
         if event.event_type == "manual_policy_update_requested":
             self._apply_manual_policy_update_requested_locked(db, event)
@@ -6143,314 +6521,6 @@ class TaskManager:
             payload={"state_event_id": event.id},
         )
         await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
-
-    async def _apply_manual_cancel_request_locked(self, db: Session, event: BinarySecurityStateEvent) -> None:
-        payload = dict(event.payload or {})
-        operation_token = str(payload.get("operation_token") or "").strip()
-        task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == event.task_id).first()
-        if task is None:
-            return
-        try:
-            token = self._service_token()
-            if operation_token:
-                current_operation_token = str(task.operation_lock_token or "").strip()
-                if current_operation_token and current_operation_token != operation_token:
-                    self._record_event(
-                        db,
-                        task,
-                        "manual_cancel_ignored",
-                        "取消事件已过期，当前任务操作锁已变化",
-                        level="warning",
-                        stage_name=task.current_stage,
-                        payload={"state_event_id": event.id},
-                    )
-                    return
-            if task.status == "cancelled":
-                running_items = db.query(BinarySecurityStageItem).filter(
-                    BinarySecurityStageItem.task_id == task.id,
-                    BinarySecurityStageItem.status.in_(["pending", "queued", "dispatching", "running"]),
-                ).all()
-                for item in running_items:
-                    item.status = "cancelled"
-                    item.finished_at = item.finished_at or _now()
-                active_stage_runs = db.query(BinarySecurityStageRun).filter(
-                    BinarySecurityStageRun.task_id == task.id,
-                    BinarySecurityStageRun.status.in_(["pending", "dispatching", "queued", "running"]),
-                ).all()
-                for stage_run in active_stage_runs:
-                    stage_run.status = "cancelled"
-                    stage_run.finished_at = stage_run.finished_at or _now()
-                downstream_refs = self._dedupe_downstream_refs(
-                    self._collect_downstream_refs(task, running_items)
-                    + self._discover_parent_linked_downstream_refs(db, task)
-                )
-                self._record_event(
-                    db,
-                    task,
-                    "manual_cancel_noop",
-                    "任务已经是取消状态，已归一化仍活跃的阶段与子任务",
-                    stage_name=task.current_stage,
-                    payload={
-                        "state_event_id": event.id,
-                        "cancelled_item_count": len(running_items),
-                        "cancelled_stage_run_count": len(active_stage_runs),
-                        "downstream_ref_count": len(downstream_refs),
-                    },
-                )
-                if downstream_refs:
-                    await self._cancel_downstream_refs(db, task, downstream_refs, token)
-                return
-            task.status = "cancelled"
-            self._invalidate_task_execution(task)
-            task.finished_at = _now()
-            running_items = db.query(BinarySecurityStageItem).filter(
-                BinarySecurityStageItem.task_id == task.id,
-                BinarySecurityStageItem.status.in_(["pending", "queued", "dispatching", "running"]),
-            ).all()
-            for item in running_items:
-                item.status = "cancelled"
-                item.finished_at = _now()
-            active_stage_runs = db.query(BinarySecurityStageRun).filter(
-                BinarySecurityStageRun.task_id == task.id,
-                BinarySecurityStageRun.status.in_(["pending", "dispatching", "queued", "running"]),
-            ).all()
-            for stage_run in active_stage_runs:
-                stage_run.status = "cancelled"
-                stage_run.finished_at = stage_run.finished_at or _now()
-            downstream_refs = self._dedupe_downstream_refs(
-                self._collect_downstream_refs(task, running_items)
-                + self._discover_parent_linked_downstream_refs(db, task)
-            )
-            self._record_event(
-                db,
-                task,
-                "task_cancelled",
-                "任务已由 reducer 串行取消",
-                stage_name=task.current_stage,
-                payload={
-                    "state_event_id": event.id,
-                    "cancelled_item_count": len(running_items),
-                    "cancelled_downstream_count": len(downstream_refs),
-                },
-            )
-            observe_task_error("cancel", stage=str(task.current_stage or "none"), result="accepted")
-            observe_task_lifecycle("finished", status=task.status, task_type=self._task_type(task))
-            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="cancelled")
-            await self._cancel_local_worker(task.id)
-            for item in running_items:
-                if str(item.downstream_task_id or "").strip():
-                    await self._cancel_downstream(item, token)
-            if downstream_refs:
-                await self._cancel_downstream_refs(db, task, downstream_refs, token)
-        finally:
-            if operation_token:
-                self._release_task_operation_lease(db, task.id, token=operation_token)
-
-    async def _apply_manual_delete_request_locked(self, db: Session, event: BinarySecurityStateEvent) -> None:
-        payload = dict(event.payload or {})
-        operation_token = str(payload.get("operation_token") or "").strip()
-        task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == event.task_id).first()
-        if task is None:
-            return
-        try:
-            if operation_token:
-                current_operation_token = str(task.operation_lock_token or "").strip()
-                if current_operation_token and current_operation_token != operation_token:
-                    self._record_event(
-                        db,
-                        task,
-                        "manual_delete_ignored",
-                        "删除事件已过期，当前任务操作锁已变化",
-                        level="warning",
-                        stage_name=task.current_stage,
-                        payload={"state_event_id": event.id},
-                    )
-                    return
-            task.status = "cancelled"
-            self._invalidate_task_execution(task)
-            task.finished_at = task.finished_at or _now()
-            self._record_event(
-                db,
-                task,
-                "task_delete_requested",
-                "任务删除已由 reducer 受理，开始清理下游与工作区",
-                stage_name=task.current_stage,
-                payload={"state_event_id": event.id},
-            )
-            items = db.query(BinarySecurityStageItem).options(
-                load_only(
-                    BinarySecurityStageItem.id,
-                    BinarySecurityStageItem.task_id,
-                    BinarySecurityStageItem.stage_name,
-                    BinarySecurityStageItem.item_key,
-                    BinarySecurityStageItem.status,
-                    BinarySecurityStageItem.retry_count,
-                    BinarySecurityStageItem.downstream_service,
-                    BinarySecurityStageItem.downstream_task_id,
-                    BinarySecurityStageItem.error_message,
-                    BinarySecurityStageItem.started_at,
-                    BinarySecurityStageItem.finished_at,
-                    BinarySecurityStageItem.created_at,
-                )
-            ).filter(BinarySecurityStageItem.task_id == task.id).all()
-            downstream_refs = self._dedupe_downstream_refs(
-                self._collect_downstream_refs(task, items)
-                + self._discover_parent_linked_downstream_refs(db, task)
-            )
-            for item in items:
-                if item.status in {"pending", "queued", "running"}:
-                    item.status = "cancelled"
-                    item.finished_at = _now()
-            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="cancelled")
-            db.flush()
-
-            await self._cancel_local_worker(task.id)
-            token = self._service_token()
-            await self._cancel_downstream_refs(db, task, downstream_refs, token)
-            deleted_downstream_count = await self._delete_downstream_refs(db, task, downstream_refs, token)
-            cleanup_status = await self._cleanup_task_workspace(task, token)
-            if cleanup_status != "deleted":
-                task.status = TASK_STATUS_DELETE_FAILED
-                task.last_error = f"任务目录清理失败: cleanup_status={cleanup_status}"
-                task.cleanup_snapshot = {
-                    **dict(task.cleanup_snapshot or {}),
-                    "delete_cleanup_status": cleanup_status,
-                    "delete_failed_at": _isoformat_or_none(_now()),
-                    "workspace_root": task.workspace_root,
-                    "downstream_ref_count": len(downstream_refs),
-                    "deleted_downstream_count": int(deleted_downstream_count or 0),
-                }
-                self._record_event(
-                    db,
-                    task,
-                    "task_delete_failed",
-                    f"任务目录清理失败，任务保留为 delete_failed: {cleanup_status}",
-                    stage_name=task.current_stage,
-                    level="error",
-                    payload={
-                        "state_event_id": event.id,
-                        "cleanup_status": cleanup_status,
-                        "workspace_root": task.workspace_root,
-                        "downstream_ref_count": len(downstream_refs),
-                        "deleted_downstream_count": int(deleted_downstream_count or 0),
-                    },
-                )
-                return
-
-            if operation_token:
-                self._release_task_operation_lease(db, task.id, token=operation_token)
-                operation_token = ""
-            db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).delete(synchronize_session=False)
-            db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).delete(synchronize_session=False)
-            db.query(BinarySecurityEvent).filter(BinarySecurityEvent.task_id == task.id).delete(synchronize_session=False)
-            db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id).delete(synchronize_session=False)
-            db.delete(task)
-        finally:
-            if operation_token:
-                self._release_task_operation_lease(db, event.task_id, token=operation_token)
-
-    def _apply_manual_module_selection_confirmed_locked(self, db: Session, event: BinarySecurityStateEvent) -> None:
-        payload = dict(event.payload or {})
-        operation_token = str(payload.get("operation_token") or "").strip()
-        task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == event.task_id).first()
-        if task is None:
-            return
-        try:
-            if operation_token:
-                current_operation_token = str(task.operation_lock_token or "").strip()
-                if current_operation_token and current_operation_token != operation_token:
-                    self._record_event(
-                        db,
-                        task,
-                        "manual_module_selection_ignored",
-                        "模块确认事件已过期，当前任务操作锁已变化",
-                        level="warning",
-                        stage_name="system_analysis",
-                        payload={"state_event_id": event.id},
-                    )
-                    return
-            if task.status != TASK_STATUS_PENDING_MODULE_CONFIRMATION:
-                self._record_event(
-                    db,
-                    task,
-                    "manual_module_selection_ignored",
-                    "任务已不处于等待模块确认状态，忽略模块确认事件",
-                    level="warning",
-                    stage_name="system_analysis",
-                    payload={"state_event_id": event.id, "status": task.status},
-                )
-                return
-            summary = dict(task.summary or {})
-            candidate_modules = list(summary.get("candidate_modules") or [])
-            candidate_map = {
-                str(module.get("module_key") or ""): dict(module)
-                for module in candidate_modules
-                if str(module.get("module_key") or "").strip()
-            }
-            requested = [str(key or "").strip() for key in payload.get("selected_module_keys") or [] if str(key or "").strip()]
-            if not requested:
-                raise ValidationError("至少选择 1 个模块")
-            invalid = [key for key in requested if key not in candidate_map]
-            if invalid:
-                raise ValidationError(f"存在不属于候选集合的模块: {invalid[0]}")
-            selected = self._mark_selected_modules([candidate_map[key] for key in requested], selected_by=MODULE_SELECTION_MODE_MANUAL_CONFIRM)
-            summary["selected_modules"] = selected
-            summary["high_risk_modules"] = selected
-            task.summary = summary
-            task.metrics = {
-                **task.metrics,
-                "selected_module_count": len(selected),
-            }
-            stage_run = db.query(BinarySecurityStageRun).filter(
-                BinarySecurityStageRun.task_id == task.id,
-                BinarySecurityStageRun.stage_name == "system_analysis",
-            ).first()
-            if stage_run:
-                stage_run.status = "success"
-                stage_run.started_at = stage_run.started_at or _now()
-                stage_run.finished_at = stage_run.finished_at or _now()
-                stage_run.last_error = None
-                stage_run.counts = self._stage_counts(db, stage_run)
-                self._merge_stage_run_output_summary(
-                    task,
-                    stage_run,
-                    {
-                        "status": "success",
-                        "sync_status": "success",
-                        "error": None,
-                        "waiting_manual_confirmation": False,
-                        "selected_module_count": len(selected),
-                        "candidate_module_count": len(candidate_modules),
-                        "module_count": len(list(summary.get("system_analysis_modules") or [])),
-                        "high_risk_module_count": len(selected),
-                        "status_synced": True,
-                    },
-                )
-            current_stage = str(task.current_stage or "").strip()
-            task.status = "pending"
-            next_stage = self._next_incomplete_stage(db, task)
-            if next_stage == current_stage or not next_stage:
-                stage_sequence = self._stage_sequence_for_task(task)
-                if current_stage in stage_sequence:
-                    current_index = stage_sequence.index(current_stage)
-                    if current_index + 1 < len(stage_sequence):
-                        next_stage = stage_sequence[current_index + 1]
-            task.current_stage = next_stage or self._stage_sequence_for_task(task)[0]
-            task.last_error = None
-            self._invalidate_task_execution(task)
-            task.finished_at = None
-            self._record_event(
-                db,
-                task,
-                "module_selection_confirmed",
-                f"已确认 {len(selected)} 个模块，任务继续执行",
-                stage_name="system_analysis",
-                payload={"selected_module_keys": requested, "state_event_id": event.id},
-            )
-            self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
-        finally:
-            if operation_token:
-                self._release_task_operation_lease(db, task.id, token=operation_token)
 
     def _apply_manual_policy_update_requested_locked(self, db: Session, event: BinarySecurityStateEvent) -> None:
         payload = dict(event.payload or {})
@@ -7386,7 +7456,7 @@ class TaskManager:
 
     def runtime_status(self) -> dict[str, object]:
         loop_task_alive = bool(self._loop_task and not self._loop_task.done())
-        action_loop_alive = bool(self._action_loop_task and not self._action_loop_task.done())
+        operation_loop_alive = bool(getattr(self, "_operation_loop_task", None) and not self._operation_loop_task.done())
         archive_loop_alive = bool(self._archive_loop_task and not self._archive_loop_task.done())
         stage_item_loop_alive = bool(self._stage_item_loop_task and not self._stage_item_loop_task.done())
         reconcile_loop_alive = bool(self._downstream_reconcile_task and not self._downstream_reconcile_task.done())
@@ -7399,7 +7469,7 @@ class TaskManager:
             "running": self._running,
             "loops": {
                 "task_dispatch": loop_task_alive,
-                "action_dispatch": action_loop_alive,
+                "operation_dispatch": operation_loop_alive,
                 "archive_dispatch": archive_loop_alive,
                 "stage_item_dispatch": stage_item_loop_alive,
                 "downstream_reconcile": reconcile_loop_alive,
@@ -7409,7 +7479,7 @@ class TaskManager:
             },
             "workers": {
                 "task_workers": len([task for task in self._workers.values() if not task.done()]),
-                "action_workers": len([task for task in self._action_workers.values() if not task.done()]),
+                "operation_workers": len([task for task in self._operation_workers.values() if not task.done()]),
                 "stage_item_workers": len([task for task in self._stage_item_workers.values() if not task.done()]),
                 "archive_workers": len([task for task in self._archive_workers if not task.done()]),
             },
@@ -8003,7 +8073,7 @@ class TaskManager:
             db.query(func.count(BinarySecurityTask.id))
             .filter(
                 BinarySecurityTask.project_id == project_id,
-                BinarySecurityTask.status.in_(["dispatching", "running", TASK_STATUS_CONTINUE_PREPARING, TASK_STATUS_RETRY_PREPARING]),
+                BinarySecurityTask.status.in_(["dispatching", "running"]),
             )
             .scalar()
             or 0
@@ -8027,7 +8097,7 @@ class TaskManager:
     def _observe_worker_counts(self) -> None:
         observe_worker_counts(
             task_workers=len([task for task in self._workers.values() if not task.done()]),
-            action_workers=len([task for task in self._action_workers.values() if not task.done()]),
+            operation_workers=len([task for task in self._operation_workers.values() if not task.done()]),
             archive_workers=len([task for task in self._archive_workers if not task.done()]),
         )
 
@@ -8042,12 +8112,6 @@ class TaskManager:
         running_tasks = int(
             db.query(func.count(BinarySecurityTask.id))
             .filter(BinarySecurityTask.status.in_(["dispatching", "running"]))
-            .scalar()
-            or 0
-        )
-        preparing_tasks = int(
-            db.query(func.count(BinarySecurityTask.id))
-            .filter(BinarySecurityTask.status.in_(list(TASK_PREPARING_STATUSES)))
             .scalar()
             or 0
         )
@@ -8080,25 +8144,24 @@ class TaskManager:
         )
         service_config = self._load_service_config(db)
         task_workers = len([task for task in self._workers.values() if not task.done()])
-        action_workers = len([task for task in self._action_workers.values() if not task.done()])
+        operation_workers = len([task for task in self._operation_workers.values() if not task.done()])
         observe_queue_depths(
             pending_tasks=pending_tasks,
             running_tasks=running_tasks,
-            preparing_tasks=preparing_tasks,
             archive_pending_jobs=archive_pending_jobs,
             archive_running_jobs=archive_running_jobs,
             archive_applying_jobs=archive_applying_jobs,
             reconcile_candidates=max(0, int(reconcile_candidates or 0)),
             redis_task_queue=int((queue_snapshot.get("task_queue") or {}).get("length", 0)),
-            redis_action_queue=int((queue_snapshot.get("action_queue") or {}).get("length", 0)),
+            redis_operation_queue=int((queue_snapshot.get("operation_queue") or {}).get("length", 0)),
             leased_tasks=leased_tasks,
             task_queue_oldest_age_seconds=float((queue_snapshot.get("task_queue") or {}).get("oldest_age_seconds", 0.0) or 0.0),
-            action_queue_oldest_age_seconds=float((queue_snapshot.get("action_queue") or {}).get("oldest_age_seconds", 0.0) or 0.0),
+            operation_queue_oldest_age_seconds=float((queue_snapshot.get("operation_queue") or {}).get("oldest_age_seconds", 0.0) or 0.0),
         )
         observe_slot_usage(
             task_active=task_workers,
             task_capacity=int(service_config.max_concurrent_tasks),
-            action_active=action_workers,
+            action_active=operation_workers,
             action_capacity=max(1, int(self.cfg.scheduler.downstream_action_concurrency)),
         )
         self._observe_worker_counts()
@@ -8106,17 +8169,6 @@ class TaskManager:
     def _finalize_task(self, db: Session, task: BinarySecurityTask) -> None:
         if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
             self._sync_task_abnormal_reason_snapshot(db, task, None)
-            task.dispatcher_instance_id = None
-            task.dispatch_started_at = None
-            task.lease_expires_at = None
-            self._last_task_heartbeat_at.pop(task.id, None)
-            return
-        pending_action = str(task.pending_action or "").strip()
-        if pending_action in TASK_PENDING_ACTIONS:
-            self._sync_task_abnormal_reason_snapshot(db, task, None)
-            task.status = _preparing_status_for_action(pending_action)
-            task.finished_at = None
-            task.last_error = None
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
             task.lease_expires_at = None
@@ -8914,60 +8966,6 @@ class TaskManager:
                 },
             )
 
-    async def _task_operation_lease_heartbeat(self, task_id: str, *, token: str, operation: str) -> None:
-        interval = max(5, int(TASK_OPERATION_LOCK_HEARTBEAT_SECONDS))
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                renewed = await asyncio.to_thread(
-                    self._renew_task_operation_lease,
-                    task_id,
-                    token=token,
-                    operation=operation,
-                )
-            except Exception:
-                logger.exception("binary-security operation lock heartbeat failed: task=%s operation=%s", task_id, operation)
-                return
-            if not renewed:
-                logger.warning("binary-security operation lock lost: task=%s operation=%s", task_id, operation)
-                return
-
-    def _touch_task_preparing_heartbeat(self, task_id: str) -> None:
-        now = _now()
-        worker = self._action_workers.get(task_id)
-        if worker is None or worker.done():
-            return
-        session = get_session_factory()()
-        try:
-            lease_expires_at = self._next_lease_expiry(session, now_value=now)
-            updated = session.query(BinarySecurityTask).filter(
-                BinarySecurityTask.id == task_id,
-                BinarySecurityTask.status.in_(list(TASK_PREPARING_STATUSES)),
-                BinarySecurityTask.dispatcher_instance_id == self.instance_id,
-            ).update(
-                {
-                    BinarySecurityTask.updated_at: now,
-                    BinarySecurityTask.lease_expires_at: lease_expires_at,
-                },
-                synchronize_session=False,
-            )
-            if updated:
-                session.commit()
-            else:
-                session.rollback()
-        finally:
-            session.close()
-
-    async def _task_preparing_lease_heartbeat(self, task_id: str) -> None:
-        interval_seconds = max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15))
-        while True:
-            await asyncio.sleep(interval_seconds)
-            try:
-                await asyncio.to_thread(self._touch_task_preparing_heartbeat, task_id)
-            except Exception:
-                logger.exception("binary-security preparing lease heartbeat failed: task=%s", task_id)
-                return
-
     @contextmanager
     def _task_operation_lock(self, db: Session, task_id: str, *, operation: str, ttl_seconds: int = TASK_OPERATION_LOCK_TTL_SECONDS):
         token = self._acquire_task_operation_lease(db, task_id, operation=operation, ttl_seconds=ttl_seconds)
@@ -9232,7 +9230,7 @@ class TaskManager:
             return [
                 str(task_id)
                 for (task_id,) in candidate_session.query(BinarySecurityTask.id)
-                .filter(BinarySecurityTask.status.in_(["pending", "running", "dispatching", "retry_preparing", "continue_preparing"]))
+                .filter(BinarySecurityTask.status.in_(["pending", "running", "dispatching"]))
                 .order_by(BinarySecurityTask.updated_at.asc(), BinarySecurityTask.created_at.asc())
                 .limit(64)
                 .all()
@@ -9316,11 +9314,13 @@ class TaskManager:
         stage_name: str | None = None,
         item: BinarySecurityStageItem | None = None,
         payload: dict[str, Any] | None = None,
+        operation_id: str | None = None,
     ) -> None:
         event = BinarySecurityEvent(
             id=f"evt_{uuid.uuid4().hex[:24]}",
             task_id=task.id,
             project_id=task.project_id,
+            operation_id=operation_id,
             stage_name=stage_name,
             item_id=_stage_item_attr(item, "id"),
             item_key=_stage_item_attr(item, "item_key"),
@@ -10567,8 +10567,6 @@ class TaskManager:
             "pending",
             "dispatching",
             "running",
-            TASK_STATUS_CONTINUE_PREPARING,
-            TASK_STATUS_RETRY_PREPARING,
             "pending_upload",
             "uploading",
             "ready_to_start",
@@ -10621,8 +10619,6 @@ class TaskManager:
             "pending",
             "dispatching",
             "running",
-            TASK_STATUS_CONTINUE_PREPARING,
-            TASK_STATUS_RETRY_PREPARING,
             "pending_upload",
             "uploading",
             "ready_to_start",
@@ -10893,9 +10889,9 @@ class TaskManager:
             task_type=self._task_type(task),
             name=task.name,
             status=task.status,
+            current_operation_id=task.current_operation_id,
             execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
             current_stage=task.current_stage,
-            pending_action=task.pending_action,
             last_error=task.last_error,
             firmware_path=task.firmware_path,
             stage_sequence=stage_sequence,
@@ -10981,21 +10977,31 @@ class TaskManager:
         *,
         stage_summaries: list[BinarySecurityStageSummary],
     ) -> dict[str, Any]:
-        now_value = _now()
-        lock_active = bool(task.operation_lock_expires_at and task.operation_lock_expires_at > now_value)
-        if lock_active:
-            operation_type = str(task.operation_lock_type or task.pending_action or "").strip() or "未知操作"
-            reason = f"当前任务正在执行 {operation_type}，请稍后重试"
+        session = None
+        active_operation = None
+        try:
+            session = get_session_factory()()
+            active_operation = self._active_operation(session, task.id)
+        except Exception:
+            active_operation = None
+        finally:
+            if session is not None:
+                session.close()
+        if active_operation is not None:
+            reason = f"当前任务正在执行 {active_operation.operation_type}，请稍后重试"
             return {
                 "overall": "in_progress",
                 "summary": reason,
                 "blocking_code": "task_operation_in_progress",
                 "blocking_reason": reason,
                 "operation_in_progress": True,
-                "operation_type": task.operation_lock_type,
-                "operation_owner": task.operation_lock_owner,
-                "operation_expires_at": task.operation_lock_expires_at,
-                "operation_heartbeat_at": task.operation_lock_heartbeat_at,
+                "operation_id": active_operation.id,
+                "operation_type": active_operation.operation_type,
+                "operation_status": active_operation.status,
+                "operation_owner": active_operation.owner_instance_id,
+                "operation_started_at": _isoformat_or_none(active_operation.started_at),
+                "operation_expires_at": _isoformat_or_none(active_operation.claim_lease_expires_at),
+                "operation_heartbeat_at": _isoformat_or_none(active_operation.heartbeat_at),
                 "can_cancel": False,
                 "can_continue": False,
                 "can_retry": False,
@@ -11010,7 +11016,8 @@ class TaskManager:
                 "can_edit_policy": False,
                 "can_confirm_modules": False,
             }
-        running = str(task.status or "").strip() in {"pending", "dispatching", "running", *TASK_PREPARING_STATUSES}
+        running_statuses = {"pending", "dispatching", "running"}
+        running = str(task.status or "").strip() in running_statuses
         has_failed_stage = any(summary.status in {"failed", "downstream_missing", "cancelled"} for summary in stage_summaries)
         return {
             "overall": "blocked" if running else "ready",
@@ -11077,9 +11084,9 @@ class TaskManager:
             task_type=self._task_type(task),
             name=task.name,
             status=task.status,
+            current_operation_id=task.current_operation_id,
             execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
             current_stage=task.current_stage,
-            pending_action=task.pending_action,
             last_error=task.last_error,
             firmware_path=task.firmware_path,
             stage_sequence=stage_sequence,
@@ -11130,47 +11137,63 @@ class TaskManager:
         task_retry_failed_reason: str | None,
         stage_summaries: list[BinarySecurityStageSummary],
     ) -> dict[str, Any]:
-        now_value = _now()
-        lock_active = bool(task.operation_lock_expires_at and task.operation_lock_expires_at > now_value)
-        operation_type = str(task.operation_lock_type or task.pending_action or "").strip() or None
-        operation_owner = str(task.operation_lock_owner or "").strip() or None
+        active_operation = self._active_operation(db, task.id)
+        if active_operation is not None:
+            blocking_reason = f"当前任务正在执行 {active_operation.operation_type}，请稍后重试"
+            return {
+                "overall": "in_progress",
+                "summary": blocking_reason,
+                "blocking_code": "task_operation_in_progress",
+                "blocking_reason": blocking_reason,
+                "operation_in_progress": True,
+                "operation_id": active_operation.id,
+                "operation_type": active_operation.operation_type,
+                "operation_status": active_operation.status,
+                "operation_owner": active_operation.owner_instance_id,
+                "operation_started_at": _isoformat_or_none(active_operation.started_at),
+                "operation_expires_at": _isoformat_or_none(active_operation.claim_lease_expires_at),
+                "operation_heartbeat_at": _isoformat_or_none(active_operation.heartbeat_at),
+                "can_cancel": False,
+                "can_continue": False,
+                "can_retry": False,
+                "can_retry_failed_items": False,
+                "can_retry_stage": False,
+                "can_retry_stage_failed_items": False,
+                "can_retry_stage_full": False,
+                "can_retry_archive": False,
+                "can_retry_archive_failed_items": False,
+                "can_retry_archive_full": False,
+                "can_delete": False,
+                "can_edit_policy": False,
+                "can_confirm_modules": False,
+            }
         has_stage_retry = any(bool(summary.retry_full_supported) for summary in stage_summaries)
         has_stage_retry_failed = any(bool(summary.retry_failed_supported) for summary in stage_summaries)
         has_item_level_stage_retry_failed = self._has_retryable_failed_stage_items(db, task)
-        preparing = task.status in TASK_PREPARING_STATUSES
         streaming_auto_progressing = self._streaming_tail_auto_progressing(db, task)
         running = task.status in {"dispatching", "running"} or streaming_auto_progressing
         waiting_modules = task.status in {TASK_STATUS_PENDING_MODULE_CONFIRMATION, "waiting_confirmation"}
-        can_retry_archive = not preparing and not running and not lock_active and any(
+        can_retry_archive = not running and any(
             self._archive_retry_support(db, task, summary.stage_name)[0] or self._archive_full_retry_support(db, task, summary.stage_name)[0]
             for summary in stage_summaries
         )
 
-        can_cancel = task.status not in TASK_TERMINAL_STATUSES and not preparing and not lock_active
-        can_continue = bool(task_continue_supported) and not lock_active
-        can_retry = bool(task_retry_supported) and not lock_active
-        can_retry_failed_items = bool(task_retry_failed_supported) and not lock_active
-        can_retry_stage = (has_stage_retry or has_stage_retry_failed) and not lock_active and not running and not preparing
-        can_retry_stage_failed_items = (has_stage_retry_failed or has_item_level_stage_retry_failed) and not lock_active and not preparing
-        can_delete = not lock_active
-        can_edit_policy = task.status not in {"dispatching", "running"} | TASK_PREPARING_STATUSES and not lock_active
-        can_confirm_modules = waiting_modules and not lock_active
+        can_cancel = task.status not in TASK_TERMINAL_STATUSES
+        can_continue = bool(task_continue_supported)
+        can_retry = bool(task_retry_supported)
+        can_retry_failed_items = bool(task_retry_failed_supported)
+        can_retry_stage = (has_stage_retry or has_stage_retry_failed) and not running
+        can_retry_stage_failed_items = has_stage_retry_failed or has_item_level_stage_retry_failed
+        can_delete = True
+        blocked_policy_statuses = {"dispatching", "running"}
+        can_edit_policy = task.status not in blocked_policy_statuses
+        can_confirm_modules = waiting_modules
 
         blocking_code: str | None = None
         blocking_reason: str | None = None
         overall = "ready"
         summary = "当前任务允许手工操作"
-        if lock_active:
-            blocking_code = "task_operation_in_progress"
-            blocking_reason = f"当前任务正在执行 {operation_type or '未知'} 操作，请稍后重试"
-            overall = "in_progress"
-            summary = blocking_reason
-        elif preparing:
-            blocking_code = "task_preparing"
-            blocking_reason = f"当前任务正在执行 {task.pending_action or operation_type or '后台准备'}，暂不可手工操作"
-            overall = "in_progress"
-            summary = blocking_reason
-        elif waiting_modules:
+        if waiting_modules:
             blocking_code = "pending_module_confirmation"
             blocking_reason = "当前任务等待模块确认，请先确认模块后再执行其他操作"
             overall = "blocked"
@@ -11202,18 +11225,18 @@ class TaskManager:
             "summary": summary,
             "blocking_code": blocking_code,
             "blocking_reason": blocking_reason,
-            "operation_in_progress": lock_active or preparing,
-            "operation_type": operation_type,
-            "operation_owner": operation_owner,
-            "operation_expires_at": _isoformat_or_none(task.operation_lock_expires_at),
-            "operation_heartbeat_at": _isoformat_or_none(task.operation_lock_heartbeat_at),
+            "operation_in_progress": False,
+            "operation_type": None,
+            "operation_owner": None,
+            "operation_expires_at": None,
+            "operation_heartbeat_at": None,
             "can_cancel": can_cancel,
             "can_continue": can_continue,
             "can_retry": can_retry,
             "can_retry_failed_items": can_retry_failed_items,
             "can_retry_stage": can_retry_stage,
             "can_retry_stage_failed_items": can_retry_stage_failed_items,
-            "can_retry_stage_full": has_stage_retry and not lock_active and not running and not preparing,
+            "can_retry_stage_full": has_stage_retry and not running,
             "can_retry_archive": can_retry_archive,
             "can_retry_archive_failed_items": can_retry_archive,
             "can_retry_archive_full": can_retry_archive,
@@ -12436,6 +12459,7 @@ class TaskManager:
 
     def _refresh_task_status_after_sync(self, db: Session, task: BinarySecurityTask) -> None:
         current_status = str(task.status or "").strip()
+        active_operation = self._active_operation(db, task.id)
         if task.status == "cancelled":
             self._invalidate_task_execution(task)
             task.finished_at = task.finished_at or _now()
@@ -12446,17 +12470,10 @@ class TaskManager:
             task.lease_expires_at = None
             task.finished_at = None
             return
-        pending_action = str(task.pending_action or "").strip()
-        if pending_action in TASK_PENDING_ACTIONS:
-            task.status = _preparing_status_for_action(pending_action)
+        if active_operation is not None:
             task.finished_at = None
-            task.last_error = None
-            if not self._preparing_action_needs_requeue(task):
-                return
-            task.dispatcher_instance_id = None
-            task.dispatch_started_at = None
-            task.lease_expires_at = None
-            self._enqueue_action(task.id)
+            task.last_error = None if str(active_operation.status or "").strip() in {"accepted", "queued", "running"} else task.last_error
+            task.current_operation_id = active_operation.id
             return
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
         statuses = [run.status for run in stage_runs]
@@ -12550,7 +12567,8 @@ class TaskManager:
 
     def _should_skip_readless_reconcile_for_active_task(self, task: BinarySecurityTask) -> bool:
         status = str(task.status or "").strip()
-        if status not in {"running", "dispatching", *TASK_PREPARING_STATUSES}:
+        active_statuses = {"running", "dispatching"}
+        if status not in active_statuses:
             return False
         if not str(task.dispatcher_instance_id or "").strip():
             return False
@@ -14216,12 +14234,14 @@ class TaskManager:
     def _task_retry_support(self, db: Session, task: BinarySecurityTask) -> tuple[bool, str | None, str | None]:
         if self._streaming_tail_auto_progressing(db, task):
             return False, "当前任务处于 streaming tail 自动推进中，暂不支持任务重试", None
+        active_operation = self._active_operation(db, task.id)
+        if active_operation is not None:
+            return False, f"当前任务已有进行中的操作: {active_operation.operation_type}", None
         if task.status in {"pending_upload", "uploading", "ready_to_start"}:
             return False, "当前任务尚未完成输入准备，不能重试", None
-        if task.status in {"pending", "dispatching", "running"} | TASK_PREPARING_STATUSES:
+        blocked_statuses = {"pending", "dispatching", "running"}
+        if task.status in blocked_statuses:
             return False, f"当前任务正在执行或排队中，不能重试: {task.status}", None
-        if str(task.pending_action or "").strip():
-            return False, f"当前任务已有待处理操作: {task.pending_action}", None
         stage_sequence = self._stage_sequence_for_task(task)
         if not stage_sequence:
             return False, "当前任务没有可执行阶段", None
@@ -14234,12 +14254,14 @@ class TaskManager:
     ) -> tuple[bool, str | None, str | None, list[BinarySecurityStageItem]]:
         if self._streaming_tail_auto_progressing(db, task):
             return False, "当前任务处于 streaming tail 自动推进中，暂不支持失败项重试", None, []
+        active_operation = self._active_operation(db, task.id)
+        if active_operation is not None:
+            return False, f"当前任务已有进行中的操作: {active_operation.operation_type}", None, []
         if task.status in {"pending_upload", "uploading", "ready_to_start"}:
             return False, "当前任务尚未完成输入准备，不能重试失败项", None, []
-        if task.status in {"pending", "dispatching", "running"} | TASK_PREPARING_STATUSES:
+        blocked_statuses = {"pending", "dispatching", "running"}
+        if task.status in blocked_statuses:
             return False, f"当前任务正在执行或排队中，不能重试失败项: {task.status}", None, []
-        if str(task.pending_action or "").strip():
-            return False, f"当前任务已有待处理操作: {task.pending_action}", None, []
         if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
             return False, "当前任务等待模块确认，请先确认模块后再重试失败项", None, []
         stage_name, items = self._first_failed_retry_stage(db, task)
@@ -14283,12 +14305,14 @@ class TaskManager:
     def _task_continue_support(self, db: Session, task: BinarySecurityTask) -> tuple[bool, str | None, str | None]:
         if self._streaming_tail_auto_progressing(db, task):
             return False, "当前任务处于 streaming tail 自动推进中，无需手动继续", None
+        active_operation = self._active_operation(db, task.id)
+        if active_operation is not None:
+            return False, f"当前任务已有进行中的操作: {active_operation.operation_type}", None
         if task.status in {"pending_upload", "uploading", "ready_to_start"}:
             return False, f"当前任务状态不允许继续: {task.status}", None
-        if task.status in {"pending", "dispatching", "running"} | TASK_PREPARING_STATUSES:
+        blocked_statuses = {"pending", "dispatching", "running"}
+        if task.status in blocked_statuses:
             return False, f"当前任务正在执行或排队中，不能手动继续: {task.status}", None
-        if str(task.pending_action or "").strip():
-            return False, f"当前任务已有待处理操作: {task.pending_action}", None
         if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
             return False, "当前任务等待模块确认，请先确认模块后继续", None
 
@@ -14539,7 +14563,6 @@ class TaskManager:
         task.execution_epoch = int(getattr(task, "execution_epoch", 0) or 0) + 1
         task.execution_mode = None
         task.target_stage_name = None
-        task.pending_action = None
         task.last_error = None
         task.finished_at = None
         task.started_at = None

@@ -141,9 +141,9 @@ class BinarySecurityTaskResponse(BaseModel):
     task_type: str = TASK_TYPE_BINARY
     name: str
     status: str
+    current_operation_id: Optional[str] = None
     execution_epoch: int = 0
     current_stage: Optional[str] = None
-    pending_action: Optional[str] = None
     last_error: Optional[str] = None
     firmware_path: str
     stage_sequence: list[str] = Field(default_factory=list)
@@ -179,6 +179,39 @@ class BinarySecurityTaskResponse(BaseModel):
     abnormal_reason: Optional[BinarySecurityAbnormalReason] = None
     stage_summaries: list[BinarySecurityStageSummary] = Field(default_factory=list)
     manual_operation_state: dict[str, Any] = Field(default_factory=dict)
+
+
+class BinarySecurityTaskOperationResponse(BaseModel):
+    id: str
+    task_id: str
+    project_id: str
+    operation_type: str
+    target_stage: Optional[str] = None
+    requested_by: Optional[str] = None
+    request_source: Optional[str] = None
+    status: str
+    operation_token: str
+    owner_instance_id: Optional[str] = None
+    claim_lease_expires_at: Optional[datetime] = None
+    heartbeat_at: Optional[datetime] = None
+    request_payload: dict[str, Any] = Field(default_factory=dict)
+    result_payload: dict[str, Any] = Field(default_factory=dict)
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    current_step: Optional[str] = None
+    step_attempts: dict[str, Any] = Field(default_factory=dict)
+    step_payload: dict[str, Any] = Field(default_factory=dict)
+    resume_cursor: dict[str, Any] = Field(default_factory=dict)
+    superseded_by_operation_id: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+
+class BinarySecurityTaskOperationPageResponse(BaseModel):
+    task_id: str
+    items: list[BinarySecurityTaskOperationResponse] = Field(default_factory=list)
 
 
 class BinarySecurityProjectStats(BaseModel):
@@ -486,6 +519,7 @@ BinarySecurityTaskDetailResponse.model_rebuild()
 class BinarySecurityActionResponse(BaseModel):
     status: str = "ok"
     task_id: str
+    operation_id: Optional[str] = None
     message: str
     accepted: bool = False
     action: Optional[str] = None

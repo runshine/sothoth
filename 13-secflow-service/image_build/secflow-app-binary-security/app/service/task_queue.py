@@ -39,9 +39,9 @@ class TaskQueue:
         client = await self._client_or_create()
         await self._push_unique(client, self.config.task_queue_key, str(task_id))
 
-    async def push_action(self, task_id: str) -> None:
+    async def push_operation(self, operation_id: str) -> None:
         client = await self._client_or_create()
-        await self._push_unique(client, self.config.action_queue_key, str(task_id))
+        await self._push_unique(client, self.config.operation_queue_key, str(operation_id))
 
     async def pop_task(self, timeout_seconds: int | None = None) -> Optional[str]:
         client = await self._client_or_create()
@@ -55,17 +55,18 @@ class TaskQueue:
             return None
         return await self._consume_result(client, self.config.task_queue_key, result)
 
-    async def pop_action(self, timeout_seconds: int | None = None) -> Optional[str]:
+    async def pop_operation(self, timeout_seconds: int | None = None) -> Optional[str]:
         client = await self._client_or_create()
+        queue_key = self.config.operation_queue_key
         try:
             result = await client.blpop(
-                self.config.action_queue_key,
+                queue_key,
                 timeout=max(1, int(timeout_seconds or self.config.block_timeout_seconds)),
             )
         except RedisTimeoutError:
-            await self._reset_client_after_timeout("action")
+            await self._reset_client_after_timeout("operation")
             return None
-        return await self._consume_result(client, self.config.action_queue_key, result)
+        return await self._consume_result(client, queue_key, result)
 
     async def _reset_client_after_timeout(self, queue_name: str) -> None:
         async with self._lock:
@@ -130,14 +131,13 @@ class TaskQueue:
         }
 
     async def snapshot(self) -> dict[str, dict[str, float | int]]:
-        client = await self._client_or_create()
-        task_queue, action_queue = await asyncio.gather(
+        task_queue, operation_queue = await asyncio.gather(
             self.queue_stats(self.config.task_queue_key),
-            self.queue_stats(self.config.action_queue_key),
+            self.queue_stats(self.config.operation_queue_key),
         )
         return {
             "task_queue": task_queue,
-            "action_queue": action_queue,
+            "operation_queue": operation_queue,
         }
 
     async def close(self) -> None:

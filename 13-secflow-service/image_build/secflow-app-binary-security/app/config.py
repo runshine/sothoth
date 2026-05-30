@@ -115,7 +115,7 @@ class QueueConfig(BaseModel):
     enabled: bool = True
     redis_url: str = "redis://redis.sothothv2-ns.svc.cluster.local:6379/0"
     task_queue_key: str = "secflow:binary-security:tasks"
-    action_queue_key: str = "secflow:binary-security:actions"
+    operation_queue_key: str = "secflow:binary-security:operations"
     block_timeout_seconds: int = 5
     reconcile_interval_seconds: int = 30
     seed_batch_size: int = 20

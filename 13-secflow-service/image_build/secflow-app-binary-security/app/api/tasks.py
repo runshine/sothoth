@@ -30,6 +30,7 @@ from app.schemas import (
     BinarySecurityUploadCompletePayload,
     BinarySecurityTaskDetailResponse,
     BinarySecurityTaskListResponse,
+    BinarySecurityTaskOperationPageResponse,
     BinarySecurityTaskPrepareResponse,
     BinarySecurityTimelineResponse,
     TokenUser,
@@ -258,6 +259,16 @@ def get_timeline(
     return get_task_manager().get_timeline(db, project_id=project_id, task_id=task_id)
 
 
+@router.get("/projects/{project_id}/tasks/{task_id}/operations", response_model=BinarySecurityTaskOperationPageResponse)
+def get_operations(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().get_operations(db, project_id=project_id, task_id=task_id)
+
+
 @router.delete("/projects/{project_id}/tasks/{task_id}/timeline", response_model=BinarySecurityActionResponse)
 def clear_timeline(
     project_id: str,
@@ -318,10 +329,11 @@ def retry_task(
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    get_task_manager().retry_task(db, project_id=project_id, task_id=task_id)
+    operation = get_task_manager().retry_task(db, project_id=project_id, task_id=task_id)
     return BinarySecurityActionResponse(
         task_id=task_id,
-        status="retry_preparing",
+        operation_id=operation.id if operation else None,
+        status="accepted",
         accepted=True,
         action="retry",
         message="任务已受理，后台正在清空并准备从第一阶段重新排队",
@@ -335,13 +347,14 @@ async def continue_task(
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    target_stage = await get_task_manager().continue_task(db, project_id=project_id, task_id=task_id)
+    operation = await get_task_manager().continue_task(db, project_id=project_id, task_id=task_id)
     return BinarySecurityActionResponse(
         task_id=task_id,
-        status="continue_preparing",
+        operation_id=operation.id if operation else None,
+        status="accepted",
         accepted=True,
         action="continue",
-        message=f"任务已受理，后台正在准备从阶段 {target_stage} 继续",
+        message=f"任务已受理，后台正在准备从阶段 {operation.target_stage} 继续",
     )
 
 
@@ -352,13 +365,14 @@ def retry_failed_items(
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    target_stage = get_task_manager().retry_failed_items(db, project_id=project_id, task_id=task_id)
+    operation = get_task_manager().retry_failed_items(db, project_id=project_id, task_id=task_id)
     return BinarySecurityActionResponse(
         task_id=task_id,
-        status="retry_preparing",
+        operation_id=operation.id if operation else None,
+        status="accepted",
         accepted=True,
         action="retry_failed_items",
-        message=f"任务已受理，后台正在准备从阶段 {target_stage} 重试失败项",
+        message=f"任务已受理，后台正在准备从阶段 {operation.target_stage} 重试失败项",
     )
 
 
@@ -370,8 +384,8 @@ def retry_stage(
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    get_task_manager().retry_stage_full(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
-    return BinarySecurityActionResponse(task_id=task_id, accepted=True, action="retry_stage_full", status="retry_preparing", message=f"阶段 {stage_name} 的完全重试已受理")
+    operation = get_task_manager().retry_stage_full(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
+    return BinarySecurityActionResponse(task_id=task_id, operation_id=operation.id if operation else None, accepted=True, action="retry_stage_full", status="accepted", message=f"阶段 {stage_name} 的完全重试已受理")
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/stages/{stage_name}/retry-failed-items", response_model=BinarySecurityActionResponse)
@@ -382,8 +396,8 @@ def retry_stage_failed_items(
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    get_task_manager().retry_stage_failed_items(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
-    return BinarySecurityActionResponse(task_id=task_id, accepted=True, action="retry_stage_failed_items", status="retry_preparing", message=f"阶段 {stage_name} 的失败项重试已受理")
+    operation = get_task_manager().retry_stage_failed_items(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
+    return BinarySecurityActionResponse(task_id=task_id, operation_id=operation.id if operation else None, accepted=True, action="retry_stage_failed_items", status="accepted", message=f"阶段 {stage_name} 的失败项重试已受理")
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/stages/{stage_name}/retry-full", response_model=BinarySecurityActionResponse)
@@ -394,8 +408,8 @@ def retry_stage_full(
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    get_task_manager().retry_stage_full(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
-    return BinarySecurityActionResponse(task_id=task_id, accepted=True, action="retry_stage_full", status="retry_preparing", message=f"阶段 {stage_name} 的完全重试已受理")
+    operation = get_task_manager().retry_stage_full(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
+    return BinarySecurityActionResponse(task_id=task_id, operation_id=operation.id if operation else None, accepted=True, action="retry_stage_full", status="accepted", message=f"阶段 {stage_name} 的完全重试已受理")
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/stages/{stage_name}/archive/retry", response_model=BinarySecurityActionResponse)
@@ -406,13 +420,14 @@ def retry_stage_archive(
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    get_task_manager().retry_stage_archive_failed_items(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
+    operation = get_task_manager().retry_stage_archive_failed_items(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
     return BinarySecurityActionResponse(
         task_id=task_id,
+        operation_id=operation.id if operation else None,
         accepted=True,
         action="retry_archive_failed_items",
-        status="running",
-        message=f"阶段 {stage_name} 的归档失败项已重新排队",
+        status="accepted",
+        message=f"阶段 {stage_name} 的归档失败项重试已受理",
     )
 
 
@@ -424,13 +439,14 @@ def retry_stage_archive_failed_items(
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    get_task_manager().retry_stage_archive_failed_items(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
+    operation = get_task_manager().retry_stage_archive_failed_items(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
     return BinarySecurityActionResponse(
         task_id=task_id,
+        operation_id=operation.id if operation else None,
         accepted=True,
         action="retry_archive_failed_items",
-        status="running",
-        message=f"阶段 {stage_name} 的归档失败项已重新排队",
+        status="accepted",
+        message=f"阶段 {stage_name} 的归档失败项重试已受理",
     )
 
 
@@ -442,13 +458,14 @@ def retry_stage_archive_full(
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    get_task_manager().retry_stage_archive_full(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
+    operation = get_task_manager().retry_stage_archive_full(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
     return BinarySecurityActionResponse(
         task_id=task_id,
+        operation_id=operation.id if operation else None,
         accepted=True,
         action="retry_archive_full",
-        status="running",
-        message=f"阶段 {stage_name} 的归档阶段已清空并重建",
+        status="accepted",
+        message=f"阶段 {stage_name} 的归档全量重试已受理",
     )
 
 

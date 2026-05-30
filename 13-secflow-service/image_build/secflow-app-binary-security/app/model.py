@@ -103,7 +103,7 @@ class BinarySecurityTask(Base, JsonMixin):
     execution_epoch = Column(Integer, nullable=False, default=0)
     execution_mode = Column(String(32), nullable=True, index=True)
     target_stage_name = Column(String(64), nullable=True, index=True)
-    pending_action = Column(String(32), nullable=True, index=True)
+    current_operation_id = Column(String(48), nullable=True, index=True)
     cleanup_snapshot_json = Column(Text, nullable=True)
     last_error = Column(Text, nullable=True)
     latest_abnormal_reason_json = Column(Text, nullable=True)
@@ -328,6 +328,7 @@ class BinarySecurityEvent(Base, JsonMixin):
     id = Column(String(48), primary_key=True)
     task_id = Column(String(32), nullable=False, index=True)
     project_id = Column(String(64), nullable=False, index=True)
+    operation_id = Column(String(48), nullable=True, index=True)
     stage_name = Column(String(64), nullable=True, index=True)
     item_id = Column(String(40), nullable=True, index=True)
     item_key = Column(String(128), nullable=True, index=True)
@@ -376,6 +377,76 @@ class BinarySecurityArchiveJob(Base, JsonMixin):
     @payload.setter
     def payload(self, value: dict[str, Any] | None) -> None:
         self.payload_json = self._dump_json(value or {})
+
+
+class BinarySecurityTaskOperation(Base, JsonMixin):
+    __tablename__ = "secflow_binary_security_task_operation"
+
+    id = Column(String(48), primary_key=True)
+    task_id = Column(String(32), nullable=False, index=True)
+    project_id = Column(String(64), nullable=False, index=True)
+    operation_type = Column(String(64), nullable=False, index=True)
+    target_stage = Column(String(64), nullable=True, index=True)
+    requested_by = Column(String(64), nullable=True, index=True)
+    request_source = Column(String(32), nullable=True, index=True)
+    status = Column(String(32), nullable=False, default="requested", index=True)
+    operation_token = Column(String(64), nullable=False, index=True)
+    owner_instance_id = Column(String(128), nullable=True, index=True)
+    claim_lease_expires_at = Column(DateTime, nullable=True, index=True)
+    heartbeat_at = Column(DateTime, nullable=True, index=True)
+    request_payload_json = Column(Text, nullable=True)
+    result_payload_json = Column(Text, nullable=True)
+    error_code = Column(String(64), nullable=True, index=True)
+    error_message = Column(Text, nullable=True)
+    current_step = Column(String(64), nullable=True, index=True)
+    step_attempts_json = Column(Text, nullable=True)
+    step_payload_json = Column(Text, nullable=True)
+    resume_cursor_json = Column(Text, nullable=True)
+    superseded_by_operation_id = Column(String(48), nullable=True, index=True)
+    created_at = Column(DateTime, default=now_local, nullable=False, index=True)
+    updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
+    started_at = Column(DateTime, nullable=True, index=True)
+    finished_at = Column(DateTime, nullable=True, index=True)
+
+    @property
+    def request_payload(self) -> dict[str, Any]:
+        return self._load_json(self.request_payload_json, {})
+
+    @request_payload.setter
+    def request_payload(self, value: dict[str, Any] | None) -> None:
+        self.request_payload_json = self._dump_json(value or {})
+
+    @property
+    def result_payload(self) -> dict[str, Any]:
+        return self._load_json(self.result_payload_json, {})
+
+    @result_payload.setter
+    def result_payload(self, value: dict[str, Any] | None) -> None:
+        self.result_payload_json = self._dump_json(value or {})
+
+    @property
+    def step_attempts(self) -> dict[str, Any]:
+        return self._load_json(self.step_attempts_json, {})
+
+    @step_attempts.setter
+    def step_attempts(self, value: dict[str, Any] | None) -> None:
+        self.step_attempts_json = self._dump_json(value or {})
+
+    @property
+    def step_payload(self) -> dict[str, Any]:
+        return self._load_json(self.step_payload_json, {})
+
+    @step_payload.setter
+    def step_payload(self, value: dict[str, Any] | None) -> None:
+        self.step_payload_json = self._dump_json(value or {})
+
+    @property
+    def resume_cursor(self) -> dict[str, Any]:
+        return self._load_json(self.resume_cursor_json, {})
+
+    @resume_cursor.setter
+    def resume_cursor(self, value: dict[str, Any] | None) -> None:
+        self.resume_cursor_json = self._dump_json(value or {})
 
 
 class BinarySecurityStateEvent(Base, JsonMixin):
@@ -544,9 +615,9 @@ def _ensure_compat_columns(engine) -> None:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN target_stage_name VARCHAR(64) NULL"
             )
-        if "pending_action" not in columns:
+        if "current_operation_id" not in columns:
             statements.append(
-                f"ALTER TABLE {task_table} ADD COLUMN pending_action VARCHAR(32) NULL"
+                f"ALTER TABLE {task_table} ADD COLUMN current_operation_id VARCHAR(48) NULL"
             )
         if "execution_epoch" not in columns:
             statements.append(
@@ -600,6 +671,15 @@ def _ensure_compat_columns(engine) -> None:
                 f"CREATE INDEX ix_bst_operation_lock_expires ON {task_table} (operation_lock_expires_at)"
             )
         _execute_compat_statements(index_statements)
+    event_table = BinarySecurityEvent.__tablename__
+    if inspector.has_table(event_table):
+        columns = {column["name"] for column in inspector.get_columns(event_table)}
+        statements = []
+        if "operation_id" not in columns:
+            statements.append(
+                f"ALTER TABLE {event_table} ADD COLUMN operation_id VARCHAR(48) NULL"
+            )
+        _execute_compat_statements(statements)
     stage_item_table = BinarySecurityStageItem.__tablename__
     if inspector.has_table(stage_item_table):
         column_defs = {column["name"]: column for column in inspector.get_columns(stage_item_table)}
@@ -687,6 +767,29 @@ def _ensure_compat_columns(engine) -> None:
                 f"CREATE INDEX ix_bsst_event_type_status_created ON {state_event_table} (event_type, status, created_at)"
             )
         _execute_compat_statements(index_statements)
+    operation_table = BinarySecurityTaskOperation.__tablename__
+    if inspector.has_table(operation_table):
+        columns = {column["name"] for column in inspector.get_columns(operation_table)}
+        statements = []
+        if "current_step" not in columns:
+            statements.append(
+                f"ALTER TABLE {operation_table} ADD COLUMN current_step VARCHAR(64) NULL"
+            )
+        if "step_attempts_json" not in columns:
+            statements.append(
+                f"ALTER TABLE {operation_table} ADD COLUMN step_attempts_json TEXT NULL"
+            )
+        if "step_payload_json" not in columns:
+            statements.append(
+                f"ALTER TABLE {operation_table} ADD COLUMN step_payload_json TEXT NULL"
+            )
+        if "resume_cursor_json" not in columns:
+            statements.append(
+                f"ALTER TABLE {operation_table} ADD COLUMN resume_cursor_json TEXT NULL"
+            )
+        _execute_compat_statements(statements)
+    else:
+        Base.metadata.tables[operation_table].create(bind=engine, checkfirst=True)
 
 
 def get_db():

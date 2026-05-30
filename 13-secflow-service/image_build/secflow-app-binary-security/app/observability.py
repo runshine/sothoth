@@ -160,6 +160,32 @@ TASK_OPERATIONS_TOTAL = Counter(
     "Total task-level operation requests.",
     labelnames=("action", "result"),
 )
+CONTROL_OPERATIONS_TOTAL = Counter(
+    "secflow_binary_security_operations_total",
+    "Total control-plane task operations by type and status.",
+    labelnames=("operation_type", "status"),
+)
+CONTROL_OPERATION_RUNNING_SECONDS = Histogram(
+    "secflow_binary_security_operation_running_seconds",
+    "Observed wall-clock duration of control-plane task operations.",
+    labelnames=("operation_type", "status"),
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 900, 1800, 3600),
+)
+CONTROL_OPERATION_LEASE_LOST_TOTAL = Counter(
+    "secflow_binary_security_operation_lease_lost_total",
+    "Total control-plane task operations that lost ownership or heartbeat.",
+    labelnames=("operation_type",),
+)
+CONTROL_OPERATION_STEP_RETRIES_TOTAL = Counter(
+    "secflow_binary_security_operation_step_retries_total",
+    "Total operation step retries by operation type and step.",
+    labelnames=("operation_type", "step"),
+)
+CONTROL_OPERATION_SUPERSEDED_TOTAL = Counter(
+    "secflow_binary_security_operation_superseded_total",
+    "Total control-plane task operations superseded by another operation.",
+    labelnames=("operation_type",),
+)
 
 ARCHIVE_ACTIONS_TOTAL = Counter(
     "secflow_binary_security_archive_actions_total",
@@ -474,6 +500,37 @@ def observe_task_operation(action: str, result: str) -> None:
         AI_ROUND_TOTAL.labels(kind="selection").inc()
 
 
+def observe_control_operation(operation_type: str, status: str) -> None:
+    CONTROL_OPERATIONS_TOTAL.labels(
+        operation_type=str(operation_type or "unknown"),
+        status=str(status or "unknown"),
+    ).inc()
+
+
+def observe_control_operation_duration(*, operation_type: str, status: str, duration_seconds: float | None) -> None:
+    if duration_seconds is None:
+        return
+    CONTROL_OPERATION_RUNNING_SECONDS.labels(
+        operation_type=str(operation_type or "unknown"),
+        status=str(status or "unknown"),
+    ).observe(max(0.0, float(duration_seconds)))
+
+
+def observe_control_operation_lease_lost(operation_type: str) -> None:
+    CONTROL_OPERATION_LEASE_LOST_TOTAL.labels(operation_type=str(operation_type or "unknown")).inc()
+
+
+def observe_control_operation_step_retry(*, operation_type: str, step: str) -> None:
+    CONTROL_OPERATION_STEP_RETRIES_TOTAL.labels(
+        operation_type=str(operation_type or "unknown"),
+        step=str(step or "unknown"),
+    ).inc()
+
+
+def observe_control_operation_superseded(operation_type: str) -> None:
+    CONTROL_OPERATION_SUPERSEDED_TOTAL.labels(operation_type=str(operation_type or "unknown")).inc()
+
+
 def observe_task_lifecycle(event: str, *, status: str, task_type: str) -> None:
     TASK_LIFECYCLE_TOTAL.labels(
         event=str(event or "unknown"),
@@ -572,9 +629,9 @@ def observe_auth_token_cache(*, result: str, entries: int | None = None) -> None
         AUTH_TOKEN_CACHE_ENTRIES.set(max(0, int(entries)))
 
 
-def observe_worker_counts(*, task_workers: int, action_workers: int, archive_workers: int) -> None:
+def observe_worker_counts(*, task_workers: int, operation_workers: int, archive_workers: int) -> None:
     ACTIVE_WORKERS.labels(kind="task").set(max(0, int(task_workers)))
-    ACTIVE_WORKERS.labels(kind="action").set(max(0, int(action_workers)))
+    ACTIVE_WORKERS.labels(kind="operation").set(max(0, int(operation_workers)))
     ACTIVE_WORKERS.labels(kind="archive").set(max(0, int(archive_workers)))
 
 
@@ -582,31 +639,29 @@ def observe_queue_depths(
     *,
     pending_tasks: int,
     running_tasks: int,
-    preparing_tasks: int,
     archive_pending_jobs: int,
     archive_running_jobs: int,
     archive_applying_jobs: int,
     reconcile_candidates: int,
     redis_task_queue: int = 0,
-    redis_action_queue: int = 0,
+    redis_operation_queue: int = 0,
     leased_tasks: int = 0,
     task_queue_oldest_age_seconds: float | None = None,
-    action_queue_oldest_age_seconds: float | None = None,
+    operation_queue_oldest_age_seconds: float | None = None,
 ) -> None:
     QUEUE_DEPTH.labels(queue="task_pending").set(max(0, int(pending_tasks)))
     QUEUE_DEPTH.labels(queue="task_running").set(max(0, int(running_tasks)))
-    QUEUE_DEPTH.labels(queue="task_preparing").set(max(0, int(preparing_tasks)))
     QUEUE_DEPTH.labels(queue="task_queued").set(max(0, int(redis_task_queue)))
-    QUEUE_DEPTH.labels(queue="action_queued").set(max(0, int(redis_action_queue)))
+    QUEUE_DEPTH.labels(queue="operation_queued").set(max(0, int(redis_operation_queue)))
     QUEUE_DEPTH.labels(queue="task_leased").set(max(0, int(leased_tasks)))
     QUEUE_DEPTH.labels(queue="archive_pending").set(max(0, int(archive_pending_jobs)))
     QUEUE_DEPTH.labels(queue="archive_running").set(max(0, int(archive_running_jobs)))
     QUEUE_DEPTH.labels(queue="archive_applying").set(max(0, int(archive_applying_jobs)))
     QUEUE_DEPTH.labels(queue="downstream_reconcile_candidates").set(max(0, int(reconcile_candidates)))
     QUEUE_AGE_SECONDS.labels(queue="task_queued").set(max(0.0, float(task_queue_oldest_age_seconds or 0.0)))
-    QUEUE_AGE_SECONDS.labels(queue="action_queued").set(max(0.0, float(action_queue_oldest_age_seconds or 0.0)))
-    AI_ROLE_COUNT.labels(role="agent").set(max(0, int(running_tasks + preparing_tasks)))
-    AI_ROLE_COUNT.labels(role="worker").set(max(0, int(redis_action_queue)))
+    QUEUE_AGE_SECONDS.labels(queue="operation_queued").set(max(0.0, float(operation_queue_oldest_age_seconds or 0.0)))
+    AI_ROLE_COUNT.labels(role="agent").set(max(0, int(running_tasks)))
+    AI_ROLE_COUNT.labels(role="worker").set(max(0, int(redis_operation_queue)))
     AI_ROLE_COUNT.labels(role="advisor").set(max(0, int(reconcile_candidates)))
 
 
