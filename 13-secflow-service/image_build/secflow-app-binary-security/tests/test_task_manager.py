@@ -218,6 +218,21 @@ class _ModelAwareDb:
     def add(self, obj):
         self.added.append(obj)
 
+    def commit(self):
+        pass
+
+    def flush(self):
+        pass
+
+    def refresh(self, obj):
+        return obj
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
 
 class StatusMappingTests(unittest.TestCase):
     def test_status_from_downstream_payload_preserves_non_terminal_pending_statuses(self):
@@ -235,21 +250,6 @@ class StatusMappingTests(unittest.TestCase):
             manager._status_from_downstream_payload({"status": "running"}, success_statuses={"passed", "success"}),
             "running",
         )
-
-    def commit(self):
-        pass
-
-    def flush(self):
-        pass
-
-    def refresh(self, obj):
-        return obj
-
-    def rollback(self):
-        pass
-
-    def close(self):
-        pass
 
 
 class _ScalarResult:
@@ -9549,7 +9549,12 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def _fetch(_task, item, _token):
             fetched_ids.append(item.id)
-            return {"status": "running"}
+            return {
+                "status": "running",
+                "parent_task_id": _task.id,
+                "parent_stage_item_id": item.id,
+                "parent_stage_item_key": item.item_key,
+            }
 
         async def _noop_write(*_args, **_kwargs):
             return None
@@ -9758,7 +9763,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def _fetch(_task, item, _token):
             fetched_ids.append(item.id)
-            return {"status": "running"}
+            return {"status": "running", "parent_stage_item_id": item.id}
 
         async def _noop_write(*_args, **_kwargs):
             return None
@@ -9781,7 +9786,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._enqueue_task = original_enqueue
 
         self.assertEqual(["si_q0", "si_q1"], fetched_ids)
-        self.assertEqual(2, resp.synced_downstream_count)
+        self.assertEqual(1, resp.synced_downstream_count)
 
     def test_sync_downstream_status_unknown_status_is_skipped(self):
         task = BinarySecurityTask(
@@ -9820,7 +9825,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         original_fetch = self.manager._fetch_downstream_task_payload
         async def _fetch(_task, _item, _token):
-            return {"status": "mystery_state"}
+            return {"status": "mystery_state", "parent_stage_item_id": "si1"}
 
         self.manager._fetch_downstream_task_payload = _fetch
         try:
@@ -9886,7 +9891,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         original_enqueue = self.manager._enqueue_task
 
         async def _fetch(_task, _item, _token):
-            return {"status": "running"}
+            return {"status": "running", "parent_stage_item_id": "si1"}
 
         async def _noop_write(*_args, **_kwargs):
             return None
@@ -9957,7 +9962,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         original_enqueue = self.manager._enqueue_task
 
         async def _fetch(_task, _item, _token):
-            return {"status": "running"}
+            return {"status": "running", "parent_stage_item_id": "si1"}
 
         async def _noop_write(*_args, **_kwargs):
             return None
