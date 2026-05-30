@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from urllib.parse import urlsplit
 from typing import Any, Optional
 
 import httpx
@@ -16,12 +17,37 @@ class JsonHttpClient:
     def __init__(self, *, base_url: str, timeout: int):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self._validate_base_url()
+
+    def _validate_base_url(self) -> None:
+        parsed = urlsplit(self.base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValidationError(f"下游服务 base_url 非法: {self.base_url!r}")
+        normalized_path = (parsed.path or "").strip()
+        if normalized_path and normalized_path != "/":
+            raise ValidationError(
+                f"下游服务 base_url 不允许包含路径: {self.base_url!r}；请仅配置服务根 URL"
+            )
 
     def _headers(self, token: Optional[str]) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         return headers
+
+    def _join_path(self, *parts: str) -> str:
+        normalized: list[str] = []
+        for part in parts:
+            value = str(part or "").strip()
+            if not value:
+                continue
+            if "://" in value:
+                raise ValidationError(f"下游资源路径非法，不能包含完整 URL: {value!r}")
+            normalized.extend(segment for segment in value.split("/") if segment)
+        return "/" + "/".join(normalized) if normalized else "/"
+
+    def _build_url(self, path: str) -> str:
+        return f"{self.base_url}{self._join_path(path)}"
 
     def _service_name(self) -> str:
         base = self.base_url.split("//", 1)[-1].split("/", 1)[0]
@@ -77,7 +103,7 @@ class JsonHttpClient:
     ) -> tuple[httpx.Response, bool, bool]:
         client = await get_shared_async_client(self.base_url, timeout=self.timeout)
         try:
-            resp = await client.get(f"{self.base_url}{path}", headers=self._headers(token), params=params)
+            resp = await client.get(self._build_url(path), headers=self._headers(token), params=params)
             return resp, False, False
         except httpx.RequestError as exc:
             error_kind = self._classify_request_error(exc)
@@ -86,7 +112,7 @@ class JsonHttpClient:
             client_recreated = await invalidate_shared_async_client(self.base_url, timeout=self.timeout)
             retry_client = await get_shared_async_client(self.base_url, timeout=self.timeout)
             try:
-                resp = await retry_client.get(f"{self.base_url}{path}", headers=self._headers(token), params=params)
+                resp = await retry_client.get(self._build_url(path), headers=self._headers(token), params=params)
                 return resp, True, client_recreated
             except httpx.RequestError as retry_exc:
                 retry_exc.retry_attempted = True
@@ -151,7 +177,7 @@ class JsonHttpClient:
         started = time.perf_counter()
         try:
             client = await get_shared_async_client(self.base_url, timeout=self.timeout)
-            resp = await client.post(f"{self.base_url}{path}", headers=self._headers(token), json=json_body or {})
+            resp = await client.post(self._build_url(path), headers=self._headers(token), json=json_body or {})
         except httpx.TimeoutException:
             observe_downstream_request(
                 service=self._service_name(),
@@ -188,7 +214,7 @@ class JsonHttpClient:
         started = time.perf_counter()
         try:
             client = await get_shared_async_client(self.base_url, timeout=self.timeout)
-            resp = await client.delete(f"{self.base_url}{path}", headers=self._headers(token))
+            resp = await client.delete(self._build_url(path), headers=self._headers(token))
         except httpx.TimeoutException:
             observe_downstream_request(
                 service=self._service_name(),

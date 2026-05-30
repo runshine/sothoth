@@ -9,6 +9,8 @@ from app.service.downstream_base import JsonHttpClient
 
 
 class BinaryToSourceClient(JsonHttpClient):
+    API_PREFIX = "/api/app/binary-to-source"
+
     def __init__(self) -> None:
         cfg = get_config().services.binary_to_source
         super().__init__(base_url=cfg.base_url, timeout=cfg.timeout)
@@ -40,13 +42,13 @@ class BinaryToSourceClient(JsonHttpClient):
         if reuse_cache is not None:
             payload["reuse_cache"] = bool(reuse_cache)
         return await self.post(
-            f"/projects/{project_id}/tasks",
+            f"{self.API_PREFIX}/projects/{project_id}/tasks",
             token=token,
             json_body=payload,
         )
 
     async def get_task(self, project_id: str, task_id: str, token: str) -> dict:
-        return await self.get(f"/projects/{project_id}/tasks/{task_id}", token=token)
+        return await self.get(f"{self.API_PREFIX}/projects/{project_id}/tasks/{task_id}", token=token)
 
     async def list_tasks(
         self,
@@ -69,17 +71,17 @@ class BinaryToSourceClient(JsonHttpClient):
             params["parent_stage_item_id"] = parent_stage_item_id
         if status:
             params["status"] = status
-        return await self.get(f"/projects/{project_id}/tasks", token=token, params=params)
+        return await self.get(f"{self.API_PREFIX}/projects/{project_id}/tasks", token=token, params=params)
 
     async def cancel_task(self, project_id: str, task_id: str, token: str) -> dict:
-        return await self.post(f"/projects/{project_id}/tasks/{task_id}/terminate", token=token)
+        return await self.post(f"{self.API_PREFIX}/projects/{project_id}/tasks/{task_id}/terminate", token=token)
 
     async def terminate_task(self, project_id: str, task_id: str, token: str) -> dict:
-        return await self.post(f"/projects/{project_id}/tasks/{task_id}/terminate", token=token)
+        return await self.post(f"{self.API_PREFIX}/projects/{project_id}/tasks/{task_id}/terminate", token=token)
 
     async def retry_task(self, project_id: str, task_id: str, token: str, item_ids: list[str] | None = None) -> dict:
         return await self.post(
-            f"/projects/{project_id}/tasks/{task_id}/retry",
+            f"{self.API_PREFIX}/projects/{project_id}/tasks/{task_id}/retry",
             token=token,
             json_body={"item_ids": item_ids},
         )
@@ -94,7 +96,7 @@ class BinaryToSourceClient(JsonHttpClient):
         cancel_running: bool = True,
     ) -> dict:
         return await self.post(
-            f"/projects/{project_id}/tasks/{task_id}/rerun",
+            f"{self.API_PREFIX}/projects/{project_id}/tasks/{task_id}/rerun",
             token=token,
             json_body={
                 "clean_output": clean_output,
@@ -103,7 +105,7 @@ class BinaryToSourceClient(JsonHttpClient):
         )
 
     async def delete_task(self, project_id: str, task_id: str, token: str) -> dict:
-        return await self.delete(f"/projects/{project_id}/tasks/{task_id}", token=token)
+        return await self.delete(f"{self.API_PREFIX}/projects/{project_id}/tasks/{task_id}", token=token)
 
 
 _client: Optional[BinaryToSourceClient] = None

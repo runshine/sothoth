@@ -10,6 +10,8 @@ from app.service.downstream_base import JsonHttpClient
 
 
 class DataflowVulnScannerClient(JsonHttpClient):
+    API_PREFIX = "/api/dataflow-vuln-scanner"
+
     def __init__(self) -> None:
         cfg = get_config().services.dataflow_vuln_scanner
         super().__init__(base_url=cfg.base_url.rstrip("/"), timeout=cfg.timeout)
@@ -36,7 +38,7 @@ class DataflowVulnScannerClient(JsonHttpClient):
         # pass absolute workspace/output refs; send project-scoped input refs so
         # allow_absolute_input_refs can remain disabled.
         return await self.post(
-            "/api/dataflow-vuln-scanner/tasks",
+            f"{self.API_PREFIX}/tasks",
             token=token,
             json_body={
                 "project_id": project_id,
@@ -48,7 +50,7 @@ class DataflowVulnScannerClient(JsonHttpClient):
         )
 
     async def get_task(self, task_id: str, token: str) -> dict:
-        return await self.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}", token=token)
+        return await self.get(f"{self.API_PREFIX}/tasks/{task_id}", token=token)
 
     async def list_tasks(
         self,
@@ -66,19 +68,19 @@ class DataflowVulnScannerClient(JsonHttpClient):
         }
         if status:
             params["status"] = status
-        return await self.get("/api/dataflow-vuln-scanner/tasks", token=token, params=params)
+        return await self.get(f"{self.API_PREFIX}/tasks", token=token, params=params)
 
     async def get_artifacts(self, task_id: str, token: str) -> dict:
-        return await self.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/artifacts", token=token)
+        return await self.get(f"{self.API_PREFIX}/tasks/{task_id}/artifacts", token=token)
 
     async def cancel_task(self, task_id: str, token: str) -> dict:
-        return await self.post(f"/api/dataflow-vuln-scanner/tasks/{task_id}/cancel", token=token)
+        return await self.post(f"{self.API_PREFIX}/tasks/{task_id}/cancel", token=token)
 
     async def retry_task(self, task_id: str, token: str) -> dict:
-        return await self.post(f"/api/dataflow-vuln-scanner/tasks/{task_id}/retry", token=token)
+        return await self.post(f"{self.API_PREFIX}/tasks/{task_id}/retry", token=token)
 
     async def delete_task(self, task_id: str, token: str) -> dict:
-        return await self.delete(f"/api/dataflow-vuln-scanner/tasks/{task_id}", token=token)
+        return await self.delete(f"{self.API_PREFIX}/tasks/{task_id}", token=token)
 
 
 _client: Optional[DataflowVulnScannerClient] = None

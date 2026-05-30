@@ -17147,6 +17147,7 @@ def _test_entry_analyse_client_uses_management_api_prefix(self):
     from app.service.entry_analyse import EntryAnalyseClient
 
     client = EntryAnalyseClient.__new__(EntryAnalyseClient)
+    client.API_PREFIX = "/api/app/entry-analyse"
     recorder = _RecordingJsonHttpClient()
     client.get = recorder.get
     client.post = recorder.post
@@ -17176,6 +17177,7 @@ def _test_dataflow_analyse_client_uses_management_api_prefix(self):
     from app.service.dataflow_analyse import DataflowAnalyseClient
 
     client = DataflowAnalyseClient.__new__(DataflowAnalyseClient)
+    client.API_PREFIX = "/api/app/dataflow-analyse"
     recorder = _RecordingJsonHttpClient()
     client.get = recorder.get
     client.post = recorder.post
@@ -17190,15 +17192,161 @@ def _test_dataflow_analyse_client_uses_management_api_prefix(self):
 
     self.assertEqual(
         [
-            ("GET", "/tasks/dfa-1"),
-            ("GET", "/tasks"),
-            ("POST", "/tasks"),
-            ("POST", "/tasks/dfa-1/cancel"),
-            ("POST", "/tasks/dfa-1/restart"),
-            ("DELETE", "/tasks/dfa-1"),
+            ("GET", "/api/app/dataflow-analyse/tasks/dfa-1"),
+            ("GET", "/api/app/dataflow-analyse/tasks"),
+            ("POST", "/api/app/dataflow-analyse/tasks"),
+            ("POST", "/api/app/dataflow-analyse/tasks/dfa-1/cancel"),
+            ("POST", "/api/app/dataflow-analyse/tasks/dfa-1/restart"),
+            ("DELETE", "/api/app/dataflow-analyse/tasks/dfa-1"),
         ],
         recorder.calls,
     )
+
+
+def _test_system_analyse_client_uses_management_api_prefix(self):
+    from app.service.system_analyse import SystemAnalyseClient
+
+    client = SystemAnalyseClient.__new__(SystemAnalyseClient)
+    client.API_PREFIX = "/api/app/system-analyse"
+    recorder = _RecordingJsonHttpClient()
+    client.get = recorder.get
+    client.post = recorder.post
+    client.delete = recorder.delete
+
+    asyncio.run(client.get_task("sa-1"))
+    asyncio.run(client.list_tasks("p1"))
+    asyncio.run(client.create_task("p1", "demo", "/tmp/in"))
+    asyncio.run(client.cancel_task("sa-1"))
+    asyncio.run(client.restart_task("sa-1"))
+    asyncio.run(client.delete_task("sa-1"))
+
+    self.assertEqual(
+        [
+            ("GET", "/api/app/system-analyse/tasks/sa-1"),
+            ("GET", "/api/app/system-analyse/tasks"),
+            ("POST", "/api/app/system-analyse/tasks"),
+            ("POST", "/api/app/system-analyse/tasks/sa-1/cancel"),
+            ("POST", "/api/app/system-analyse/tasks/sa-1/restart"),
+            ("DELETE", "/api/app/system-analyse/tasks/sa-1"),
+        ],
+        recorder.calls,
+    )
+
+
+def _test_binary_to_source_client_uses_management_api_prefix(self):
+    from app.service.binary_to_source import BinaryToSourceClient
+
+    client = BinaryToSourceClient.__new__(BinaryToSourceClient)
+    client.API_PREFIX = "/api/app/binary-to-source"
+    recorder = _RecordingJsonHttpClient()
+    client.get = recorder.get
+    client.post = recorder.post
+    client.delete = recorder.delete
+
+    asyncio.run(client.get_task("p1", "b2s-1", "tok"))
+    asyncio.run(client.list_tasks("p1", "tok"))
+    asyncio.run(client.create_task("p1", "demo", [], "tok"))
+    asyncio.run(client.cancel_task("p1", "b2s-1", "tok"))
+    asyncio.run(client.retry_task("p1", "b2s-1", "tok"))
+    asyncio.run(client.rerun_task("p1", "b2s-1", "tok"))
+    asyncio.run(client.delete_task("p1", "b2s-1", "tok"))
+
+    self.assertEqual(
+        [
+            ("GET", "/api/app/binary-to-source/projects/p1/tasks/b2s-1"),
+            ("GET", "/api/app/binary-to-source/projects/p1/tasks"),
+            ("POST", "/api/app/binary-to-source/projects/p1/tasks"),
+            ("POST", "/api/app/binary-to-source/projects/p1/tasks/b2s-1/terminate"),
+            ("POST", "/api/app/binary-to-source/projects/p1/tasks/b2s-1/retry"),
+            ("POST", "/api/app/binary-to-source/projects/p1/tasks/b2s-1/rerun"),
+            ("DELETE", "/api/app/binary-to-source/projects/p1/tasks/b2s-1"),
+        ],
+        recorder.calls,
+    )
+
+
+def _test_firmware_unpacker_client_uses_management_api_prefix(self):
+    from app.service.firmware_unpacker import FirmwareUnpackerClient
+
+    client = FirmwareUnpackerClient.__new__(FirmwareUnpackerClient)
+    client.API_PREFIX = "/api/app/firmware-unpacker"
+    recorder = _RecordingJsonHttpClient()
+    client.get = recorder.get
+    client.post = recorder.post
+    client.delete = recorder.delete
+
+    asyncio.run(client.get_task("p1", "fu-1", "tok"))
+    asyncio.run(client.list_tasks("p1", "tok"))
+    asyncio.run(client.create_task("p1", "/tmp/fw.bin", "tok"))
+    asyncio.run(client.cancel_task("fu-1", "tok"))
+    asyncio.run(client.retry_task("fu-1", "tok"))
+    asyncio.run(client.delete_task("fu-1", "tok"))
+
+    self.assertEqual(
+        [
+            ("GET", "/api/app/firmware-unpacker/projects/p1/tasks/fu-1"),
+            ("GET", "/api/app/firmware-unpacker/projects/p1/tasks"),
+            ("POST", "/api/app/firmware-unpacker/projects/p1/tasks"),
+            ("POST", "/api/app/firmware-unpacker/tasks/fu-1/cancel"),
+            ("POST", "/api/app/firmware-unpacker/tasks/fu-1/retry"),
+            ("DELETE", "/api/app/firmware-unpacker/tasks/fu-1"),
+        ],
+        recorder.calls,
+    )
+
+
+def _test_dataflow_vuln_scanner_client_uses_api_prefix(self):
+    from app.service.dataflow_vuln_scanner import DataflowVulnScannerClient
+
+    client = DataflowVulnScannerClient.__new__(DataflowVulnScannerClient)
+    client.API_PREFIX = "/api/dataflow-vuln-scanner"
+    client._project_filesystem_ref = lambda project_id, path: {"project_id": project_id, "path": path}
+    recorder = _RecordingJsonHttpClient()
+    client.get = recorder.get
+    client.post = recorder.post
+    client.delete = recorder.delete
+
+    asyncio.run(client.get_task("dfvs-1", "tok"))
+    asyncio.run(client.list_tasks("p1", "tok"))
+    asyncio.run(client.create_task("p1", "demo", "tok", "/tmp/flow", "/tmp/src"))
+    asyncio.run(client.cancel_task("dfvs-1", "tok"))
+    asyncio.run(client.retry_task("dfvs-1", "tok"))
+    asyncio.run(client.delete_task("dfvs-1", "tok"))
+    asyncio.run(client.get_artifacts("dfvs-1", "tok"))
+
+    self.assertEqual(
+        [
+            ("GET", "/api/dataflow-vuln-scanner/tasks/dfvs-1"),
+            ("GET", "/api/dataflow-vuln-scanner/tasks"),
+            ("POST", "/api/dataflow-vuln-scanner/tasks"),
+            ("POST", "/api/dataflow-vuln-scanner/tasks/dfvs-1/cancel"),
+            ("POST", "/api/dataflow-vuln-scanner/tasks/dfvs-1/retry"),
+            ("DELETE", "/api/dataflow-vuln-scanner/tasks/dfvs-1"),
+            ("GET", "/api/dataflow-vuln-scanner/tasks/dfvs-1/artifacts"),
+        ],
+        recorder.calls,
+    )
+
+
+def _test_service_base_urls_use_service_roots(self):
+    from app.config import ServicesConfig
+
+    services = ServicesConfig()
+    self.assertEqual("http://secflow-app-firmware-unpacker", services.firmware_unpacker.base_url)
+    self.assertEqual("http://secflow-app-system-analyse", services.system_analyse.base_url)
+    self.assertEqual("http://secflow-app-binary-to-source-manager", services.binary_to_source.base_url)
+    self.assertEqual("http://secflow-app-entry-analyse", services.entry_analyse.base_url)
+    self.assertEqual("http://secflow-app-dataflow-analyse", services.dataflow_analyse.base_url)
+    self.assertEqual("http://secflow-app-dataflow-vuln-scanner", services.dataflow_vuln_scanner.base_url)
+    for value in (
+        services.firmware_unpacker.base_url,
+        services.system_analyse.base_url,
+        services.binary_to_source.base_url,
+        services.entry_analyse.base_url,
+        services.dataflow_analyse.base_url,
+        services.dataflow_vuln_scanner.base_url,
+    ):
+        self.assertNotIn("/api/", value)
 
 
 TaskManagerTests.test_stage_item_response_falls_back_to_downstream_payload_status = _test_stage_item_response_falls_back_to_downstream_payload_status
@@ -17207,6 +17355,11 @@ TaskManagerTests.test_task_sync_cooldown_elapsed_uses_all_candidate_items = _tes
 TaskManagerTests.test_streaming_stage_terminal_observed_keeps_task_running_with_active_items = _test_streaming_stage_terminal_observed_keeps_task_running_with_active_items
 TaskManagerTests.test_entry_analyse_client_uses_management_api_prefix = _test_entry_analyse_client_uses_management_api_prefix
 TaskManagerTests.test_dataflow_analyse_client_uses_management_api_prefix = _test_dataflow_analyse_client_uses_management_api_prefix
+TaskManagerTests.test_system_analyse_client_uses_management_api_prefix = _test_system_analyse_client_uses_management_api_prefix
+TaskManagerTests.test_binary_to_source_client_uses_management_api_prefix = _test_binary_to_source_client_uses_management_api_prefix
+TaskManagerTests.test_firmware_unpacker_client_uses_management_api_prefix = _test_firmware_unpacker_client_uses_management_api_prefix
+TaskManagerTests.test_dataflow_vuln_scanner_client_uses_api_prefix = _test_dataflow_vuln_scanner_client_uses_api_prefix
+TaskManagerTests.test_service_base_urls_use_service_roots = _test_service_base_urls_use_service_roots
 
 
 if __name__ == "__main__":

@@ -9,13 +9,15 @@ from app.service.downstream_base import JsonHttpClient
 
 
 class FirmwareUnpackerClient(JsonHttpClient):
+    API_PREFIX = "/api/app/firmware-unpacker"
+
     def __init__(self) -> None:
         cfg = get_config().services.firmware_unpacker
         super().__init__(base_url=cfg.base_url, timeout=cfg.timeout)
 
     async def create_task(self, project_id: str, firmware_path: str, token: str, origin: dict[str, Any] | None = None) -> dict:
         return await self.post(
-            f"/api/app/firmware-unpacker/projects/{project_id}/tasks",
+            f"{self.API_PREFIX}/projects/{project_id}/tasks",
             token=token,
             json_body={
                 "project_id": project_id,
@@ -25,7 +27,7 @@ class FirmwareUnpackerClient(JsonHttpClient):
         )
 
     async def get_task(self, project_id: str, task_id: str, token: str) -> dict:
-        return await self.get(f"/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}", token=token)
+        return await self.get(f"{self.API_PREFIX}/projects/{project_id}/tasks/{task_id}", token=token)
 
     async def list_tasks(
         self,
@@ -42,16 +44,16 @@ class FirmwareUnpackerClient(JsonHttpClient):
         }
         if origin_mode:
             params["origin_mode"] = origin_mode
-        return await self.get(f"/api/app/firmware-unpacker/projects/{project_id}/tasks", token=token, params=params)
+        return await self.get(f"{self.API_PREFIX}/projects/{project_id}/tasks", token=token, params=params)
 
     async def cancel_task(self, task_id: str, token: str) -> dict:
-        return await self.post(f"/api/app/firmware-unpacker/tasks/{task_id}/cancel", token=token)
+        return await self.post(f"{self.API_PREFIX}/tasks/{task_id}/cancel", token=token)
 
     async def retry_task(self, task_id: str, token: str) -> dict:
-        return await self.post(f"/api/app/firmware-unpacker/tasks/{task_id}/retry", token=token)
+        return await self.post(f"{self.API_PREFIX}/tasks/{task_id}/retry", token=token)
 
     async def delete_task(self, task_id: str, token: str) -> dict:
-        return await self.delete(f"/api/app/firmware-unpacker/tasks/{task_id}", token=token)
+        return await self.delete(f"{self.API_PREFIX}/tasks/{task_id}", token=token)
 
 
 _client: Optional[FirmwareUnpackerClient] = None

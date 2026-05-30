@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from urllib.parse import urlsplit
 from typing import Optional
 
 import yaml
@@ -162,16 +163,16 @@ class ServicesConfig(BaseModel):
         default_factory=lambda: SimpleServiceConfig(base_url="http://secflow-app-firmware-unpacker")
     )
     system_analyse: SimpleServiceConfig = Field(
-        default_factory=lambda: SimpleServiceConfig(base_url="http://secflow-app-system-analyse/api/app/system-analyse")
+        default_factory=lambda: SimpleServiceConfig(base_url="http://secflow-app-system-analyse")
     )
     binary_to_source: SimpleServiceConfig = Field(
-        default_factory=lambda: SimpleServiceConfig(base_url="http://secflow-app-binary-to-source-manager/api/app/binary-to-source")
+        default_factory=lambda: SimpleServiceConfig(base_url="http://secflow-app-binary-to-source-manager")
     )
     entry_analyse: SimpleServiceConfig = Field(
-        default_factory=lambda: SimpleServiceConfig(base_url="http://secflow-app-entry-analyse/api/app/entry-analyse")
+        default_factory=lambda: SimpleServiceConfig(base_url="http://secflow-app-entry-analyse")
     )
     dataflow_analyse: SimpleServiceConfig = Field(
-        default_factory=lambda: SimpleServiceConfig(base_url="http://secflow-app-dataflow-analyse/api/app/dataflow-analyse")
+        default_factory=lambda: SimpleServiceConfig(base_url="http://secflow-app-dataflow-analyse")
     )
     dataflow_vuln_scanner: VulnerabilityServiceConfig = Field(
         default_factory=VulnerabilityServiceConfig
@@ -197,6 +198,30 @@ class Config(BaseModel):
 _config: Optional[Config] = None
 
 
+def validate_downstream_service_base_urls(config: Config) -> None:
+    services_to_validate = {
+        "firmware_unpacker": config.services.firmware_unpacker.base_url,
+        "system_analyse": config.services.system_analyse.base_url,
+        "binary_to_source": config.services.binary_to_source.base_url,
+        "entry_analyse": config.services.entry_analyse.base_url,
+        "dataflow_analyse": config.services.dataflow_analyse.base_url,
+        "dataflow_vuln_scanner": config.services.dataflow_vuln_scanner.base_url,
+    }
+    for service_name, raw_url in services_to_validate.items():
+        value = str(raw_url or "").strip()
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(
+                f"下游服务 {service_name} 的 base_url 非法: {value!r}；期望格式为 http(s)://host[:port]"
+            )
+        normalized_path = (parsed.path or "").strip()
+        if normalized_path and normalized_path != "/":
+            raise ValueError(
+                f"下游服务 {service_name} 的 base_url 不允许包含路径: {value!r}；"
+                "请仅配置服务根，不要包含 /api/... 前缀"
+            )
+
+
 def load_config(config_path: Optional[str] = None) -> Config:
     global _config
     if _config is not None:
@@ -215,6 +240,7 @@ def load_config(config_path: Optional[str] = None) -> Config:
 
     with open(config_path, "r", encoding="utf-8") as file:
         _config = Config(**yaml.safe_load(file))
+    validate_downstream_service_base_urls(_config)
     return _config
 
 

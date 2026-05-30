@@ -9,6 +9,8 @@ from app.service.downstream_base import JsonHttpClient
 
 
 class DataflowAnalyseClient(JsonHttpClient):
+    API_PREFIX = "/api/app/dataflow-analyse"
+
     def __init__(self) -> None:
         cfg = get_config().services.dataflow_analyse
         super().__init__(base_url=cfg.base_url, timeout=cfg.timeout)
@@ -34,7 +36,7 @@ class DataflowAnalyseClient(JsonHttpClient):
         entry_reason_source: str | None = None,
     ) -> dict:
         return await self.post(
-            "/tasks",
+            f"{self.API_PREFIX}/tasks",
             json_body={
                 "project_id": project_id,
                 "task_name": task_name,
@@ -58,7 +60,7 @@ class DataflowAnalyseClient(JsonHttpClient):
         )
 
     async def get_task(self, task_id: str) -> dict:
-        return await self.get(f"/tasks/{task_id}")
+        return await self.get(f"{self.API_PREFIX}/tasks/{task_id}")
 
     async def list_tasks(
         self,
@@ -82,16 +84,16 @@ class DataflowAnalyseClient(JsonHttpClient):
             params["parent_task_id"] = parent_task_id
         if parent_stage_item_id:
             params["parent_stage_item_id"] = parent_stage_item_id
-        return await self.get("/tasks", params=params)
+        return await self.get(f"{self.API_PREFIX}/tasks", params=params)
 
     async def cancel_task(self, task_id: str) -> dict:
-        return await self.post(f"/tasks/{task_id}/cancel")
+        return await self.post(f"{self.API_PREFIX}/tasks/{task_id}/cancel")
 
     async def restart_task(self, task_id: str) -> dict:
-        return await self.post(f"/tasks/{task_id}/restart")
+        return await self.post(f"{self.API_PREFIX}/tasks/{task_id}/restart")
 
     async def delete_task(self, task_id: str) -> dict:
-        return await self.delete(f"/tasks/{task_id}")
+        return await self.delete(f"{self.API_PREFIX}/tasks/{task_id}")
 
 
 _client: Optional[DataflowAnalyseClient] = None

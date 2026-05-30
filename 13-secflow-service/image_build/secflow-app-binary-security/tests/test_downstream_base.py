@@ -20,8 +20,31 @@ class _FakeAsyncClient:
             raise outcome
         return outcome
 
+    async def post(self, url, headers=None, json=None):
+        self.calls.append({"url": url, "headers": headers, "json": json})
+        outcome = self._responses.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    async def delete(self, url, headers=None):
+        self.calls.append({"url": url, "headers": headers})
+        outcome = self._responses.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
 
 class JsonHttpClientTests(unittest.TestCase):
+    def test_base_url_rejects_paths(self):
+        with self.assertRaisesRegex(Exception, "base_url 不允许包含路径"):
+            JsonHttpClient(base_url="http://dfa/api/app/dataflow-analyse", timeout=30)
+
+    def test_build_url_normalizes_slashes(self):
+        client = JsonHttpClient(base_url="http://dfa", timeout=30)
+        self.assertEqual("http://dfa/api/app/dataflow-analyse/tasks/dfa-1", client._build_url("/api/app/dataflow-analyse//tasks/dfa-1"))
+        self.assertEqual("http://dfa/api/app/dataflow-analyse/tasks", client._build_url("api/app/dataflow-analyse/tasks"))
+
     def test_get_retries_once_after_stale_connection_rebuild(self):
         request = httpx.Request("GET", "http://dfa/tasks/t1")
         stale_error = httpx.RemoteProtocolError(
