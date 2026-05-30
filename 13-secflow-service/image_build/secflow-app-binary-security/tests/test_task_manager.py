@@ -493,6 +493,26 @@ class _AsyncDataflowAnalyseClientStub:
         return dict(result)
 
 
+class _RecordingJsonHttpClient:
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+
+    async def get(self, path, **kwargs):
+        del kwargs
+        self.calls.append(("GET", path))
+        return {}
+
+    async def post(self, path, **kwargs):
+        del kwargs
+        self.calls.append(("POST", path))
+        return {}
+
+    async def delete(self, path, **kwargs):
+        del kwargs
+        self.calls.append(("DELETE", path))
+        return {}
+
+
 class _AsyncFirmwareUnpackerClientStub:
     def __init__(self, *, listed=None, fetched=None, fail_on_create=False):
         self.listed = listed or {"items": []}
@@ -5005,9 +5025,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("retry_preparing", task.status)
-        self.assertEqual("worker-a", task.dispatcher_instance_id)
-        self.assertIsNotNone(task.dispatch_started_at)
-        self.assertIsNotNone(task.lease_expires_at)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertIsNone(task.dispatch_started_at)
+        self.assertIsNone(task.lease_expires_at)
 
     def test_mark_task_waiting_for_archive_retry_clears_latest_abnormal_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -8065,20 +8085,30 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 name="source",
                 status="failed",
                 task_type=TASK_TYPE_SOURCE,
-                current_stage="entry_analysis",
+                current_stage="system_analysis",
                 firmware_source="project_filesystem",
                 firmware_path="/src",
                 output_root=str(workspace / "output"),
                 workspace_root=str(workspace),
             )
-            run = BinarySecurityStageRun(
-                id="sr1",
-                task_id="s1",
-                project_id="p1",
-                stage_name="entry_analysis",
-                sequence_no=2,
-                status="failed",
-            )
+            runs = [
+                BinarySecurityStageRun(
+                    id="sr-system",
+                    task_id="s1",
+                    project_id="p1",
+                    stage_name="system_analysis",
+                    sequence_no=1,
+                    status="success",
+                ),
+                BinarySecurityStageRun(
+                    id="sr1",
+                    task_id="s1",
+                    project_id="p1",
+                    stage_name="entry_analysis",
+                    sequence_no=2,
+                    status="failed",
+                ),
+            ]
             archive_jobs = [
                 BinarySecurityArchiveJob(
                     id="aj1",
@@ -8100,7 +8130,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                     status="failed",
                 )
             ]
-            db = _ModelAwareDb(tasks=[task], stage_runs=[run], stage_items=stage_items, archive_jobs=archive_jobs)
+            db = _ModelAwareDb(tasks=[task], stage_runs=runs, stage_items=stage_items, archive_jobs=archive_jobs)
 
             self.manager.retry_stage(db, project_id="p1", task_id="s1", stage_name="entry_analysis")
 
@@ -16949,6 +16979,259 @@ def _test_upsert_stage_item_preserves_sync_metadata_on_refresh(self):
 TaskManagerTests.test_apply_child_task_status_change_records_timeline_and_sync_metadata = _test_apply_child_task_status_change_records_timeline_and_sync_metadata
 TaskManagerTests.test_defer_item_after_downstream_transport_error_records_child_sync_failed = _test_defer_item_after_downstream_transport_error_records_child_sync_failed
 TaskManagerTests.test_upsert_stage_item_preserves_sync_metadata_on_refresh = _test_upsert_stage_item_preserves_sync_metadata_on_refresh
+
+
+def _test_stage_item_response_falls_back_to_downstream_payload_status(self):
+    item = BinarySecurityStageItem(
+        id="si-entry",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="module-a",
+        item_name="module-a",
+        status="success",
+        downstream_service="entry_analyse",
+        downstream_task_id="ea-1",
+    )
+    item.result = {
+        "downstream": {
+            "status": "passed",
+            "task_id": "ea-1",
+        }
+    }
+
+    response = self.manager._stage_item_response(item)
+
+    self.assertEqual("passed", response.downstream_status)
+    self.assertEqual("synced", response.sync_status)
+
+
+def _test_task_reconcile_candidate_items_scans_all_stages_with_downstream_refs(self):
+    task = BinarySecurityTask(
+        id="task1",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/tmp",
+    )
+    entry_item = BinarySecurityStageItem(
+        id="si-entry",
+        task_id="task1",
+        project_id="p1",
+        stage_run_id="sr-entry",
+        stage_name="entry_analysis",
+        item_key="entry-a",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    entry_item.result = {
+        "sync_status": "transport_error",
+        "downstream_status_synced_at": _now().isoformat(),
+    }
+    dataflow_item = BinarySecurityStageItem(
+        id="si-df",
+        task_id="task1",
+        project_id="p1",
+        stage_run_id="sr-df",
+        stage_name="dataflow_analysis",
+        item_key="entry-a",
+        status="running",
+        downstream_service="dataflow_analyse",
+        downstream_task_id="dfa-1",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[entry_item, dataflow_item])
+
+    candidate_ids = [item.id for item in self.manager._task_reconcile_candidate_items(db, task)]
+
+    self.assertEqual(["si-entry", "si-df"], candidate_ids)
+
+
+def _test_task_sync_cooldown_elapsed_uses_all_candidate_items(self):
+    task = BinarySecurityTask(
+        id="task1",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/tmp",
+    )
+    old_sync = (_now() - timedelta(minutes=10)).isoformat()
+    fresh_sync = _now().isoformat()
+    entry_item = BinarySecurityStageItem(
+        id="si-entry",
+        task_id="task1",
+        project_id="p1",
+        stage_run_id="sr-entry",
+        stage_name="entry_analysis",
+        item_key="entry-a",
+        status="success",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    entry_item.result = {
+        "sync_status": "synced",
+        "downstream_status_synced_at": old_sync,
+        "downstream_status": "passed",
+    }
+    dataflow_item = BinarySecurityStageItem(
+        id="si-df",
+        task_id="task1",
+        project_id="p1",
+        stage_run_id="sr-df",
+        stage_name="dataflow_analysis",
+        item_key="entry-a",
+        status="running",
+        downstream_service="dataflow_analyse",
+        downstream_task_id="dfa-1",
+    )
+    dataflow_item.result = {
+        "sync_status": "synced",
+        "downstream_status_synced_at": fresh_sync,
+        "downstream_status": "running",
+    }
+    db = _ModelAwareDb(tasks=[task], stage_items=[entry_item, dataflow_item])
+
+    self.assertTrue(self.manager._task_sync_cooldown_elapsed(db, task))
+
+
+def _test_streaming_stage_terminal_observed_keeps_task_running_with_active_items(self):
+    task = BinarySecurityTask(
+        id="task1",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/tmp",
+    )
+    stage_run = BinarySecurityStageRun(
+        id="sr-df",
+        task_id="task1",
+        project_id="p1",
+        stage_name="dataflow_analysis",
+        sequence_no=3,
+        status="running",
+        started_at=_now(),
+    )
+    item = BinarySecurityStageItem(
+        id="si-df",
+        task_id="task1",
+        project_id="p1",
+        stage_run_id="sr-df",
+        stage_name="dataflow_analysis",
+        item_key="entry-a",
+        status="running",
+        downstream_service="dataflow_analyse",
+        downstream_task_id="dfa-1",
+    )
+    event = BinarySecurityStateEvent(
+        id="sev-df",
+        task_id="task1",
+        project_id="p1",
+        stage_name="dataflow_analysis",
+        event_type="stage_worker_terminal_observed",
+        idempotency_key="stage_worker_terminal_observed:task1:dataflow_analysis:x:failed",
+    )
+    event.payload = {
+        "stage_name": "dataflow_analysis",
+        "status": "failed",
+        "summary": {},
+    }
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], state_events=[event], events=[])
+
+    async def _noop_write(*_args, **_kwargs):
+        return None
+
+    original_write = self.manager._write_task_metadata_async
+    self.manager._write_task_metadata_async = _noop_write
+    try:
+        asyncio.run(self.manager._apply_stage_worker_terminal_event_locked(db, event))
+    finally:
+        self.manager._write_task_metadata_async = original_write
+
+    self.assertEqual("running", task.status)
+    self.assertEqual("dataflow_analysis", task.current_stage)
+    self.assertEqual("running", stage_run.status)
+    self.assertTrue(any(row.event_type == "stage_worker_terminal_deferred" for row in db.events))
+
+
+def _test_entry_analyse_client_uses_management_api_prefix(self):
+    from app.service.entry_analyse import EntryAnalyseClient
+
+    client = EntryAnalyseClient.__new__(EntryAnalyseClient)
+    recorder = _RecordingJsonHttpClient()
+    client.get = recorder.get
+    client.post = recorder.post
+    client.delete = recorder.delete
+
+    asyncio.run(client.get_task("eat-1", token="tok"))
+    asyncio.run(client.list_tasks("p1", token="tok"))
+    asyncio.run(client.create_task("p1", "demo", "/tmp", "module", token="tok"))
+    asyncio.run(client.cancel_task("eat-1", token="tok"))
+    asyncio.run(client.restart_task("eat-1", token="tok"))
+    asyncio.run(client.delete_task("eat-1", token="tok"))
+
+    self.assertEqual(
+        [
+            ("GET", "/api/app/entry-analyse/tasks/eat-1"),
+            ("GET", "/api/app/entry-analyse/tasks"),
+            ("POST", "/api/app/entry-analyse/tasks"),
+            ("POST", "/api/app/entry-analyse/tasks/eat-1/cancel"),
+            ("POST", "/api/app/entry-analyse/tasks/eat-1/restart"),
+            ("DELETE", "/api/app/entry-analyse/tasks/eat-1"),
+        ],
+        recorder.calls,
+    )
+
+
+def _test_dataflow_analyse_client_uses_management_api_prefix(self):
+    from app.service.dataflow_analyse import DataflowAnalyseClient
+
+    client = DataflowAnalyseClient.__new__(DataflowAnalyseClient)
+    recorder = _RecordingJsonHttpClient()
+    client.get = recorder.get
+    client.post = recorder.post
+    client.delete = recorder.delete
+
+    asyncio.run(client.get_task("dfa-1"))
+    asyncio.run(client.list_tasks("p1"))
+    asyncio.run(client.create_task("p1", "demo", "/tmp/mod", "/tmp/src", "prompt"))
+    asyncio.run(client.cancel_task("dfa-1"))
+    asyncio.run(client.restart_task("dfa-1"))
+    asyncio.run(client.delete_task("dfa-1"))
+
+    self.assertEqual(
+        [
+            ("GET", "/api/app/dataflow-analyse/tasks/dfa-1"),
+            ("GET", "/api/app/dataflow-analyse/tasks"),
+            ("POST", "/api/app/dataflow-analyse/tasks"),
+            ("POST", "/api/app/dataflow-analyse/tasks/dfa-1/cancel"),
+            ("POST", "/api/app/dataflow-analyse/tasks/dfa-1/restart"),
+            ("DELETE", "/api/app/dataflow-analyse/tasks/dfa-1"),
+        ],
+        recorder.calls,
+    )
+
+
+TaskManagerTests.test_stage_item_response_falls_back_to_downstream_payload_status = _test_stage_item_response_falls_back_to_downstream_payload_status
+TaskManagerTests.test_task_reconcile_candidate_items_scans_all_stages_with_downstream_refs = _test_task_reconcile_candidate_items_scans_all_stages_with_downstream_refs
+TaskManagerTests.test_task_sync_cooldown_elapsed_uses_all_candidate_items = _test_task_sync_cooldown_elapsed_uses_all_candidate_items
+TaskManagerTests.test_streaming_stage_terminal_observed_keeps_task_running_with_active_items = _test_streaming_stage_terminal_observed_keeps_task_running_with_active_items
+TaskManagerTests.test_entry_analyse_client_uses_management_api_prefix = _test_entry_analyse_client_uses_management_api_prefix
+TaskManagerTests.test_dataflow_analyse_client_uses_management_api_prefix = _test_dataflow_analyse_client_uses_management_api_prefix
 
 
 if __name__ == "__main__":
