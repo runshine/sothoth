@@ -19,7 +19,7 @@ spec:
       containers:
         # tcp容器
         - name: redis
-          image: redis:8.4.0-alpine
+          image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/redis:alpine-linuxarm64
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 6379
