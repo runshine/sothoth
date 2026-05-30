@@ -33,7 +33,7 @@ spec:
       containers:
         # udp容器
         - name: openvpn-udp
-          image: kylemanna/openvpn:latest
+          image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/kylemanna/openvpn:latest
           imagePullPolicy: IfNotPresent
           command: [ '/script/entrypoint.sh' ]
           env:
