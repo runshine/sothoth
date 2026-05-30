@@ -2807,15 +2807,34 @@ class TaskManager:
         if not affected_stages:
             affected_stages = await self._prepare_retry_stage_full(db, task, target_stage)
         downstream_refs = [dict(ref) for ref in (plan.get("downstream_refs") or []) if isinstance(ref, dict)]
+        cleared_output_roots = []
+        output_root = Path(str(task.output_root or "")).resolve()
+        for stage_name in affected_stages:
+            for downstream_service in STAGE_OUTPUT_SERVICES.get(stage_name, []):
+                folder = SERVICE_OUTPUT_FOLDERS.get(downstream_service, downstream_service.replace("_", "-"))
+                cleared_output_roots.append(str(output_root / folder))
 
+        self._record_event(
+            db,
+            task,
+            "stage_retry_full_cleanup_started",
+            f"阶段完全重试开始清理: {target_stage}",
+            payload={
+                "target_stage": target_stage,
+                "affected_stages": list(affected_stages),
+                "old_retry_mode": task.execution_mode,
+                "new_retry_mode": TASK_ACTION_RETRY_STAGE_FULL,
+            },
+            operation_id=operation.id,
+        )
         self._invalidate_task_execution(task)
         if downstream_refs:
             await self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token())
         self._clear_stage_outputs_from(task, target_stage, mark_stale=False)
-        self._delete_archive_children_for_stages(db, task, affected_stages)
-        self._delete_stage_items_for_stages(db, task.id, affected_stages)
-        self._delete_state_event_rows_for_stages(db, task.id, affected_stages)
-        self._delete_timeline_rows_for_stages(db, task.id, affected_stages)
+        deleted_archive_job_count = self._delete_archive_children_for_stages(db, task, affected_stages)
+        deleted_stage_item_count = self._delete_stage_items_for_stages(db, task.id, affected_stages)
+        deleted_state_event_count = self._delete_state_event_rows_for_stages(db, task.id, affected_stages)
+        deleted_timeline_event_count = self._delete_timeline_rows_for_stages(db, task.id, affected_stages)
         for stage_name in affected_stages:
             stage_run = db.query(BinarySecurityStageRun).filter(
                 BinarySecurityStageRun.task_id == task.id,
@@ -2838,7 +2857,25 @@ class TaskManager:
             "target_stage": target_stage,
             "affected_stages": list(affected_stages),
             "downstream_ref_count": len(downstream_refs),
+            "deleted_stage_item_count": deleted_stage_item_count,
+            "deleted_archive_job_count": deleted_archive_job_count,
+            "deleted_state_event_count": deleted_state_event_count,
+            "deleted_timeline_event_count": deleted_timeline_event_count,
+            "cleared_output_roots": cleared_output_roots,
         }
+        self._record_event(
+            db,
+            task,
+            "stage_retry_full_cleanup_finished",
+            f"阶段完全重试清理完成: {target_stage}",
+            stage_name=target_stage,
+            payload={
+                **cleanup_summary,
+                "old_retry_mode": task.execution_mode,
+                "new_retry_mode": TASK_ACTION_RETRY_STAGE_FULL,
+            },
+            operation_id=operation.id,
+        )
         operation.result_payload = {
             **dict(operation.result_payload or {}),
             "cleanup_plan": {
@@ -2902,6 +2939,9 @@ class TaskManager:
         supported, reason = self._stage_retry_support(db, task, stage_name)
         if not supported:
             raise ValidationError(reason or f"阶段 {stage_name} 不支持完全重试")
+        task.execution_mode = TASK_ACTION_RETRY_STAGE_FULL
+        task.target_stage_name = stage_name
+        task.current_stage = stage_name
         self._set_retry_plan(
             task,
             {
@@ -4420,6 +4460,17 @@ class TaskManager:
         if not normalized:
             return 0
         self._clear_stage_output_artifacts(task, normalized)
+        if hasattr(db, "archive_jobs") and isinstance(getattr(db, "archive_jobs"), list):
+            allowed_stage_names = set(normalized)
+            matching = [
+                row
+                for row in db.archive_jobs
+                if str(getattr(row, "task_id", "") or "").strip() == task.id
+                and str(getattr(row, "stage_name", "") or "").strip() in allowed_stage_names
+            ]
+            if matching:
+                db.archive_jobs = [row for row in db.archive_jobs if row not in matching]
+                return len(matching)
         return self._clear_archive_jobs_for_stages(db, task.id, normalized)
 
     def _archive_retry_blocked_reason(self, db: Session, task: BinarySecurityTask) -> str | None:
@@ -6638,6 +6689,13 @@ class TaskManager:
                 payload={"status": status, "state_event_id": event.id},
             )
         if status == "failed":
+            if bool(payload.get("stage_retry_mode")) or bool(payload.get("task_retry_mode")):
+                self._clear_retry_execution_context(
+                    db,
+                    task,
+                    stage_name=stage_name,
+                    payload={"status": status, "state_event_id": event.id},
+                )
             task.status = "failed"
             task.last_error = (
                 summary.get("failure_message")
@@ -6670,13 +6728,12 @@ class TaskManager:
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
             return
         if bool(payload.get("stage_retry_mode")) or bool(payload.get("task_retry_mode")):
-            task.execution_mode = None
-            task.target_stage_name = None
-            task_summary = dict(task.summary or {})
-            task_summary.pop("stage_retry_context", None)
-            task_summary.pop("task_retry_context", None)
-            task_summary.pop("retry_plan", None)
-            task.summary = task_summary
+            self._clear_retry_execution_context(
+                db,
+                task,
+                stage_name=stage_name,
+                payload={"status": status, "state_event_id": event.id},
+            )
         next_stage = self._next_incomplete_stage(db, task)
         if (
             task.status in {"running", "dispatching"}
@@ -7673,13 +7730,16 @@ class TaskManager:
                 db.commit()
                 return
             if stage_retry_mode or task_retry_mode:
-                task.execution_mode = None
-                task.target_stage_name = None
-                summary = dict(task.summary or {})
-                summary.pop("stage_retry_context", None)
-                summary.pop("task_retry_context", None)
-                summary.pop("retry_plan", None)
-                task.summary = summary
+                self._clear_retry_execution_context(
+                    db,
+                    task,
+                    stage_name=target_stage_name or task.current_stage,
+                    payload={
+                        "status": task.status,
+                        "stage_retry_mode": bool(stage_retry_mode),
+                        "task_retry_mode": bool(task_retry_mode),
+                    },
+                )
             next_stage = self._next_incomplete_stage(db, task)
             if task.status in {"running", "dispatching"} and next_stage:
                 task.status = "pending"
@@ -9287,6 +9347,17 @@ class TaskManager:
         normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
         if not normalized:
             return 0
+        if hasattr(db, "stage_items") and isinstance(getattr(db, "stage_items"), list):
+            allowed_stage_names = set(normalized)
+            matching = [
+                row
+                for row in db.stage_items
+                if str(getattr(row, "task_id", "") or "").strip() == task_id
+                and str(getattr(row, "stage_name", "") or "").strip() in allowed_stage_names
+            ]
+            if matching:
+                db.stage_items = [row for row in db.stage_items if row not in matching]
+                return len(matching)
         deleted = 0
         while True:
             item_ids = [
@@ -12253,6 +12324,32 @@ class TaskManager:
             summary.pop("retry_plan", None)
         task.summary = summary
 
+    def _clear_retry_execution_context(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_name: str | None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        had_context = bool(task.execution_mode or task.target_stage_name or self._retry_plan(task))
+        task.execution_mode = None
+        task.target_stage_name = None
+        task_summary = dict(task.summary or {})
+        task_summary.pop("stage_retry_context", None)
+        task_summary.pop("task_retry_context", None)
+        task_summary.pop("retry_plan", None)
+        task.summary = task_summary
+        if had_context:
+            self._record_event(
+                db,
+                task,
+                "stage_retry_context_cleared",
+                f"阶段重试上下文已清理: {stage_name or task.current_stage or '-'}",
+                stage_name=stage_name,
+                payload=dict(payload or {}),
+            )
+
     def _normalize_item_status(self, status: str | None) -> str:
         return (self._normalize_downstream_status(status) or str(status or "").strip().lower() or "unknown")
 
@@ -12630,9 +12727,31 @@ class TaskManager:
                 **stage_run.counts,
             },
         )
-        if status in {"running", "pending", "queued"}:
+        items_present = bool(items)
+        active_items_present = any(str(item.status or "").strip() in {"running", "dispatching"} for item in items)
+        should_start = False
+        if status in {"running", "dispatching"}:
+            should_start = items_present
+        elif status in {"pending", "queued"}:
+            should_start = items_present
+        if status in {"running", "pending", "queued", "dispatching"}:
             stage_run.finished_at = None
-            stage_run.started_at = stage_run.started_at or _now()
+            if should_start:
+                stage_run.started_at = stage_run.started_at or _now()
+            elif self._is_streaming_tail_stage(task, stage_name) and stage_run.started_at is None:
+                self._record_event(
+                    db,
+                    task,
+                    "streaming_tail_stage_start_suppressed",
+                    f"流式尾段尚无真实子项，保留未启动态: {stage_name}",
+                    stage_name=stage_name,
+                    payload={
+                        "stage_name": stage_name,
+                        "status": status,
+                        "items_present": items_present,
+                        "active_items_present": active_items_present,
+                    },
+                )
         else:
             stage_run.finished_at = stage_run.finished_at or _now()
         if stage_name == "firmware_unpack":
@@ -12888,19 +13007,19 @@ class TaskManager:
         stage_retry_mode = task.execution_mode in {"stage_retry", "stage_retry_failed_items", "stage_retry_full"} and bool(task.target_stage_name)
         task_retry_mode = task.execution_mode in {"task_retry", "task_retry_failed_items"} and bool(task.target_stage_name)
         if stage_retry_mode:
-            task.execution_mode = None
-            task.target_stage_name = None
-            summary = dict(task.summary or {})
-            summary.pop("stage_retry_context", None)
-            summary.pop("retry_plan", None)
-            task.summary = summary
+            self._clear_retry_execution_context(
+                db,
+                task,
+                stage_name=task.current_stage,
+                payload={"status": task.status, "stage_retry_mode": True},
+            )
         if task_retry_mode:
-            task.execution_mode = None
-            task.target_stage_name = None
-            summary = dict(task.summary or {})
-            summary.pop("task_retry_context", None)
-            summary.pop("retry_plan", None)
-            task.summary = summary
+            self._clear_retry_execution_context(
+                db,
+                task,
+                stage_name=task.current_stage,
+                payload={"status": task.status, "task_retry_mode": True},
+            )
         failed_stage_run = next(
             (
                 run

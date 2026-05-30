@@ -8777,7 +8777,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 BinarySecurityEvent(id="ev-df", task_id="task1", project_id="p1", stage_name="dataflow_analysis", event_type="stage_failed"),
                 BinarySecurityEvent(id="ev-vuln", task_id="task1", project_id="p1", stage_name="vuln_scan", event_type="archive_finished"),
             ]
-            db = _ModelAwareDb(
+            db = _AppendingModelAwareDb(
                 tasks=[task],
                 operations=[operation],
                 stage_runs=stage_runs,
@@ -8802,10 +8802,24 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([], db.stage_items)
             self.assertEqual([], db.archive_jobs)
             self.assertEqual([], db.state_events)
-            self.assertEqual([], db.events)
             self.assertEqual([], task.summary.get("entry_results") or [])
             self.assertEqual([], task.summary.get("dataflow_results") or [])
             self.assertEqual([], task.summary.get("vuln_results") or [])
+            self.assertEqual(3, cleanup_summary["deleted_stage_item_count"])
+            self.assertEqual(3, cleanup_summary["deleted_archive_job_count"])
+            self.assertEqual(3, cleanup_summary["deleted_state_event_count"])
+            self.assertEqual(3, cleanup_summary["deleted_timeline_event_count"])
+            self.assertEqual(
+                [],
+                [
+                    row
+                    for row in db.events
+                    if row.stage_name in {"entry_analysis", "dataflow_analysis", "vuln_scan"}
+                    and row.event_type not in {"stage_retry_full_cleanup_finished"}
+                ],
+            )
+            self.assertIn("stage_retry_full_cleanup_started", [row.event_type for row in db.events])
+            self.assertIn("stage_retry_full_cleanup_finished", [row.event_type for row in db.events])
 
     def test_run_task_operation_steps_retry_stage_full_executes_cleanup_before_requeue(self):
         task = BinarySecurityTask(
@@ -9161,6 +9175,141 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("failed", task.stage_summary["dataflow_analysis"]["status"])
         self.assertEqual("dfa failed", task.stage_summary["dataflow_analysis"]["last_error"])
+
+    def test_refresh_stage_run_from_items_keeps_empty_streaming_tail_pending_without_started_at(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        run = BinarySecurityStageRun(
+            id="sr-df",
+            task_id="task1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            sequence_no=2,
+            status="pending",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[])
+
+        self.manager._refresh_stage_run_from_items(db, task, "dataflow_analysis")
+
+        self.assertEqual("pending", run.status)
+        self.assertIsNone(run.started_at)
+        self.assertIn("streaming_tail_stage_start_suppressed", [row.event_type for row in db.events])
+
+    def test_refresh_stage_run_from_items_sets_started_at_when_streaming_tail_has_pending_items(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        run = BinarySecurityStageRun(
+            id="sr-df",
+            task_id="task1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            sequence_no=2,
+            status="pending",
+        )
+        item = BinarySecurityStageItem(
+            id="si-df",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr-df",
+            stage_name="dataflow_analysis",
+            item_key="entry-a",
+            parent_key="mod-a",
+            status="pending",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa-1",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item])
+
+        self.manager._refresh_stage_run_from_items(db, task, "dataflow_analysis")
+
+        self.assertEqual("pending", run.status)
+        self.assertIsNotNone(run.started_at)
+
+    def test_stage_retry_full_terminal_failure_clears_retry_context(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+            execution_mode="stage_retry_full",
+            target_stage_name="entry_analysis",
+        )
+        task.summary = {
+            "retry_plan": {"target_stage": "entry_analysis", "mode": "retry_stage_full"},
+            "stage_retry_context": {"entry_analysis": {"a": 1}},
+        }
+        run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+            started_at=_now(),
+        )
+        event = BinarySecurityStateEvent(
+            id="sev-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            event_type="stage_worker_terminal_observed",
+            idempotency_key="stage_worker_terminal_observed:task1:entry_analysis:x:failed",
+        )
+        event.payload = {
+            "stage_name": "entry_analysis",
+            "status": "failed",
+            "stage_retry_mode": True,
+            "target_stage_name": "entry_analysis",
+            "summary": {"error": "boom"},
+        }
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], state_events=[event], events=[])
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        original_write = self.manager._write_task_metadata_async
+        self.manager._write_task_metadata_async = _noop_write
+        try:
+            asyncio.run(self.manager._apply_stage_worker_terminal_event_locked(db, event))
+        finally:
+            self.manager._write_task_metadata_async = original_write
+
+        self.assertEqual("failed", task.status)
+        self.assertIsNone(task.execution_mode)
+        self.assertIsNone(task.target_stage_name)
+        self.assertNotIn("retry_plan", task.summary)
+        self.assertNotIn("stage_retry_context", task.summary)
+        self.assertIn("stage_retry_context_cleared", [row.event_type for row in db.events])
 
     def test_refresh_task_status_after_stage_retry_requeues_downstream_stage(self):
         task = BinarySecurityTask(
@@ -13284,6 +13433,10 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("retry_stage_full", operation.operation_type)
         self.assertEqual("queued", operation.status)
         self.assertEqual(operation.id, task.current_operation_id)
+        self.assertEqual("retry_stage_full", task.execution_mode)
+        self.assertEqual("entry_analysis", task.target_stage_name)
+        self.assertEqual("entry_analysis", task.current_stage)
+        self.assertEqual("entry_analysis", task.summary["retry_plan"]["target_stage"])
 
     def test_task_retry_support_targets_first_stage_for_full_restart(self):
         task = BinarySecurityTask(
