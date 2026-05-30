@@ -1495,7 +1495,38 @@ class TaskManager:
             )
 
             stage_started = time.perf_counter()
-            items = [self._task_list_response(task, queue_info=queue_info) for task in tasks]
+            stage_runs_by_task: dict[str, list[BinarySecurityStageRun]] = {}
+            stage_items_by_task: dict[str, list[BinarySecurityStageItem]] = {}
+            task_ids = [str(task.id) for task in tasks if getattr(task, "id", None)]
+            if task_ids:
+                stage_runs = (
+                    db.query(BinarySecurityStageRun)
+                    .filter(BinarySecurityStageRun.task_id.in_(task_ids))
+                    .all()
+                )
+                stage_items = (
+                    db.query(BinarySecurityStageItem)
+                    .filter(BinarySecurityStageItem.task_id.in_(task_ids))
+                    .all()
+                )
+                for run in stage_runs:
+                    task_id = str(getattr(run, "task_id", "") or "")
+                    if task_id:
+                        stage_runs_by_task.setdefault(task_id, []).append(run)
+                for item in stage_items:
+                    task_id = str(getattr(item, "task_id", "") or "")
+                    if task_id:
+                        stage_items_by_task.setdefault(task_id, []).append(item)
+            items = [
+                self._task_list_response(
+                    db,
+                    task,
+                    queue_info=queue_info,
+                    stage_runs=stage_runs_by_task.get(str(task.id), []),
+                    stage_items=stage_items_by_task.get(str(task.id), []),
+                )
+                for task in tasks
+            ]
             observe_task_list_query_stage(
                 stage="serialize_items",
                 task_type=metrics_task_type,
@@ -11127,12 +11158,26 @@ class TaskManager:
 
         return list(aggregates.values())
 
-    def _task_list_response(self, task: BinarySecurityTask, *, queue_info: dict[str, Any] | None = None) -> BinarySecurityTaskResponse:
+    def _task_list_response(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        queue_info: dict[str, Any] | None = None,
+        stage_runs: list[BinarySecurityStageRun] | None = None,
+        stage_items: list[BinarySecurityStageItem] | None = None,
+    ) -> BinarySecurityTaskResponse:
         metrics = task.metrics or {}
         queue_info = queue_info or {"pending_positions": {}}
         queue_position = queue_info.get("pending_positions", {}).get(task.id)
         stage_sequence = self._stage_sequence_for_task(task)
-        stage_summaries = self._build_stage_summaries_from_snapshot(task, stage_sequence)
+        stage_summaries = self._build_task_list_stage_summaries(
+            db,
+            task,
+            stage_sequence,
+            stage_runs=stage_runs,
+            stage_items=stage_items,
+        )
         abnormal_reason = None
         if isinstance(task.latest_abnormal_reason, dict):
             try:
@@ -11185,6 +11230,27 @@ class TaskManager:
             stage_summaries=stage_summaries,
             manual_operation_state=manual_operation_state,
         )
+
+    def _build_task_list_stage_summaries(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_sequence: list[str],
+        *,
+        stage_runs: list[BinarySecurityStageRun] | None = None,
+        stage_items: list[BinarySecurityStageItem] | None = None,
+    ) -> list[BinarySecurityStageSummary]:
+        resolved_stage_runs = list(stage_runs or [])
+        resolved_stage_items = list(stage_items or [])
+        if resolved_stage_runs or resolved_stage_items:
+            return self._build_stage_summaries(
+                db,
+                task,
+                stage_sequence,
+                resolved_stage_runs,
+                resolved_stage_items,
+            )
+        return self._build_stage_summaries_from_snapshot(task, stage_sequence)
 
     def _build_stage_summaries_from_snapshot(
         self,

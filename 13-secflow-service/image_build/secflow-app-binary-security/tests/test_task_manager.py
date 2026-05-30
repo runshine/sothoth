@@ -12014,6 +12014,67 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(0, snapshot.get("failed_items"))
             self.assertIsNone(snapshot.get("last_error"))
 
+    def test_list_tasks_prefers_authoritative_stage_state_over_stale_snapshot(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="iSulad",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/output",
+            workspace_root="/workspace",
+        )
+        task.policy = {}
+        task.stage_summary = {
+            "system_analysis": {
+                "sequence_no": 1,
+                "status": "pending",
+                "total_items": 0,
+                "success_items": 0,
+                "failed_items": 0,
+            }
+        }
+        system_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="success",
+            started_at=datetime(2026, 5, 29, 22, 39, 20),
+            finished_at=datetime(2026, 5, 29, 23, 47, 6),
+        )
+        system_item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="system_analysis",
+            item_key="source_project",
+            item_name="source_project",
+            status="success",
+            downstream_service="system_analyse",
+            downstream_task_id="sat1",
+        )
+        system_item.result = {
+            "sync_observation": {
+                "downstream_status": "passed",
+            }
+        }
+        db = _ModelAwareDb(tasks=[task], stage_runs=[system_run], stage_items=[system_item])
+
+        response = self.manager.list_tasks(db, project_id="p1")
+
+        summary_by_stage = {summary.stage_name: summary for summary in response.items[0].stage_summaries}
+        self.assertEqual("success", summary_by_stage["system_analysis"].status)
+        self.assertEqual(1, summary_by_stage["system_analysis"].total_items)
+        self.assertEqual(1, summary_by_stage["system_analysis"].success_items)
+        self.assertEqual("2026-05-29T22:39:20", summary_by_stage["system_analysis"].started_at.isoformat())
+        self.assertEqual("2026-05-29T23:47:06", summary_by_stage["system_analysis"].finished_at.isoformat())
+
     def test_refresh_system_analysis_stage_preserves_failed_item_reason_when_no_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
