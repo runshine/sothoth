@@ -2658,8 +2658,44 @@ class TaskManager:
             raise ValidationError(f"无效阶段: {target_stage}")
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
-        self._invalidate_task_execution(task)
+        return affected_stages
+
+    async def _operation_collect_retry_stage_full_plan(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> dict[str, Any]:
+        target_stage = str(operation.target_stage or "").strip()
+        affected_stages = await self._prepare_retry_stage_full(db, task, target_stage)
         downstream_refs = self._retry_downstream_refs_for_stages(db, task, affected_stages)
+        plan = {
+            "operation_type": operation.operation_type,
+            "target_stage": target_stage,
+            "affected_stages": list(affected_stages),
+            "downstream_refs": [dict(ref) for ref in downstream_refs],
+            "downstream_ref_count": len(downstream_refs),
+        }
+        operation.result_payload = {
+            **dict(operation.result_payload or {}),
+            "cleanup_plan": plan,
+        }
+        return plan
+
+    async def _operation_execute_retry_stage_full_cleanup(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> dict[str, Any]:
+        plan = dict(dict(operation.result_payload or {}).get("cleanup_plan") or {})
+        target_stage = str(plan.get("target_stage") or operation.target_stage or "").strip()
+        affected_stages = [str(stage).strip() for stage in (plan.get("affected_stages") or []) if str(stage).strip()]
+        if not affected_stages:
+            affected_stages = await self._prepare_retry_stage_full(db, task, target_stage)
+        downstream_refs = [dict(ref) for ref in (plan.get("downstream_refs") or []) if isinstance(ref, dict)]
+
+        self._invalidate_task_execution(task)
         if downstream_refs:
             await self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token())
         self._clear_stage_outputs_from(task, target_stage, mark_stale=False)
@@ -2674,16 +2710,33 @@ class TaskManager:
             ).first()
             if stage_run:
                 self._reset_stage_run_for_retry(task, stage_run, increment_retry=(stage_name == target_stage))
-        plan = self._retry_plan(task)
+        retry_plan = self._retry_plan(task)
         self._set_retry_plan(
             task,
             {
-                **plan,
-                "cleared_business_stages": affected_stages,
-                "cleared_archive_stages": affected_stages,
+                **retry_plan,
+                "target_stage": target_stage,
+                "mode": TASK_ACTION_RETRY_STAGE_FULL,
+                "cleared_business_stages": list(affected_stages),
+                "cleared_archive_stages": list(affected_stages),
             },
         )
-        return affected_stages
+        cleanup_summary = {
+            "target_stage": target_stage,
+            "affected_stages": list(affected_stages),
+            "downstream_ref_count": len(downstream_refs),
+        }
+        operation.result_payload = {
+            **dict(operation.result_payload or {}),
+            "cleanup_plan": {
+                **plan,
+                "target_stage": target_stage,
+                "affected_stages": list(affected_stages),
+                "downstream_refs": downstream_refs,
+            },
+            "cleanup_result": cleanup_summary,
+        }
+        return cleanup_summary
 
     def retry_stage(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
         self.retry_stage_full(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
@@ -5059,91 +5112,92 @@ class TaskManager:
         task: BinarySecurityTask,
         operation: BinarySecurityTaskOperation,
     ) -> None:
-        prepare_step = TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN
         resume_step = self._operation_resume_step(operation)
-        if resume_step == prepare_step:
-            self._record_operation_step_started(
-                db,
-                task,
-                operation,
-                step_name=prepare_step,
-                message=f"后台操作开始执行准备步骤: {operation.operation_type}",
-                stage_name=operation.target_stage,
-                payload={"operation_type": operation.operation_type},
-            )
-            db.commit()
-            try:
-                if operation.operation_type == TASK_ACTION_CONTINUE:
-                    await self._prepare_continue_task(db, task, str(operation.target_stage or "").strip())
-                elif operation.operation_type == TASK_ACTION_RETRY:
-                    await self._prepare_retry_task(db, task)
-                elif operation.operation_type == TASK_ACTION_RETRY_FAILED_ITEMS:
-                    await self._prepare_retry_failed_items(db, task, str(operation.target_stage or "").strip())
-                elif operation.operation_type == TASK_ACTION_RETRY_STAGE_FAILED_ITEMS:
-                    await self._prepare_retry_failed_items(db, task, str(operation.target_stage or "").strip())
-                elif operation.operation_type == TASK_ACTION_RETRY_STAGE_FULL:
-                    await self._prepare_retry_stage_full(db, task, str(operation.target_stage or "").strip())
-                elif operation.operation_type == TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS:
-                    await self._prepare_archive_retry_failed_items(db, task, str(operation.target_stage or "").strip())
-                elif operation.operation_type == TASK_ACTION_RETRY_ARCHIVE_FULL:
-                    await self._prepare_archive_retry_full(db, task, str(operation.target_stage or "").strip())
-                elif operation.operation_type == TASK_ACTION_CANCEL:
-                    await self._prepare_cancel_task(db, task)
-                    self._record_operation_step_finished(
-                        db,
-                        task,
-                        operation,
-                        step_name=prepare_step,
-                        message=f"后台操作准备步骤已完成: {operation.operation_type}",
-                        stage_name=operation.target_stage,
-                        next_step=TASK_OPERATION_STEP_SUCCEEDED,
-                    )
-                    operation.current_step = TASK_OPERATION_STEP_SUCCEEDED
-                    db.commit()
-                    return
-                elif operation.operation_type == TASK_ACTION_DELETE:
-                    await self._prepare_delete_task(db, task)
-                    self._record_operation_step_finished(
-                        db,
-                        task,
-                        operation,
-                        step_name=prepare_step,
-                        message=f"后台操作准备步骤已完成: {operation.operation_type}",
-                        stage_name=operation.target_stage,
-                        next_step=TASK_OPERATION_STEP_SUCCEEDED,
-                    )
-                    operation.current_step = TASK_OPERATION_STEP_SUCCEEDED
-                    db.commit()
-                    return
-                else:
-                    raise ValidationError(f"未知操作类型: {operation.operation_type}")
-            except Exception as exc:
-                self._record_operation_step_failed(
+        if operation.operation_type == TASK_ACTION_RETRY_STAGE_FULL:
+            resume_step = await self._run_retry_stage_full_operation_steps(db, task, operation, resume_step)
+        else:
+            prepare_step = TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN
+            if resume_step == prepare_step:
+                self._record_operation_step_started(
                     db,
                     task,
                     operation,
                     step_name=prepare_step,
-                    error=exc,
+                    message=f"后台操作开始执行准备步骤: {operation.operation_type}",
                     stage_name=operation.target_stage,
+                    payload={"operation_type": operation.operation_type},
                 )
                 db.commit()
-                raise
+                try:
+                    if operation.operation_type == TASK_ACTION_CONTINUE:
+                        await self._prepare_continue_task(db, task, str(operation.target_stage or "").strip())
+                    elif operation.operation_type == TASK_ACTION_RETRY:
+                        await self._prepare_retry_task(db, task)
+                    elif operation.operation_type == TASK_ACTION_RETRY_FAILED_ITEMS:
+                        await self._prepare_retry_failed_items(db, task, str(operation.target_stage or "").strip())
+                    elif operation.operation_type == TASK_ACTION_RETRY_STAGE_FAILED_ITEMS:
+                        await self._prepare_retry_failed_items(db, task, str(operation.target_stage or "").strip())
+                    elif operation.operation_type == TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS:
+                        await self._prepare_archive_retry_failed_items(db, task, str(operation.target_stage or "").strip())
+                    elif operation.operation_type == TASK_ACTION_RETRY_ARCHIVE_FULL:
+                        await self._prepare_archive_retry_full(db, task, str(operation.target_stage or "").strip())
+                    elif operation.operation_type == TASK_ACTION_CANCEL:
+                        await self._prepare_cancel_task(db, task)
+                        self._record_operation_step_finished(
+                            db,
+                            task,
+                            operation,
+                            step_name=prepare_step,
+                            message=f"后台操作准备步骤已完成: {operation.operation_type}",
+                            stage_name=operation.target_stage,
+                            next_step=TASK_OPERATION_STEP_SUCCEEDED,
+                        )
+                        operation.current_step = TASK_OPERATION_STEP_SUCCEEDED
+                        db.commit()
+                        return
+                    elif operation.operation_type == TASK_ACTION_DELETE:
+                        await self._prepare_delete_task(db, task)
+                        self._record_operation_step_finished(
+                            db,
+                            task,
+                            operation,
+                            step_name=prepare_step,
+                            message=f"后台操作准备步骤已完成: {operation.operation_type}",
+                            stage_name=operation.target_stage,
+                            next_step=TASK_OPERATION_STEP_SUCCEEDED,
+                        )
+                        operation.current_step = TASK_OPERATION_STEP_SUCCEEDED
+                        db.commit()
+                        return
+                    else:
+                        raise ValidationError(f"未知操作类型: {operation.operation_type}")
+                except Exception as exc:
+                    self._record_operation_step_failed(
+                        db,
+                        task,
+                        operation,
+                        step_name=prepare_step,
+                        error=exc,
+                        stage_name=operation.target_stage,
+                    )
+                    db.commit()
+                    raise
 
-            requeue_required = operation.operation_type not in {TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS, TASK_ACTION_RETRY_ARCHIVE_FULL}
-            next_step = TASK_OPERATION_STEP_REQUEUE_TASK if requeue_required else TASK_OPERATION_STEP_SUCCEEDED
-            self._record_operation_step_finished(
-                db,
-                task,
-                operation,
-                step_name=prepare_step,
-                message=f"后台操作准备步骤已完成: {operation.operation_type}",
-                stage_name=operation.target_stage,
-                next_step=next_step,
-            )
-            if not requeue_required:
-                db.commit()
-                return
-            resume_step = TASK_OPERATION_STEP_REQUEUE_TASK
+                requeue_required = operation.operation_type not in {TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS, TASK_ACTION_RETRY_ARCHIVE_FULL}
+                next_step = TASK_OPERATION_STEP_REQUEUE_TASK if requeue_required else TASK_OPERATION_STEP_SUCCEEDED
+                self._record_operation_step_finished(
+                    db,
+                    task,
+                    operation,
+                    step_name=prepare_step,
+                    message=f"后台操作准备步骤已完成: {operation.operation_type}",
+                    stage_name=operation.target_stage,
+                    next_step=next_step,
+                )
+                if not requeue_required:
+                    db.commit()
+                    return
+                resume_step = TASK_OPERATION_STEP_REQUEUE_TASK
 
         if resume_step != TASK_OPERATION_STEP_REQUEUE_TASK:
             return
@@ -5194,6 +5248,69 @@ class TaskManager:
             next_step=TASK_OPERATION_STEP_SUCCEEDED,
         )
         db.commit()
+
+    async def _run_retry_stage_full_operation_steps(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+        resume_step: str,
+    ) -> str:
+        step_flow = (
+            (
+                TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN,
+                "后台操作开始收集清理计划",
+                "后台操作清理计划收集完成",
+                self._operation_collect_retry_stage_full_plan,
+                TASK_OPERATION_STEP_CANCEL_DOWNSTREAM,
+            ),
+            (
+                TASK_OPERATION_STEP_CANCEL_DOWNSTREAM,
+                "后台操作开始清理下游子任务",
+                "后台操作下游子任务清理完成",
+                self._operation_execute_retry_stage_full_cleanup,
+                TASK_OPERATION_STEP_REQUEUE_TASK,
+            ),
+        )
+        for step_name, start_message, finish_message, handler, next_step in step_flow:
+            if resume_step != step_name:
+                continue
+            self._record_operation_step_started(
+                db,
+                task,
+                operation,
+                step_name=step_name,
+                message=f"{start_message}: {operation.operation_type}",
+                stage_name=operation.target_stage,
+                payload={"operation_type": operation.operation_type},
+            )
+            db.commit()
+            try:
+                payload = await handler(db, task, operation)
+            except Exception as exc:
+                self._record_operation_step_failed(
+                    db,
+                    task,
+                    operation,
+                    step_name=step_name,
+                    error=exc,
+                    stage_name=operation.target_stage,
+                )
+                db.commit()
+                raise
+            self._record_operation_step_finished(
+                db,
+                task,
+                operation,
+                step_name=step_name,
+                message=f"{finish_message}: {operation.operation_type}",
+                stage_name=operation.target_stage,
+                payload=payload,
+                next_step=next_step,
+            )
+            db.commit()
+            resume_step = next_step
+        return resume_step
 
     async def _dispatch_loop(self) -> None:
         session_factory = get_session_factory()

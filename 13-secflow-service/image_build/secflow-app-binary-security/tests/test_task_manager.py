@@ -8695,7 +8695,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([], task.summary.get("vuln_results"))
             self.assertEqual(0, int((task.metrics or {}).get("vuln_result_count", 0)))
 
-    def test_prepare_retry_stage_full_clears_downstream_stage_events(self):
+    def test_operation_execute_retry_stage_full_cleanup_clears_downstream_stage_events(self):
         with tempfile.TemporaryDirectory() as tmp:
             task = BinarySecurityTask(
                 id="task1",
@@ -8709,10 +8709,25 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 output_root=str(Path(tmp) / "output"),
                 workspace_root=tmp,
             )
+            operation = BinarySecurityTaskOperation(
+                id="op1",
+                task_id="task1",
+                project_id="p1",
+                operation_type="retry_stage_full",
+                target_stage="entry_analysis",
+                status="running",
+            )
             task.summary = {
                 "entry_results": [{"entry_key": "entry-a"}],
                 "dataflow_results": [{"entry_key": "entry-a"}],
                 "vuln_results": [{"entry_key": "entry-a"}],
+            }
+            operation.result_payload = {
+                "cleanup_plan": {
+                    "target_stage": "entry_analysis",
+                    "affected_stages": ["entry_analysis", "dataflow_analysis", "vuln_scan"],
+                    "downstream_refs": [],
+                }
             }
             stage_runs = [
                 BinarySecurityStageRun(id="sr-entry", task_id="task1", project_id="p1", stage_name="entry_analysis", sequence_no=2, status="partial_success"),
@@ -8741,6 +8756,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ]
             db = _ModelAwareDb(
                 tasks=[task],
+                operations=[operation],
                 stage_runs=stage_runs,
                 stage_items=stage_items,
                 archive_jobs=archive_jobs,
@@ -8755,11 +8771,11 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             original_cleanup = self.manager._cleanup_downstream_refs
             try:
                 self.manager._cleanup_downstream_refs = _noop_cleanup
-                affected = asyncio.run(self.manager._prepare_retry_stage_full(db, task, "entry_analysis"))
+                cleanup_summary = asyncio.run(self.manager._operation_execute_retry_stage_full_cleanup(db, task, operation))
             finally:
                 self.manager._cleanup_downstream_refs = original_cleanup
 
-            self.assertEqual(["entry_analysis", "dataflow_analysis", "vuln_scan"], affected)
+            self.assertEqual(["entry_analysis", "dataflow_analysis", "vuln_scan"], cleanup_summary["affected_stages"])
             self.assertEqual([], db.stage_items)
             self.assertEqual([], db.archive_jobs)
             self.assertEqual([], db.state_events)
@@ -8767,6 +8783,79 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([], task.summary.get("entry_results") or [])
             self.assertEqual([], task.summary.get("dataflow_results") or [])
             self.assertEqual([], task.summary.get("vuln_results") or [])
+
+    def test_run_task_operation_steps_retry_stage_full_executes_cleanup_before_requeue(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            current_stage="dataflow_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            current_operation_id="op1",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="task1",
+            project_id="p1",
+            operation_type="retry_stage_full",
+            target_stage="entry_analysis",
+            status="running",
+            current_step="collect_cleanup_plan",
+        )
+        operation.resume_cursor = {"current_step": "collect_cleanup_plan"}
+        db = _AppendingModelAwareDb(tasks=[task], operations=[operation])
+        calls = []
+
+        async def fake_collect(db_arg, task_arg, operation_arg):
+            del db_arg, operation_arg
+            calls.append(("collect", task_arg.id))
+            return {
+                "target_stage": "entry_analysis",
+                "affected_stages": ["entry_analysis", "dataflow_analysis", "vuln_scan"],
+                "downstream_ref_count": 2,
+            }
+
+        async def fake_cleanup(db_arg, task_arg, operation_arg):
+            del db_arg, operation_arg
+            calls.append(("cleanup", task_arg.id))
+            return {
+                "target_stage": "entry_analysis",
+                "affected_stages": ["entry_analysis", "dataflow_analysis", "vuln_scan"],
+                "downstream_ref_count": 2,
+            }
+
+        original_collect = self.manager._operation_collect_retry_stage_full_plan
+        original_cleanup = self.manager._operation_execute_retry_stage_full_cleanup
+        try:
+            self.manager._operation_collect_retry_stage_full_plan = fake_collect
+            self.manager._operation_execute_retry_stage_full_cleanup = fake_cleanup
+            self.manager._enqueue_task = lambda task_id: calls.append(("requeue", task_id))
+            asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
+        finally:
+            self.manager._operation_collect_retry_stage_full_plan = original_collect
+            self.manager._operation_execute_retry_stage_full_cleanup = original_cleanup
+
+        self.assertEqual(
+            [("collect", "task1"), ("cleanup", "task1"), ("requeue", "task1")],
+            calls,
+        )
+        self.assertEqual("pending", task.status)
+        self.assertEqual("entry_analysis", task.current_stage)
+        self.assertEqual("requeue_task", operation.current_step)
+        self.assertEqual("operation_succeeded", dict(operation.resume_cursor or {}).get("current_step"))
+        step_payload = dict(operation.step_payload or {})
+        self.assertEqual("succeeded", step_payload["collect_cleanup_plan"]["status"])
+        self.assertEqual("succeeded", step_payload["cancel_downstream"]["status"])
+        self.assertEqual("succeeded", step_payload["requeue_task"]["status"])
+        event_types = [row.event_type for row in db.events]
+        self.assertIn("operation_step_started", event_types)
+        self.assertIn("operation_step_succeeded", event_types)
+        self.assertIn("task_requeued", event_types)
 
     def test_sync_streaming_task_tail_state_rebuilds_entry_results(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
