@@ -59,9 +59,10 @@ async def start_runtime() -> None:
             if any(runtime_has_role(role) for role in ("dispatcher", "worker", "cleanup-worker")):
                 start_worker_heartbeat()
                 _runtime_state["worker_heartbeat"] = True
-            if runtime_has_role("dispatcher"):
+            if runtime_has_role("dispatcher") or runtime_has_role("cleanup-worker"):
                 start_cluster_maintenance()
                 _runtime_state["cluster_maintenance"] = True
+            if runtime_has_role("dispatcher"):
                 start_task_dispatcher()
                 _runtime_state["dispatcher"] = True
             if runtime_has_role("cleanup-worker"):

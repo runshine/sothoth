@@ -171,6 +171,11 @@ def activate_tool_version(
 ) -> Path:
     family_id = _slugify(family_id)
     manifest = read_family_manifest(tools_store_dir, family_id)
+    target_path = target_path.resolve()
+    try:
+        target_path.relative_to(tools_store_dir.resolve())
+    except Exception as exc:
+        raise ValueError(f"target_path must be inside tools store: {target_path}") from exc
     try:
         version_name = str(target_path.relative_to(tools_store_dir))
     except Exception:

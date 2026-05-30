@@ -9,6 +9,8 @@ from app.service.downstream_base import JsonHttpClient
 
 
 class EntryAnalyseClient(JsonHttpClient):
+    API_PREFIX = "/api/app/entry-analyse"
+
     def __init__(self) -> None:
         cfg = get_config().services.entry_analyse
         super().__init__(base_url=cfg.base_url, timeout=cfg.timeout)
@@ -24,7 +26,7 @@ class EntryAnalyseClient(JsonHttpClient):
         origin: dict[str, Any] | None = None,
     ) -> dict:
         return await self.post(
-            "/tasks",
+            f"{self.API_PREFIX}/tasks",
             token=token,
             json_body={
                 "project_id": project_id,
@@ -38,7 +40,7 @@ class EntryAnalyseClient(JsonHttpClient):
         )
 
     async def get_task(self, task_id: str, token: str | None = None) -> dict:
-        return await self.get(f"/tasks/{task_id}", token=token)
+        return await self.get(f"{self.API_PREFIX}/tasks/{task_id}", token=token)
 
     async def list_tasks(
         self,
@@ -63,16 +65,16 @@ class EntryAnalyseClient(JsonHttpClient):
             params["parent_task_id"] = parent_task_id
         if parent_stage_item_id:
             params["parent_stage_item_id"] = parent_stage_item_id
-        return await self.get("/tasks", token=token, params=params)
+        return await self.get(f"{self.API_PREFIX}/tasks", token=token, params=params)
 
     async def cancel_task(self, task_id: str, token: str | None = None) -> dict:
-        return await self.post(f"/tasks/{task_id}/cancel", token=token)
+        return await self.post(f"{self.API_PREFIX}/tasks/{task_id}/cancel", token=token)
 
     async def restart_task(self, task_id: str, token: str | None = None) -> dict:
-        return await self.post(f"/tasks/{task_id}/restart", token=token)
+        return await self.post(f"{self.API_PREFIX}/tasks/{task_id}/restart", token=token)
 
     async def delete_task(self, task_id: str, token: str | None = None) -> dict:
-        return await self.delete(f"/tasks/{task_id}", token=token)
+        return await self.delete(f"{self.API_PREFIX}/tasks/{task_id}", token=token)
 
 
 _client: Optional[EntryAnalyseClient] = None

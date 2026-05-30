@@ -341,7 +341,20 @@ class FirmwareEvolutionJob(Base):
     max_rounds = Column(Integer, nullable=False, default=3)
     current_stage = Column(String(32), nullable=True, index=True)
     owner_id = Column(String(96), nullable=True, index=True)
+    dispatch_token = Column(String(64), nullable=True, index=True)
+    dispatch_owner_id = Column(String(96), nullable=True, index=True)
+    dispatch_claimed_at = Column(DateTime, nullable=True, index=True)
+    dispatch_lease_expires_at = Column(DateTime, nullable=True, index=True)
+    heartbeat_at = Column(DateTime, nullable=True, index=True)
     lease_expires_at = Column(DateTime, nullable=True, index=True)
+    cancel_requested_at = Column(DateTime, nullable=True)
+    last_progress_at = Column(DateTime, nullable=True)
+    runner_pid = Column(Integer, nullable=True, index=True)
+    runner_started_at = Column(DateTime, nullable=True)
+    runner_heartbeat_at = Column(DateTime, nullable=True)
+    run_token = Column(String(64), nullable=True, index=True)
+    cancel_grace_deadline = Column(DateTime, nullable=True)
+    cancel_force_deadline = Column(DateTime, nullable=True)
     attempts = Column(Integer, nullable=False, default=0)
     error_message = Column(Text, nullable=True)
     created_by = Column(String(64), nullable=True)
@@ -362,7 +375,20 @@ class FirmwareEvolutionJob(Base):
             "max_rounds": self.max_rounds,
             "current_stage": self.current_stage,
             "owner_id": self.owner_id,
+            "dispatch_token": self.dispatch_token,
+            "dispatch_owner_id": self.dispatch_owner_id,
+            "dispatch_claimed_at": isoformat_local(self.dispatch_claimed_at),
+            "dispatch_lease_expires_at": isoformat_local(self.dispatch_lease_expires_at),
+            "heartbeat_at": isoformat_local(self.heartbeat_at),
             "lease_expires_at": isoformat_local(self.lease_expires_at),
+            "cancel_requested_at": isoformat_local(self.cancel_requested_at),
+            "last_progress_at": isoformat_local(self.last_progress_at),
+            "runner_pid": self.runner_pid,
+            "runner_started_at": isoformat_local(self.runner_started_at),
+            "runner_heartbeat_at": isoformat_local(self.runner_heartbeat_at),
+            "run_token": self.run_token,
+            "cancel_grace_deadline": isoformat_local(self.cancel_grace_deadline),
+            "cancel_force_deadline": isoformat_local(self.cancel_force_deadline),
             "attempts": self.attempts,
             "error_message": self.error_message,
             "created_by": self.created_by,
@@ -522,6 +548,7 @@ def init_database() -> None:
     apply_table_prefix_if_needed()
     Base.metadata.create_all(bind=get_engine())
     _ensure_unpack_task_columns()
+    _ensure_evolution_job_columns()
     _seed_default_configs()
 
 
@@ -613,6 +640,63 @@ def _ensure_unpack_task_columns() -> None:
     if "ix_fu_tasks_dispatch_status_created_id" not in indexes:
         index_statements.append(
             f"CREATE INDEX ix_fu_tasks_dispatch_status_created_id ON {UnpackTask.__table__.name} (status, dispatch_claimed_at, id)"
+        )
+    with engine.begin() as conn:
+        for statement in index_statements:
+            conn.execute(text(statement))
+
+
+def _ensure_evolution_job_columns() -> None:
+    engine = get_engine()
+    inspector = inspect(engine)
+    try:
+        columns = {column["name"] for column in inspector.get_columns(FirmwareEvolutionJob.__table__.name)}
+    except Exception:
+        return
+
+    statements = {
+        "dispatch_token": f"ALTER TABLE {FirmwareEvolutionJob.__table__.name} ADD COLUMN dispatch_token VARCHAR(64)",
+        "dispatch_owner_id": f"ALTER TABLE {FirmwareEvolutionJob.__table__.name} ADD COLUMN dispatch_owner_id VARCHAR(96)",
+        "dispatch_claimed_at": f"ALTER TABLE {FirmwareEvolutionJob.__table__.name} ADD COLUMN dispatch_claimed_at DATETIME",
+        "dispatch_lease_expires_at": f"ALTER TABLE {FirmwareEvolutionJob.__table__.name} ADD COLUMN dispatch_lease_expires_at DATETIME",
+        "heartbeat_at": f"ALTER TABLE {FirmwareEvolutionJob.__table__.name} ADD COLUMN heartbeat_at DATETIME",
+        "cancel_requested_at": f"ALTER TABLE {FirmwareEvolutionJob.__table__.name} ADD COLUMN cancel_requested_at DATETIME",
+        "last_progress_at": f"ALTER TABLE {FirmwareEvolutionJob.__table__.name} ADD COLUMN last_progress_at DATETIME",
+        "runner_pid": f"ALTER TABLE {FirmwareEvolutionJob.__table__.name} ADD COLUMN runner_pid INTEGER",
+        "runner_started_at": f"ALTER TABLE {FirmwareEvolutionJob.__table__.name} ADD COLUMN runner_started_at DATETIME",
+        "runner_heartbeat_at": f"ALTER TABLE {FirmwareEvolutionJob.__table__.name} ADD COLUMN runner_heartbeat_at DATETIME",
+        "run_token": f"ALTER TABLE {FirmwareEvolutionJob.__table__.name} ADD COLUMN run_token VARCHAR(64)",
+        "cancel_grace_deadline": f"ALTER TABLE {FirmwareEvolutionJob.__table__.name} ADD COLUMN cancel_grace_deadline DATETIME",
+        "cancel_force_deadline": f"ALTER TABLE {FirmwareEvolutionJob.__table__.name} ADD COLUMN cancel_force_deadline DATETIME",
+    }
+
+    with engine.begin() as conn:
+        for column_name, statement in statements.items():
+            if column_name in columns:
+                continue
+            conn.execute(text(statement))
+
+    indexes = {index["name"] for index in inspector.get_indexes(FirmwareEvolutionJob.__table__.name)}
+    index_statements = []
+    if "ix_fu_evolution_jobs_task_created_id" not in indexes:
+        index_statements.append(
+            f"CREATE INDEX ix_fu_evolution_jobs_task_created_id ON {FirmwareEvolutionJob.__table__.name} (task_id, created_at, id)"
+        )
+    if "ix_fu_evolution_jobs_status_created_id" not in indexes:
+        index_statements.append(
+            f"CREATE INDEX ix_fu_evolution_jobs_status_created_id ON {FirmwareEvolutionJob.__table__.name} (status, created_at, id)"
+        )
+    if "ix_fu_evolution_jobs_owner_created_id" not in indexes:
+        index_statements.append(
+            f"CREATE INDEX ix_fu_evolution_jobs_owner_created_id ON {FirmwareEvolutionJob.__table__.name} (owner_id, created_at, id)"
+        )
+    if "ix_fu_evolution_jobs_dispatch_owner_created_id" not in indexes:
+        index_statements.append(
+            f"CREATE INDEX ix_fu_evolution_jobs_dispatch_owner_created_id ON {FirmwareEvolutionJob.__table__.name} (dispatch_owner_id, created_at, id)"
+        )
+    if "ix_fu_evolution_jobs_dispatch_status_created_id" not in indexes:
+        index_statements.append(
+            f"CREATE INDEX ix_fu_evolution_jobs_dispatch_status_created_id ON {FirmwareEvolutionJob.__table__.name} (status, dispatch_claimed_at, id)"
         )
     with engine.begin() as conn:
         for statement in index_statements:

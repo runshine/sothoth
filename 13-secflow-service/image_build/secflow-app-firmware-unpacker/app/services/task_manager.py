@@ -6,6 +6,7 @@ import logging
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -51,6 +52,8 @@ _futures: Dict[str, Future] = {}
 _futures_lock = threading.Lock()
 _active_cancel_hooks: Dict[str, object] = {}
 _active_cancel_hooks_lock = threading.Lock()
+_active_evolution_processes: Dict[str, int] = {}
+_active_evolution_processes_lock = threading.Lock()
 _active_result_cache_refreshes: set[str] = set()
 _active_result_cache_refreshes_lock = threading.Lock()
 PROJECT_FILES_ROOT = Path(os.environ.get("PROJECT_FILES_ROOT", "/data/files"))
@@ -82,7 +85,9 @@ SKILL_GENERATION_SUCCESS = "success"
 SKILL_GENERATION_FAILED = "failed"
 SKILL_GENERATION_NOT_APPLICABLE = "not_applicable"
 EVOLUTION_PENDING = "pending"
+EVOLUTION_CLAIMED = "claimed"
 EVOLUTION_RUNNING = "running"
+EVOLUTION_CANCELLING = "cancelling"
 EVOLUTION_SUCCESS = "success"
 EVOLUTION_FAILED = "failed"
 EVOLUTION_CANCELLED = "cancelled"
@@ -476,14 +481,15 @@ def _local_running_evolution_job_count() -> int:
     owner_id = get_worker_id()
     db = get_db_session()
     try:
-        return int(
-            db.query(FirmwareEvolutionJob)
+        rows = (
+            db.query(FirmwareEvolutionJob.id, FirmwareEvolutionJob.runner_pid)
             .filter(
                 FirmwareEvolutionJob.owner_id == owner_id,
-                FirmwareEvolutionJob.status == EVOLUTION_RUNNING,
+                FirmwareEvolutionJob.status.in_([EVOLUTION_RUNNING, EVOLUTION_CANCELLING]),
             )
-            .count()
+            .all()
         )
+        return sum(1 for _, pid in rows if _is_process_alive(pid))
     finally:
         db.close()
 
@@ -494,6 +500,110 @@ def _register_cancel_hook(task_id: str, hook) -> None:
             _active_cancel_hooks.pop(task_id, None)
         else:
             _active_cancel_hooks[task_id] = hook
+
+
+def _register_evolution_pid(job_id: str, pid: int | None) -> None:
+    with _active_evolution_processes_lock:
+        if not pid or int(pid) <= 0:
+            _active_evolution_processes.pop(job_id, None)
+        else:
+            _active_evolution_processes[job_id] = int(pid)
+
+
+def _get_registered_evolution_pid(job_id: str) -> int | None:
+    with _active_evolution_processes_lock:
+        pid = _active_evolution_processes.get(job_id)
+    return int(pid) if pid else None
+
+
+def _clear_registered_evolution_pid(job_id: str) -> None:
+    with _active_evolution_processes_lock:
+        _active_evolution_processes.pop(job_id, None)
+
+
+def _signal_evolution_runner(job, sig: int, *, event_type: str, summary: str) -> bool:
+    sent = _signal_runner_process(getattr(job, "runner_pid", None), sig)
+    if sent:
+        _record_task_event(
+            str(getattr(job, "task_id", "")),
+            project_id=getattr(job, "project_id", None),
+            event_type=event_type,
+            summary=summary,
+            stage_key="evolution",
+            status=getattr(job, "status", None),
+            detail={
+                "job_id": getattr(job, "id", None),
+                "runner_pid": getattr(job, "runner_pid", None),
+                "signal": sig,
+            },
+            owner_id=getattr(job, "owner_id", None),
+            created_by="task_manager",
+        )
+    return sent
+
+
+def _kill_processes_by_path_marker(path_marker: str) -> list[int]:
+    marker = str(path_marker or "").strip()
+    if not marker:
+        return []
+    killed: list[int] = []
+    try:
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            try:
+                cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "ignore")
+            except Exception:
+                continue
+            if marker not in cmdline:
+                continue
+            if _signal_runner_process(pid, signal.SIGTERM):
+                killed.append(pid)
+        if killed:
+            time.sleep(1.0)
+            for pid in list(killed):
+                if _is_process_alive(pid):
+                    _signal_runner_process(pid, signal.SIGKILL)
+    except Exception as exc:
+        logger.warning("failed to kill processes by path marker %s: %s", marker, exc)
+    return killed
+
+
+def _terminate_evolution_runtime(job_id: str, job_root: Path | None = None) -> dict[str, Any]:
+    runtime_root = str(job_root or "").strip()
+    killed_pids: list[int] = []
+    registered_pid = _get_registered_evolution_pid(job_id)
+    if registered_pid:
+        if _signal_runner_process(registered_pid, signal.SIGTERM):
+            killed_pids.append(int(registered_pid))
+            time.sleep(0.5)
+            if _is_process_alive(registered_pid):
+                _signal_runner_process(registered_pid, signal.SIGKILL)
+        _clear_registered_evolution_pid(job_id)
+    if runtime_root:
+        for pid in _kill_processes_by_path_marker(runtime_root):
+            if pid not in killed_pids:
+                killed_pids.append(pid)
+    return {
+        "job_id": job_id,
+        "job_root": runtime_root or None,
+        "killed_pids": killed_pids,
+    }
+
+
+def _cleanup_evolution_job_workspace(job_root: Path) -> None:
+    if not job_root.exists():
+        return
+    for name in ("round_001", "round_002", "round_003", "sessions", "working_tool", "workspace"):
+        target = job_root / name
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+    for name in ("tool_manifest.json", "evolution_result.json"):
+        target = job_root / name
+        with suppress(Exception):
+            if target.exists():
+                target.unlink()
 
 
 def _record_task_event(
@@ -550,26 +660,6 @@ def _record_task_event_from_row(
     )
 
 
-def _record_task_action_event_from_row(
-    task,
-    *,
-    event_type: str,
-    summary: str,
-    detail: Optional[dict] = None,
-    created_by: Optional[str] = None,
-) -> None:
-    _record_task_event_from_row(
-        task,
-        event_type=event_type,
-        summary=summary,
-        stage_key=getattr(task, "current_stage", None),
-        status=getattr(task, "status", None),
-        detail=detail,
-        owner_id=getattr(task, "owner_id", None),
-        created_by=created_by,
-    )
-
-
 def _trigger_cancel_hook(task_id: str) -> None:
     with _active_cancel_hooks_lock:
         hook = _active_cancel_hooks.get(task_id)
@@ -604,7 +694,7 @@ def get_local_active_task_count() -> int:
 
 
 def recover_stale_owned_tasks() -> None:
-    from app.model import TaskStatus, UnpackTask, get_db_session
+    from app.model import FirmwareEvolutionJob, TaskStatus, UnpackTask, get_db_session
     from app.services.worker import get_worker_id
 
     owner_id = get_worker_id()
@@ -617,6 +707,14 @@ def recover_stale_owned_tasks() -> None:
                 UnpackTask.status.in_(
                     [TaskStatus.CLAIMED.value, TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value]
                 ),
+            )
+            .all()
+        )
+        evolution_jobs = (
+            db.query(FirmwareEvolutionJob)
+            .filter(
+                FirmwareEvolutionJob.owner_id == owner_id,
+                FirmwareEvolutionJob.status.in_([EVOLUTION_CLAIMED, EVOLUTION_RUNNING, EVOLUTION_CANCELLING]),
             )
             .all()
         )
@@ -634,6 +732,464 @@ def recover_stale_owned_tasks() -> None:
             _mark_task_cancelled(task.id, reason=reason)
         else:
             _finalize_orphaned_task(task.id, reason=reason)
+    for job in evolution_jobs:
+        if job.status == EVOLUTION_CLAIMED:
+            _reset_evolution_claim(job.id)
+            continue
+        if _is_process_alive(job.runner_pid):
+            continue
+        reason = "evolution owner restarted without active runner process"
+        if job.status == EVOLUTION_CANCELLING:
+            _mark_evolution_cancelled(job.id, reason=reason)
+        else:
+            _finalize_orphaned_evolution_job(job.id, reason=reason)
+
+
+def _reset_evolution_claim(job_id: str) -> None:
+    from app.model import FirmwareEvolutionJob, get_db_session
+
+    db = get_db_session()
+    try:
+        (
+            db.query(FirmwareEvolutionJob)
+            .filter(
+                FirmwareEvolutionJob.id == job_id,
+                FirmwareEvolutionJob.status.in_([EVOLUTION_CLAIMED, EVOLUTION_RUNNING]),
+            )
+            .update(
+                {
+                    FirmwareEvolutionJob.status: EVOLUTION_PENDING,
+                    FirmwareEvolutionJob.owner_id: None,
+                    FirmwareEvolutionJob.dispatch_owner_id: None,
+                    FirmwareEvolutionJob.dispatch_token: None,
+                    FirmwareEvolutionJob.dispatch_claimed_at: None,
+                    FirmwareEvolutionJob.dispatch_lease_expires_at: None,
+                    FirmwareEvolutionJob.heartbeat_at: None,
+                    FirmwareEvolutionJob.lease_expires_at: None,
+                    FirmwareEvolutionJob.cancel_requested_at: None,
+                    FirmwareEvolutionJob.last_progress_at: now_local(),
+                    FirmwareEvolutionJob.runner_pid: None,
+                    FirmwareEvolutionJob.runner_started_at: None,
+                    FirmwareEvolutionJob.runner_heartbeat_at: None,
+                    FirmwareEvolutionJob.run_token: None,
+                    FirmwareEvolutionJob.cancel_grace_deadline: None,
+                    FirmwareEvolutionJob.cancel_force_deadline: None,
+                    FirmwareEvolutionJob.started_at: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _claim_evolution_job(job_id: str) -> bool:
+    from app.model import FirmwareEvolutionJob, get_db_session
+    from app.services.worker import get_worker_id
+
+    owner_id = get_worker_id()
+    now = now_local()
+    claim_deadline = now + timedelta(seconds=_dispatch_interval_seconds() * 4)
+    dispatch_token = uuid.uuid4().hex
+
+    db = get_db_session()
+    try:
+        updated = (
+            db.query(FirmwareEvolutionJob)
+            .filter(FirmwareEvolutionJob.id == job_id, FirmwareEvolutionJob.status == EVOLUTION_PENDING)
+            .update(
+                {
+                    FirmwareEvolutionJob.status: EVOLUTION_CLAIMED,
+                    FirmwareEvolutionJob.owner_id: owner_id,
+                    FirmwareEvolutionJob.dispatch_owner_id: owner_id,
+                    FirmwareEvolutionJob.dispatch_token: dispatch_token,
+                    FirmwareEvolutionJob.dispatch_claimed_at: now,
+                    FirmwareEvolutionJob.dispatch_lease_expires_at: claim_deadline,
+                    FirmwareEvolutionJob.current_stage: "queued",
+                    FirmwareEvolutionJob.heartbeat_at: now,
+                    FirmwareEvolutionJob.lease_expires_at: None,
+                    FirmwareEvolutionJob.cancel_requested_at: None,
+                    FirmwareEvolutionJob.last_progress_at: now,
+                    FirmwareEvolutionJob.runner_pid: None,
+                    FirmwareEvolutionJob.runner_started_at: None,
+                    FirmwareEvolutionJob.runner_heartbeat_at: None,
+                    FirmwareEvolutionJob.run_token: None,
+                    FirmwareEvolutionJob.cancel_grace_deadline: None,
+                    FirmwareEvolutionJob.cancel_force_deadline: None,
+                    FirmwareEvolutionJob.completed_at: None,
+                    FirmwareEvolutionJob.error_message: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return bool(updated)
+    finally:
+        db.close()
+
+
+def _claim_pending_evolution_jobs(limit: int) -> list[str]:
+    from app.model import FirmwareEvolutionJob, get_db_session
+    from app.services.worker import get_worker_id
+
+    fetch_limit = max(1, limit)
+    owner_id = get_worker_id()
+    use_skip_locked = _supports_skip_locked()
+
+    def _do_claim_pending_jobs() -> list[dict[str, object]]:
+        now = now_local()
+        claim_deadline = now + timedelta(seconds=_dispatch_interval_seconds() * 4)
+        if not use_skip_locked:
+            candidate_ids: list[str] = []
+            db = get_db_session()
+            try:
+                candidate_ids = [
+                    row.id
+                    for row in (
+                        db.query(FirmwareEvolutionJob.id)
+                        .filter(FirmwareEvolutionJob.status == EVOLUTION_PENDING)
+                        .order_by(FirmwareEvolutionJob.created_at.asc(), FirmwareEvolutionJob.id.asc())
+                        .limit(fetch_limit)
+                        .all()
+                    )
+                ]
+            finally:
+                db.close()
+            claimed_payloads: list[dict[str, object]] = []
+            for job_id in candidate_ids:
+                if len(claimed_payloads) >= fetch_limit:
+                    break
+                if _claim_evolution_job(job_id):
+                    claimed_payloads.append(
+                        {
+                            "job_id": job_id,
+                            "status": EVOLUTION_CLAIMED,
+                            "owner_id": owner_id,
+                            "event_recorded": True,
+                        }
+                    )
+            return claimed_payloads
+
+        db = get_db_session()
+        claimed_payloads: list[dict[str, object]] = []
+        try:
+            query = (
+                db.query(FirmwareEvolutionJob)
+                .filter(FirmwareEvolutionJob.status == EVOLUTION_PENDING)
+                .order_by(FirmwareEvolutionJob.created_at.asc(), FirmwareEvolutionJob.id.asc())
+            )
+            if use_skip_locked:
+                query = query.with_for_update(skip_locked=True)
+            candidates = query.limit(fetch_limit).all()
+            for job in candidates:
+                dispatch_token = uuid.uuid4().hex
+                job.status = EVOLUTION_CLAIMED
+                job.owner_id = owner_id
+                job.dispatch_owner_id = owner_id
+                job.dispatch_token = dispatch_token
+                job.dispatch_claimed_at = now
+                job.dispatch_lease_expires_at = claim_deadline
+                job.current_stage = "queued"
+                job.heartbeat_at = now
+                job.lease_expires_at = None
+                job.cancel_requested_at = None
+                job.last_progress_at = now
+                job.runner_pid = None
+                job.runner_started_at = None
+                job.runner_heartbeat_at = None
+                job.run_token = None
+                job.cancel_grace_deadline = None
+                job.cancel_force_deadline = None
+                job.completed_at = None
+                job.error_message = None
+                claimed_payloads.append(
+                    {
+                        "job_id": job.id,
+                        "task_id": job.task_id,
+                        "project_id": job.project_id,
+                        "status": job.status,
+                        "owner_id": owner_id,
+                    }
+                )
+            db.commit()
+            return claimed_payloads
+        except SQLAlchemyError:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    claimed_payloads = _run_db_retry(
+        "claim_pending_evolution_jobs",
+        _do_claim_pending_jobs,
+        context={"owner_id": owner_id, "limit": fetch_limit, "skip_locked": use_skip_locked},
+    )
+
+    for payload in claimed_payloads:
+        if payload.get("event_recorded"):
+            continue
+        _record_task_event(
+            str(payload.get("task_id") or ""),
+            project_id=payload.get("project_id"),
+            event_type="evolution_claimed",
+            summary="进化任务已被当前 owner 认领",
+            stage_key="evolution",
+            status=str(payload["status"]),
+            detail={"job_id": payload["job_id"], "owner_id": payload.get("owner_id"), "dispatch_token_present": True},
+            owner_id=str(payload.get("owner_id") or ""),
+            created_by="task_manager",
+        )
+    return [str(item["job_id"]) for item in claimed_payloads]
+
+
+def _launch_evolution_runner(job_id: str) -> None:
+    from app.model import FirmwareEvolutionJob, get_db_session
+    from app.services.worker import get_worker_id, refresh_worker_active_tasks
+
+    owner_id = get_worker_id()
+    db = get_db_session()
+    try:
+        job = (
+            db.query(FirmwareEvolutionJob)
+            .filter(
+                FirmwareEvolutionJob.id == job_id,
+                FirmwareEvolutionJob.owner_id == owner_id,
+                FirmwareEvolutionJob.status == EVOLUTION_CLAIMED,
+            )
+            .first()
+        )
+        if job is None or not job.dispatch_token:
+            raise RuntimeError(f"进化任务未被当前 owner 正确认领: {job_id}")
+        dispatch_token = job.dispatch_token
+        run_token = uuid.uuid4().hex
+    finally:
+        db.close()
+
+    env = os.environ.copy()
+    project_root = str(Path(__file__).resolve().parents[2])
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = project_root if not existing_pythonpath else f"{project_root}{os.pathsep}{existing_pythonpath}"
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "app.evolution_runner",
+            "--job-id",
+            job_id,
+            "--owner-id",
+            owner_id,
+            "--run-token",
+            run_token,
+        ],
+        cwd=project_root,
+        env=env,
+        start_new_session=True,
+    )
+
+    now = now_local()
+    db = get_db_session()
+    try:
+        updated = (
+            db.query(FirmwareEvolutionJob)
+            .filter(
+                FirmwareEvolutionJob.id == job_id,
+                FirmwareEvolutionJob.owner_id == owner_id,
+                FirmwareEvolutionJob.dispatch_token == dispatch_token,
+                FirmwareEvolutionJob.status == EVOLUTION_CLAIMED,
+            )
+            .update(
+                {
+                    FirmwareEvolutionJob.status: EVOLUTION_RUNNING,
+                    FirmwareEvolutionJob.dispatch_lease_expires_at: None,
+                    FirmwareEvolutionJob.runner_pid: proc.pid,
+                    FirmwareEvolutionJob.runner_started_at: now,
+                    FirmwareEvolutionJob.runner_heartbeat_at: now,
+                    FirmwareEvolutionJob.heartbeat_at: now,
+                    FirmwareEvolutionJob.lease_expires_at: None,
+                    FirmwareEvolutionJob.last_progress_at: now,
+                    FirmwareEvolutionJob.run_token: run_token,
+                    FirmwareEvolutionJob.started_at: now,
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        if not updated:
+            _signal_runner_process(proc.pid, signal.SIGTERM)
+            raise RuntimeError(f"进化任务状态已变化，已停止新 runner: {job_id}")
+        job = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
+        if job is not None:
+            _record_task_event(
+                job.task_id,
+                project_id=job.project_id,
+                event_type="evolution_runner_started",
+                summary="进化任务独立执行进程已启动",
+                stage_key="evolution",
+                status=job.status,
+                detail={"job_id": job.id, "runner_pid": proc.pid, "run_token_present": True, "dispatch_token_present": True},
+                owner_id=owner_id,
+                created_by="task_manager",
+            )
+    finally:
+        db.close()
+    refresh_worker_active_tasks()
+
+
+def _should_cancel_evolution_run(job_id: str, run_token: Optional[str]) -> bool:
+    from app.model import FirmwareEvolutionJob, get_db_session
+
+    db = get_db_session()
+    try:
+        job = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
+        if job is None:
+            return True
+        if run_token and job.run_token != run_token:
+            return True
+        return str(job.status or "") in {EVOLUTION_CANCELLING, EVOLUTION_CANCELLED}
+    finally:
+        db.close()
+
+
+def _update_evolution_progress_for_owner(job_id: str, *, owner_id: str, run_token: str, round_id: int, stage: str) -> None:
+    from app.model import FirmwareEvolutionJob, UnpackTask, get_db_session
+
+    now = now_local()
+    db = get_db_session()
+    try:
+        job = (
+            db.query(FirmwareEvolutionJob)
+            .filter(
+                FirmwareEvolutionJob.id == job_id,
+                FirmwareEvolutionJob.owner_id == owner_id,
+                FirmwareEvolutionJob.run_token == run_token,
+            )
+            .first()
+        )
+        if job is None:
+            return
+        job.current_round = int(round_id or 0)
+        job.current_stage = stage
+        job.runner_heartbeat_at = now
+        job.heartbeat_at = now
+        job.last_progress_at = now
+        task = db.query(UnpackTask).filter(UnpackTask.id == job.task_id).first()
+        if task is not None:
+            task.latest_evolution_status = job.status
+        db.commit()
+    finally:
+        db.close()
+
+
+def _mark_evolution_cancelled(job_id: str, reason: str = "Evolution job was cancelled") -> None:
+    from app.model import FirmwareEvolutionJob, UnpackTask, get_db_session
+
+    db = get_db_session()
+    try:
+        job = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
+        if job is None:
+            return
+        previous_owner_id = job.owner_id
+        now = now_local()
+        job.status = EVOLUTION_CANCELLED
+        job.error_message = reason
+        job.owner_id = None
+        job.dispatch_owner_id = None
+        job.dispatch_token = None
+        job.dispatch_claimed_at = None
+        job.dispatch_lease_expires_at = None
+        job.heartbeat_at = now
+        job.lease_expires_at = None
+        job.runner_pid = None
+        job.runner_started_at = None
+        job.runner_heartbeat_at = None
+        job.run_token = None
+        job.cancel_grace_deadline = None
+        job.cancel_force_deadline = None
+        job.completed_at = now
+        job.last_progress_at = now
+        task = db.query(UnpackTask).filter(UnpackTask.id == job.task_id).first()
+        if task is not None:
+            task.latest_evolution_job_id = job.id
+            task.latest_evolution_status = EVOLUTION_CANCELLED
+            task.latest_evolution_completed_at = now
+        db.commit()
+        _record_task_event(
+            job.task_id,
+            project_id=job.project_id,
+            event_type="evolution_cancelled",
+            summary=f"手动进化任务已取消：{reason}",
+            stage_key="evolution",
+            status=job.status,
+            detail={"job_id": job.id, "reason": reason},
+            owner_id=previous_owner_id,
+            created_by="task_manager",
+        )
+        if task is not None:
+            _write_task_result_cache(task.id)
+    finally:
+        db.close()
+
+
+def _finalize_orphaned_evolution_job(job_id: str, reason: str) -> None:
+    from app.model import FirmwareEvolutionJob, UnpackTask, get_db_session
+
+    db = get_db_session()
+    try:
+        job = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
+        if job is None or str(job.status or "") not in {EVOLUTION_CLAIMED, EVOLUTION_RUNNING, EVOLUTION_CANCELLING}:
+            return
+        now = now_local()
+        if str(job.status or "") == EVOLUTION_CLAIMED:
+            job.status = EVOLUTION_PENDING
+            job.current_stage = "pending"
+            job.error_message = None
+            job.completed_at = None
+        elif str(job.status or "") == EVOLUTION_CANCELLING:
+            job.status = EVOLUTION_CANCELLED
+            job.error_message = reason
+            job.completed_at = now
+        else:
+            job.status = EVOLUTION_FAILED
+            job.error_message = reason
+            job.completed_at = now
+        previous_owner_id = job.owner_id
+        job.owner_id = None
+        job.dispatch_owner_id = None
+        job.dispatch_token = None
+        job.dispatch_claimed_at = None
+        job.dispatch_lease_expires_at = None
+        job.lease_expires_at = None
+        job.runner_pid = None
+        job.runner_started_at = None
+        job.runner_heartbeat_at = None
+        job.heartbeat_at = now
+        job.run_token = None
+        job.cancel_grace_deadline = None
+        job.cancel_force_deadline = None
+        job.last_progress_at = now
+        task = db.query(UnpackTask).filter(UnpackTask.id == job.task_id).first()
+        if task is not None:
+            task.latest_evolution_job_id = job.id
+            task.latest_evolution_status = job.status
+            task.latest_evolution_completed_at = job.completed_at
+            task.latest_evolution_final_skill_path = job.final_skill_path
+        db.commit()
+        _record_task_event(
+            job.task_id,
+            project_id=job.project_id,
+            event_type="evolution_orphan_recovered",
+            summary="进化孤儿任务已完成状态收敛",
+            stage_key="evolution",
+            status=job.status,
+            detail={"job_id": job.id, "reason": reason},
+            owner_id=previous_owner_id,
+            created_by="task_manager",
+        )
+        if task is not None and str(job.status or "") in {EVOLUTION_FAILED, EVOLUTION_CANCELLED}:
+            _write_task_result_cache(task.id)
+    finally:
+        db.close()
 
 
 def _mark_task_stage(task_id: str, stage: str) -> None:
@@ -1411,7 +1967,6 @@ def submit_unpack_task(
     parent_stage_name: Optional[str] = None,
     parent_stage_item_id: Optional[str] = None,
     parent_stage_item_key: Optional[str] = None,
-    created_by: str = "task_manager",
 ) -> dict[str, str]:
     """Insert a pending task into the shared database."""
     from app.model import TaskStatus, UnpackTask, generate_id, get_db_session
@@ -1463,7 +2018,7 @@ def submit_unpack_task(
                 "task_origin_type": normalized_origin_type,
                 "llm_binding_snapshot_frozen_at": effective_snapshot.get("frozen_at") if isinstance(effective_snapshot, dict) else None,
             },
-            created_by=created_by,
+            created_by="task_manager",
         )
         record_task_lifecycle(
             event="created",
@@ -1482,7 +2037,7 @@ def submit_unpack_task(
     }
 
 
-def cancel_task(task_id: str, *, created_by: str = "task_manager") -> tuple[bool, str]:
+def cancel_task(task_id: str) -> tuple[bool, str]:
     from app.model import TaskStatus, UnpackTask, get_db_session
     from app.services.worker import get_worker_id
 
@@ -1517,7 +2072,7 @@ def cancel_task(task_id: str, *, created_by: str = "task_manager") -> tuple[bool
                 stage_key=task.current_stage,
                 status=TaskStatus.CANCELLING.value,
                 detail={"owner_id": task.owner_id},
-                created_by=created_by,
+                created_by="task_manager",
             )
             _record_task_event_from_row(
                 task,
@@ -1526,7 +2081,7 @@ def cancel_task(task_id: str, *, created_by: str = "task_manager") -> tuple[bool
                 stage_key=task.current_stage,
                 status=task.status,
                 detail={"reason": "Task was cancelled before execution"},
-                created_by=created_by,
+                created_by="task_manager",
             )
             record_task_error(category="cancel", status=task.status, task_origin=_task_origin(task))
             record_task_lifecycle(event="finished", status=task.status, task_origin=_task_origin(task))
@@ -1557,7 +2112,7 @@ def cancel_task(task_id: str, *, created_by: str = "task_manager") -> tuple[bool
             stage_key=task.current_stage,
             status=task.status,
             detail={"owner_id": task.owner_id},
-            created_by=created_by,
+            created_by="task_manager",
         )
         if trigger_runtime_cancel:
             if str(task.owner_id or "").strip() == get_worker_id() and task.runner_pid:
@@ -1573,7 +2128,7 @@ def cancel_task(task_id: str, *, created_by: str = "task_manager") -> tuple[bool
         db.close()
 
 
-def retry_task(task_id: str, *, created_by: str = "task_manager") -> tuple[bool, Optional[str], str]:
+def retry_task(task_id: str) -> tuple[bool, Optional[str], str]:
     from app.model import TaskStatus, UnpackTask, get_db_session
 
     db = get_db_session()
@@ -1620,7 +2175,7 @@ def retry_task(task_id: str, *, created_by: str = "task_manager") -> tuple[bool,
             stage_key="retry_preparing",
             status=TaskStatus.RETRY_PREPARING.value,
             detail={"retry_mode": "inplace_async"},
-            created_by=created_by,
+            created_by="task_manager",
         )
         try:
             enqueue_workspace_cleanup(
@@ -1637,7 +2192,7 @@ def retry_task(task_id: str, *, created_by: str = "task_manager") -> tuple[bool,
         db.close()
 
 
-def delete_tasks(task_ids: list[str], *, created_by: str = "task_manager") -> tuple[int, list[str]]:
+def delete_tasks(task_ids: list[str]) -> tuple[int, list[str]]:
     from app.model import TaskStatus, UnpackTask, get_db_session
 
     deleted_count = 0
@@ -1692,7 +2247,7 @@ def delete_tasks(task_ids: list[str], *, created_by: str = "task_manager") -> tu
                 status=payload.get("status"),
                 detail=payload.get("detail"),
                 owner_id=payload.get("owner_id"),
-                created_by=created_by,
+                created_by="task_manager",
             )
         for task_id, project_id in cleanup_candidates:
             enqueue_workspace_cleanup(
@@ -1741,13 +2296,13 @@ def _should_cancel_run(task_id: str, run_token: Optional[str]) -> bool:
 
 
 def recover_orphaned_tasks() -> None:
-    from app.model import TaskStatus, UnpackTask, WorkerInstance, get_db_session
+    from app.model import FirmwareEvolutionJob, TaskStatus, UnpackTask, WorkerInstance, get_db_session
     from app.services.worker import get_worker_id
 
     now = now_local()
     heartbeat_cutoff = now - timedelta(seconds=max(15, int(get_config().worker.dead_threshold_seconds)))
 
-    def _load_recovery_snapshot() -> tuple[set[str], list[Any]]:
+    def _load_recovery_snapshot() -> tuple[set[str], list[Any], list[Any]]:
         db = get_db_session()
         try:
             active_owner_ids = {
@@ -1768,11 +2323,18 @@ def recover_orphaned_tasks() -> None:
                 )
                 .all()
             )
-            return active_owner_ids, tasks
+            evolution_jobs = (
+                db.query(FirmwareEvolutionJob)
+                .filter(
+                    FirmwareEvolutionJob.status.in_([EVOLUTION_CLAIMED, EVOLUTION_RUNNING, EVOLUTION_CANCELLING])
+                )
+                .all()
+            )
+            return active_owner_ids, tasks, evolution_jobs
         finally:
             db.close()
 
-    active_owner_ids, tasks = _run_db_retry(
+    active_owner_ids, tasks, evolution_jobs = _run_db_retry(
         "recover_orphaned_tasks_snapshot",
         _load_recovery_snapshot,
         context={"heartbeat_cutoff": isoformat_local(heartbeat_cutoff)},
@@ -1884,12 +2446,126 @@ def recover_orphaned_tasks() -> None:
                 getattr(task, "owner_id", None),
                 exc,
             )
+    for job in evolution_jobs:
+        try:
+            owner_id = str(job.owner_id or "").strip()
+            cancel_requested_at = getattr(job, "cancel_requested_at", None)
+            owner_missing = not owner_id or owner_id not in active_owner_ids
+            local_owned = owner_id == current_owner
+            runner_pid = getattr(job, "runner_pid", None)
+            runner_alive = _is_process_alive(runner_pid) if local_owned and runner_pid else False
+            runner_not_started = bool(
+                local_owned
+                and not runner_pid
+                and job.started_at
+                and job.started_at + timedelta(seconds=_runner_start_grace_seconds()) < now
+            )
+            cancel_timed_out = bool(
+                cancel_requested_at
+                and cancel_requested_at + timedelta(seconds=_cancel_timeout_seconds()) < now
+            )
+            progress_stale = bool(
+                job.last_progress_at
+                and job.last_progress_at + timedelta(seconds=_cancel_timeout_seconds()) < now
+            )
+            claim_stale = bool(
+                str(job.status or "") == EVOLUTION_CLAIMED
+                and job.dispatch_claimed_at
+                and job.dispatch_claimed_at + timedelta(seconds=_runner_start_grace_seconds()) < now
+            )
+            if str(job.status or "") == EVOLUTION_CLAIMED:
+                if owner_missing or claim_stale:
+                    _reset_evolution_claim(job.id)
+                    action_counts["evolution_claim_reset"] = int(action_counts.get("evolution_claim_reset", 0)) + 1
+                continue
+            if str(job.status or "") == EVOLUTION_CANCELLING and local_owned:
+                if runner_not_started:
+                    _mark_evolution_cancelled(job.id, reason="Evolution runner was not started")
+                    action_counts["evolution_cancelled_runner_not_started"] = int(action_counts.get("evolution_cancelled_runner_not_started", 0)) + 1
+                    continue
+                if not runner_alive:
+                    _mark_evolution_cancelled(job.id, reason="Evolution runner exited while cancelling")
+                    action_counts["evolution_cancelled_runner_exited"] = int(action_counts.get("evolution_cancelled_runner_exited", 0)) + 1
+                    continue
+                if job.cancel_grace_deadline and job.cancel_grace_deadline <= now:
+                    sent = _signal_evolution_runner(
+                        job,
+                        signal.SIGTERM,
+                        event_type="evolution_cancel_sigterm_sent",
+                        summary="已向进化任务执行进程发送 SIGTERM",
+                    )
+                    if sent:
+                        db = get_db_session()
+                        try:
+                            current = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job.id).first()
+                            if current is not None:
+                                current.cancel_grace_deadline = None
+                                db.commit()
+                        finally:
+                            db.close()
+                        action_counts["evolution_cancel_sigterm_sent"] = int(action_counts.get("evolution_cancel_sigterm_sent", 0)) + 1
+                if (
+                    (job.cancel_force_deadline and job.cancel_force_deadline <= now)
+                    or cancel_timed_out
+                    or progress_stale
+                ):
+                    _signal_evolution_runner(
+                        job,
+                        signal.SIGKILL,
+                        event_type="evolution_cancel_sigkill_sent",
+                        summary="已向进化任务执行进程发送 SIGKILL",
+                    )
+                    task_db = get_db_session()
+                    try:
+                        current = task_db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job.id).first()
+                        task = task_db.query(UnpackTask).filter(UnpackTask.id == job.task_id).first()
+                        job_root = _derive_evolution_job_root(str(getattr(task, "output_path", "") or ""), job.id) if task is not None else None
+                    finally:
+                        task_db.close()
+                    _terminate_evolution_runtime(job.id, job_root)
+                    _mark_evolution_cancelled(job.id, reason="Evolution task cancelled after force kill deadline")
+                    action_counts["evolution_cancel_sigkill_sent"] = int(action_counts.get("evolution_cancel_sigkill_sent", 0)) + 1
+                continue
+            if str(job.status or "") == EVOLUTION_CANCELLING:
+                if owner_missing or cancel_timed_out or progress_stale:
+                    _mark_evolution_cancelled(job.id, reason="Evolution task cancelled after owner lost or timeout")
+                    action_counts["evolution_cancel_timeout"] = int(action_counts.get("evolution_cancel_timeout", 0)) + 1
+                continue
+            if str(job.status or "") == EVOLUTION_RUNNING:
+                if owner_missing:
+                    _finalize_orphaned_evolution_job(job.id, reason="Evolution task owner pod lost")
+                    action_counts["evolution_owner_lost"] = int(action_counts.get("evolution_owner_lost", 0)) + 1
+                elif local_owned and runner_not_started:
+                    _finalize_orphaned_evolution_job(job.id, reason="Evolution runner was not started")
+                    action_counts["evolution_runner_not_started"] = int(action_counts.get("evolution_runner_not_started", 0)) + 1
+                elif local_owned and not runner_alive:
+                    _finalize_orphaned_evolution_job(job.id, reason="Evolution runner process exited unexpectedly")
+                    action_counts["evolution_runner_exited"] = int(action_counts.get("evolution_runner_exited", 0)) + 1
+                elif local_owned and runner_alive:
+                    _update_evolution_progress_for_owner(
+                        job.id,
+                        owner_id=owner_id,
+                        run_token=job.run_token,
+                        round_id=int(job.current_round or 0),
+                        stage=str(job.current_stage or "evolution_execute"),
+                    )
+                    action_counts["evolution_progress_refreshed"] = int(action_counts.get("evolution_progress_refreshed", 0)) + 1
+        except Exception as exc:
+            action_counts["evolution_errors"] = int(action_counts.get("evolution_errors", 0)) + 1
+            logger.warning(
+                "recover orphaned evolution warning job_id=%s status=%s owner_id=%s error=%s",
+                job.id,
+                job.status,
+                getattr(job, "owner_id", None),
+                exc,
+            )
     if action_counts:
         logger.info(
-            "recover orphaned tasks summary owner_id=%s active_workers=%s scanned_tasks=%s actions=%s",
+            "recover orphaned tasks summary owner_id=%s active_workers=%s scanned_tasks=%s scanned_evolution_jobs=%s actions=%s",
             current_owner,
             len(active_owner_ids),
             len(tasks),
+            len(evolution_jobs),
             action_counts,
         )
     record_orphan_recovery(
@@ -2543,7 +3219,7 @@ def _build_running_evolution_round(
     job_root: Path,
 ) -> dict[str, Any] | None:
     job_status = str(enriched.get("status") or "").strip().lower()
-    if job_status not in {EVOLUTION_PENDING, EVOLUTION_RUNNING}:
+    if job_status not in {EVOLUTION_PENDING, EVOLUTION_CLAIMED, EVOLUTION_RUNNING, EVOLUTION_CANCELLING}:
         return None
     round_id = int(enriched.get("current_round") or 0)
     if round_id <= 0:
@@ -2931,7 +3607,7 @@ def submit_evolution_job(task_id: str, *, created_by: str = "task_manager") -> d
             db.query(FirmwareEvolutionJob)
             .filter(
                 FirmwareEvolutionJob.task_id == task.id,
-                FirmwareEvolutionJob.status.in_([EVOLUTION_PENDING, EVOLUTION_RUNNING]),
+                FirmwareEvolutionJob.status.in_([EVOLUTION_PENDING, EVOLUTION_CLAIMED, EVOLUTION_RUNNING, EVOLUTION_CANCELLING]),
             )
             .first()
         )
@@ -3099,23 +3775,55 @@ def cancel_evolution_job(job_id: str) -> dict[str, Any]:
         if job is None:
             raise ValueError("进化任务不存在")
         task = db.query(UnpackTask).filter(UnpackTask.id == job.task_id).first()
-        if str(job.status or "") not in {EVOLUTION_PENDING, EVOLUTION_RUNNING}:
+        status = str(job.status or "")
+        if status not in {EVOLUTION_PENDING, EVOLUTION_CLAIMED, EVOLUTION_RUNNING, EVOLUTION_CANCELLING}:
             return {"message": "进化任务已处于终态", "task_id": job.task_id}
-        job.status = EVOLUTION_CANCELLED
-        job.lease_expires_at = None
-        job.completed_at = now_local()
-        job.error_message = "用户手动结束进化任务"
+        job_root = _derive_evolution_job_root(str(task.output_path or ""), job.id) if task is not None else None
+        now = now_local()
+        runtime_cleanup: dict[str, Any] = {"job_id": job.id}
+        if status in {EVOLUTION_PENDING, EVOLUTION_CLAIMED}:
+            runtime_cleanup = _terminate_evolution_runtime(job.id, job_root)
+            job.status = EVOLUTION_CANCELLED
+            job.owner_id = None
+            job.dispatch_owner_id = None
+            job.dispatch_token = None
+            job.dispatch_claimed_at = None
+            job.dispatch_lease_expires_at = None
+            job.heartbeat_at = now
+            job.lease_expires_at = None
+            job.runner_pid = None
+            job.runner_started_at = None
+            job.runner_heartbeat_at = None
+            job.run_token = None
+            job.cancel_grace_deadline = None
+            job.cancel_force_deadline = None
+            job.completed_at = now
+            job.last_progress_at = now
+        else:
+            job.status = EVOLUTION_CANCELLING
+            job.cancel_requested_at = now
+            job.cancel_grace_deadline = now + timedelta(seconds=_cancel_grace_seconds())
+            job.cancel_force_deadline = now + timedelta(seconds=_cancel_force_seconds())
+            job.heartbeat_at = now
+            job.last_progress_at = now
+            if job.runner_pid:
+                _signal_evolution_runner(
+                    job,
+                    signal.SIGTERM,
+                    event_type="evolution_runner_sigterm_sent",
+                    summary="已向进化任务执行进程发送 SIGTERM",
+                )
         if task is not None:
             task.latest_evolution_job_id = job.id
-            task.latest_evolution_status = EVOLUTION_CANCELLED
+            task.latest_evolution_status = job.status
             task.latest_evolution_completed_at = job.completed_at
             _record_task_event_from_row(
                 task,
-                event_type="evolution_cancelled",
-                summary="手动进化任务已结束",
+                event_type="evolution_cancel_requested" if job.status == EVOLUTION_CANCELLING else "evolution_cancelled",
+                summary="已提交进化任务结束请求" if job.status == EVOLUTION_CANCELLING else "手动进化任务已结束",
                 stage_key="evolution",
                 status=task.status,
-                detail={"job_id": job.id},
+                detail={"job_id": job.id, **runtime_cleanup},
                 created_by="task_manager",
             )
         db.commit()
@@ -3134,7 +3842,7 @@ def retry_evolution_job(job_id: str) -> dict[str, Any]:
         job = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
         if job is None:
             raise ValueError("进化任务不存在")
-        if str(job.status or "") in {EVOLUTION_PENDING, EVOLUTION_RUNNING}:
+        if str(job.status or "") in {EVOLUTION_PENDING, EVOLUTION_CLAIMED, EVOLUTION_RUNNING, EVOLUTION_CANCELLING}:
             raise ValueError("运行中的进化任务不能重试")
         task = db.query(UnpackTask).filter(UnpackTask.id == job.task_id).first()
         if task is None:
@@ -3144,19 +3852,34 @@ def retry_evolution_job(job_id: str) -> dict[str, Any]:
             .filter(
                 FirmwareEvolutionJob.task_id == job.task_id,
                 FirmwareEvolutionJob.id != job.id,
-                FirmwareEvolutionJob.status.in_([EVOLUTION_PENDING, EVOLUTION_RUNNING]),
+                FirmwareEvolutionJob.status.in_([EVOLUTION_PENDING, EVOLUTION_CLAIMED, EVOLUTION_RUNNING, EVOLUTION_CANCELLING]),
             )
             .first()
         )
         if existing is not None:
             raise ValueError("当前主任务已有运行中的进化任务")
+        job_root = _derive_evolution_job_root(str(task.output_path or ""), job.id)
+        runtime_cleanup = _terminate_evolution_runtime(job.id, job_root)
+        _cleanup_evolution_job_workspace(job_root)
         db.query(FirmwareEvolutionRound).filter(FirmwareEvolutionRound.job_id == job.id).delete()
-        source_tool_path = _resolve_evolution_dispatcher_tool_path(task) or _resolve_evolution_source_tool_path(task, job)
         job.status = EVOLUTION_PENDING
         job.current_round = 0
         job.current_stage = "evolution_execute"
         job.owner_id = None
+        job.dispatch_owner_id = None
+        job.dispatch_token = None
+        job.dispatch_claimed_at = None
+        job.dispatch_lease_expires_at = None
+        job.heartbeat_at = None
         job.lease_expires_at = None
+        job.cancel_requested_at = None
+        job.last_progress_at = now_local()
+        job.runner_pid = None
+        job.runner_started_at = None
+        job.runner_heartbeat_at = None
+        job.run_token = None
+        job.cancel_grace_deadline = None
+        job.cancel_force_deadline = None
         job.error_message = None
         job.started_at = None
         job.completed_at = None
@@ -3175,7 +3898,7 @@ def retry_evolution_job(job_id: str) -> dict[str, Any]:
             summary="手动进化任务已重新排队",
             stage_key="evolution",
             status=task.status,
-            detail={"job_id": job.id},
+            detail={"job_id": job.id, **runtime_cleanup},
             created_by="task_manager",
         )
         _write_task_result_cache(task.id)
@@ -3192,10 +3915,12 @@ def delete_evolution_job(job_id: str) -> dict[str, Any]:
         job = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
         if job is None:
             raise ValueError("进化任务不存在")
-        if str(job.status or "") in {EVOLUTION_PENDING, EVOLUTION_RUNNING}:
+        if str(job.status or "") in {EVOLUTION_PENDING, EVOLUTION_CLAIMED, EVOLUTION_RUNNING, EVOLUTION_CANCELLING}:
             raise ValueError("运行中的进化任务不能删除，请先结束")
         task_id = job.task_id
         task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+        job_root = _derive_evolution_job_root(str(task.output_path or ""), job.id) if task is not None else None
+        runtime_cleanup = _terminate_evolution_runtime(job.id, job_root)
         db.query(FirmwareEvolutionRound).filter(FirmwareEvolutionRound.job_id == job.id).delete()
         db.delete(job)
         latest = (
@@ -3211,6 +3936,18 @@ def delete_evolution_job(job_id: str) -> dict[str, Any]:
             task.latest_evolution_completed_at = latest.completed_at if latest is not None else None
             task.latest_evolution_final_skill_path = latest.final_skill_path if latest is not None else None
         db.commit()
+        if job_root is not None:
+            shutil.rmtree(job_root, ignore_errors=True)
+        if task is not None:
+            _record_task_event_from_row(
+                task,
+                event_type="evolution_deleted",
+                summary="手动进化任务已删除",
+                stage_key="evolution",
+                status=task.status,
+                detail={"job_id": job_id, **runtime_cleanup},
+                created_by="task_manager",
+            )
         if task is not None:
             _write_task_result_cache(task.id)
         return {"message": "进化任务已删除", "task_id": task_id}
@@ -3423,187 +4160,202 @@ def confirm_evolution_tool_replacement(job_id: str) -> dict[str, Any]:
 
 
 def process_evolution_jobs(limit: int = 1) -> int:
-    from app.evolution_engine import run_evolution_job
-    from app.model import FirmwareEvolutionJob, FirmwareEvolutionRound, UnpackTask, get_db_session, get_worker_id, generate_id
-
-    owner_id = get_worker_id()
     processed = 0
     while processed < max(1, limit):
         available_slots = _runtime_max_concurrent() - get_local_active_task_count()
         if available_slots <= 0:
             break
-        db = get_db_session()
-        job = None
-        now = now_local()
-        try:
-            job = (
-                db.query(FirmwareEvolutionJob)
-                .filter(
-                    (FirmwareEvolutionJob.status == EVOLUTION_PENDING)
-                    | (
-                        (FirmwareEvolutionJob.status == EVOLUTION_RUNNING)
-                        & (
-                            (FirmwareEvolutionJob.lease_expires_at.is_(None))
-                            | (FirmwareEvolutionJob.lease_expires_at < now)
-                        )
-                    )
-                )
-                .order_by(FirmwareEvolutionJob.created_at.asc())
-                .first()
-            )
-            if job is None:
-                db.close()
+        claimed_job_ids = _claim_pending_evolution_jobs(max(1, min(limit - processed, available_slots)))
+        if not claimed_job_ids:
+            break
+        for job_id in claimed_job_ids:
+            if _runtime_max_concurrent() - get_local_active_task_count() <= 0:
+                _reset_evolution_claim(job_id)
                 break
-            task = db.query(UnpackTask).filter(UnpackTask.id == job.task_id).first()
-            if task is None:
-                raise RuntimeError("进化任务对应主任务不存在")
-            job.status = EVOLUTION_RUNNING
-            job.owner_id = owner_id
-            job.started_at = job.started_at or now
-            job.completed_at = None
-            job.error_message = None
-            job.attempts = int(job.attempts or 0) + 1
-            job.lease_expires_at = _skill_generation_job_lease_deadline(now)
-            task.latest_evolution_job_id = job.id
-            task.latest_evolution_status = EVOLUTION_RUNNING
-            task.latest_evolution_started_at = job.started_at
-            task.latest_evolution_completed_at = None
-            db.commit()
-            _record_task_event_from_row(
-                task,
-                event_type="evolution_started",
-                summary="手动进化任务开始执行",
-                stage_key="evolution",
-                status=task.status,
-                detail={"job_id": job.id},
-                owner_id=owner_id,
-                created_by="task_manager",
-            )
-            task_id = task.id
-            job_id = job.id
-            project_id = task.project_id
-            firmware_path = task.firmware_path
-            output_path = task.output_path
-            latest_job = (
-                db.query(FirmwareEvolutionJob)
-                .filter(FirmwareEvolutionJob.task_id == task.id)
-                .order_by(FirmwareEvolutionJob.created_at.desc())
-                .first()
-            )
-            active_skill_path = _resolve_evolution_dispatcher_tool_path(task) or _resolve_evolution_source_tool_path(task, latest_job) or ""
-            llm_binding_snapshot = _parse_llm_binding_snapshot(task.llm_binding_snapshot)
-            max_rounds = int(job.max_rounds or EVOLUTION_MAX_ROUNDS)
-        finally:
-            db.close()
-
-        result: dict[str, Any] | None = None
-        error_message: Optional[str] = None
-        try:
-            def _progress(round_id: int, stage: str) -> None:
-                db = get_db_session()
-                try:
-                    current = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
-                    task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
-                    if current is not None:
-                        current.current_round = round_id
-                        current.current_stage = stage
-                        current.lease_expires_at = _skill_generation_job_lease_deadline(now_local())
-                    if task is not None:
-                        task.latest_evolution_status = EVOLUTION_RUNNING
-                    db.commit()
-                finally:
-                    db.close()
-
-            result = run_evolution_job(
-                task_id=task_id,
-                evolution_job_id=job_id,
-                firmware_path=firmware_path,
-                unpack_output_path=output_path,
-                active_skill_path=active_skill_path,
-                llm_binding_snapshot=llm_binding_snapshot,
-                max_rounds=max_rounds,
-                progress_callback=_progress,
-            )
-        except Exception as exc:
-            error_message = str(exc)
-            logger.warning("failed to process evolution job %s task %s: %s", job_id, task_id, exc)
-
-        db = get_db_session()
-        try:
-            current = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
-            task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
-            if current is None or task is None:
+            try:
+                _launch_evolution_runner(job_id)
                 processed += 1
-                continue
-            if str(current.status or "") == EVOLUTION_CANCELLED:
-                current.owner_id = owner_id
-                current.lease_expires_at = None
-                current.completed_at = current.completed_at or now_local()
-                task.latest_evolution_job_id = job_id
-                task.latest_evolution_status = EVOLUTION_CANCELLED
-                task.latest_evolution_completed_at = current.completed_at
-                db.commit()
-                _write_task_result_cache(task_id)
-                processed += 1
-                continue
-            db.query(FirmwareEvolutionRound).filter(FirmwareEvolutionRound.job_id == job_id).delete()
-            for item in list((result or {}).get("rounds") or []):
-                if not isinstance(item, dict):
-                    continue
-                db.add(
-                    FirmwareEvolutionRound(
-                        id=generate_id(),
-                        job_id=job_id,
-                        round=int(item.get("round") or 0),
-                        status=str(item.get("status") or "failed"),
-                        tool_skill_path_before=str(item.get("tool_skill_path_before") or "").strip() or None,
-                        tool_skill_path_after=str(item.get("tool_skill_path_after") or "").strip() or None,
-                        tool_changed=bool(item.get("tool_changed")),
-                        review_result=str(item.get("review_result") or "").strip() or None,
-                        summary_path=str(item.get("summary_path") or "").strip() or None,
-                        reason_path=str(item.get("reason_path") or "").strip() or None,
-                        created_at=now_local(),
-                        completed_at=now_local(),
-                    )
-                )
-            completed_at = now_local()
-            current.owner_id = owner_id
-            current.lease_expires_at = None
-            current.completed_at = completed_at
-            current.current_round = int((result or {}).get("current_round") or current.current_round or 0)
-            current.current_stage = "review"
-            current.status = EVOLUTION_FAILED if error_message else str((result or {}).get("status") or EVOLUTION_FAILED)
-            current.error_message = error_message
-            current.final_skill_path = str((result or {}).get("final_skill_path") or "").strip() or None
-            current.replaced_skill_path = str((result or {}).get("replaced_skill_path") or "").strip() or None
-            current.review_passed = bool((result or {}).get("review_passed"))
-            task.latest_evolution_job_id = job_id
-            task.latest_evolution_status = current.status
-            task.latest_evolution_started_at = current.started_at
-            task.latest_evolution_completed_at = completed_at
-            task.latest_evolution_final_skill_path = current.final_skill_path
-            db.commit()
-            _record_task_event_from_row(
-                task,
-                event_type="evolution_failed" if error_message or current.status != EVOLUTION_SUCCESS else "evolution_completed",
-                summary="手动进化任务失败" if error_message or current.status != EVOLUTION_SUCCESS else "手动进化任务完成",
-                stage_key="evolution",
-                status=task.status,
-                detail={
-                    "job_id": job_id,
-                    "evolution_status": current.status,
-                    "current_round": current.current_round,
-                    "final_skill_path": current.final_skill_path,
-                    "error": error_message,
-                },
-                owner_id=owner_id,
-                created_by="task_manager",
-            )
-            _write_task_result_cache(task_id)
-        finally:
-            db.close()
-        processed += 1
+            except Exception:
+                _reset_evolution_claim(job_id)
+                raise
     return processed
+
+
+def _run_claimed_evolution_job(job_id: str) -> None:
+    from app.model import FirmwareEvolutionJob, get_db_session
+    from app.services.worker import get_worker_id
+
+    owner_id = get_worker_id()
+    db = get_db_session()
+    try:
+        job = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
+        run_token = job.run_token if job is not None else None
+    finally:
+        db.close()
+    if not run_token:
+        return
+    run_claimed_evolution_job_process(job_id, owner_id=owner_id, run_token=run_token)
+
+
+def run_claimed_evolution_job_process(job_id: str, *, owner_id: str, run_token: str) -> None:
+    from app.evolution_engine import run_evolution_job
+    from app.model import FirmwareEvolutionJob, FirmwareEvolutionRound, UnpackTask, generate_id, get_db_session
+
+    db = get_db_session()
+    try:
+        job = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
+        if job is None or job.owner_id != owner_id or job.run_token != run_token:
+            return
+        project_id = job.project_id
+        task = db.query(UnpackTask).filter(UnpackTask.id == job.task_id).first()
+        if task is None:
+            raise RuntimeError("进化任务对应主任务不存在")
+        task_id = task.id
+        firmware_path = task.firmware_path
+        output_path = task.output_path
+        latest_job = (
+            db.query(FirmwareEvolutionJob)
+            .filter(FirmwareEvolutionJob.task_id == task.id)
+            .order_by(FirmwareEvolutionJob.created_at.desc())
+            .first()
+        )
+        active_skill_path = _resolve_evolution_dispatcher_tool_path(task) or _resolve_evolution_source_tool_path(task, latest_job) or ""
+        llm_binding_snapshot = _parse_llm_binding_snapshot(task.llm_binding_snapshot)
+        max_rounds = int(job.max_rounds or EVOLUTION_MAX_ROUNDS)
+    finally:
+        db.close()
+
+    result: dict[str, Any] | None = None
+    error_message: Optional[str] = None
+    _register_evolution_pid(job_id, os.getpid())
+    try:
+        if _should_cancel_evolution_run(job_id, run_token):
+            _mark_evolution_cancelled(job_id, reason="cancel requested before execution")
+            return
+
+        _record_task_event(
+            task_id,
+            project_id=project_id,
+            event_type="evolution_started",
+            summary="手动进化任务开始执行",
+            stage_key="evolution",
+            status=EVOLUTION_RUNNING,
+            detail={"job_id": job_id, "owner_id": owner_id},
+            owner_id=owner_id,
+            created_by="task_manager",
+        )
+
+        result = run_evolution_job(
+            task_id=task_id,
+            evolution_job_id=job_id,
+            firmware_path=firmware_path,
+            unpack_output_path=output_path,
+            active_skill_path=active_skill_path,
+            llm_binding_snapshot=llm_binding_snapshot,
+            max_rounds=max_rounds,
+            progress_callback=lambda round_id, stage: _update_evolution_progress_for_owner(
+                job_id,
+                owner_id=owner_id,
+                run_token=run_token,
+                round_id=round_id,
+                stage=stage,
+            ),
+        )
+    except Exception as exc:
+        logger.exception("evolution job %s failed with exception: %s", job_id, exc)
+        error_message = str(exc)
+    finally:
+        _clear_registered_evolution_pid(job_id)
+
+    db = get_db_session()
+    try:
+        current = (
+            db.query(FirmwareEvolutionJob)
+            .filter(
+                FirmwareEvolutionJob.id == job_id,
+                FirmwareEvolutionJob.owner_id == owner_id,
+                FirmwareEvolutionJob.run_token == run_token,
+            )
+            .first()
+        )
+        task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+        if current is None or task is None:
+            return
+        if str(current.status or "") == EVOLUTION_CANCELLING:
+            _mark_evolution_cancelled(job_id, reason=error_message or "cancel requested during execution")
+            return
+
+        db.query(FirmwareEvolutionRound).filter(FirmwareEvolutionRound.job_id == job_id).delete()
+        for item in list((result or {}).get("rounds") or []):
+            if not isinstance(item, dict):
+                continue
+            db.add(
+                FirmwareEvolutionRound(
+                    id=generate_id(),
+                    job_id=job_id,
+                    round=int(item.get("round") or 0),
+                    status=str(item.get("status") or "failed"),
+                    tool_skill_path_before=str(item.get("tool_skill_path_before") or "").strip() or None,
+                    tool_skill_path_after=str(item.get("tool_skill_path_after") or "").strip() or None,
+                    tool_changed=bool(item.get("tool_changed")),
+                    review_result=str(item.get("review_result") or "").strip() or None,
+                    summary_path=str(item.get("summary_path") or "").strip() or None,
+                    reason_path=str(item.get("reason_path") or "").strip() or None,
+                    created_at=now_local(),
+                    completed_at=now_local(),
+                )
+            )
+
+        completed_at = now_local()
+        current.status = EVOLUTION_FAILED if error_message else str((result or {}).get("status") or EVOLUTION_FAILED)
+        current.owner_id = None
+        current.dispatch_owner_id = None
+        current.dispatch_token = None
+        current.dispatch_claimed_at = None
+        current.dispatch_lease_expires_at = None
+        current.heartbeat_at = completed_at
+        current.lease_expires_at = None
+        current.cancel_requested_at = None
+        current.last_progress_at = completed_at
+        current.runner_pid = None
+        current.runner_started_at = None
+        current.runner_heartbeat_at = None
+        current.run_token = None
+        current.cancel_grace_deadline = None
+        current.cancel_force_deadline = None
+        current.completed_at = completed_at
+        current.current_round = int((result or {}).get("current_round") or current.current_round or 0)
+        current.current_stage = "review"
+        current.error_message = error_message
+        current.final_skill_path = str((result or {}).get("final_skill_path") or "").strip() or None
+        current.replaced_skill_path = str((result or {}).get("replaced_skill_path") or "").strip() or None
+        current.review_passed = bool((result or {}).get("review_passed"))
+
+        task.latest_evolution_job_id = job_id
+        task.latest_evolution_status = current.status
+        task.latest_evolution_started_at = current.started_at
+        task.latest_evolution_completed_at = completed_at
+        task.latest_evolution_final_skill_path = current.final_skill_path
+        db.commit()
+        _record_task_event_from_row(
+            task,
+            event_type="evolution_failed" if error_message or current.status != EVOLUTION_SUCCESS else "evolution_completed",
+            summary="手动进化任务失败" if error_message or current.status != EVOLUTION_SUCCESS else "手动进化任务完成",
+            stage_key="evolution",
+            status=task.status,
+            detail={
+                "job_id": job_id,
+                "evolution_status": current.status,
+                "current_round": current.current_round,
+                "final_skill_path": current.final_skill_path,
+                "error": error_message,
+            },
+            owner_id=owner_id,
+            created_by="task_manager",
+        )
+        _write_task_result_cache(task_id)
+    finally:
+        db.close()
 
 
 def _run_task_result_cache_refresh(task_id: str) -> None:
@@ -3648,7 +4400,7 @@ def _run_task_result_cache_refresh(task_id: str) -> None:
             _active_result_cache_refreshes.discard(task_id)
 
 
-def request_task_result_cache_refresh(task_id: str, *, created_by: str = "task_manager") -> tuple[bool, str]:
+def request_task_result_cache_refresh(task_id: str) -> tuple[bool, str]:
     from app.model import UnpackTask, get_db_session
 
     db = get_db_session()
@@ -3660,12 +4412,13 @@ def request_task_result_cache_refresh(task_id: str, *, created_by: str = "task_m
             if task_id in _active_result_cache_refreshes:
                 return True, "结果缓存刷新已在后台执行中"
             _active_result_cache_refreshes.add(task_id)
-        _record_task_action_event_from_row(
+        _record_task_event_from_row(
             task,
             event_type="task_result_cache_refresh_requested",
             summary="任务结果缓存刷新已受理",
-            detail={"requested_by": created_by},
-            created_by=created_by,
+            stage_key=task.current_stage,
+            status=task.status,
+            created_by="task_manager",
         )
     finally:
         db.close()
@@ -4032,7 +4785,7 @@ def stop() -> None:
 def shutdown() -> None:
     global _executor
 
-    from app.model import TaskStatus, UnpackTask, get_db_session
+    from app.model import FirmwareEvolutionJob, TaskStatus, UnpackTask, get_db_session
     from app.services.worker import get_worker_id
 
     owner_id = get_worker_id()
@@ -4043,6 +4796,14 @@ def shutdown() -> None:
             .filter(
                 UnpackTask.owner_id == owner_id,
                 UnpackTask.status.in_([TaskStatus.CLAIMED.value, TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value]),
+            )
+            .all()
+        )
+        evolution_jobs = (
+            db.query(FirmwareEvolutionJob)
+            .filter(
+                FirmwareEvolutionJob.owner_id == owner_id,
+                FirmwareEvolutionJob.status.in_([EVOLUTION_CLAIMED, EVOLUTION_RUNNING, EVOLUTION_CANCELLING]),
             )
             .all()
         )
@@ -4058,6 +4819,17 @@ def shutdown() -> None:
                 signal.SIGTERM,
                 event_type="runner_shutdown_sigterm_sent",
                 summary="服务停止，已向任务执行进程发送 SIGTERM",
+            )
+    for job in evolution_jobs:
+        if str(job.status or "") == EVOLUTION_CLAIMED:
+            _reset_evolution_claim(job.id)
+            continue
+        if _is_process_alive(job.runner_pid):
+            _signal_evolution_runner(
+                job,
+                signal.SIGTERM,
+                event_type="evolution_runner_shutdown_sigterm_sent",
+                summary="服务停止，已向进化任务执行进程发送 SIGTERM",
             )
 
     _cleanup_completed_futures()
