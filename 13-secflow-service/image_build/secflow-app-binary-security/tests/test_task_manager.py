@@ -17215,12 +17215,12 @@ def _test_dataflow_analyse_client_uses_management_api_prefix(self):
 
     self.assertEqual(
         [
-            ("GET", "/api/app/dataflow-analyse/tasks/dfa-1"),
-            ("GET", "/api/app/dataflow-analyse/tasks"),
-            ("POST", "/api/app/dataflow-analyse/tasks"),
-            ("POST", "/api/app/dataflow-analyse/tasks/dfa-1/cancel"),
-            ("POST", "/api/app/dataflow-analyse/tasks/dfa-1/restart"),
-            ("DELETE", "/api/app/dataflow-analyse/tasks/dfa-1"),
+            ("GET", "/tasks/dfa-1"),
+            ("GET", "/tasks"),
+            ("POST", "/tasks"),
+            ("POST", "/tasks/dfa-1/cancel"),
+            ("POST", "/tasks/dfa-1/restart"),
+            ("DELETE", "/tasks/dfa-1"),
         ],
         recorder.calls,
     )
