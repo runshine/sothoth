@@ -12743,6 +12743,28 @@ class TaskManager:
                 **stage_run.counts,
             },
         )
+        self._merge_task_stage_summary_entry(
+            task,
+            stage_run,
+            {
+                "sequence_no": stage_run.sequence_no,
+                "status": stage_run.status,
+                "total_items": int((stage_run.counts or {}).get("total_items") or len(items)),
+                "success_items": int((stage_run.counts or {}).get("success_items") or len(success)),
+                "failed_items": int((stage_run.counts or {}).get("failed_items") or len(failed)),
+                "orchestration_failed_items": int(
+                    (stage_run.counts or {}).get("failed_items") or len(failed)
+                ),
+                "downstream_missing_items": int((stage_run.counts or {}).get("downstream_missing_items") or 0),
+                "skipped_items": int((stage_run.counts or {}).get("skipped_items") or 0),
+                "running_items": int((stage_run.counts or {}).get("running_items") or 0),
+                "cancelled_items": int((stage_run.counts or {}).get("cancelled_items") or 0),
+                "downstream_status_counts": {},
+                "started_at": stage_run.started_at.isoformat() if stage_run.started_at else None,
+                "finished_at": stage_run.finished_at.isoformat() if stage_run.finished_at else None,
+                "last_error": stage_run.last_error,
+            },
+        )
 
     def _refresh_task_status_after_sync(self, db: Session, task: BinarySecurityTask) -> None:
         current_status = str(task.status or "").strip()

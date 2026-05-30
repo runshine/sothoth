@@ -11952,6 +11952,68 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             event_types = [getattr(event, "event_type", "") for event in db.added if isinstance(event, BinarySecurityEvent)]
             self.assertIn("system_analysis_no_candidate_modules", event_types)
 
+    def test_refresh_system_analysis_stage_from_synced_items_updates_task_stage_summary_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            output_root = workspace / "output"
+            artifact_root = output_root / "system-analyse" / "source_project__sat1"
+            artifact_root.mkdir(parents=True, exist_ok=True)
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="source-task",
+                status="running",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="system_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(output_root),
+                workspace_root=str(workspace),
+            )
+            task.policy = {}
+            stage_run = BinarySecurityStageRun(
+                id="sr1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="system_analysis",
+                sequence_no=1,
+                status="running",
+            )
+            item = BinarySecurityStageItem(
+                id="si1",
+                task_id="t1",
+                project_id="p1",
+                stage_run_id="sr1",
+                stage_name="system_analysis",
+                item_key="source_project",
+                item_name="source-project",
+                status="success",
+                downstream_service="system_analyse",
+                downstream_task_id="sat1",
+            )
+            item.result = {
+                "firmware_key": "source_project",
+                "firmware_name": "source-task",
+                "filename": "source-project",
+                "unpacked_root": str(workspace / "input"),
+                "source_root": str(workspace / "input"),
+                "task_type": TASK_TYPE_SOURCE,
+                "artifact_root": str(artifact_root),
+                "archive_root": str(artifact_root),
+                "modules": [{"module_key": "m1", "module_name": "m1", "risk_level": "高", "risk_score": 9}],
+            }
+            item.output_ref = {"archive_root": str(artifact_root)}
+            db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item])
+
+            self.manager._refresh_system_analysis_stage_from_synced_items(db, task)
+
+            snapshot = dict(task.stage_summary or {}).get("system_analysis") or {}
+            self.assertEqual("success", snapshot.get("status"))
+            self.assertEqual(1, snapshot.get("total_items"))
+            self.assertEqual(1, snapshot.get("success_items"))
+            self.assertEqual(0, snapshot.get("failed_items"))
+            self.assertIsNone(snapshot.get("last_error"))
+
     def test_refresh_system_analysis_stage_preserves_failed_item_reason_when_no_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
