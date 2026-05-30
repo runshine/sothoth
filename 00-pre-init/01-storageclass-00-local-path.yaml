@@ -157,5 +157,5 @@ data:
           effect: NoSchedule
       containers:
         - name: helper-pod
-          image: busybox
+          image: ghcr.io/containerd/busybox
           imagePullPolicy: IfNotPresent
