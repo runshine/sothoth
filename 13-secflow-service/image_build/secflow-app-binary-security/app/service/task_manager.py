@@ -10740,7 +10740,15 @@ class TaskManager:
                 downstream_status_counts=downstream_status_counts,
                 started_at=run.started_at if run else None,
                 finished_at=run.finished_at if run else None,
-                last_error=(run.last_error if run and run.last_error else next((item.error_message for item in stage_items if item.error_message), None)),
+                last_error=(
+                    run.last_error
+                    if run and run.last_error
+                    else (
+                        next((item.error_message for item in stage_items if item.error_message), None)
+                        if self._business_stage_status(task, stage_name, run, stage_items) in {"failed", "partial_success", "downstream_missing", "cancelled"}
+                        else None
+                    )
+                ),
             )
             stage_summary.abnormal_reason = self._stage_abnormal_reason(stage_name, stage_summary, stage_items)
             summaries.append(stage_summary)

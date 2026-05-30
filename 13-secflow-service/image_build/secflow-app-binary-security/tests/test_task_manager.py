@@ -9296,6 +9296,54 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("running", run.status)
         self.assertIsNone(run.last_error)
 
+    def test_build_stage_summaries_running_stage_does_not_surface_failed_item_error(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        failed_item = BinarySecurityStageItem(
+            id="si-failed",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="source_project-api",
+            status="failed",
+            error_message="流水线未产生任何外部入口结果",
+        )
+        running_item = BinarySecurityStageItem(
+            id="si-running",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="source_project-cri",
+            status="running",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[failed_item, running_item])
+
+        summaries = self.manager._build_stage_summaries(db, task, ["entry_analysis"], [run], [failed_item, running_item])
+
+        self.assertEqual(1, len(summaries))
+        self.assertEqual("running", summaries[0].status)
+        self.assertIsNone(summaries[0].last_error)
+
     def test_stage_retry_full_terminal_failure_clears_retry_context(self):
         task = BinarySecurityTask(
             id="task1",
