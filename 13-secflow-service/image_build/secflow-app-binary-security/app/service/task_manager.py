@@ -6309,6 +6309,47 @@ class TaskManager:
             state_applied=state_applied,
         )
 
+    def _refresh_polled_child_sync_snapshot(
+        self,
+        *,
+        task_id: str,
+        item_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        mapped_status = self._map_downstream_status(str(payload.get("status") or "").lower())
+        if mapped_status not in {"pending", "queued", "running"}:
+            return
+        session = get_session_factory()()
+        try:
+            task = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
+            item = session.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == item_id).first()
+            if task is None or item is None:
+                return
+            current_downstream_task_id = str(item.downstream_task_id or "").strip()
+            payload_task_id = str(payload.get("task_id") or payload.get("id") or "").strip()
+            if payload_task_id and current_downstream_task_id and payload_task_id != current_downstream_task_id:
+                return
+            if mapped_status in {"queued", "running"}:
+                item.status = mapped_status
+                item.started_at = item.started_at or _now()
+                item.finished_at = None
+                item.error_message = None
+            self._mark_stage_item_sync_observation(
+                item,
+                sync_status="synced",
+                error_message=None,
+                status_raw=self._string_or_none(payload.get("status")),
+                mapped_status=mapped_status,
+                downstream_status=self._string_or_none(payload.get("status")),
+                state_applied=True,
+            )
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     def _apply_stage_worker_start_requested_locked(self, db: Session, event: BinarySecurityStateEvent) -> None:
         payload = dict(event.payload or {})
         if payload.get("stage_start_applied"):
@@ -15270,6 +15311,13 @@ class TaskManager:
                 if mapped_status == "downstream_missing":
                     return "downstream_missing", payload
                 return "failed", payload
+            if item is not None:
+                await asyncio.to_thread(
+                    self._refresh_polled_child_sync_snapshot,
+                    task_id=task.id,
+                    item_id=item.id,
+                    payload=dict(payload),
+                )
             if await self._is_task_cancelled_async(task.id):
                 if item and item.downstream_task_id:
                     await self._cancel_downstream(item, self._service_token())

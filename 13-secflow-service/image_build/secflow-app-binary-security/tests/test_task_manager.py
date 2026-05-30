@@ -13623,6 +13623,75 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("cancelled", status)
         self.assertEqual("cancelled", payload["status"])
 
+    def test_poll_until_terminal_refreshes_sync_snapshot_for_running_payload(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="entry_analysis",
+            item_key="IPSEC",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+            result={"sync_status": "transport_error"},
+        )
+        responses = iter([
+            {"task_id": "eat_1", "status": "running"},
+            {"task_id": "eat_1", "status": "success"},
+        ])
+
+        async def _fetch():
+            return next(responses)
+
+        async def _noop_async(*_args, **_kwargs):
+            return None
+
+        refresh_mock = unittest.mock.Mock()
+        original_ensure = self.manager._ensure_task_execution_current_async
+        original_touch = self.manager._touch_task_heartbeat_async
+        original_cancelled = self.manager._is_task_cancelled_async
+        original_refresh = self.manager._refresh_polled_child_sync_snapshot
+        self.manager._ensure_task_execution_current_async = _noop_async
+        self.manager._touch_task_heartbeat_async = _noop_async
+        self.manager._is_task_cancelled_async = unittest.mock.AsyncMock(return_value=False)
+        self.manager._refresh_polled_child_sync_snapshot = refresh_mock
+        try:
+            with patch("app.service.task_manager.asyncio.sleep", new=unittest.mock.AsyncMock(return_value=None)):
+                status, payload = asyncio.run(
+                    self.manager._poll_until_terminal(
+                        _fetch,
+                        success_statuses={"passed", "success"},
+                        failure_statuses={"failed", "error", "cancelled"},
+                        task=task,
+                        item=item,
+                    )
+                )
+        finally:
+            self.manager._ensure_task_execution_current_async = original_ensure
+            self.manager._touch_task_heartbeat_async = original_touch
+            self.manager._is_task_cancelled_async = original_cancelled
+            self.manager._refresh_polled_child_sync_snapshot = original_refresh
+
+        self.assertEqual("success", status)
+        self.assertEqual("success", payload["status"])
+        refresh_mock.assert_called_once_with(
+            task_id="task1",
+            item_id="si1",
+            payload={"task_id": "eat_1", "status": "running"},
+        )
+
     def test_run_stage_item_by_id_requeues_dispatching_item_after_transport_error(self):
         task = BinarySecurityTask(
             id="task1",
