@@ -13,6 +13,9 @@ from app.exception import UpstreamError, setup_exception_handlers
 from app.model import get_db
 from app.service.project import ProjectService
 from app.schemas import (
+    BinarySecurityAbnormalReasonHistoryResponse,
+    BinarySecurityArchiveJobPageResponse,
+    BinarySecurityOverviewResponse,
     BinarySecurityProjectConfigPayload,
     BinarySecurityProjectConfigResponse,
     BinarySecurityServiceConfigPayload,
@@ -138,6 +141,25 @@ class _RouteManagerStub:
                 "metadata_path": "/w/input/task-metadata.json",
             },
         }
+
+    def get_task_overview(self, db, project_id, task_id):
+        self.calls.append(("get_task_overview", db, project_id, task_id))
+        return BinarySecurityOverviewResponse(task_id=task_id, nodes=[])
+
+    def get_task_archive_jobs_page(self, db, project_id, task_id, stage_name, page, per_page):
+        self.calls.append(("get_task_archive_jobs_page", db, project_id, task_id, stage_name, page, per_page))
+        return BinarySecurityArchiveJobPageResponse(
+            task_id=task_id,
+            stage_name=stage_name,
+            total=0,
+            page=page,
+            per_page=per_page,
+            items=[],
+        )
+
+    def get_task_abnormal_reason_history(self, db, project_id, task_id):
+        self.calls.append(("get_task_abnormal_reason_history", db, project_id, task_id))
+        return BinarySecurityAbnormalReasonHistoryResponse(task_id=task_id, items=[])
 
     def get_service_config(self, db):
         self.calls.append(("get_service_config", db))
@@ -270,6 +292,52 @@ class TaskApiRouteTests(unittest.TestCase):
             ("get_orchestration_observability", fake_db, "p1", "t1"),
             manager.calls[0],
         )
+
+    def test_get_task_overview_route_delegates_to_manager(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/app/binary-security/projects/p1/tasks/t1/overview",
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(("get_task_overview", fake_db, "p1", "t1"), manager.calls[0])
+
+    def test_get_task_archive_jobs_route_preserves_filters(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/app/binary-security/projects/p1/tasks/t1/archive-jobs",
+                    params={"stage_name": "vuln_scan", "page": 3, "per_page": 7},
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(
+            ("get_task_archive_jobs_page", fake_db, "p1", "t1", "vuln_scan", 3, 7),
+            manager.calls[0],
+        )
+
+    def test_get_task_abnormal_reason_history_route_delegates_to_manager(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/app/binary-security/projects/p1/tasks/t1/abnormal-reason-history",
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(("get_task_abnormal_reason_history", fake_db, "p1", "t1"), manager.calls[0])
 
     def test_get_service_config_route_returns_defaults(self):
         app, fake_db = self._build_client()

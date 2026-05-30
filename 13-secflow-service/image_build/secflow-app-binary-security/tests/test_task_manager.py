@@ -444,9 +444,11 @@ class _AsyncEntryAnalyseClientStub:
         self.created = 0
         self.deleted: list[str] = []
         self.cancelled: list[str] = []
+        self.list_calls: list[dict[str, object]] = []
 
     async def list_tasks(self, *args, **kwargs):
-        del args, kwargs
+        del args
+        self.list_calls.append(dict(kwargs))
         return self.listed
 
     async def get_task(self, task_id, token=None):
@@ -5925,7 +5927,10 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("archive_failed", detail.archive_jobs[0].abnormal_reason.code)
         self.assertEqual("downstream_failed", detail.stage_items[0].abnormal_reason.code)
         self.assertEqual("downstream_failed", detail.stage_summaries[2].abnormal_reason.code)
-        self.assertEqual(1, len(detail.abnormal_reason_history))
+        self.assertEqual([], detail.abnormal_reason_history)
+
+        history = self.manager.get_task_abnormal_reason_history(db, project_id="p1", task_id="t1")
+        self.assertEqual(1, len(history.items))
 
     def test_get_task_detail_streaming_tail_snapshot_stays_consistent(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -9317,6 +9322,88 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("downstream_missing", item.status)
         self.assertEqual("下游子任务不存在", item.error_message)
         self.assertEqual(1, resp.synced_downstream_count)
+
+    def test_sync_downstream_status_skips_entry_payload_bound_to_old_stage_item(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="entry_analysis",
+            item_key="m1",
+            parent_key="source_project",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_old_round",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
+
+        original_fetch = self.manager._fetch_downstream_task_payload
+        original_find = self.manager._find_reusable_entry_payload
+        original_write = self.manager._write_task_metadata_async
+        original_enqueue = self.manager._enqueue_task
+
+        async def _fetch(*_args, **_kwargs):
+            return {
+                "task_id": "eat_old_round",
+                "status": "passed",
+                "parent_stage_item_id": "si-old",
+                "parent_stage_item_key": "m1",
+            }
+
+        async def _find(*_args, **_kwargs):
+            return None
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._fetch_downstream_task_payload = _fetch
+        self.manager._find_reusable_entry_payload = _find
+        self.manager._write_task_metadata_async = _noop_write
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        try:
+            resp = asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id="p1",
+                    task_id="s1",
+                    stage_name="entry_analysis",
+                    apply_state=True,
+                )
+            )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+            self.manager._find_reusable_entry_payload = original_find
+            self.manager._write_task_metadata_async = original_write
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual("running", item.status)
+        self.assertEqual("binding_mismatch", item.result.get("sync_status"))
+        mismatch_events = [event for event in db.events if event.event_type == "downstream_parent_mismatch"]
+        self.assertTrue(mismatch_events)
+        self.assertEqual("si1", mismatch_events[-1].payload.get("expected_parent_stage_item_id"))
+        self.assertEqual("si-old", mismatch_events[-1].payload.get("observed_parent_stage_item_id"))
+        self.assertEqual(0, resp.synced_downstream_count)
 
     def test_sync_downstream_status_keeps_all_missing_children_after_multiple_404s(self):
         task = BinarySecurityTask(
@@ -14482,6 +14569,64 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(payload)
         self.assertEqual("eat-running", payload["task_id"])
         self.assertEqual("eat-running", item.downstream_task_id)
+
+    def test_find_reusable_entry_payload_prefers_latest_when_status_ties(self):
+        task = BinarySecurityTask(id="t1", project_id="p1")
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-old",
+            status="queued",
+        )
+        client = _AsyncEntryAnalyseClientStub(
+            listed={
+                "items": [
+                    {"task_id": "eat-running-old", "status": "running", "parent_stage_item_id": "si1", "updated_at": "2026-05-18T23:34:41"},
+                    {"task_id": "eat-running-new", "status": "running", "parent_stage_item_id": "si1", "updated_at": "2026-05-18T23:36:41"},
+                ]
+            }
+        )
+
+        with patch.object(downstream_tasks_module, "get_entry_analyse_client", return_value=client):
+            payload = asyncio.run(self.manager._find_reusable_entry_payload(task, item, "tok"))
+
+        self.assertIsNotNone(payload)
+        self.assertEqual("eat-running-new", payload["task_id"])
+        self.assertEqual("eat-running-new", item.downstream_task_id)
+
+    def test_find_reusable_entry_payload_does_not_fallback_to_item_key_when_id_exists(self):
+        task = BinarySecurityTask(id="t1", project_id="p1")
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-old",
+            status="queued",
+        )
+        client = _AsyncEntryAnalyseClientStub(
+            listed={
+                "items": [
+                    {"task_id": "eat-stale", "status": "running", "parent_stage_item_id": "si-old", "parent_stage_item_key": "module-1", "updated_at": "2026-05-18T23:40:41"},
+                ]
+            }
+        )
+
+        with patch.object(downstream_tasks_module, "get_entry_analyse_client", return_value=client):
+            payload = asyncio.run(self.manager._find_reusable_entry_payload(task, item, "tok"))
+
+        self.assertIsNone(payload)
+        self.assertEqual("eat-old", item.downstream_task_id)
+        self.assertTrue(client.list_calls)
+        self.assertEqual("entry_analysis", client.list_calls[-1]["parent_stage_name"])
+        self.assertEqual("si1", client.list_calls[-1]["parent_stage_item_id"])
+        self.assertIsNone(client.list_calls[-1].get("parent_stage_item_key"))
 
     def test_find_reusable_firmware_unpack_payload_prefers_active_duplicate_task(self):
         task = BinarySecurityTask(id="t1", project_id="p1")

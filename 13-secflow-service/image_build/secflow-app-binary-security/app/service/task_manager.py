@@ -21,6 +21,7 @@ from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
+from dataclasses import dataclass, field
 
 from sqlalchemy import Integer, case, cast, func, or_, text
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -85,14 +86,17 @@ from app.observability import (
     render_metrics,
 )
 from app.schemas import (
+    BinarySecurityAbnormalReasonHistoryResponse,
     BinarySecurityActionResponse,
     BinarySecurityAbnormalEvidence,
     BinarySecurityAbnormalReason,
     BinarySecurityAbnormalReasonEventSummary,
+    BinarySecurityArchiveJobPageResponse,
     BinarySecurityArchiveJobResponse,
     BinarySecurityArtifactsResponse,
     BinarySecurityInputFile,
     BinarySecurityModuleSelectionResponse,
+    BinarySecurityOverviewResponse,
     BinarySecurityOverviewArchiveDetail,
     BinarySecurityOverviewBusinessDetail,
     BinarySecurityOverviewNode,
@@ -138,6 +142,18 @@ logger = logging.getLogger(__name__)
 
 DB_SUMMARY_ITEM_LIMIT = 50
 DB_FAILURE_ITEM_LIMIT = 20
+
+
+@dataclass
+class _TaskDetailContext:
+    task: BinarySecurityTask
+    queue_info: dict[str, Any]
+    stage_sequence: list[str]
+    stage_runs: list[BinarySecurityStageRun] = field(default_factory=list)
+    stage_items: list[BinarySecurityStageItem] = field(default_factory=list)
+    archive_jobs: list[BinarySecurityArchiveJob] = field(default_factory=list)
+    stage_summaries: list[BinarySecurityStageSummary] = field(default_factory=list)
+    abnormal_reason: BinarySecurityAbnormalReason | None = None
 DB_ENTRY_PREVIEW_LIMIT = 50
 DB_ARTIFACT_PREVIEW_LIMIT = 50
 DB_EVENT_PAYLOAD_LIMIT_BYTES = 32768
@@ -1508,82 +1524,36 @@ class TaskManager:
             )
 
     def get_task_detail(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskDetailResponse:
-        task = self._task_or_404(db, project_id, task_id)
-        active_stage_name = self._active_reconcile_stage_name(task)
-        if active_stage_name:
-            self._refresh_stage_from_authoritative_items(db, task, active_stage_name)
-        items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).order_by(
-            BinarySecurityStageItem.created_at.asc()
-        ).all()
-        archive_jobs = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id).order_by(
-            BinarySecurityArchiveJob.created_at.asc()
-        ).all()
-        queue_info = self._build_queue_info(db, project_id=project_id)
-        base = self._task_response(db, task, queue_info=queue_info).model_dump()
+        ctx = self._build_task_detail_context(db, project_id=project_id, task_id=task_id)
+        base = self._task_response(db, ctx.task, queue_info=ctx.queue_info, detail_ctx=ctx).model_dump()
         base.pop("execution_epoch", None)
-        stage_summaries = [BinarySecurityStageSummary(**summary) if isinstance(summary, dict) else summary for summary in base.get("stage_summaries", [])]
-        archive_job_responses: list[BinarySecurityArchiveJobResponse] = []
-        for job in archive_jobs:
-            retry_supported, retry_reason = self._archive_job_retry_support(db, task, job)
-            archive_job_responses.append(
-                BinarySecurityArchiveJobResponse(
-                    id=job.id,
-                    stage_name=job.stage_name,
-                    item_id=job.item_id,
-                    item_key=job.item_key,
-                    downstream_service=job.downstream_service,
-                    downstream_task_id=job.downstream_task_id,
-                    archive_status=job.archive_status,
-                    archive_root=job.archive_root,
-                    error_message=job.error_message,
-                    abnormal_reason=self._archive_job_abnormal_reason(job),
-                    attempts=job.attempts or 0,
-                    created_at=job.created_at,
-                    started_at=job.started_at,
-                    completed_at=job.completed_at,
-                    updated_at=job.updated_at,
-                    retry_supported=retry_supported,
-                    retry_reason=retry_reason,
-                    retry_failed_supported=retry_supported,
-                    retry_failed_reason=retry_reason,
-                    copy_stats=dict((job.payload or {}).get("archive_copy_stats") or {}),
-                )
-            )
-        abnormal_reason = None
-        if isinstance(task.latest_abnormal_reason, dict):
-            try:
-                abnormal_reason = BinarySecurityAbnormalReason(**task.latest_abnormal_reason)
-            except Exception:
-                abnormal_reason = None
-        if abnormal_reason is None:
-            abnormal_reason = self._task_abnormal_reason(task, stage_summaries, items, archive_jobs)
-        base["abnormal_reason"] = abnormal_reason
-        stage_item_responses = [self._stage_item_response(item) for item in items[:DETAIL_STAGE_ITEMS_LIMIT]]
+        stage_item_responses = [self._stage_item_response(item) for item in ctx.stage_items[:DETAIL_STAGE_ITEMS_LIMIT]]
+        archive_job_responses = self._archive_job_responses(db, ctx.task, ctx.archive_jobs)
         return BinarySecurityTaskDetailResponse(
             **base,
-            execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
-            description=task.description,
-            output_root=task.output_root,
-            workspace_root=task.workspace_root,
-            fileserver_subproject_name=task.fileserver_subproject_name,
-            policy=task.policy,
-            summary=task.summary,
-            metrics=task.metrics,
-            item_stats=self._item_stats(items),
-            stage_items_total=len(items),
-            stage_items_truncated=len(items) > DETAIL_STAGE_ITEMS_LIMIT,
+            execution_epoch=int(getattr(ctx.task, "execution_epoch", 0) or 0),
+            description=ctx.task.description,
+            output_root=ctx.task.output_root,
+            workspace_root=ctx.task.workspace_root,
+            fileserver_subproject_name=ctx.task.fileserver_subproject_name,
+            policy=ctx.task.policy,
+            summary=ctx.task.summary,
+            metrics=ctx.task.metrics,
+            item_stats=self._item_stats(ctx.stage_items),
+            stage_items_total=len(ctx.stage_items),
+            stage_items_truncated=len(ctx.stage_items) > DETAIL_STAGE_ITEMS_LIMIT,
             stage_items=stage_item_responses,
             archive_jobs=archive_job_responses,
-            abnormal_reason_history=self._abnormal_reason_history(db, task),
+            abnormal_reason_history=[],
             overview_nodes=self._build_stage_overview_nodes(
                 db,
-                task,
-                stage_summaries,
+                ctx.task,
+                ctx.stage_summaries,
                 archive_job_responses,
-                items,
+                ctx.stage_items,
             ),
-            orchestration_observability=self._build_orchestration_observability(db, task),
-            cleanup_snapshot=dict(task.cleanup_snapshot or {}),
+            orchestration_observability=self._build_orchestration_observability(db, ctx.task),
+            cleanup_snapshot=dict(ctx.task.cleanup_snapshot or {}),
         )
 
     def get_task_stage_items_page(
@@ -1620,6 +1590,139 @@ class TaskManager:
     def get_orchestration_observability(self, db: Session, *, project_id: str, task_id: str) -> dict[str, Any]:
         task = self._task_or_404(db, project_id, task_id)
         return self._build_orchestration_observability(db, task)
+
+    def get_task_overview(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityOverviewResponse:
+        ctx = self._build_task_detail_context(db, project_id=project_id, task_id=task_id)
+        archive_job_responses = self._archive_job_responses(db, ctx.task, ctx.archive_jobs)
+        return BinarySecurityOverviewResponse(
+            task_id=ctx.task.id,
+            nodes=self._build_stage_overview_nodes(
+                db,
+                ctx.task,
+                ctx.stage_summaries,
+                archive_job_responses,
+                ctx.stage_items,
+            ),
+        )
+
+    def get_task_archive_jobs_page(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        stage_name: str | None = None,
+        page: int = 1,
+        per_page: int = 100,
+    ) -> BinarySecurityArchiveJobPageResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        query = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id)
+        normalized_stage_name = str(stage_name or "").strip() or None
+        if normalized_stage_name:
+            query = query.filter(BinarySecurityArchiveJob.stage_name == normalized_stage_name)
+        query = query.order_by(BinarySecurityArchiveJob.created_at.asc(), BinarySecurityArchiveJob.id.asc())
+        total = query.count()
+        rows = query.offset((page - 1) * per_page).limit(per_page).all()
+        return BinarySecurityArchiveJobPageResponse(
+            task_id=task.id,
+            stage_name=normalized_stage_name,
+            total=total,
+            page=page,
+            per_page=per_page,
+            items=self._archive_job_responses(db, task, rows),
+        )
+
+    def get_task_abnormal_reason_history(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+    ) -> BinarySecurityAbnormalReasonHistoryResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        return BinarySecurityAbnormalReasonHistoryResponse(
+            task_id=task.id,
+            items=self._abnormal_reason_history(db, task),
+        )
+
+    def _build_task_detail_context(self, db: Session, *, project_id: str, task_id: str) -> _TaskDetailContext:
+        task = self._task_or_404(db, project_id, task_id)
+        active_stage_name = self._active_reconcile_stage_name(task)
+        if active_stage_name:
+            self._refresh_stage_from_authoritative_items(db, task, active_stage_name)
+        stage_runs = (
+            db.query(BinarySecurityStageRun)
+            .filter(BinarySecurityStageRun.task_id == task.id)
+            .order_by(BinarySecurityStageRun.sequence_no.asc())
+            .all()
+        )
+        stage_items = (
+            db.query(BinarySecurityStageItem)
+            .filter(BinarySecurityStageItem.task_id == task.id)
+            .order_by(BinarySecurityStageItem.created_at.asc(), BinarySecurityStageItem.id.asc())
+            .all()
+        )
+        archive_jobs = (
+            db.query(BinarySecurityArchiveJob)
+            .filter(BinarySecurityArchiveJob.task_id == task.id)
+            .order_by(BinarySecurityArchiveJob.created_at.asc(), BinarySecurityArchiveJob.id.asc())
+            .all()
+        )
+        stage_sequence = self._stage_sequence_for_task(task)
+        stage_summaries = self._build_stage_summaries(db, task, stage_sequence, stage_runs, stage_items)
+        abnormal_reason = None
+        if isinstance(task.latest_abnormal_reason, dict):
+            try:
+                abnormal_reason = BinarySecurityAbnormalReason(**task.latest_abnormal_reason)
+            except Exception:
+                abnormal_reason = None
+        if abnormal_reason is None:
+            abnormal_reason = self._task_abnormal_reason(task, stage_summaries, stage_items, archive_jobs)
+        return _TaskDetailContext(
+            task=task,
+            queue_info=self._build_queue_info(db, project_id=project_id),
+            stage_sequence=stage_sequence,
+            stage_runs=stage_runs,
+            stage_items=stage_items,
+            archive_jobs=archive_jobs,
+            stage_summaries=stage_summaries,
+            abnormal_reason=abnormal_reason,
+        )
+
+    def _archive_job_responses(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        archive_jobs: list[BinarySecurityArchiveJob],
+    ) -> list[BinarySecurityArchiveJobResponse]:
+        archive_job_responses: list[BinarySecurityArchiveJobResponse] = []
+        for job in archive_jobs:
+            retry_supported, retry_reason = self._archive_job_retry_support(db, task, job)
+            archive_job_responses.append(
+                BinarySecurityArchiveJobResponse(
+                    id=job.id,
+                    stage_name=job.stage_name,
+                    item_id=job.item_id,
+                    item_key=job.item_key,
+                    downstream_service=job.downstream_service,
+                    downstream_task_id=job.downstream_task_id,
+                    archive_status=job.archive_status,
+                    archive_root=job.archive_root,
+                    error_message=job.error_message,
+                    abnormal_reason=self._archive_job_abnormal_reason(job),
+                    attempts=job.attempts or 0,
+                    created_at=job.created_at,
+                    started_at=job.started_at,
+                    completed_at=job.completed_at,
+                    updated_at=job.updated_at,
+                    retry_supported=retry_supported,
+                    retry_reason=retry_reason,
+                    retry_failed_supported=retry_supported,
+                    retry_failed_reason=retry_reason,
+                    copy_stats=dict((job.payload or {}).get("archive_copy_stats") or {}),
+                )
+            )
+        return archive_job_responses
 
     def _build_orchestration_observability(self, db: Session, task: BinarySecurityTask) -> dict[str, Any]:
         now_value = _now()
@@ -3706,6 +3809,29 @@ class TaskManager:
                 if exc is not None:
                     raise exc
                 assert isinstance(payload, dict)
+                if item.downstream_service == "entry_analyse":
+                    payload, rebound_notice_payload = await self._reconcile_entry_payload_binding(task, item, payload, auth_token)
+                    if rebound_notice_payload is not None:
+                        self._record_event(
+                            db,
+                            task,
+                            "downstream_parent_mismatch",
+                            "下游子任务绑定到旧轮次阶段项，已阻断旧轮次状态回写",
+                            level="warning",
+                            stage_name=item.stage_name,
+                            item=item,
+                            payload=rebound_notice_payload,
+                        )
+                    if payload is None:
+                        self._mark_stage_item_sync_observation(
+                            item,
+                            sync_status="binding_mismatch",
+                            error_message="下游子任务仍绑定旧轮次阶段项",
+                            error_type="parent_mismatch",
+                            state_applied=False,
+                        )
+                        skipped_count += 1
+                        continue
                 downstream_status = str(payload.get("status") or "").lower()
                 mapped_status = self._map_downstream_status(downstream_status)
                 if not observed_apply_state and stage_name and not item_id:
@@ -11134,29 +11260,48 @@ class TaskManager:
             "can_confirm_modules": str(task.status or "").strip() in {TASK_STATUS_PENDING_MODULE_CONFIRMATION, "waiting_confirmation"},
         }
 
-    def _task_response(self, db: Session, task: BinarySecurityTask, queue_info: dict[str, Any] | None = None) -> BinarySecurityTaskResponse:
-        active_stage_name = self._active_reconcile_stage_name(task)
-        if active_stage_name:
-            self._refresh_stage_from_authoritative_items(db, task, active_stage_name)
-        stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).order_by(BinarySecurityStageRun.sequence_no.asc()).all()
-        items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
-        archive_jobs = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id).all()
+    def _task_response(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        queue_info: dict[str, Any] | None = None,
+        detail_ctx: _TaskDetailContext | None = None,
+    ) -> BinarySecurityTaskResponse:
+        if detail_ctx is None:
+            active_stage_name = self._active_reconcile_stage_name(task)
+            if active_stage_name:
+                self._refresh_stage_from_authoritative_items(db, task, active_stage_name)
+            stage_runs = (
+                db.query(BinarySecurityStageRun)
+                .filter(BinarySecurityStageRun.task_id == task.id)
+                .order_by(BinarySecurityStageRun.sequence_no.asc())
+                .all()
+            )
+            items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
+            archive_jobs = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id).all()
+            stage_sequence = self._stage_sequence_for_task(task)
+            stage_summaries = self._build_stage_summaries(db, task, stage_sequence, stage_runs, items)
+            abnormal_reason = None
+            if isinstance(task.latest_abnormal_reason, dict):
+                try:
+                    abnormal_reason = BinarySecurityAbnormalReason(**task.latest_abnormal_reason)
+                except Exception:
+                    abnormal_reason = None
+            if abnormal_reason is None:
+                abnormal_reason = self._task_abnormal_reason(task, stage_summaries, items, archive_jobs)
+        else:
+            stage_runs = detail_ctx.stage_runs
+            items = detail_ctx.stage_items
+            archive_jobs = detail_ctx.archive_jobs
+            stage_sequence = detail_ctx.stage_sequence
+            stage_summaries = detail_ctx.stage_summaries
+            abnormal_reason = detail_ctx.abnormal_reason
         metrics = task.metrics or {}
         queue_info = queue_info or {"pending_positions": {}}
         queue_position = queue_info.get("pending_positions", {}).get(task.id)
-        stage_sequence = self._stage_sequence_for_task(task)
         task_retry_supported, task_retry_reason, _ = self._task_retry_support(db, task)
         task_continue_supported, task_continue_reason, _ = self._task_continue_support(db, task)
         task_retry_failed_supported, task_retry_failed_reason, _, _ = self._task_retry_failed_items_support(db, task)
-        stage_summaries = self._build_stage_summaries(db, task, stage_sequence, stage_runs, items)
-        abnormal_reason = None
-        if isinstance(task.latest_abnormal_reason, dict):
-            try:
-                abnormal_reason = BinarySecurityAbnormalReason(**task.latest_abnormal_reason)
-            except Exception:
-                abnormal_reason = None
-        if abnormal_reason is None:
-            abnormal_reason = self._task_abnormal_reason(task, stage_summaries, items, archive_jobs)
         manual_operation_state = self._build_manual_operation_state(
             db,
             task,
@@ -13763,7 +13908,7 @@ class TaskManager:
             return payload
         return None
 
-    def _sort_downstream_payload_priority(self, payload: dict[str, Any]) -> tuple[int, datetime, str]:
+    def _sort_downstream_payload_priority(self, payload: dict[str, Any]) -> tuple[int, float, str]:
         status = str(payload.get("status") or "").strip().lower()
         mapped = self._map_downstream_status(status)
         if mapped == "running":
@@ -13783,7 +13928,8 @@ class TaskManager:
             or self._parse_comparable_datetime(payload.get("created_at"))
             or datetime.min
         )
-        return (priority, comparable, str(payload.get("task_id") or payload.get("id") or ""))
+        timestamp = comparable.timestamp() if comparable != datetime.min else float("-inf")
+        return (priority, -timestamp, str(payload.get("task_id") or payload.get("id") or ""))
 
     async def _find_reusable_dataflow_payload(
         self,
@@ -13838,7 +13984,9 @@ class TaskManager:
                 project_id=task.project_id,
                 token=token,
                 parent_task_id=task.id,
+                parent_stage_name=item.stage_name,
                 parent_stage_item_id=item_id or None,
+                parent_stage_item_key=None if item_id else (item_key or None),
                 per_page=100,
                 sort_by="updated_at",
                 sort_order="desc",
@@ -13857,7 +14005,7 @@ class TaskManager:
             if item_id and origin_item_id == item_id:
                 candidates.append(row)
                 continue
-            if item_key and origin_item_key == item_key:
+            if not item_id and item_key and origin_item_key == item_key:
                 candidates.append(row)
         if not candidates:
             return None
@@ -13868,6 +14016,48 @@ class TaskManager:
         if selected_task_id and selected_task_id != current_task_id:
             item.downstream_task_id = selected_task_id
         return selected
+
+    def _entry_payload_matches_stage_item(
+        self,
+        item: BinarySecurityStageItem,
+        payload: dict[str, Any] | None,
+    ) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        item_id = str(item.id or "").strip()
+        item_key = str(item.item_key or "").strip()
+        origin_item_id = str(payload.get("parent_stage_item_id") or "").strip()
+        origin_item_key = str(payload.get("parent_stage_item_key") or "").strip()
+        if item_id:
+            return bool(origin_item_id and origin_item_id == item_id)
+        if item_key:
+            return bool(origin_item_key and origin_item_key == item_key)
+        return False
+
+    async def _reconcile_entry_payload_binding(
+        self,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        payload: dict[str, Any],
+        token: str | None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        if str(item.downstream_service or "").strip() != "entry_analyse":
+            return payload, None
+        if self._entry_payload_matches_stage_item(item, payload):
+            return payload, None
+        mismatch_payload = {
+            "downstream_service": item.downstream_service,
+            "downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+            "expected_parent_stage_item_id": str(item.id or "").strip() or None,
+            "expected_parent_stage_item_key": str(item.item_key or "").strip() or None,
+            "observed_parent_stage_item_id": str(payload.get("parent_stage_item_id") or "").strip() or None,
+            "observed_parent_stage_item_key": str(payload.get("parent_stage_item_key") or "").strip() or None,
+        }
+        rebound = await self._find_reusable_entry_payload(task, item, token)
+        if rebound is not None and self._entry_payload_matches_stage_item(item, rebound):
+            mismatch_payload["rebound_downstream_task_id"] = str(rebound.get("task_id") or rebound.get("id") or "").strip() or None
+            return rebound, mismatch_payload
+        return None, mismatch_payload
 
     async def _find_reusable_firmware_unpack_payload(
         self,

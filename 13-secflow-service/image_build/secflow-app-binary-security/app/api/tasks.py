@@ -13,11 +13,14 @@ from app.exception import UnauthorizedError
 from app.model import get_db
 from app.runtime_health import collect_liveness, collect_readiness
 from app.schemas import (
+    BinarySecurityAbnormalReasonHistoryResponse,
     BinarySecurityActionResponse,
+    BinarySecurityArchiveJobPageResponse,
     BinarySecurityArtifactsResponse,
     BinarySecurityDownstreamStatusSyncPayload,
     BinarySecurityModuleSelectionConfirmPayload,
     BinarySecurityModuleSelectionResponse,
+    BinarySecurityOverviewResponse,
     BinarySecurityProjectConfigPayload,
     BinarySecurityProjectConfigResponse,
     BinarySecurityReducerEventPageResponse,
@@ -225,6 +228,49 @@ def get_task_orchestration_observability(
     db: Session = Depends(get_db),
 ):
     return get_task_manager().get_orchestration_observability(db, project_id=project_id, task_id=task_id)
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/overview", response_model=BinarySecurityOverviewResponse)
+def get_task_overview(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().get_task_overview(db, project_id=project_id, task_id=task_id)
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/archive-jobs", response_model=BinarySecurityArchiveJobPageResponse)
+def get_task_archive_jobs(
+    project_id: str,
+    task_id: str,
+    stage_name: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(100, ge=1, le=1000),
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().get_task_archive_jobs_page(
+        db,
+        project_id=project_id,
+        task_id=task_id,
+        stage_name=stage_name,
+        page=page,
+        per_page=per_page,
+    )
+
+
+@router.get(
+    "/projects/{project_id}/tasks/{task_id}/abnormal-reason-history",
+    response_model=BinarySecurityAbnormalReasonHistoryResponse,
+)
+def get_task_abnormal_reason_history(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().get_task_abnormal_reason_history(db, project_id=project_id, task_id=task_id)
 
 
 @router.put("/projects/{project_id}/tasks/{task_id}/concurrency", response_model=BinarySecurityTaskDetailResponse)

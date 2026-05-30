@@ -454,6 +454,25 @@ class BinarySecurityStageItemPageResponse(BaseModel):
     items: list[BinarySecurityStageItemResponse] = Field(default_factory=list)
 
 
+class BinarySecurityArchiveJobPageResponse(BaseModel):
+    task_id: str
+    stage_name: Optional[str] = None
+    total: int = 0
+    page: int = 1
+    per_page: int = 100
+    items: list[BinarySecurityArchiveJobResponse] = Field(default_factory=list)
+
+
+class BinarySecurityOverviewResponse(BaseModel):
+    task_id: str
+    nodes: list[BinarySecurityOverviewNode] = Field(default_factory=list)
+
+
+class BinarySecurityAbnormalReasonHistoryResponse(BaseModel):
+    task_id: str
+    items: list[BinarySecurityAbnormalReasonEventSummary] = Field(default_factory=list)
+
+
 class BinarySecurityTaskEventResponse(BaseModel):
     id: str
     stage_name: Optional[str] = None
