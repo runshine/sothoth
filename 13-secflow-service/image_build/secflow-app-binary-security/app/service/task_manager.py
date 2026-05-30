@@ -2329,97 +2329,81 @@ class TaskManager:
         return groups
 
     async def cancel_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityActionResponse:
-        operation_token = self._acquire_task_operation_lease(db, task_id, operation="cancel", ttl_seconds=TASK_OPERATION_LOCK_TTL_SECONDS)
-        try:
-            task = self._task_or_404(db, project_id, task_id)
-            if task.status == "cancelled":
-                active_item_count = db.query(BinarySecurityStageItem).filter(
-                    BinarySecurityStageItem.task_id == task.id,
-                    BinarySecurityStageItem.status.in_(["pending", "queued", "running", "dispatching"]),
-                ).count()
-                active_stage_count = db.query(BinarySecurityStageRun).filter(
-                    BinarySecurityStageRun.task_id == task.id,
-                    BinarySecurityStageRun.status.in_(["pending", "dispatching", "queued", "running"]),
-                ).count()
-                if active_item_count <= 0 and active_stage_count <= 0:
-                    observe_task_operation("cancel", "already_cancelled")
-                    self._release_task_operation_lease(db, task_id, token=operation_token)
-                    return BinarySecurityActionResponse(task_id=task_id, message="任务已取消")
-            operation = self._queue_task_operation(
-                db,
-                task,
-                operation_type=TASK_ACTION_CANCEL,
-                target_stage=task.current_stage,
-                requested_by=task.created_by,
-                request_payload={"current_stage": task.current_stage},
-                accepted_event_type="task_cancel_accepted",
-                accepted_message="任务取消已受理，后台正在停止执行并清理下游任务",
-            )
-            observe_task_operation("cancel", "accepted")
-            return BinarySecurityActionResponse(
-                task_id=task_id,
-                operation_id=operation.id,
-                accepted=True,
-                action="cancel",
-                status="accepted",
-                message="任务取消已受理，后台正在停止执行并清理下游任务",
-            )
-        except Exception:
-            self._release_task_operation_lease(db, task_id, token=operation_token)
-            raise
+        task = self._task_or_404(db, project_id, task_id)
+        if task.status == "cancelled":
+            active_item_count = db.query(BinarySecurityStageItem).filter(
+                BinarySecurityStageItem.task_id == task.id,
+                BinarySecurityStageItem.status.in_(["pending", "queued", "running", "dispatching"]),
+            ).count()
+            active_stage_count = db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.status.in_(["pending", "dispatching", "queued", "running"]),
+            ).count()
+            if active_item_count <= 0 and active_stage_count <= 0:
+                observe_task_operation("cancel", "already_cancelled")
+                return BinarySecurityActionResponse(task_id=task_id, message="任务已取消")
+        operation = self._queue_task_operation(
+            db,
+            task,
+            operation_type=TASK_ACTION_CANCEL,
+            target_stage=task.current_stage,
+            requested_by=task.created_by,
+            request_payload={"current_stage": task.current_stage},
+            accepted_event_type="task_cancel_accepted",
+            accepted_message="任务取消已受理，后台正在停止执行并清理下游任务",
+        )
+        observe_task_operation("cancel", "accepted")
+        return BinarySecurityActionResponse(
+            task_id=task_id,
+            operation_id=operation.id,
+            accepted=True,
+            action="cancel",
+            status="accepted",
+            message="任务取消已受理，后台正在停止执行并清理下游任务",
+        )
 
     async def delete_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityActionResponse:
-        operation_token = self._acquire_task_operation_lease(db, task_id, operation="delete", ttl_seconds=TASK_OPERATION_LOCK_TTL_SECONDS)
-        try:
-            task = self._task_or_404(db, project_id, task_id)
-            operation = self._queue_task_operation(
-                db,
-                task,
-                operation_type=TASK_ACTION_DELETE,
-                target_stage=task.current_stage,
-                requested_by=task.created_by,
-                request_payload={"current_stage": task.current_stage},
-                accepted_event_type="task_delete_accepted",
-                accepted_message="任务删除已受理，后台正在清理下游资源与工作区",
-            )
-            return BinarySecurityActionResponse(
-                task_id=task_id,
-                operation_id=operation.id,
-                accepted=True,
-                action="delete",
-                status="accepted",
-                message="任务删除已受理，后台正在清理下游资源与工作区",
-            )
-        except Exception:
-            self._release_task_operation_lease(db, task_id, token=operation_token)
-            raise
+        task = self._task_or_404(db, project_id, task_id)
+        operation = self._queue_task_operation(
+            db,
+            task,
+            operation_type=TASK_ACTION_DELETE,
+            target_stage=task.current_stage,
+            requested_by=task.created_by,
+            request_payload={"current_stage": task.current_stage},
+            accepted_event_type="task_delete_accepted",
+            accepted_message="任务删除已受理，后台正在清理下游资源与工作区",
+        )
+        return BinarySecurityActionResponse(
+            task_id=task_id,
+            operation_id=operation.id,
+            accepted=True,
+            action="delete",
+            status="accepted",
+            message="任务删除已受理，后台正在清理下游资源与工作区",
+        )
 
     async def continue_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskOperation:
-        operation_token = self._acquire_task_operation_lease(db, task_id, operation="continue")
-        try:
-            task = self._task_or_404(db, project_id, task_id)
-            supported, reason, target_stage = self._task_continue_support(db, task)
-            if not supported:
-                observe_task_operation("continue", "rejected")
-                raise ValidationError(reason or "当前任务不可继续")
-            if not target_stage:
-                observe_task_operation("continue", "rejected")
-                raise ValidationError("当前任务未找到可继续的阶段")
-            operation = self._queue_task_operation(
-                db,
-                task,
-                operation_type=TASK_ACTION_CONTINUE,
-                target_stage=target_stage,
-                requested_by=task.created_by,
-                request_payload={"target_stage": target_stage},
-                accepted_event_type="task_continue_accepted",
-                accepted_message=f"继续任务已受理，后台正在准备从阶段 {target_stage} 继续",
-            )
-            observe_task_operation("continue", "accepted")
-            return operation
-        except Exception:
-            self._release_task_operation_lease(db, task_id, token=operation_token)
-            raise
+        task = self._task_or_404(db, project_id, task_id)
+        supported, reason, target_stage = self._task_continue_support(db, task)
+        if not supported:
+            observe_task_operation("continue", "rejected")
+            raise ValidationError(reason or "当前任务不可继续")
+        if not target_stage:
+            observe_task_operation("continue", "rejected")
+            raise ValidationError("当前任务未找到可继续的阶段")
+        operation = self._queue_task_operation(
+            db,
+            task,
+            operation_type=TASK_ACTION_CONTINUE,
+            target_stage=target_stage,
+            requested_by=task.created_by,
+            request_payload={"target_stage": target_stage},
+            accepted_event_type="task_continue_accepted",
+            accepted_message=f"继续任务已受理，后台正在准备从阶段 {target_stage} 继续",
+        )
+        observe_task_operation("continue", "accepted")
+        return operation
 
     async def _prepare_continue_task(self, db: Session, task: BinarySecurityTask, target_stage: str) -> list[str]:
         stage_sequence = self._stage_sequence_for_task(task)
@@ -2460,82 +2444,72 @@ class TaskManager:
         return affected_stages
 
     def retry_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskOperation:
-        operation_token = self._acquire_task_operation_lease(db, task_id, operation="retry")
-        try:
-            task = self._task_or_404(db, project_id, task_id)
-            supported, reason, stage_name = self._task_retry_support(db, task)
-            if not supported or not stage_name:
-                observe_task_operation("retry", "rejected")
-                observe_task_error("retry", stage=str(task.current_stage or "none"), result="rejected")
-                raise ValidationError(reason or "当前任务不支持安全重试")
-            first_stage = self._stage_sequence_for_task(task)[0]
-            operation = self._queue_task_operation(
-                db,
-                task,
-                operation_type=TASK_ACTION_RETRY,
-                target_stage=first_stage,
-                requested_by=task.created_by,
-                request_payload={"target_stage": first_stage},
-                accepted_event_type="task_retry_accepted",
-                accepted_message=f"清空并从头开始已受理，后台正在准备从阶段 {first_stage} 重新排队",
-            )
-            observe_task_operation("retry", "accepted")
-            observe_task_error("retry", stage=first_stage, result="accepted")
-            return operation
-        except Exception:
-            self._release_task_operation_lease(db, task_id, token=operation_token)
-            raise
+        task = self._task_or_404(db, project_id, task_id)
+        supported, reason, stage_name = self._task_retry_support(db, task)
+        if not supported or not stage_name:
+            observe_task_operation("retry", "rejected")
+            observe_task_error("retry", stage=str(task.current_stage or "none"), result="rejected")
+            raise ValidationError(reason or "当前任务不支持安全重试")
+        first_stage = self._stage_sequence_for_task(task)[0]
+        operation = self._queue_task_operation(
+            db,
+            task,
+            operation_type=TASK_ACTION_RETRY,
+            target_stage=first_stage,
+            requested_by=task.created_by,
+            request_payload={"target_stage": first_stage},
+            accepted_event_type="task_retry_accepted",
+            accepted_message=f"清空并从头开始已受理，后台正在准备从阶段 {first_stage} 重新排队",
+        )
+        observe_task_operation("retry", "accepted")
+        observe_task_error("retry", stage=first_stage, result="accepted")
+        return operation
 
     def retry_failed_items(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskOperation:
-        operation_token = self._acquire_task_operation_lease(db, task_id, operation=TASK_ACTION_RETRY_FAILED_ITEMS)
-        try:
-            task = self._task_or_404(db, project_id, task_id)
-            supported, reason, stage_name, items = self._task_retry_failed_items_support(db, task)
-            if not supported or not stage_name:
-                continue_supported, continue_reason, continue_stage = self._task_continue_support(db, task)
-                if not continue_supported or not continue_stage:
-                    observe_task_operation(TASK_ACTION_RETRY_FAILED_ITEMS, "rejected")
-                    raise ValidationError(reason or continue_reason or "当前任务不支持重试失败项")
-                operation = self._queue_task_operation(
-                    db,
-                    task,
-                    operation_type=TASK_ACTION_CONTINUE,
-                    target_stage=continue_stage,
-                    requested_by=task.created_by,
-                    request_payload={"target_stage": continue_stage, "fallback_from": TASK_ACTION_RETRY_FAILED_ITEMS},
-                    accepted_event_type="task_retry_failed_items_continue_accepted",
-                    accepted_message=f"当前没有失败项，已自动转为继续推进，后台将从阶段 {continue_stage} 重新排队",
-                )
-                observe_task_operation(TASK_ACTION_RETRY_FAILED_ITEMS, "accepted")
-                return operation
-            item_keys = sorted({self._stage_item_identity(item.item_key, item.parent_key) for item in items})
-            self._set_retry_plan(
-                task,
-                {
-                    "target_stage": stage_name,
-                    "mode": TASK_ACTION_RETRY_FAILED_ITEMS,
-                    "retry_item_keys": item_keys,
-                    "preserve_success_items": True,
-                    "archive_mode": "linked_failed_items",
-                    "cleared_business_stages": [],
-                    "cleared_archive_stages": [],
-                },
-            )
+        task = self._task_or_404(db, project_id, task_id)
+        supported, reason, stage_name, items = self._task_retry_failed_items_support(db, task)
+        if not supported or not stage_name:
+            continue_supported, continue_reason, continue_stage = self._task_continue_support(db, task)
+            if not continue_supported or not continue_stage:
+                observe_task_operation(TASK_ACTION_RETRY_FAILED_ITEMS, "rejected")
+                raise ValidationError(reason or continue_reason or "当前任务不支持重试失败项")
             operation = self._queue_task_operation(
                 db,
                 task,
-                operation_type=TASK_ACTION_RETRY_FAILED_ITEMS,
-                target_stage=stage_name,
+                operation_type=TASK_ACTION_CONTINUE,
+                target_stage=continue_stage,
                 requested_by=task.created_by,
-                request_payload={"target_stage": stage_name, "retry_item_keys": item_keys, "retry_item_count": len(item_keys)},
-                accepted_event_type="task_retry_failed_items_accepted",
-                accepted_message=f"重试失败项已受理，后台正在准备从阶段 {stage_name} 重新排队",
+                request_payload={"target_stage": continue_stage, "fallback_from": TASK_ACTION_RETRY_FAILED_ITEMS},
+                accepted_event_type="task_retry_failed_items_continue_accepted",
+                accepted_message=f"当前没有失败项，已自动转为继续推进，后台将从阶段 {continue_stage} 重新排队",
             )
             observe_task_operation(TASK_ACTION_RETRY_FAILED_ITEMS, "accepted")
             return operation
-        except Exception:
-            self._release_task_operation_lease(db, task_id, token=operation_token)
-            raise
+        item_keys = sorted({self._stage_item_identity(item.item_key, item.parent_key) for item in items})
+        self._set_retry_plan(
+            task,
+            {
+                "target_stage": stage_name,
+                "mode": TASK_ACTION_RETRY_FAILED_ITEMS,
+                "retry_item_keys": item_keys,
+                "preserve_success_items": True,
+                "archive_mode": "linked_failed_items",
+                "cleared_business_stages": [],
+                "cleared_archive_stages": [],
+            },
+        )
+        operation = self._queue_task_operation(
+            db,
+            task,
+            operation_type=TASK_ACTION_RETRY_FAILED_ITEMS,
+            target_stage=stage_name,
+            requested_by=task.created_by,
+            request_payload={"target_stage": stage_name, "retry_item_keys": item_keys, "retry_item_count": len(item_keys)},
+            accepted_event_type="task_retry_failed_items_accepted",
+            accepted_message=f"重试失败项已受理，后台正在准备从阶段 {stage_name} 重新排队",
+        )
+        observe_task_operation(TASK_ACTION_RETRY_FAILED_ITEMS, "accepted")
+        return operation
 
     async def _prepare_retry_task(self, db: Session, task: BinarySecurityTask) -> list[str]:
         cleanup_snapshot = await self._prepare_hard_restart_task(db, task)
@@ -2715,145 +2689,125 @@ class TaskManager:
         self.retry_stage_full(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
 
     def retry_stage_failed_items(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> BinarySecurityTaskOperation:
-        operation_token = self._acquire_task_operation_lease(db, task_id, operation=TASK_ACTION_RETRY_STAGE_FAILED_ITEMS)
-        try:
-            task = self._task_or_404(db, project_id, task_id)
-            supported, reason, items = self._stage_retry_failed_items_support(db, task, stage_name)
-            if not supported:
-                continue_supported, continue_reason, continue_stage = self._task_continue_support(db, task)
-                if not continue_supported or not continue_stage:
-                    raise ValidationError(reason or continue_reason or f"阶段 {stage_name} 不支持重试失败项")
-                operation = self._queue_task_operation(
-                    db,
-                    task,
-                    operation_type=TASK_ACTION_CONTINUE,
-                    target_stage=continue_stage,
-                    requested_by=task.created_by,
-                    request_payload={"target_stage": continue_stage, "requested_stage": stage_name},
-                    accepted_event_type="stage_retry_failed_items_continue_accepted",
-                    accepted_message=f"阶段 {stage_name} 当前没有失败项，已自动转为继续推进，后台将从阶段 {continue_stage} 重新排队",
-                )
-                return operation
-            item_keys = sorted({self._stage_item_identity(item.item_key, item.parent_key) for item in items})
-            self._set_retry_plan(
-                task,
-                {
-                    "target_stage": stage_name,
-                    "mode": TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
-                    "retry_item_keys": item_keys,
-                    "preserve_success_items": True,
-                    "archive_mode": "linked_failed_items",
-                    "cleared_business_stages": [],
-                    "cleared_archive_stages": [],
-                },
-            )
+        task = self._task_or_404(db, project_id, task_id)
+        supported, reason, items = self._stage_retry_failed_items_support(db, task, stage_name)
+        if not supported:
+            continue_supported, continue_reason, continue_stage = self._task_continue_support(db, task)
+            if not continue_supported or not continue_stage:
+                raise ValidationError(reason or continue_reason or f"阶段 {stage_name} 不支持重试失败项")
             operation = self._queue_task_operation(
                 db,
                 task,
-                operation_type=TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
-                target_stage=stage_name,
+                operation_type=TASK_ACTION_CONTINUE,
+                target_stage=continue_stage,
                 requested_by=task.created_by,
-                request_payload={"target_stage": stage_name, "retry_item_keys": item_keys, "retry_item_count": len(item_keys)},
-                accepted_event_type="stage_retry_failed_items_accepted",
-                accepted_message=f"阶段 {stage_name} 的失败项重试已受理，后台正在准备重新排队",
+                request_payload={"target_stage": continue_stage, "requested_stage": stage_name},
+                accepted_event_type="stage_retry_failed_items_continue_accepted",
+                accepted_message=f"阶段 {stage_name} 当前没有失败项，已自动转为继续推进，后台将从阶段 {continue_stage} 重新排队",
             )
             return operation
-        except Exception:
-            self._release_task_operation_lease(db, task_id, token=operation_token)
-            raise
+        item_keys = sorted({self._stage_item_identity(item.item_key, item.parent_key) for item in items})
+        self._set_retry_plan(
+            task,
+            {
+                "target_stage": stage_name,
+                "mode": TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
+                "retry_item_keys": item_keys,
+                "preserve_success_items": True,
+                "archive_mode": "linked_failed_items",
+                "cleared_business_stages": [],
+                "cleared_archive_stages": [],
+            },
+        )
+        operation = self._queue_task_operation(
+            db,
+            task,
+            operation_type=TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
+            target_stage=stage_name,
+            requested_by=task.created_by,
+            request_payload={"target_stage": stage_name, "retry_item_keys": item_keys, "retry_item_count": len(item_keys)},
+            accepted_event_type="stage_retry_failed_items_accepted",
+            accepted_message=f"阶段 {stage_name} 的失败项重试已受理，后台正在准备重新排队",
+        )
+        return operation
 
     def retry_stage_full(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> BinarySecurityTaskOperation:
-        operation_token = self._acquire_task_operation_lease(db, task_id, operation=TASK_ACTION_RETRY_STAGE_FULL)
-        try:
-            task = self._task_or_404(db, project_id, task_id)
-            supported, reason = self._stage_retry_support(db, task, stage_name)
-            if not supported:
-                raise ValidationError(reason or f"阶段 {stage_name} 不支持完全重试")
-            self._set_retry_plan(
-                task,
-                {
-                    "target_stage": stage_name,
-                    "mode": TASK_ACTION_RETRY_STAGE_FULL,
-                    "retry_item_keys": [],
-                    "preserve_success_items": False,
-                    "archive_mode": "linked_full",
-                    "cleared_business_stages": [],
-                    "cleared_archive_stages": [],
-                },
-            )
-            operation = self._queue_task_operation(
-                db,
-                task,
-                operation_type=TASK_ACTION_RETRY_STAGE_FULL,
-                target_stage=stage_name,
-                requested_by=task.created_by,
-                request_payload={"target_stage": stage_name},
-                accepted_event_type="stage_retry_full_accepted",
-                accepted_message=f"阶段 {stage_name} 的完全重试已受理，后台正在清理旧子任务并重建输入",
-            )
-            return operation
-        except Exception:
-            self._release_task_operation_lease(db, task_id, token=operation_token)
-            raise
+        task = self._task_or_404(db, project_id, task_id)
+        supported, reason = self._stage_retry_support(db, task, stage_name)
+        if not supported:
+            raise ValidationError(reason or f"阶段 {stage_name} 不支持完全重试")
+        self._set_retry_plan(
+            task,
+            {
+                "target_stage": stage_name,
+                "mode": TASK_ACTION_RETRY_STAGE_FULL,
+                "retry_item_keys": [],
+                "preserve_success_items": False,
+                "archive_mode": "linked_full",
+                "cleared_business_stages": [],
+                "cleared_archive_stages": [],
+            },
+        )
+        operation = self._queue_task_operation(
+            db,
+            task,
+            operation_type=TASK_ACTION_RETRY_STAGE_FULL,
+            target_stage=stage_name,
+            requested_by=task.created_by,
+            request_payload={"target_stage": stage_name},
+            accepted_event_type="stage_retry_full_accepted",
+            accepted_message=f"阶段 {stage_name} 的完全重试已受理，后台正在清理旧子任务并重建输入",
+        )
+        return operation
 
     def retry_stage_archive(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> BinarySecurityTaskOperation:
         return self.retry_stage_archive_failed_items(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
 
     def retry_stage_archive_failed_items(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> BinarySecurityTaskOperation:
-        operation_token = self._acquire_task_operation_lease(db, task_id, operation=TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS)
-        try:
-            task = self._task_or_404(db, project_id, task_id)
-            stage_sequence = self._stage_sequence_for_task(task)
-            if stage_name not in stage_sequence:
-                observe_archive_action("retry_stage", "rejected")
-                raise ValidationError(f"无效阶段: {stage_name}")
-            supported, reason, jobs = self._archive_retry_support(db, task, stage_name, ignore_operation_lock=True)
-            if not supported:
-                observe_archive_action("retry_stage", "rejected")
-                raise ValidationError(reason or f"阶段 {stage_name} 暂无可重试的归档任务")
-            operation = self._queue_task_operation(
-                db,
-                task,
-                operation_type=TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS,
-                target_stage=stage_name,
-                requested_by=task.created_by,
-                request_payload={"target_stage": stage_name, "retryable_job_ids": [job.id for job in jobs]},
-                accepted_event_type="archive_stage_retry_accepted",
-                accepted_message=f"阶段 {stage_name} 的归档失败项重试已受理，后台正在重新排队归档任务",
-            )
-            observe_archive_action("retry_stage", "accepted")
-            return operation
-        except Exception:
-            self._release_task_operation_lease(db, task_id, token=operation_token)
-            raise
+        task = self._task_or_404(db, project_id, task_id)
+        stage_sequence = self._stage_sequence_for_task(task)
+        if stage_name not in stage_sequence:
+            observe_archive_action("retry_stage", "rejected")
+            raise ValidationError(f"无效阶段: {stage_name}")
+        supported, reason, jobs = self._archive_retry_support(db, task, stage_name, ignore_operation_lock=True)
+        if not supported:
+            observe_archive_action("retry_stage", "rejected")
+            raise ValidationError(reason or f"阶段 {stage_name} 暂无可重试的归档任务")
+        operation = self._queue_task_operation(
+            db,
+            task,
+            operation_type=TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS,
+            target_stage=stage_name,
+            requested_by=task.created_by,
+            request_payload={"target_stage": stage_name, "retryable_job_ids": [job.id for job in jobs]},
+            accepted_event_type="archive_stage_retry_accepted",
+            accepted_message=f"阶段 {stage_name} 的归档失败项重试已受理，后台正在重新排队归档任务",
+        )
+        observe_archive_action("retry_stage", "accepted")
+        return operation
 
     def retry_stage_archive_full(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> BinarySecurityTaskOperation:
-        operation_token = self._acquire_task_operation_lease(db, task_id, operation=TASK_ACTION_RETRY_ARCHIVE_FULL)
-        try:
-            task = self._task_or_404(db, project_id, task_id)
-            supported, reason, jobs, stage_items = self._archive_full_retry_support(db, task, stage_name, ignore_operation_lock=True)
-            if not supported:
-                observe_archive_action("retry_stage_full", "rejected")
-                raise ValidationError(reason or f"阶段 {stage_name} 暂无可完全重试的归档任务")
-            operation = self._queue_task_operation(
-                db,
-                task,
-                operation_type=TASK_ACTION_RETRY_ARCHIVE_FULL,
-                target_stage=stage_name,
-                requested_by=task.created_by,
-                request_payload={
-                    "target_stage": stage_name,
-                    "existing_job_ids": [job.id for job in jobs],
-                    "stage_item_ids": [item.id for item in stage_items],
-                },
-                accepted_event_type="archive_stage_full_retry_accepted",
-                accepted_message=f"阶段 {stage_name} 的归档全量重试已受理，后台正在清空并重建归档任务",
-            )
-            observe_archive_action("retry_stage_full", "accepted")
-            return operation
-        except Exception:
-            self._release_task_operation_lease(db, task_id, token=operation_token)
-            raise
+        task = self._task_or_404(db, project_id, task_id)
+        supported, reason, jobs, stage_items = self._archive_full_retry_support(db, task, stage_name, ignore_operation_lock=True)
+        if not supported:
+            observe_archive_action("retry_stage_full", "rejected")
+            raise ValidationError(reason or f"阶段 {stage_name} 暂无可完全重试的归档任务")
+        operation = self._queue_task_operation(
+            db,
+            task,
+            operation_type=TASK_ACTION_RETRY_ARCHIVE_FULL,
+            target_stage=stage_name,
+            requested_by=task.created_by,
+            request_payload={
+                "target_stage": stage_name,
+                "existing_job_ids": [job.id for job in jobs],
+                "stage_item_ids": [item.id for item in stage_items],
+            },
+            accepted_event_type="archive_stage_full_retry_accepted",
+            accepted_message=f"阶段 {stage_name} 的归档全量重试已受理，后台正在清空并重建归档任务",
+        )
+        observe_archive_action("retry_stage_full", "accepted")
+        return operation
 
     def retry_archive_job(self, db: Session, *, project_id: str, task_id: str, archive_job_id: str) -> str:
         task = self._task_or_404(db, project_id, task_id)

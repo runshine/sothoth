@@ -12764,6 +12764,79 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("firmware_unpack", operation.target_stage)
         self.assertEqual("retry_stage_full", operation.operation_type)
 
+    def test_retry_stage_full_ignores_legacy_task_operation_lock_when_no_active_operation(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            operation_lock_type="retry_stage_full",
+            operation_lock_owner="legacy-worker",
+            operation_lock_token="legacy-token",
+            operation_lock_expires_at=_now() + timedelta(minutes=10),
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr0",
+            task_id="task1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            sequence_no=1,
+            status="success",
+        )
+        failed_stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="failed",
+        )
+        stage_item = BinarySecurityStageItem(
+            id="si1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="m1",
+            parent_key="m1",
+            downstream_service="entry_analyse",
+            downstream_task_id=None,
+            status="failed",
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si0",
+            task_id="task1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            item_key="m1",
+            parent_key="m1",
+            downstream_service="binary_to_source",
+            downstream_task_id="b2s-1",
+            status="success",
+        )
+        db = _ModelAwareDb(
+            tasks=[task],
+            stage_runs=[stage_run, failed_stage_run],
+            stage_items=[upstream_item, stage_item],
+            operations=[],
+        )
+
+        operation = self.manager.retry_stage_full(
+            db,
+            project_id="p1",
+            task_id="task1",
+            stage_name="entry_analysis",
+        )
+
+        self.assertEqual("retry_stage_full", operation.operation_type)
+        self.assertEqual("queued", operation.status)
+        self.assertEqual(operation.id, task.current_operation_id)
+
     def test_task_retry_support_targets_first_stage_for_full_restart(self):
         task = BinarySecurityTask(
             id="task1",
