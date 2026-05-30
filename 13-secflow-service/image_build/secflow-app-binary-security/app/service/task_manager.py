@@ -6138,11 +6138,7 @@ class TaskManager:
                 summary = dict(stage_run.output_summary or summary)
                 status = str(stage_run.status or status).strip() or status
                 active_stage_status = status in {"pending", "queued", "running", "dispatching"}
-                has_live_downstream_child = any(
-                    str(current_item.status or "").strip() in {"pending", "queued", "running", "dispatching"}
-                    and str(current_item.downstream_task_id or "").strip()
-                    for current_item in existing_items
-                )
+                has_live_downstream_child = self._stage_has_live_downstream_children(existing_items)
                 if observed_terminal_status in terminal_failure_statuses and active_stage_status and has_live_downstream_child:
                     self._record_event(
                         db,
@@ -6187,33 +6183,56 @@ class TaskManager:
                     },
                 )
         else:
-            stage_run.status = "waiting_confirmation" if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION else ("running" if active_stage_status else status)
-            stage_run.finished_at = None if active_stage_status else _now()
-            if not active_stage_status:
-                observe_stage_duration(
-                    stage=stage_name,
-                    result=stage_run.status,
-                    duration_seconds=_elapsed_seconds_since(stage_run.started_at),
+            existing_items = self._stage_items(db, task.id, stage_name)
+            if existing_items:
+                stage_run = self._refresh_stage_from_authoritative_items(db, task, stage_name) or stage_run
+                summary = dict(stage_run.output_summary or summary)
+                status = str(stage_run.status or status).strip() or status
+                active_stage_status = status in {"pending", "queued", "running", "dispatching"}
+                has_live_downstream_child = self._stage_has_live_downstream_children(existing_items)
+                if observed_terminal_status in terminal_failure_statuses and active_stage_status and has_live_downstream_child:
+                    self._record_event(
+                        db,
+                        task,
+                        "stage_worker_terminal_deferred",
+                        "阶段终态事件与活跃下游子任务冲突，已按权威子项状态延后收敛",
+                        level="warning",
+                        stage_name=stage_name,
+                        payload={
+                            "state_event_id": event.id,
+                            "observed_status": observed_terminal_status,
+                            "authoritative_stage_status": status,
+                        },
+                    )
+                    observed_terminal_status = status
+            else:
+                stage_run.status = "waiting_confirmation" if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION else ("running" if active_stage_status else status)
+                stage_run.finished_at = None if active_stage_status else _now()
+                if not active_stage_status:
+                    observe_stage_duration(
+                        stage=stage_name,
+                        result=stage_run.status,
+                        duration_seconds=_elapsed_seconds_since(stage_run.started_at),
+                    )
+                await self._persist_stage_run_output_summary_async(task, stage_run, summary)
+                stage_run.counts = self._stage_counts(db, stage_run)
+                if status in {"failed", "partial_success", "downstream_missing"}:
+                    stage_run.last_error = summary.get("error")
+                self._merge_task_stage_summary_entry(
+                    task,
+                    stage_run,
+                    {
+                        **(
+                            {
+                                "failure_code": summary.get("failure_code"),
+                                "failure_category": summary.get("failure_category"),
+                                "failure_message": summary.get("failure_message"),
+                            }
+                            if summary.get("failure_code")
+                            else {}
+                        ),
+                    },
                 )
-            await self._persist_stage_run_output_summary_async(task, stage_run, summary)
-            stage_run.counts = self._stage_counts(db, stage_run)
-            if status in {"failed", "partial_success", "downstream_missing"}:
-                stage_run.last_error = summary.get("error")
-            self._merge_task_stage_summary_entry(
-                task,
-                stage_run,
-                {
-                    **(
-                        {
-                            "failure_code": summary.get("failure_code"),
-                            "failure_category": summary.get("failure_category"),
-                            "failure_message": summary.get("failure_message"),
-                        }
-                        if summary.get("failure_code")
-                        else {}
-                    ),
-                },
-            )
         task.current_stage = stage_name
         if stage_name == "firmware_unpack":
             task.metrics = {
@@ -12129,6 +12148,17 @@ class TaskManager:
         if any(status == "downstream_missing" for status in statuses):
             return "downstream_missing"
         return statuses[0]
+
+    def _stage_has_live_downstream_children(
+        self,
+        items: list[BinarySecurityStageItem],
+    ) -> bool:
+        live_statuses = {"pending", "queued", "running", "dispatching"}
+        return any(
+            str(item.status or "").strip().lower() in live_statuses
+            and str(item.downstream_task_id or "").strip()
+            for item in items
+        )
 
     def _empty_streaming_stage_run_status(self, task: BinarySecurityTask, stage_run: BinarySecurityStageRun) -> str:
         if not self._streaming_mode_enabled(task) or not self._is_streaming_tail_stage(task, stage_run.stage_name):
