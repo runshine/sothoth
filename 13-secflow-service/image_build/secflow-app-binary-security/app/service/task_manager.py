@@ -6604,8 +6604,7 @@ class TaskManager:
         operation: BinarySecurityTaskOperation,
     ) -> dict[str, Any]:
         await self._operation_reconcile_retry_non_abnormal_children(db, task, operation)
-        result = self._build_retry_prepare_result(db, task, target_stage=str(operation.target_stage or "").strip())
-        validation = dict(result.get("validation") or {})
+        target_stage = str(operation.target_stage or "").strip()
         for action in self._retry_item_actions(task):
             item_id = str(action.get("item_id") or "").strip()
             item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == item_id).first()
@@ -6643,9 +6642,15 @@ class TaskManager:
                     "new_downstream_task_id": item.downstream_task_id,
                 },
             )
+        result = self._build_retry_prepare_result(db, task, target_stage=target_stage)
+        validation = dict(result.get("validation") or {})
         if not bool(validation.get("validated")):
             raise ValidationError("失败项重试绑定校验失败")
-        operation.result_payload = {**dict(operation.result_payload or {}), **result}
+        operation.result_payload = {
+            **dict(operation.result_payload or {}),
+            **result,
+            "item_actions": self._retry_item_actions(task),
+        }
         return result
 
     async def _operation_reconcile_retry_non_abnormal_children(

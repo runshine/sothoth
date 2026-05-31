@@ -9375,6 +9375,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("pending", item.status)
         self.assertEqual("operation_succeeded", dict(operation.resume_cursor or {}).get("current_step"))
         self.assertEqual("succeeded", dict(operation.result_payload or {}).get("validation", {}).get("validated") and "succeeded" or "failed")
+        action_rows = list((operation.result_payload or {}).get("item_actions") or [])
+        self.assertEqual("succeeded", action_rows[0].get("verification_status"))
 
     def test_prepare_retry_failed_items_streaming_dataflow_retry_clears_vuln_summary_when_last_descendant_removed(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
