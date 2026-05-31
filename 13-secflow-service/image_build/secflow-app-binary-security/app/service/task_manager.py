@@ -708,6 +708,12 @@ TASK_OPERATION_STEP_DELETE_STAGE_TIMELINE = "delete_stage_timeline"
 TASK_OPERATION_STEP_REBUILD_UPSTREAM_DERIVED_INPUTS = "rebuild_upstream_derived_inputs"
 TASK_OPERATION_STEP_RESET_STAGE_RUNS = "reset_stage_runs"
 TASK_OPERATION_STEP_REQUEUE_TASK = "requeue_task"
+TASK_OPERATION_STEP_SYNC_TARGET_STAGE_STATE = "sync_target_stage_state"
+TASK_OPERATION_STEP_PREPARE_RETRY_ITEMS = "prepare_retry_items"
+TASK_OPERATION_STEP_CLEANUP_ABNORMAL_CHILDREN = "cleanup_abnormal_children"
+TASK_OPERATION_STEP_CREATE_REPLACEMENT_CHILDREN = "create_replacement_children"
+TASK_OPERATION_STEP_VERIFY_RETRY_BINDINGS = "verify_retry_bindings"
+TASK_OPERATION_STEP_FINALIZE_RETRY_OPERATION = "finalize_retry_operation"
 TASK_OPERATION_STEP_MARK_TASK_CANCELLING = "mark_task_cancelling"
 TASK_OPERATION_STEP_COLLECT_CANCEL_TARGETS = "collect_cancel_targets"
 TASK_OPERATION_STEP_CANCEL_LOCAL_EXECUTION = "cancel_local_execution"
@@ -723,6 +729,12 @@ RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL = "recreate_from_abnormal"
 RETRY_CHILD_ABNORMAL_STATUSES = {"failed", "cancelled", "downstream_missing"}
 TASK_OPERATION_SAGA_STEPS = (
     TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN,
+    TASK_OPERATION_STEP_SYNC_TARGET_STAGE_STATE,
+    TASK_OPERATION_STEP_PREPARE_RETRY_ITEMS,
+    TASK_OPERATION_STEP_CLEANUP_ABNORMAL_CHILDREN,
+    TASK_OPERATION_STEP_CREATE_REPLACEMENT_CHILDREN,
+    TASK_OPERATION_STEP_VERIFY_RETRY_BINDINGS,
+    TASK_OPERATION_STEP_FINALIZE_RETRY_OPERATION,
     TASK_OPERATION_STEP_CANCEL_DOWNSTREAM,
     TASK_OPERATION_STEP_DELETE_DOWNSTREAM,
     TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_ABSENT,
@@ -2771,13 +2783,11 @@ class TaskManager:
         )
         if target_stage == "entry_analysis":
             # Failed-item retry for entry-analysis must sever the stale child link
-            # after observing the old terminal state; otherwise the requeued stage
-            # can still attempt to continue/re-read the cancelled child instead of
-            # creating a replacement downstream task.
+            # after observing the old terminal state, but binding removal now
+            # belongs to the retry operation cleanup step rather than prepare.
             for item in retry_items:
                 result = dict(item.result or {})
                 sync_observation = dict(result.get("sync_observation") or {})
-                self._clear_item_downstream_runtime_state(item)
                 item.status = "pending"
                 item.finished_at = None
                 self._mark_stage_item_sync_observation(
@@ -2833,9 +2843,84 @@ class TaskManager:
                 **plan,
                 "cleared_business_stages": cleared_business_stages,
                 "cleared_archive_stages": cleared_archive_stages,
+                "retry_item_keys": sorted(retry_item_keys),
+                "item_actions": self._retry_item_actions(task),
+                "affected_stages": affected_stages,
             },
         )
         return affected_stages
+
+    def _build_retry_prepare_result(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        target_stage: str,
+    ) -> dict[str, Any]:
+        plan = self._retry_plan(task)
+        retry_item_keys = [str(item_key).strip() for item_key in list(plan.get("retry_item_keys") or []) if str(item_key).strip()]
+        item_actions = [dict(row) for row in list(plan.get("item_actions") or []) if isinstance(row, dict)]
+        affected_stages = [str(stage).strip() for stage in list(plan.get("affected_stages") or []) if str(stage).strip()]
+        validation = self._validate_retry_prepare_state(
+            db,
+            task,
+            target_stage=target_stage,
+            retry_item_keys=retry_item_keys,
+            item_actions=item_actions,
+            affected_stages=affected_stages,
+        )
+        return {
+            "target_stage": target_stage,
+            "retry_item_keys": retry_item_keys,
+            "item_actions": item_actions,
+            "affected_stages": affected_stages,
+            "validation": validation,
+        }
+
+    def _retry_target_items(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        target_stage: str,
+    ) -> list[BinarySecurityStageItem]:
+        plan = self._retry_plan(task)
+        retry_item_keys = {
+            str(item_key).strip()
+            for item_key in list(plan.get("retry_item_keys") or [])
+            if str(item_key).strip()
+        }
+        if not retry_item_keys:
+            return []
+        return [
+            item
+            for item in self._stage_items(db, task.id, target_stage)
+            if self._stage_item_identity(item.item_key, item.parent_key) in retry_item_keys
+        ]
+
+    async def _collect_retry_item_actions(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        target_stage: str,
+        token: str | None,
+    ) -> list[dict[str, Any]]:
+        actions: list[dict[str, Any]] = []
+        for item in self._retry_target_items(db, task, target_stage=target_stage):
+            active_payload = await self._active_downstream_payload(task, item, token)
+            strategy, observed_status = self._classify_retry_downstream_strategy(item, active_payload=active_payload)
+            action = self._retry_item_action_snapshot(
+                item,
+                strategy=strategy,
+                observed_status=observed_status,
+                old_downstream_task_id=str(item.downstream_task_id or "").strip() or None,
+                cleanup_performed=False,
+                binding_cleared=False,
+            )
+            actions.append(action)
+        self._set_retry_item_actions(task, actions)
+        return actions
 
     async def _prepare_retry_stage_full(self, db: Session, task: BinarySecurityTask, target_stage: str) -> list[str]:
         stage_sequence = self._stage_sequence_for_task(task)
@@ -5927,6 +6012,9 @@ class TaskManager:
         if operation.operation_type == TASK_ACTION_CANCEL:
             await self._run_cancel_operation_steps(db, task, operation, resume_step)
             return
+        if operation.operation_type in {TASK_ACTION_RETRY_FAILED_ITEMS, TASK_ACTION_RETRY_STAGE_FAILED_ITEMS}:
+            await self._run_retry_failed_items_operation_steps(db, task, operation, resume_step)
+            return
         if operation.operation_type == TASK_ACTION_RETRY_STAGE_FULL:
             resume_step = await self._run_retry_stage_full_operation_steps(db, task, operation, resume_step)
         else:
@@ -5983,6 +6071,39 @@ class TaskManager:
                     db.commit()
                     raise
 
+                if operation.operation_type in {TASK_ACTION_RETRY_FAILED_ITEMS, TASK_ACTION_RETRY_STAGE_FAILED_ITEMS}:
+                    prepare_result = self._build_retry_prepare_result(
+                        db,
+                        task,
+                        target_stage=str(operation.target_stage or "").strip(),
+                    )
+                    operation.result_payload = {
+                        **dict(operation.result_payload or {}),
+                        **prepare_result,
+                    }
+                    validation = dict(prepare_result.get("validation") or {})
+                    if not bool(validation.get("validated")):
+                        self._record_operation_event(
+                            db,
+                            task,
+                            operation,
+                            "retry_prepare_validation_failed",
+                            "失败项重试准备校验失败",
+                            level="error",
+                            stage_name=operation.target_stage,
+                            payload=prepare_result,
+                        )
+                        raise ValidationError("失败项重试准备校验失败")
+                    self._record_operation_event(
+                        db,
+                        task,
+                        operation,
+                        "retry_prepare_validation_succeeded",
+                        "失败项重试准备校验通过",
+                        stage_name=operation.target_stage,
+                        payload=prepare_result,
+                    )
+
                 requeue_required = operation.operation_type not in {TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS, TASK_ACTION_RETRY_ARCHIVE_FULL}
                 next_step = TASK_OPERATION_STEP_REQUEUE_TASK if requeue_required else TASK_OPERATION_STEP_SUCCEEDED
                 self._record_operation_step_finished(
@@ -5992,6 +6113,7 @@ class TaskManager:
                     step_name=prepare_step,
                     message=f"后台操作准备步骤已完成: {operation.operation_type}",
                     stage_name=operation.target_stage,
+                    payload=dict(operation.result_payload or {}) if operation.operation_type in {TASK_ACTION_RETRY_FAILED_ITEMS, TASK_ACTION_RETRY_STAGE_FAILED_ITEMS} else None,
                     next_step=next_step,
                 )
                 if not requeue_required:
@@ -6030,12 +6152,174 @@ class TaskManager:
         task.finished_at = None
         self._invalidate_task_execution(task)
         self._enqueue_task(task.id)
+        operation.result_payload = {
+            **dict(operation.result_payload or {}),
+            "requeue": {
+                "task_status_before": "requeue_pending",
+                "task_status_after": task.status,
+                "requeue_requested": True,
+            },
+        }
         self._record_operation_event(
             db,
             task,
             operation,
             "task_requeued",
             f"后台操作完成，任务已重新排队: {operation.operation_type}",
+            stage_name=operation.target_stage,
+        )
+        self._record_operation_step_finished(
+            db,
+            task,
+            operation,
+            step_name=TASK_OPERATION_STEP_REQUEUE_TASK,
+            message=f"后台操作重新排队步骤已完成: {operation.operation_type}",
+            stage_name=operation.target_stage,
+            next_step=TASK_OPERATION_STEP_SUCCEEDED,
+        )
+        db.commit()
+
+    async def _run_retry_failed_items_operation_steps(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+        resume_step: str,
+    ) -> None:
+        step_flow = (
+            (
+                TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN,
+                "开始收集失败项重试计划",
+                "失败项重试计划已收集",
+                self._operation_collect_retry_failed_items_plan,
+                TASK_OPERATION_STEP_SYNC_TARGET_STAGE_STATE,
+            ),
+            (
+                TASK_OPERATION_STEP_SYNC_TARGET_STAGE_STATE,
+                "开始同步目标阶段下游状态",
+                "目标阶段下游状态同步完成",
+                self._operation_sync_retry_target_stage_state,
+                TASK_OPERATION_STEP_PREPARE_RETRY_ITEMS,
+            ),
+            (
+                TASK_OPERATION_STEP_PREPARE_RETRY_ITEMS,
+                "开始准备失败项重试上下文",
+                "失败项重试上下文准备完成",
+                self._operation_prepare_retry_items,
+                TASK_OPERATION_STEP_CLEANUP_ABNORMAL_CHILDREN,
+            ),
+            (
+                TASK_OPERATION_STEP_CLEANUP_ABNORMAL_CHILDREN,
+                "开始清理异常子任务",
+                "异常子任务清理完成",
+                self._operation_cleanup_retry_abnormal_children,
+                TASK_OPERATION_STEP_CREATE_REPLACEMENT_CHILDREN,
+            ),
+            (
+                TASK_OPERATION_STEP_CREATE_REPLACEMENT_CHILDREN,
+                "开始创建替换子任务",
+                "替换子任务创建完成",
+                self._operation_create_retry_children,
+                TASK_OPERATION_STEP_VERIFY_RETRY_BINDINGS,
+            ),
+            (
+                TASK_OPERATION_STEP_VERIFY_RETRY_BINDINGS,
+                "开始校验失败项重试绑定",
+                "失败项重试绑定校验完成",
+                self._operation_verify_retry_bindings,
+                TASK_OPERATION_STEP_FINALIZE_RETRY_OPERATION,
+            ),
+            (
+                TASK_OPERATION_STEP_FINALIZE_RETRY_OPERATION,
+                "开始完成失败项重试操作",
+                "失败项重试操作已完成",
+                self._operation_finalize_retry_failed_items,
+                TASK_OPERATION_STEP_REQUEUE_TASK,
+            ),
+        )
+        current_step = resume_step if resume_step in {row[0] for row in step_flow} else TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN
+        for step_name, start_message, finish_message, handler, next_step in step_flow:
+            if current_step != step_name:
+                continue
+            self._record_operation_step_started(
+                db,
+                task,
+                operation,
+                step_name=step_name,
+                message=f"{start_message}: {operation.operation_type}",
+                stage_name=operation.target_stage,
+                payload={"operation_type": operation.operation_type},
+            )
+            db.commit()
+            try:
+                payload = await handler(db, task, operation)
+            except Exception as exc:
+                self._record_operation_step_failed(
+                    db,
+                    task,
+                    operation,
+                    step_name=step_name,
+                    error=exc,
+                    stage_name=operation.target_stage,
+                )
+                db.commit()
+                raise
+            self._record_operation_step_finished(
+                db,
+                task,
+                operation,
+                step_name=step_name,
+                message=f"{finish_message}: {operation.operation_type}",
+                stage_name=operation.target_stage,
+                payload=dict(payload or {}),
+                next_step=next_step,
+            )
+            db.commit()
+            current_step = next_step
+
+        if current_step != TASK_OPERATION_STEP_REQUEUE_TASK:
+            return
+        if self._is_operation_requeue_state_applied(task, operation):
+            self._record_operation_step_finished(
+                db,
+                task,
+                operation,
+                step_name=TASK_OPERATION_STEP_REQUEUE_TASK,
+                message=f"后台操作重新排队步骤已确认完成，无需重复执行: {operation.operation_type}",
+                stage_name=operation.target_stage,
+                payload={"idempotent_recovery": True},
+                next_step=TASK_OPERATION_STEP_SUCCEEDED,
+            )
+            db.commit()
+            return
+        self._record_operation_step_started(
+            db,
+            task,
+            operation,
+            step_name=TASK_OPERATION_STEP_REQUEUE_TASK,
+            message=f"后台操作进入重新排队步骤: {operation.operation_type}",
+            stage_name=operation.target_stage,
+        )
+        task.status = "pending"
+        task.current_stage = operation.target_stage or task.current_stage
+        task.last_error = None
+        task.finished_at = None
+        self._invalidate_task_execution(task)
+        self._enqueue_task(task.id)
+        operation.result_payload = {
+            **dict(operation.result_payload or {}),
+            "requeue": {
+                "requested": True,
+                "task_status_before": "retry_operation_succeeded",
+                "task_status_after": task.status,
+            },
+        }
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "task_requeued",
+            f"失败项重试完成，任务已重新排队: {operation.operation_type}",
             stage_name=operation.target_stage,
         )
         self._record_operation_step_finished(
@@ -6111,6 +6395,374 @@ class TaskManager:
             db.commit()
             resume_step = next_step
         return resume_step
+
+    async def _operation_collect_retry_failed_items_plan(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> dict[str, Any]:
+        target_stage = str(operation.target_stage or "").strip()
+        actions = await self._collect_retry_item_actions(db, task, target_stage=target_stage, token=self._service_token())
+        payload = {
+            "target_stage": target_stage,
+            "retry_item_keys": [str(item_key).strip() for item_key in list(self._retry_plan(task).get("retry_item_keys") or []) if str(item_key).strip()],
+            "item_actions": actions,
+        }
+        operation.result_payload = {**dict(operation.result_payload or {}), **payload}
+        return payload
+
+    async def _operation_sync_retry_target_stage_state(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> dict[str, Any]:
+        target_stage = str(operation.target_stage or "").strip()
+        await self.sync_downstream_status(
+            db,
+            project_id=task.project_id,
+            task_id=task.id,
+            stage_name=target_stage,
+            force=True,
+            token=self._service_token(),
+            record_request_event=False,
+            record_noop_events=False,
+            apply_state=(target_stage != "entry_analysis"),
+        )
+        payload = {"target_stage": target_stage, "synced": True}
+        operation.result_payload = {**dict(operation.result_payload or {}), "sync_target_stage_state": payload}
+        return payload
+
+    async def _operation_prepare_retry_items(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> dict[str, Any]:
+        target_stage = str(operation.target_stage or "").strip()
+        affected_stages = await self._prepare_retry_failed_items(db, task, target_stage)
+        prepare_result = self._build_retry_prepare_result(db, task, target_stage=target_stage)
+        prepare_result["affected_stages"] = affected_stages
+        operation.result_payload = {**dict(operation.result_payload or {}), **prepare_result}
+        validation = dict(prepare_result.get("validation") or {})
+        if not bool(validation.get("validated")):
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "retry_prepare_validation_failed",
+                "失败项重试准备校验失败",
+                level="error",
+                stage_name=operation.target_stage,
+                payload=prepare_result,
+            )
+            raise ValidationError("失败项重试准备校验失败")
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "retry_prepare_validation_succeeded",
+            "失败项重试准备校验通过",
+            stage_name=operation.target_stage,
+            payload=prepare_result,
+        )
+        return prepare_result
+
+    async def _operation_cleanup_retry_abnormal_children(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> dict[str, Any]:
+        cleaned = 0
+        for action in self._retry_item_actions(task):
+            if str(action.get("strategy") or "").strip() != RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
+                continue
+            item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == str(action.get("item_id") or "")).first()
+            if item is None:
+                raise ValidationError(f"失败项重试目标缺失: {action.get('item_id')}")
+            old_task_id = str(action.get("old_downstream_task_id") or "").strip()
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "retry_item_cleanup_started",
+                f"开始清理旧下游子任务: {item.downstream_service}:{old_task_id or '-'}",
+                stage_name=item.stage_name,
+                payload={"item_id": item.id, "item_key": item.item_key, "old_downstream_task_id": old_task_id},
+            )
+            if old_task_id:
+                refs = [{
+                    "service": item.downstream_service,
+                    "task_id": old_task_id,
+                    "project_id": task.project_id,
+                    "stage_name": item.stage_name,
+                    "item_id": item.id,
+                    "item_key": item.item_key,
+                }]
+                try:
+                    await self._downstream_cancel_refs(db, task, refs, self._service_token())
+                except Exception:
+                    db.rollback()
+                await self._delete_downstream_refs(db, task, refs, self._service_token())
+            self._clear_item_downstream_runtime_state(item)
+            item.status = "pending"
+            item.finished_at = None
+            self._update_retry_item_action(
+                task,
+                item_id=item.id,
+                updates={
+                    "cleanup_performed": True,
+                    "binding_cleared": True,
+                    "cleanup_status": "succeeded",
+                    "current_downstream_task_id": None,
+                    "new_downstream_task_id": None,
+                },
+            )
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "retry_item_cleanup_succeeded",
+                f"旧下游子任务已清理: {item.downstream_service}:{old_task_id or '-'}",
+                stage_name=item.stage_name,
+                payload={"item_id": item.id, "item_key": item.item_key, "old_downstream_task_id": old_task_id},
+            )
+            cleaned += 1
+        operation.result_payload = {**dict(operation.result_payload or {}), "cleanup": {"cleaned_items": cleaned}}
+        return {"cleaned_items": cleaned}
+
+    async def _operation_create_retry_children(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> dict[str, Any]:
+        created_count = 0
+        for action in self._retry_item_actions(task):
+            strategy = str(action.get("strategy") or "").strip()
+            if strategy != RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
+                continue
+            item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == str(action.get("item_id") or "")).first()
+            if item is None:
+                raise ValidationError(f"失败项重试目标缺失: {action.get('item_id')}")
+            if str(item.downstream_task_id or "").strip():
+                self._update_retry_item_action(
+                    task,
+                    item_id=item.id,
+                    updates={
+                        "new_downstream_task_id": str(item.downstream_task_id or "").strip(),
+                        "create_status": "succeeded",
+                    },
+                )
+                continue
+            service, token, payload = self._retry_recreate_payload_for_item(task, item)
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "retry_item_create_started",
+                f"开始创建替换子任务: {service}",
+                stage_name=item.stage_name,
+                payload={"item_id": item.id, "item_key": item.item_key, "service": service},
+            )
+            created = await self._downstream_create_task(db, task, item, service=service, token=token, payload=payload)
+            new_task_id = str(created.get("task_id") or created.get("id") or "").strip()
+            if not new_task_id:
+                raise ValidationError(f"重试创建新子任务失败，缺少任务ID: {service}:{item.item_key}")
+            item.downstream_task_id = new_task_id
+            item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
+            item.started_at = item.started_at or _now()
+            item.error_message = None
+            self._update_retry_item_action(
+                task,
+                item_id=item.id,
+                updates={
+                    "current_downstream_task_id": new_task_id,
+                    "new_downstream_task_id": new_task_id,
+                    "create_status": "succeeded",
+                },
+            )
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "retry_item_create_succeeded",
+                f"替换子任务已创建: {service}:{new_task_id}",
+                stage_name=item.stage_name,
+                payload={"item_id": item.id, "item_key": item.item_key, "service": service, "new_downstream_task_id": new_task_id},
+            )
+            created_count += 1
+        operation.result_payload = {**dict(operation.result_payload or {}), "create": {"created_items": created_count}}
+        return {"created_items": created_count}
+
+    async def _operation_verify_retry_bindings(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> dict[str, Any]:
+        await self._operation_reconcile_retry_non_abnormal_children(db, task, operation)
+        result = self._build_retry_prepare_result(db, task, target_stage=str(operation.target_stage or "").strip())
+        validation = dict(result.get("validation") or {})
+        for action in self._retry_item_actions(task):
+            item_id = str(action.get("item_id") or "").strip()
+            item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == item_id).first()
+            if item is None:
+                raise ValidationError(f"失败项重试目标缺失: {item_id}")
+            strategy = str(action.get("strategy") or "").strip()
+            if strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
+                old_task_id = str(action.get("old_downstream_task_id") or "").strip()
+                new_task_id = str(item.downstream_task_id or "").strip()
+                if not new_task_id:
+                    raise ValidationError(f"失败项重试未生成新的下游任务: {item.item_key}")
+                if old_task_id and old_task_id == new_task_id:
+                    raise ValidationError(f"失败项重试仍绑定旧下游任务: {item.item_key}")
+            self._update_retry_item_action(
+                task,
+                item_id=item_id,
+                updates={
+                    "current_downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+                    "new_downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+                    "verification_status": "succeeded",
+                },
+            )
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "retry_item_binding_verified",
+                "失败项重试绑定已校验通过",
+                stage_name=item.stage_name,
+                payload={
+                    "item_id": item.id,
+                    "item_key": item.item_key,
+                    "strategy": strategy,
+                    "old_downstream_task_id": action.get("old_downstream_task_id"),
+                    "new_downstream_task_id": item.downstream_task_id,
+                },
+            )
+        if not bool(validation.get("validated")):
+            raise ValidationError("失败项重试绑定校验失败")
+        operation.result_payload = {**dict(operation.result_payload or {}), **result}
+        return result
+
+    async def _operation_reconcile_retry_non_abnormal_children(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> dict[str, Any]:
+        reused = 0
+        adopted = 0
+        for action in self._retry_item_actions(task):
+            item_id = str(action.get("item_id") or "").strip()
+            item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == item_id).first()
+            if item is None:
+                raise ValidationError(f"失败项重试目标缺失: {item_id}")
+            strategy = str(action.get("strategy") or "").strip()
+            if strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS:
+                item.status = "success"
+                self._update_retry_item_action(
+                    task,
+                    item_id=item_id,
+                    updates={
+                        "cleanup_status": "not_required",
+                        "create_status": "not_required",
+                        "verification_status": "succeeded",
+                        "current_downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+                        "new_downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+                    },
+                )
+                reused += 1
+                continue
+            if strategy != RETRY_CHILD_STRATEGY_ADOPT_ACTIVE:
+                continue
+            if not str(item.downstream_task_id or "").strip():
+                control = await self._downstream_control_existing_task(
+                    db,
+                    stage_name=item.stage_name,
+                    task=task,
+                    item=item,
+                    token=self._service_token() if item.downstream_service != "system_analyse" and item.downstream_service != "dataflow_analyse" else None,
+                )
+                payload = dict(control.get("payload") or {})
+                outcome = str(control.get("outcome") or "").strip()
+                if outcome in {"accepted", "already_running", "already_terminal"}:
+                    rebound_task_id = str(payload.get("task_id") or payload.get("id") or "").strip()
+                    if rebound_task_id:
+                        item.downstream_task_id = rebound_task_id
+                elif outcome == "not_found":
+                    self._update_retry_item_action(
+                        task,
+                        item_id=item_id,
+                        updates={
+                            "strategy": RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL,
+                            "observed_status": "downstream_missing",
+                            "cleanup_required": True,
+                            "create_required": True,
+                            "cleanup_status": "pending",
+                            "create_status": "pending",
+                            "verification_status": "pending",
+                            "error": None,
+                        },
+                    )
+                    continue
+            normalized_status = self._normalize_item_status(item.status)
+            if normalized_status not in {"pending", "queued", "dispatching", "running"}:
+                self._update_retry_item_action(
+                    task,
+                    item_id=item_id,
+                    updates={
+                        "strategy": RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL,
+                        "observed_status": normalized_status,
+                        "cleanup_required": True,
+                        "create_required": True,
+                        "cleanup_status": "pending",
+                        "create_status": "pending",
+                        "verification_status": "pending",
+                        "error": None,
+                    },
+                )
+                continue
+            self._update_retry_item_action(
+                task,
+                item_id=item_id,
+                updates={
+                    "cleanup_status": "not_required",
+                    "create_status": "not_required",
+                    "verification_status": "succeeded",
+                    "current_downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+                    "new_downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+                },
+            )
+            adopted += 1
+        operation.result_payload = {
+            **dict(operation.result_payload or {}),
+            "non_abnormal": {"reused_items": reused, "adopted_items": adopted},
+            "item_actions": self._retry_item_actions(task),
+        }
+        return {"reused_items": reused, "adopted_items": adopted}
+
+    async def _operation_finalize_retry_failed_items(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> dict[str, Any]:
+        payload = {"finalized": True, "target_stage": operation.target_stage}
+        operation.result_payload = {**dict(operation.result_payload or {}), "finalize": payload}
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "retry_operation_succeeded",
+            "失败项重试控制面已收敛",
+            stage_name=operation.target_stage,
+            payload=payload,
+        )
+        return payload
 
     async def _dispatch_loop(self) -> None:
         session_factory = get_session_factory()
@@ -12243,6 +12895,10 @@ class TaskManager:
         active_operation = self._active_operation(db, task.id)
         if active_operation is not None:
             blocking_reason = f"当前任务正在执行 {active_operation.operation_type}，请稍后重试"
+            result_payload = dict(active_operation.result_payload or {})
+            item_actions = [dict(row) for row in list(result_payload.get("item_actions") or []) if isinstance(row, dict)]
+            validation = dict(result_payload.get("validation") or {})
+            requeue = dict(result_payload.get("requeue") or {})
             return {
                 "overall": "in_progress",
                 "summary": blocking_reason,
@@ -12256,6 +12912,13 @@ class TaskManager:
                 "operation_started_at": _isoformat_or_none(active_operation.started_at),
                 "operation_expires_at": _isoformat_or_none(active_operation.claim_lease_expires_at),
                 "operation_heartbeat_at": _isoformat_or_none(active_operation.heartbeat_at),
+                "current_step": active_operation.current_step,
+                "target_stage": active_operation.target_stage,
+                "item_actions": item_actions,
+                "item_actions_count": len(item_actions),
+                "validation": validation,
+                "issues": list(validation.get("issues") or []),
+                "requeue": requeue,
                 "can_cancel": False,
                 "can_continue": False,
                 "can_retry": False,
@@ -13040,7 +13703,11 @@ class TaskManager:
         return [
             item
             for item in self._stage_items(db, task.id, stage_name)
-            if self._is_failed_retry_candidate_status(item.status) and str(item.downstream_task_id or "").strip()
+            if self._is_failed_retry_candidate_status(item.status)
+            and (
+                str(item.downstream_task_id or "").strip()
+                or self._latest_observed_downstream_status(item) in RETRY_CHILD_ABNORMAL_STATUSES
+            )
         ]
 
     def _has_retryable_failed_stage_items(self, db: Session, task: BinarySecurityTask) -> bool:
@@ -14708,6 +15375,167 @@ class TaskManager:
             result.pop(key, None)
         item.result = result
 
+    def _retry_item_action_snapshot(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        strategy: str,
+        observed_status: str | None,
+        old_downstream_task_id: str | None,
+        cleanup_performed: bool,
+        binding_cleared: bool,
+        cleanup_status: str | None = None,
+        create_required: bool | None = None,
+        create_status: str | None = None,
+        verification_status: str | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "stage_name": item.stage_name,
+            "item_id": item.id,
+            "item_key": item.item_key,
+            "parent_key": item.parent_key,
+            "downstream_service": item.downstream_service,
+            "old_downstream_task_id": old_downstream_task_id,
+            "current_downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+            "new_downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+            "strategy": strategy,
+            "observed_status": observed_status,
+            "cleanup_performed": bool(cleanup_performed),
+            "binding_cleared": bool(binding_cleared),
+            "cleanup_required": bool(strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL),
+            "cleanup_status": cleanup_status or ("pending" if strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL else "not_required"),
+            "create_required": bool(create_required if create_required is not None else strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL),
+            "create_status": create_status or ("pending" if strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL else "not_required"),
+            "verification_status": verification_status or "pending",
+            "error": error,
+        }
+
+    def _store_retry_item_action(self, task: BinarySecurityTask, action: dict[str, Any] | None) -> None:
+        if not isinstance(action, dict):
+            return
+        plan = self._retry_plan(task)
+        actions = [dict(row) for row in list(plan.get("item_actions") or []) if isinstance(row, dict)]
+        item_key = str(action.get("item_key") or "").strip()
+        parent_key = str(action.get("parent_key") or "").strip()
+        normalized: list[dict[str, Any]] = []
+        replaced = False
+        for row in actions:
+            if (
+                str(row.get("item_key") or "").strip() == item_key
+                and str(row.get("parent_key") or "").strip() == parent_key
+            ):
+                normalized.append(dict(action))
+                replaced = True
+            else:
+                normalized.append(row)
+        if not replaced:
+            normalized.append(dict(action))
+        plan["item_actions"] = normalized
+        self._set_retry_plan(task, plan)
+
+    def _retry_item_actions(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        plan = self._retry_plan(task)
+        return [dict(row) for row in list(plan.get("item_actions") or []) if isinstance(row, dict)]
+
+    def _set_retry_item_actions(self, task: BinarySecurityTask, actions: list[dict[str, Any]]) -> None:
+        plan = self._retry_plan(task)
+        plan["item_actions"] = [dict(row) for row in actions if isinstance(row, dict)]
+        self._set_retry_plan(task, plan)
+
+    def _update_retry_item_action(
+        self,
+        task: BinarySecurityTask,
+        *,
+        item_id: str,
+        updates: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        actions = self._retry_item_actions(task)
+        updated: dict[str, Any] | None = None
+        normalized: list[dict[str, Any]] = []
+        for row in actions:
+            if str(row.get("item_id") or "").strip() == str(item_id or "").strip():
+                updated = {**row, **dict(updates or {})}
+                normalized.append(updated)
+            else:
+                normalized.append(row)
+        self._set_retry_item_actions(task, normalized)
+        return updated
+
+    def _validate_retry_prepare_state(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        target_stage: str,
+        retry_item_keys: list[str],
+        item_actions: list[dict[str, Any]],
+        affected_stages: list[str],
+    ) -> dict[str, Any]:
+        stage_items = self._stage_items(db, task.id, target_stage)
+        keyed_items = {
+            self._stage_item_identity(item.item_key, item.parent_key): item
+            for item in stage_items
+        }
+        issues: list[dict[str, Any]] = []
+        validated_item_count = 0
+        failed_item_count = 0
+        for item_key in retry_item_keys:
+            item = keyed_items.get(item_key)
+            if item is None:
+                issues.append({"item_key": item_key, "issue": "missing_retry_item"})
+                failed_item_count += 1
+                continue
+            validated_item_count += 1
+            action = next((row for row in item_actions if str(row.get("item_key") or "") == item_key), None)
+            strategy = str((action or {}).get("strategy") or "").strip()
+            if strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
+                if str(item.downstream_task_id or "").strip():
+                    issues.append({"item_key": item_key, "issue": "binding_not_cleared", "downstream_task_id": item.downstream_task_id})
+                if any(
+                    [
+                        item.downstream_status,
+                        item.sync_status,
+                        item.last_synced_at,
+                        item.downstream_raw_status,
+                        item.downstream_mapped_status,
+                        item.sync_observation_error_message,
+                        item.sync_observation_error_type,
+                        item.sync_observation_http_status,
+                    ]
+                ):
+                    issues.append({"item_key": item_key, "issue": "stale_sync_snapshot_present"})
+                if str(item.status or "").strip() != "pending":
+                    issues.append({"item_key": item_key, "issue": "status_not_reset", "status": item.status})
+                if item.finished_at is not None:
+                    issues.append({"item_key": item_key, "issue": "finished_at_not_cleared"})
+            elif strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS:
+                if str(item.status or "").strip() != "success":
+                    issues.append({"item_key": item_key, "issue": "success_child_not_preserved", "status": item.status})
+            elif strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE:
+                if not str(item.downstream_task_id or "").strip():
+                    issues.append({"item_key": item_key, "issue": "active_binding_missing"})
+                if self._normalize_item_status(item.status) not in {"pending", "queued", "dispatching", "running"}:
+                    issues.append({"item_key": item_key, "issue": "active_status_not_preserved", "status": item.status})
+        for stage_name in affected_stages:
+            stage_run = db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == stage_name,
+            ).first()
+            if stage_run is None:
+                continue
+            if stage_name == target_stage:
+                if str(stage_run.status or "").strip() not in {"pending", "queued", "running"}:
+                    issues.append({"stage_name": stage_name, "issue": "target_stage_not_reset", "status": stage_run.status})
+            elif str(stage_run.status or "").strip() not in {"pending", "queued"}:
+                issues.append({"stage_name": stage_name, "issue": "downstream_stage_not_reset", "status": stage_run.status})
+        return {
+            "validated": not issues,
+            "validated_item_count": validated_item_count,
+            "failed_item_count": failed_item_count + len(issues),
+            "issues": issues,
+        }
+
     def _classify_retry_downstream_strategy(
         self,
         item: BinarySecurityStageItem,
@@ -14742,7 +15570,7 @@ class TaskManager:
         strategy: str,
         observed_status: str | None,
         token: str | None,
-    ) -> None:
+    ) -> dict[str, Any]:
         old_task_id = str(item.downstream_task_id or "").strip() or None
         self._record_downstream_item_disposition(
             session,
@@ -14777,7 +15605,14 @@ class TaskManager:
                     "old_downstream_status": observed_status,
                 },
             )
-            return
+            return self._retry_item_action_snapshot(
+                item,
+                strategy=strategy,
+                observed_status=observed_status,
+                old_downstream_task_id=old_task_id,
+                cleanup_performed=False,
+                binding_cleared=False,
+            )
         if strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE:
             self._record_downstream_item_disposition(
                 session,
@@ -14795,7 +15630,14 @@ class TaskManager:
                     "old_downstream_status": observed_status,
                 },
             )
-            return
+            return self._retry_item_action_snapshot(
+                item,
+                strategy=strategy,
+                observed_status=observed_status,
+                old_downstream_task_id=old_task_id,
+                cleanup_performed=False,
+                binding_cleared=False,
+            )
         self._record_downstream_item_disposition(
             session,
             task,
@@ -14916,6 +15758,14 @@ class TaskManager:
                 "strategy": strategy,
                 "old_downstream_status": observed_status,
             },
+        )
+        return self._retry_item_action_snapshot(
+            item,
+            strategy=strategy,
+            observed_status=observed_status,
+            old_downstream_task_id=old_task_id,
+            cleanup_performed=bool(old_task_id or observed_status == "downstream_missing"),
+            binding_cleared=True,
         )
 
     def _is_vuln_retry_recreate_outcome(self, control: dict[str, Any]) -> bool:
@@ -16601,7 +17451,7 @@ class TaskManager:
             retry_strategy_status = None
             if retrying:
                 retry_strategy, retry_strategy_status = self._classify_retry_downstream_strategy(item, active_payload=active_payload)
-                await self._prepare_retry_child_for_reuse_or_recreate(
+                action_snapshot = await self._prepare_retry_child_for_reuse_or_recreate(
                     session,
                     task,
                     item,
@@ -16609,6 +17459,7 @@ class TaskManager:
                     observed_status=retry_strategy_status,
                     token=token,
                 )
+                self._store_retry_item_action(task, action_snapshot)
                 session.commit()
                 if retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
                     active_payload = None
@@ -17061,7 +17912,28 @@ class TaskManager:
             )
             session.commit()
             active_payload = await self._active_downstream_payload(task, item)
+            retry_strategy = None
+            retry_strategy_status = None
+            if retrying:
+                retry_strategy, retry_strategy_status = self._classify_retry_downstream_strategy(item, active_payload=active_payload)
+                action_snapshot = await self._prepare_retry_child_for_reuse_or_recreate(
+                    session,
+                    task,
+                    item,
+                    strategy=retry_strategy,
+                    observed_status=retry_strategy_status,
+                    token=None,
+                )
+                self._store_retry_item_action(task, action_snapshot)
+                session.commit()
+                if retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
+                    active_payload = None
             if active_payload is not None:
+                item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "running"
+                item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
+                item.started_at = item.started_at or _now()
+                item.error_message = None
+                session.commit()
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, None),
                     success_statuses={"passed", "success"},
@@ -17096,7 +17968,7 @@ class TaskManager:
                             status = "downstream_missing"
                         else:
                             status = "failed"
-                elif retrying and self._has_retryable_downstream_task(item):
+                elif retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
                     control = await self._downstream_control_existing_task(
                         session,
                         stage_name=stage_run.stage_name,
@@ -17170,6 +18042,25 @@ class TaskManager:
                         },
                     )
                     item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+                    item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
+                    item.started_at = item.started_at or _now()
+                    item.error_message = None
+                    self._record_downstream_item_disposition(
+                        session,
+                        task,
+                        item,
+                        event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
+                        message="已创建新的下游子任务",
+                        payload={
+                            "stage_name": item.stage_name,
+                            "item_id": item.id,
+                            "item_key": item.item_key,
+                            "old_downstream_task_id": None,
+                            "new_downstream_task_id": item.downstream_task_id,
+                            "strategy": retry_strategy if retrying else None,
+                            "old_downstream_status": retry_strategy_status if retrying else None,
+                        },
+                    )
                     session.commit()
                     status, payload = await self._poll_until_terminal(
                         lambda: self._downstream_fetch_item_payload(task, item, None),
@@ -18051,8 +18942,27 @@ class TaskManager:
             session.commit()
             elf_tasks = self._build_module_elf_tasks(module)
             active_payload = await self._active_downstream_payload(task, item, token)
+            retry_strategy = None
+            retry_strategy_status = None
+            if retrying:
+                retry_strategy, retry_strategy_status = self._classify_retry_downstream_strategy(item, active_payload=active_payload)
+                action_snapshot = await self._prepare_retry_child_for_reuse_or_recreate(
+                    session,
+                    task,
+                    item,
+                    strategy=retry_strategy,
+                    observed_status=retry_strategy_status,
+                    token=token,
+                )
+                self._store_retry_item_action(task, action_snapshot)
+                session.commit()
+                if retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
+                    active_payload = None
             if active_payload is not None:
                 item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or item.status
+                item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
+                item.started_at = item.started_at or _now()
+                item.error_message = None
                 session.commit()
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, token or ""),
@@ -18088,7 +18998,7 @@ class TaskManager:
                             status = "downstream_missing"
                         else:
                             status = "failed"
-                elif retrying and self._has_retryable_downstream_task(item):
+                elif retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
                     control = await self._downstream_control_existing_task(
                         session,
                         stage_name=stage_run.stage_name,
@@ -18161,6 +19071,25 @@ class TaskManager:
                     )
                     item.downstream_task_id = created.get("id") or item.downstream_task_id
                     item.result = {"project_id": task.project_id}
+                    item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
+                    item.started_at = item.started_at or _now()
+                    item.error_message = None
+                    self._record_downstream_item_disposition(
+                        session,
+                        task,
+                        item,
+                        event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
+                        message="已创建新的下游子任务",
+                        payload={
+                            "stage_name": item.stage_name,
+                            "item_id": item.id,
+                            "item_key": item.item_key,
+                            "old_downstream_task_id": None,
+                            "new_downstream_task_id": item.downstream_task_id,
+                            "strategy": retry_strategy if retrying else None,
+                            "old_downstream_status": retry_strategy_status if retrying else None,
+                        },
+                    )
                     session.commit()
                     status, payload = await self._poll_until_terminal(
                         lambda: self._downstream_fetch_item_payload(task, item, token or ""),
@@ -18564,7 +19493,7 @@ class TaskManager:
             retry_strategy_status = None
             if retrying:
                 retry_strategy, retry_strategy_status = self._classify_retry_downstream_strategy(item, active_payload=active_payload)
-                await self._prepare_retry_child_for_reuse_or_recreate(
+                action_snapshot = await self._prepare_retry_child_for_reuse_or_recreate(
                     session,
                     task,
                     item,
@@ -18572,6 +19501,7 @@ class TaskManager:
                     observed_status=retry_strategy_status,
                     token=token,
                 )
+                self._store_retry_item_action(task, action_snapshot)
                 session.commit()
                 if retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
                     active_payload = None
@@ -19024,6 +19954,97 @@ class TaskManager:
                 return str(report_path.parent)
         return ""
 
+    def _retry_recreate_payload_for_item(
+        self,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+    ) -> tuple[str, str | None, dict[str, Any]]:
+        input_ref = dict(item.input_ref or {})
+        service = str(item.downstream_service or "").strip()
+        token: str | None = self._service_token()
+        if service == "firmware_unpacker":
+            input_path = str(input_ref.get("path") or "").strip()
+            if not input_path:
+                raise ValidationError("firmware_unpack retry 缺少输入路径")
+            return service, token, {
+                "firmware_path": input_path,
+                "origin": _downstream_origin_payload(task, item),
+            }
+        if service == "system_analyse":
+            input_path = str(input_ref.get("input_path") or "").strip()
+            firmware_name = str(item.item_name or input_ref.get("firmware_key") or "firmware").strip()
+            if not input_path:
+                raise ValidationError("system_analysis retry 缺少 input_path")
+            return service, None, {
+                "task_name": f"{task.name}-{firmware_name}-system-analysis",
+                "input_path": input_path,
+                "origin": _downstream_origin_payload(task, item),
+                "analysis_mode": self._task_type(task),
+            }
+        if service == "binary_to_source":
+            elf_tasks = self._build_module_elf_tasks(input_ref)
+            b2s_mode, b2s_engine = self._b2s_execution_mode(task)
+            return service, token, {
+                "name": f"{task.name}-{input_ref['module_name']}",
+                "elf_tasks": elf_tasks,
+                "origin": _downstream_origin_payload(task, item),
+                "mode": b2s_mode,
+                "engine": b2s_engine,
+            }
+        if service == "entry_analyse":
+            entry_input = self._normalize_entry_analysis_module_input(task, input_ref)
+            input_contract = self._build_entry_analysis_input_contract(entry_input)
+            return service, token, {
+                "task_name": f"{task.name}-{entry_input['module_name']}-entry",
+                "input_path": input_contract["module_dir"],
+                "module_name": entry_input["module_name"],
+                "source_path": input_contract["source_root"],
+                "origin": {
+                    **_downstream_origin_payload(task, item),
+                    "input_contract": input_contract,
+                    "entry_descriptor_root": entry_input.get("entry_descriptor_root"),
+                    "entry_files_list": entry_input.get("entry_files_list"),
+                },
+            }
+        if service == "dataflow_analyse":
+            entry = self._validate_entry_output_contract(input_ref, allow_fallback=True)
+            taint_params = [str(value).strip() for value in (entry.get("taint_params") or []) if str(value).strip()] or _entry_signature_params(entry)
+            definition_kind = self._resolve_entry_definition_kind(entry)
+            definition_line = str(entry.get("definition_line") or entry.get("line_no") or "").strip()
+            normalized_source_file = self._normalize_dfa_source_file(str(entry.get("source_root_path") or ""), entry)
+            prompt = f"分析文件 {str(entry.get('definition_file') or entry['file_name'])} 中函数 {entry['function_name']} 的外部输入数据流"
+            line_hint = definition_line if not definition_line or definition_line.upper().startswith("L") else f"L{definition_line}"
+            return service, None, {
+                "task_name": f"{task.name}-{entry['function_name']}-dfa",
+                "module_input_path": entry["module_input_path"],
+                "source_root_path": entry["source_root_path"],
+                "prompt_content": prompt,
+                "origin": _downstream_origin_payload(task, item),
+                "source_file": normalized_source_file,
+                "function_name": entry["function_name"],
+                "line_hint": line_hint,
+                "definition_kind": definition_kind,
+                "taint_params": taint_params,
+                "function_description": str(entry.get("function_description") or ""),
+                "function_description_source": str(entry.get("function_description_source") or ""),
+                "entry_reason": str(entry.get("entry_reason") or ""),
+                "entry_reason_source": str(entry.get("entry_reason_source") or ""),
+                "taint_details": [dict(detail) for detail in (entry.get("taint_details") or []) if isinstance(detail, dict)],
+            }
+        if service == "dataflow_vuln_scanner":
+            dataflow_result = self._validate_dataflow_output_contract(input_ref, allow_fallback=True)
+            dataflow_input_dir = self._resolve_vuln_scan_dataflow_input_dir(dataflow_result)
+            source_dir = str(dataflow_result.get("source_root_path") or dataflow_result.get("source_dir") or "").strip()
+            if not dataflow_input_dir or not source_dir:
+                raise ValidationError("vuln_scan retry 缺少 dataflow/source 输入")
+            return service, token, {
+                "title": f"{task.name}-{dataflow_result['function_name']}-scan",
+                "data_flow_path": dataflow_input_dir,
+                "source_dir": source_dir,
+                "origin": _downstream_origin_payload(task, item),
+            }
+        raise ValidationError(f"不支持的 retry downstream service: {service or '-'}")
+
     def _resolve_dataflow_directory(self, root: Path) -> Path | None:
         if not root.exists():
             return None
@@ -19243,7 +20264,7 @@ class TaskManager:
             retry_strategy_status = None
             if retrying:
                 retry_strategy, retry_strategy_status = self._classify_retry_downstream_strategy(item, active_payload=active_payload)
-                await self._prepare_retry_child_for_reuse_or_recreate(
+                action_snapshot = await self._prepare_retry_child_for_reuse_or_recreate(
                     session,
                     task,
                     item,
@@ -19251,6 +20272,7 @@ class TaskManager:
                     observed_status=retry_strategy_status,
                     token=None,
                 )
+                self._store_retry_item_action(task, action_snapshot)
                 session.commit()
                 if retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
                     active_payload = None
@@ -19635,7 +20657,7 @@ class TaskManager:
             retry_strategy_status = None
             if retrying:
                 retry_strategy, retry_strategy_status = self._classify_retry_downstream_strategy(item, active_payload=active_payload)
-                await self._prepare_retry_child_for_reuse_or_recreate(
+                action_snapshot = await self._prepare_retry_child_for_reuse_or_recreate(
                     session,
                     task,
                     item,
@@ -19643,6 +20665,7 @@ class TaskManager:
                     observed_status=retry_strategy_status,
                     token=token,
                 )
+                self._store_retry_item_action(task, action_snapshot)
                 session.commit()
                 if retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
                     active_payload = None

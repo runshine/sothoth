@@ -8596,6 +8596,67 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state["can_retry"])
         self.assertFalse(state["can_retry_failed_items"])
 
+    def test_build_manual_operation_state_exposes_retry_operation_progress_fields(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/in",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="failed",
+            current_operation_id="op1",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="retry_failed_items",
+            target_stage="entry_analysis",
+            status="running",
+            current_step="verify_retry_bindings",
+        )
+        operation.result_payload = {
+            "item_actions": [
+                {
+                    "item_id": "si1",
+                    "item_key": "IPSEC",
+                    "strategy": "recreate_from_abnormal",
+                    "old_downstream_task_id": "eat-old",
+                    "new_downstream_task_id": "eat-new",
+                    "cleanup_status": "succeeded",
+                    "create_status": "succeeded",
+                    "verification_status": "succeeded",
+                }
+            ],
+            "validation": {"validated": True, "issues": []},
+            "requeue": {"requested": True, "task_status_after": "pending"},
+        }
+        db = _ModelAwareDb(tasks=[task], operations=[operation])
+
+        state = self.manager._build_manual_operation_state(
+            db,
+            task,
+            task_retry_supported=False,
+            task_retry_reason=None,
+            task_retry_failed_supported=False,
+            task_retry_failed_reason=None,
+            task_continue_supported=False,
+            task_continue_reason=None,
+            stage_summaries=[BinarySecurityStageSummary(stage_name="entry_analysis", sequence_no=3, status="failed")],
+        )
+
+        self.assertTrue(state["operation_in_progress"])
+        self.assertEqual("retry_failed_items", state["operation_type"])
+        self.assertEqual("verify_retry_bindings", state["current_step"])
+        self.assertEqual("entry_analysis", state["target_stage"])
+        self.assertEqual(1, state["item_actions_count"])
+        self.assertTrue(state["validation"]["validated"])
+        self.assertEqual([], state["issues"])
+        self.assertTrue(state["requeue"]["requested"])
+
     def test_task_response_exposes_stage_full_retry_for_binary_module_when_upstreams_succeed(self):
         task = BinarySecurityTask(
             id="bm1",
@@ -9145,18 +9206,175 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["entry_analysis", "dataflow_analysis", "vuln_scan"], affected)
         self.assertEqual(1, len(sync_calls))
         self.assertFalse(sync_calls[0]["apply_state"])
-        self.assertIsNone(items[0].downstream_task_id)
         self.assertEqual("pending", items[0].status)
-        self.assertIsNone(items[0].downstream_status)
-        self.assertIsNone(items[0].sync_status)
-        self.assertIsNone(items[0].downstream_raw_status)
-        self.assertIsNone(items[0].downstream_mapped_status)
-        self.assertFalse(items[0].downstream_state_applied)
-        self.assertIsNone(items[0].error_message)
+        self.assertEqual("eat-old", items[0].downstream_task_id)
+        self.assertEqual("cancelled", items[0].downstream_status)
+        self.assertEqual("synced", items[0].sync_status)
+        self.assertEqual("cancelled", items[0].downstream_raw_status)
+        self.assertEqual("cancelled", items[0].downstream_mapped_status)
+        self.assertTrue(items[0].downstream_state_applied)
+        self.assertEqual("任务已取消", items[0].error_message)
         self.assertIsNone(items[0].finished_at)
-        self.assertIsNone((items[0].result or {}).get("downstream_status"))
-        self.assertIsNone((items[0].result or {}).get("downstream"))
         self.assertFalse((items[0].result or {}).get("sync_observation", {}).get("state_applied"))
+        retry_plan = task.summary.get("retry_plan") or {}
+        self.assertEqual(["IPSEC::module-input"], retry_plan.get("retry_item_keys"))
+        self.assertEqual(["entry_analysis", "dataflow_analysis", "vuln_scan"], retry_plan.get("affected_stages"))
+        self.assertEqual([], retry_plan.get("item_actions") or [])
+
+    def test_build_retry_prepare_result_marks_validation_failure_for_stale_binding(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            current_stage="entry_analysis",
+        )
+        task.summary = {
+            "retry_plan": {
+                "target_stage": "entry_analysis",
+                "retry_item_keys": ["IPSEC::module-input"],
+                "item_actions": [
+                    {
+                        "item_key": "IPSEC",
+                        "parent_key": "module-input",
+                        "strategy": "recreate_from_abnormal",
+                    }
+                ],
+                "affected_stages": ["entry_analysis"],
+            }
+        }
+        runs = [
+            BinarySecurityStageRun(id="sr-entry", task_id="task1", project_id="p1", stage_name="entry_analysis", sequence_no=2, status="pending"),
+        ]
+        items = [
+            BinarySecurityStageItem(
+                id="si-entry",
+                task_id="task1",
+                project_id="p1",
+                stage_run_id="sr-entry",
+                stage_name="entry_analysis",
+                item_key="IPSEC",
+                item_name="IPSEC",
+                parent_key="module-input",
+                item_identity_key="IPSEC::module-input",
+                downstream_service="entry_analyse",
+                downstream_task_id="eat-stale",
+                status="pending",
+            )
+        ]
+        db = _ModelAwareDb(tasks=[task], stage_runs=runs, stage_items=items)
+
+        result = self.manager._build_retry_prepare_result(db, task, target_stage="entry_analysis")
+
+        self.assertFalse(result["validation"]["validated"])
+        self.assertTrue(any(issue.get("issue") == "binding_not_cleared" for issue in result["validation"]["issues"]))
+
+    def test_run_task_operation_steps_retry_failed_items_recreates_abnormal_child_inside_operation(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            current_operation_id="op1",
+        )
+        task.summary = {
+            "retry_plan": {
+                "target_stage": "entry_analysis",
+                "mode": "retry_failed_items",
+                "retry_item_keys": ["IPSEC::module-input"],
+            }
+        }
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="failed",
+        )
+        item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="IPSEC",
+            item_name="IPSEC",
+            parent_key="module-input",
+            item_identity_key="IPSEC::module-input",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-old",
+            status="cancelled",
+        )
+        item.input_ref = {
+            "module_key": "IPSEC",
+            "module_name": "IPSEC",
+            "firmware_key": "module-input",
+            "source_dir": "/src",
+            "source_root": "/src",
+            "source_root_path": "/src",
+            "module_dir": "/src/modules/IPSEC",
+            "entry_descriptor_root": "/src",
+            "entry_files_list": "/src/modules/IPSEC/files.list",
+            "entry_descriptor_ready": True,
+        }
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="task1",
+            project_id="p1",
+            operation_type="retry_failed_items",
+            target_stage="entry_analysis",
+            status="running",
+            current_step="collect_cleanup_plan",
+        )
+        operation.resume_cursor = {"current_step": "collect_cleanup_plan"}
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], operations=[operation])
+        deleted_refs = []
+        created_payloads = []
+
+        async def fake_sync(*args, **kwargs):
+            del args, kwargs
+            return None
+
+        async def fake_delete_refs(db_arg, task_arg, refs_arg, token_arg):
+            del db_arg, task_arg, token_arg
+            deleted_refs.extend(refs_arg)
+            return len(refs_arg)
+
+        async def fake_create(db_arg, task_arg, item_arg, *, service, token, payload):
+            del db_arg, task_arg, token
+            created_payloads.append({"service": service, "payload": dict(payload), "item_id": item_arg.id})
+            return {"task_id": "eat-new", "status": "pending"}
+
+        original_sync = self.manager.sync_downstream_status
+        original_delete = self.manager._delete_downstream_refs
+        original_create = self.manager._downstream_create_task
+        original_enqueue = self.manager._enqueue_task
+        try:
+            self.manager.sync_downstream_status = fake_sync
+            self.manager._delete_downstream_refs = fake_delete_refs
+            self.manager._downstream_create_task = fake_create
+            self.manager._enqueue_task = lambda task_id: None
+            asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
+        finally:
+            self.manager.sync_downstream_status = original_sync
+            self.manager._delete_downstream_refs = original_delete
+            self.manager._downstream_create_task = original_create
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual(["eat-old"], [row["task_id"] for row in deleted_refs])
+        self.assertEqual(1, len(created_payloads))
+        self.assertEqual("entry_analyse", created_payloads[0]["service"])
+        self.assertEqual("eat-new", item.downstream_task_id)
+        self.assertEqual("pending", item.status)
+        self.assertEqual("operation_succeeded", dict(operation.resume_cursor or {}).get("current_step"))
+        self.assertEqual("succeeded", dict(operation.result_payload or {}).get("validation", {}).get("validated") and "succeeded" or "failed")
 
     def test_prepare_retry_failed_items_streaming_dataflow_retry_clears_vuln_summary_when_last_descendant_removed(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -16717,6 +16935,41 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(item.error_message)
         self.assertIsNone(item.finished_at)
         self.assertEqual({}, item.result)
+
+    def test_prepare_retry_child_for_reuse_or_recreate_returns_action_snapshot(self):
+        task = BinarySecurityTask(id="t1", project_id="p1")
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            parent_key="firmware-1",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-old",
+            status="cancelled",
+        )
+        fake_session = _ModelAwareDb()
+
+        with (
+            patch.object(self.manager, "_downstream_cancel_refs", new=AsyncMock(return_value=1)),
+            patch.object(self.manager, "_delete_downstream_refs", new=AsyncMock(return_value=1)),
+        ):
+            action = asyncio.run(
+                self.manager._prepare_retry_child_for_reuse_or_recreate(
+                    fake_session,
+                    task,
+                    item,
+                    strategy="recreate_from_abnormal",
+                    observed_status="cancelled",
+                    token="tok",
+                )
+            )
+
+        self.assertEqual("module-1", action["item_key"])
+        self.assertEqual("recreate_from_abnormal", action["strategy"])
+        self.assertTrue(action["cleanup_performed"])
+        self.assertTrue(action["binding_cleared"])
 
     def test_run_firmware_item_reuses_duplicate_downstream_task_before_create(self):
         task = BinarySecurityTask(
