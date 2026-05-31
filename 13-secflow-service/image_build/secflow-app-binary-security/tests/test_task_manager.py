@@ -16326,6 +16326,10 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             status="cancelled",
             output_ref={},
         )
+        item.result = {
+            "downstream_status": "cancelled",
+            "sync_observation": {"downstream_status": "cancelled"},
+        }
         module = {
             "module_key": "module-1",
             "module_name": "mod",
@@ -16350,7 +16354,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_active_downstream_payload", return_value=None),
-            patch.object(self.manager, "_downstream_control_existing_task", return_value={"outcome": "already_terminal", "payload": {"task_id": "ea-old", "status": "cancelled"}}),
+            patch.object(self.manager, "_downstream_control_existing_task") as control_mock,
             patch.object(self.manager, "_downstream_create_task", side_effect=fake_create_task),
             patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
             patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
@@ -16363,6 +16367,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("success", result["status"])
         self.assertEqual(1, len(create_calls))
         self.assertEqual("entry_analyse", create_calls[0]["service"])
+        control_mock.assert_not_called()
         self.assertEqual("ea-new", item.downstream_task_id)
         self.assertEqual("success", item.status)
 

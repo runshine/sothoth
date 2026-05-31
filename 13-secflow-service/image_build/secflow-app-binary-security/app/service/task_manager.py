@@ -14618,6 +14618,16 @@ class TaskManager:
             return "downstream_missing"
         return "failed"
 
+    def _latest_observed_downstream_status(self, item: BinarySecurityStageItem) -> str | None:
+        result = dict(item.result or {})
+        if not result:
+            return None
+        observed = result.get("downstream_status")
+        if observed is None and isinstance(result.get("sync_observation"), dict):
+            observed = result["sync_observation"].get("downstream_status")
+        mapped = self._map_downstream_status(str(observed or ""))
+        return mapped or (str(observed or "").strip().lower() or None)
+
     def _has_retryable_downstream_task(self, item: BinarySecurityStageItem) -> bool:
         if not str(item.downstream_task_id or "").strip():
             return False
@@ -18273,6 +18283,28 @@ class TaskManager:
                         payload = dict(reusable_payload)
                         status = self._status_from_downstream_payload(payload, success_statuses={"passed", "success"})
                     created = None
+                elif retrying and self._latest_observed_downstream_status(item) in {"failed", "cancelled", "downstream_missing"}:
+                    input_contract = self._build_entry_analysis_input_contract(entry_input)
+                    item.downstream_task_id = None
+                    created = await self._downstream_create_task(
+                        session,
+                        task,
+                        item,
+                        service="entry_analyse",
+                        token=token,
+                        payload={
+                            "task_name": f"{task.name}-{entry_input['module_name']}-entry",
+                            "input_path": input_contract["module_dir"],
+                            "module_name": entry_input["module_name"],
+                            "source_path": input_contract["source_root"],
+                            "origin": {
+                                **_downstream_origin_payload(task, item),
+                                "input_contract": input_contract,
+                                "entry_descriptor_root": entry_input.get("entry_descriptor_root"),
+                                "entry_files_list": entry_input.get("entry_files_list"),
+                            },
+                        },
+                    )
                 elif retrying and self._has_retryable_downstream_task(item):
                     control = await self._downstream_control_existing_task(
                         session,
