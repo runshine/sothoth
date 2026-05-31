@@ -8993,6 +8993,64 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([], [row.id for row in db.state_events if row.stage_name in {"dataflow_analysis", "vuln_scan"}])
             self.assertEqual([], [row.id for row in db.events if row.stage_name in {"dataflow_analysis", "vuln_scan"}])
 
+    def test_prepare_retry_failed_items_for_entry_analysis_syncs_without_applying_old_terminal_state(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="cancelled",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {
+            "retry_plan": {
+                "target_stage": "entry_analysis",
+                "mode": "retry_failed_items",
+                "retry_item_keys": ["IPSEC::module-input"],
+            }
+        }
+        runs = [
+            BinarySecurityStageRun(id="sr-entry", task_id="task1", project_id="p1", stage_name="entry_analysis", sequence_no=2, status="cancelled"),
+        ]
+        items = [
+            BinarySecurityStageItem(
+                id="si-entry",
+                task_id="task1",
+                project_id="p1",
+                stage_run_id="sr-entry",
+                stage_name="entry_analysis",
+                item_key="IPSEC",
+                item_name="IPSEC",
+                parent_key="module-input",
+                item_identity_key="IPSEC::module-input",
+                downstream_service="entry_analyse",
+                downstream_task_id="eat-old",
+                status="cancelled",
+            )
+        ]
+        db = _ModelAwareDb(tasks=[task], stage_runs=runs, stage_items=items)
+        sync_calls: list[dict[str, object]] = []
+
+        async def fake_sync(*args, **kwargs):
+            del args
+            sync_calls.append(dict(kwargs))
+            return None
+
+        original_sync = self.manager.sync_downstream_status
+        try:
+            self.manager.sync_downstream_status = fake_sync
+            affected = asyncio.run(self.manager._prepare_retry_failed_items(db, task, "entry_analysis"))
+        finally:
+            self.manager.sync_downstream_status = original_sync
+
+        self.assertEqual(["entry_analysis", "dataflow_analysis", "vuln_scan"], affected)
+        self.assertEqual(1, len(sync_calls))
+        self.assertFalse(sync_calls[0]["apply_state"])
+
     def test_prepare_retry_failed_items_streaming_dataflow_retry_clears_vuln_summary_when_last_descendant_removed(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         with tempfile.TemporaryDirectory() as tmp:

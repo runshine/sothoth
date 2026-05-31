@@ -2748,6 +2748,12 @@ class TaskManager:
         ]
         if not retry_items:
             raise ValidationError("失败项重试未找到目标阶段子任务")
+        sync_apply_state = True
+        if target_stage == "entry_analysis":
+            # Entry-analysis failed-item retry must not eagerly re-apply the old
+            # terminal downstream state, otherwise the stale cancelled/failed child
+            # short-circuits the requeue path before a replacement child can be created.
+            sync_apply_state = False
         await self.sync_downstream_status(
             db,
             project_id=task.project_id,
@@ -2757,7 +2763,7 @@ class TaskManager:
             token=self._service_token(),
             record_request_event=False,
             record_noop_events=False,
-            apply_state=True,
+            apply_state=sync_apply_state,
         )
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
