@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 
 from app.model import B2STaskItem
 from app.service.task_service import (
+    build_task_item_artifact_content,
     build_generated_files,
     build_task_item_artifacts,
     build_task_result_summary,
@@ -136,6 +137,23 @@ class ResultKindSummaryTests(unittest.TestCase):
                 [str(root / "main.c"), str(root / "main.h")],
                 normalize_generated_files(item),
             )
+
+    def test_root_artifact_content_is_readable_from_artifact_id(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "main.c").write_text("int main(void){return 0;}\n", encoding="utf-8")
+            (root / "main.h").write_text("#pragma once\n", encoding="utf-8")
+
+            item = _item(item_id="item-7", output_dir=str(root))
+            artifacts = build_task_item_artifacts(item)
+            source_artifact = next(artifact for artifact in artifacts.artifacts if artifact.relative_path == "main.c")
+            header_artifact = next(artifact for artifact in artifacts.artifacts if artifact.relative_path == "main.h")
+
+            source_content = build_task_item_artifact_content(item, source_artifact.id, limit=1024)
+            header_content = build_task_item_artifact_content(item, header_artifact.id, limit=1024)
+
+            self.assertIn("int main", source_content.content)
+            self.assertIn("#pragma once", header_content.content)
 
     def test_remove_ida_intermediate_outputs_only_cleans_final_output_root(self) -> None:
         with TemporaryDirectory() as tmp:

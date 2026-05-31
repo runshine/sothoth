@@ -4205,6 +4205,31 @@ def _iter_root_artifact_paths(output_dir: Path) -> list[Path]:
     return paths
 
 
+def _iter_all_artifact_files(advanced: TaskItemAdvancedResponse) -> list[AdvancedFile]:
+    base = Path(advanced.output_dir).resolve()
+    files: list[AdvancedFile] = []
+    seen_paths: set[str] = set()
+    for file in _iter_advanced_files(advanced):
+        resolved_path = str(Path(file.path).resolve())
+        if resolved_path in seen_paths:
+            continue
+        seen_paths.add(resolved_path)
+        files.append(file)
+    for path in _iter_root_artifact_paths(base):
+        resolved_path = str(path.resolve())
+        if resolved_path in seen_paths:
+            continue
+        seen_paths.add(resolved_path)
+        file = _safe_read_advanced_file(path, base, False, _root_artifact_meta(path))
+        if file:
+            files.append(file)
+    return files
+
+
+def _resolve_artifact_file(advanced: TaskItemAdvancedResponse, artifact_id: str) -> AdvancedFile | None:
+    return next((candidate for candidate in _iter_all_artifact_files(advanced) if _artifact_id(candidate.path) == artifact_id), None)
+
+
 B2S_RESULT_SUMMARY_VERSION = 1
 _RESULT_KIND_PRIORITY = [
     "recovered_source",
@@ -4311,34 +4336,9 @@ def build_task_item_artifacts(item: B2STaskItem) -> TaskItemArtifactsResponse:
     advanced = build_task_item_advanced(item, include_content=False)
     base = Path(advanced.output_dir).resolve()
     artifacts: list[B2SArtifact] = []
-    seen_paths: set[str] = set()
-    for file in _iter_advanced_files(advanced):
-        resolved_path = str(Path(file.path).resolve())
-        if resolved_path in seen_paths:
-            continue
-        seen_paths.add(resolved_path)
+    for file in _iter_all_artifact_files(advanced):
         try:
             relative_path = str(Path(file.path).resolve().relative_to(base))
-        except Exception:
-            relative_path = file.name
-        artifact_id = _artifact_id(file.path)
-        content_url = f"/api/app/binary-to-source/projects/{item.project_id}/tasks/{item.task_id}/items/{item.id}/artifacts/{artifact_id}/content"
-        artifacts.append(B2SArtifact(
-            id=artifact_id, name=file.name, path=file.path, relative_path=relative_path, kind=file.kind, size=file.size,
-            stage=file.stage, stage_order=file.stage_order, section=file.section, section_order=file.section_order,
-            round=file.round, round_order=file.round_order, agent=file.agent, role=file.role, batch_no=file.batch_no,
-            attempt_no=file.attempt_no, content_url=content_url,
-        ))
-    for path in _iter_root_artifact_paths(base):
-        resolved_path = str(path.resolve())
-        if resolved_path in seen_paths:
-            continue
-        seen_paths.add(resolved_path)
-        file = _safe_read_advanced_file(path, base, False, _root_artifact_meta(path))
-        if not file:
-            continue
-        try:
-            relative_path = str(path.resolve().relative_to(base))
         except Exception:
             relative_path = file.name
         artifact_id = _artifact_id(file.path)
@@ -4375,7 +4375,7 @@ def build_task_item_artifacts(item: B2STaskItem) -> TaskItemArtifactsResponse:
 
 def build_task_item_artifact_content(item: B2STaskItem, artifact_id: str, offset: int = 0, limit: int = ADVANCED_MAX_BYTES) -> B2SArtifactContentResponse:
     advanced = build_task_item_advanced(item, include_content=False)
-    file = next((candidate for candidate in _iter_advanced_files(advanced) if _artifact_id(candidate.path) == artifact_id), None)
+    file = _resolve_artifact_file(advanced, artifact_id)
     if not file:
         raise NotFoundError("产物文件不存在")
     path = Path(file.path).resolve()

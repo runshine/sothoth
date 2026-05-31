@@ -645,6 +645,12 @@ class B2SCacheService:
             query = query.filter(B2SAnalysisCache.cache_key.like("%_deep"))
         elif normalized_mode == "turbo":
             query = query.filter(B2SAnalysisCache.cache_key.like("%_turbo"))
+        elif normalized_mode == "unknown":
+            query = query.filter(
+                ~B2SAnalysisCache.cache_key.like("%_fast"),
+                ~B2SAnalysisCache.cache_key.like("%_deep"),
+                ~B2SAnalysisCache.cache_key.like("%_turbo"),
+            )
         if cache_key:
             query = query.filter(B2SAnalysisCache.cache_key.contains(str(cache_key).strip()))
         if elf_basename:

@@ -85,6 +85,25 @@ def test_list_cache_entries_filters_and_summarizes(db_session, monkeypatch):
     assert payload["summary"]["total_hit_count"] == 3
 
 
+def test_list_cache_entries_supports_turbo_and_unknown_modes(db_session, monkeypatch):
+    session, tmp_path = db_session
+    service = B2SCacheService()
+    monkeypatch.setattr("app.service.cache_service.get_config", lambda: SimpleNamespace(cache=SimpleNamespace(enabled=True, root_dir=str(tmp_path), materialize_mode="copy")))
+    turbo_row = _make_cache_row(tmp_path, cache_key=f"{'c' * 64}_turbo", project_id="p1", task_id="t1", item_id="i1", hit_count=1)
+    unknown_row = _make_cache_row(tmp_path, cache_key=f"{'d' * 64}_legacy", project_id="p1", task_id="t2", item_id="i2", hit_count=0)
+    session.add_all([turbo_row, unknown_row])
+    session.commit()
+
+    turbo_payload = service.list_cache_entries(session, project_id="p1", include_all_projects=False, mode="turbo")
+    unknown_payload = service.list_cache_entries(session, project_id="p1", include_all_projects=False, mode="unknown")
+
+    assert turbo_payload["total"] == 1
+    assert turbo_payload["items"][0]["cache_key"] == turbo_row.cache_key
+    assert turbo_payload["summary"]["turbo_entries"] == 1
+    assert unknown_payload["total"] == 1
+    assert unknown_payload["items"][0]["cache_key"] == unknown_row.cache_key
+
+
 def test_get_cache_entry_detail_returns_manifest_and_flags(db_session, monkeypatch):
     session, tmp_path = db_session
     service = B2SCacheService()
