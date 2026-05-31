@@ -674,6 +674,8 @@ STAGE_RETRY_ALLOWED_STATUSES = {"success", "failed", "partial_success", "cancell
 STAGE_RETRY_BLOCKED_TASK_STATUSES = {"pending", "dispatching", "running", "pending_upload", "uploading", "ready_to_start"}
 TASK_STATUS_PENDING_MODULE_CONFIRMATION = "pending_module_confirmation"
 TASK_STATUS_HARD_RESTART_FAILED = "hard_restart_failed"
+TASK_STATUS_CANCELLING = "cancelling"
+TASK_STATUS_CANCEL_FAILED = "cancel_failed"
 TASK_STATUS_DELETE_FAILED = "delete_failed"
 TASK_ACTION_CONTINUE = "continue"
 TASK_ACTION_RETRY = "retry"
@@ -706,6 +708,13 @@ TASK_OPERATION_STEP_DELETE_STAGE_TIMELINE = "delete_stage_timeline"
 TASK_OPERATION_STEP_REBUILD_UPSTREAM_DERIVED_INPUTS = "rebuild_upstream_derived_inputs"
 TASK_OPERATION_STEP_RESET_STAGE_RUNS = "reset_stage_runs"
 TASK_OPERATION_STEP_REQUEUE_TASK = "requeue_task"
+TASK_OPERATION_STEP_MARK_TASK_CANCELLING = "mark_task_cancelling"
+TASK_OPERATION_STEP_COLLECT_CANCEL_TARGETS = "collect_cancel_targets"
+TASK_OPERATION_STEP_CANCEL_LOCAL_EXECUTION = "cancel_local_execution"
+TASK_OPERATION_STEP_CANCEL_DOWNSTREAM_TARGETS = "cancel_downstream_targets"
+TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_QUIESCED = "verify_downstream_quiesced"
+TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED = "finalize_task_cancelled"
+TASK_OPERATION_STEP_FINALIZE_TASK_CANCEL_FAILED = "finalize_task_cancel_failed"
 TASK_OPERATION_STEP_SUCCEEDED = "operation_succeeded"
 TASK_OPERATION_SAGA_STEPS = (
     TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN,
@@ -721,8 +730,19 @@ TASK_OPERATION_SAGA_STEPS = (
     TASK_OPERATION_STEP_REQUEUE_TASK,
     TASK_OPERATION_STEP_SUCCEEDED,
 )
+TASK_CANCEL_SAGA_STEPS = (
+    TASK_OPERATION_STEP_MARK_TASK_CANCELLING,
+    TASK_OPERATION_STEP_COLLECT_CANCEL_TARGETS,
+    TASK_OPERATION_STEP_CANCEL_LOCAL_EXECUTION,
+    TASK_OPERATION_STEP_CANCEL_DOWNSTREAM_TARGETS,
+    TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_QUIESCED,
+    TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED,
+    TASK_OPERATION_STEP_FINALIZE_TASK_CANCEL_FAILED,
+    TASK_OPERATION_STEP_SUCCEEDED,
+)
 TASK_OPERATION_LOCK_TTL_SECONDS = 1800
 TASK_OPERATION_LOCK_HEARTBEAT_SECONDS = 20
+TASK_CANCEL_VERIFY_TIMEOUT_SECONDS = 180
 STATE_EVENT_LEASE_SECONDS = 120
 TASK_STATE_LEASE_SECONDS = 300
 STATE_EVENT_MAX_ATTEMPTS = 5
@@ -2443,6 +2463,18 @@ class TaskManager:
 
     async def cancel_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityActionResponse:
         task = self._task_or_404(db, project_id, task_id)
+        active_cancel_operation = self._active_operation(db, task.id)
+        if active_cancel_operation is not None and str(active_cancel_operation.operation_type or "").strip() == TASK_ACTION_CANCEL:
+            observe_task_operation("cancel", "already_queued")
+            return BinarySecurityActionResponse(
+                task_id=task_id,
+                operation_id=active_cancel_operation.id,
+                accepted=True,
+                action="cancel",
+                status="accepted",
+                message="任务取消已受理，后台正在停止执行并清理下游任务",
+                task_status_after_accept=TASK_STATUS_CANCELLING,
+            )
         if task.status == "cancelled":
             active_item_count = db.query(BinarySecurityStageItem).filter(
                 BinarySecurityStageItem.task_id == task.id,
@@ -2465,6 +2497,11 @@ class TaskManager:
             accepted_event_type="task_cancel_accepted",
             accepted_message="任务取消已受理，后台正在停止执行并清理下游任务",
         )
+        task.status = TASK_STATUS_CANCELLING
+        task.finished_at = None
+        task.last_error = None
+        task.current_operation_id = operation.id
+        db.commit()
         observe_task_operation("cancel", "accepted")
         return BinarySecurityActionResponse(
             task_id=task_id,
@@ -2473,6 +2510,7 @@ class TaskManager:
             action="cancel",
             status="accepted",
             message="任务取消已受理，后台正在停止执行并清理下游任务",
+            task_status_after_accept=TASK_STATUS_CANCELLING,
         )
 
     async def delete_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityActionResponse:
@@ -3413,12 +3451,191 @@ class TaskManager:
     def _operation_resume_step(self, operation: BinarySecurityTaskOperation) -> str:
         cursor = dict(operation.resume_cursor or {})
         current_step = str(cursor.get("current_step") or operation.current_step or "").strip()
-        if current_step in TASK_OPERATION_SAGA_STEPS:
+        valid_steps = TASK_CANCEL_SAGA_STEPS if str(operation.operation_type or "").strip() == TASK_ACTION_CANCEL else TASK_OPERATION_SAGA_STEPS
+        if current_step in valid_steps:
             return current_step
+        if str(operation.operation_type or "").strip() == TASK_ACTION_CANCEL:
+            return TASK_OPERATION_STEP_MARK_TASK_CANCELLING
         return TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN
 
     def _operation_step_snapshot(self, operation: BinarySecurityTaskOperation, step_name: str) -> dict[str, Any]:
         return dict(dict(operation.step_payload or {}).get(step_name) or {})
+
+    def _cancel_verify_timeout_seconds(self) -> int:
+        scheduler_cfg = getattr(self.cfg, "scheduler", None)
+        request_timeout = int(getattr(scheduler_cfg, "downstream_request_timeout_seconds", 120) or 120)
+        poll_interval = int(getattr(scheduler_cfg, "stage_poll_interval_seconds", 5) or 5)
+        return max(TASK_CANCEL_VERIFY_TIMEOUT_SECONDS, request_timeout, poll_interval * 6)
+
+    def _latest_cancel_operation(self, db: Session, task_id: str) -> BinarySecurityTaskOperation | None:
+        return (
+            db.query(BinarySecurityTaskOperation)
+            .filter(
+                BinarySecurityTaskOperation.task_id == task_id,
+                BinarySecurityTaskOperation.operation_type == TASK_ACTION_CANCEL,
+            )
+            .order_by(BinarySecurityTaskOperation.created_at.desc(), BinarySecurityTaskOperation.id.desc())
+            .first()
+        )
+
+    def _cancel_state_from_operation(
+        self,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation | None,
+    ) -> dict[str, Any]:
+        if operation is None:
+            return {}
+        targets = [
+            dict(target)
+            for target in list((operation.result_payload or {}).get("cancel_targets") or [])
+            if isinstance(target, dict)
+        ]
+        blocking_targets = [
+            dict(target)
+            for target in targets
+            if bool(target.get("blocking")) and str(target.get("terminal_observation_status") or "") not in {"cancelled", "success", "failed", "missing"}
+        ]
+        return {
+            "operation_id": operation.id,
+            "operation_type": operation.operation_type,
+            "operation_status": operation.status,
+            "current_step": operation.current_step,
+            "task_status": str(task.status or ""),
+            "targets_total": len(targets),
+            "targets_terminal": sum(
+                1
+                for target in targets
+                if str(target.get("terminal_observation_status") or "") in {"cancelled", "success", "failed", "missing"}
+            ),
+            "targets_blocking": len(blocking_targets),
+            "blocking_targets": blocking_targets,
+            "last_progress_at": (
+                (operation.result_payload or {}).get("last_progress_at")
+                or _isoformat_or_none(operation.updated_at)
+            ),
+        }
+
+    def _cancel_target_key(self, target: dict[str, Any]) -> str:
+        target_type = str(target.get("target_type") or "").strip()
+        if target_type == "local_worker":
+            return "local_worker"
+        if target_type == "stage_item":
+            return f"stage_item:{target.get('item_id')}"
+        return f"downstream:{target.get('downstream_service')}:{target.get('downstream_task_id')}"
+
+    def _cancel_target_is_terminal(self, observation_status: str) -> bool:
+        return str(observation_status or "").strip() in {"cancelled", "success", "failed", "missing"}
+
+    def _cancel_target_display(self, target: dict[str, Any]) -> str:
+        target_type = str(target.get("target_type") or "").strip()
+        if target_type == "local_worker":
+            return f"local_worker:{target.get('task_id') or '-'}"
+        if target_type == "stage_item":
+            return f"stage_item:{target.get('stage_name') or '-'}:{target.get('item_id') or '-'}"
+        return f"{target.get('downstream_service') or '-'}:{target.get('downstream_task_id') or '-'}"
+
+    def _normalize_cancel_targets(self, targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        deduped: dict[str, dict[str, Any]] = {}
+        for raw_target in targets:
+            if not isinstance(raw_target, dict):
+                continue
+            target = dict(raw_target)
+            target.setdefault("cancel_request_status", "not_sent")
+            target.setdefault("terminal_observation_status", "unknown")
+            target.setdefault("blocking", True)
+            key = self._cancel_target_key(target)
+            current = deduped.get(key)
+            if current is None:
+                deduped[key] = target
+                continue
+            merged = {**current, **target}
+            merged["blocking"] = bool(current.get("blocking")) or bool(target.get("blocking"))
+            deduped[key] = merged
+        return list(deduped.values())
+
+    def _collect_cancel_targets(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> list[dict[str, Any]]:
+        targets: list[dict[str, Any]] = []
+        if str(task.status or "").strip() not in TASK_TERMINAL_STATUSES or str(task.current_operation_id or "").strip():
+            targets.append(
+                {
+                    "target_type": "local_worker",
+                    "task_id": task.id,
+                    "stage_name": task.current_stage,
+                    "blocking": True,
+                    "cancel_request_status": "requested",
+                    "terminal_observation_status": "unknown",
+                    "last_observed_at": None,
+                    "error": None,
+                }
+            )
+
+        items = db.query(BinarySecurityStageItem).filter(
+            BinarySecurityStageItem.task_id == task.id,
+            BinarySecurityStageItem.status.in_(["pending", "queued", "dispatching", "running"]),
+        ).all()
+        for item in items:
+            targets.append(
+                {
+                    "target_type": "stage_item",
+                    "stage_name": item.stage_name,
+                    "item_id": item.id,
+                    "item_key": item.item_key,
+                    "blocking": True,
+                    "cancel_request_status": "requested",
+                    "terminal_observation_status": self._normalize_item_status(item.status),
+                    "last_observed_at": _isoformat_or_none(_now()),
+                    "error": None,
+                }
+            )
+        refs = self._dedupe_downstream_refs(
+            self._collect_downstream_refs(task, items) + self._discover_parent_linked_downstream_refs(db, task)
+        )
+        for ref in refs:
+            targets.append(
+                {
+                    "target_type": "downstream_task",
+                    "stage_name": ref.get("stage_name"),
+                    "item_id": ref.get("item_id"),
+                    "item_key": ref.get("item_key"),
+                    "downstream_service": ref.get("service"),
+                    "downstream_task_id": ref.get("task_id"),
+                    "project_id": ref.get("project_id"),
+                    "blocking": True,
+                    "cancel_request_status": "not_sent",
+                    "terminal_observation_status": "unknown",
+                    "last_observed_at": None,
+                    "error": None,
+                }
+            )
+        return self._normalize_cancel_targets(targets)
+
+    def _store_cancel_targets(
+        self,
+        operation: BinarySecurityTaskOperation,
+        targets: list[dict[str, Any]],
+        *,
+        last_progress_at: datetime | None = None,
+    ) -> None:
+        operation.result_payload = {
+            **dict(operation.result_payload or {}),
+            "cancel_targets": self._normalize_cancel_targets(targets),
+            "last_progress_at": _isoformat_or_none(last_progress_at or _now()),
+        }
+
+    def _update_cancel_target(
+        self,
+        operation: BinarySecurityTaskOperation,
+        target: dict[str, Any],
+    ) -> None:
+        targets = self._normalize_cancel_targets(
+            [dict(item) for item in list((operation.result_payload or {}).get("cancel_targets") or []) if isinstance(item, dict)]
+            + [target]
+        )
+        self._store_cancel_targets(operation, targets)
 
     def _is_operation_requeue_state_applied(
         self,
@@ -4781,9 +4998,9 @@ class TaskManager:
                 await self._cancel_downstream_refs(db, task, downstream_refs, token)
             return [stage.stage_name for stage in active_stage_runs]
 
-        task.status = "cancelled"
+        task.status = TASK_STATUS_CANCELLING
         self._invalidate_task_execution(task)
-        task.finished_at = _now()
+        task.finished_at = None
         running_items = db.query(BinarySecurityStageItem).filter(
             BinarySecurityStageItem.task_id == task.id,
             BinarySecurityStageItem.status.in_(["pending", "queued", "dispatching", "running"]),
@@ -4805,8 +5022,8 @@ class TaskManager:
         self._record_event(
             db,
             task,
-            "task_cancelled",
-            "任务已取消，后台正在停止下游执行",
+            "task_cancelling",
+            "任务进入取消中，后台正在停止下游执行并等待收敛",
             stage_name=target_stage,
             payload={
                 "cancelled_item_count": len(running_items),
@@ -4814,8 +5031,7 @@ class TaskManager:
             },
         )
         observe_task_error("cancel", stage=str(task.current_stage or "none"), result="accepted")
-        observe_task_lifecycle("finished", status=task.status, task_type=self._task_type(task))
-        await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="cancelled")
+        await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=TASK_STATUS_CANCELLING)
         await self._cancel_local_worker(task.id)
         for item in running_items:
             if str(item.downstream_task_id or "").strip():
@@ -4823,6 +5039,329 @@ class TaskManager:
         if downstream_refs:
             await self._cancel_downstream_refs(db, task, downstream_refs, token)
         return sorted({str(stage_run.stage_name or "").strip() for stage_run in active_stage_runs if str(stage_run.stage_name or "").strip()})
+
+    def _cancel_target_observation_status(self, payload: dict[str, Any] | None) -> str:
+        raw_payload = dict(payload or {})
+        mapped_status = self._map_downstream_status(str(raw_payload.get("status") or "")) or ""
+        if mapped_status == "cancelled":
+            return "cancelled"
+        if mapped_status == "downstream_missing":
+            return "missing"
+        if mapped_status in {"success", "partial_success"}:
+            return "success"
+        if mapped_status == "failed":
+            return "failed"
+        if bool(raw_payload.get("cancel_requested")):
+            return "cancelling"
+        raw_status = str(raw_payload.get("status") or "").strip().lower()
+        if raw_status == "cancelling":
+            return "cancelling"
+        if mapped_status in {"running", "dispatching", "pending"}:
+            return mapped_status
+        return "unknown"
+
+    async def _run_cancel_operation_steps(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+        resume_step: str,
+    ) -> None:
+        cancel_steps = TASK_CANCEL_SAGA_STEPS
+        current_step = resume_step if resume_step in cancel_steps else TASK_OPERATION_STEP_MARK_TASK_CANCELLING
+        step_order = {name: index for index, name in enumerate(cancel_steps)}
+
+        async def _run_step(
+            step_name: str,
+            *,
+            message: str,
+            next_step: str | None,
+            fn,
+        ) -> Any:
+            nonlocal current_step
+            if step_order[current_step] > step_order[step_name]:
+                return None
+            self._record_operation_step_started(
+                db,
+                task,
+                operation,
+                step_name=step_name,
+                message=message,
+                stage_name=operation.target_stage,
+                payload={"operation_type": operation.operation_type},
+            )
+            db.commit()
+            try:
+                result = await fn()
+            except Exception as exc:
+                self._record_operation_step_failed(
+                    db,
+                    task,
+                    operation,
+                    step_name=step_name,
+                    error=exc,
+                    stage_name=operation.target_stage,
+                )
+                db.commit()
+                raise
+            payload = result if isinstance(result, dict) else None
+            self._record_operation_step_finished(
+                db,
+                task,
+                operation,
+                step_name=step_name,
+                message=message,
+                stage_name=operation.target_stage,
+                payload=payload,
+                next_step=next_step,
+            )
+            current_step = next_step or step_name
+            db.commit()
+            return result
+
+        async def _mark_task_cancelling() -> dict[str, Any]:
+            task.status = TASK_STATUS_CANCELLING
+            task.finished_at = None
+            task.last_error = None
+            task.current_operation_id = operation.id
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "task_cancelling",
+                "取消操作已开始，任务进入取消中",
+                stage_name=operation.target_stage,
+            )
+            return {"task_status": task.status}
+
+        async def _collect_targets() -> dict[str, Any]:
+            targets = self._collect_cancel_targets(db, task)
+            self._store_cancel_targets(operation, targets)
+            for target in targets:
+                self._record_operation_event(
+                    db,
+                    task,
+                    operation,
+                    "cancel_target_collected",
+                    f"取消目标已纳入收敛检查: {self._cancel_target_display(target)}",
+                    stage_name=str(target.get("stage_name") or operation.target_stage or "").strip() or None,
+                    payload=dict(target),
+                )
+            return {"targets_total": len(targets)}
+
+        async def _cancel_local() -> dict[str, Any]:
+            cancelled_stages = await self._prepare_cancel_task(db, task)
+            targets = [dict(target) for target in list((operation.result_payload or {}).get("cancel_targets") or []) if isinstance(target, dict)]
+            for target in targets:
+                if str(target.get("target_type") or "") == "local_worker":
+                    target["cancel_request_status"] = "requested"
+                    target["terminal_observation_status"] = "cancelled"
+                    target["last_observed_at"] = _isoformat_or_none(_now())
+            self._store_cancel_targets(operation, targets)
+            return {"cancelled_stage_names": cancelled_stages}
+
+        async def _cancel_downstream_targets() -> dict[str, Any]:
+            targets = [dict(target) for target in list((operation.result_payload or {}).get("cancel_targets") or []) if isinstance(target, dict)]
+            for target in targets:
+                if str(target.get("target_type") or "") == "downstream_task":
+                    target["cancel_request_status"] = "requested"
+                    target["last_observed_at"] = _isoformat_or_none(_now())
+            self._store_cancel_targets(operation, targets)
+            return {
+                "downstream_target_count": sum(
+                    1 for target in targets if str(target.get("target_type") or "") == "downstream_task"
+                )
+            }
+
+        async def _verify_quiesced() -> dict[str, Any]:
+            timeout_seconds = self._cancel_verify_timeout_seconds()
+            deadline = _now() + timedelta(seconds=timeout_seconds)
+            token = self._service_token()
+            last_blocking_snapshot: list[str] = []
+            while True:
+                refreshed_targets: list[dict[str, Any]] = []
+                blocking_targets: list[dict[str, Any]] = []
+                stored_targets = [
+                    dict(target)
+                    for target in list((operation.result_payload or {}).get("cancel_targets") or [])
+                    if isinstance(target, dict)
+                ]
+                task_items = {
+                    item.id: item
+                    for item in db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
+                }
+                for target in stored_targets:
+                    target_type = str(target.get("target_type") or "").strip()
+                    previous_observed_status = str(target.get("terminal_observation_status") or "unknown")
+                    observed_status = previous_observed_status
+                    if target_type == "local_worker":
+                        local_worker = self._workers.get(task.id)
+                        observed_status = "running" if local_worker is not None and not local_worker.done() else "cancelled"
+                    elif target_type == "stage_item":
+                        item = task_items.get(str(target.get("item_id") or ""))
+                        observed_status = self._normalize_item_status(item.status) if item is not None else "missing"
+                    elif target_type == "downstream_task":
+                        ref = {
+                            "service": target.get("downstream_service"),
+                            "task_id": target.get("downstream_task_id"),
+                            "project_id": target.get("project_id"),
+                            "stage_name": target.get("stage_name"),
+                            "item_id": target.get("item_id"),
+                            "item_key": target.get("item_key"),
+                        }
+                        try:
+                            payload = await self._downstream_tasks().fetch_child_ref_payload(ref, token)
+                        except NotFoundError:
+                            observed_status = "missing"
+                        except Exception as exc:
+                            observed_status = "unknown"
+                            target["error"] = str(exc)
+                        else:
+                            observed_status = self._cancel_target_observation_status(payload)
+                            target["error"] = None
+                            target["status_raw"] = payload.get("status")
+                    target["terminal_observation_status"] = observed_status
+                    target["last_observed_at"] = _isoformat_or_none(_now())
+                    refreshed_targets.append(target)
+                    if bool(target.get("blocking")) and not self._cancel_target_is_terminal(observed_status):
+                        blocking_targets.append(target)
+                    if observed_status != previous_observed_status or previous_observed_status == "unknown":
+                        self._record_operation_event(
+                            db,
+                            task,
+                            operation,
+                            "cancel_target_terminal_observed",
+                            (
+                                f"取消目标仍未收敛: {self._cancel_target_display(target)} -> {observed_status}"
+                                if bool(target.get("blocking")) and not self._cancel_target_is_terminal(observed_status)
+                                else f"取消目标已收敛: {self._cancel_target_display(target)} -> {observed_status}"
+                            ),
+                            stage_name=str(target.get("stage_name") or operation.target_stage or "").strip() or None,
+                            payload=dict(target),
+                        )
+                self._store_cancel_targets(operation, refreshed_targets)
+                db.commit()
+                if not blocking_targets:
+                    return {
+                        "targets_total": len(refreshed_targets),
+                        "targets_blocking": 0,
+                    }
+                blocking_snapshot = sorted(self._cancel_target_display(target) for target in blocking_targets)
+                if blocking_snapshot != last_blocking_snapshot:
+                    self._record_operation_event(
+                        db,
+                        task,
+                        operation,
+                        "task_cancel_waiting_for_convergence",
+                        f"取消仍在等待 {len(blocking_targets)} 个目标收敛",
+                        level="warning",
+                        stage_name=operation.target_stage,
+                        payload={"blocking_targets": blocking_targets},
+                    )
+                    db.commit()
+                    last_blocking_snapshot = blocking_snapshot
+                if _now() >= deadline:
+                    raise ValidationError(
+                        "取消收敛超时，仍有目标未进入终态: "
+                        + ", ".join(self._cancel_target_display(target) for target in blocking_targets[:5])
+                    )
+                await asyncio.sleep(max(1, int(self.cfg.scheduler.stage_poll_interval_seconds or 5)))
+                db.expire_all()
+                task_refreshed = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task.id).first()
+                operation_refreshed = db.query(BinarySecurityTaskOperation).filter(BinarySecurityTaskOperation.id == operation.id).first()
+                if task_refreshed is not None:
+                    task.status = task_refreshed.status
+                    task.current_operation_id = task_refreshed.current_operation_id
+                    task.updated_at = task_refreshed.updated_at
+                if operation_refreshed is not None:
+                    operation.result_payload = dict(operation_refreshed.result_payload or {})
+                    operation.step_payload = dict(operation_refreshed.step_payload or {})
+                    operation.step_attempts = dict(operation_refreshed.step_attempts or {})
+                    operation.resume_cursor = dict(operation_refreshed.resume_cursor or {})
+                    operation.current_step = operation_refreshed.current_step
+
+        async def _finalize_cancelled() -> dict[str, Any]:
+            task.status = "cancelled"
+            task.finished_at = _now()
+            task.last_error = None
+            self._invalidate_task_execution(task)
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "task_cancel_succeeded",
+                "任务取消已确认完成",
+                stage_name=operation.target_stage,
+                payload={"cancel_state": self._cancel_state_from_operation(task, operation)},
+            )
+            observe_task_lifecycle("finished", status=task.status, task_type=self._task_type(task))
+            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="cancelled")
+            return {"task_status": task.status}
+
+        async def _finalize_cancel_failed(error: Exception) -> dict[str, Any]:
+            task.status = TASK_STATUS_CANCEL_FAILED
+            task.finished_at = _now()
+            task.last_error = str(error)
+            self._invalidate_task_execution(task)
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "task_cancel_failed",
+                f"任务取消失败: {error}",
+                level="error",
+                stage_name=operation.target_stage,
+                payload={"cancel_state": self._cancel_state_from_operation(task, operation)},
+            )
+            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=TASK_STATUS_CANCEL_FAILED)
+            return {"task_status": task.status, "error": str(error)}
+
+        try:
+            await _run_step(
+                TASK_OPERATION_STEP_MARK_TASK_CANCELLING,
+                message="取消操作已进入任务状态切换",
+                next_step=TASK_OPERATION_STEP_COLLECT_CANCEL_TARGETS,
+                fn=_mark_task_cancelling,
+            )
+            await _run_step(
+                TASK_OPERATION_STEP_COLLECT_CANCEL_TARGETS,
+                message="取消操作已收集需要收敛的目标",
+                next_step=TASK_OPERATION_STEP_CANCEL_LOCAL_EXECUTION,
+                fn=_collect_targets,
+            )
+            await _run_step(
+                TASK_OPERATION_STEP_CANCEL_LOCAL_EXECUTION,
+                message="取消操作已停止本地执行链",
+                next_step=TASK_OPERATION_STEP_CANCEL_DOWNSTREAM_TARGETS,
+                fn=_cancel_local,
+            )
+            await _run_step(
+                TASK_OPERATION_STEP_CANCEL_DOWNSTREAM_TARGETS,
+                message="取消操作已向下游发出取消请求",
+                next_step=TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_QUIESCED,
+                fn=_cancel_downstream_targets,
+            )
+            await _run_step(
+                TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_QUIESCED,
+                message="取消操作已完成下游收敛核验",
+                next_step=TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED,
+                fn=_verify_quiesced,
+            )
+        except Exception as exc:
+            await _run_step(
+                TASK_OPERATION_STEP_FINALIZE_TASK_CANCEL_FAILED,
+                message="取消操作已收口为失败",
+                next_step=TASK_OPERATION_STEP_FINALIZE_TASK_CANCEL_FAILED,
+                fn=lambda: _finalize_cancel_failed(exc),
+            )
+            raise
+
+        await _run_step(
+            TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED,
+            message="取消操作已收口为已取消",
+            next_step=TASK_OPERATION_STEP_SUCCEEDED,
+            fn=_finalize_cancelled,
+        )
 
     async def _prepare_delete_task(self, db: Session, task: BinarySecurityTask) -> list[str]:
         task.status = "cancelled"
@@ -5300,6 +5839,9 @@ class TaskManager:
         operation: BinarySecurityTaskOperation,
     ) -> None:
         resume_step = self._operation_resume_step(operation)
+        if operation.operation_type == TASK_ACTION_CANCEL:
+            await self._run_cancel_operation_steps(db, task, operation, resume_step)
+            return
         if operation.operation_type == TASK_ACTION_RETRY_STAGE_FULL:
             resume_step = await self._run_retry_stage_full_operation_steps(db, task, operation, resume_step)
         else:
@@ -5328,20 +5870,6 @@ class TaskManager:
                         await self._prepare_archive_retry_failed_items(db, task, str(operation.target_stage or "").strip())
                     elif operation.operation_type == TASK_ACTION_RETRY_ARCHIVE_FULL:
                         await self._prepare_archive_retry_full(db, task, str(operation.target_stage or "").strip())
-                    elif operation.operation_type == TASK_ACTION_CANCEL:
-                        await self._prepare_cancel_task(db, task)
-                        self._record_operation_step_finished(
-                            db,
-                            task,
-                            operation,
-                            step_name=prepare_step,
-                            message=f"后台操作准备步骤已完成: {operation.operation_type}",
-                            stage_name=operation.target_stage,
-                            next_step=TASK_OPERATION_STEP_SUCCEEDED,
-                        )
-                        operation.current_step = TASK_OPERATION_STEP_SUCCEEDED
-                        db.commit()
-                        return
                     elif operation.operation_type == TASK_ACTION_DELETE:
                         await self._prepare_delete_task(db, task)
                         self._record_operation_step_finished(
@@ -8502,6 +9030,12 @@ class TaskManager:
             task.lease_expires_at = None
             self._last_task_heartbeat_at.pop(task.id, None)
             return
+        if task.status == TASK_STATUS_CANCELLING:
+            self._invalidate_task_execution(task)
+            task.finished_at = None
+            self._last_task_heartbeat_at.pop(task.id, None)
+            self._sync_task_abnormal_reason_snapshot(db, task, None)
+            return
         if task.status == "cancelled":
             stage_sequence = self._stage_sequence_for_task(task)
             stage_summaries = self._build_stage_summaries(db, task, stage_sequence, db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all(), db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all())
@@ -8512,6 +9046,16 @@ class TaskManager:
             task.dispatch_started_at = None
             task.lease_expires_at = None
             task.finished_at = _now()
+            self._last_task_heartbeat_at.pop(task.id, None)
+            return
+        if task.status == TASK_STATUS_CANCEL_FAILED:
+            stage_sequence = self._stage_sequence_for_task(task)
+            stage_summaries = self._build_stage_summaries(db, task, stage_sequence, db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all(), db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all())
+            items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
+            archive_jobs = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id).all()
+            self._sync_task_abnormal_reason_snapshot(db, task, self._task_abnormal_reason(task, stage_summaries, items, archive_jobs))
+            self._invalidate_task_execution(task)
+            task.finished_at = task.finished_at or _now()
             self._last_task_heartbeat_at.pop(task.id, None)
             return
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
@@ -11289,6 +11833,11 @@ class TaskManager:
                 abnormal_reason = BinarySecurityAbnormalReason(**task.latest_abnormal_reason)
             except Exception:
                 abnormal_reason = None
+        cancel_operation = None
+        try:
+            cancel_operation = active_operation or self._latest_cancel_operation(session, task.id)
+        except Exception:
+            cancel_operation = active_operation
         manual_operation_state = self._build_task_list_manual_operation_state(task, stage_summaries=stage_summaries)
         return BinarySecurityTaskResponse(
             id=task.id,
@@ -11334,6 +11883,7 @@ class TaskManager:
             abnormal_reason=abnormal_reason,
             stage_summaries=stage_summaries,
             manual_operation_state=manual_operation_state,
+            cancel_state=self._cancel_state_from_operation(task, cancel_operation),
         )
 
     def _build_task_list_stage_summaries(
@@ -11525,6 +12075,7 @@ class TaskManager:
             task_retry_failed_reason=task_retry_failed_reason,
             stage_summaries=stage_summaries,
         )
+        cancel_operation = self._active_operation(db, task.id) or self._latest_cancel_operation(db, task.id)
         return BinarySecurityTaskResponse(
             id=task.id,
             project_id=task.project_id,
@@ -11569,6 +12120,7 @@ class TaskManager:
             abnormal_reason=abnormal_reason,
             stage_summaries=stage_summaries,
             manual_operation_state=manual_operation_state,
+            cancel_state=self._cancel_state_from_operation(task, cancel_operation),
         )
 
     def _build_manual_operation_state(
@@ -12990,7 +13542,20 @@ class TaskManager:
     def _refresh_task_status_after_sync(self, db: Session, task: BinarySecurityTask) -> None:
         current_status = str(task.status or "").strip()
         active_operation = self._active_operation(db, task.id)
+        if task.status == TASK_STATUS_CANCELLING or (
+            active_operation is not None and str(active_operation.operation_type or "").strip() == TASK_ACTION_CANCEL
+        ):
+            task.status = TASK_STATUS_CANCELLING
+            task.finished_at = None
+            task.current_operation_id = active_operation.id if active_operation is not None else task.current_operation_id
+            task.last_error = None
+            self._invalidate_task_execution(task)
+            return
         if task.status == "cancelled":
+            self._invalidate_task_execution(task)
+            task.finished_at = task.finished_at or _now()
+            return
+        if task.status == TASK_STATUS_CANCEL_FAILED:
             self._invalidate_task_execution(task)
             task.finished_at = task.finished_at or _now()
             return

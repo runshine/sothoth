@@ -179,6 +179,7 @@ class BinarySecurityTaskResponse(BaseModel):
     abnormal_reason: Optional[BinarySecurityAbnormalReason] = None
     stage_summaries: list[BinarySecurityStageSummary] = Field(default_factory=list)
     manual_operation_state: dict[str, Any] = Field(default_factory=dict)
+    cancel_state: dict[str, Any] = Field(default_factory=dict)
 
 
 class BinarySecurityTaskOperationResponse(BaseModel):
@@ -542,6 +543,7 @@ class BinarySecurityActionResponse(BaseModel):
     message: str
     accepted: bool = False
     action: Optional[str] = None
+    task_status_after_accept: Optional[str] = None
     cancelled_downstream_count: int = 0
     deleted_downstream_count: int = 0
     cleanup_status: Optional[str] = None
