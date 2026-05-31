@@ -5130,8 +5130,19 @@ class TaskManager:
         raw_status = str(raw_payload.get("status") or "").strip().lower()
         if raw_status == "cancelling":
             return "cancelling"
+        normalized_status = self._normalize_downstream_status(raw_status) or raw_status
+        if normalized_status in {"success", "partial_success"}:
+            return "success"
+        if normalized_status == "failed":
+            return "failed"
+        if normalized_status == "cancelled":
+            return "cancelled"
+        if normalized_status == "downstream_missing":
+            return "missing"
         if mapped_status in {"running", "dispatching", "pending"}:
             return mapped_status
+        if normalized_status in {"running", "dispatching", "pending", "queued"}:
+            return normalized_status
         return "unknown"
 
     async def _run_cancel_operation_steps(
@@ -13257,7 +13268,7 @@ class TaskManager:
             return "dispatching"
         if normalized in {"running", "processing", "in_progress", "cancelling", "started"}:
             return "running"
-        if normalized in {"success", "passed", "completed", "complete", "done"}:
+        if normalized in {"success", "succeeded", "passed", "completed", "complete", "done"}:
             return "success"
         if normalized == "partial_success":
             return "partial_success"

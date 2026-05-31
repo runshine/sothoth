@@ -7183,6 +7183,83 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("task_cancelling", event_types)
         self.assertIn("task_cancel_succeeded", event_types)
 
+    def test_cancel_target_observation_status_treats_succeeded_as_success(self):
+        self.assertEqual(
+            "success",
+            self.manager._cancel_target_observation_status({"status": "succeeded"}),
+        )
+
+    def test_run_cancel_operation_steps_treats_succeeded_downstream_as_terminal(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="cancelling",
+            current_stage="vuln_scan",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="vuln_scan",
+            item_key="entry-1",
+            status="cancelled",
+            downstream_service="dataflow_vuln_scanner",
+            downstream_task_id="tt1",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="cancel",
+            status="running",
+            target_stage="vuln_scan",
+        )
+        operation.result_payload = {
+            "cancel_targets": [
+                {
+                    "target_type": "downstream_task",
+                    "stage_name": "vuln_scan",
+                    "item_id": "si1",
+                    "item_key": "entry-1",
+                    "downstream_service": "dataflow_vuln_scanner",
+                    "downstream_task_id": "tt1",
+                    "project_id": "p1",
+                    "blocking": True,
+                    "cancel_request_status": "requested",
+                    "terminal_observation_status": "unknown",
+                }
+            ]
+        }
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], operations=[operation])
+        db.expire_all = lambda: None
+
+        async def fake_write_task_metadata_async(*args, **kwargs):
+            return None
+
+        async def fake_fetch_child_ref_payload(ref, token):
+            del ref, token
+            return {"status": "succeeded"}
+
+        controller = self.manager._downstream_tasks()
+        original_write = self.manager._write_task_metadata_async
+        self.manager._write_task_metadata_async = fake_write_task_metadata_async
+        try:
+            with patch.object(controller, "fetch_child_ref_payload", side_effect=fake_fetch_child_ref_payload):
+                asyncio.run(self.manager._run_cancel_operation_steps(db, task, operation, "verify_downstream_quiesced"))
+        finally:
+            self.manager._write_task_metadata_async = original_write
+
+        self.assertEqual("cancelled", task.status)
+        self.assertEqual(0, self.manager._cancel_state_from_operation(task, operation)["targets_blocking"])
+        event_types = [getattr(event, "event_type", "") for event in db.added]
+        self.assertIn("task_cancel_succeeded", event_types)
+
     def test_retry_task_clears_archive_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
