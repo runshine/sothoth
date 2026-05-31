@@ -717,6 +717,10 @@ TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED = "finalize_task_cancelled"
 TASK_OPERATION_STEP_FINALIZE_TASK_CANCEL_FAILED = "finalize_task_cancel_failed"
 TASK_OPERATION_STEP_SUCCEEDED = "operation_succeeded"
 TASK_CANCEL_BLOCKING_TARGETS_PREVIEW_LIMIT = 20
+RETRY_CHILD_STRATEGY_REUSE_SUCCESS = "reuse_success"
+RETRY_CHILD_STRATEGY_ADOPT_ACTIVE = "adopt_active"
+RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL = "recreate_from_abnormal"
+RETRY_CHILD_ABNORMAL_STATUSES = {"failed", "cancelled", "downstream_missing"}
 TASK_OPERATION_SAGA_STEPS = (
     TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN,
     TASK_OPERATION_STEP_CANCEL_DOWNSTREAM,
@@ -14669,6 +14673,240 @@ class TaskManager:
             return False
         return str(item.status or "").strip().lower() != "downstream_missing"
 
+    def _clear_item_downstream_runtime_state(self, item: BinarySecurityStageItem) -> None:
+        item.downstream_task_id = None
+        item.downstream_status = None
+        item.sync_status = None
+        item.last_synced_at = None
+        item.downstream_raw_status = None
+        item.downstream_mapped_status = None
+        item.downstream_state_applied = False
+        item.sync_observation_error_message = None
+        item.sync_observation_error_type = None
+        item.sync_observation_http_status = None
+        item.error_message = None
+        result = dict(item.result or {})
+        for key in (
+            "downstream_status_sync",
+            "downstream_status_synced_at",
+            "downstream_status",
+            "sync_observation",
+            "downstream",
+            "sync_status",
+        ):
+            result.pop(key, None)
+        item.result = result
+
+    def _classify_retry_downstream_strategy(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        active_payload: dict[str, Any] | None = None,
+        observed_payload: dict[str, Any] | None = None,
+    ) -> tuple[str, str | None]:
+        if active_payload is not None:
+            status = self._map_downstream_status(str(active_payload.get("status") or ""))
+            if status in {"pending", "queued", "dispatching", "running"}:
+                return RETRY_CHILD_STRATEGY_ADOPT_ACTIVE, status
+        payload = observed_payload if isinstance(observed_payload, dict) else None
+        raw_status = None
+        if payload is not None:
+            raw_status = self._status_from_downstream_payload(payload, success_statuses={"success", "partial_success", "completed", "passed", "succeeded"})
+        mapped_status = raw_status or self._latest_observed_downstream_status(item) or str(item.status or "").strip().lower() or None
+        mapped_status = self._map_downstream_status(str(mapped_status or "")) or (str(mapped_status or "").strip().lower() or None)
+        if mapped_status == "success":
+            return RETRY_CHILD_STRATEGY_REUSE_SUCCESS, mapped_status
+        if mapped_status in {"pending", "queued", "dispatching", "running"}:
+            return RETRY_CHILD_STRATEGY_ADOPT_ACTIVE, mapped_status
+        if mapped_status in RETRY_CHILD_ABNORMAL_STATUSES:
+            return RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL, mapped_status
+        return RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL, mapped_status
+
+    async def _prepare_retry_child_for_reuse_or_recreate(
+        self,
+        session: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        strategy: str,
+        observed_status: str | None,
+        token: str | None,
+    ) -> None:
+        old_task_id = str(item.downstream_task_id or "").strip() or None
+        self._record_downstream_item_disposition(
+            session,
+            task,
+            item,
+            event_type="retry_item_strategy_selected",
+            message=f"重试子任务策略已确定: {strategy}",
+            payload={
+                "stage_name": item.stage_name,
+                "item_id": item.id,
+                "item_key": item.item_key,
+                "old_downstream_task_id": old_task_id,
+                "new_downstream_task_id": None,
+                "strategy": strategy,
+                "old_downstream_status": observed_status,
+            },
+        )
+        if strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS:
+            self._record_downstream_item_disposition(
+                session,
+                task,
+                item,
+                event_type="retry_item_reuse_success_child",
+                message="重试复用已成功的下游子任务",
+                payload={
+                    "stage_name": item.stage_name,
+                    "item_id": item.id,
+                    "item_key": item.item_key,
+                    "old_downstream_task_id": old_task_id,
+                    "new_downstream_task_id": old_task_id,
+                    "strategy": strategy,
+                    "old_downstream_status": observed_status,
+                },
+            )
+            return
+        if strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE:
+            self._record_downstream_item_disposition(
+                session,
+                task,
+                item,
+                event_type="retry_item_adopt_active_child",
+                message="重试接管仍在运行中的下游子任务",
+                payload={
+                    "stage_name": item.stage_name,
+                    "item_id": item.id,
+                    "item_key": item.item_key,
+                    "old_downstream_task_id": old_task_id,
+                    "new_downstream_task_id": old_task_id,
+                    "strategy": strategy,
+                    "old_downstream_status": observed_status,
+                },
+            )
+            return
+        self._record_downstream_item_disposition(
+            session,
+            task,
+            item,
+            event_type="retry_item_recreate_from_abnormal_child",
+            message="重试检测到异常下游子任务，准备删旧重建",
+            level="warning",
+            payload={
+                "stage_name": item.stage_name,
+                "item_id": item.id,
+                "item_key": item.item_key,
+                "old_downstream_task_id": old_task_id,
+                "new_downstream_task_id": None,
+                "strategy": strategy,
+                "old_downstream_status": observed_status,
+            },
+        )
+        if old_task_id:
+            self._record_downstream_item_disposition(
+                session,
+                task,
+                item,
+                event_type="retry_item_old_child_cancel_requested",
+                message=f"重试前请求取消旧下游子任务: {item.downstream_service}:{old_task_id}",
+                level="warning",
+                payload={
+                    "stage_name": item.stage_name,
+                    "item_id": item.id,
+                    "item_key": item.item_key,
+                    "old_downstream_task_id": old_task_id,
+                    "new_downstream_task_id": None,
+                    "strategy": strategy,
+                    "old_downstream_status": observed_status,
+                },
+            )
+            session.commit()
+            try:
+                await self._downstream_cancel_refs(
+                    session,
+                    task,
+                    [
+                        {
+                            "service": item.downstream_service,
+                            "task_id": old_task_id,
+                            "project_id": task.project_id,
+                            "stage_name": item.stage_name,
+                            "item_id": item.id,
+                            "item_key": item.item_key,
+                        }
+                    ],
+                    token,
+                )
+            except Exception:
+                session.rollback()
+            self._record_downstream_item_disposition(
+                session,
+                task,
+                item,
+                event_type="retry_item_old_child_delete_requested",
+                message=f"重试前请求删除旧下游子任务: {item.downstream_service}:{old_task_id}",
+                level="warning",
+                payload={
+                    "stage_name": item.stage_name,
+                    "item_id": item.id,
+                    "item_key": item.item_key,
+                    "old_downstream_task_id": old_task_id,
+                    "new_downstream_task_id": None,
+                    "strategy": strategy,
+                    "old_downstream_status": observed_status,
+                },
+            )
+            session.commit()
+            await self._delete_downstream_refs(
+                session,
+                task,
+                [
+                    {
+                        "service": item.downstream_service,
+                        "task_id": old_task_id,
+                        "project_id": task.project_id,
+                        "stage_name": item.stage_name,
+                        "item_id": item.id,
+                        "item_key": item.item_key,
+                    }
+                ],
+                token,
+            )
+            self._record_downstream_item_disposition(
+                session,
+                task,
+                item,
+                event_type="retry_item_old_child_verified_absent",
+                message=f"旧下游子任务已确认不可见: {item.downstream_service}:{old_task_id}",
+                payload={
+                    "stage_name": item.stage_name,
+                    "item_id": item.id,
+                    "item_key": item.item_key,
+                    "old_downstream_task_id": old_task_id,
+                    "new_downstream_task_id": None,
+                    "strategy": strategy,
+                    "old_downstream_status": observed_status,
+                },
+            )
+        self._clear_item_downstream_runtime_state(item)
+        item.finished_at = None
+        self._record_downstream_item_disposition(
+            session,
+            task,
+            item,
+            event_type="retry_item_old_child_cleared",
+            message="旧下游绑定与同步快照已清空，准备创建新子任务",
+            payload={
+                "stage_name": item.stage_name,
+                "item_id": item.id,
+                "item_key": item.item_key,
+                "old_downstream_task_id": old_task_id,
+                "new_downstream_task_id": None,
+                "strategy": strategy,
+                "old_downstream_status": observed_status,
+            },
+        )
+
     def _is_vuln_retry_recreate_outcome(self, control: dict[str, Any]) -> bool:
         outcome = str(control.get("retry_outcome") or control.get("outcome") or "").strip()
         if outcome == "not_found":
@@ -16348,6 +16586,21 @@ class TaskManager:
             )
             session.commit()
             active_payload = await self._active_downstream_payload(task, item, token)
+            retry_strategy = None
+            retry_strategy_status = None
+            if retrying:
+                retry_strategy, retry_strategy_status = self._classify_retry_downstream_strategy(item, active_payload=active_payload)
+                await self._prepare_retry_child_for_reuse_or_recreate(
+                    session,
+                    task,
+                    item,
+                    strategy=retry_strategy,
+                    observed_status=retry_strategy_status,
+                    token=token,
+                )
+                session.commit()
+                if retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
+                    active_payload = None
             if active_payload is not None:
                 item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "running"
                 item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
@@ -16392,7 +16645,7 @@ class TaskManager:
                         status = self._status_from_downstream_payload(payload, success_statuses={"success"})
                         session.commit()
                     created = None
-                elif retrying and self._has_retryable_downstream_task(item):
+                elif retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
                     control = await self._downstream_control_existing_task(
                         session,
                         stage_name=stage_run.stage_name,
@@ -16459,6 +16712,22 @@ class TaskManager:
                 item.downstream_task_id = created.get("task_id") or item.downstream_task_id
                 item.started_at = _now()
                 item.result = {"project_id": task.project_id}
+                self._record_downstream_item_disposition(
+                    session,
+                    task,
+                    item,
+                    event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
+                    message="已创建新的下游子任务",
+                    payload={
+                        "stage_name": item.stage_name,
+                        "item_id": item.id,
+                        "item_key": item.item_key,
+                        "old_downstream_task_id": None,
+                        "new_downstream_task_id": item.downstream_task_id,
+                        "strategy": retry_strategy if retrying else None,
+                        "old_downstream_status": retry_strategy_status if retrying else None,
+                    },
+                )
                 session.commit()
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, token or ""),
@@ -18280,6 +18549,21 @@ class TaskManager:
             )
             session.commit()
             active_payload = await self._active_downstream_payload(task, item, token)
+            retry_strategy = None
+            retry_strategy_status = None
+            if retrying:
+                retry_strategy, retry_strategy_status = self._classify_retry_downstream_strategy(item, active_payload=active_payload)
+                await self._prepare_retry_child_for_reuse_or_recreate(
+                    session,
+                    task,
+                    item,
+                    strategy=retry_strategy,
+                    observed_status=retry_strategy_status,
+                    token=token,
+                )
+                session.commit()
+                if retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
+                    active_payload = None
             if active_payload is not None:
                 item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "running"
                 item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
@@ -18319,29 +18603,7 @@ class TaskManager:
                         payload = dict(reusable_payload)
                         status = self._status_from_downstream_payload(payload, success_statuses={"passed", "success"})
                     created = None
-                elif retrying and self._latest_observed_downstream_status(item) in {"failed", "cancelled", "downstream_missing"}:
-                    input_contract = self._build_entry_analysis_input_contract(entry_input)
-                    item.downstream_task_id = None
-                    created = await self._downstream_create_task(
-                        session,
-                        task,
-                        item,
-                        service="entry_analyse",
-                        token=token,
-                        payload={
-                            "task_name": f"{task.name}-{entry_input['module_name']}-entry",
-                            "input_path": input_contract["module_dir"],
-                            "module_name": entry_input["module_name"],
-                            "source_path": input_contract["source_root"],
-                            "origin": {
-                                **_downstream_origin_payload(task, item),
-                                "input_contract": input_contract,
-                                "entry_descriptor_root": entry_input.get("entry_descriptor_root"),
-                                "entry_files_list": entry_input.get("entry_files_list"),
-                            },
-                        },
-                    )
-                elif retrying and self._has_retryable_downstream_task(item):
+                elif retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
                     control = await self._downstream_control_existing_task(
                         session,
                         stage_name=stage_run.stage_name,
@@ -18440,6 +18702,22 @@ class TaskManager:
                 if created_task_id and (not current_downstream_task_id or current_downstream_task_id == created_task_id):
                     item.downstream_task_id = created_task_id
                 item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
+                self._record_downstream_item_disposition(
+                    session,
+                    task,
+                    item,
+                    event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
+                    message="已创建新的下游子任务",
+                    payload={
+                        "stage_name": item.stage_name,
+                        "item_id": item.id,
+                        "item_key": item.item_key,
+                        "old_downstream_task_id": None,
+                        "new_downstream_task_id": item.downstream_task_id,
+                        "strategy": retry_strategy if retrying else None,
+                        "old_downstream_status": retry_strategy_status if retrying else None,
+                    },
+                )
                 session.commit()
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, token or ""),
@@ -18949,6 +19227,22 @@ class TaskManager:
                 auto_retrying=auto_retrying,
             )
             session.commit()
+            active_payload = await self._active_downstream_payload(task, item, token)
+            retry_strategy = None
+            retry_strategy_status = None
+            if retrying:
+                retry_strategy, retry_strategy_status = self._classify_retry_downstream_strategy(item, active_payload=active_payload)
+                await self._prepare_retry_child_for_reuse_or_recreate(
+                    session,
+                    task,
+                    item,
+                    strategy=retry_strategy,
+                    observed_status=retry_strategy_status,
+                    token=None,
+                )
+                session.commit()
+                if retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
+                    active_payload = None
             taint_params = [
                 str(value).strip()
                 for value in (entry.get("taint_params") or [])
@@ -19045,124 +19339,9 @@ class TaskManager:
             if definition_line:
                 line_hint = definition_line if definition_line.upper().startswith("L") else f"L{definition_line}"
             allow_rebind = not auto_retrying
-            reusable_payload = None if retrying else await self._find_reusable_dataflow_payload(
-                task,
-                item,
-                allow_rebind=allow_rebind,
-            )
-            if reusable_payload is not None:
-                downstream_status = str(reusable_payload.get("status") or "").lower()
-                mapped_reusable_status = self._map_downstream_status(downstream_status)
-                await self._cleanup_duplicate_downstream_refs_for_item(
-                    session,
-                    task,
-                    item,
-                    token,
-                    keep_task_ids={str(item.downstream_task_id or "").strip()},
-                )
-                if mapped_reusable_status in {"queued", "running"}:
-                    item.status = mapped_reusable_status
-                    session.commit()
-                    status, payload = await self._poll_until_terminal(
-                        lambda: self._downstream_fetch_item_payload(task, item, None),
-                        success_statuses={"passed", "success"},
-                        failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
-                        task=task,
-                        item=item,
-                    )
-                else:
-                    session.commit()
-                    payload = await self._downstream_fetch_item_payload(task, item, None)
-                    downstream_status = str(payload.get("status") or "").lower()
-                    if downstream_status in {"passed", "success"}:
-                        status = "success"
-                    elif downstream_status == "cancelled":
-                        status = "cancelled"
-                    elif downstream_status == "downstream_missing":
-                        status = "downstream_missing"
-                    else:
-                        status = "failed"
-            elif retrying and self._has_retryable_downstream_task(item):
-                control = await self._downstream_control_existing_task(
-                    session,
-                    stage_name=stage_run.stage_name,
-                    task=task,
-                    item=item,
-                    token=None,
-                )
-                outcome = str(control.get("outcome") or "")
-                if outcome == "accepted":
-                    created = dict(control.get("payload") or {})
-                    item.downstream_task_id = created.get("task_id") or item.downstream_task_id
-                    item.status = "running"
-                    session.commit()
-                    status, payload = await self._poll_until_terminal(
-                        lambda: self._downstream_fetch_item_payload(task, item, None),
-                        success_statuses={"passed", "success"},
-                        failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
-                        task=task,
-                        item=item,
-                    )
-                elif outcome == "already_running":
-                    payload = dict(control.get("payload") or {})
-                    item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
-                    item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
-                    session.commit()
-                    status, payload = await self._poll_until_terminal(
-                        lambda: self._downstream_fetch_item_payload(task, item, None),
-                        success_statuses={"passed", "success"},
-                        failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
-                        task=task,
-                        item=item,
-                    )
-                elif outcome == "already_terminal":
-                    payload = dict(control.get("payload") or {})
-                    item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
-                    session.commit()
-                    status = self._status_from_downstream_payload(payload, success_statuses={"passed", "success"})
-                elif outcome == "not_found":
-                    item.status = "downstream_missing"
-                    item.error_message = str(control.get("error_message") or "下游子任务不存在")
-                    item.finished_at = _now()
-                    session.commit()
-                    return {"status": "downstream_missing", "error": item.error_message, "item": entry}
-                elif outcome == "transport_error":
-                    return self._defer_item_after_downstream_transport_error(
-                        session,
-                        task,
-                        item,
-                        operation="dataflow_analysis",
-                        exc=UpstreamError(str(control.get("error_message") or "下游通信异常")),
-                        response_item=entry,
-                    )
-                else:
-                    raise ValidationError(str(control.get("error_message") or "下游重试失败"))
-            else:
-                created = await self._downstream_create_task(
-                    session,
-                    task,
-                    item,
-                    service="dataflow_analyse",
-                    token=None,
-                    payload={
-                        "task_name": f"{task.name}-{entry['function_name']}-dfa",
-                        "module_input_path": module_input_path,
-                        "source_root_path": source_root_path,
-                        "prompt_content": prompt,
-                        "origin": _downstream_origin_payload(task, item),
-                        "source_file": normalized_source_file,
-                        "function_name": entry["function_name"],
-                        "line_hint": line_hint,
-                        "definition_kind": definition_kind,
-                        "taint_params": taint_params,
-                        "function_description": str(entry.get("function_description") or ""),
-                        "function_description_source": str(entry.get("function_description_source") or ""),
-                        "entry_reason": str(entry.get("entry_reason") or ""),
-                        "entry_reason_source": str(entry.get("entry_reason_source") or ""),
-                        "taint_details": [dict(detail) for detail in (entry.get("taint_details") or []) if isinstance(detail, dict)],
-                    },
-                )
-                item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+            if active_payload is not None:
+                item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "running"
+                item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
                 session.commit()
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, None),
@@ -19171,6 +19350,149 @@ class TaskManager:
                     task=task,
                     item=item,
                 )
+            else:
+                reusable_payload = None if retrying else await self._find_reusable_dataflow_payload(
+                    task,
+                    item,
+                    allow_rebind=allow_rebind,
+                )
+                if reusable_payload is not None:
+                    downstream_status = str(reusable_payload.get("status") or "").lower()
+                    mapped_reusable_status = self._map_downstream_status(downstream_status)
+                    await self._cleanup_duplicate_downstream_refs_for_item(
+                        session,
+                        task,
+                        item=item,
+                        token=token,
+                        keep_task_ids={str(item.downstream_task_id or "").strip()},
+                    )
+                    if mapped_reusable_status in {"queued", "running"}:
+                        item.status = mapped_reusable_status
+                        session.commit()
+                        status, payload = await self._poll_until_terminal(
+                            lambda: self._downstream_fetch_item_payload(task, item, None),
+                            success_statuses={"passed", "success"},
+                            failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
+                            task=task,
+                            item=item,
+                        )
+                    else:
+                        session.commit()
+                        payload = await self._downstream_fetch_item_payload(task, item, None)
+                        downstream_status = str(payload.get("status") or "").lower()
+                        if downstream_status in {"passed", "success"}:
+                            status = "success"
+                        elif downstream_status == "cancelled":
+                            status = "cancelled"
+                        elif downstream_status == "downstream_missing":
+                            status = "downstream_missing"
+                        else:
+                            status = "failed"
+                elif retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
+                    control = await self._downstream_control_existing_task(
+                        session,
+                        stage_name=stage_run.stage_name,
+                        task=task,
+                        item=item,
+                        token=None,
+                    )
+                    outcome = str(control.get("outcome") or "")
+                    if outcome == "accepted":
+                        created = dict(control.get("payload") or {})
+                        item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+                        item.status = "running"
+                        session.commit()
+                        status, payload = await self._poll_until_terminal(
+                            lambda: self._downstream_fetch_item_payload(task, item, None),
+                            success_statuses={"passed", "success"},
+                            failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
+                            task=task,
+                            item=item,
+                        )
+                    elif outcome == "already_running":
+                        payload = dict(control.get("payload") or {})
+                        item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
+                        item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
+                        session.commit()
+                        status, payload = await self._poll_until_terminal(
+                            lambda: self._downstream_fetch_item_payload(task, item, None),
+                            success_statuses={"passed", "success"},
+                            failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
+                            task=task,
+                            item=item,
+                        )
+                    elif outcome == "already_terminal":
+                        payload = dict(control.get("payload") or {})
+                        item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
+                        session.commit()
+                        status = self._status_from_downstream_payload(payload, success_statuses={"passed", "success"})
+                    elif outcome == "not_found":
+                        item.status = "downstream_missing"
+                        item.error_message = str(control.get("error_message") or "下游子任务不存在")
+                        item.finished_at = _now()
+                        session.commit()
+                        return {"status": "downstream_missing", "error": item.error_message, "item": entry}
+                    elif outcome == "transport_error":
+                        return self._defer_item_after_downstream_transport_error(
+                            session,
+                            task,
+                            item,
+                            operation="dataflow_analysis",
+                            exc=UpstreamError(str(control.get("error_message") or "下游通信异常")),
+                            response_item=entry,
+                        )
+                    else:
+                        raise ValidationError(str(control.get("error_message") or "下游重试失败"))
+                else:
+                    created = await self._downstream_create_task(
+                        session,
+                        task,
+                        item,
+                        service="dataflow_analyse",
+                        token=None,
+                        payload={
+                            "task_name": f"{task.name}-{entry['function_name']}-dfa",
+                            "module_input_path": module_input_path,
+                            "source_root_path": source_root_path,
+                            "prompt_content": prompt,
+                            "origin": _downstream_origin_payload(task, item),
+                            "source_file": normalized_source_file,
+                            "function_name": entry["function_name"],
+                            "line_hint": line_hint,
+                            "definition_kind": definition_kind,
+                            "taint_params": taint_params,
+                            "function_description": str(entry.get("function_description") or ""),
+                            "function_description_source": str(entry.get("function_description_source") or ""),
+                            "entry_reason": str(entry.get("entry_reason") or ""),
+                            "entry_reason_source": str(entry.get("entry_reason_source") or ""),
+                            "taint_details": [dict(detail) for detail in (entry.get("taint_details") or []) if isinstance(detail, dict)],
+                        },
+                    )
+                    item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+                    self._record_downstream_item_disposition(
+                        session,
+                        task,
+                        item,
+                        event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
+                        message="已创建新的下游子任务",
+                        payload={
+                            "stage_name": item.stage_name,
+                            "item_id": item.id,
+                            "item_key": item.item_key,
+                            "old_downstream_task_id": None,
+                            "new_downstream_task_id": item.downstream_task_id,
+                            "strategy": retry_strategy if retrying else None,
+                            "old_downstream_status": retry_strategy_status if retrying else None,
+                        },
+                    )
+                    session.commit()
+                    status, payload = await self._poll_until_terminal(
+                        lambda: self._downstream_fetch_item_payload(task, item, None),
+                        success_statuses={"passed", "success"},
+                        failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
+                        task=task,
+                        item=item,
+                    )
             artifact_root = self._service_output_dir(task, item.downstream_service or stage_run.stage_name, entry["entry_key"], item.downstream_task_id)
             materialized = self._materialize_stage_artifact(
                 artifact_root,
@@ -19298,6 +19620,21 @@ class TaskManager:
             )
             session.commit()
             active_payload = await self._active_downstream_payload(task, item, token)
+            retry_strategy = None
+            retry_strategy_status = None
+            if retrying:
+                retry_strategy, retry_strategy_status = self._classify_retry_downstream_strategy(item, active_payload=active_payload)
+                await self._prepare_retry_child_for_reuse_or_recreate(
+                    session,
+                    task,
+                    item,
+                    strategy=retry_strategy,
+                    observed_status=retry_strategy_status,
+                    token=token,
+                )
+                session.commit()
+                if retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
+                    active_payload = None
             if active_payload is not None:
                 item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
                 item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "pending"
@@ -19337,7 +19674,7 @@ class TaskManager:
                         payload = dict(reusable_payload)
                         status = self._status_from_downstream_payload(payload, success_statuses={"success", "succeeded", "completed"})
                     created = None
-                elif retrying and self._has_retryable_downstream_task(item):
+                elif retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
                     control = await self._downstream_control_existing_task(
                         session,
                         stage_name=stage_run.stage_name,
@@ -19441,6 +19778,22 @@ class TaskManager:
             if created is not None:
                 item.downstream_task_id = created.get("task_id") or item.downstream_task_id
                 item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
+                self._record_downstream_item_disposition(
+                    session,
+                    task,
+                    item,
+                    event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
+                    message="已创建新的下游子任务",
+                    payload={
+                        "stage_name": item.stage_name,
+                        "item_id": item.id,
+                        "item_key": item.item_key,
+                        "old_downstream_task_id": None,
+                        "new_downstream_task_id": item.downstream_task_id,
+                        "strategy": retry_strategy if retrying else None,
+                        "old_downstream_status": retry_strategy_status if retrying else None,
+                    },
+                )
                 session.commit()
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, token or ""),
