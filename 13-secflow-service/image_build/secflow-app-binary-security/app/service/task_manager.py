@@ -6791,9 +6791,15 @@ class TaskManager:
                     "new_downstream_task_id": item.downstream_task_id,
                 },
             )
+        db.flush()
+        refreshed_actions = self._retry_item_actions(task)
         result = self._build_retry_prepare_result(db, task, target_stage=target_stage)
         validation = dict(result.get("validation") or {})
         if not bool(validation.get("validated")):
+            result = {
+                **result,
+                "item_actions": refreshed_actions,
+            }
             self._record_operation_event(
                 db,
                 task,
@@ -6808,7 +6814,7 @@ class TaskManager:
         operation.result_payload = {
             **dict(operation.result_payload or {}),
             **result,
-            "item_actions": self._retry_item_actions(task),
+            "item_actions": refreshed_actions,
         }
         return result
 

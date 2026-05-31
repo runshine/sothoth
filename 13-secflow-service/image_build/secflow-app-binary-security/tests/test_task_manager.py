@@ -9793,6 +9793,100 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         event_types = [getattr(event, "event_type", None) for event in db.events]
         self.assertIn("retry_item_binding_verification_failed", event_types)
 
+    def test_operation_verify_retry_bindings_succeeds_when_recreated_child_is_already_bound(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            current_operation_id="op1",
+        )
+        task.summary = {
+            "retry_plan": {
+                "target_stage": "binary_to_source",
+                "mode": "retry_failed_items",
+                "retry_item_keys": ["mod-a::fw-a"],
+                "item_actions": [
+                    {
+                        "stage_name": "binary_to_source",
+                        "item_id": "si-b2s",
+                        "item_key": "mod-a",
+                        "parent_key": "fw-a",
+                        "downstream_service": "binary_to_source",
+                        "old_downstream_task_id": "b2s-old",
+                        "current_downstream_task_id": "b2s-new",
+                        "new_downstream_task_id": "b2s-new",
+                        "strategy": "recreate_from_abnormal",
+                        "observed_status": "failed",
+                        "cleanup_performed": True,
+                        "binding_cleared": True,
+                        "cleanup_required": True,
+                        "cleanup_status": "succeeded",
+                        "create_required": True,
+                        "create_status": "succeeded",
+                        "verification_status": "pending",
+                        "error": None,
+                    }
+                ],
+                "affected_stages": ["binary_to_source", "entry_analysis"],
+            }
+        }
+        stage_runs = [
+            BinarySecurityStageRun(
+                id="sr-b2s",
+                task_id="task1",
+                project_id="p1",
+                stage_name="binary_to_source",
+                sequence_no=3,
+                status="pending",
+            ),
+            BinarySecurityStageRun(
+                id="sr-entry",
+                task_id="task1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=4,
+                status="pending",
+            ),
+        ]
+        item = BinarySecurityStageItem(
+            id="si-b2s",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr-b2s",
+            stage_name="binary_to_source",
+            item_key="mod-a",
+            item_name="mod-a",
+            parent_key="fw-a",
+            item_identity_key="mod-a::fw-a",
+            downstream_service="binary_to_source",
+            downstream_task_id="b2s-new",
+            status="pending",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="task1",
+            project_id="p1",
+            operation_type="retry_failed_items",
+            target_stage="binary_to_source",
+            status="running",
+            current_step="verify_retry_bindings",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=stage_runs, stage_items=[item], operations=[operation])
+
+        result = asyncio.run(self.manager._operation_verify_retry_bindings(db, task, operation))
+
+        self.assertTrue(result["validation"]["validated"])
+        action_rows = list((operation.result_payload or {}).get("item_actions") or [])
+        self.assertEqual("succeeded", action_rows[0].get("verification_status"))
+        self.assertEqual("b2s-new", action_rows[0].get("new_downstream_task_id"))
+
     def test_prepare_retry_failed_items_streaming_dataflow_retry_clears_vuln_summary_when_last_descendant_removed(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         with tempfile.TemporaryDirectory() as tmp:
