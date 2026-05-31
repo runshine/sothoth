@@ -2765,6 +2765,29 @@ class TaskManager:
             record_noop_events=False,
             apply_state=sync_apply_state,
         )
+        if target_stage == "entry_analysis":
+            # Failed-item retry for entry-analysis must sever the stale child link
+            # after observing the old terminal state; otherwise the requeued stage
+            # can still attempt to continue/re-read the cancelled child instead of
+            # creating a replacement downstream task.
+            for item in retry_items:
+                result = dict(item.result or {})
+                sync_observation = dict(result.get("sync_observation") or {})
+                item.downstream_task_id = None
+                self._mark_stage_item_sync_observation(
+                    item,
+                    sync_status=self._string_or_none(sync_observation.get("sync_status")) or "observed",
+                    synced_at=_now(),
+                    error_message=None,
+                    http_status=None,
+                    error_type=None,
+                    status_raw=None,
+                    mapped_status=None,
+                    downstream_status=None,
+                    state_applied=False,
+                )
+                result.pop("downstream", None)
+                item.result = result
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
         downstream_stages = stage_sequence[target_index + 1:]

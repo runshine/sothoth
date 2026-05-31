@@ -9050,6 +9050,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["entry_analysis", "dataflow_analysis", "vuln_scan"], affected)
         self.assertEqual(1, len(sync_calls))
         self.assertFalse(sync_calls[0]["apply_state"])
+        self.assertIsNone(items[0].downstream_task_id)
+        self.assertIsNone((items[0].result or {}).get("downstream_status"))
+        self.assertFalse((items[0].result or {}).get("sync_observation", {}).get("state_applied"))
 
     def test_prepare_retry_failed_items_streaming_dataflow_retry_clears_vuln_summary_when_last_descendant_removed(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
