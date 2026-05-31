@@ -9378,6 +9378,421 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         action_rows = list((operation.result_payload or {}).get("item_actions") or [])
         self.assertEqual("succeeded", action_rows[0].get("verification_status"))
 
+    def test_run_task_operation_steps_retry_failed_items_recreates_item_that_falls_from_active_to_abnormal_during_verify(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            current_operation_id="op1",
+        )
+        task.summary = {
+            "retry_plan": {
+                "target_stage": "entry_analysis",
+                "mode": "retry_failed_items",
+                "retry_item_keys": ["IPSEC::module-input"],
+            }
+        }
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="failed",
+        )
+        item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="IPSEC",
+            item_name="IPSEC",
+            parent_key="module-input",
+            item_identity_key="IPSEC::module-input",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-old",
+            status="running",
+        )
+        item.input_ref = {
+            "module_key": "IPSEC",
+            "module_name": "IPSEC",
+            "firmware_key": "module-input",
+            "source_dir": "/src",
+            "source_root": "/src",
+            "source_root_path": "/src",
+            "module_dir": "/src/modules/IPSEC",
+            "entry_descriptor_root": "/src",
+            "entry_files_list": "/src/modules/IPSEC/files.list",
+            "entry_descriptor_ready": True,
+        }
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="task1",
+            project_id="p1",
+            operation_type="retry_failed_items",
+            target_stage="entry_analysis",
+            status="running",
+            current_step="collect_cleanup_plan",
+        )
+        operation.resume_cursor = {"current_step": "collect_cleanup_plan"}
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], operations=[operation])
+        deleted_refs = []
+        created_payloads = []
+
+        async def fake_sync(*args, **kwargs):
+            del args, kwargs
+            return None
+
+        async def fake_active_payload(*args, **kwargs):
+            del args, kwargs
+            return {"task_id": "eat-old", "status": "running"}
+
+        async def fake_control(*args, **kwargs):
+            del args, kwargs
+            item.status = "cancelled"
+            return {"outcome": "already_terminal", "payload": {"task_id": "eat-old", "status": "cancelled"}}
+
+        async def fake_delete_refs(db_arg, task_arg, refs_arg, token_arg):
+            del db_arg, task_arg, token_arg
+            deleted_refs.extend(refs_arg)
+            return len(refs_arg)
+
+        async def fake_create(db_arg, task_arg, item_arg, *, service, token, payload):
+            del db_arg, task_arg, token
+            created_payloads.append({"service": service, "payload": dict(payload), "item_id": item_arg.id})
+            return {"task_id": "eat-new", "status": "pending"}
+
+        original_sync = self.manager.sync_downstream_status
+        original_active = self.manager._active_downstream_payload
+        original_control = self.manager._downstream_control_existing_task
+        original_delete = self.manager._delete_downstream_refs
+        original_create = self.manager._downstream_create_task
+        original_enqueue = self.manager._enqueue_task
+        try:
+            self.manager.sync_downstream_status = fake_sync
+            self.manager._active_downstream_payload = fake_active_payload
+            self.manager._downstream_control_existing_task = fake_control
+            self.manager._delete_downstream_refs = fake_delete_refs
+            self.manager._downstream_create_task = fake_create
+            self.manager._enqueue_task = lambda task_id: None
+            asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
+        finally:
+            self.manager.sync_downstream_status = original_sync
+            self.manager._active_downstream_payload = original_active
+            self.manager._downstream_control_existing_task = original_control
+            self.manager._delete_downstream_refs = original_delete
+            self.manager._downstream_create_task = original_create
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual(["eat-old"], [row["task_id"] for row in deleted_refs])
+        self.assertEqual(1, len(created_payloads))
+        self.assertEqual("eat-new", item.downstream_task_id)
+        action_rows = list((operation.result_payload or {}).get("item_actions") or [])
+        self.assertEqual("recreate_from_abnormal", action_rows[0].get("strategy"))
+        self.assertEqual("succeeded", action_rows[0].get("cleanup_status"))
+        self.assertEqual("succeeded", action_rows[0].get("create_status"))
+        self.assertEqual("succeeded", action_rows[0].get("verification_status"))
+
+    def test_run_task_operation_steps_retry_failed_items_marks_create_failure_in_item_actions(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            current_operation_id="op1",
+        )
+        task.summary = {
+            "retry_plan": {
+                "target_stage": "entry_analysis",
+                "mode": "retry_failed_items",
+                "retry_item_keys": ["IPSEC::module-input"],
+            }
+        }
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="failed",
+        )
+        item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="IPSEC",
+            item_name="IPSEC",
+            parent_key="module-input",
+            item_identity_key="IPSEC::module-input",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-old",
+            status="cancelled",
+        )
+        item.input_ref = {
+            "module_key": "IPSEC",
+            "module_name": "IPSEC",
+            "firmware_key": "module-input",
+            "source_dir": "/src",
+            "source_root": "/src",
+            "source_root_path": "/src",
+            "module_dir": "/src/modules/IPSEC",
+            "entry_descriptor_root": "/src",
+            "entry_files_list": "/src/modules/IPSEC/files.list",
+            "entry_descriptor_ready": True,
+        }
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="task1",
+            project_id="p1",
+            operation_type="retry_failed_items",
+            target_stage="entry_analysis",
+            status="running",
+            current_step="collect_cleanup_plan",
+        )
+        operation.resume_cursor = {"current_step": "collect_cleanup_plan"}
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], operations=[operation])
+
+        async def fake_sync(*args, **kwargs):
+            del args, kwargs
+            return None
+
+        async def fake_delete_refs(db_arg, task_arg, refs_arg, token_arg):
+            del db_arg, task_arg, refs_arg, token_arg
+            return 1
+
+        async def fake_create(*args, **kwargs):
+            del args, kwargs
+            raise ValidationError("boom")
+
+        original_sync = self.manager.sync_downstream_status
+        original_delete = self.manager._delete_downstream_refs
+        original_create = self.manager._downstream_create_task
+        original_enqueue = self.manager._enqueue_task
+        try:
+            self.manager.sync_downstream_status = fake_sync
+            self.manager._delete_downstream_refs = fake_delete_refs
+            self.manager._downstream_create_task = fake_create
+            self.manager._enqueue_task = lambda task_id: None
+            with self.assertRaises(ValidationError):
+                asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
+        finally:
+            self.manager.sync_downstream_status = original_sync
+            self.manager._delete_downstream_refs = original_delete
+            self.manager._downstream_create_task = original_create
+            self.manager._enqueue_task = original_enqueue
+
+        action_rows = list(self.manager._retry_item_actions(task))
+        self.assertEqual("failed", action_rows[0].get("create_status"))
+        self.assertIn("boom", str(action_rows[0].get("error") or ""))
+
+    def test_run_task_operation_steps_retry_failed_items_recovers_created_child_without_duplicate_create(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            current_operation_id="op1",
+        )
+        task.summary = {
+            "retry_plan": {
+                "target_stage": "entry_analysis",
+                "mode": "retry_failed_items",
+                "retry_item_keys": ["IPSEC::module-input"],
+            }
+        }
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="failed",
+        )
+        item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="IPSEC",
+            item_name="IPSEC",
+            parent_key="module-input",
+            item_identity_key="IPSEC::module-input",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-old",
+            status="cancelled",
+        )
+        item.input_ref = {
+            "module_key": "IPSEC",
+            "module_name": "IPSEC",
+            "firmware_key": "module-input",
+            "source_dir": "/src",
+            "source_root": "/src",
+            "source_root_path": "/src",
+            "module_dir": "/src/modules/IPSEC",
+            "entry_descriptor_root": "/src",
+            "entry_files_list": "/src/modules/IPSEC/files.list",
+            "entry_descriptor_ready": True,
+        }
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="task1",
+            project_id="p1",
+            operation_type="retry_failed_items",
+            target_stage="entry_analysis",
+            status="running",
+            current_step="collect_cleanup_plan",
+        )
+        operation.resume_cursor = {"current_step": "collect_cleanup_plan"}
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], operations=[operation])
+        create_calls = []
+
+        async def fake_sync(*args, **kwargs):
+            del args, kwargs
+            return None
+
+        async def fake_delete_refs(db_arg, task_arg, refs_arg, token_arg):
+            del db_arg, task_arg, refs_arg, token_arg
+            return 1
+
+        async def fake_find_created(task_arg, item_arg):
+            del task_arg, item_arg
+            return {"task_id": "eat-recovered", "status": "pending"}
+
+        async def fake_create(*args, **kwargs):
+            create_calls.append((args, kwargs))
+            return {"task_id": "should-not-happen", "status": "pending"}
+
+        original_sync = self.manager.sync_downstream_status
+        original_delete = self.manager._delete_downstream_refs
+        original_find = self.manager._find_retry_created_child_payload
+        original_create = self.manager._downstream_create_task
+        original_enqueue = self.manager._enqueue_task
+        try:
+            self.manager.sync_downstream_status = fake_sync
+            self.manager._delete_downstream_refs = fake_delete_refs
+            self.manager._find_retry_created_child_payload = fake_find_created
+            self.manager._downstream_create_task = fake_create
+            self.manager._enqueue_task = lambda task_id: None
+            asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
+        finally:
+            self.manager.sync_downstream_status = original_sync
+            self.manager._delete_downstream_refs = original_delete
+            self.manager._find_retry_created_child_payload = original_find
+            self.manager._downstream_create_task = original_create
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual([], create_calls)
+        self.assertEqual("eat-recovered", item.downstream_task_id)
+        action_rows = list((operation.result_payload or {}).get("item_actions") or [])
+        self.assertEqual("eat-recovered", action_rows[0].get("new_downstream_task_id"))
+        self.assertEqual("succeeded", action_rows[0].get("create_status"))
+
+    def test_operation_verify_retry_bindings_records_failed_event(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            current_operation_id="op1",
+        )
+        task.summary = {
+            "retry_plan": {
+                "target_stage": "entry_analysis",
+                "mode": "retry_failed_items",
+                "retry_item_keys": ["IPSEC::module-input"],
+                "item_actions": [
+                    {
+                        "stage_name": "entry_analysis",
+                        "item_id": "si-entry",
+                        "item_key": "IPSEC::module-input",
+                        "parent_key": "module-input",
+                        "downstream_service": "entry_analyse",
+                        "old_downstream_task_id": "eat-old",
+                        "current_downstream_task_id": None,
+                        "new_downstream_task_id": None,
+                        "strategy": "recreate_from_abnormal",
+                        "observed_status": "cancelled",
+                        "cleanup_performed": True,
+                        "binding_cleared": True,
+                        "cleanup_required": True,
+                        "cleanup_status": "succeeded",
+                        "create_required": True,
+                        "create_status": "succeeded",
+                        "verification_status": "pending",
+                        "error": None,
+                    }
+                ],
+                "affected_stages": ["entry_analysis"],
+            }
+        }
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="pending",
+        )
+        item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="IPSEC::module-input",
+            item_name="IPSEC",
+            parent_key="module-input",
+            item_identity_key="IPSEC::module-input",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-old",
+            status="pending",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="task1",
+            project_id="p1",
+            operation_type="retry_failed_items",
+            target_stage="entry_analysis",
+            status="running",
+            current_step="verify_retry_bindings",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], operations=[operation])
+
+        with self.assertRaises(ValidationError):
+            asyncio.run(self.manager._operation_verify_retry_bindings(db, task, operation))
+
+        event_types = [getattr(event, "event_type", None) for event in db.events]
+        self.assertIn("retry_item_binding_verification_failed", event_types)
+
     def test_prepare_retry_failed_items_streaming_dataflow_retry_clears_vuln_summary_when_last_descendant_removed(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         with tempfile.TemporaryDirectory() as tmp:
