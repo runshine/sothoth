@@ -6744,10 +6744,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("cancelling", task.status)
         self.assertEqual("cancelled", item.status)
         self.assertEqual(1, len(calls))
-        self.assertEqual(
-            ["sat_1", "dfa_orphan"],
-            [ref["task_id"] for ref in calls[0]["refs"]],
-        )
+        self.assertEqual(["sat_1"], [ref["task_id"] for ref in calls[0]["refs"]])
 
     def test_manual_cancel_noop_retries_orphan_downstream_cancel(self):
         task = BinarySecurityTask(
@@ -6797,10 +6794,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("cancelled", item.status)
         self.assertEqual(1, len(calls))
-        self.assertEqual(
-            ["sat_1", "dfa_orphan"],
-            [ref["task_id"] for ref in calls[0]["refs"]],
-        )
+        self.assertEqual(["sat_1"], [ref["task_id"] for ref in calls[0]["refs"]])
 
     def test_refresh_task_status_after_sync_preserves_cancelling_while_cancel_operation_active(self):
         task = BinarySecurityTask(
@@ -6837,6 +6831,70 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("cancelling", task.status)
         self.assertIsNone(task.finished_at)
         self.assertEqual("op1", task.current_operation_id)
+
+    def test_stage_terminal_success_does_not_requeue_task_while_cancel_operation_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="source",
+                status="cancelling",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="binary_to_source",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(Path(tmp) / "output"),
+                workspace_root=tmp,
+                started_at=_now(),
+            )
+            stage_run = BinarySecurityStageRun(
+                id="sr1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="binary_to_source",
+                sequence_no=3,
+                status="running",
+                started_at=_now(),
+            )
+            next_stage_run = BinarySecurityStageRun(
+                id="sr2",
+                task_id="t1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=4,
+                status="pending",
+            )
+            operation = BinarySecurityTaskOperation(
+                id="op1",
+                task_id="t1",
+                project_id="p1",
+                operation_type="cancel",
+                status="running",
+            )
+            event = BinarySecurityStateEvent(
+                id="sev-stage-success-under-cancel",
+                task_id="t1",
+                project_id="p1",
+                stage_name="binary_to_source",
+                event_type="stage_worker_terminal_observed",
+                idempotency_key="sev-stage-success-under-cancel",
+                status="processing",
+                available_at=_now(),
+            )
+            event.payload = {
+                "stage_name": "binary_to_source",
+                "status": "success",
+                "summary": {"success_count": 1, "failed_count": 0},
+            }
+            db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run, next_stage_run], operations=[operation])
+
+            asyncio.run(self.manager._apply_stage_worker_terminal_event_locked(db, event))
+
+            self.assertEqual("cancelling", task.status)
+            self.assertEqual("binary_to_source", task.current_stage)
+            self.assertEqual("op1", task.current_operation_id)
+            event_types = [row.event_type for row in db.events]
+            self.assertNotIn("task_requeued_after_stage_completion", event_types)
 
     def test_task_response_includes_cancel_state_from_latest_cancel_operation(self):
         task = BinarySecurityTask(
@@ -6885,6 +6943,122 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, response.cancel_state["targets_total"])
         self.assertEqual(1, response.cancel_state["targets_blocking"])
         self.assertEqual("eat_1", response.cancel_state["blocking_targets"][0]["downstream_task_id"])
+
+    def test_task_response_hides_stale_cancel_state_after_task_resumes_running(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op-old-cancel",
+            task_id="t1",
+            project_id="p1",
+            operation_type="cancel",
+            status="succeeded",
+            current_step="operation_succeeded",
+        )
+        operation.result_payload = {
+            "cancel_targets": [
+                {
+                    "target_type": "downstream_task",
+                    "downstream_service": "entry_analyse",
+                    "downstream_task_id": "eat_1",
+                    "blocking": True,
+                    "terminal_observation_status": "cancelled",
+                }
+            ]
+        }
+        db = _ModelAwareDb(tasks=[task], operations=[operation])
+
+        response = self.manager._task_response(db, task)
+
+        self.assertEqual({}, response.cancel_state)
+
+    def test_collect_cancel_targets_excludes_historical_parent_linked_refs(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item])
+
+        original_discover = self.manager._discover_parent_linked_downstream_refs
+        self.manager._discover_parent_linked_downstream_refs = lambda _db, _task: [
+            {"service": "entry_analyse", "task_id": "eat_old_1", "project_id": "p1", "stage_name": "entry_analysis"},
+            {"service": "dataflow_analyse", "task_id": "dfa_old_1", "project_id": "p1", "stage_name": "dataflow_analysis"},
+        ]
+        try:
+            targets = self.manager._collect_cancel_targets(db, task)
+        finally:
+            self.manager._discover_parent_linked_downstream_refs = original_discover
+
+        downstream_targets = [target for target in targets if target.get("target_type") == "downstream_task"]
+        self.assertEqual(["eat_1"], [target.get("downstream_task_id") for target in downstream_targets])
+
+    def test_cancel_state_preview_is_capped_for_large_blocking_target_sets(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="cancelling",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="cancel",
+            status="running",
+        )
+        operation.result_payload = {
+            "cancel_targets": [
+                {
+                    "target_type": "downstream_task",
+                    "downstream_service": "entry_analyse",
+                    "downstream_task_id": f"eat_{index}",
+                    "blocking": True,
+                    "terminal_observation_status": "running",
+                }
+                for index in range(25)
+            ]
+        }
+
+        cancel_state = self.manager._cancel_state_from_operation(task, operation)
+
+        self.assertEqual(25, cancel_state["targets_blocking"])
+        self.assertEqual(20, cancel_state["blocking_targets_preview_count"])
+        self.assertTrue(cancel_state["blocking_targets_truncated"])
+        self.assertEqual(20, len(cancel_state["blocking_targets"]))
 
     def test_run_cancel_operation_steps_converges_before_marking_task_cancelled(self):
         task = BinarySecurityTask(
@@ -16121,6 +16295,77 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("ea-live", item.downstream_task_id)
         self.assertEqual("success", item.status)
 
+    def test_run_entry_item_retry_recreates_child_when_existing_downstream_is_terminal_cancelled(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="source-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="mod",
+            parent_key="fw-1",
+            downstream_service="entry_analyse",
+            downstream_task_id="ea-old",
+            status="cancelled",
+            output_ref={},
+        )
+        module = {
+            "module_key": "module-1",
+            "module_name": "mod",
+            "firmware_key": "fw-1",
+            "source_dir": "/tmp/src",
+            "module_dir": "/tmp/src",
+            "source_root": "/tmp/src",
+        }
+        fake_session = _ModelAwareDb()
+        create_calls: list[dict[str, object]] = []
+
+        async def fake_create_task(session, parent_task, stage_item, *, service, token, payload):
+            del session, parent_task, stage_item, token
+            create_calls.append({"service": service, "payload": dict(payload)})
+            return {"task_id": "ea-new", "status": "pending"}
+
+        async def fake_poll(*args, **kwargs):
+            del args, kwargs
+            return "success", {"task_id": "ea-new", "status": "passed"}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_active_downstream_payload", return_value=None),
+            patch.object(self.manager, "_downstream_control_existing_task", return_value={"outcome": "already_terminal", "payload": {"task_id": "ea-old", "status": "cancelled"}}),
+            patch.object(self.manager, "_downstream_create_task", side_effect=fake_create_task),
+            patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
+            patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
+            patch.object(self.manager, "_parse_entries", return_value=[]),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+            patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
+        ):
+            result = asyncio.run(self.manager._run_entry_item(task, stage_run, module, token="tok", retrying=True))
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual(1, len(create_calls))
+        self.assertEqual("entry_analyse", create_calls[0]["service"])
+        self.assertEqual("ea-new", item.downstream_task_id)
+        self.assertEqual("success", item.status)
+
     def test_run_firmware_item_reuses_duplicate_downstream_task_before_create(self):
         task = BinarySecurityTask(
             id="t1",
@@ -17369,10 +17614,7 @@ def _test_manual_cancel_collects_dispatching_and_orphan_downstream_refs(self):
     self.assertEqual("cancelling", task.status)
     self.assertEqual("cancelled", item.status)
     self.assertEqual(1, len(calls))
-    self.assertEqual(
-        ["sat_1", "dfa_orphan"],
-        [ref["task_id"] for ref in calls[0]["refs"]],
-    )
+    self.assertEqual(["sat_1"], [ref["task_id"] for ref in calls[0]["refs"]])
 
 
 def _test_manual_cancel_noop_retries_orphan_downstream_cancel(self):
@@ -17423,10 +17665,7 @@ def _test_manual_cancel_noop_retries_orphan_downstream_cancel(self):
 
     self.assertEqual("cancelled", item.status)
     self.assertEqual(1, len(calls))
-    self.assertEqual(
-        ["sat_1", "dfa_orphan"],
-        [ref["task_id"] for ref in calls[0]["refs"]],
-    )
+    self.assertEqual(["sat_1"], [ref["task_id"] for ref in calls[0]["refs"]])
 
 
 TaskManagerTests.test_manual_cancel_collects_dispatching_and_orphan_downstream_refs = _test_manual_cancel_collects_dispatching_and_orphan_downstream_refs
