@@ -3651,13 +3651,12 @@ class TaskManager:
         active_cancel_operation: BinarySecurityTaskOperation | None = None,
     ) -> BinarySecurityTaskOperation | None:
         operation = active_cancel_operation or self._active_cancel_operation(db, task.id)
-        if operation is None and str(task.status or "").strip() != TASK_STATUS_CANCELLING:
+        if operation is None:
             return None
         task.status = TASK_STATUS_CANCELLING
         task.finished_at = None
         task.last_error = None
-        if operation is not None:
-            task.current_operation_id = operation.id
+        task.current_operation_id = operation.id
         self._invalidate_task_execution(task)
         return operation
 
@@ -11886,9 +11885,13 @@ class TaskManager:
                 abnormal_reason = BinarySecurityAbnormalReason(**task.latest_abnormal_reason)
             except Exception:
                 abnormal_reason = None
+        active_operation = self._active_operation(db, task.id)
         cancel_operation = None
         try:
-            cancel_operation = self._active_cancel_operation(db, task.id) or self._latest_cancel_operation(db, task.id)
+            if active_operation is not None and str(active_operation.operation_type or "").strip() != TASK_ACTION_CANCEL:
+                cancel_operation = None
+            else:
+                cancel_operation = self._active_cancel_operation(db, task.id) or self._latest_cancel_operation(db, task.id)
         except Exception:
             cancel_operation = None
         manual_operation_state = self._build_task_list_manual_operation_state(task, stage_summaries=stage_summaries)
@@ -12128,7 +12131,11 @@ class TaskManager:
             task_retry_failed_reason=task_retry_failed_reason,
             stage_summaries=stage_summaries,
         )
-        cancel_operation = self._active_cancel_operation(db, task.id) or self._latest_cancel_operation(db, task.id)
+        active_operation = self._active_operation(db, task.id)
+        if active_operation is not None and str(active_operation.operation_type or "").strip() != TASK_ACTION_CANCEL:
+            cancel_operation = None
+        else:
+            cancel_operation = self._active_cancel_operation(db, task.id) or self._latest_cancel_operation(db, task.id)
         return BinarySecurityTaskResponse(
             id=task.id,
             project_id=task.project_id,

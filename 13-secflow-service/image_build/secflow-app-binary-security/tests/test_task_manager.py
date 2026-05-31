@@ -6982,6 +6982,70 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual({}, response.cancel_state)
 
+    def test_task_response_hides_stale_cancel_state_while_non_cancel_operation_is_running(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="cancelling",
+            current_stage="binary_to_source",
+            current_operation_id="op-retry",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        retry_operation = BinarySecurityTaskOperation(
+            id="op-retry",
+            task_id="t1",
+            project_id="p1",
+            operation_type="retry_stage_failed_items",
+            status="running",
+        )
+        cancel_operation = BinarySecurityTaskOperation(
+            id="op-old-cancel",
+            task_id="t1",
+            project_id="p1",
+            operation_type="cancel",
+            status="failed",
+            current_step="verify_downstream_quiesced",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[retry_operation, cancel_operation])
+
+        response = self.manager._task_response(db, task)
+
+        self.assertEqual({}, response.cancel_state)
+
+    def test_ensure_task_remains_cancelling_requires_active_cancel_operation(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="cancelling",
+            current_stage="binary_to_source",
+            current_operation_id="op-retry",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        retry_operation = BinarySecurityTaskOperation(
+            id="op-retry",
+            task_id="t1",
+            project_id="p1",
+            operation_type="retry_stage_failed_items",
+            status="running",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[retry_operation])
+
+        operation = self.manager._ensure_task_remains_cancelling(db, task)
+
+        self.assertIsNone(operation)
+        self.assertEqual("cancelling", task.status)
+        self.assertEqual("op-retry", task.current_operation_id)
+
     def test_collect_cancel_targets_excludes_historical_parent_linked_refs(self):
         task = BinarySecurityTask(
             id="t1",
