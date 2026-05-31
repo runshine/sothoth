@@ -2777,7 +2777,9 @@ class TaskManager:
             for item in retry_items:
                 result = dict(item.result or {})
                 sync_observation = dict(result.get("sync_observation") or {})
-                item.downstream_task_id = None
+                self._clear_item_downstream_runtime_state(item)
+                item.status = "pending"
+                item.finished_at = None
                 self._mark_stage_item_sync_observation(
                     item,
                     sync_status=self._string_or_none(sync_observation.get("sync_status")) or "observed",
@@ -2790,8 +2792,6 @@ class TaskManager:
                     downstream_status=None,
                     state_applied=False,
                 )
-                result.pop("downstream", None)
-                item.result = result
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
         downstream_stages = stage_sequence[target_index + 1:]

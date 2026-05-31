@@ -9032,6 +9032,24 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 status="cancelled",
             )
         ]
+        items[0].downstream_status = "cancelled"
+        items[0].sync_status = "synced"
+        items[0].last_synced_at = datetime.now(timezone.utc)
+        items[0].downstream_raw_status = "cancelled"
+        items[0].downstream_mapped_status = "cancelled"
+        items[0].downstream_state_applied = True
+        items[0].error_message = "任务已取消"
+        items[0].result = {
+            "downstream_status": "cancelled",
+            "downstream": {"task_id": "eat-old", "status": "cancelled"},
+            "sync_observation": {
+                "sync_status": "synced",
+                "last_synced_at": "2026-05-31T21:23:10.738082",
+                "state_applied": True,
+                "downstream_status": "cancelled",
+            },
+            "sync_status": "synced",
+        }
         db = _ModelAwareDb(tasks=[task], stage_runs=runs, stage_items=items)
         sync_calls: list[dict[str, object]] = []
 
@@ -9051,7 +9069,16 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(sync_calls))
         self.assertFalse(sync_calls[0]["apply_state"])
         self.assertIsNone(items[0].downstream_task_id)
+        self.assertEqual("pending", items[0].status)
+        self.assertIsNone(items[0].downstream_status)
+        self.assertIsNone(items[0].sync_status)
+        self.assertIsNone(items[0].downstream_raw_status)
+        self.assertIsNone(items[0].downstream_mapped_status)
+        self.assertFalse(items[0].downstream_state_applied)
+        self.assertIsNone(items[0].error_message)
+        self.assertIsNone(items[0].finished_at)
         self.assertIsNone((items[0].result or {}).get("downstream_status"))
+        self.assertIsNone((items[0].result or {}).get("downstream"))
         self.assertFalse((items[0].result or {}).get("sync_observation", {}).get("state_applied"))
 
     def test_prepare_retry_failed_items_streaming_dataflow_retry_clears_vuln_summary_when_last_descendant_removed(self):
