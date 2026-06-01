@@ -1569,6 +1569,9 @@ class TaskManager:
         project_id: str,
         status: str | None = None,
         task_type: str | None = None,
+        search: str | None = None,
+        sort_by: str = "created_at",
+        sort_order: str = "desc",
         page: int = 1,
         page_size: int = 50,
     ) -> BinarySecurityTaskListResponse:
@@ -1600,6 +1603,15 @@ class TaskManager:
             query = base_query
             if status:
                 query = query.filter(BinarySecurityTask.status == status)
+            normalized_search = str(search or "").strip()
+            if normalized_search:
+                query = query.filter(
+                    or_(
+                        BinarySecurityTask.id.like(f"%{normalized_search}%"),
+                        BinarySecurityTask.name.like(f"%{normalized_search}%"),
+                        BinarySecurityTask.firmware_path.like(f"%{normalized_search}%"),
+                    )
+                )
 
             stage_started = time.perf_counter()
             total = int(query.count() or 0)
@@ -1611,6 +1623,17 @@ class TaskManager:
             stage_durations["count"] = time.perf_counter() - stage_started
 
             offset = max(0, (page - 1) * page_size)
+            sort_field_map = {
+                "created_at": BinarySecurityTask.created_at,
+                "updated_at": BinarySecurityTask.updated_at,
+                "started_at": BinarySecurityTask.started_at,
+                "finished_at": BinarySecurityTask.finished_at,
+                "status": BinarySecurityTask.status,
+                "name": BinarySecurityTask.name,
+                "task_name": BinarySecurityTask.name,
+            }
+            sort_column = sort_field_map.get(str(sort_by or "").strip(), BinarySecurityTask.created_at)
+            order_expr = sort_column.asc() if str(sort_order or "").lower() == "asc" else sort_column.desc()
             stage_started = time.perf_counter()
             tasks = query.options(
                 load_only(
@@ -1636,7 +1659,7 @@ class TaskManager:
                     BinarySecurityTask.last_error,
                     BinarySecurityTask.current_operation_id,
                 )
-            ).order_by(BinarySecurityTask.created_at.desc()).offset(offset).limit(page_size).all()
+            ).order_by(order_expr, BinarySecurityTask.id.desc()).offset(offset).limit(page_size).all()
             observe_task_list_query_stage(
                 stage="page_items",
                 task_type=metrics_task_type,

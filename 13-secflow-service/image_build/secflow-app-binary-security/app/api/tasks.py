@@ -92,12 +92,25 @@ def list_tasks(
     project_id: str,
     status: Optional[str] = Query(None),
     task_type: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    sort_by: str = Query("created_at"),
+    sort_order: str = Query("desc"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    return get_task_manager().list_tasks(db, project_id=project_id, status=status, task_type=task_type, page=page, page_size=page_size)
+    return get_task_manager().list_tasks(
+        db,
+        project_id=project_id,
+        status=status,
+        task_type=task_type,
+        search=search,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.get("/reducer/events", response_model=BinarySecurityReducerEventPageResponse)
