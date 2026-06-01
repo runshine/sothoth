@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-app-entry-analyse-worker-adaptive
+  namespace: secflow-ns
+  labels:
+    variant: adaptive-memory-test
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      name: secflow-app-entry-analyse-worker-adaptive
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        name: secflow-app-entry-analyse-worker-adaptive
+        # 调度器通过 app=secflow-app-entry-analyse-worker 选 pod，
+        # 保证 adaptive worker 能正常接收任务
+        app: secflow-app-entry-analyse-worker
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - secflow-app-entry-analyse-worker
+              topologyKey: kubernetes.io/hostname
+            weight: 100
+      containers:
+      - env:
+        - name: TZ
+          value: Asia/Shanghai
+        - name: EA_RUNTIME_ROLE
+          value: worker
+        - name: EA_POD_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+        - name: FILESERVER_ROOT
+          value: /data/files
+        - name: EA_TASK_LEASE_SECONDS
+          value: '120'
+        - name: EA_TASK_LEASE_RENEW_INTERVAL_SECONDS
+          value: '30'
+        - name: EA_TASK_CANCEL_POLL_INTERVAL_SECONDS
+          value: '3'
+        - name: EA_SCHEDULER_POLL_SECONDS
+          value: '5'
+        - name: EA_WORKER_POLL_SECONDS
+          value: '5'
+        - name: WORKER_ISOLATION_MODE
+          value: none
+        - name: EA_POD_IP
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: status.podIP
+        # ── 内存自适应配置 ─────────────────────────────
+        - name: EA_ADAPTIVE_MEMORY_ENABLED
+          value: 'true'
+        - name: EA_ADAPTIVE_GROW_THRESHOLD
+          value: '88'
+        - name: EA_ADAPTIVE_EMERGENCY_THRESHOLD
+          value: '98'
+        - name: EA_ADAPTIVE_INTERVAL_SEC
+          value: '2'
+        # ─────────────────────────────────────────────
+        image: ghcr.io/runshine/secflow-app-entry-analyse:latest
+        imagePullPolicy: Always
+        name: secflow-app-entry-analyse-worker-adaptive
+        resources:
+          requests:
+            cpu: "1"
+            memory: 1Gi
+          limits:
+            cpu: "4"
+            memory: 4Gi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /app/service.yaml
+          name: secflow-app-entry-analyse-config
+          subPath: service.yaml
+        - mountPath: /data
+          name: secflow-platform-fileserver-data-nfs-pvc
+      dnsPolicy: ClusterFirstWithHostNet
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 60
+      topologySpreadConstraints:
+      - labelSelector:
+          matchLabels:
+            app: secflow-app-entry-analyse-worker
+        maxSkew: 2
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+      volumes:
+      - configMap:
+          defaultMode: 420
+          items:
+          - key: service.yaml
+            path: service.yaml
+          name: secflow-app-entry-analyse-config
+        name: secflow-app-entry-analyse-config
+      - name: secflow-platform-fileserver-data-nfs-pvc
+        persistentVolumeClaim:
+          claimName: secflow-platform-fileserver-data-nfs-pvc
