@@ -13622,6 +13622,7 @@ class TaskManager:
     def _stage_item_response(self, item: BinarySecurityStageItem) -> BinarySecurityStageItemResponse:
         result = dict(item.result or {})
         downstream_status, sync_observation, repaired = self._effective_stage_item_downstream_status(item, result=result)
+        downstream_payload = dict(result.get("downstream") or {})
         last_synced_at = result.get("downstream_status_synced_at")
         sync_status = result.get("sync_status")
         if not sync_status:
@@ -13652,6 +13653,7 @@ class TaskManager:
             downstream_service=item.downstream_service,
             downstream_task_id=item.downstream_task_id,
             downstream_status=downstream_status,
+            downstream_cancel_phase=self._string_or_none(downstream_payload.get("cancel_phase")),
             downstream_summary=self._stage_item_downstream_summary(item, result=result),
             input_ref=item.input_ref,
             output_ref=item.output_ref,
@@ -18912,6 +18914,15 @@ class TaskManager:
             "id",
             "project_id",
             "status",
+            "cancel_phase",
+            "cancel_requested",
+            "cancel_acknowledged",
+            "cancel_process_cleanup_done",
+            "cancel_finalized",
+            "cancel_requested_at",
+            "cancel_acknowledged_at",
+            "cancel_process_cleanup_at",
+            "cancel_finalized_at",
             "error",
             "error_message",
             "message",

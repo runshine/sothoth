@@ -335,6 +335,7 @@ class BinarySecurityStageItemResponse(BaseModel):
     downstream_service: Optional[str] = None
     downstream_task_id: Optional[str] = None
     downstream_status: Optional[str] = None
+    downstream_cancel_phase: Optional[str] = None
     downstream_summary: Optional[dict[str, Any]] = None
     input_ref: dict[str, Any] = Field(default_factory=dict)
     output_ref: dict[str, Any] = Field(default_factory=dict)
