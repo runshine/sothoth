@@ -7312,6 +7312,14 @@ class TaskManager:
                 item.status = "pending"
                 item.error_message = str(exc)
                 item.finished_at = None
+                if task is not None and self._should_hold_task_on_stage_after_requeue(db, task, item.stage_name):
+                    task.status = "running"
+                    task.current_stage = item.stage_name
+                    task.finished_at = None
+                    task.last_error = None
+                    task.dispatcher_instance_id = None
+                    task.dispatch_started_at = None
+                    task.lease_expires_at = None
                 db.commit()
                 if task is not None:
                     self._record_event(
@@ -9975,6 +9983,32 @@ class TaskManager:
                 )
                 reclaimed = True
                 continue
+            if self._is_streaming_tail_stage(task, stage_name) and not active_items:
+                fallback_stage = self._next_incomplete_stage(db, task)
+                if fallback_stage and fallback_stage != stage_name:
+                    task.status = "pending"
+                    task.current_stage = fallback_stage
+                    task.dispatcher_instance_id = None
+                    task.dispatch_started_at = None
+                    task.lease_expires_at = None
+                    task.last_error = None
+                    task.finished_at = None
+                    self._record_event(
+                        db,
+                        task,
+                        "running_execution_released",
+                        "运行实例心跳超时，空尾阶段已释放并回退到最近仍有真实工作的阶段",
+                        level="warning",
+                        stage_name=stage_name,
+                        payload={
+                            "stage_name": stage_name,
+                            "fallback_stage": fallback_stage,
+                            "active_item_count": 0,
+                            "empty_tail_stage": True,
+                        },
+                    )
+                    reclaimed = True
+                    continue
             if stage_run:
                 stage_run.status = "failed"
                 stage_run.finished_at = _now()
@@ -14174,6 +14208,12 @@ class TaskManager:
                     return stage_name
                 continue
             normalized_status = self._normalize_downstream_status(run.status) or str(run.status or "").strip()
+            if (
+                normalized_status in {"pending", "queued", "running", "dispatching"}
+                and self._is_streaming_tail_stage(task, stage_name)
+                and not items
+            ):
+                continue
             if normalized_status in {"pending", "queued", "running", "dispatching"}:
                 return stage_name
             if normalized_status not in {"success", "failed", "cancelled", "downstream_missing", "partial_success", "skipped"}:
@@ -14541,6 +14581,36 @@ class TaskManager:
         items: list[BinarySecurityStageItem],
     ) -> bool:
         return self._stage_has_active_items(items)
+
+    def _stage_has_real_runnable_work(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> bool:
+        items = self._stage_items(db, task.id, stage_name)
+        if items:
+            return True
+        return not self._is_streaming_tail_stage(task, stage_name)
+
+    def _should_hold_task_on_stage_after_requeue(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> bool:
+        if not stage_name:
+            return False
+        items = self._stage_items(db, task.id, stage_name)
+        if any(self._is_active_item_status(item.status) for item in items):
+            return True
+        target_stage = str(task.target_stage_name or "").strip()
+        return (
+            task.execution_mode == TASK_ACTION_RETRY_STAGE_FULL
+            and bool(target_stage)
+            and target_stage == stage_name
+            and self._stage_has_real_runnable_work(db, task, stage_name)
+        )
 
     def _empty_streaming_stage_run_status(self, task: BinarySecurityTask, stage_run: BinarySecurityStageRun) -> str:
         if not self._streaming_mode_enabled(task) or not self._is_streaming_tail_stage(task, stage_run.stage_name):
@@ -14970,7 +15040,11 @@ class TaskManager:
         next_stage = self._next_incomplete_stage(db, task)
         next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
         next_stage_status = next_stage_run.status if next_stage_run else "pending"
-        if next_stage and str(next_stage_status or "").strip() in {"pending", "queued", "running", "dispatching"}:
+        if (
+            next_stage
+            and str(next_stage_status or "").strip() in {"pending", "queued", "running", "dispatching"}
+            and self._stage_has_real_runnable_work(db, task, next_stage)
+        ):
             task.status = "running" if str(next_stage_status or "").strip() in {"running", "dispatching"} else "pending"
             task.current_stage = next_stage
             task.finished_at = None
