@@ -354,8 +354,6 @@ def list_tasks(
     sort_column = {
         "created_at": B2STask.created_at,
         "updated_at": B2STask.updated_at,
-        "started_at": B2STask.started_at,
-        "finished_at": B2STask.finished_at,
         "status": B2STask.status,
         "name": B2STask.name,
     }.get(sort_by, B2STask.created_at)
