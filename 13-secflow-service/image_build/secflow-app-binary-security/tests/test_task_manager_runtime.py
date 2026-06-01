@@ -213,6 +213,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
     async def test_readless_reconcile_loop_commits_per_task_and_stops_after_sleep(self):
         manager = TaskManager()
         manager._running = True
+        manager.cfg.scheduler.readless_reconcile_interval_seconds = 300
 
         class _CandidateSession:
             def query(self, model):
@@ -302,6 +303,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, observe_calls[0]["failed"])
         self.assertEqual(1, observe_calls[0]["candidates"])
         self.assertGreaterEqual(len(sleep_calls), 1)
+        self.assertEqual(300, sleep_calls[0])
 
     async def test_readless_reconcile_skips_active_leased_task_without_refreshing(self):
         manager = TaskManager()
@@ -362,6 +364,53 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], refresh_calls)
         self.assertEqual(0, task_session.commits)
         self.assertEqual(1, task_session.rollbacks)
+
+    async def test_observe_runtime_metrics_collects_db_snapshot_in_thread(self):
+        manager = TaskManager()
+        manager._workers = {"t1": type("Task", (), {"done": lambda self: False})()}
+        manager._operation_workers = {"o1": type("Task", (), {"done": lambda self: False})()}
+
+        async def _snapshot():
+            return {
+                "task_queue": {"length": 2, "oldest_age_seconds": 11.0},
+                "operation_queue": {"length": 3, "oldest_age_seconds": 7.0},
+            }
+
+        collected = []
+
+        def _collect_sync():
+            collected.append("called")
+            return {
+                "pending_tasks": 4,
+                "running_tasks": 5,
+                "archive_pending_jobs": 6,
+                "archive_running_jobs": 7,
+                "archive_applying_jobs": 8,
+                "leased_tasks": 9,
+                "task_capacity": 10,
+            }
+
+        manager._collect_runtime_metrics_snapshot_sync = _collect_sync
+
+        class _Queue:
+            async def snapshot(self):
+                return await _snapshot()
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch("app.service.task_manager.observe_queue_depths") as observe_queue_depths,
+            patch("app.service.task_manager.observe_slot_usage") as observe_slot_usage,
+        ):
+            await manager._observe_runtime_metrics(db=None, reconcile_candidates=12)
+
+        self.assertEqual(["called"], collected)
+        observe_queue_depths.assert_called_once()
+        self.assertEqual(4, observe_queue_depths.call_args.kwargs["pending_tasks"])
+        self.assertEqual(12, observe_queue_depths.call_args.kwargs["reconcile_candidates"])
+        observe_slot_usage.assert_called_once()
+        self.assertEqual(10, observe_slot_usage.call_args.kwargs["task_capacity"])
+        self.assertEqual(1, observe_slot_usage.call_args.kwargs["task_active"])
+        self.assertEqual(1, observe_slot_usage.call_args.kwargs["action_active"])
 
     async def test_claim_state_event_returns_none_on_retryable_lock_conflict(self):
         manager = TaskManager()

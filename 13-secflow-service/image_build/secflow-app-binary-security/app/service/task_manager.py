@@ -10132,48 +10132,92 @@ class TaskManager:
             archive_workers=len([task for task in self._archive_workers if not task.done()]),
         )
 
+    def _collect_runtime_metrics_snapshot_sync(self) -> dict[str, int]:
+        db = get_session_factory()()
+        try:
+            pending_tasks = int(
+                db.query(func.count(BinarySecurityTask.id))
+                .filter(BinarySecurityTask.status == "pending")
+                .scalar()
+                or 0
+            )
+            running_tasks = int(
+                db.query(func.count(BinarySecurityTask.id))
+                .filter(BinarySecurityTask.status.in_(["dispatching", "running"]))
+                .scalar()
+                or 0
+            )
+            archive_pending_jobs = int(
+                db.query(func.count(BinarySecurityArchiveJob.id))
+                .filter(BinarySecurityArchiveJob.archive_status == "pending")
+                .scalar()
+                or 0
+            )
+            archive_running_jobs = int(
+                db.query(func.count(BinarySecurityArchiveJob.id))
+                .filter(BinarySecurityArchiveJob.archive_status == "running")
+                .scalar()
+                or 0
+            )
+            archive_applying_jobs = int(
+                db.query(func.count(BinarySecurityArchiveJob.id))
+                .filter(BinarySecurityArchiveJob.archive_status.in_(["archived", "applying"]))
+                .scalar()
+                or 0
+            )
+            leased_tasks = int(
+                db.query(func.count(BinarySecurityTask.id))
+                .filter(
+                    BinarySecurityTask.dispatch_started_at.isnot(None),
+                    BinarySecurityTask.lease_expires_at.isnot(None),
+                )
+                .scalar()
+                or 0
+            )
+            service_config = self._load_service_config(db)
+            return {
+                "pending_tasks": pending_tasks,
+                "running_tasks": running_tasks,
+                "archive_pending_jobs": archive_pending_jobs,
+                "archive_running_jobs": archive_running_jobs,
+                "archive_applying_jobs": archive_applying_jobs,
+                "leased_tasks": leased_tasks,
+                "task_capacity": int(service_config.max_concurrent_tasks),
+            }
+        finally:
+            db.close()
+
     async def _observe_runtime_metrics(self, db: Session, *, reconcile_candidates: int | None = None) -> None:
+        del db
         queue_snapshot = await get_task_queue().snapshot()
+        metrics_snapshot = await asyncio.to_thread(self._collect_runtime_metrics_snapshot_sync)
+        pending_tasks = int(metrics_snapshot.get("pending_tasks", 0) or 0)
+        running_tasks = int(metrics_snapshot.get("running_tasks", 0) or 0)
+        archive_pending_jobs = int(metrics_snapshot.get("archive_pending_jobs", 0) or 0)
+        archive_running_jobs = int(metrics_snapshot.get("archive_running_jobs", 0) or 0)
+        archive_applying_jobs = int(metrics_snapshot.get("archive_applying_jobs", 0) or 0)
+        leased_tasks = int(metrics_snapshot.get("leased_tasks", 0) or 0)
+        task_capacity = int(metrics_snapshot.get("task_capacity", 0) or 0)
+        if task_capacity <= 0:
+            task_capacity = 1
         pending_tasks = int(
-            db.query(func.count(BinarySecurityTask.id))
-            .filter(BinarySecurityTask.status == "pending")
-            .scalar()
-            or 0
+            pending_tasks
         )
         running_tasks = int(
-            db.query(func.count(BinarySecurityTask.id))
-            .filter(BinarySecurityTask.status.in_(["dispatching", "running"]))
-            .scalar()
-            or 0
+            running_tasks
         )
         archive_pending_jobs = int(
-            db.query(func.count(BinarySecurityArchiveJob.id))
-            .filter(BinarySecurityArchiveJob.archive_status == "pending")
-            .scalar()
-            or 0
+            archive_pending_jobs
         )
         archive_running_jobs = int(
-            db.query(func.count(BinarySecurityArchiveJob.id))
-            .filter(BinarySecurityArchiveJob.archive_status == "running")
-            .scalar()
-            or 0
+            archive_running_jobs
         )
         archive_applying_jobs = int(
-            db.query(func.count(BinarySecurityArchiveJob.id))
-            .filter(BinarySecurityArchiveJob.archive_status.in_(["archived", "applying"]))
-            .scalar()
-            or 0
+            archive_applying_jobs
         )
         leased_tasks = int(
-            db.query(func.count(BinarySecurityTask.id))
-            .filter(
-                BinarySecurityTask.dispatch_started_at.isnot(None),
-                BinarySecurityTask.lease_expires_at.isnot(None),
-            )
-            .scalar()
-            or 0
+            leased_tasks
         )
-        service_config = self._load_service_config(db)
         task_workers = len([task for task in self._workers.values() if not task.done()])
         operation_workers = len([task for task in self._operation_workers.values() if not task.done()])
         observe_queue_depths(
@@ -10191,7 +10235,7 @@ class TaskManager:
         )
         observe_slot_usage(
             task_active=task_workers,
-            task_capacity=int(service_config.max_concurrent_tasks),
+            task_capacity=task_capacity,
             action_active=operation_workers,
             action_capacity=max(1, int(self.cfg.scheduler.downstream_action_concurrency)),
         )
@@ -11296,7 +11340,7 @@ class TaskManager:
         return task
 
     async def _readless_reconcile_loop(self) -> None:
-        interval_seconds = max(5, int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30) or 30))
+        interval_seconds = max(300, int(getattr(self.cfg.scheduler, "readless_reconcile_interval_seconds", 300) or 300))
         await run_readless_sync_loop(
             should_stop=lambda: not self._running,
             interval_seconds=interval_seconds,
@@ -11322,7 +11366,7 @@ class TaskManager:
         finally:
             candidate_session.close()
 
-    async def _process_readless_reconcile_task(self, task_id: str) -> tuple[bool, bool]:
+    def _process_readless_reconcile_task_sync(self, task_id: str) -> tuple[bool, bool]:
         session = get_session_factory()()
         try:
             task = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
@@ -11342,6 +11386,9 @@ class TaskManager:
             raise
         finally:
             session.close()
+
+    async def _process_readless_reconcile_task(self, task_id: str) -> tuple[bool, bool]:
+        return await asyncio.to_thread(self._process_readless_reconcile_task_sync, task_id)
 
     def _observe_readless_reconcile_stats(self, stats: ReadlessSyncStats) -> None:
         observe_task_readless_reconcile(

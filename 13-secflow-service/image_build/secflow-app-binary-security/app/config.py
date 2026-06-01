@@ -102,6 +102,7 @@ class SchedulerConfig(BaseModel):
     task_concurrency: int = 2
     stage_poll_interval_seconds: int = 5
     downstream_reconcile_interval_seconds: int = 30
+    readless_reconcile_interval_seconds: int = 300
     heartbeat_update_interval_seconds: int = 15
     downstream_reconcile_grace_seconds: int = 30
     shutdown_grace_seconds: int = 10

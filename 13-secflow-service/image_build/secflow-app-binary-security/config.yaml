@@ -45,6 +45,7 @@ scheduler:
   task_concurrency: 2
   stage_poll_interval_seconds: 5
   downstream_reconcile_interval_seconds: 30
+  readless_reconcile_interval_seconds: 300
   heartbeat_update_interval_seconds: 15
   downstream_reconcile_grace_seconds: 30
   shutdown_grace_seconds: 10
