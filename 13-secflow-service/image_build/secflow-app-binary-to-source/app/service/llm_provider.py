@@ -5,13 +5,19 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
+import asyncio
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
 from app.exception import ValidationError
 from app.config import get_config
+from app.model import B2SDispatchLease, get_db_session
 from app.service.configcenter import get_configcenter_client
+from app.time_utils import now_local
+from sqlalchemy.exc import IntegrityError
 
 
 logger = logging.getLogger(__name__)
@@ -19,6 +25,10 @@ _cached_provider: Optional[dict[str, Any]] = None
 _cached_providers: dict[str, dict[str, Any]] = {}
 _DEFAULT_CONTEXT_WINDOW = 128000
 _DEFAULT_MAX_TOKENS = 8192
+_MATERIALIZE_LEASE_NAME = "b2s_llm_provider_materialize"
+_MATERIALIZE_LEASE_SECONDS = 30
+_MATERIALIZE_WAIT_SECONDS = 20.0
+_MATERIALIZE_POLL_INTERVAL_SECONDS = 1.0
 
 
 def _provider_api(provider_type: str) -> str:
@@ -153,6 +163,108 @@ def _write_file_bindings(config_dir: Path, provider: dict[str, Any]) -> None:
     _write_json(safe_root / "manifest.json", {"items": manifest})
 
 
+def _config_dir() -> Path:
+    return Path(get_config().pi_re_agent.agent_config_dir).resolve()
+
+
+def _provider_snapshot_path() -> Path:
+    return _config_dir() / "provider.snapshot.json"
+
+
+def is_materialized_provider_ready() -> bool:
+    cfg = get_config()
+    if not cfg.configcenter_service.enabled:
+        return True
+    config_dir = _config_dir()
+    required = [
+        config_dir / "models.json",
+        config_dir / "settings.json",
+        config_dir / "auth.json",
+        config_dir / "provider.snapshot.json",
+    ]
+    return all(path.exists() for path in required)
+
+
+def _load_materialized_provider_snapshot() -> dict[str, Any] | None:
+    snapshot_path = _provider_snapshot_path()
+    try:
+        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.warning("读取共享LLM Provider快照失败: path=%s", snapshot_path, exc_info=True)
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _snapshot_matches_provider(provider_key: str | None) -> bool:
+    if not is_materialized_provider_ready():
+        return False
+    if not provider_key:
+        return True
+    snapshot = _load_materialized_provider_snapshot()
+    return str((snapshot or {}).get("provider_key") or "").strip() == str(provider_key or "").strip()
+
+
+def _lease_owner_id() -> str:
+    return os.environ.get("POD_NAME") or f"b2s-llm-provider-{os.getpid()}"
+
+
+def _try_acquire_materialize_lease(owner_id: str) -> bool:
+    db = get_db_session()
+    try:
+        now = now_local()
+        lease_until = now + timedelta(seconds=_MATERIALIZE_LEASE_SECONDS)
+        lease = db.query(B2SDispatchLease).filter(B2SDispatchLease.lease_name == _MATERIALIZE_LEASE_NAME).first()
+        if lease is None:
+            try:
+                db.add(B2SDispatchLease(
+                    lease_name=_MATERIALIZE_LEASE_NAME,
+                    owner_id=owner_id,
+                    lease_until=lease_until,
+                    renewed_at=now,
+                ))
+                db.commit()
+                return True
+            except IntegrityError:
+                db.rollback()
+                return False
+        if lease.owner_id == owner_id or lease.lease_until <= now:
+            lease.owner_id = owner_id
+            lease.lease_until = lease_until
+            lease.renewed_at = now
+            db.commit()
+            return True
+        return False
+    finally:
+        db.close()
+
+
+def _release_materialize_lease(owner_id: str) -> None:
+    db = get_db_session()
+    try:
+        lease = db.query(B2SDispatchLease).filter(B2SDispatchLease.lease_name == _MATERIALIZE_LEASE_NAME).first()
+        if lease is None or lease.owner_id != owner_id:
+            return
+        lease.lease_until = now_local()
+        lease.renewed_at = now_local()
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning("释放LLM Provider共享写入租约失败", exc_info=True)
+    finally:
+        db.close()
+
+
+def _publish_materialized_provider(items: list[dict[str, Any]], provider: dict[str, Any]) -> None:
+    config_dir = _config_dir()
+    _write_json(config_dir / "models.json", _build_models_json(items))
+    _write_json(config_dir / "settings.json", _build_settings_json(provider))
+    _write_json(config_dir / "auth.json", {})
+    _write_json(config_dir / "provider.snapshot.json", provider)
+    _write_file_bindings(config_dir, provider)
+
+
 async def sync_llm_providers(provider_key: str | None = None) -> dict[str, Any] | None:
     """Fetch enabled ConfigCenter LLM Providers and write pi-re-agent config files."""
     global _cached_provider
@@ -182,21 +294,35 @@ async def sync_llm_providers(provider_key: str | None = None) -> dict[str, Any] 
         if resolved_key:
             _cached_providers[resolved_key] = item
 
-    config_dir = Path(cfg.pi_re_agent.agent_config_dir).resolve()
-    _write_json(config_dir / "models.json", _build_models_json(items))
-    _write_json(config_dir / "settings.json", _build_settings_json(provider))
-    _write_json(config_dir / "auth.json", {})
-    _write_json(config_dir / "provider.snapshot.json", provider)
-    _write_file_bindings(config_dir, provider)
-
-    _cached_provider = provider
-    logger.info(
-        "已从配置中心同步LLM Providers，并设置当前默认Provider: provider_key=%s model=%s config_dir=%s",
-        provider.get("provider_key"),
-        provider.get("model"),
-        config_dir,
-    )
-    return provider
+    selected_provider_key = str(provider.get("provider_key") or "").strip()
+    owner_id = _lease_owner_id()
+    deadline = time.monotonic() + _MATERIALIZE_WAIT_SECONDS
+    while True:
+        if _try_acquire_materialize_lease(owner_id):
+            try:
+                _publish_materialized_provider(items, provider)
+                _cached_provider = provider
+                logger.info(
+                    "已从配置中心同步LLM Providers，并设置当前默认Provider: provider_key=%s model=%s config_dir=%s",
+                    provider.get("provider_key"),
+                    provider.get("model"),
+                    _config_dir(),
+                )
+                return provider
+            finally:
+                _release_materialize_lease(owner_id)
+        if _snapshot_matches_provider(selected_provider_key):
+            snapshot = _load_materialized_provider_snapshot()
+            _cached_provider = snapshot or provider
+            logger.info(
+                "复用现有共享LLM Provider快照: provider_key=%s config_dir=%s",
+                selected_provider_key or (snapshot or {}).get("provider_key"),
+                _config_dir(),
+            )
+            return snapshot or provider
+        if time.monotonic() >= deadline:
+            raise ValidationError(f"等待共享LLM Provider配置写入超时: provider_key={selected_provider_key or '<default>'}")
+        await asyncio.sleep(_MATERIALIZE_POLL_INTERVAL_SECONDS)
 
 
 def get_cached_provider_model() -> str | None:

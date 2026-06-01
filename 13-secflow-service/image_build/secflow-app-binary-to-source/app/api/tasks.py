@@ -6,7 +6,7 @@ import asyncio
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -50,6 +50,7 @@ from app.service.task_service import (
     terminate_task,
     clear_task_timeline,
 )
+from app.service.llm_provider import is_materialized_provider_ready
 
 router = APIRouter(prefix="/api/app/binary-to-source", tags=["binary-to-source"])
 
@@ -143,6 +144,8 @@ async def health_check():
 
 @router.get("/ready")
 async def ready_check():
+    if not is_materialized_provider_ready():
+        raise HTTPException(status_code=503, detail={"status": "not_ready", "reason": "llm_provider_not_materialized"})
     return {"status": "ready"}
 
 

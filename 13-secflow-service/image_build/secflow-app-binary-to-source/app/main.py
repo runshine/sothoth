@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import time
+import asyncio
 from contextlib import asynccontextmanager
 from threading import Lock
 from typing import Callable, Any
@@ -25,7 +26,7 @@ from app.metrics_summary import build_ai_summary, build_generic_observability_su
 from app.observability import get_observability
 from app.runtime_role import get_service_role
 from app.service.dispatcher import get_dispatcher
-from app.service.llm_provider import materialize_llm_provider
+from app.service.llm_provider import is_materialized_provider_ready, materialize_llm_provider
 from app.service.registry import get_registry_service
 from app.service.task_syncer import get_task_syncer
 
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 _SUMMARY_CACHE_TTL_SECONDS = 5.0
 _summary_cache: dict[str, tuple[float, Any]] = {}
 _summary_cache_lock = Lock()
+_provider_materialize_task: asyncio.Task | None = None
 
 
 def _cached_summary(key: str, builder: Callable[[], Any]) -> Any:
@@ -115,6 +117,7 @@ def verify_auth_service_or_exit() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global _provider_materialize_task
     logger.info("正在启动SecFlow B2S后端适配服务...")
     try:
         load_config()
@@ -122,18 +125,34 @@ async def lifespan(_: FastAPI):
         with get_engine().connect() as conn:
             conn.exec_driver_sql("SELECT 1")
         verify_auth_service_or_exit()
-        await materialize_llm_provider()
         if _api_enabled():
             await get_registry_service().start()
         if _worker_enabled():
             get_dispatcher().start()
             get_task_syncer().start()
+        if get_config().configcenter_service.enabled:
+            async def _materialize_in_background() -> None:
+                try:
+                    await materialize_llm_provider()
+                except Exception as exc:
+                    logger.warning("后台同步LLM Provider失败: %s", exc, exc_info=True)
+            _provider_materialize_task = asyncio.create_task(
+                _materialize_in_background(),
+                name="b2s-llm-provider-materialize",
+            )
     except Exception as exc:
         logger.exception("B2S服务启动失败: %s", exc)
         sys.exit(1)
     logger.info("SecFlow B2S后端适配服务启动成功")
     yield
     try:
+        if _provider_materialize_task:
+            _provider_materialize_task.cancel()
+            try:
+                await _provider_materialize_task
+            except asyncio.CancelledError:
+                pass
+            _provider_materialize_task = None
         if _worker_enabled():
             await get_task_syncer().stop()
             await get_dispatcher().stop()
