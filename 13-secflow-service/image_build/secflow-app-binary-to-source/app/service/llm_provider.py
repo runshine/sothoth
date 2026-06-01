@@ -300,7 +300,7 @@ async def sync_llm_providers(provider_key: str | None = None) -> dict[str, Any] 
     while True:
         if _try_acquire_materialize_lease(owner_id):
             try:
-                _publish_materialized_provider(items, provider)
+                await asyncio.to_thread(_publish_materialized_provider, items, provider)
                 _cached_provider = provider
                 logger.info(
                     "已从配置中心同步LLM Providers，并设置当前默认Provider: provider_key=%s model=%s config_dir=%s",
