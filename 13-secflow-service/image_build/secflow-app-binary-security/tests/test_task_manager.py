@@ -16641,12 +16641,37 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 return False
 
         manager._workers = {"task-1": _Worker()}
+        manager._register_task_execution_owner("task-1", "primary_task_worker")
         manager._last_task_heartbeat_at.pop("task-1", None)
+
+        class _TaskQuery:
+            def filter(self, *args, **kwargs):
+                del args, kwargs
+                return self
+
+            def first(self):
+                return SimpleNamespace(
+                    id="task-1",
+                    status="running",
+                    dispatcher_instance_id=manager.instance_id,
+                    finished_at=None,
+                )
+
+            def update(self, *args, **kwargs):
+                del args, kwargs
+                return 0
 
         class _Query:
             def filter(self, *args, **kwargs):
                 del args, kwargs
                 return self
+
+            def order_by(self, *args, **kwargs):
+                del args, kwargs
+                return self
+
+            def first(self):
+                return None
 
             def update(self, *args, **kwargs):
                 del args, kwargs
@@ -16657,7 +16682,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 self.commit_calls = 0
                 self.rollback_calls = 0
 
-            def query(self, *_args, **_kwargs):
+            def query(self, model, *_args, **_kwargs):
+                if getattr(model, "__name__", "") == "BinarySecurityTask":
+                    return _TaskQuery()
                 return _Query()
 
             def commit(self):

@@ -18609,7 +18609,9 @@ class TaskManager:
         if last_heartbeat_at and (now - last_heartbeat_at).total_seconds() < interval_seconds:
             observe_heartbeat_update("fallback_skipped")
             return
-        if not self._has_local_task_execution_owner(task_id):
+        has_owner = self._has_local_task_execution_owner(task_id)
+        has_streaming_worker = self._task_has_active_streaming_stage_workers(task_id)
+        if not has_owner and not has_streaming_worker:
             observe_heartbeat_update("fallback_skipped")
             return
         session = get_session_factory()()
