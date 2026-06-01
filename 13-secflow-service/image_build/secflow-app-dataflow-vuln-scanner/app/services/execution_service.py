@@ -1872,6 +1872,32 @@ class ExecutionService:
                 "linked_execution_id": latest_execution.id if latest_execution else None,
                 **run_summary,
             }
+        run_index_for_unbound = None
+        run_index_id = str(run_summary.get("run_id") or "").strip()
+        if run_index_id:
+            run_index_for_unbound = db.get(RunIndex, run_index_id)
+        if run_index_for_unbound is None and latest_execution is not None:
+            run_index_for_unbound = (
+                db.query(RunIndex)
+                .filter(RunIndex.linked_execution_id == latest_execution.id)
+                .first()
+            )
+        if run_index_for_unbound is None:
+            run_index_for_unbound = (
+                db.query(RunIndex)
+                .filter(RunIndex.linked_task_id == trigger.id)
+                .order_by(RunIndex.started_at.desc(), RunIndex.created_at.desc())
+                .first()
+            )
+        if latest_execution is not None and self._requeue_unbound_active_execution_if_safe(
+            db,
+            trigger=trigger,
+            execution=latest_execution,
+            run_index=run_index_for_unbound,
+            reason="scan_task_response",
+        ):
+            db.flush()
+            latest_execution = self._latest_execution_for_trigger(db, trigger.id)
         abnormal_reason = self._task_abnormal_reason(trigger, latest_execution, run_summary)
         effective_task_status, effective_task_message, effective_started_at, effective_finished_at = self._effective_scan_task_runtime_state(
             trigger=trigger,
@@ -2204,6 +2230,191 @@ class ExecutionService:
             resolved.finished_at,
         )
 
+    def _unbound_active_runtime_evidence(
+        self,
+        db: Session,
+        *,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+        run_index: RunIndex | None,
+    ) -> dict[str, Any]:
+        evidence: dict[str, Any] = {
+            "has_owner_pod_id": False,
+            "has_worker_job_id": False,
+            "has_process_pid": False,
+            "has_process_started_at": False,
+            "has_local_process": False,
+            "has_active_worker_job": False,
+            "has_process_file_running": False,
+            "has_recent_run_activity": False,
+            "run_index_id": run_index.id if run_index is not None else None,
+        }
+        if execution is None:
+            return evidence
+
+        evidence["has_owner_pod_id"] = bool(str(execution.owner_pod_id or "").strip())
+        evidence["has_worker_job_id"] = bool(str(execution.worker_job_id or "").strip())
+        evidence["has_process_pid"] = bool(execution.process_pid)
+        evidence["has_process_started_at"] = bool(execution.process_started_at)
+        evidence["has_local_process"] = self._local_cli_process(execution.id) is not None
+
+        if run_index is not None:
+            process_state = self._run_process_state(db, run_index, trigger=trigger, execution=execution)
+            source = str(process_state.get("source") or "").strip().lower()
+            evidence["has_process_file_running"] = bool(
+                process_state.get("process_file_status") in {"running", "timeout_requested", "stop_requested", "delete_requested"}
+                and not bool(process_state.get("stale"))
+            )
+            evidence["has_recent_run_activity"] = bool(
+                process_state.get("is_running")
+                and source in {"local_process", "process_file_heartbeat"}
+            )
+
+        if evidence["has_worker_job_id"] and evidence["has_owner_pod_id"]:
+            try:
+                from app.services.scheduler import get_scheduler_service
+
+                worker_jobs = get_scheduler_service().list_local_jobs() if str(execution.owner_pod_id or "").strip() == get_config().scheduler.pod_id else []
+                evidence["has_active_worker_job"] = any(
+                    str(job.get("execution_id") or "").strip() == execution.id
+                    and str(job.get("status") or "").strip().lower() in ACTIVE_JOB_STATUSES
+                    for job in worker_jobs
+                )
+            except Exception:
+                evidence["has_active_worker_job"] = False
+
+        return evidence
+
+    def _can_requeue_unbound_active_execution(
+        self,
+        db: Session,
+        *,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+        run_index: RunIndex | None,
+    ) -> tuple[bool, dict[str, Any]]:
+        evidence = self._unbound_active_runtime_evidence(
+            db,
+            trigger=trigger,
+            execution=execution,
+            run_index=run_index,
+        )
+        should_requeue = not any(
+            bool(evidence.get(key))
+            for key in (
+                "has_owner_pod_id",
+                "has_process_pid",
+                "has_process_started_at",
+                "has_local_process",
+                "has_active_worker_job",
+                "has_process_file_running",
+                "has_recent_run_activity",
+            )
+        )
+        return should_requeue, evidence
+
+    def _requeue_unbound_active_execution_if_safe(
+        self,
+        db: Session,
+        *,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+        run_index: RunIndex | None,
+        reason: str,
+    ) -> bool:
+        if execution is None:
+            return False
+        if str(execution.owner_pod_id or "").strip():
+            return False
+
+        execution_status = _canonical_task_status(execution.status)
+        trigger_status = _canonical_task_status(trigger.status) if trigger is not None else ""
+        if execution_status not in {"dispatching", "running"} and trigger_status not in {"dispatching", "running"}:
+            return False
+
+        should_requeue, evidence = self._can_requeue_unbound_active_execution(
+            db,
+            trigger=trigger,
+            execution=execution,
+            run_index=run_index,
+        )
+        self.record_event(
+            db,
+            execution_id=execution.id,
+            event_type="unbound_active_execution_detected",
+            message="detected active execution without owner pod binding",
+            level="warning",
+            payload_json={
+                "trigger_task_id": trigger.id if trigger is not None else None,
+                "owner_pod_id_before": str(execution.owner_pod_id or "").strip() or None,
+                "worker_job_id_before": str(execution.worker_job_id or "").strip() or None,
+                "process_pid": execution.process_pid,
+                "process_started_at": isoformat_local(execution.process_started_at),
+                "dispatch_status": str(execution.dispatch_status or "").strip() or None,
+                "run_index_id": run_index.id if run_index is not None else None,
+                "runtime_evidence": evidence,
+                "requeue_applied": should_requeue,
+                "reason": reason,
+            },
+        )
+        if not should_requeue:
+            self.record_event(
+                db,
+                execution_id=execution.id,
+                event_type="unbound_active_execution_preserved_due_to_runtime_evidence",
+                message="preserved unbound active execution because runtime evidence still exists",
+                level="warning",
+                payload_json={
+                    "trigger_task_id": trigger.id if trigger is not None else None,
+                    "runtime_evidence": evidence,
+                    "reason": reason,
+                },
+            )
+            return False
+
+        message = "unbound active execution requeued after no-runtime confirmation"
+        execution.worker_url = None
+        execution.worker_job_id = None
+        execution.owner_pod_id = None
+        execution.status = "pending"
+        execution.public_status = "pending"
+        execution.control_state = "none"
+        execution.dispatch_status = None
+        execution.dispatch_error = message
+        execution.process_status = "not_started"
+        execution.process_pid = None
+        execution.process_started_at = None
+        execution.process_finished_at = None
+        execution.started_at = None
+        execution.finished_at = None
+        execution.message = message
+        if trigger is not None:
+            trigger.status = "pending"
+            trigger.public_status = "pending"
+            trigger.control_state = "none"
+            trigger.started_at = None
+            trigger.finished_at = None
+            trigger.message = message
+            db.add(trigger)
+        self._sync_runtime_state_snapshots(trigger=trigger, execution=execution, public_status="pending", control_state="none")
+        db.add(execution)
+        self._refresh_task_list_projection_for_execution(db, execution)
+        db.flush()
+        self.record_event(
+            db,
+            execution_id=execution.id,
+            event_type="unbound_active_execution_requeued",
+            message=message,
+            level="warning",
+            payload_json={
+                "trigger_task_id": trigger.id if trigger is not None else None,
+                "run_index_id": run_index.id if run_index is not None else None,
+                "runtime_evidence": evidence,
+                "reason": reason,
+            },
+        )
+        return True
+
     def _slot_binding_state(
         self,
         *,
@@ -2225,7 +2436,7 @@ class ExecutionService:
         if dispatch_status in {"queued", "dispatching"}:
             return "queued", f"dispatch_status={dispatch_status}"
         if execution_status == "running":
-            return "unbound_running", "active execution without owner_pod_id"
+            return "unbound", "active execution without owner_pod_id"
         return "unbound", None
 
     def _sync_runtime_state_snapshots(
@@ -5907,6 +6118,14 @@ class ExecutionService:
     ) -> bool:
         if run_index is None or (trigger is None and execution is None):
             return False
+        if self._requeue_unbound_active_execution_if_safe(
+            db,
+            trigger=trigger,
+            execution=execution,
+            run_index=run_index,
+            reason="stale_runtime_reconcile",
+        ):
+            return True
         if self._reconcile_terminal_run_state(
             db,
             run_index=run_index,
@@ -6175,6 +6394,16 @@ class ExecutionService:
                 db.commit()
                 continue
             run_index = self._ensure_run_index_for_execution(db, execution, trigger)
+            if self._requeue_unbound_active_execution_if_safe(
+                db,
+                trigger=trigger,
+                execution=execution,
+                run_index=run_index,
+                reason="reconcile_stale_active_executions",
+            ):
+                reconciled += 1
+                db.commit()
+                continue
             if self._reconcile_stale_runtime(
                 db,
                 run_index=run_index,

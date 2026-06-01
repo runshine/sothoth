@@ -1357,6 +1357,104 @@ def test_reconcile_stale_runtime_without_process_requeues_instead_of_failing(ser
         assert event is not None
 
 
+def test_reconcile_unbound_running_without_runtime_evidence_requeues_to_pending(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_unbound_running_requeue_20260601_010203"
+    bound = _create_execution_bound_run(client, run_root)
+
+    with get_db_session() as db:
+        run_index = db.get(RunIndex, bound["run_id"])
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        trigger = db.get(TriggerTask, bound["task_id"])
+        assert run_index is not None and execution is not None and trigger is not None
+        old_started_at = now_local() - timedelta(seconds=120)
+        run_index.status = "running"
+        execution.status = "running"
+        execution.public_status = "running"
+        execution.dispatch_status = "running"
+        execution.owner_pod_id = None
+        execution.worker_url = None
+        execution.worker_job_id = None
+        execution.started_at = old_started_at
+        execution.process_pid = None
+        execution.process_started_at = None
+        execution.process_status = None
+        trigger.status = "running"
+        trigger.public_status = "running"
+        trigger.started_at = old_started_at
+        db.add_all([run_index, execution, trigger])
+        db.commit()
+
+        service = get_execution_service()
+        assert service._reconcile_stale_runtime(db, run_index=run_index, trigger=trigger, execution=execution) is True
+        db.commit()
+        db.refresh(execution)
+        db.refresh(trigger)
+        assert execution.status == "pending"
+        assert execution.public_status == "pending"
+        assert execution.dispatch_status is None
+        assert execution.owner_pod_id is None
+        assert execution.process_pid is None
+        assert trigger.status == "pending"
+        event = (
+            db.query(WorkflowExecutionEvent)
+            .filter(
+                WorkflowExecutionEvent.execution_id == execution.id,
+                WorkflowExecutionEvent.event_type == "unbound_active_execution_requeued",
+            )
+            .first()
+        )
+        assert event is not None
+
+
+def test_reconcile_unbound_running_with_local_process_is_preserved(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_unbound_running_preserved_20260601_010203"
+    bound = _create_execution_bound_run(client, run_root)
+
+    with get_db_session() as db:
+        run_index = db.get(RunIndex, bound["run_id"])
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        trigger = db.get(TriggerTask, bound["task_id"])
+        assert run_index is not None and execution is not None and trigger is not None
+        now = now_local()
+        run_index.status = "running"
+        execution.status = "running"
+        execution.public_status = "running"
+        execution.dispatch_status = "running"
+        execution.owner_pod_id = None
+        execution.started_at = now
+        execution.process_status = "running"
+        trigger.status = "running"
+        trigger.public_status = "running"
+        trigger.started_at = now
+        db.add_all([run_index, execution, trigger])
+        db.commit()
+
+        service = get_execution_service()
+        fake_process = _FakeCliProcess()
+        service._register_cli_process(execution.id, fake_process)
+        try:
+            assert service._reconcile_stale_runtime(db, run_index=run_index, trigger=trigger, execution=execution) is False
+            db.refresh(execution)
+            db.refresh(trigger)
+            assert execution.status == "running"
+            assert trigger.status == "running"
+            event = (
+                db.query(WorkflowExecutionEvent)
+                .filter(
+                    WorkflowExecutionEvent.execution_id == execution.id,
+                    WorkflowExecutionEvent.event_type == "unbound_active_execution_preserved_due_to_runtime_evidence",
+                )
+                .first()
+            )
+            assert event is not None
+        finally:
+            service._forget_cli_process(execution.id, fake_process)
+
+
 def test_run_delete_active_run_stops_process_and_removes_records(service_config_path, monkeypatch):
     app = create_app()
     client = TestClient(app)
