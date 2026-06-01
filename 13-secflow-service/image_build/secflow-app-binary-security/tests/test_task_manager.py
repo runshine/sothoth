@@ -20552,6 +20552,158 @@ TaskManagerTests.test_defer_item_after_downstream_transport_error_records_child_
 TaskManagerTests.test_upsert_stage_item_preserves_sync_metadata_on_refresh = _test_upsert_stage_item_preserves_sync_metadata_on_refresh
 
 
+def _test_self_healing_downstream_failure_observation_is_not_applied(self):
+    task = BinarySecurityTask(
+        id="s1",
+        project_id="p1",
+        name="binary-module",
+        status="running",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        current_stage="vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/tmp",
+    )
+    run = BinarySecurityStageRun(
+        id="sr1",
+        task_id="s1",
+        project_id="p1",
+        stage_name="vuln_scan",
+        sequence_no=3,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="s1",
+        project_id="p1",
+        stage_run_id="sr1",
+        stage_name="vuln_scan",
+        item_key="entry1",
+        parent_key="module1",
+        status="queued",
+        downstream_service="dataflow_vuln_scanner",
+        downstream_task_id="tt-1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item])
+
+    original_fetch = self.manager._fetch_downstream_task_payload
+    original_write = self.manager._write_task_metadata_async
+    original_enqueue = self.manager._enqueue_task
+
+    async def _fetch(_task, _item, _token):
+        return {
+            "status": "failed",
+            "message": "stale active runtime awaiting recovery",
+            "error_message": "stale active runtime awaiting recovery",
+            "parent_stage_item_id": "si1",
+        }
+
+    async def _noop_write(*_args, **_kwargs):
+        return None
+
+    self.manager._fetch_downstream_task_payload = _fetch
+    self.manager._write_task_metadata_async = _noop_write
+    self.manager._enqueue_task = lambda *_args, **_kwargs: None
+    try:
+        resp = asyncio.run(
+            self.manager.sync_downstream_status(
+                db,
+                project_id="p1",
+                task_id="s1",
+                stage_name="vuln_scan",
+            )
+        )
+    finally:
+        self.manager._fetch_downstream_task_payload = original_fetch
+        self.manager._write_task_metadata_async = original_write
+        self.manager._enqueue_task = original_enqueue
+
+    self.assertEqual("queued", item.status)
+    self.assertEqual(1, resp.skipped_downstream_count)
+    self.assertFalse(bool(item.result.get("sync_observation", {}).get("state_applied")))
+    self.assertEqual("failed", item.result.get("sync_observation", {}).get("mapped_status"))
+    skipped_events = [event for event in db.events if event.event_type == "downstream_status_sync_skipped"]
+    self.assertTrue(skipped_events)
+    self.assertTrue(skipped_events[-1].payload.get("self_healing_failure"))
+
+
+def _test_running_message_downstream_failure_observation_is_not_applied(self):
+    task = BinarySecurityTask(
+        id="s1",
+        project_id="p1",
+        name="binary-module",
+        status="running",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        current_stage="vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/tmp",
+    )
+    run = BinarySecurityStageRun(
+        id="sr1",
+        task_id="s1",
+        project_id="p1",
+        stage_name="vuln_scan",
+        sequence_no=3,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="s1",
+        project_id="p1",
+        stage_run_id="sr1",
+        stage_name="vuln_scan",
+        item_key="entry1",
+        parent_key="module1",
+        status="running",
+        downstream_service="dataflow_vuln_scanner",
+        downstream_task_id="tt-1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item])
+
+    original_fetch = self.manager._fetch_downstream_task_payload
+    original_write = self.manager._write_task_metadata_async
+    original_enqueue = self.manager._enqueue_task
+
+    async def _fetch(_task, _item, _token):
+        return {
+            "status": "failed",
+            "message": "run_vuln_scan.py running",
+            "error_message": "run_vuln_scan.py running",
+            "parent_stage_item_id": "si1",
+        }
+
+    async def _noop_write(*_args, **_kwargs):
+        return None
+
+    self.manager._fetch_downstream_task_payload = _fetch
+    self.manager._write_task_metadata_async = _noop_write
+    self.manager._enqueue_task = lambda *_args, **_kwargs: None
+    try:
+        resp = asyncio.run(
+            self.manager.sync_downstream_status(
+                db,
+                project_id="p1",
+                task_id="s1",
+                stage_name="vuln_scan",
+            )
+        )
+    finally:
+        self.manager._fetch_downstream_task_payload = original_fetch
+        self.manager._write_task_metadata_async = original_write
+        self.manager._enqueue_task = original_enqueue
+
+    self.assertEqual("running", item.status)
+    self.assertEqual(1, resp.skipped_downstream_count)
+    self.assertFalse(bool(item.result.get("sync_observation", {}).get("state_applied")))
+
+
+TaskManagerTests.test_self_healing_downstream_failure_observation_is_not_applied = _test_self_healing_downstream_failure_observation_is_not_applied
+TaskManagerTests.test_running_message_downstream_failure_observation_is_not_applied = _test_running_message_downstream_failure_observation_is_not_applied
+
+
 def _test_stage_item_response_falls_back_to_downstream_payload_status(self):
     item = BinarySecurityStageItem(
         id="si-entry",

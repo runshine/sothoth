@@ -4458,6 +4458,49 @@ class TaskManager:
                     mapped_status = current_item_status
                     downstream_status = current_item_status
                 if terminal_status:
+                    observed_error_message = payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message
+                    self_healing_failure = self._is_self_healing_downstream_failure_observation(
+                        mapped_status=mapped_status,
+                        downstream_status=downstream_status,
+                        payload=payload,
+                        error_message=observed_error_message,
+                        error_type=None,
+                    )
+                    if self_healing_failure:
+                        self._mark_stage_item_sync_observation(
+                            item,
+                            sync_status="observed",
+                            error_message=observed_error_message,
+                            status_raw=downstream_status,
+                            mapped_status=mapped_status,
+                            downstream_status=downstream_status,
+                            state_applied=False,
+                        )
+                        if force or mapped_status != before_status or record_noop_events:
+                            self._record_event(
+                                db,
+                                task,
+                                "downstream_status_sync_skipped",
+                                "下游 failed 观测属于自愈/恢复态，本次仅记录观测，不回写父任务失败状态",
+                                stage_name=item.stage_name,
+                                item=item,
+                                level="warning",
+                                payload={
+                                    "downstream_service": item.downstream_service,
+                                    "downstream_task_id": item.downstream_task_id,
+                                    "http_status": None,
+                                    "error_type": None,
+                                    "status_raw": downstream_status,
+                                    "mapped_status": mapped_status,
+                                    "state_applied": False,
+                                    "before_status": before_status,
+                                    "downstream_status": downstream_status,
+                                    "after_status": before_status,
+                                    "self_healing_failure": True,
+                                },
+                            )
+                        skipped_count += 1
+                        continue
                     if mapped_status == "downstream_missing":
                         should_apply = observed_apply_state and (mapped_status != before_status or force)
                         if should_apply:
@@ -4526,7 +4569,7 @@ class TaskManager:
                             )
                         continue
                     if mapped_status not in ARCHIVE_SUCCESS_MAPPED_STATUSES:
-                        error_message = payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message
+                        error_message = observed_error_message
                         should_apply = observed_apply_state and (mapped_status != before_status or force)
                         if should_apply:
                             self._enqueue_downstream_terminal_event(
@@ -16055,6 +16098,41 @@ class TaskManager:
         if mapped_status == "downstream_missing":
             return "downstream_missing"
         return "failed"
+
+    def _is_self_healing_downstream_failure_observation(
+        self,
+        *,
+        mapped_status: str | None,
+        downstream_status: str | None = None,
+        payload: dict[str, Any] | None = None,
+        error_message: str | None = None,
+        error_type: str | None = None,
+    ) -> bool:
+        normalized_mapped = str(mapped_status or "").strip().lower()
+        if normalized_mapped != "failed":
+            return False
+        raw_parts = [
+            str(downstream_status or "").strip().lower(),
+            str(error_message or "").strip().lower(),
+            str(error_type or "").strip().lower(),
+            str((payload or {}).get("message") or "").strip().lower(),
+            str((payload or {}).get("error") or "").strip().lower(),
+            str((payload or {}).get("error_message") or "").strip().lower(),
+        ]
+        joined = " ".join(part for part in raw_parts if part)
+        self_healing_tokens = (
+            "stale active runtime",
+            "assumed failed",
+            "awaiting recovery",
+            "kept running by run evidence",
+            "requeued",
+            "pending recovery",
+            "run_vuln_scan.py running",
+            "http_5xx",
+            "transport_error",
+            "upstreamerror",
+        )
+        return any(token in joined for token in self_healing_tokens)
 
     def _latest_observed_downstream_status(self, item: BinarySecurityStageItem) -> str | None:
         result = dict(item.result or {})
