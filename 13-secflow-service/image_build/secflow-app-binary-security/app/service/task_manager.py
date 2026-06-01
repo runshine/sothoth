@@ -2964,6 +2964,9 @@ class TaskManager:
         repaired = False
         if normalized_item in {"success", "failed", "cancelled", "partial_success", "downstream_missing"} and normalized_display in {"pending", "dispatching", "running"}:
             display_status = normalized_item
+            sync_observation["downstream_status"] = normalized_item
+            sync_observation.setdefault("status_raw", normalized_display or display_status)
+            sync_observation["mapped_status"] = normalized_item
             repaired = True
         return display_status, sync_observation, repaired
 
@@ -16053,11 +16056,7 @@ class TaskManager:
 
     def _latest_observed_downstream_status(self, item: BinarySecurityStageItem) -> str | None:
         result = dict(item.result or {})
-        if not result:
-            return None
-        observed = result.get("downstream_status")
-        if observed is None and isinstance(result.get("sync_observation"), dict):
-            observed = result["sync_observation"].get("downstream_status")
+        observed, _sync_observation, _repaired = self._effective_stage_item_downstream_status(item, result=result)
         mapped = self._map_downstream_status(str(observed or ""))
         return mapped or (str(observed or "").strip().lower() or None)
 

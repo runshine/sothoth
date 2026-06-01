@@ -697,8 +697,8 @@ def test_worker_jobs_api_claims_and_starts_assigned_execution(
     assert response.status_code == 200
     payload = response.json()
     assert payload["id"] == execution_id
-    assert payload["status"] == "starting"
-    assert payload["phase"] == "starting"
+    assert payload["status"] == "dispatching"
+    assert payload["phase"] == "queued"
     assert started == [execution_id]
 
     list_response = client.get("/api/v1/jobs")
@@ -713,12 +713,12 @@ def test_worker_jobs_api_claims_and_starts_assigned_execution(
         trigger = db.get(TriggerTask, "tt-sched-worker-api")
         assert execution is not None
         assert trigger is not None
-        assert execution.status == "starting"
+        assert execution.status == "dispatching"
         assert trigger.status == "dispatching"
         assert execution.owner_pod_id == "worker-pod"
         assert execution.worker_url == "http://worker-pod"
         assert execution.worker_job_id == execution_id
-        assert execution.dispatch_status == "starting"
+        assert execution.dispatch_status == "queued"
     finally:
         db.close()
 

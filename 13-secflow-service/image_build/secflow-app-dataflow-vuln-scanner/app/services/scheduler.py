@@ -4,6 +4,7 @@ import asyncio
 import dataclasses
 import hashlib
 import logging
+from collections import deque
 import threading
 import time
 from datetime import timedelta
@@ -79,6 +80,11 @@ class SchedulerService:
         self._cluster_capacity_summary_snapshot_at = None
         self._cluster_capacity_summary_lock = threading.Lock()
         self._active_reconcile_running = False
+        self._execution_health_lock = threading.Lock()
+        self._startup_failure_timestamps: deque[float] = deque()
+        self._stale_without_pid_timestamps: deque[float] = deque()
+        self._requeued_before_process_start_timestamps: deque[float] = deque()
+        self._degraded_until_monotonic: float = 0.0
 
     @property
     def role(self) -> str:
@@ -130,6 +136,90 @@ class SchedulerService:
 
     def has_available_capacity(self) -> bool:
         return self.has_unlimited_capacity or self.local_running_count() < self.capacity
+
+    def _execution_health_window_seconds(self) -> int:
+        return max(60, int(get_config().scheduler.execution_health_window_seconds or 600))
+
+    def _execution_degraded_cooldown_seconds(self) -> int:
+        return max(60, int(get_config().scheduler.execution_degraded_cooldown_seconds or 600))
+
+    def _prune_execution_health_samples_locked(self, now_monotonic: float) -> None:
+        cutoff = now_monotonic - self._execution_health_window_seconds()
+        for bucket in (
+            self._startup_failure_timestamps,
+            self._stale_without_pid_timestamps,
+            self._requeued_before_process_start_timestamps,
+        ):
+            while bucket and bucket[0] < cutoff:
+                bucket.popleft()
+
+    def _execution_health_snapshot(self) -> dict[str, Any]:
+        with self._execution_health_lock:
+            now_monotonic = time.monotonic()
+            self._prune_execution_health_samples_locked(now_monotonic)
+            return {
+                "queued_without_process_count": len(self._stale_without_pid_timestamps),
+                "startup_fail_count": len(self._startup_failure_timestamps),
+                "requeued_before_process_start_count": len(self._requeued_before_process_start_timestamps),
+                "stale_without_pid_count": len(self._stale_without_pid_timestamps),
+                "degraded": self._degraded_until_monotonic > now_monotonic,
+            }
+
+    def _restore_worker_execution_health_if_ready(self) -> None:
+        should_restore = False
+        with self._execution_health_lock:
+            now_monotonic = time.monotonic()
+            self._prune_execution_health_samples_locked(now_monotonic)
+            if self._worker_status == "degraded" and self._degraded_until_monotonic and now_monotonic >= self._degraded_until_monotonic:
+                self._degraded_until_monotonic = 0.0
+                should_restore = True
+        if should_restore:
+            self._worker_status = "active"
+
+    def _record_execution_health_sample(self, bucket_name: str, *, reason: str, payload: dict[str, Any] | None = None) -> None:
+        degrade = False
+        snapshot: dict[str, Any] = {}
+        with self._execution_health_lock:
+            now_monotonic = time.monotonic()
+            self._prune_execution_health_samples_locked(now_monotonic)
+            bucket = {
+                "startup_fail": self._startup_failure_timestamps,
+                "stale_without_pid": self._stale_without_pid_timestamps,
+                "requeued_before_process_start": self._requeued_before_process_start_timestamps,
+            }[bucket_name]
+            bucket.append(now_monotonic)
+            startup_fail_count = len(self._startup_failure_timestamps)
+            stale_without_pid_count = len(self._stale_without_pid_timestamps)
+            requeue_count = len(self._requeued_before_process_start_timestamps)
+            snapshot = {
+                "startup_fail_count": startup_fail_count,
+                "stale_without_pid_count": stale_without_pid_count,
+                "requeued_before_process_start_count": requeue_count,
+            }
+            degrade = (
+                self._worker_status == "active"
+                and (
+                    startup_fail_count >= max(1, int(get_config().scheduler.execution_degraded_consecutive_startup_failures or 3))
+                    or stale_without_pid_count >= max(1, int(get_config().scheduler.execution_degraded_stale_without_pid_count or 5))
+                )
+            )
+            if degrade:
+                self._degraded_until_monotonic = now_monotonic + self._execution_degraded_cooldown_seconds()
+        if not degrade:
+            return
+        self._worker_status = "degraded"
+        logger.warning(
+            "worker execution health degraded pod=%s reason=%s startup_fail_count=%s stale_without_pid_count=%s requeue_count=%s",
+            self.pod_id,
+            reason,
+            snapshot.get("startup_fail_count"),
+            snapshot.get("stale_without_pid_count"),
+            snapshot.get("requeued_before_process_start_count"),
+        )
+        try:
+            self._heartbeat_once()
+        except Exception:
+            logger.exception("failed to publish worker degraded heartbeat")
 
     async def start(self) -> None:
         if self._started or not get_config().scheduler.enabled:
@@ -575,11 +665,18 @@ class SchedulerService:
     def _heartbeat_once(self) -> None:
         if not self.runs_worker:
             return
+        self._restore_worker_execution_health_if_ready()
         db = get_db_session()
         try:
             worker = db.get(SchedulerWorker, self.pod_id)
             now = now_local()
             first_heartbeat = not self._heartbeat_published
+            metadata_json = {
+                "service": "secflow-app-dataflow-vuln-scanner",
+                "role": self.role,
+                "advertise_url": self.advertise_url(),
+                "execution_health": self._execution_health_snapshot(),
+            }
             if worker is None:
                 worker = SchedulerWorker(
                     pod_id=self.pod_id,
@@ -588,11 +685,7 @@ class SchedulerService:
                     running_count=len(self._running_tasks),
                     last_heartbeat_at=now,
                     status=self._worker_status,
-                    metadata_json={
-                        "service": "secflow-app-dataflow-vuln-scanner",
-                        "role": self.role,
-                        "advertise_url": self.advertise_url(),
-                    },
+                    metadata_json=metadata_json,
                 )
             else:
                 # Do not inherit stale DB "draining" on process startup; a restarted
@@ -608,11 +701,7 @@ class SchedulerService:
                 worker.running_count = len(self._running_tasks)
                 worker.last_heartbeat_at = now
                 worker.status = self._worker_status
-                worker.metadata_json = {
-                    "service": "secflow-app-dataflow-vuln-scanner",
-                    "role": self.role,
-                    "advertise_url": self.advertise_url(),
-                }
+                worker.metadata_json = metadata_json
             db.add(worker)
             db.commit()
             self._heartbeat_published = True
@@ -719,7 +808,6 @@ class SchedulerService:
             db.close()
 
     def _claim_assigned_execution(self, db: Session, execution: WorkflowExecution, trigger: TriggerTask) -> str | None:
-        now = now_local()
         updated_execution = (
             db.query(WorkflowExecution)
             .filter(
@@ -730,8 +818,7 @@ class SchedulerService:
             )
             .update(
                 {
-                    WorkflowExecution.status: "starting",
-                    WorkflowExecution.started_at: now,
+                    WorkflowExecution.status: "dispatching",
                     WorkflowExecution.dispatch_status: "starting",
                     WorkflowExecution.dispatch_error: None,
                     WorkflowExecution.message: f"starting on worker {self.pod_id}",
@@ -745,7 +832,6 @@ class SchedulerService:
             .update(
                 {
                     TriggerTask.status: "dispatching",
-                    TriggerTask.started_at: now,
                     TriggerTask.message: f"starting on worker {self.pod_id}",
                 },
                 synchronize_session=False,
@@ -760,7 +846,7 @@ class SchedulerService:
             execution_id=execution.id,
             event_type="worker_job_starting",
             message=f"worker job starting on {self.pod_id}",
-            payload_json={"worker_pod_id": self.pod_id},
+            payload_json={"worker_pod_id": self.pod_id, "dispatch_status_after": "starting"},
         )
         logger.info("starting assigned execution %s on worker %s", execution.id, self.pod_id)
         return execution.id
@@ -784,7 +870,6 @@ class SchedulerService:
                 .all()
             )
             for execution, trigger, _definition in candidates:
-                now = now_local()
                 updated_execution = (
                     db.query(WorkflowExecution)
                     .filter(
@@ -794,9 +879,8 @@ class SchedulerService:
                     )
                     .update(
                         {
-                            WorkflowExecution.status: "starting",
+                            WorkflowExecution.status: "dispatching",
                             WorkflowExecution.owner_pod_id: self.pod_id,
-                            WorkflowExecution.started_at: now,
                             WorkflowExecution.dispatch_status: "starting",
                             WorkflowExecution.dispatch_error: None,
                             WorkflowExecution.message: f"starting by {self.pod_id}",
@@ -813,7 +897,6 @@ class SchedulerService:
                     .update(
                         {
                             TriggerTask.status: "dispatching",
-                            TriggerTask.started_at: now,
                             TriggerTask.message: f"starting by {self.pod_id}",
                         },
                         synchronize_session=False,
@@ -828,7 +911,7 @@ class SchedulerService:
                     execution_id=execution.id,
                     event_type="worker_job_starting",
                     message=f"worker job starting on {self.pod_id}",
-                    payload_json={"worker_pod_id": self.pod_id, "mode": "standalone_claim"},
+                    payload_json={"worker_pod_id": self.pod_id, "mode": "standalone_claim", "dispatch_status_after": "starting"},
                 )
                 logger.info("starting execution %s on pod %s", execution.id, self.pod_id)
                 return execution.id
@@ -850,7 +933,6 @@ class SchedulerService:
             definition = db.get(WorkflowDefinition, execution.workflow_definition_id)
             if definition is None or not definition.enabled:
                 return None
-            now = now_local()
             updated_execution = (
                 db.query(WorkflowExecution)
                 .filter(
@@ -860,9 +942,8 @@ class SchedulerService:
                 )
                 .update(
                     {
-                        WorkflowExecution.status: "starting",
+                        WorkflowExecution.status: "dispatching",
                         WorkflowExecution.owner_pod_id: self.pod_id,
-                        WorkflowExecution.started_at: now,
                         WorkflowExecution.dispatch_status: "starting",
                         WorkflowExecution.dispatch_error: None,
                         WorkflowExecution.message: f"starting immediately by {self.pod_id}",
@@ -876,7 +957,6 @@ class SchedulerService:
                 .update(
                     {
                         TriggerTask.status: "dispatching",
-                        TriggerTask.started_at: now,
                         TriggerTask.message: f"starting immediately by {self.pod_id}",
                     },
                     synchronize_session=False,
@@ -891,7 +971,7 @@ class SchedulerService:
                 execution_id=execution_id,
                 event_type="worker_job_starting",
                 message=f"worker job starting on {self.pod_id}",
-                payload_json={"worker_pod_id": self.pod_id, "mode": "start_execution_now"},
+                payload_json={"worker_pod_id": self.pod_id, "mode": "start_execution_now", "dispatch_status_after": "starting"},
             )
             logger.info("immediately starting execution %s on pod %s", execution_id, self.pod_id)
             return execution_id
@@ -1088,12 +1168,22 @@ class SchedulerService:
         if not registry_worker_urls:
             raise DataflowWorkerError("no healthy registry worker available")
         snapshots = self._build_worker_load_snapshots(db, workers, include_worker_jobs=True)
-        counts = {
-            worker_id: (
-                1_000_000 if (snapshots.get(worker_id) and snapshots[worker_id].probe_error) else snapshots.get(worker_id, WorkerLoadSnapshot(worker_id=worker_id, capacity=0, healthy=False)).used_slots
+        counts: dict[str, int] = {}
+        worker_map = {str(worker.pod_id): worker for worker in workers}
+        for worker_id in registry_worker_urls:
+            snapshot = snapshots.get(worker_id, WorkerLoadSnapshot(worker_id=worker_id, capacity=0, healthy=False))
+            worker = worker_map.get(worker_id)
+            metadata = dict(getattr(worker, "metadata_json", {}) or {}) if worker is not None else {}
+            execution_health = dict(metadata.get("execution_health") or {})
+            degraded = str(getattr(worker, "status", "") or "").strip().lower() in {"degraded", "draining"}
+            if snapshot.probe_error or degraded:
+                counts[worker_id] = 1_000_000
+                continue
+            counts[worker_id] = (
+                snapshot.used_slots
+                + int(execution_health.get("startup_fail_count") or 0) * 100
+                + int(execution_health.get("requeued_before_process_start_count") or 0) * 10
             )
-            for worker_id in registry_worker_urls
-        }
 
         salt = int(hashlib.sha256(execution_id.encode("utf-8")).hexdigest(), 16)
         ordered_pod_ids = list(registry_worker_urls.keys())
@@ -1400,7 +1490,16 @@ class SchedulerService:
                 event_type="worker_job_requeued_before_process_start",
                 message=message,
                 level="warning",
-                payload_json={"reason": "process_not_started", "error": error},
+                payload_json={"reason": "process_not_started", "error": error, "worker_pod_id": self.pod_id},
+            )
+            self._record_execution_health_sample(
+                "requeued_before_process_start",
+                reason=error,
+                payload={
+                    "execution_id": execution_id,
+                    "owner_pod_id": owner_pod_id,
+                    "worker_job_id": worker_job_id,
+                },
             )
             logger.warning(
                 "requeued execution %s before process start owner=%s job=%s error=%s",
@@ -1439,6 +1538,11 @@ class SchedulerService:
                 get_execution_service().run_claimed_execution(execution_id)
             except Exception as exc:
                 logger.exception("execution %s failed during startup/execution", execution_id)
+                self._record_execution_health_sample(
+                    "startup_fail",
+                    reason=str(exc),
+                    payload={"execution_id": execution_id},
+                )
                 self._requeue_if_not_process_started(execution_id, str(exc))
             finally:
                 self._running_tasks.pop(execution_id, None)
@@ -1526,7 +1630,12 @@ class SchedulerService:
                 execution_id=execution.id,
                 event_type="worker_job_queued",
                 message=f"worker job queued on {self.pod_id}",
-                payload_json={"worker_url": execution.worker_url, "worker_job_id": execution.worker_job_id},
+                payload_json={
+                    "worker_url": execution.worker_url,
+                    "worker_job_id": execution.worker_job_id,
+                    "phase": "queued",
+                    "dispatch_status_after": "queued",
+                },
             )
         finally:
             db.close()

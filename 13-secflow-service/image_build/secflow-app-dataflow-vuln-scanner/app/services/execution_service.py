@@ -6111,8 +6111,23 @@ class ExecutionService:
                 "worker_url": worker_url,
                 "owner_pod_id": owner_pod_id,
                 "worker_job_id": worker_job_id,
+                "process_pid": None,
             },
         )
+        try:
+            from app.services.scheduler import get_scheduler_service
+
+            get_scheduler_service()._record_execution_health_sample(  # type: ignore[attr-defined]
+                "stale_without_pid",
+                reason=message,
+                payload={
+                    "execution_id": execution.id,
+                    "owner_pod_id": owner_pod_id,
+                    "worker_job_id": worker_job_id,
+                },
+            )
+        except Exception:
+            logger.exception("failed to record stale-without-pid execution health sample execution=%s", execution.id)
         return True
 
     def reconcile_stale_active_executions(self, db: Session, *, limit: int = 200) -> int:
@@ -7079,6 +7094,7 @@ class ExecutionService:
         if os.environ.get("SECFLOW_DATAFLOW_CLI_IN_PROCESS") == "1":
             now = now_local()
             execution.status = "running"
+            execution.started_at = now
             execution.process_pid = os.getpid()
             execution.process_host = get_config().scheduler.pod_id
             execution.process_status = "running"
@@ -7123,6 +7139,7 @@ class ExecutionService:
         self._register_cli_process(execution.id, process)
         now = now_local()
         execution.status = "running"
+        execution.started_at = now
         execution.process_pid = int(process.pid)
         execution.process_host = get_config().scheduler.pod_id
         execution.process_status = "running"

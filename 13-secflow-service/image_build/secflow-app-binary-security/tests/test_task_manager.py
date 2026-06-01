@@ -20219,7 +20219,7 @@ def _test_stage_item_response_prefers_terminal_item_status_over_stale_running_do
     self.assertEqual("failed", response.status)
     self.assertEqual("failed", response.downstream_status)
     self.assertEqual("running", response.downstream_raw_status)
-    self.assertEqual("running", response.downstream_mapped_status)
+    self.assertEqual("failed", response.downstream_mapped_status)
 
 
 def _test_active_downstream_payload_treats_dispatching_as_active(self):

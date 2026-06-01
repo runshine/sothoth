@@ -177,6 +177,10 @@ class SchedulerConfig(BaseModel):
     requeue_stuck_dispatch_after_seconds: int = 60
     active_reconcile_interval_seconds: int = 30
     active_reconcile_limit: int = 100
+    execution_degraded_consecutive_startup_failures: int = 3
+    execution_degraded_stale_without_pid_count: int = 5
+    execution_health_window_seconds: int = 600
+    execution_degraded_cooldown_seconds: int = 600
 
 
 class DataflowWorkerConfig(BaseModel):
