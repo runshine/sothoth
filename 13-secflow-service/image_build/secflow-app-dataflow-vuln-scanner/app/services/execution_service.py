@@ -145,6 +145,7 @@ _TASK_LIST_SORT_COLUMNS = {
 
 _ACTIVE_RECONCILE_TRIGGER_STATUSES = {"running", "cancel_requested", "delete_requested", "dispatching"}
 _ACTIVE_RECONCILE_EXECUTION_STATUSES = {"running", "cancel_requested", "delete_requested", "dispatching", "starting", "pending"}
+_ACTIVE_RECONCILE_RUN_INDEX_STATUSES = {"running", "pending", "queued", "dispatching", "starting", "cancel_requested", "delete_requested"}
 
 _TIMELINE_STAGE_LABELS = {
     "dispatch": "调度/分发",
@@ -1016,11 +1017,13 @@ class ExecutionService:
             db.query(TriggerTask)
             .outerjoin(DfvsTaskListProjection, DfvsTaskListProjection.task_id == TriggerTask.id)
             .outerjoin(WorkflowExecution, WorkflowExecution.id == TriggerTask.latest_execution_id)
+            .outerjoin(RunIndex, RunIndex.linked_task_id == TriggerTask.id)
             .filter(
                 or_(
                     TriggerTask.status.in_(tuple(trigger_statuses)),
                     WorkflowExecution.status.in_(tuple(execution_statuses)),
                     DfvsTaskListProjection.public_status.in_(tuple(trigger_statuses)),
+                    RunIndex.status.in_(tuple(_ACTIVE_RECONCILE_RUN_INDEX_STATUSES)),
                 )
             )
             .order_by(TriggerTask.updated_at.asc(), TriggerTask.created_at.asc(), TriggerTask.id.asc())
