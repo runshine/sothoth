@@ -21,7 +21,7 @@ Requirements:
 4. Inspect the unpacked output tree and compare it against the firmware structure.
 5. Determine whether the unpacking is complete enough to be accepted.
 6. If it is not complete, identify what is missing or incorrect.
-7. Even if the unpacking is mostly complete, assess whether the tool can still be improved, whether unpacking can be faster, and whether token usage can be lower.
+7. Even if the unpacking is mostly complete, assess whether the tool can still be improved and whether unpacking can be faster.
 8. You must also review the tool implementation itself as part of the acceptance decision. Reject the round if the tool is only suitable for the current sample and not for the format family.
 9. Do not read full session transcripts by default. Only if `$round_context`, the current tool, and the summary/reason files are insufficient, read `sessions/index.json` first and then open only one targeted session file.
 

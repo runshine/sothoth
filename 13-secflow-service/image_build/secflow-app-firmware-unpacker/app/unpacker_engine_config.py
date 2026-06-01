@@ -77,11 +77,11 @@ def get_max_retries() -> int:
 
         db = get_db_session()
         try:
-            return get_config_value(db, "max_retries", default=5)
+            return get_config_value(db, "max_retries", default=3)
         finally:
             db.close()
     except Exception:
-        return 5
+        return 3
 
 
 def get_agent_run_timeout_seconds() -> int:

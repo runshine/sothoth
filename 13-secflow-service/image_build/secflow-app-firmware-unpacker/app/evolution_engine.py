@@ -1141,7 +1141,7 @@ def _build_evolution_improve_existing_tool_prompt(
             "   - 关键执行步骤",
             "   - 主要输出产物",
             "   - 剩余问题或可疑缺口",
-            "   - 本轮耗时和 token 数量（若无法精确得出，也要预留该字段）",
+            "   - 本轮耗时",
             "5. 最终回复只能输出本轮使用或更新后的 Python 工具绝对路径。",
         ]
     ) + previous_feedback_text
@@ -1197,7 +1197,7 @@ def _build_evolution_execute_prompt(
             "   - 当前工具路径",
             "   - 本轮修复了哪些问题",
             "   - 仍然存在的问题",
-            "   - 本轮耗时和 token 数量（若无法精确得出，也要预留该字段）",
+            "   - 本轮耗时",
             "4. 最终回复只能输出本轮更新后的 Python 工具绝对路径。",
         ]
     ) + previous_feedback_text

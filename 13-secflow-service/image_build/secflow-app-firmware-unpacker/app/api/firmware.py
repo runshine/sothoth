@@ -408,9 +408,10 @@ def _log_time_bounds(path: Path) -> tuple[Optional[datetime], Optional[datetime]
                 ts = _parse_iso_datetime(line[1:end])
                 if ts is None:
                     continue
-                if first is None:
+                if first is None or ensure_local(ts) < ensure_local(first):
                     first = ts
-                last = ts
+                if last is None or ensure_local(ts) > ensure_local(last):
+                    last = ts
     except Exception:
         return None, None
     return first, last
@@ -813,12 +814,12 @@ def _get_task_progress(task_id: str) -> dict:
         if has_tool_review:
             review_status = "success"
             review_detail = "工具执行后的评审已通过"
-            if fallback_to_llm:
+            if task_current_stage == "review" and not fallback_to_llm and not (executor_logs or verifier_logs or round_items):
+                review_status = "running"
+                review_detail = "正在执行 tool 评审"
+            elif fallback_to_llm:
                 review_status = "failed"
                 review_detail = "工具执行后的评审未通过，已回退到 LLM"
-            elif task_current_stage == "review" and not (executor_logs or verifier_logs or round_items):
-                review_status = "running"
-                review_detail = "LLM 正在评审工具执行结果"
             elif task_status == "failed" and not fallback_to_llm and not (executor_logs or verifier_logs or round_items):
                 review_status = "failed"
                 review_detail = "工具执行后的评审未通过"

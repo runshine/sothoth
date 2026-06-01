@@ -15,5 +15,5 @@ Rules:
 - You may execute the selected Python tool to unpack the firmware into `$output`.
 - Your goal is to validate and apply the existing tool, not to invent a new unpack workflow.
 - Write a concise execution summary to `$output/summary.txt`, and keep `$output/summary.md` in sync with the same content.
-- The summary must include unpacking time and token usage.
+- The summary must include unpacking time.
 - If you encounter failures, include them in the summary files.

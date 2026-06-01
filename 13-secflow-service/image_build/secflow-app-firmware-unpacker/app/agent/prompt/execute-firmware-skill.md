@@ -21,4 +21,3 @@ Target rules:
    - extracted artifacts
    - remaining failures or suspicious gaps
    - unpacking time consumed
-   - token usage consumed
