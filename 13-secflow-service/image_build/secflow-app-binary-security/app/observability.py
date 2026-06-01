@@ -203,6 +203,15 @@ HEARTBEAT_UPDATES_TOTAL = Counter(
     "Total task heartbeat update attempts.",
     labelnames=("result",),
 )
+TASK_HEARTBEAT_CANDIDATES = Gauge(
+    "secflow_binary_security_task_heartbeat_candidates",
+    "Current number of task heartbeat candidates owned by this pod.",
+)
+TASK_HEARTBEAT_LOOP_DURATION_SECONDS = Histogram(
+    "secflow_binary_security_task_heartbeat_loop_duration_seconds",
+    "Duration of a task heartbeat controller loop iteration in seconds.",
+    buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30),
+)
 
 ACTIVE_WORKERS = Gauge(
     "secflow_binary_security_active_workers",
@@ -601,6 +610,16 @@ def observe_archive_reclaim(result: str) -> None:
 
 def observe_heartbeat_update(result: str) -> None:
     HEARTBEAT_UPDATES_TOTAL.labels(result=result).inc()
+
+
+def observe_task_heartbeat_candidates(count: int) -> None:
+    TASK_HEARTBEAT_CANDIDATES.set(max(0, int(count)))
+
+
+def observe_task_heartbeat_loop_duration(duration_seconds: float | None) -> None:
+    if duration_seconds is None:
+        return
+    TASK_HEARTBEAT_LOOP_DURATION_SECONDS.observe(max(0.0, float(duration_seconds)))
 
 
 def observe_downstream_request(

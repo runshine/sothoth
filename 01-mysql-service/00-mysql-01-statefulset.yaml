@@ -41,6 +41,9 @@ spec:
           volumeMounts:
             - name: mysql-local-path-pvc
               mountPath: /var/lib/mysql
+            - name: mysql-config
+              mountPath: /etc/mysql/conf.d/90-binlog-retention.cnf
+              subPath: 90-binlog-retention.cnf
           livenessProbe:
             exec:
               command: ["mysqladmin", "ping", "-uroot", "-pHuawei12#$"]
@@ -58,3 +61,6 @@ spec:
         - name: mysql-local-path-pvc
           persistentVolumeClaim:
             claimName: mysql-local-path-pvc  # 引用PVC
+        - name: mysql-config
+          configMap:
+            name: mysql-config

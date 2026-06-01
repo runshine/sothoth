@@ -5,6 +5,8 @@ metadata:
   namespace: sothothv2-ns
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       name: cloudbeaver

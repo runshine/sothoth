@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-config
+  namespace: sothothv2-ns
+data:
+  90-binlog-retention.cnf: |
+    [mysqld]
+    # Retain binary logs for 7 days instead of 30 days.
+    binlog_expire_logs_seconds=604800

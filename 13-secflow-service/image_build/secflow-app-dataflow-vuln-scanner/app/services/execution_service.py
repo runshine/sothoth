@@ -1332,6 +1332,10 @@ class ExecutionService:
         project_id: str | None = None,
         status_filter: str | None = None,
         profile_id: str | None = None,
+        search: str | None = None,
+        slot_binding_state: str | None = None,
+        report_status: str | None = None,
+        model: str | None = None,
         mode: str | None = None,
         parent_task_id: str | None = None,
         sort_by: str | None = None,
@@ -1348,6 +1352,34 @@ class ExecutionService:
             query = query.filter(DfvsTaskListProjection.public_status == normalize_public_task_status(status_filter))
         if profile_id:
             query = query.filter(DfvsTaskListProjection.profile_id == profile_id)
+        normalized_search = str(search or "").strip()
+        if normalized_search:
+            escaped = normalized_search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            query = query.filter(or_(
+                DfvsTaskListProjection.task_id.ilike(pattern, escape="\\"),
+                DfvsTaskListProjection.title.ilike(pattern, escape="\\"),
+                DfvsTaskListProjection.public_status.ilike(pattern, escape="\\"),
+                DfvsTaskListProjection.message.ilike(pattern, escape="\\"),
+                DfvsTaskListProjection.latest_execution_id.ilike(pattern, escape="\\"),
+                DfvsTaskListProjection.profile_id.ilike(pattern, escape="\\"),
+                DfvsTaskListProjection.run_name.ilike(pattern, escape="\\"),
+                DfvsTaskListProjection.run_path.ilike(pattern, escape="\\"),
+                DfvsTaskListProjection.runs_root.ilike(pattern, escape="\\"),
+                DfvsTaskListProjection.run_model.ilike(pattern, escape="\\"),
+                DfvsTaskListProjection.run_provider.ilike(pattern, escape="\\"),
+                DfvsTaskListProjection.run_workflow_mode.ilike(pattern, escape="\\"),
+                DfvsTaskListProjection.parent_task_id.ilike(pattern, escape="\\"),
+            ))
+        normalized_slot_binding_state = str(slot_binding_state or "").strip()
+        if normalized_slot_binding_state:
+            query = query.filter(DfvsTaskListProjection.slot_binding_state == normalized_slot_binding_state)
+        normalized_report_status = str(report_status or "").strip()
+        if normalized_report_status:
+            query = query.filter(DfvsTaskListProjection.vuln_report_status == normalized_report_status)
+        normalized_model = str(model or "").strip()
+        if normalized_model:
+            query = query.filter(DfvsTaskListProjection.run_model == normalized_model)
         normalized_mode = str(mode or "").strip().lower()
         if normalized_mode in {"manual", "binary", "source"}:
             query = query.filter(DfvsTaskListProjection.origin_mode == normalized_mode)
@@ -5066,6 +5098,10 @@ class ExecutionService:
         project_id: str | None = None,
         status_filter: str | None = None,
         profile_id: str | None = None,
+        search: str | None = None,
+        slot_binding_state: str | None = None,
+        report_status: str | None = None,
+        model: str | None = None,
         page: int | None = None,
         per_page: int | None = None,
         mode: str | None = None,
@@ -5080,6 +5116,10 @@ class ExecutionService:
             project_id=project_id,
             status_filter=status_filter,
             profile_id=profile_id,
+            search=search,
+            slot_binding_state=slot_binding_state,
+            report_status=report_status,
+            model=model,
             mode=mode,
             parent_task_id=parent_task_id,
             sort_by=sort_by,
@@ -5106,6 +5146,10 @@ class ExecutionService:
         project_id: str | None = None,
         status_filter: str | None = None,
         profile_id: str | None = None,
+        search: str | None = None,
+        slot_binding_state: str | None = None,
+        report_status: str | None = None,
+        model: str | None = None,
         mode: str | None = None,
         parent_task_id: str | None = None,
     ) -> ScanTaskStatsResponse:
@@ -5116,6 +5160,10 @@ class ExecutionService:
             project_id=project_id,
             status_filter=status_filter,
             profile_id=profile_id,
+            search=search,
+            slot_binding_state=slot_binding_state,
+            report_status=report_status,
+            model=model,
             mode=mode,
             parent_task_id=parent_task_id,
             sort_by="created_at",

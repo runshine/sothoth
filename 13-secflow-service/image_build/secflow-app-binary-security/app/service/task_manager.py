@@ -80,6 +80,8 @@ from app.observability import (
     observe_task_state_lock,
     observe_task_duration,
     observe_task_error,
+    observe_task_heartbeat_candidates,
+    observe_task_heartbeat_loop_duration,
     observe_task_list_query,
     observe_task_list_query_stage,
     observe_task_lifecycle,
@@ -888,6 +890,7 @@ class TaskManager:
         self._readless_reconcile_task: Optional[asyncio.Task] = None
         self._state_reducer_loop_task: Optional[asyncio.Task] = None
         self._reducer_metrics_snapshot_loop_task: Optional[asyncio.Task] = None
+        self._task_heartbeat_loop_task: Optional[asyncio.Task] = None
         self._stage_item_loop_task: Optional[asyncio.Task] = None
         self._workers: dict[str, asyncio.Task] = {}
         self._operation_workers: dict[str, asyncio.Task] = {}
@@ -898,6 +901,8 @@ class TaskManager:
         self._stage_item_worker_lock = asyncio.Lock()
         self._archive_worker_lock = asyncio.Lock()
         self._last_task_heartbeat_at: dict[str, datetime] = {}
+        self._task_execution_owners: dict[str, set[str]] = {}
+        self._task_execution_owner_lock = threading.Lock()
         self._last_queue_reconcile_at: datetime | None = None
         self._state_reducer_consecutive_crash_count = 0
         self._task_list_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
@@ -1074,6 +1079,10 @@ class TaskManager:
                 self._readless_reconcile_loop(),
                 name="binary-security-readless-reconcile",
             )
+            self._task_heartbeat_loop_task = asyncio.create_task(
+                self._task_heartbeat_loop(),
+                name="binary-security-task-heartbeat",
+            )
         if run_reducer_loop:
             self._state_reducer_loop_task = asyncio.create_task(
                 self._state_reducer_loop(),
@@ -1124,6 +1133,12 @@ class TaskManager:
                 await self._readless_reconcile_task
             except asyncio.CancelledError:
                 pass
+        if self._task_heartbeat_loop_task:
+            self._task_heartbeat_loop_task.cancel()
+            try:
+                await self._task_heartbeat_loop_task
+            except asyncio.CancelledError:
+                pass
         if self._state_reducer_loop_task:
             self._state_reducer_loop_task.cancel()
             try:
@@ -1152,7 +1167,131 @@ class TaskManager:
             task.cancel()
         if operation_active:
             await asyncio.gather(*operation_active, return_exceptions=True)
+        stage_item_active = list(self._stage_item_workers.values())
+        for task in stage_item_active:
+            task.cancel()
+        if stage_item_active:
+            await asyncio.gather(*stage_item_active, return_exceptions=True)
+        with self._task_execution_owner_lock:
+            self._task_execution_owners.clear()
+        self._last_task_heartbeat_at.clear()
+        observe_task_heartbeat_candidates(0)
         observe_worker_counts(task_workers=0, operation_workers=0, archive_workers=0)
+
+    def _register_task_execution_owner(self, task_id: str, owner_kind: str) -> None:
+        normalized_task_id = str(task_id or "").strip()
+        normalized_owner = str(owner_kind or "").strip()
+        if not normalized_task_id or not normalized_owner:
+            return
+        with self._task_execution_owner_lock:
+            owners = self._task_execution_owners.setdefault(normalized_task_id, set())
+            owners.add(normalized_owner)
+
+    def _release_task_execution_owner(self, task_id: str, owner_kind: str) -> None:
+        normalized_task_id = str(task_id or "").strip()
+        normalized_owner = str(owner_kind or "").strip()
+        if not normalized_task_id or not normalized_owner:
+            return
+        with self._task_execution_owner_lock:
+            owners = self._task_execution_owners.get(normalized_task_id)
+            if not owners:
+                return
+            owners.discard(normalized_owner)
+            if not owners:
+                self._task_execution_owners.pop(normalized_task_id, None)
+
+    def _task_execution_owner_count(self, task_id: str) -> int:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return 0
+        with self._task_execution_owner_lock:
+            return len(self._task_execution_owners.get(normalized_task_id) or ())
+
+    def _has_local_task_execution_owner(self, task_id: str) -> bool:
+        return self._task_execution_owner_count(task_id) > 0
+
+    def _collect_heartbeat_candidates(self) -> list[str]:
+        with self._task_execution_owner_lock:
+            return sorted(task_id for task_id, owners in self._task_execution_owners.items() if owners)
+
+    def _should_keep_task_heartbeat(self, db: Session, task: BinarySecurityTask | None) -> bool:
+        if task is None:
+            return False
+        if str(task.status or "").strip().lower() != "running":
+            return False
+        if str(task.dispatcher_instance_id or "").strip() != self.instance_id:
+            return False
+        if str(task.status or "").strip() == TASK_STATUS_CANCELLING:
+            return False
+        if task.finished_at is not None:
+            return False
+        if self._task_has_active_cancel_operation(db, task):
+            return False
+        if not self._has_local_task_execution_owner(task.id) and not self._task_has_active_streaming_stage_workers(task.id):
+            return False
+        return True
+
+    def _write_task_heartbeat(self, session: Session, task_id: str, *, now_value: datetime, source: str) -> bool:
+        lease_expires_at = self._next_lease_expiry(session, now_value=now_value)
+        updated = session.query(BinarySecurityTask).filter(
+            BinarySecurityTask.id == task_id,
+            BinarySecurityTask.status == "running",
+            BinarySecurityTask.dispatcher_instance_id == self.instance_id,
+        ).update(
+            {
+                BinarySecurityTask.updated_at: now_value,
+                BinarySecurityTask.lease_expires_at: lease_expires_at,
+            },
+            synchronize_session=False,
+        )
+        if updated:
+            session.commit()
+            self._last_task_heartbeat_at[task_id] = now_value
+            observe_heartbeat_update(f"{source}_written")
+            return True
+        session.rollback()
+        observe_heartbeat_update(f"{source}_skipped")
+        return False
+
+    def _refresh_task_heartbeats_once(self) -> None:
+        session = get_session_factory()()
+        try:
+            candidate_ids = self._collect_heartbeat_candidates()
+            observe_task_heartbeat_candidates(len(candidate_ids))
+            if not candidate_ids:
+                return
+            rows = session.query(BinarySecurityTask).filter(BinarySecurityTask.id.in_(candidate_ids)).all()
+            tasks_by_id = {task.id: task for task in rows}
+            for task_id in candidate_ids:
+                task = tasks_by_id.get(task_id)
+                if not self._should_keep_task_heartbeat(session, task):
+                    if not self._has_local_task_execution_owner(task_id):
+                        self._last_task_heartbeat_at.pop(task_id, None)
+                    observe_heartbeat_update("controller_skipped")
+                    continue
+                try:
+                    self._write_task_heartbeat(session, task_id, now_value=_now(), source="controller")
+                except Exception:
+                    session.rollback()
+                    observe_heartbeat_update("controller_failed")
+                    logger.exception("binary-security task heartbeat write failed: task_id=%s", task_id)
+        finally:
+            session.close()
+
+    async def _task_heartbeat_loop(self) -> None:
+        interval_seconds = max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15))
+        while self._running:
+            started = time.perf_counter()
+            try:
+                await asyncio.to_thread(self._refresh_task_heartbeats_once)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("binary-security task heartbeat loop crashed and recovered")
+                await asyncio.sleep(1)
+            finally:
+                observe_task_heartbeat_loop_duration(time.perf_counter() - started)
+            await asyncio.sleep(interval_seconds)
 
     def prepare_task_id(self, db: Session, project_id: str) -> str:
         for _ in range(10):
@@ -7333,6 +7472,8 @@ class TaskManager:
 
     async def _run_stage_item_by_id(self, item_id: str) -> None:
         db = get_session_factory()()
+        owner_task_id: str | None = None
+        owner_kind = f"streaming_stage_item:{item_id}"
         try:
             item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == item_id).first()
             if item is None:
@@ -7342,6 +7483,8 @@ class TaskManager:
                 return
             if task.status in TASK_TERMINAL_STATUSES or task.status == "cancelled":
                 return
+            owner_task_id = task.id
+            self._register_task_execution_owner(owner_task_id, owner_kind)
             stage_run = self._ensure_stage_run(db, task, item.stage_name)
             db.commit()
             payload = dict(item.input_ref or {})
@@ -7412,6 +7555,8 @@ class TaskManager:
                     db.commit()
             logger.exception("binary-security streaming stage item worker failed: item_id=%s", item_id)
         finally:
+            if owner_task_id:
+                self._release_task_execution_owner(owner_task_id, owner_kind)
             db.close()
             async with self._stage_item_worker_lock:
                 self._stage_item_workers.pop(item_id, None)
@@ -9357,6 +9502,7 @@ class TaskManager:
         session_factory = get_session_factory()
         db = session_factory()
         execution_token: str | None = None
+        owner_registered = False
         try:
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
             if (
@@ -9375,6 +9521,8 @@ class TaskManager:
             task.status = "running"
             self._clear_task_abnormal_reason_snapshot(db, task)
             self._bind_execution_token(task)
+            self._register_task_execution_owner(task.id, "primary_task_worker")
+            owner_registered = True
             observe_task_lifecycle("started", status=task.status, task_type=self._task_type(task))
             self._record_event(
                 db,
@@ -9417,6 +9565,8 @@ class TaskManager:
                 )
                 db.commit()
         finally:
+            if owner_registered:
+                self._release_task_execution_owner(task_id, "primary_task_worker")
             async with self._worker_lock:
                 self._workers.pop(task_id, None)
             db.close()
@@ -9772,6 +9922,8 @@ class TaskManager:
             return False
         if not str(task.dispatcher_instance_id or "").strip():
             return True
+        if str(task.dispatcher_instance_id or "").strip() == self.instance_id and self._has_local_task_execution_owner(task.id):
+            return False
         if not self._lease_is_active(task):
             return True
         heartbeat_at = task.updated_at or task.dispatch_started_at
@@ -10510,6 +10662,8 @@ class TaskManager:
         self._observe_worker_counts()
 
     def _finalize_task(self, db: Session, task: BinarySecurityTask) -> None:
+        with self._task_execution_owner_lock:
+            self._task_execution_owners.pop(task.id, None)
         if self._ensure_task_remains_cancelling(db, task) is not None:
             self._last_task_heartbeat_at.pop(task.id, None)
             self._sync_task_abnormal_reason_snapshot(db, task, None)
@@ -11156,6 +11310,11 @@ class TaskManager:
         self._last_task_heartbeat_at.pop(task.id, None)
 
     def _task_has_active_streaming_stage_workers(self, task_id: str) -> bool:
+        if self._task_execution_owner_count(task_id) > 0:
+            with self._task_execution_owner_lock:
+                owners = set(self._task_execution_owners.get(task_id) or ())
+            if any(owner.startswith("streaming_stage_item:") for owner in owners):
+                return True
         active_worker_item_ids = {
             str(item_id or "")
             for item_id, worker in self._stage_item_workers.items()
@@ -18448,35 +18607,18 @@ class TaskManager:
         last_heartbeat_at = self._last_task_heartbeat_at.get(task_id)
         interval_seconds = max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15))
         if last_heartbeat_at and (now - last_heartbeat_at).total_seconds() < interval_seconds:
-            observe_heartbeat_update("skipped")
+            observe_heartbeat_update("fallback_skipped")
             return
-        worker = self._workers.get(task_id)
-        has_primary_worker = worker is not None and not worker.done()
-        has_streaming_workers = self._task_has_active_streaming_stage_workers(task_id)
-        if not has_primary_worker and not has_streaming_workers:
-            observe_heartbeat_update("skipped")
+        if not self._has_local_task_execution_owner(task_id):
+            observe_heartbeat_update("fallback_skipped")
             return
         session = get_session_factory()()
         try:
-            lease_expires_at = self._next_lease_expiry(session, now_value=now)
-            updated = session.query(BinarySecurityTask).filter(
-                BinarySecurityTask.id == task_id,
-                BinarySecurityTask.status == "running",
-                BinarySecurityTask.dispatcher_instance_id == self.instance_id,
-            ).update(
-                {
-                    BinarySecurityTask.updated_at: now,
-                    BinarySecurityTask.lease_expires_at: lease_expires_at,
-                },
-                synchronize_session=False,
-            )
-            if updated:
-                session.commit()
-                self._last_task_heartbeat_at[task_id] = now
-                observe_heartbeat_update("written")
-            else:
-                session.rollback()
-                observe_heartbeat_update("skipped")
+            task = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
+            if not self._should_keep_task_heartbeat(session, task):
+                observe_heartbeat_update("fallback_skipped")
+                return
+            self._write_task_heartbeat(session, task_id, now_value=now, source="fallback")
         finally:
             session.close()
 

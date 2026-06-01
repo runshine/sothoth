@@ -19,6 +19,10 @@ RUN pip install --no-cache-dir pymysql cryptography
 # 复制配置文件
 COPY config.yaml /app/
 
+COPY create_admin.sh /app/
+
+COPY configure_admin.py /app/
+
 # 复制启动脚本
 COPY app/start.py /app/app/
 

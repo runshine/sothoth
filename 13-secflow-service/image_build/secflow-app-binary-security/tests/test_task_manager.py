@@ -21354,6 +21354,68 @@ def _test_service_base_urls_use_service_roots(self):
         self.assertNotIn("/api/", value)
 
 
+def _test_task_heartbeat_controller_refreshes_owned_running_task(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-1",
+        project_id="p1",
+        status="running",
+        dispatcher_instance_id=manager.instance_id,
+        dispatch_started_at=_now(),
+        lease_expires_at=_now() + timedelta(seconds=5),
+    )
+    db = _AppendingModelAwareDb(tasks=[task])
+    original_factory = task_manager_module.get_session_factory
+    try:
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+        manager._register_task_execution_owner(task.id, "primary_task_worker")
+        original_lease = task.lease_expires_at
+        manager._refresh_task_heartbeats_once()
+        self.assertIsNotNone(task.lease_expires_at)
+        self.assertGreater(task.lease_expires_at, original_lease)
+    finally:
+        task_manager_module.get_session_factory = original_factory
+
+
+def _test_task_heartbeat_controller_skips_task_without_owner(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-2",
+        project_id="p1",
+        status="running",
+        dispatcher_instance_id=manager.instance_id,
+        dispatch_started_at=_now(),
+        lease_expires_at=_now() + timedelta(seconds=5),
+    )
+    db = _AppendingModelAwareDb(tasks=[task])
+    original_factory = task_manager_module.get_session_factory
+    try:
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+        original_updated_at = task.updated_at
+        original_lease = task.lease_expires_at
+        manager._refresh_task_heartbeats_once()
+        self.assertEqual(original_updated_at, task.updated_at)
+        self.assertEqual(original_lease, task.lease_expires_at)
+    finally:
+        task_manager_module.get_session_factory = original_factory
+
+
+def _test_task_needs_downstream_reconcile_skips_locally_owned_running_task(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-3",
+        project_id="p1",
+        status="running",
+        dispatcher_instance_id=manager.instance_id,
+        current_stage="entry_analysis",
+        dispatch_started_at=_now() - timedelta(minutes=5),
+        lease_expires_at=_now() - timedelta(seconds=1),
+        updated_at=_now() - timedelta(minutes=5),
+    )
+    manager._register_task_execution_owner(task.id, "primary_task_worker")
+    self.assertFalse(manager._task_needs_downstream_reconcile(task))
+
+
 TaskManagerTests.test_stage_item_response_falls_back_to_downstream_payload_status = _test_stage_item_response_falls_back_to_downstream_payload_status
 TaskManagerTests.test_task_reconcile_candidate_items_scans_all_stages_with_downstream_refs = _test_task_reconcile_candidate_items_scans_all_stages_with_downstream_refs
 TaskManagerTests.test_task_sync_cooldown_elapsed_uses_all_candidate_items = _test_task_sync_cooldown_elapsed_uses_all_candidate_items
@@ -21366,6 +21428,9 @@ TaskManagerTests.test_binary_to_source_client_uses_management_api_prefix = _test
 TaskManagerTests.test_firmware_unpacker_client_uses_management_api_prefix = _test_firmware_unpacker_client_uses_management_api_prefix
 TaskManagerTests.test_dataflow_vuln_scanner_client_uses_api_prefix = _test_dataflow_vuln_scanner_client_uses_api_prefix
 TaskManagerTests.test_service_base_urls_use_service_roots = _test_service_base_urls_use_service_roots
+TaskManagerTests.test_task_heartbeat_controller_refreshes_owned_running_task = _test_task_heartbeat_controller_refreshes_owned_running_task
+TaskManagerTests.test_task_heartbeat_controller_skips_task_without_owner = _test_task_heartbeat_controller_skips_task_without_owner
+TaskManagerTests.test_task_needs_downstream_reconcile_skips_locally_owned_running_task = _test_task_needs_downstream_reconcile_skips_locally_owned_running_task
 
 
 if __name__ == "__main__":
