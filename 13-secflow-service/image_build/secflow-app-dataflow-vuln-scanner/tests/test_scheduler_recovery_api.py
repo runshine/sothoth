@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from app.models.database import DfvsTaskListProjection, SchedulerWorker, SchedulerWorkerSlotReservation, TriggerTask, WorkflowExecution, WorkflowExecutionEvent, get_db_session
+from app.models.database import DfvsTaskListProjection, RunIndex, SchedulerWorker, SchedulerWorkerSlotReservation, TriggerTask, WorkflowExecution, WorkflowExecutionEvent, get_db_session
 from app.schemas import ScanProfileCreateRequest, ScanTaskCreateRequest
 from app.services.execution_service import get_execution_service
 from app.services.scheduler import SchedulerService
@@ -447,5 +447,89 @@ def test_active_reconcile_refreshes_stale_running_projection(service_config_path
         assert projection is not None
         assert projection.public_status == "failed"
         assert projection.dispatch_status == "failed"
+    finally:
+        db.close()
+
+
+def test_active_reconcile_terminal_task_fixes_stale_running_run_index(service_config_path):
+    db = get_db_session()
+    try:
+        execution_id = "exec-active-reconcile-stale-run-index"
+        finished_at = now_local()
+        trigger = TriggerTask(
+            id="tt-active-reconcile-stale-run-index",
+            workflow_definition_id="wfd-active-reconcile-stale-run-index",
+            project_id="default",
+            trigger_type="manual",
+            input_tasks_json={"tasks": []},
+            priority=100,
+            status="cancelled",
+            public_status="cancelled",
+            message="cancelled before worker start",
+            submitted_by="tester",
+            retry_count=0,
+            max_retry_count=3,
+            latest_execution_id=execution_id,
+            finished_at=finished_at,
+        )
+        execution = WorkflowExecution(
+            id=execution_id,
+            trigger_task_id=trigger.id,
+            workflow_definition_id=trigger.workflow_definition_id,
+            project_id="default",
+            attempt_no=1,
+            status="pending",
+            public_status="pending",
+            dispatch_status=None,
+            owner_pod_id=None,
+            worker_job_id=None,
+            worker_url=None,
+            process_status="not_started",
+            message="cancelled before worker start",
+        )
+        run_index = RunIndex(
+            id="ri-active-reconcile-stale-run-index",
+            project_id="default",
+            source_type="execution_workspace",
+            source_key="/tmp/stale-run-index",
+            run_name="stale-run-index",
+            run_root_path="/tmp/stale-run-index",
+            linked_task_id=trigger.id,
+            linked_execution_id=execution.id,
+            status="running",
+            started_at=finished_at - timedelta(seconds=30),
+        )
+        db.add_all([trigger, execution, run_index])
+        db.flush()
+        get_execution_service()._rebuild_task_list_projections(db, [trigger])
+        projection = db.get(DfvsTaskListProjection, trigger.id)
+        assert projection is not None
+        projection.public_status = "running"
+        projection.latest_run_status = "running"
+        db.add(projection)
+        db.commit()
+    finally:
+        db.close()
+
+    db = get_db_session()
+    try:
+        response = get_execution_service().reconcile_active_tasks(db, limit=10)
+        assert response.reconciled_count >= 1
+        run_index = db.get(RunIndex, "ri-active-reconcile-stale-run-index")
+        assert run_index is not None
+        assert run_index.status == "cancelled"
+        projection = db.get(DfvsTaskListProjection, "tt-active-reconcile-stale-run-index")
+        assert projection is not None
+        assert projection.public_status == "cancelled"
+        assert projection.latest_run_status == "cancelled"
+        event = (
+            db.query(WorkflowExecutionEvent)
+            .filter(
+                WorkflowExecutionEvent.execution_id == execution_id,
+                WorkflowExecutionEvent.event_type == "run_index_status_reconciled",
+            )
+            .first()
+        )
+        assert event is not None
     finally:
         db.close()

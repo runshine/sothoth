@@ -1144,6 +1144,13 @@ class ExecutionService:
                 changed = True
                 terminalized_count += 1
             if changed or projection_drift:
+                if self._reconcile_stale_run_index_to_terminal_task(
+                    db,
+                    run_index=run_index,
+                    trigger=trigger,
+                    execution=latest_execution,
+                ):
+                    changed = True
                 self._refresh_task_list_projection_for_task_id(db, trigger.id)
                 projection_refreshed_count += 1
                 reconciled_count += 1
@@ -5722,6 +5729,49 @@ class ExecutionService:
             message=message,
             process_status="exited",
         )
+
+    def _reconcile_stale_run_index_to_terminal_task(
+        self,
+        db: Session,
+        *,
+        run_index: RunIndex | None,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+    ) -> bool:
+        if run_index is None or trigger is None:
+            return False
+        task_status = _public_task_status(trigger.status)
+        if task_status not in {"success", "failed", "cancelled"}:
+            return False
+        run_status = _public_task_status(run_index.status)
+        if run_status not in {"running", "pending", "queued", "dispatching", "starting", "cancel_requested", "delete_requested"}:
+            return False
+
+        now = now_local()
+        run_index.status = "completed" if task_status == "success" else task_status
+        run_index.finished_at = run_index.finished_at or trigger.finished_at or (execution.finished_at if execution is not None else None) or now
+        if run_index.started_at and run_index.duration_seconds is None:
+            run_index.duration_seconds = max((run_index.finished_at - run_index.started_at).total_seconds(), 0)
+        if task_status in {"failed", "cancelled"} and not str(run_index.error or "").strip():
+            run_index.error = str(trigger.message or (execution.message if execution is not None else "") or f"task {task_status}").strip()
+        run_index.last_synced_at = now
+        db.add(run_index)
+        if execution is not None:
+            self.record_event(
+                db,
+                execution_id=execution.id,
+                event_type="run_index_status_reconciled",
+                message=f"run index reconciled to terminal task status: {task_status}",
+                level="warning",
+                payload_json={
+                    "reason": "terminal_task_reconciled_stale_run_index",
+                    "run_index_id": run_index.id,
+                    "run_status_before": run_status,
+                    "run_status_after": run_index.status,
+                    "task_status": task_status,
+                },
+            )
+        return True
 
     def _reconcile_terminal_run_state(
         self,
