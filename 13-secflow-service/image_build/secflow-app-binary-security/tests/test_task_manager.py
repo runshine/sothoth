@@ -9283,6 +9283,10 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
     def test_prepare_retry_failed_items_streaming_entry_retry_clears_only_linked_descendants(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "src"
+            source_root.mkdir(parents=True, exist_ok=True)
+            (source_root / "mod-a.c").write_text("int func_a(void) { return 0; }\n", encoding="utf-8")
+            (source_root / "mod-b.c").write_text("int func_b(void) { return 0; }\n", encoding="utf-8")
             task = BinarySecurityTask(
                 id="task1",
                 project_id="p1",
@@ -10330,6 +10334,344 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(["dfvs-a"], [ref["task_id"] for ref in cleanup_refs])
             self.assertEqual([], task.summary.get("vuln_results"))
             self.assertEqual(0, int((task.metrics or {}).get("vuln_result_count", 0)))
+
+    def test_collect_retry_item_actions_for_dataflow_analysis_treats_all_non_success_items_as_targets(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="failed",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="dataflow_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(Path(tmp) / "output"),
+                workspace_root=tmp,
+                policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+            )
+            task.summary = {
+                "retry_plan": {
+                    "target_stage": "dataflow_analysis",
+                    "mode": "retry_stage_failed_items",
+                    "retry_item_keys": [
+                        "entry-cancelled::mod-a",
+                        "entry-missing::mod-b",
+                        "entry-active::mod-c",
+                    ],
+                }
+            }
+            stage_run = BinarySecurityStageRun(
+                id="sr-df",
+                task_id="task1",
+                project_id="p1",
+                stage_name="dataflow_analysis",
+                sequence_no=1,
+                status="failed",
+            )
+            cancelled_item = BinarySecurityStageItem(
+                id="si-df-cancelled",
+                task_id="task1",
+                project_id="p1",
+                stage_run_id="sr-df",
+                stage_name="dataflow_analysis",
+                item_key="entry-cancelled",
+                item_name="func_cancelled",
+                parent_key="mod-a",
+                item_identity_key="entry-cancelled::mod-a",
+                status="cancelled",
+                downstream_service="dataflow_analyse",
+                downstream_task_id="dfa-cancelled",
+            )
+            missing_item = BinarySecurityStageItem(
+                id="si-df-missing",
+                task_id="task1",
+                project_id="p1",
+                stage_run_id="sr-df",
+                stage_name="dataflow_analysis",
+                item_key="entry-missing",
+                item_name="func_missing",
+                parent_key="mod-b",
+                item_identity_key="entry-missing::mod-b",
+                status="downstream_missing",
+                downstream_service="dataflow_analyse",
+            )
+            missing_item.result = {
+                "downstream_status": "downstream_missing",
+                "sync_observation": {"downstream_status": "downstream_missing"},
+            }
+            active_item = BinarySecurityStageItem(
+                id="si-df-active",
+                task_id="task1",
+                project_id="p1",
+                stage_run_id="sr-df",
+                stage_name="dataflow_analysis",
+                item_key="entry-active",
+                item_name="func_active",
+                parent_key="mod-c",
+                item_identity_key="entry-active::mod-c",
+                status="running",
+                downstream_service="dataflow_analyse",
+                downstream_task_id="dfa-active",
+            )
+            db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[cancelled_item, missing_item, active_item])
+
+            async def fake_active_payload(task_arg, item_arg, token_arg):
+                del task_arg, token_arg
+                if item_arg.id == "si-df-active":
+                    return {"task_id": "dfa-active", "status": "running"}
+                return None
+
+            original_active_payload = self.manager._active_downstream_payload
+            try:
+                self.manager._active_downstream_payload = fake_active_payload
+                actions = asyncio.run(
+                    self.manager._collect_retry_item_actions(
+                        db,
+                        task,
+                        target_stage="dataflow_analysis",
+                        token=None,
+                    )
+                )
+            finally:
+                self.manager._active_downstream_payload = original_active_payload
+
+            self.assertEqual(3, len(actions))
+            by_item_id = {row["item_id"]: row for row in actions}
+            self.assertEqual("recreate_from_abnormal", by_item_id["si-df-cancelled"]["strategy"])
+            self.assertEqual("cancelled", by_item_id["si-df-cancelled"]["observed_status"])
+            self.assertEqual("recreate_from_abnormal", by_item_id["si-df-missing"]["strategy"])
+            self.assertEqual("downstream_missing", by_item_id["si-df-missing"]["observed_status"])
+            self.assertEqual("adopt_active", by_item_id["si-df-active"]["strategy"])
+            self.assertEqual("running", by_item_id["si-df-active"]["observed_status"])
+
+    def test_retry_failed_items_dataflow_operation_recreates_abnormal_children_without_recreating_vuln_scan_children_early(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "src"
+            source_root.mkdir(parents=True, exist_ok=True)
+            (source_root / "mod-a.c").write_text("int func_a(void) { return 0; }\n", encoding="utf-8")
+            (source_root / "mod-b.c").write_text("int func_b(void) { return 0; }\n", encoding="utf-8")
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="failed",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="dataflow_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(Path(tmp) / "output"),
+                workspace_root=tmp,
+                current_operation_id="op1",
+                policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+            )
+            task.summary = {
+                "retry_plan": {
+                    "target_stage": "dataflow_analysis",
+                    "mode": "retry_failed_items",
+                    "retry_item_keys": ["entry-a::mod-a"],
+                },
+                "entry_results": [
+                    {
+                        "module_key": "mod-a",
+                        "entries": [{"entry_key": "entry-a", "function_name": "func_a", "module_key": "mod-a"}],
+                    },
+                    {
+                        "module_key": "mod-b",
+                        "entries": [{"entry_key": "entry-b", "function_name": "func_b", "module_key": "mod-b"}],
+                    },
+                ],
+                "vuln_results": [{"entry_key": "entry-a"}, {"entry_key": "entry-b"}],
+            }
+            stage_runs = [
+                BinarySecurityStageRun(id="sr-entry", task_id="task1", project_id="p1", stage_name="entry_analysis", sequence_no=1, status="success"),
+                BinarySecurityStageRun(id="sr-df", task_id="task1", project_id="p1", stage_name="dataflow_analysis", sequence_no=2, status="failed"),
+                BinarySecurityStageRun(id="sr-vuln", task_id="task1", project_id="p1", stage_name="vuln_scan", sequence_no=3, status="success"),
+            ]
+            df_abnormal = BinarySecurityStageItem(
+                id="si-df-a",
+                task_id="task1",
+                project_id="p1",
+                stage_run_id="sr-df",
+                stage_name="dataflow_analysis",
+                item_key="entry-a",
+                item_name="func_a",
+                parent_key="mod-a",
+                item_identity_key="entry-a::mod-a",
+                status="cancelled",
+                downstream_service="dataflow_analyse",
+                downstream_task_id="dfa-old-a",
+            )
+            df_abnormal.input_ref = {
+                "entry_key": "entry-a",
+                "function_name": "func_a",
+                "module_key": "mod-a",
+                "module_name": "mod-a",
+                "definition_file": "mod-a.c",
+                "definition_line": "10",
+                "definition_kind": "definition",
+                "module_input_path": str(source_root / "mod-a"),
+                "source_root_path": str(source_root),
+                "source_dir": str(source_root),
+            }
+            df_success = BinarySecurityStageItem(
+                id="si-df-b",
+                task_id="task1",
+                project_id="p1",
+                stage_run_id="sr-df",
+                stage_name="dataflow_analysis",
+                item_key="entry-b",
+                item_name="func_b",
+                parent_key="mod-b",
+                item_identity_key="entry-b::mod-b",
+                status="success",
+                downstream_service="dataflow_analyse",
+                downstream_task_id="dfa-success-b",
+            )
+            df_success.input_ref = {
+                "entry_key": "entry-b",
+                "function_name": "func_b",
+                "module_key": "mod-b",
+                "module_name": "mod-b",
+                "definition_file": "mod-b.c",
+                "definition_line": "20",
+                "definition_kind": "definition",
+                "module_input_path": str(source_root / "mod-b"),
+                "source_root_path": str(source_root),
+                "source_dir": str(source_root),
+            }
+            vuln_for_abnormal = BinarySecurityStageItem(
+                id="si-vuln-a",
+                task_id="task1",
+                project_id="p1",
+                stage_run_id="sr-vuln",
+                stage_name="vuln_scan",
+                item_key="entry-a",
+                item_name="func_a",
+                parent_key="mod-a",
+                item_identity_key="entry-a::mod-a",
+                status="success",
+                downstream_service="dataflow_vuln_scanner",
+                downstream_task_id="dfvs-old-a",
+            )
+            vuln_for_abnormal.input_ref = {"entry_key": "entry-a", "function_name": "func_a", "module_key": "mod-a", "upstream_item_id": "si-df-a"}
+            vuln_for_success = BinarySecurityStageItem(
+                id="si-vuln-b",
+                task_id="task1",
+                project_id="p1",
+                stage_run_id="sr-vuln",
+                stage_name="vuln_scan",
+                item_key="entry-b",
+                item_name="func_b",
+                parent_key="mod-b",
+                item_identity_key="entry-b::mod-b",
+                status="success",
+                downstream_service="dataflow_vuln_scanner",
+                downstream_task_id="dfvs-keep-b",
+            )
+            vuln_for_success.input_ref = {"entry_key": "entry-b", "function_name": "func_b", "module_key": "mod-b", "upstream_item_id": "si-df-b"}
+            archive_jobs = [
+                BinarySecurityArchiveJob(id="aj-vuln-a", task_id="task1", project_id="p1", stage_name="vuln_scan", item_id="si-vuln-a", archive_status="success"),
+                BinarySecurityArchiveJob(id="aj-vuln-b", task_id="task1", project_id="p1", stage_name="vuln_scan", item_id="si-vuln-b", archive_status="success"),
+            ]
+            operation = BinarySecurityTaskOperation(
+                id="op1",
+                task_id="task1",
+                project_id="p1",
+                operation_type="retry_failed_items",
+                target_stage="dataflow_analysis",
+                status="running",
+                current_step="collect_cleanup_plan",
+            )
+            operation.resume_cursor = {"current_step": "collect_cleanup_plan"}
+            db = _AppendingModelAwareDb(
+                tasks=[task],
+                stage_runs=stage_runs,
+                stage_items=[df_abnormal, df_success, vuln_for_abnormal, vuln_for_success],
+                archive_jobs=archive_jobs,
+                operations=[operation],
+            )
+            cleanup_refs = []
+            create_calls = []
+
+            async def fake_sync(*args, **kwargs):
+                del args, kwargs
+                return None
+
+            async def fake_active_payload(*args, **kwargs):
+                del args, kwargs
+                return None
+
+            async def fake_cleanup_refs(db_arg, task_arg, refs_arg, token_arg):
+                del db_arg, task_arg, token_arg
+                cleanup_refs.extend(dict(ref) for ref in refs_arg)
+                return len(refs_arg)
+
+            async def fake_delete_refs(db_arg, task_arg, refs_arg, token_arg):
+                del db_arg, task_arg, token_arg
+                cleanup_refs.extend(dict(ref) for ref in refs_arg)
+                return len(refs_arg)
+
+            async def fake_create(db_arg, task_arg, item_arg, *, service, token, payload):
+                del db_arg, task_arg, token
+                create_calls.append({"service": service, "item_id": item_arg.id, "payload": dict(payload)})
+                if service == "dataflow_analyse":
+                    return {"task_id": "dfa-new-a", "status": "pending"}
+                if service == "dataflow_vuln_scanner":
+                    return {"task_id": "dfvs-new-a", "status": "pending"}
+                raise AssertionError(f"unexpected service {service}")
+
+            original_sync = self.manager.sync_downstream_status
+            original_active_payload = self.manager._active_downstream_payload
+            original_cleanup_refs = self.manager._cleanup_downstream_refs
+            original_delete_refs = self.manager._delete_downstream_refs
+            original_create = self.manager._downstream_create_task
+            original_enqueue = self.manager._enqueue_task
+            original_delete_items = self.manager._delete_stage_items_by_ids
+            original_clear_archive = self.manager._clear_archive_jobs_for_stage_items
+            try:
+                self.manager.sync_downstream_status = fake_sync
+                self.manager._active_downstream_payload = fake_active_payload
+                self.manager._cleanup_downstream_refs = fake_cleanup_refs
+                self.manager._delete_downstream_refs = fake_delete_refs
+                self.manager._downstream_create_task = fake_create
+                self.manager._enqueue_task = lambda task_id: None
+                self.manager._delete_stage_items_by_ids = lambda db_arg, item_ids: (
+                    setattr(db_arg, "stage_items", [item for item in db_arg.stage_items if item.id not in set(item_ids)]) or len(item_ids)
+                )
+                self.manager._clear_archive_jobs_for_stage_items = lambda db_arg, task_id, stage_name, item_ids: (
+                    setattr(db_arg, "archive_jobs", [job for job in db_arg.archive_jobs if job.item_id not in set(item_ids)]) or len(item_ids)
+                )
+                asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
+            finally:
+                self.manager.sync_downstream_status = original_sync
+                self.manager._active_downstream_payload = original_active_payload
+                self.manager._cleanup_downstream_refs = original_cleanup_refs
+                self.manager._delete_downstream_refs = original_delete_refs
+                self.manager._downstream_create_task = original_create
+                self.manager._enqueue_task = original_enqueue
+                self.manager._delete_stage_items_by_ids = original_delete_items
+                self.manager._clear_archive_jobs_for_stage_items = original_clear_archive
+
+            self.assertEqual({"dfvs-old-a", "dfa-old-a"}, {ref["task_id"] for ref in cleanup_refs})
+            self.assertEqual({"dataflow_vuln_scanner", "dataflow_analyse"}, {ref["service"] for ref in cleanup_refs})
+            self.assertEqual(["dataflow_analyse"], [row["service"] for row in create_calls])
+            self.assertEqual("dfa-new-a", df_abnormal.downstream_task_id)
+            self.assertEqual("success", df_success.status)
+            self.assertEqual("dfa-success-b", df_success.downstream_task_id)
+            self.assertEqual({"si-df-a", "si-df-b", "si-vuln-b"}, {item.id for item in db.stage_items})
+            self.assertEqual(["aj-vuln-b"], [job.id for job in db.archive_jobs])
+            action_rows = {row["item_id"]: row for row in list((operation.result_payload or {}).get("item_actions") or [])}
+            self.assertEqual("recreate_from_abnormal", action_rows["si-df-a"]["strategy"])
+            self.assertEqual("dfa-old-a", action_rows["si-df-a"]["old_downstream_task_id"])
+            self.assertEqual("dfa-new-a", action_rows["si-df-a"]["new_downstream_task_id"])
+            self.assertEqual("succeeded", action_rows["si-df-a"]["cleanup_status"])
+            self.assertEqual("succeeded", action_rows["si-df-a"]["create_status"])
+            self.assertEqual("succeeded", action_rows["si-df-a"]["verification_status"])
+            self.assertNotIn("si-df-b", action_rows)
+            self.assertEqual([], [row for row in create_calls if row["service"] == "dataflow_vuln_scanner"])
 
     def test_operation_execute_retry_stage_full_cleanup_clears_downstream_stage_events(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -19582,6 +19924,59 @@ def _test_stage_item_response_exposes_downstream_status_from_sync_observation(se
     self.assertEqual("success", response.downstream_mapped_status)
 
 
+def _test_stage_item_response_prefers_terminal_item_status_over_stale_running_downstream(self):
+    item = BinarySecurityStageItem(
+        id="si-vuln",
+        task_id="t1",
+        project_id="p1",
+        stage_name="vuln_scan",
+        item_key="entry-a",
+        item_name="entry-a",
+        status="failed",
+        downstream_service="dataflow_vuln_scanner",
+        downstream_task_id="tt-1",
+    )
+    item.result = {
+        "downstream_status_synced_at": _now().isoformat(),
+        "sync_observation": {
+            "status_raw": "running",
+            "mapped_status": "running",
+            "downstream_status": "running",
+            "state_applied": True,
+        },
+    }
+
+    response = self.manager._stage_item_response(item)
+
+    self.assertEqual("failed", response.status)
+    self.assertEqual("failed", response.downstream_status)
+    self.assertEqual("running", response.downstream_raw_status)
+    self.assertEqual("running", response.downstream_mapped_status)
+
+
+def _test_active_downstream_payload_treats_dispatching_as_active(self):
+    task = BinarySecurityTask(id="t1", project_id="p1")
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="vuln_scan",
+        item_key="entry-a",
+        downstream_service="dataflow_vuln_scanner",
+        downstream_task_id="tt-1",
+        status="failed",
+    )
+
+    async def _run():
+        with patch.object(self.manager, "_fetch_downstream_task_payload", return_value={"task_id": "tt-1", "status": "dispatching"}):
+            payload = await self.manager._active_downstream_payload(task, item, token="tok")
+        return payload
+
+    payload = asyncio.run(_run())
+    self.assertIsNotNone(payload)
+    self.assertEqual("dispatching", payload["status"])
+
+
 def _test_build_stage_summaries_and_overview_preserve_orchestration_and_downstream_statuses(self):
     task = BinarySecurityTask(
         id="t1",
@@ -19663,6 +20058,8 @@ def _test_build_stage_summaries_and_overview_preserve_orchestration_and_downstre
 
 
 TaskManagerTests.test_stage_item_response_exposes_downstream_status_from_sync_observation = _test_stage_item_response_exposes_downstream_status_from_sync_observation
+TaskManagerTests.test_stage_item_response_prefers_terminal_item_status_over_stale_running_downstream = _test_stage_item_response_prefers_terminal_item_status_over_stale_running_downstream
+TaskManagerTests.test_active_downstream_payload_treats_dispatching_as_active = _test_active_downstream_payload_treats_dispatching_as_active
 TaskManagerTests.test_build_stage_summaries_and_overview_preserve_orchestration_and_downstream_statuses = _test_build_stage_summaries_and_overview_preserve_orchestration_and_downstream_statuses
 
 

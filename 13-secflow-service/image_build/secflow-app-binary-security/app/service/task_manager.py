@@ -2874,6 +2874,13 @@ class TaskManager:
             cleared_business_stages = await self._cleanup_streaming_retry_descendants(db, task, target_stage, retry_items)
             cleared_archive_stages = list(cleared_business_stages)
             affected_stages = [target_stage, *cleared_business_stages]
+            for downstream_stage in cleared_business_stages:
+                downstream_run = db.query(BinarySecurityStageRun).filter(
+                    BinarySecurityStageRun.task_id == task.id,
+                    BinarySecurityStageRun.stage_name == downstream_stage,
+                ).first()
+                if downstream_run:
+                    self._reset_stage_run_for_retry(task, downstream_run, increment_retry=False)
         else:
             if all_downstream_refs:
                 await self._cleanup_downstream_refs(db, task, all_downstream_refs, self._service_token())
@@ -2938,6 +2945,66 @@ class TaskManager:
             "affected_stages": affected_stages,
             "validation": validation,
         }
+
+    def _effective_stage_item_downstream_status(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        result: dict[str, Any] | None = None,
+    ) -> tuple[str | None, dict[str, Any], bool]:
+        result_payload = dict(result or item.result or {})
+        sync_observation = dict(result_payload.get("sync_observation") or {})
+        display_status = (
+            self._string_or_none(sync_observation.get("downstream_status"))
+            or self._string_or_none(result_payload.get("downstream_status"))
+            or self._string_or_none(dict(result_payload.get("downstream") or {}).get("status"))
+        )
+        normalized_display = self._normalize_downstream_status(display_status)
+        normalized_item = self._normalize_downstream_status(item.status) or self._string_or_none(item.status)
+        repaired = False
+        if normalized_item in {"success", "failed", "cancelled", "partial_success", "downstream_missing"} and normalized_display in {"pending", "dispatching", "running"}:
+            display_status = normalized_item
+            repaired = True
+        return display_status, sync_observation, repaired
+
+    def _repair_stage_item_terminal_downstream_observation(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        reason: str,
+    ) -> bool:
+        mapped_status = self._normalize_downstream_status(item.status) or self._string_or_none(item.status)
+        if mapped_status not in {"success", "failed", "cancelled", "partial_success", "downstream_missing"}:
+            return False
+        self._mark_stage_item_sync_observation(
+            item,
+            sync_status="synced",
+            error_message=item.error_message,
+            status_raw=mapped_status,
+            mapped_status=mapped_status,
+            downstream_status=mapped_status,
+            state_applied=True,
+        )
+        self._record_event(
+            db,
+            task,
+            "downstream_status_repaired_from_item_terminal",
+            "下游展示状态已按当前终态子任务回收修正",
+            level="warning",
+            stage_name=item.stage_name,
+            item=item,
+            payload={
+                "reason": reason,
+                "item_status": item.status,
+                "downstream_status_display": mapped_status,
+                "downstream_status_raw": mapped_status,
+                "downstream_task_id": item.downstream_task_id,
+                "repair_applied": True,
+            },
+        )
+        return True
 
     def _retry_target_items(
         self,
@@ -4340,6 +4407,7 @@ class TaskManager:
                         continue
                 downstream_status = str(payload.get("status") or "").lower()
                 mapped_status = self._map_downstream_status(downstream_status)
+                current_item_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower() or None
                 if not observed_apply_state and stage_name and not item_id:
                     observed_apply_state = bool(
                         force
@@ -4383,6 +4451,9 @@ class TaskManager:
                         )
                     continue
                 terminal_status = mapped_status in {"success", "partial_success", "failed", "cancelled", "downstream_missing"}
+                if terminal_status and current_item_status in {"success", "partial_success", "failed", "cancelled", "downstream_missing"} and current_item_status != mapped_status:
+                    mapped_status = current_item_status
+                    downstream_status = current_item_status
                 if terminal_status:
                     if mapped_status == "downstream_missing":
                         should_apply = observed_apply_state and (mapped_status != before_status or force)
@@ -4773,13 +4844,27 @@ class TaskManager:
                 # Keep previously synchronized item updates intact; this branch
                 # only records the current item's fetch failure.
                 failed_count += 1
+                repair_applied = False
+                current_item_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower() or None
+                current_observed = self._normalize_downstream_status(
+                    self._string_or_none(dict(item.result or {}).get("sync_observation", {}).get("downstream_status"))
+                )
+                if current_item_status in {"success", "partial_success", "failed", "cancelled", "downstream_missing"} and current_observed in {"pending", "dispatching", "running"}:
+                    repair_applied = self._repair_stage_item_terminal_downstream_observation(
+                        db,
+                        task,
+                        item,
+                        reason="sync_fetch_failed_but_item_terminal",
+                    )
+                    if repair_applied:
+                        touched_stages.add(item.stage_name)
                 self._mark_stage_item_sync_observation(
                     item,
-                    sync_status="transport_error",
+                    sync_status="synced" if repair_applied else "transport_error",
                     error_message=str(exc),
                     http_status=self._extract_http_status_from_exception(exc),
                     error_type=self._classify_downstream_sync_error(exc),
-                    state_applied=False,
+                    state_applied=repair_applied,
                 )
                 self._record_event(
                     db,
@@ -4797,7 +4882,8 @@ class TaskManager:
                         "error_type": self._classify_downstream_sync_error(exc),
                         "status_raw": None,
                         "mapped_status": None,
-                        "state_applied": False,
+                        "state_applied": repair_applied,
+                        "repair_applied": repair_applied,
                     },
                 )
         for current_stage in touched_stages:
@@ -13451,12 +13537,7 @@ class TaskManager:
 
     def _stage_item_response(self, item: BinarySecurityStageItem) -> BinarySecurityStageItemResponse:
         result = dict(item.result or {})
-        sync_observation = dict(result.get("sync_observation") or {})
-        downstream_status = (
-            self._string_or_none(sync_observation.get("downstream_status"))
-            or self._string_or_none(result.get("downstream_status"))
-            or self._string_or_none(dict(result.get("downstream") or {}).get("status"))
-        )
+        downstream_status, sync_observation, repaired = self._effective_stage_item_downstream_status(item, result=result)
         last_synced_at = result.get("downstream_status_synced_at")
         sync_status = result.get("sync_status")
         if not sync_status:
@@ -13466,6 +13547,8 @@ class TaskManager:
                     sync_status = "synced"
             else:
                 sync_status = "not_applicable"
+        if repaired and sync_status in {None, "", "pending"}:
+            sync_status = "synced"
         parsed_last_synced_at = last_synced_at
         if isinstance(last_synced_at, str):
             try:
@@ -16481,7 +16564,7 @@ class TaskManager:
         if not isinstance(payload, dict):
             return None
         mapped_status = self._map_downstream_status(str(payload.get("status") or ""))
-        if mapped_status in {"queued", "running"}:
+        if mapped_status in {"pending", "queued", "dispatching", "running"}:
             return payload
         return None
 

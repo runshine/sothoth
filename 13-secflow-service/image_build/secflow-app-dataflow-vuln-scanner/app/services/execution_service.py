@@ -5731,14 +5731,47 @@ class ExecutionService:
         execution: WorkflowExecution | None,
         message: str,
     ) -> None:
+        trigger_before = {
+            "status": str(trigger.status or "").strip() if trigger is not None else None,
+            "public_status": str(trigger.public_status or "").strip() if trigger is not None else None,
+            "message": str(trigger.message or "").strip() if trigger is not None else None,
+        }
+        execution_before = {
+            "status": str(execution.status or "").strip() if execution is not None else None,
+            "public_status": str(execution.public_status or "").strip() if execution is not None else None,
+            "message": str(execution.message or "").strip() if execution is not None else None,
+        }
         self._apply_terminal_state_mutation(
             db,
-            execution=execution if execution is not None and self._run_index_status_is_active(execution.status) else None,
-            trigger=trigger if trigger is not None and self._run_index_status_is_active(trigger.status) else None,
+            execution=execution,
+            trigger=trigger,
             terminal_status="failed",
             message=message,
             process_status="exited",
         )
+        if execution is not None:
+            self.record_event(
+                db,
+                execution_id=execution.id,
+                event_type="task_public_state_reconciled",
+                message="task public state reconciled to terminal failure",
+                level="warning",
+                payload_json={
+                    "reason": "stale_runtime_terminal_reconciled",
+                    "trigger_status_before": trigger_before["status"],
+                    "trigger_public_status_before": trigger_before["public_status"],
+                    "trigger_message_before": trigger_before["message"],
+                    "execution_status_before": execution_before["status"],
+                    "execution_public_status_before": execution_before["public_status"],
+                    "execution_message_before": execution_before["message"],
+                    "trigger_status_after": str(trigger.status or "").strip() if trigger is not None else None,
+                    "trigger_public_status_after": str(trigger.public_status or "").strip() if trigger is not None else None,
+                    "trigger_message_after": str(trigger.message or "").strip() if trigger is not None else None,
+                    "execution_status_after": str(execution.status or "").strip(),
+                    "execution_public_status_after": str(execution.public_status or "").strip(),
+                    "execution_message_after": str(execution.message or "").strip(),
+                },
+            )
 
     def _reconcile_stale_run_index_to_terminal_task(
         self,

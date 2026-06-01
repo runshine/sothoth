@@ -102,6 +102,28 @@ def test_resolve_public_task_state_prefers_completed_run_over_stale_runtime_fail
     assert resolved.finished_at == run_finished_at
 
 
+def test_resolve_public_task_state_prefers_terminal_trigger_over_stale_running_message() -> None:
+    finished_at = datetime(2026, 1, 1, 0, 10, 0)
+    resolved = resolve_public_task_state(
+        trigger_status="failed",
+        trigger_message="run_vuln_scan.py running",
+        trigger_started_at=datetime(2026, 1, 1, 0, 0, 0),
+        trigger_finished_at=finished_at,
+        execution_status="failed",
+        execution_message="run_vuln_scan.py running",
+        execution_started_at=datetime(2026, 1, 1, 0, 0, 0),
+        execution_finished_at=finished_at,
+        dispatch_status="failed",
+        preferred_error_message="stale active runtime assumed failed",
+        run_status="failed",
+        run_message="stale active runtime assumed failed",
+        run_started_at=datetime(2026, 1, 1, 0, 0, 0),
+        run_finished_at=finished_at,
+    )
+    assert resolved.status == "failed"
+    assert resolved.source == "trigger"
+
+
 def test_public_task_status_matches_filter_uses_public_status() -> None:
     assert public_task_status_matches_filter("review_error", "failed")
     assert public_task_status_matches_filter("queued", "dispatching")
