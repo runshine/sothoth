@@ -12,8 +12,9 @@ class FirmwareUnpackerClient(JsonHttpClient):
     API_PREFIX = "/api/app/firmware-unpacker"
 
     def __init__(self) -> None:
-        cfg = get_config().services.firmware_unpacker
-        super().__init__(base_url=cfg.base_url, timeout=cfg.timeout)
+        app_cfg = get_config()
+        cfg = app_cfg.services.firmware_unpacker
+        super().__init__(base_url=cfg.base_url, timeout=app_cfg.scheduler.downstream_request_timeout_seconds)
 
     async def create_task(self, project_id: str, firmware_path: str, token: str, origin: dict[str, Any] | None = None) -> dict:
         return await self.post(

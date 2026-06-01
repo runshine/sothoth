@@ -13,8 +13,9 @@ class DataflowVulnScannerClient(JsonHttpClient):
     API_PREFIX = "/api/dataflow-vuln-scanner"
 
     def __init__(self) -> None:
-        cfg = get_config().services.dataflow_vuln_scanner
-        super().__init__(base_url=cfg.base_url.rstrip("/"), timeout=cfg.timeout)
+        app_cfg = get_config()
+        cfg = app_cfg.services.dataflow_vuln_scanner
+        super().__init__(base_url=cfg.base_url.rstrip("/"), timeout=app_cfg.scheduler.downstream_request_timeout_seconds)
 
     def _project_filesystem_ref(self, project_id: str, path: str) -> dict[str, Any]:
         """Convert a shared /data/files/<project_id>/... path to DFVS input ref."""

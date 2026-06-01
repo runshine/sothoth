@@ -12,8 +12,9 @@ class EntryAnalyseClient(JsonHttpClient):
     API_PREFIX = "/api/app/entry-analyse"
 
     def __init__(self) -> None:
-        cfg = get_config().services.entry_analyse
-        super().__init__(base_url=cfg.base_url, timeout=cfg.timeout)
+        app_cfg = get_config()
+        cfg = app_cfg.services.entry_analyse
+        super().__init__(base_url=cfg.base_url, timeout=app_cfg.scheduler.downstream_request_timeout_seconds)
 
     async def create_task(
         self,

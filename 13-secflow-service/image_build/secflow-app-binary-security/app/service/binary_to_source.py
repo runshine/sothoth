@@ -12,8 +12,9 @@ class BinaryToSourceClient(JsonHttpClient):
     API_PREFIX = "/api/app/binary-to-source"
 
     def __init__(self) -> None:
-        cfg = get_config().services.binary_to_source
-        super().__init__(base_url=cfg.base_url, timeout=cfg.timeout)
+        app_cfg = get_config()
+        cfg = app_cfg.services.binary_to_source
+        super().__init__(base_url=cfg.base_url, timeout=app_cfg.scheduler.downstream_request_timeout_seconds)
 
     async def create_task(
         self,

@@ -14149,7 +14149,13 @@ class TaskManager:
         downstream_status, sync_observation, repaired = self._effective_stage_item_downstream_status(item, result=result)
         downstream_payload = dict(result.get("downstream") or {})
         last_synced_at = result.get("downstream_status_synced_at")
-        sync_status = result.get("sync_status")
+        raw_sync_status = result.get("sync_status")
+        sync_status = str(raw_sync_status).strip().lower() if raw_sync_status is not None else None
+        if sync_status == "transport_error" and (downstream_status or last_synced_at):
+            # Keep surfacing the latest observation error fields, but do not let
+            # a transient fetch failure permanently override the last known good
+            # child state in the primary sync_status badge.
+            sync_status = "synced"
         if not sync_status:
             if item.downstream_task_id and (downstream_status or last_synced_at):
                 sync_status = "synced" if last_synced_at else "pending"

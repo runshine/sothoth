@@ -14822,7 +14822,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         response = self.manager._stage_item_response(item)
 
-        self.assertEqual("transport_error", response.sync_status)
+        self.assertEqual("synced", response.sync_status)
         self.assertIsNotNone(response.last_synced_at)
         self.assertEqual("failed", response.downstream_raw_status)
         self.assertEqual("failed", response.downstream_mapped_status)
@@ -21360,6 +21360,42 @@ def _test_dataflow_vuln_scanner_client_uses_api_prefix(self):
     )
 
 
+def _test_downstream_clients_use_scheduler_request_timeout(self):
+    from types import SimpleNamespace
+
+    from app.service.binary_to_source import BinaryToSourceClient
+    from app.service.dataflow_analyse import DataflowAnalyseClient
+    from app.service.dataflow_vuln_scanner import DataflowVulnScannerClient
+    from app.service.entry_analyse import EntryAnalyseClient
+    from app.service.firmware_unpacker import FirmwareUnpackerClient
+    from app.service.system_analyse import SystemAnalyseClient
+
+    cfg = SimpleNamespace(
+        scheduler=SimpleNamespace(downstream_request_timeout_seconds=120),
+        services=SimpleNamespace(
+            firmware_unpacker=SimpleNamespace(base_url="http://firmware-unpacker", timeout=10),
+            system_analyse=SimpleNamespace(base_url="http://system-analyse", timeout=10),
+            binary_to_source=SimpleNamespace(base_url="http://binary-to-source", timeout=10),
+            entry_analyse=SimpleNamespace(base_url="http://entry-analyse", timeout=10),
+            dataflow_analyse=SimpleNamespace(base_url="http://dataflow-analyse", timeout=10),
+            dataflow_vuln_scanner=SimpleNamespace(base_url="http://dataflow-vuln-scanner", timeout=60),
+        ),
+    )
+
+    with patch("app.service.firmware_unpacker.get_config", return_value=cfg):
+        self.assertEqual(120, FirmwareUnpackerClient().timeout)
+    with patch("app.service.system_analyse.get_config", return_value=cfg):
+        self.assertEqual(120, SystemAnalyseClient().timeout)
+    with patch("app.service.binary_to_source.get_config", return_value=cfg):
+        self.assertEqual(120, BinaryToSourceClient().timeout)
+    with patch("app.service.entry_analyse.get_config", return_value=cfg):
+        self.assertEqual(120, EntryAnalyseClient().timeout)
+    with patch("app.service.dataflow_analyse.get_config", return_value=cfg):
+        self.assertEqual(120, DataflowAnalyseClient().timeout)
+    with patch("app.service.dataflow_vuln_scanner.get_config", return_value=cfg):
+        self.assertEqual(120, DataflowVulnScannerClient().timeout)
+
+
 def _test_service_base_urls_use_service_roots(self):
     from app.config import ServicesConfig
 
@@ -21454,6 +21490,7 @@ TaskManagerTests.test_system_analyse_client_uses_management_api_prefix = _test_s
 TaskManagerTests.test_binary_to_source_client_uses_management_api_prefix = _test_binary_to_source_client_uses_management_api_prefix
 TaskManagerTests.test_firmware_unpacker_client_uses_management_api_prefix = _test_firmware_unpacker_client_uses_management_api_prefix
 TaskManagerTests.test_dataflow_vuln_scanner_client_uses_api_prefix = _test_dataflow_vuln_scanner_client_uses_api_prefix
+TaskManagerTests.test_downstream_clients_use_scheduler_request_timeout = _test_downstream_clients_use_scheduler_request_timeout
 TaskManagerTests.test_service_base_urls_use_service_roots = _test_service_base_urls_use_service_roots
 TaskManagerTests.test_task_heartbeat_controller_refreshes_owned_running_task = _test_task_heartbeat_controller_refreshes_owned_running_task
 TaskManagerTests.test_task_heartbeat_controller_skips_task_without_owner = _test_task_heartbeat_controller_skips_task_without_owner
