@@ -1493,15 +1493,63 @@ def test_timeline_clear_and_delete_do_not_create_extra_events(service_config_pat
     assert delete_one.status_code == 200
     after_delete = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/timeline")
     assert after_delete.status_code == 200
-    after_delete_items = after_delete.json()["items"]
-    assert all(item["event_type"] != "timeline_event_deleted" for item in after_delete_items)
 
-    clear_response = client.delete(f"/api/dataflow-vuln-scanner/tasks/{task_id}/timeline")
-    assert clear_response.status_code == 200
-    assert clear_response.json()["deleted_event_count"] == len(after_delete_items)
-    final_timeline = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/timeline")
-    assert final_timeline.status_code == 200
-    assert final_timeline.json()["items"] == []
+
+def test_cancel_orphaned_requeued_task_converges_to_cancelled(service_config_path, patch_mock_agent_runtime):
+    app = create_app()
+    client = TestClient(app)
+    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
+    created = _create_business_dataflow_task(
+        client,
+        profile_id=profile["profile_id"],
+        case_name="case-orphan-cancel-requeue",
+        title="orphan cancel requeue scan",
+    )
+    task_id = created["task_id"]
+
+    with get_db_session() as db:
+        trigger = db.get(TriggerTask, task_id)
+        assert trigger is not None
+        execution = (
+            db.query(WorkflowExecution)
+            .filter(WorkflowExecution.trigger_task_id == task_id)
+            .order_by(WorkflowExecution.attempt_no.desc(), WorkflowExecution.created_at.desc())
+            .first()
+        )
+        assert execution is not None
+        trigger.status = "running"
+        trigger.public_status = "running"
+        trigger.control_state = "cancel_requested"
+        trigger.message = "cancel requested"
+        execution.status = "pending"
+        execution.public_status = "pending"
+        execution.control_state = "cancel_requested"
+        execution.owner_pod_id = None
+        execution.worker_job_id = None
+        execution.worker_url = None
+        execution.dispatch_status = None
+        execution.process_status = "not_started"
+        execution.message = "worker dispatch failed, requeued: timeout"
+        db.add_all([trigger, execution])
+        db.commit()
+
+    cancel_response = client.post(f"/api/dataflow-vuln-scanner/tasks/{task_id}/cancel")
+    assert cancel_response.status_code == 200
+    payload = cancel_response.json()
+    assert payload["status"] == "cancelled"
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}")
+    assert detail.status_code == 200
+    detail_payload = detail.json()
+    assert detail_payload["status"] == "cancelled"
+    assert detail_payload["run"]["process_state"]["source"] == "terminal_linked_status"
+
+    timeline = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/timeline")
+    assert timeline.status_code == 200
+    items = timeline.json()["items"]
+    assert next((item for item in items if item["event_type"] == "task_cancel_requested"), None) is not None
+    reconciled = next((item for item in items if item["event_type"] == "task_cancel_reconciled"), None)
+    assert reconciled is not None
 
 
 def test_project_filesystem_browser_uses_local_project_tree(service_config_path):

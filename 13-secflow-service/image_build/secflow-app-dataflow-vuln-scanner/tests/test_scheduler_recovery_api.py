@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from app.models.database import SchedulerWorker, SchedulerWorkerSlotReservation, TriggerTask, WorkflowExecution, get_db_session
+from app.models.database import SchedulerWorker, SchedulerWorkerSlotReservation, TriggerTask, WorkflowExecution, WorkflowExecutionEvent, get_db_session
 from app.schemas import ScanProfileCreateRequest, ScanTaskCreateRequest
 from app.services.execution_service import get_execution_service
 from app.services.scheduler import SchedulerService
@@ -324,5 +324,70 @@ def test_cleanup_requeues_stuck_starting_execution_before_process_launch(service
         assert execution.dispatch_status is None
         assert execution.process_status == "not_started"
         assert trigger.status == "pending"
+    finally:
+        db.close()
+
+
+def test_cleanup_reconciles_orphan_cancel_requested_execution(service_config_path):
+    db = get_db_session()
+    try:
+        execution_id = "exec-orphan-cancel-reconcile"
+        trigger = TriggerTask(
+            id="tt-orphan-cancel-reconcile",
+            workflow_definition_id="wfd-orphan-cancel-reconcile",
+            project_id="default",
+            trigger_type="manual",
+            input_tasks_json={"tasks": []},
+            priority=100,
+            status="running",
+            public_status="running",
+            control_state="cancel_requested",
+            message="cancel requested",
+            submitted_by="tester",
+            retry_count=0,
+            max_retry_count=3,
+            latest_execution_id=execution_id,
+        )
+        execution = WorkflowExecution(
+            id=execution_id,
+            trigger_task_id=trigger.id,
+            workflow_definition_id=trigger.workflow_definition_id,
+            project_id="default",
+            attempt_no=1,
+            status="pending",
+            public_status="pending",
+            control_state="cancel_requested",
+            dispatch_status=None,
+            owner_pod_id=None,
+            worker_job_id=None,
+            worker_url=None,
+            process_status="not_started",
+            message="worker dispatch failed, requeued: timeout",
+        )
+        db.add_all([trigger, execution])
+        db.commit()
+    finally:
+        db.close()
+
+    SchedulerService()._cleanup_once()
+
+    db = get_db_session()
+    try:
+        execution = db.get(WorkflowExecution, execution_id)
+        trigger = db.get(TriggerTask, "tt-orphan-cancel-reconcile")
+        assert execution is not None
+        assert trigger is not None
+        assert execution.status == "cancelled"
+        assert trigger.status == "cancelled"
+        event = (
+            db.query(WorkflowExecutionEvent)
+            .filter(
+                WorkflowExecutionEvent.execution_id == execution.id,
+                WorkflowExecutionEvent.event_type == "task_cancel_reconciled",
+            )
+            .order_by(WorkflowExecutionEvent.created_at.desc())
+            .first()
+        )
+        assert event is not None
     finally:
         db.close()

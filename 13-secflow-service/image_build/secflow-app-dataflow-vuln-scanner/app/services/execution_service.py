@@ -3366,6 +3366,114 @@ class ExecutionService:
             self._refresh_task_list_projection_for_execution(db, execution)
         db.flush()
 
+    def _has_active_execution_runtime(
+        self,
+        *,
+        execution: WorkflowExecution | None,
+        local_process: subprocess.Popen | None = None,
+    ) -> bool:
+        if execution is None:
+            return False
+        if local_process is not None:
+            return True
+        if bool(execution.worker_url and execution.worker_job_id):
+            return True
+        if _canonical_task_status(execution.status) in {"dispatching", "running"}:
+            return True
+        if str(execution.process_status or "").strip().lower() in {
+            "running",
+            "starting",
+            "stop_requested",
+            "delete_requested",
+        }:
+            return True
+        return False
+
+    def _orphaned_control_request_resolution(
+        self,
+        *,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+        local_process: subprocess.Popen | None = None,
+    ) -> dict[str, Any] | None:
+        control_state = str(
+            (trigger.control_state if trigger is not None else None)
+            or (execution.control_state if execution is not None else None)
+            or derive_task_control_state(
+                dispatch_status=execution.dispatch_status if execution is not None else None,
+                process_status=execution.process_status if execution is not None else None,
+                trigger_message=trigger.message if trigger is not None else None,
+                execution_message=execution.message if execution is not None else None,
+            )
+            or ""
+        ).strip().lower()
+        if control_state not in {"cancel_requested", "delete_requested"}:
+            return None
+        if trigger is not None and _canonical_task_status(trigger.status) not in {"pending", "running"}:
+            return None
+        if execution is None:
+            return None
+        if _canonical_task_status(execution.status) != "pending":
+            return None
+        if self._has_active_execution_runtime(execution=execution, local_process=local_process):
+            return None
+        if execution.owner_pod_id or execution.worker_job_id:
+            return None
+        if str(execution.process_status or "").strip().lower() not in {"", "not_started", "exited"}:
+            return None
+        if control_state == "delete_requested":
+            return {
+                "terminal_status": "cancelled",
+                "message": "deleted after dispatch requeue",
+                "event_type": "task_delete_reconciled",
+                "resolution_reason": "dispatch_requeued_no_active_worker_delete_requested",
+                "process_status": "not_started",
+            }
+        return {
+            "terminal_status": "cancelled",
+            "message": "cancelled after dispatch requeue",
+            "event_type": "task_cancel_reconciled",
+            "resolution_reason": "dispatch_requeued_no_active_worker_cancel_requested",
+            "process_status": "not_started",
+        }
+
+    def _finalize_orphaned_control_request(
+        self,
+        db: Session,
+        *,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+        resolution: dict[str, Any],
+    ) -> None:
+        self._apply_terminal_state_mutation(
+            db,
+            execution=execution,
+            trigger=trigger,
+            terminal_status=str(resolution.get("terminal_status") or "cancelled"),
+            message=str(resolution.get("message") or "cancelled"),
+            process_status=str(resolution.get("process_status") or "not_started"),
+        )
+        if execution is not None:
+            payload_json = {
+                "task_id": trigger.id if trigger is not None else execution.trigger_task_id,
+                "execution_id": execution.id,
+                "status_before": "pending" if execution is not None else None,
+                "dispatch_status_before": execution.dispatch_status,
+                "process_status_before": execution.process_status,
+                "worker_url": execution.worker_url,
+                "worker_job_id": execution.worker_job_id,
+                "owner_pod_id": execution.owner_pod_id,
+                "resolution_reason": resolution.get("resolution_reason"),
+            }
+            self.record_event(
+                db,
+                execution_id=execution.id,
+                event_type=str(resolution.get("event_type") or "task_cancel_reconciled"),
+                message=str(resolution.get("message") or "cancelled"),
+                level="warning",
+                payload_json=payload_json,
+            )
+
     def mark_dispatch_failure_terminal(
         self,
         db: Session,
@@ -5174,6 +5282,36 @@ class ExecutionService:
         run_status = str(run_index.status or "").strip().lower()
         trigger_status = str(trigger.status or "").strip().lower() if trigger is not None else ""
         execution_status = str(execution.status or "").strip().lower() if execution is not None else ""
+        local_process = self._local_cli_process(execution.id) if execution is not None else None
+        orphaned_resolution = self._orphaned_control_request_resolution(
+            trigger=trigger,
+            execution=execution,
+            local_process=local_process,
+        )
+        if orphaned_resolution is not None:
+            base.update(
+                {
+                    "can_retry": False,
+                    "is_queued": False,
+                    "reason": str(orphaned_resolution.get("message") or "control request reconciliable"),
+                    "source": "orphaned_control_requested",
+                    "display_status": "cancel_requested",
+                    "display_label": "取消收敛中",
+                    "resolution_reason": orphaned_resolution.get("resolution_reason"),
+                }
+            )
+            return base
+        if _public_task_status(trigger_status) in {"success", "failed", "cancelled"} or _public_task_status(execution_status) in {"success", "failed", "cancelled"}:
+            base.update(
+                {
+                    "can_retry": True,
+                    "is_running": False,
+                    "is_queued": False,
+                    "reason": "任务已进入终态，无活跃 run_vuln_scan.py 进程",
+                    "source": "terminal_linked_status",
+                }
+            )
+            return base
         if is_run_queued(run_status) or is_run_queued(trigger_status) or is_run_queued(execution_status):
             base.update(
                 {
@@ -5186,7 +5324,6 @@ class ExecutionService:
             return base
 
         if execution is not None:
-            local_process = self._local_cli_process(execution.id)
             if local_process is not None:
                 base.update(
                     {
@@ -5295,6 +5432,9 @@ class ExecutionService:
         process_state: dict[str, Any],
     ) -> str:
         current = str(current_status or "").strip().lower()
+        orphaned_resolution = self._orphaned_control_request_resolution(trigger=trigger, execution=execution)
+        if orphaned_resolution is not None:
+            return str(orphaned_resolution.get("terminal_status") or "cancelled")
         linked_statuses = [
             str(execution.status or "").strip().lower() if execution is not None else "",
             str(trigger.status or "").strip().lower() if trigger is not None else "",
@@ -5717,6 +5857,20 @@ class ExecutionService:
         )
         for execution in rows:
             trigger = db.get(TriggerTask, execution.trigger_task_id)
+            orphaned_resolution = self._orphaned_control_request_resolution(
+                trigger=trigger,
+                execution=execution,
+            )
+            if orphaned_resolution is not None:
+                self._finalize_orphaned_control_request(
+                    db,
+                    trigger=trigger,
+                    execution=execution,
+                    resolution=orphaned_resolution,
+                )
+                reconciled += 1
+                db.commit()
+                continue
             if self._reconcile_legacy_dispatch_failure(
                 db,
                 trigger=trigger,
@@ -6442,27 +6596,41 @@ class ExecutionService:
                 process_status="not_started",
             )
         elif _canonical_task_status(trigger.status) in {"dispatching", "running"}:
-            trigger.status = "running"
-            trigger.message = "cancel requested"
-            trigger.latest_abnormal_reason_json = None
-            if latest_execution is not None and _canonical_task_status(latest_execution.status) in {"dispatching", "running"}:
-                latest_execution.status = "running"
-                latest_execution.message = "cancel requested"
-                latest_execution.process_status = "stop_requested"
-                self._sync_runtime_state_snapshots(
+            local_process = self._local_cli_process(latest_execution.id) if latest_execution is not None else None
+            orphaned_resolution = self._orphaned_control_request_resolution(
+                trigger=trigger,
+                execution=latest_execution,
+                local_process=local_process,
+            )
+            if orphaned_resolution is not None:
+                self._finalize_orphaned_control_request(
+                    db,
                     trigger=trigger,
                     execution=latest_execution,
-                    public_status="running",
-                    control_state="cancel_requested",
+                    resolution=orphaned_resolution,
                 )
-                db.add(latest_execution)
             else:
-                self._sync_runtime_state_snapshots(
-                    trigger=trigger,
-                    execution=latest_execution,
-                    public_status="running",
-                    control_state="cancel_requested",
-                )
+                trigger.status = "running"
+                trigger.message = "cancel requested"
+                trigger.latest_abnormal_reason_json = None
+                if latest_execution is not None and self._has_active_execution_runtime(execution=latest_execution, local_process=local_process):
+                    latest_execution.status = "running"
+                    latest_execution.message = "cancel requested"
+                    latest_execution.process_status = "stop_requested"
+                    self._sync_runtime_state_snapshots(
+                        trigger=trigger,
+                        execution=latest_execution,
+                        public_status="running",
+                        control_state="cancel_requested",
+                    )
+                    db.add(latest_execution)
+                else:
+                    self._sync_runtime_state_snapshots(
+                        trigger=trigger,
+                        execution=latest_execution,
+                        public_status="running",
+                        control_state="cancel_requested",
+                    )
         else:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="task is not cancelable")
         db.add(trigger)
@@ -6492,7 +6660,7 @@ class ExecutionService:
                     action="cancel",
                     payload=stop_payload,
                 )
-            elif _canonical_task_status(latest_execution.status) in {"dispatching", "running"}:
+            elif self._has_active_execution_runtime(execution=latest_execution):
                 self._signal_local_cli_process(latest_execution.id, wait=False)
         db.refresh(trigger)
         return self._scan_task_response(db, trigger)
@@ -6501,12 +6669,31 @@ class ExecutionService:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
         if is_canonical_task_active(trigger.status):
-            try:
-                self.cancel_scan_task(db, task_id, principal)
-                trigger = self._trigger_or_404(db, task_id)
-            except Exception:
-                db.rollback()
-                trigger = self._trigger_or_404(db, task_id)
+            latest_execution = self._latest_execution_for_trigger(db, trigger.id)
+            orphaned_resolution = self._orphaned_control_request_resolution(
+                trigger=trigger,
+                execution=latest_execution,
+            )
+            if orphaned_resolution is None:
+                try:
+                    self.cancel_scan_task(db, task_id, principal)
+                    trigger = self._trigger_or_404(db, task_id)
+                except Exception:
+                    db.rollback()
+                    trigger = self._trigger_or_404(db, task_id)
+            else:
+                self._finalize_orphaned_control_request(
+                    db,
+                    trigger=trigger,
+                    execution=latest_execution,
+                    resolution={
+                        **orphaned_resolution,
+                        "message": "deleted after dispatch requeue",
+                        "event_type": "task_delete_reconciled",
+                        "resolution_reason": "dispatch_requeued_no_active_worker_delete_requested",
+                    },
+                )
+                db.commit()
 
         executions = self._list_executions_for_trigger(db, trigger.id)
         run_index_ids: set[str] = set()

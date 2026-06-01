@@ -1277,6 +1277,13 @@ class SchedulerService:
             if trigger is not None and trigger.status in {"pending", "dispatching"}:
                 trigger.status = "pending"
                 trigger.public_status = "pending"
+                trigger.control_state = "none"
+                trigger.message = execution.message
+                db.add(trigger)
+            elif trigger is not None and trigger.status == "running":
+                trigger.status = "pending"
+                trigger.public_status = "pending"
+                trigger.control_state = "none"
                 trigger.message = execution.message
                 db.add(trigger)
             self._release_reservation(db, execution_id)
@@ -1734,6 +1741,13 @@ class SchedulerService:
                 if trigger is not None and trigger.status in {"pending", "dispatching"}:
                     trigger.status = "pending"
                     trigger.public_status = "pending"
+                    trigger.control_state = "none"
+                    trigger.message = execution.message
+                    db.add(trigger)
+                elif trigger is not None and trigger.status == "running":
+                    trigger.status = "pending"
+                    trigger.public_status = "pending"
+                    trigger.control_state = "none"
                     trigger.message = execution.message
                     db.add(trigger)
                 get_execution_service().record_event(
