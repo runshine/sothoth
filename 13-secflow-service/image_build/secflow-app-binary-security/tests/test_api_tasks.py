@@ -16,6 +16,7 @@ from app.schemas import (
     BinarySecurityAbnormalReasonHistoryResponse,
     BinarySecurityArchiveJobPageResponse,
     BinarySecurityOverviewResponse,
+    BinarySecurityProjectStats,
     BinarySecurityProjectConfigPayload,
     BinarySecurityProjectConfigResponse,
     BinarySecurityServiceConfigPayload,
@@ -24,6 +25,8 @@ from app.schemas import (
     BinarySecurityStageItemResponse,
     BinarySecurityStageSummary,
     BinarySecurityTaskDetailResponse,
+    BinarySecurityTaskListResponse,
+    BinarySecurityTaskResponse,
     TokenUser,
 )
 
@@ -171,6 +174,44 @@ class _RouteManagerStub:
             )
         )
 
+    def list_tasks(self, db, project_id, status=None, task_type=None, page=1, page_size=50):
+        self.calls.append(("list_tasks", db, project_id, status, task_type, page, page_size))
+        return BinarySecurityTaskListResponse(
+            total=1,
+            page=page,
+            page_size=page_size,
+            total_pages=1,
+            running_count=1,
+            queued_count=0,
+            max_concurrent_tasks=12,
+            project_stats=BinarySecurityProjectStats(total=1, running=1),
+            project_stage_aggregates=[],
+            items=[
+                BinarySecurityTaskResponse(
+                    id="t-list-1",
+                    project_id=project_id,
+                    task_type=task_type or "source",
+                    name="list-task",
+                    status="running",
+                    current_stage="entry_analysis",
+                    firmware_path="/src",
+                    stage_summaries=[
+                        BinarySecurityStageSummary(
+                            stage_name="entry_analysis",
+                            sequence_no=2,
+                            status="running",
+                            running_items=1,
+                        )
+                    ],
+                    manual_operation_state={
+                        "overall": "blocked",
+                        "blocking_code": "task_running",
+                        "can_delete": False,
+                    },
+                )
+            ],
+        )
+
 
 class TaskApiRouteTests(unittest.TestCase):
     def _build_client(self):
@@ -213,6 +254,28 @@ class TaskApiRouteTests(unittest.TestCase):
         self.assertEqual("running", payload["stage_summaries"][0]["status"])
         self.assertEqual("task_running", payload["manual_operation_state"]["blocking_code"])
         self.assertEqual(("get_task_detail", fake_db, "p1", "t1"), manager.calls[0])
+
+    def test_list_tasks_route_preserves_filters_and_pagination(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/app/binary-security/projects/p1/tasks",
+                    params={"task_type": "source", "status": "running", "page": 2, "page_size": 20},
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual(2, payload["page"])
+        self.assertEqual(20, payload["page_size"])
+        self.assertEqual("task_running", payload["items"][0]["manual_operation_state"]["blocking_code"])
+        self.assertEqual(
+            ("list_tasks", fake_db, "p1", "running", "source", 2, 20),
+            manager.calls[0],
+        )
 
     def test_get_task_stage_items_route_preserves_pagination_and_lineage(self):
         app, fake_db = self._build_client()

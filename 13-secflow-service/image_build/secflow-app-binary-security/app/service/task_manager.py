@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import tarfile
+import threading
 import time
 import uuid
 import zipfile
@@ -898,6 +899,8 @@ class TaskManager:
         self._last_task_heartbeat_at: dict[str, datetime] = {}
         self._last_queue_reconcile_at: datetime | None = None
         self._state_reducer_consecutive_crash_count = 0
+        self._task_list_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
+        self._task_list_cache_lock = threading.Lock()
 
     def _downstream_tasks(self):
         return get_downstream_task_controller(self)
@@ -1432,6 +1435,7 @@ class TaskManager:
         normalized_task_type = self._validate_task_type(task_type) if task_type else None
         metrics_task_type = normalized_task_type or "all"
         result = "success"
+        stage_durations: dict[str, float] = {}
         try:
             stage_started = time.perf_counter()
             base_query = db.query(BinarySecurityTask).filter(BinarySecurityTask.project_id == project_id)
@@ -1450,6 +1454,7 @@ class TaskManager:
                 task_type=metrics_task_type,
                 duration_seconds=time.perf_counter() - stage_started,
             )
+            stage_durations["build_base_query"] = time.perf_counter() - stage_started
 
             query = base_query
             if status:
@@ -1462,6 +1467,7 @@ class TaskManager:
                 task_type=metrics_task_type,
                 duration_seconds=time.perf_counter() - stage_started,
             )
+            stage_durations["count"] = time.perf_counter() - stage_started
 
             offset = max(0, (page - 1) * page_size)
             stage_started = time.perf_counter()
@@ -1487,6 +1493,7 @@ class TaskManager:
                     BinarySecurityTask.target_stage_name,
                     BinarySecurityTask.latest_abnormal_reason_json,
                     BinarySecurityTask.last_error,
+                    BinarySecurityTask.current_operation_id,
                 )
             ).order_by(BinarySecurityTask.created_at.desc()).offset(offset).limit(page_size).all()
             observe_task_list_query_stage(
@@ -1494,14 +1501,23 @@ class TaskManager:
                 task_type=metrics_task_type,
                 duration_seconds=time.perf_counter() - stage_started,
             )
+            stage_durations["page_items"] = time.perf_counter() - stage_started
 
             stage_started = time.perf_counter()
-            queue_info = self._build_queue_info(db, project_id=project_id)
+            queue_info = self._load_task_list_cached_value(
+                cache_group="queue_info",
+                project_id=project_id,
+                task_type=normalized_task_type,
+                ttl_seconds=3.0,
+                loader=lambda: self._build_queue_info(db, project_id=project_id),
+                fallback={"running_count": 0, "queued_count": 0, "pending_positions": {}},
+            )
             observe_task_list_query_stage(
                 stage="queue_info",
                 task_type=metrics_task_type,
                 duration_seconds=time.perf_counter() - stage_started,
             )
+            stage_durations["queue_info"] = time.perf_counter() - stage_started
 
             stage_started = time.perf_counter()
             service_config = self._load_service_config(db)
@@ -1510,29 +1526,47 @@ class TaskManager:
                 task_type=metrics_task_type,
                 duration_seconds=time.perf_counter() - stage_started,
             )
+            stage_durations["service_config"] = time.perf_counter() - stage_started
 
             stage_started = time.perf_counter()
-            project_stats = self._build_project_stats_sql(db, project_id=project_id, task_type=normalized_task_type)
+            project_stats = self._load_task_list_cached_value(
+                cache_group="project_stats",
+                project_id=project_id,
+                task_type=normalized_task_type,
+                ttl_seconds=5.0,
+                loader=lambda: self._build_project_stats_sql(db, project_id=project_id, task_type=normalized_task_type),
+                fallback=BinarySecurityProjectStats(total=0),
+            )
             observe_task_list_query_stage(
                 stage="project_stats",
                 task_type=metrics_task_type,
                 duration_seconds=time.perf_counter() - stage_started,
             )
+            stage_durations["project_stats"] = time.perf_counter() - stage_started
 
             stage_started = time.perf_counter()
-            project_stage_aggregates = self._build_project_stage_aggregates_sql(
-                db,
+            project_stage_aggregates = self._load_task_list_cached_value(
+                cache_group="project_stage_aggregates",
                 project_id=project_id,
                 task_type=normalized_task_type,
+                ttl_seconds=5.0,
+                loader=lambda: self._build_project_stage_aggregates_sql(
+                    db,
+                    project_id=project_id,
+                    task_type=normalized_task_type,
+                ),
+                fallback=[],
             )
             observe_task_list_query_stage(
                 stage="project_stage_aggregates",
                 task_type=metrics_task_type,
                 duration_seconds=time.perf_counter() - stage_started,
             )
+            stage_durations["project_stage_aggregates"] = time.perf_counter() - stage_started
 
             stage_started = time.perf_counter()
             stage_runs_by_task, stage_items_by_task = self._task_list_stage_state_by_task(db, tasks)
+            active_operations_by_task, cancel_operations_by_task = self._task_list_operation_maps(db, tasks)
             items = [
                 self._task_list_response(
                     db,
@@ -1540,6 +1574,8 @@ class TaskManager:
                     queue_info=queue_info,
                     stage_runs=stage_runs_by_task.get(str(task.id), []),
                     stage_items=stage_items_by_task.get(str(task.id), []),
+                    active_operation=active_operations_by_task.get(str(task.id)),
+                    cancel_operation=cancel_operations_by_task.get(str(task.id)),
                 )
                 for task in tasks
             ]
@@ -1547,6 +1583,17 @@ class TaskManager:
                 stage="serialize_items",
                 task_type=metrics_task_type,
                 duration_seconds=time.perf_counter() - stage_started,
+            )
+            stage_durations["serialize_items"] = time.perf_counter() - stage_started
+            self._log_task_list_query(
+                project_id=project_id,
+                task_type=metrics_task_type,
+                page=page,
+                page_size=page_size,
+                total=total,
+                item_count=len(tasks),
+                duration_seconds=time.perf_counter() - started,
+                stage_durations=stage_durations,
             )
             return BinarySecurityTaskListResponse(
                 total=total,
@@ -1564,10 +1611,23 @@ class TaskManager:
             result = "error"
             raise
         finally:
+            total_duration = time.perf_counter() - started
+            if result != "success":
+                self._log_task_list_query(
+                    project_id=project_id,
+                    task_type=metrics_task_type,
+                    page=page,
+                    page_size=page_size,
+                    total=None,
+                    item_count=None,
+                    duration_seconds=total_duration,
+                    stage_durations=stage_durations,
+                    result=result,
+                )
             observe_task_list_query(
                 result=result,
                 task_type=metrics_task_type,
-                duration_seconds=time.perf_counter() - started,
+                duration_seconds=total_duration,
             )
 
     def get_task_detail(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskDetailResponse:
@@ -12240,22 +12300,32 @@ class TaskManager:
         stage_sequence: list[str],
         stage_runs: list[BinarySecurityStageRun],
         items: list[BinarySecurityStageItem],
+        *,
+        include_retry_support: bool = True,
     ) -> list[BinarySecurityStageSummary]:
         runs_by_stage = {run.stage_name: run for run in stage_runs if run.stage_name in stage_sequence}
         items_by_stage: dict[str, list[BinarySecurityStageItem]] = {stage_name: [] for stage_name in stage_sequence}
         for item in items:
             if item.stage_name in items_by_stage:
                 items_by_stage[item.stage_name].append(item)
-        stage_retry_support = {
-            stage_name: self._stage_retry_support(db, task, stage_name)
-            for stage_name in stage_sequence
-            if stage_name in runs_by_stage
-        }
-        stage_retry_failed_support = {
-            stage_name: self._stage_retry_failed_items_support(db, task, stage_name)
-            for stage_name in stage_sequence
-            if stage_name in runs_by_stage
-        }
+        stage_retry_support = (
+            {
+                stage_name: self._stage_retry_support(db, task, stage_name)
+                for stage_name in stage_sequence
+                if stage_name in runs_by_stage
+            }
+            if include_retry_support
+            else {}
+        )
+        stage_retry_failed_support = (
+            {
+                stage_name: self._stage_retry_failed_items_support(db, task, stage_name)
+                for stage_name in stage_sequence
+                if stage_name in runs_by_stage
+            }
+            if include_retry_support
+            else {}
+        )
         summaries: list[BinarySecurityStageSummary] = []
         for index, stage_name in enumerate(stage_sequence, start=1):
             run = runs_by_stage.get(stage_name)
@@ -12792,11 +12862,6 @@ class TaskManager:
         if not task_ids:
             return {}, {}
 
-        for task in tasks:
-            active_stage_name = self._active_reconcile_stage_name(task)
-            if active_stage_name:
-                self._refresh_stage_from_authoritative_items(db, task, active_stage_name)
-
         stage_runs = (
             db.query(BinarySecurityStageRun)
             .filter(BinarySecurityStageRun.task_id.in_(task_ids))
@@ -12827,6 +12892,8 @@ class TaskManager:
         queue_info: dict[str, Any] | None = None,
         stage_runs: list[BinarySecurityStageRun] | None = None,
         stage_items: list[BinarySecurityStageItem] | None = None,
+        active_operation: BinarySecurityTaskOperation | None = None,
+        cancel_operation: BinarySecurityTaskOperation | None = None,
     ) -> BinarySecurityTaskResponse:
         metrics = task.metrics or {}
         queue_info = queue_info or {"pending_positions": {}}
@@ -12836,25 +12903,20 @@ class TaskManager:
             db,
             task,
             stage_sequence,
-            stage_runs=stage_runs,
-            stage_items=stage_items,
-        )
+                    stage_runs=stage_runs,
+                    stage_items=stage_items,
+                )
         abnormal_reason = None
         if isinstance(task.latest_abnormal_reason, dict):
             try:
                 abnormal_reason = BinarySecurityAbnormalReason(**task.latest_abnormal_reason)
             except Exception:
                 abnormal_reason = None
-        active_operation = self._active_operation(db, task.id)
-        cancel_operation = None
-        try:
-            if active_operation is not None and str(active_operation.operation_type or "").strip() != TASK_ACTION_CANCEL:
-                cancel_operation = None
-            else:
-                cancel_operation = self._active_cancel_operation(db, task.id) or self._latest_cancel_operation(db, task.id)
-        except Exception:
-            cancel_operation = None
-        manual_operation_state = self._build_task_list_manual_operation_state(task, stage_summaries=stage_summaries)
+        manual_operation_state = self._build_task_list_manual_operation_state(
+            task,
+            stage_summaries=stage_summaries,
+            active_operation=active_operation,
+        )
         return BinarySecurityTaskResponse(
             id=task.id,
             project_id=task.project_id,
@@ -12920,6 +12982,7 @@ class TaskManager:
                 stage_sequence,
                 resolved_stage_runs,
                 resolved_stage_items,
+                include_retry_support=False,
             )
         return self._build_stage_summaries_from_snapshot(task, stage_sequence)
 
@@ -12970,17 +13033,8 @@ class TaskManager:
         task: BinarySecurityTask,
         *,
         stage_summaries: list[BinarySecurityStageSummary],
+        active_operation: BinarySecurityTaskOperation | None = None,
     ) -> dict[str, Any]:
-        session = None
-        active_operation = None
-        try:
-            session = get_session_factory()()
-            active_operation = self._active_operation(session, task.id)
-        except Exception:
-            active_operation = None
-        finally:
-            if session is not None:
-                session.close()
         if active_operation is not None:
             reason = f"当前任务正在执行 {active_operation.operation_type}，请稍后重试"
             return {
@@ -13037,6 +13091,109 @@ class TaskManager:
             "can_edit_policy": not running,
             "can_confirm_modules": str(task.status or "").strip() in {TASK_STATUS_PENDING_MODULE_CONFIRMATION, "waiting_confirmation"},
         }
+
+    def _task_list_operation_maps(
+        self,
+        db: Session,
+        tasks: list[BinarySecurityTask],
+    ) -> tuple[dict[str, BinarySecurityTaskOperation], dict[str, BinarySecurityTaskOperation]]:
+        task_ids = [str(task.id) for task in tasks if getattr(task, "id", None)]
+        if not task_ids:
+            return {}, {}
+
+        operations = (
+            db.query(BinarySecurityTaskOperation)
+            .filter(BinarySecurityTaskOperation.task_id.in_(task_ids))
+            .order_by(BinarySecurityTaskOperation.created_at.desc(), BinarySecurityTaskOperation.id.desc())
+            .all()
+        )
+
+        active_operations_by_task: dict[str, BinarySecurityTaskOperation] = {}
+        cancel_operations_by_task: dict[str, BinarySecurityTaskOperation] = {}
+        for operation in operations:
+            task_id = str(getattr(operation, "task_id", "") or "")
+            if not task_id:
+                continue
+            status_value = str(getattr(operation, "status", "") or "").strip()
+            operation_type = str(getattr(operation, "operation_type", "") or "").strip()
+            if task_id not in active_operations_by_task and status_value in TASK_OPERATION_ACTIVE_STATUSES:
+                active_operations_by_task[task_id] = operation
+            if task_id not in cancel_operations_by_task and operation_type == TASK_ACTION_CANCEL:
+                if task_id in active_operations_by_task and str(active_operations_by_task[task_id].operation_type or "").strip() != TASK_ACTION_CANCEL:
+                    continue
+                cancel_operations_by_task[task_id] = operation
+        return active_operations_by_task, cancel_operations_by_task
+
+    def _load_task_list_cached_value(
+        self,
+        *,
+        cache_group: str,
+        project_id: str,
+        task_type: str | None,
+        ttl_seconds: float,
+        loader,
+        fallback,
+    ):
+        cache_key = (cache_group, project_id, str(task_type or "all"))
+        now_ts = time.monotonic()
+        with self._task_list_cache_lock:
+            cached = self._task_list_cache.get(cache_key)
+            if cached and now_ts < cached[0]:
+                return copy.deepcopy(cached[1])
+        try:
+            value = loader()
+        except Exception:
+            logger.warning(
+                "binary-security task list cache loader failed group=%s project_id=%s task_type=%s",
+                cache_group,
+                project_id,
+                task_type or "all",
+                exc_info=True,
+            )
+            with self._task_list_cache_lock:
+                cached = self._task_list_cache.get(cache_key)
+                if cached:
+                    return copy.deepcopy(cached[1])
+            return copy.deepcopy(fallback)
+        with self._task_list_cache_lock:
+            self._task_list_cache[cache_key] = (now_ts + max(0.1, float(ttl_seconds)), copy.deepcopy(value))
+        return value
+
+    def _log_task_list_query(
+        self,
+        *,
+        project_id: str,
+        task_type: str,
+        page: int,
+        page_size: int,
+        total: int | None,
+        item_count: int | None,
+        duration_seconds: float,
+        stage_durations: dict[str, float],
+        result: str = "success",
+    ) -> None:
+        stage_summary = " ".join(
+            f"{name}={duration:.3f}s"
+            for name, duration in sorted(stage_durations.items(), key=lambda item: item[0])
+        )
+        level = logging.INFO
+        if duration_seconds > 3.0:
+            level = logging.ERROR
+        elif duration_seconds > 1.0:
+            level = logging.WARNING
+        logger.log(
+            level,
+            "binary-security task list query result=%s project_id=%s task_type=%s page=%s page_size=%s total=%s item_count=%s duration=%.3fs stages=%s",
+            result,
+            project_id,
+            task_type,
+            page,
+            page_size,
+            total if total is not None else "-",
+            item_count if item_count is not None else "-",
+            duration_seconds,
+            stage_summary or "-",
+        )
 
     def _task_response(
         self,

@@ -13932,7 +13932,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("2026-05-29T22:39:20", summary_by_stage["system_analysis"].started_at.isoformat())
         self.assertEqual("2026-05-29T23:47:06", summary_by_stage["system_analysis"].finished_at.isoformat())
 
-    def test_list_tasks_refreshes_active_stage_from_authoritative_items(self):
+    def test_list_tasks_does_not_refresh_active_stage_from_authoritative_items(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -13988,7 +13988,42 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("running", summary_by_stage["entry_analysis"].status)
         self.assertEqual(1, summary_by_stage["entry_analysis"].total_items)
         self.assertEqual(1, summary_by_stage["entry_analysis"].running_items)
-        self.assertEqual("running", task.stage_summary["entry_analysis"]["status"])
+        self.assertEqual("pending", task.stage_summary["entry_analysis"]["status"])
+
+    def test_list_tasks_manual_operation_state_uses_prefetched_operations_without_new_session(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source-task",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            current_operation_id="op1",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/output",
+            workspace_root="/workspace",
+        )
+        task.policy = {}
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="retry_stage_full",
+            operation_token="tok1",
+            status="running",
+            owner_instance_id="pod-a",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation])
+
+        with patch.object(task_manager_module, "get_session_factory", side_effect=AssertionError("list_tasks should not allocate per-task sessions")):
+            response = self.manager.list_tasks(db, project_id="p1")
+
+        manual_state = response.items[0].manual_operation_state
+        self.assertEqual("in_progress", manual_state["overall"])
+        self.assertTrue(manual_state["operation_in_progress"])
+        self.assertEqual("op1", manual_state["operation_id"])
+        self.assertEqual("retry_stage_full", manual_state["operation_type"])
 
     def test_refresh_system_analysis_stage_preserves_failed_item_reason_when_no_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
