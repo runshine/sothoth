@@ -150,7 +150,7 @@ COPY start.sh /app/start.sh
 RUN mkdir -p /app/data \
     && chmod +x /app/start.sh
 
-ARG SECFLOW_BUILD_VERSION=dev
+ARG SECFLOW_BUILD_VERSION=""
 RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
 EXPOSE 8080
