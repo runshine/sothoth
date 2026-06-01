@@ -1339,13 +1339,13 @@ def test_reconcile_stale_runtime_without_process_requeues_instead_of_failing(ser
         db.commit()
         db.refresh(execution)
         db.refresh(trigger)
-        assert execution.status == "pending"
+        assert execution.status == "queued"
         assert execution.owner_pod_id is None
         assert execution.worker_job_id is None
         assert execution.worker_url is None
-        assert execution.dispatch_status is None
+        assert execution.dispatch_status == "queued"
         assert execution.process_status == "not_started"
-        assert trigger.status == "pending"
+        assert trigger.status == "queued"
         event = (
             db.query(WorkflowExecutionEvent)
             .filter(
@@ -1355,6 +1355,8 @@ def test_reconcile_stale_runtime_without_process_requeues_instead_of_failing(ser
             .first()
         )
         assert event is not None
+
+
 
 
 def test_reconcile_unbound_running_without_runtime_evidence_requeues_to_pending(service_config_path):

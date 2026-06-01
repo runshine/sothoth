@@ -5894,10 +5894,10 @@ class ExecutionService:
                 "event_type": "execution_cancelled",
             }
         return {
-            "terminal_status": "failed",
-            "control_status": "failed",
-            "message": "stale active runtime assumed failed",
-            "event_type": "execution_failed",
+            "terminal_status": "queued",
+            "control_status": "pending",
+            "message": "stale active runtime awaiting recovery",
+            "event_type": "stale_runtime_recovery_pending",
         }
 
     def _enrich_run_payload(
@@ -6207,6 +6207,51 @@ class ExecutionService:
                 )
             return True
 
+        if terminal_status == "queued":
+            if self._requeue_stale_runtime_without_process(
+                db,
+                run_index=run_index,
+                trigger=trigger,
+                execution=execution,
+                message=message,
+                process_state={**process_state, "source": "stale_runtime_recovery_pending"},
+            ):
+                if execution is not None:
+                    self.record_event(
+                        db,
+                        execution_id=execution.id,
+                        event_type=event_type,
+                        message=message,
+                        level="warning",
+                        payload_json={"reason": "stale_runtime_recovery_pending", "process_state": process_state},
+                    )
+                return True
+            if execution is not None:
+                execution.message = "stale active runtime kept running by run evidence"
+                db.add(execution)
+            if trigger is not None:
+                trigger.message = "stale active runtime kept running by run evidence"
+                db.add(trigger)
+            if run_index is not None:
+                self._write_run_control_state(
+                    run_index.run_root_path,
+                    status_text="running",
+                    message="stale active runtime kept running by run evidence",
+                )
+                get_run_index_service().sync_execution_run(db, execution)
+            if execution is not None:
+                self._refresh_task_list_projection_for_execution(db, execution)
+                db.flush()
+                self.record_event(
+                    db,
+                    execution_id=execution.id,
+                    event_type="stale_runtime_kept_running",
+                    message="stale active runtime kept running by run evidence",
+                    level="warning",
+                    payload_json={"reason": "stale_runtime_kept_running", "process_state": process_state},
+                )
+            return True
+
         self._mark_stale_runtime_exited(
             db,
             trigger=trigger,
@@ -6291,10 +6336,10 @@ class ExecutionService:
         execution.worker_url = None
         execution.worker_job_id = None
         execution.owner_pod_id = None
-        execution.status = "pending"
-        execution.public_status = "pending"
+        execution.status = "queued"
+        execution.public_status = "queued"
         execution.control_state = "none"
-        execution.dispatch_status = None
+        execution.dispatch_status = "queued"
         execution.dispatch_error = message
         execution.process_status = "not_started"
         execution.process_pid = None
@@ -6304,19 +6349,19 @@ class ExecutionService:
         execution.finished_at = None
         execution.message = requeue_message
         if trigger is not None:
-            trigger.status = "pending"
-            trigger.public_status = "pending"
+            trigger.status = "queued"
+            trigger.public_status = "queued"
             trigger.control_state = "none"
             trigger.started_at = None
             trigger.finished_at = None
             trigger.message = requeue_message
             db.add(trigger)
-        self._sync_runtime_state_snapshots(trigger=trigger, execution=execution, public_status="pending", control_state="none")
+        self._sync_runtime_state_snapshots(trigger=trigger, execution=execution, public_status="queued", control_state="none")
         db.add(execution)
         self._refresh_task_list_projection_for_execution(db, execution)
         db.flush()
         if run_index is not None:
-            self._write_run_control_state(run_index.run_root_path, status_text="pending", message=requeue_message)
+            self._write_run_control_state(run_index.run_root_path, status_text="queued", message=requeue_message)
             get_run_index_service().sync_execution_run(db, execution)
         self.record_event(
             db,
