@@ -59,8 +59,10 @@ def _metrics_rows():
 
 
 def _service_role() -> str:
-    raw_role = os.environ.get("SECFLOW_B2S_ROLE") or ""
+    raw_role = os.environ.get("SECFLOW_B2S_ROLE") or os.environ.get("ROLE") or ""
     normalized = str(raw_role).strip().lower()
+    if normalized == "manager":
+        return "api"
     return normalized if normalized in {"api", "worker"} else "all"
 
 

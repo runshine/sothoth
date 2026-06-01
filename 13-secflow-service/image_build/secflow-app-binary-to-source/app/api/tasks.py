@@ -17,6 +17,7 @@ from app.schemas import ActionResponse, B2SAgentSessionRuntimeResponse, B2SArtif
 from app.service.auth import get_auth_service
 from app.service.cache_service import get_cache_service
 from app.service.configcenter import get_configcenter_client
+from app.main import _service_role
 from app.service.config_service import get_config_service
 from app.service.project import get_project_service
 from app.service.pi_cluster import PiWorkerActiveJobSnapshot, PiWorkerSnapshot, fetch_worker_active_jobs, get_pi_cluster_monitor
@@ -135,7 +136,7 @@ async def health_check():
     return {
         "status": "ok",
         "service": "secflow-app-binary-to-source",
-        "role": str(__import__("os").environ.get("SECFLOW_B2S_ROLE") or "all").strip().lower() or "all",
+        "role": _service_role(),
         **build_service_meta(),
     }
 
