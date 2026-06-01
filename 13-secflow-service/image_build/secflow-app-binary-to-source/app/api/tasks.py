@@ -14,7 +14,7 @@ from app.build_info import build_service_meta
 from app.exception import NotFoundError, UnauthorizedError, ValidationError
 from app.model import B2STask, B2STaskItem, get_db
 from app.runtime_role import get_service_role
-from app.schemas import ActionResponse, B2SAgentSessionRuntimeResponse, B2SArtifactContentResponse, B2SCacheBatchDeleteRequest, B2SCacheBatchDeleteResponse, B2SCacheDeleteResponse, B2SCacheDetailResponse, B2SCacheListResponse, B2SServiceConfig, B2STaskTimelineResponse, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, SessionFileResponse, SessionIndexResponse, TaskBatchDeleteItemResult, TaskBatchDeleteRequest, TaskBatchDeleteResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskListResponse, TaskObservabilitySummary, TaskPrepareResponse, TaskRelationshipResponse, TaskResponse, TaskResultSummary, TokenUser
+from app.schemas import ActionResponse, B2SAgentSessionRuntimeResponse, B2SArtifactContentResponse, B2SCacheBatchDeleteRequest, B2SCacheBatchDeleteResponse, B2SCacheDeleteResponse, B2SCacheDetailResponse, B2SCacheListResponse, B2SServiceConfig, B2STaskListStatsResponse, B2STaskTimelineResponse, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, SessionFileResponse, SessionIndexResponse, TaskBatchDeleteItemResult, TaskBatchDeleteRequest, TaskBatchDeleteResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskListResponse, TaskObservabilitySummary, TaskPrepareResponse, TaskRelationshipResponse, TaskResponse, TaskResultSummary, TokenUser
 from app.service.auth import get_auth_service
 from app.service.cache_service import get_cache_service
 from app.service.configcenter import get_configcenter_client
@@ -30,6 +30,7 @@ from app.service.task_service import (
     build_task_item_review_analytics,
     build_task_item_observability_summary,
     build_task_observability_summary,
+    build_task_list_stats,
     build_task_agent_session_runtime,
     build_task_relationship,
     build_task_result_summary,
@@ -303,8 +304,13 @@ def batch_delete_b2s_cache_entries(
 def list_tasks(
     project_id: str,
     status: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
     parent_task_id: Optional[str] = Query(None),
     parent_stage_item_id: Optional[str] = Query(None),
+    task_origin_type: Optional[str] = Query(None),
+    input_filename: Optional[str] = Query(None),
+    sort_by: str = Query("created_at"),
+    sort_order: str = Query("desc"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     _: TokenUser = Depends(get_current_context),
@@ -317,10 +323,96 @@ def list_tasks(
         query = query.filter(B2STask.parent_task_id == parent_task_id)
     if parent_stage_item_id:
         query = query.filter(B2STask.parent_stage_item_id == parent_stage_item_id)
+    if task_origin_type:
+        query = query.filter(B2STask.task_origin_type == task_origin_type)
+    search_text = str(search or "").strip()
+    if search_text:
+        escaped = search_text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        query = query.filter(or_(
+            B2STask.id.ilike(pattern, escape="\\"),
+            B2STask.name.ilike(pattern, escape="\\"),
+            B2STask.parent_task_id.ilike(pattern, escape="\\"),
+            B2STask.parent_task_type.ilike(pattern, escape="\\"),
+            B2STask.parent_stage_name.ilike(pattern, escape="\\"),
+            B2STask.parent_stage_item_id.ilike(pattern, escape="\\"),
+            B2STask.origin_label.ilike(pattern, escape="\\"),
+            B2STask.parent_task_display.ilike(pattern, escape="\\"),
+        ))
+    filename_text = str(input_filename or "").strip()
+    if filename_text:
+        escaped = filename_text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        query = query.filter(
+            B2STask.id.in_(
+                db.query(B2STaskItem.task_id)
+                .filter(B2STaskItem.task_id == B2STask.id)
+                .filter(B2STaskItem.elf_path.ilike(pattern, escape="\\"))
+            )
+        )
     total = query.count()
-    tasks = query.order_by(B2STask.created_at.desc()).offset(offset).limit(limit).all()
+    sort_column = {
+        "created_at": B2STask.created_at,
+        "updated_at": B2STask.updated_at,
+        "started_at": B2STask.started_at,
+        "finished_at": B2STask.finished_at,
+        "status": B2STask.status,
+        "name": B2STask.name,
+    }.get(sort_by, B2STask.created_at)
+    order_expr = sort_column.asc() if str(sort_order or "").lower() == "asc" else sort_column.desc()
+    tasks = query.order_by(order_expr, B2STask.created_at.desc()).offset(offset).limit(limit).all()
     items = [build_task_response(db, task) for task in tasks]
     return TaskListResponse(total=total, items=items)
+
+
+@router.get("/projects/{project_id}/tasks/stats", response_model=B2STaskListStatsResponse)
+def get_task_stats(
+    project_id: str,
+    status: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    parent_task_id: Optional[str] = Query(None),
+    parent_stage_item_id: Optional[str] = Query(None),
+    task_origin_type: Optional[str] = Query(None),
+    input_filename: Optional[str] = Query(None),
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    query = db.query(B2STask).filter(B2STask.project_id == project_id)
+    if status:
+        query = query.filter(B2STask.status == status)
+    if parent_task_id:
+        query = query.filter(B2STask.parent_task_id == parent_task_id)
+    if parent_stage_item_id:
+        query = query.filter(B2STask.parent_stage_item_id == parent_stage_item_id)
+    if task_origin_type:
+        query = query.filter(B2STask.task_origin_type == task_origin_type)
+    search_text = str(search or "").strip()
+    if search_text:
+        escaped = search_text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        query = query.filter(or_(
+            B2STask.id.ilike(pattern, escape="\\"),
+            B2STask.name.ilike(pattern, escape="\\"),
+            B2STask.parent_task_id.ilike(pattern, escape="\\"),
+            B2STask.parent_task_type.ilike(pattern, escape="\\"),
+            B2STask.parent_stage_name.ilike(pattern, escape="\\"),
+            B2STask.parent_stage_item_id.ilike(pattern, escape="\\"),
+            B2STask.origin_label.ilike(pattern, escape="\\"),
+            B2STask.parent_task_display.ilike(pattern, escape="\\"),
+        ))
+    filename_text = str(input_filename or "").strip()
+    if filename_text:
+        escaped = filename_text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        query = query.filter(
+            B2STask.id.in_(
+                db.query(B2STaskItem.task_id)
+                .filter(B2STaskItem.task_id == B2STask.id)
+                .filter(B2STaskItem.elf_path.ilike(pattern, escape="\\"))
+            )
+        )
+    tasks = query.all()
+    return build_task_list_stats(db, tasks)
 
 
 @router.get("/projects/{project_id}/pi-cluster", response_model=PiClusterCapacityResponse)

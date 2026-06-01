@@ -772,6 +772,16 @@ class TaskListResponse(BaseModel):
     items: list[TaskResponse]
 
 
+class B2STaskListStatsResponse(BaseModel):
+    total: int = 0
+    pending: int = 0
+    running: int = 0
+    success: int = 0
+    partial: int = 0
+    failed: int = 0
+    cancelled: int = 0
+
+
 class ReviewAnalyticsAttempt(BaseModel):
     attempt_no: int
     label: Optional[str] = None

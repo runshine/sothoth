@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import urlencode
 from uuid import uuid4
 
+from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -68,6 +69,7 @@ from app.schemas import (
     TaskConfigSnapshot,
     TaskCreate,
     TaskDetailResponse,
+    B2STaskListStatsResponse,
     TaskItemAdvancedResponse,
     TaskItemArtifactsResponse,
     TaskItemResponse,
@@ -3545,6 +3547,36 @@ def build_task_response(db: Session, task: B2STask) -> TaskResponse:
         abnormal_reason_category=abnormal_reason.category if abnormal_reason else None,
         abnormal_reason=abnormal_reason,
         **counts,
+    )
+
+
+def build_task_list_stats(db: Session, tasks: list[B2STask]) -> B2STaskListStatsResponse:
+    counts = {
+        "pending": 0,
+        "running": 0,
+        "success": 0,
+        "partial": 0,
+        "failed": 0,
+        "cancelled": 0,
+    }
+    for task in tasks:
+        normalized = str(task.status or "").strip().lower()
+        if normalized == "queued":
+            normalized = "pending"
+        elif normalized == "partial_success":
+            normalized = "partial"
+        elif normalized == "completed":
+            normalized = "success"
+        if normalized in counts:
+            counts[normalized] += 1
+    return B2STaskListStatsResponse(
+        total=len(tasks),
+        pending=counts["pending"],
+        running=counts["running"],
+        success=counts["success"],
+        partial=counts["partial"],
+        failed=counts["failed"],
+        cancelled=counts["cancelled"],
     )
 
 
