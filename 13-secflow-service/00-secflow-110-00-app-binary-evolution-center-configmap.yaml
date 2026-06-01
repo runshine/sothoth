@@ -14,7 +14,7 @@ data:
       host: "mysql.sothothv2-ns.svc.cluster.local"
       port: 3306
       username: "secflow"
-      password: "${SECFLOW_BINARY_EVOLUTION_DB_PASSWORD}"
+      password: "Huawei12#$"
       name: "secflow"
       table_prefix: "secflow_binary_evolution_"
       pool_size: 10
@@ -26,7 +26,7 @@ data:
       port: 80
       validate_human_token_path: "/api/auth/validate-human-token"
       validate_machine_token_path: "/api/auth/validate-token"
-      service_machine_token: "${SECFLOW_BINARY_EVOLUTION_SERVICE_MACHINE_TOKEN}"
+      service_machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
       timeout: 10
 
     project_service:
