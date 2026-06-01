@@ -21,6 +21,7 @@ from app.api.tasks import router
 from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
 from app.metrics_aggregate import get_metrics_aggregator
+from app.metrics_summary import build_ai_summary, build_binary_security_observability_summary, build_rest_api_summary, parse_prometheus_metrics
 from app.model import get_engine, init_database
 from app.observability import (
     normalize_http_route,
@@ -303,6 +304,27 @@ async def aggregate_metrics_endpoint():
         duration_seconds=time.perf_counter() - started,
     )
     return Response(content=aggregated.payload, media_type=aggregated.content_type)
+
+
+@app.get("/api/app/binary-security/metrics/summary", include_in_schema=False)
+async def metrics_summary_endpoint():
+    aggregated = await get_metrics_aggregator().aggregate()
+    rows = parse_prometheus_metrics(aggregated.payload.decode("utf-8", errors="ignore"))
+    return build_binary_security_observability_summary(rows)
+
+
+@app.get("/api/app/binary-security/metrics/rest-api-summary", include_in_schema=False)
+async def metrics_rest_api_summary_endpoint():
+    aggregated = await get_metrics_aggregator().aggregate()
+    rows = parse_prometheus_metrics(aggregated.payload.decode("utf-8", errors="ignore"))
+    return build_rest_api_summary(rows)
+
+
+@app.get("/api/app/binary-security/metrics/ai-summary", include_in_schema=False)
+async def metrics_ai_summary_endpoint():
+    aggregated = await get_metrics_aggregator().aggregate()
+    rows = parse_prometheus_metrics(aggregated.payload.decode("utf-8", errors="ignore"))
+    return build_ai_summary(rows, coverage_text="编排器 AI 指标聚合，覆盖调度、状态同步与下游协同相关调用。")
 
 
 @app.get("/api/app/binary-security/metrics/reducer", include_in_schema=False)

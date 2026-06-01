@@ -19,6 +19,7 @@ from app.pi_vuln_core.config.loader import ConfigValidationError
 from app.pi_vuln_core.runner import load_framework_config_from_path, run_framework_config
 from app.pi_vuln_core.utils.win_compat import ensure_event_loop_policy
 from app.observability import build_metrics_response, observe_http_request, observe_http_request_inflight
+from app.metrics_summary import build_ai_summary, build_generic_observability_summary, build_rest_api_summary, parse_prometheus_metrics
 from app.runtime_bootstrap import get_runtime_bootstrap
 from app.services.auth import get_auth_service
 from app.services.llm_provider_sync import sync_providers_to_pi
@@ -134,6 +135,24 @@ def create_app() -> FastAPI:
     @app.get("/api/app/dataflow-vuln-scanner/metrics", include_in_schema=False)
     async def metrics():
         return build_metrics_response()
+
+    @app.get("/api/app/dataflow-vuln-scanner/metrics/summary", include_in_schema=False)
+    async def metrics_summary():
+        response = build_metrics_response()
+        rows = parse_prometheus_metrics(response.body)
+        return build_generic_observability_summary(rows, title="数据流漏洞挖掘")
+
+    @app.get("/api/app/dataflow-vuln-scanner/metrics/rest-api-summary", include_in_schema=False)
+    async def metrics_rest_api_summary():
+        response = build_metrics_response()
+        rows = parse_prometheus_metrics(response.body)
+        return build_rest_api_summary(rows)
+
+    @app.get("/api/app/dataflow-vuln-scanner/metrics/ai-summary", include_in_schema=False)
+    async def metrics_ai_summary():
+        response = build_metrics_response()
+        rows = parse_prometheus_metrics(response.body)
+        return build_ai_summary(rows, coverage_text="数据流漏洞挖掘 AI 指标覆盖 cycle、candidate、judge 与 token/cost。")
 
     return app
 

@@ -17,6 +17,7 @@ from app.api.tasks import router
 from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
 from app.model import get_engine, init_database
+from app.metrics_summary import build_ai_summary, build_generic_observability_summary, build_rest_api_summary, parse_prometheus_metrics
 from app.observability import get_observability
 from app.service.dispatcher import get_dispatcher
 from app.service.llm_provider import materialize_llm_provider
@@ -165,6 +166,27 @@ app.include_router(router)
 @app.get("/api/app/binary-to-source/metrics", include_in_schema=False)
 async def metrics():
     return get_observability().metrics_response()
+
+
+@app.get("/api/app/binary-to-source/metrics/summary", include_in_schema=False)
+async def metrics_summary():
+    response = get_observability().metrics_response()
+    rows = parse_prometheus_metrics(response.body)
+    return build_generic_observability_summary(rows, title="二进制逆向")
+
+
+@app.get("/api/app/binary-to-source/metrics/rest-api-summary", include_in_schema=False)
+async def metrics_rest_api_summary():
+    response = get_observability().metrics_response()
+    rows = parse_prometheus_metrics(response.body)
+    return build_rest_api_summary(rows)
+
+
+@app.get("/api/app/binary-to-source/metrics/ai-summary", include_in_schema=False)
+async def metrics_ai_summary():
+    response = get_observability().metrics_response()
+    rows = parse_prometheus_metrics(response.body)
+    return build_ai_summary(rows, coverage_text="二进制逆向 AI 指标覆盖函数恢复、评审、缓存与 token/cost。")
 
 
 if __name__ == "__main__":

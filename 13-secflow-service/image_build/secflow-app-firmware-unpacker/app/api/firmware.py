@@ -51,6 +51,7 @@ from app.schemas import (
 from app.services.pod_metrics import get_pod_resource_usage
 from app.services.configcenter import get_configcenter_client
 from app.services.observability import generate_metrics_payload, metrics_content_type
+from app.metrics_summary import build_ai_summary, build_generic_observability_summary, build_rest_api_summary, parse_prometheus_metrics
 from app.services.task_events import list_task_events
 from app.services.task_manager import (
     cancel_task,
@@ -94,6 +95,24 @@ RUNTIME_ALLOWED_ROOTS = [
 @router.get("/api/app/firmware-unpacker/metrics", include_in_schema=False)
 async def metrics() -> Response:
     return Response(content=generate_metrics_payload(), media_type=metrics_content_type())
+
+
+@router.get("/api/app/firmware-unpacker/metrics/summary", include_in_schema=False)
+async def metrics_summary() -> dict[str, Any]:
+    rows = parse_prometheus_metrics(generate_metrics_payload())
+    return build_generic_observability_summary(rows, title="固件解包")
+
+
+@router.get("/api/app/firmware-unpacker/metrics/rest-api-summary", include_in_schema=False)
+async def metrics_rest_api_summary() -> dict[str, Any]:
+    rows = parse_prometheus_metrics(generate_metrics_payload())
+    return build_rest_api_summary(rows)
+
+
+@router.get("/api/app/firmware-unpacker/metrics/ai-summary", include_in_schema=False)
+async def metrics_ai_summary() -> dict[str, Any]:
+    rows = parse_prometheus_metrics(generate_metrics_payload())
+    return build_ai_summary(rows, coverage_text="固件解包 AI 指标覆盖工具调用、任务执行与 token/cost。")
 
 
 def _normalize_project_id(project_id: Optional[str]) -> Optional[str]:
