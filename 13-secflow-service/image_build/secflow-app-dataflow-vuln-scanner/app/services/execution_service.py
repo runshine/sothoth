@@ -1113,13 +1113,19 @@ class ExecutionService:
                 "orphaned_cancel_requested",
                 "orphaned_delete_requested",
             }
-            if not needs_state_reconcile and not projection_drift:
+            run_index_drift = (
+                run_index is not None
+                and trigger is not None
+                and _public_task_status(trigger.status) in {"success", "failed", "cancelled"}
+                and _public_task_status(run_index.status) in _ACTIVE_RECONCILE_RUN_INDEX_STATUSES
+            )
+            if not needs_state_reconcile and not projection_drift and not run_index_drift:
                 continue
             if dry_run:
                 reconciled_count += 1
                 if needs_state_reconcile:
                     terminalized_count += 1
-                if projection_drift:
+                if projection_drift or run_index_drift:
                     projection_refreshed_count += 1
                 if len(sample_task_ids) < 20:
                     sample_task_ids.append(trigger.id)
@@ -1146,14 +1152,15 @@ class ExecutionService:
                 )
                 changed = True
                 terminalized_count += 1
-            if changed or projection_drift:
-                if self._reconcile_stale_run_index_to_terminal_task(
-                    db,
-                    run_index=run_index,
-                    trigger=trigger,
-                    execution=latest_execution,
-                ):
-                    changed = True
+            if self._reconcile_stale_run_index_to_terminal_task(
+                db,
+                run_index=run_index,
+                trigger=trigger,
+                execution=latest_execution,
+            ):
+                changed = True
+                run_index_drift = True
+            if changed or projection_drift or run_index_drift:
                 self._refresh_task_list_projection_for_task_id(db, trigger.id)
                 projection_refreshed_count += 1
                 reconciled_count += 1
