@@ -5,10 +5,13 @@ import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
+from threading import Lock
+from typing import Any, Callable
 
 import time
 
 from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -33,6 +36,26 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
+_SUMMARY_CACHE_TTL_SECONDS = 5.0
+_summary_cache: dict[str, tuple[float, Any]] = {}
+_summary_cache_lock = Lock()
+
+
+def _cached_summary(key: str, builder: Callable[[], Any]) -> Any:
+    now = time.monotonic()
+    with _summary_cache_lock:
+        cached = _summary_cache.get(key)
+        if cached and now - cached[0] <= _SUMMARY_CACHE_TTL_SECONDS:
+            return cached[1]
+    value = builder()
+    with _summary_cache_lock:
+        _summary_cache[key] = (time.monotonic(), value)
+    return value
+
+
+def _metrics_rows():
+    response = build_metrics_response()
+    return parse_prometheus_metrics(response.body)
 
 
 @asynccontextmanager
@@ -83,6 +106,13 @@ def create_app() -> FastAPI:
                         "/api/dataflow-vuln-scanner/ready",
                         "/api/dataflow-vuln-scanner/workers/cluster-capacity",
                         "/api/app/dataflow-vuln-scanner/metrics",
+                        "/api/app/dataflow-vuln-scanner/metrics/summary",
+                        "/api/app/dataflow-vuln-scanner/metrics/rest-api-summary",
+                        "/api/app/dataflow-vuln-scanner/metrics/ai-summary",
+                        "/api/dataflow-vuln-scanner/metrics",
+                        "/api/dataflow-vuln-scanner/metrics/summary",
+                        "/api/dataflow-vuln-scanner/metrics/rest-api-summary",
+                        "/api/dataflow-vuln-scanner/metrics/ai-summary",
                         "/metrics",
                         "/openapi.json",
                     }
@@ -96,6 +126,13 @@ def create_app() -> FastAPI:
                         "/api/dataflow-vuln-scanner/health",
                         "/api/dataflow-vuln-scanner/ready",
                         "/api/app/dataflow-vuln-scanner/metrics",
+                        "/api/app/dataflow-vuln-scanner/metrics/summary",
+                        "/api/app/dataflow-vuln-scanner/metrics/rest-api-summary",
+                        "/api/app/dataflow-vuln-scanner/metrics/ai-summary",
+                        "/api/dataflow-vuln-scanner/metrics",
+                        "/api/dataflow-vuln-scanner/metrics/summary",
+                        "/api/dataflow-vuln-scanner/metrics/rest-api-summary",
+                        "/api/dataflow-vuln-scanner/metrics/ai-summary",
                         "/metrics",
                         "/openapi.json",
                     }
@@ -133,26 +170,36 @@ def create_app() -> FastAPI:
 
     @app.get("/metrics", include_in_schema=False)
     @app.get("/api/app/dataflow-vuln-scanner/metrics", include_in_schema=False)
+    @app.get("/api/dataflow-vuln-scanner/metrics", include_in_schema=False)
     async def metrics():
         return build_metrics_response()
 
     @app.get("/api/app/dataflow-vuln-scanner/metrics/summary", include_in_schema=False)
+    @app.get("/api/dataflow-vuln-scanner/metrics/summary", include_in_schema=False)
     async def metrics_summary():
-        response = build_metrics_response()
-        rows = parse_prometheus_metrics(response.body)
-        return build_generic_observability_summary(rows, title="数据流漏洞挖掘")
+        return await run_in_threadpool(
+            _cached_summary,
+            "summary",
+            lambda: build_generic_observability_summary(_metrics_rows(), title="数据流漏洞挖掘"),
+        )
 
     @app.get("/api/app/dataflow-vuln-scanner/metrics/rest-api-summary", include_in_schema=False)
+    @app.get("/api/dataflow-vuln-scanner/metrics/rest-api-summary", include_in_schema=False)
     async def metrics_rest_api_summary():
-        response = build_metrics_response()
-        rows = parse_prometheus_metrics(response.body)
-        return build_rest_api_summary(rows)
+        return await run_in_threadpool(
+            _cached_summary,
+            "rest-api-summary",
+            lambda: build_rest_api_summary(_metrics_rows()),
+        )
 
     @app.get("/api/app/dataflow-vuln-scanner/metrics/ai-summary", include_in_schema=False)
+    @app.get("/api/dataflow-vuln-scanner/metrics/ai-summary", include_in_schema=False)
     async def metrics_ai_summary():
-        response = build_metrics_response()
-        rows = parse_prometheus_metrics(response.body)
-        return build_ai_summary(rows, coverage_text="数据流漏洞挖掘 AI 指标覆盖 cycle、candidate、judge 与 token/cost。")
+        return await run_in_threadpool(
+            _cached_summary,
+            "ai-summary",
+            lambda: build_ai_summary(_metrics_rows(), coverage_text="数据流漏洞挖掘 AI 指标覆盖 cycle、candidate、judge 与 token/cost。"),
+        )
 
     return app
 

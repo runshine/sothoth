@@ -6,12 +6,16 @@ import json
 import logging
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
+from threading import Lock
+from typing import Callable, Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 
 from app.api.tasks import router
 from app.config import get_config, load_config
@@ -31,6 +35,26 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
+_SUMMARY_CACHE_TTL_SECONDS = 5.0
+_summary_cache: dict[str, tuple[float, Any]] = {}
+_summary_cache_lock = Lock()
+
+
+def _cached_summary(key: str, builder: Callable[[], Any]) -> Any:
+    now = time.monotonic()
+    with _summary_cache_lock:
+        cached = _summary_cache.get(key)
+        if cached and now - cached[0] <= _SUMMARY_CACHE_TTL_SECONDS:
+            return cached[1]
+    value = builder()
+    with _summary_cache_lock:
+        _summary_cache[key] = (time.monotonic(), value)
+    return value
+
+
+def _metrics_rows():
+    response = get_observability().metrics_response()
+    return parse_prometheus_metrics(response.body)
 
 
 def _service_role() -> str:
@@ -170,23 +194,29 @@ async def metrics():
 
 @app.get("/api/app/binary-to-source/metrics/summary", include_in_schema=False)
 async def metrics_summary():
-    response = get_observability().metrics_response()
-    rows = parse_prometheus_metrics(response.body)
-    return build_generic_observability_summary(rows, title="二进制逆向")
+    return await run_in_threadpool(
+        _cached_summary,
+        "summary",
+        lambda: build_generic_observability_summary(_metrics_rows(), title="二进制逆向"),
+    )
 
 
 @app.get("/api/app/binary-to-source/metrics/rest-api-summary", include_in_schema=False)
 async def metrics_rest_api_summary():
-    response = get_observability().metrics_response()
-    rows = parse_prometheus_metrics(response.body)
-    return build_rest_api_summary(rows)
+    return await run_in_threadpool(
+        _cached_summary,
+        "rest-api-summary",
+        lambda: build_rest_api_summary(_metrics_rows()),
+    )
 
 
 @app.get("/api/app/binary-to-source/metrics/ai-summary", include_in_schema=False)
 async def metrics_ai_summary():
-    response = get_observability().metrics_response()
-    rows = parse_prometheus_metrics(response.body)
-    return build_ai_summary(rows, coverage_text="二进制逆向 AI 指标覆盖函数恢复、评审、缓存与 token/cost。")
+    return await run_in_threadpool(
+        _cached_summary,
+        "ai-summary",
+        lambda: build_ai_summary(_metrics_rows(), coverage_text="二进制逆向 AI 指标覆盖函数恢复、评审、缓存与 token/cost。"),
+    )
 
 
 if __name__ == "__main__":
