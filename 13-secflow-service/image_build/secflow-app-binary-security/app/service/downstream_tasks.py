@@ -19,6 +19,10 @@ from app.model import BinarySecurityStageItem, BinarySecurityTask
 from app.time_utils import now_local
 
 
+DOWNSTREAM_REF_ACTIVE_STATUSES = {"queued", "running", "dispatching", "pending", "cancelling", "cancel_requested"}
+DOWNSTREAM_REF_DELETED_STATUSES = {"deleted", "missing", "downstream_missing", "not_found"}
+
+
 def get_binary_to_source_client():
     from app.service import task_manager as task_manager_module
 
@@ -805,6 +809,8 @@ class DownstreamTaskController:
         return await self.gateway.delete_task(service, project_id=project_id, task_id=task_id, token=token)
 
     async def delete_child_refs(self, db: Session, task: BinarySecurityTask, refs: list[dict[str, str]], token: str | None) -> int:
+        cleanup_results: list[dict[str, Any]] = []
+        setattr(self.manager, "_last_downstream_cleanup_results", cleanup_results)
         for ref in refs:
             event_item = self.manager._event_item_for_downstream_ref(db, task, ref)
             self._record_event(
@@ -821,6 +827,8 @@ class DownstreamTaskController:
             verification: dict[str, object] = {
                 "verified_absent": False,
                 "verified_deleted": False,
+                "observed_status": None,
+                "observed_active": False,
                 "verification_error": None,
             }
             service = str(ref.get("service") or "").strip()
@@ -837,19 +845,50 @@ class DownstreamTaskController:
                 verification["verification_error"] = str(verify_exc)
                 return False, verification
             payload_status = str((payload or {}).get("status") or "").strip().lower()
-            if payload_status in {"deleted", "cancelled"} and bool((payload or {}).get("is_deleted")):
+            mapped_status = self.manager._map_downstream_status(payload_status) or payload_status
+            verification["observed_status"] = mapped_status
+            verification["observed_active"] = mapped_status in DOWNSTREAM_REF_ACTIVE_STATUSES
+            if bool((payload or {}).get("is_deleted")) or mapped_status in DOWNSTREAM_REF_DELETED_STATUSES:
                 verification["verified_deleted"] = True
                 return True, verification
             return False, verification
 
-        async def do_delete(ref: dict[str, str]) -> bool:
-            await self.delete_child_task(
-                service=str(ref["service"]),
-                project_id=str(ref.get("project_id") or "") or None,
-                task_id=str(ref["task_id"]),
-                token=token,
-            )
-            return True
+        async def do_delete(ref: dict[str, str]) -> dict[str, Any]:
+            result: dict[str, Any] = {
+                **ref,
+                "operation": "delete",
+                "delete_status": "not_sent",
+                "verify_status": "not_checked",
+                "verified_absent": False,
+                "verified_deleted": False,
+                "blocking": False,
+                "error": None,
+            }
+            try:
+                payload = await self.delete_child_task(
+                    service=str(ref["service"]),
+                    project_id=str(ref.get("project_id") or "") or None,
+                    task_id=str(ref["task_id"]),
+                    token=token,
+                )
+                result["delete_status"] = "succeeded"
+                result["delete_payload"] = payload
+                return result
+            except ConflictError as exc:
+                result["delete_status"] = "conflict"
+                result["error"] = str(exc)
+            except Exception as exc:
+                result["delete_status"] = "failed"
+                result["error"] = str(exc)
+            verified_ok, verification = await verify_deleted(ref)
+            result.update(verification)
+            result["verify_status"] = "succeeded" if verified_ok else "failed"
+            if verified_ok:
+                result["delete_status"] = "succeeded_after_verify"
+                result["blocking"] = False
+                return result
+            result["blocking"] = bool(verification.get("observed_active") or result.get("delete_status") == "conflict")
+            return result
 
         db.commit()
         results = await self.manager._run_with_limits(
@@ -859,9 +898,22 @@ class DownstreamTaskController:
             timeout_seconds=self.manager.cfg.scheduler.downstream_request_timeout_seconds,
         )
         success_count = 0
-        for ref, ok, exc in results:
+        for ref, result, exc in results:
             event_item = self.manager._event_item_for_downstream_ref(db, task, ref)
-            if exc is None and ok:
+            cleanup_result = dict(result or {})
+            if exc is not None:
+                cleanup_result = {
+                    **ref,
+                    "operation": "delete",
+                    "delete_status": "failed",
+                    "verify_status": "not_checked",
+                    "blocking": True,
+                    "error": str(exc),
+                }
+            cleanup_results.append(cleanup_result)
+            delete_status = str(cleanup_result.get("delete_status") or "").strip()
+            verify_status = str(cleanup_result.get("verify_status") or "").strip()
+            if exc is None and delete_status == "succeeded":
                 success_count += 1
                 self._record_downstream_item_disposition(
                     db,
@@ -869,13 +921,10 @@ class DownstreamTaskController:
                     event_item,
                     event_type="child_task_delete_succeeded",
                     message=f"下游子任务已删除: {ref['service']}:{ref['task_id']}",
-                    payload={**ref, "operation": "delete"},
+                    payload=cleanup_result,
                 )
                 continue
-            if isinstance(exc, ConflictError):
-                raise ValidationError(f"旧下游任务仍在运行，不能安全删除: {ref['service']}:{ref['task_id']}") from exc
-            verified_ok, verification = await verify_deleted(ref)
-            if verified_ok:
+            if exc is None and verify_status == "succeeded":
                 success_count += 1
                 self._record_downstream_item_disposition(
                     db,
@@ -884,7 +933,7 @@ class DownstreamTaskController:
                     event_type="child_task_delete_verified_absent",
                     message=f"下游删除报错但已确认不存在: {ref['service']}:{ref['task_id']}",
                     level="warning",
-                    payload={**ref, **verification, "operation": "delete", "error": str(exc)},
+                    payload=cleanup_result,
                 )
                 self._record_downstream_item_disposition(
                     db,
@@ -893,20 +942,25 @@ class DownstreamTaskController:
                     event_type="child_task_delete_failed_but_ignored",
                     message=f"下游删除报错但已降级忽略: {ref['service']}:{ref['task_id']}",
                     level="warning",
-                    payload={**ref, **verification, "operation": "delete", "error": str(exc)},
+                    payload=cleanup_result,
                 )
                 continue
+            blocking_message = (
+                f"旧下游任务仍在运行，不能安全删除: {ref['service']}:{ref['task_id']}"
+                if cleanup_result.get("blocking")
+                else str(cleanup_result.get("error") or exc or "下游删除失败且无法确认资源已删除")
+            )
             self._record_event(
                 db,
                 task,
                 "child_task_delete_failed_blocking",
-                f"下游删除失败: {ref['service']}:{ref['task_id']} - {exc}",
+                f"下游删除失败: {ref['service']}:{ref['task_id']} - {blocking_message}",
                 stage_name=ref.get("stage_name"),
                 item=event_item,
                 level="warning",
-                payload={**ref, **verification, "operation": "delete", "error": str(exc)},
+                payload=cleanup_result,
             )
-            raise ValidationError(str(exc))
+            raise ValidationError(blocking_message)
         db.commit()
         return success_count
 

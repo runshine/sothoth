@@ -30,7 +30,7 @@ from app.model import (
     TASK_TYPE_BINARY_MODULE,
     TASK_TYPE_SOURCE,
 )
-from app.exception import NotFoundError, UpstreamError, ValidationError
+from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
 from app.schemas import BinarySecurityServiceConfigPayload
 from app.schemas import (
     BinarySecurityInputFile,
@@ -19251,10 +19251,64 @@ def _test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exi
                     "token",
                 )
             )
+    cleanup_results = list(getattr(self.manager, "_last_downstream_cleanup_results", []) or [])
+    self.assertEqual(1, len(cleanup_results))
+    self.assertEqual("failed", cleanup_results[0]["verify_status"])
+    self.assertFalse(cleanup_results[0]["blocking"])
+
+
+def _test_delete_downstream_refs_blocks_when_entry_delete_conflict_and_task_active(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="binary",
+        status="failed",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/tmp/out",
+        workspace_root="/tmp/ws",
+    )
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="IPSEC",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat_x",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+    client = _AsyncEntryAnalyseClientStub(delete_result=ConflictError("任务正在运行，请先取消后再删除"))
+
+    async def _active_task(task_id, token):
+        del token
+        return {"task_id": task_id, "status": "running"}
+
+    client.get_task = _active_task
+
+    with patch.object(downstream_tasks_module, "get_entry_analyse_client", return_value=client):
+        with self.assertRaises(ValidationError):
+            asyncio.run(
+                self.manager._delete_downstream_refs(
+                    db,
+                    task,
+                    [{"service": "entry_analyse", "task_id": "eat_x", "stage_name": "entry_analysis"}],
+                    "token",
+                )
+            )
+    cleanup_results = list(getattr(self.manager, "_last_downstream_cleanup_results", []) or [])
+    self.assertEqual(1, len(cleanup_results))
+    self.assertEqual("conflict", cleanup_results[0]["delete_status"])
+    self.assertEqual("failed", cleanup_results[0]["verify_status"])
+    self.assertTrue(cleanup_results[0]["blocking"])
 
 
 TaskManagerTests.test_delete_downstream_refs_treats_entry_delete_500_with_absent_task_as_success = _test_delete_downstream_refs_treats_entry_delete_500_with_absent_task_as_success
 TaskManagerTests.test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exists = _test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exists
+TaskManagerTests.test_delete_downstream_refs_blocks_when_entry_delete_conflict_and_task_active = _test_delete_downstream_refs_blocks_when_entry_delete_conflict_and_task_active
 
 
 def _test_task_manager_does_not_access_downstream_clients_directly(self):

@@ -2989,6 +2989,16 @@ class TaskManager:
         self._invalidate_task_execution(task)
         if downstream_refs:
             await self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token())
+        downstream_cleanup_results = [
+            dict(result)
+            for result in list(getattr(self, "_last_downstream_cleanup_results", []) or [])
+            if isinstance(result, dict)
+        ]
+        downstream_cleanup_blocking_refs = [
+            dict(result)
+            for result in downstream_cleanup_results
+            if bool(result.get("blocking"))
+        ]
         self._clear_stage_outputs_from(task, target_stage, mark_stale=False)
         deleted_archive_job_count = self._delete_archive_children_for_stages(db, task, affected_stages)
         deleted_stage_item_count = self._delete_stage_items_for_stages(db, task.id, affected_stages)
@@ -3021,6 +3031,8 @@ class TaskManager:
             "deleted_state_event_count": deleted_state_event_count,
             "deleted_timeline_event_count": deleted_timeline_event_count,
             "cleared_output_roots": cleared_output_roots,
+            "downstream_cleanup_results": downstream_cleanup_results,
+            "downstream_cleanup_blocking_refs": downstream_cleanup_blocking_refs,
         }
         self._record_event(
             db,
@@ -13151,6 +13163,17 @@ class TaskManager:
             item_actions = [dict(row) for row in list(result_payload.get("item_actions") or []) if isinstance(row, dict)]
             validation = dict(result_payload.get("validation") or {})
             requeue = dict(result_payload.get("requeue") or {})
+            cleanup_result = dict(result_payload.get("cleanup_result") or {})
+            downstream_cleanup_results = [
+                dict(row)
+                for row in list(cleanup_result.get("downstream_cleanup_results") or result_payload.get("downstream_cleanup_results") or [])
+                if isinstance(row, dict)
+            ]
+            downstream_cleanup_blocking_refs = [
+                dict(row)
+                for row in list(cleanup_result.get("downstream_cleanup_blocking_refs") or result_payload.get("downstream_cleanup_blocking_refs") or [])
+                if isinstance(row, dict)
+            ]
             return {
                 "overall": "in_progress",
                 "summary": blocking_reason,
@@ -13171,6 +13194,12 @@ class TaskManager:
                 "validation": validation,
                 "issues": list(validation.get("issues") or []),
                 "requeue": requeue,
+                "error_code": active_operation.error_code,
+                "error_message": active_operation.error_message,
+                "downstream_cleanup_results": downstream_cleanup_results,
+                "downstream_cleanup_blocking_refs": downstream_cleanup_blocking_refs,
+                "downstream_cleanup_result_count": len(downstream_cleanup_results),
+                "downstream_cleanup_blocking_count": len(downstream_cleanup_blocking_refs),
                 "can_cancel": False,
                 "can_continue": False,
                 "can_retry": False,
