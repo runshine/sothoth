@@ -192,6 +192,11 @@ ARCHIVE_ACTIONS_TOTAL = Counter(
     "Total archive pipeline actions.",
     labelnames=("action", "result"),
 )
+ARCHIVE_RECLAIM_TOTAL = Counter(
+    "secflow_binary_security_archive_reclaim_total",
+    "Total archive reclaim observations and resolutions.",
+    labelnames=("result",),
+)
 
 HEARTBEAT_UPDATES_TOTAL = Counter(
     "secflow_binary_security_heartbeat_updates_total",
@@ -588,6 +593,10 @@ def observe_archive_duration(*, action: str, result: str, duration_seconds: floa
         action=str(action or "unknown"),
         result=str(result or "unknown"),
     ).observe(max(0.0, float(duration_seconds)))
+
+
+def observe_archive_reclaim(result: str) -> None:
+    ARCHIVE_RECLAIM_TOTAL.labels(result=str(result or "unknown")).inc()
 
 
 def observe_heartbeat_update(result: str) -> None:

@@ -64,11 +64,11 @@ class _FakeQuery:
             if not field_name or operator is None:
                 continue
             if operator is operators.eq:
-                expected = getattr(right, "value", None)
+                expected = getattr(right, "value", right)
                 rows = [row for row in rows if getattr(row, field_name, None) == expected]
                 continue
             if operator is operators.in_op:
-                values = getattr(right, "value", None)
+                values = getattr(right, "value", right)
                 if values is None:
                     continue
                 allowed = set(values)
@@ -217,6 +217,19 @@ class _ModelAwareDb:
 
     def add(self, obj):
         self.added.append(obj)
+        model_name = obj.__class__.__name__
+        if model_name == "BinarySecurityEvent":
+            self.events.append(obj)
+        elif model_name == "BinarySecurityStateEvent":
+            self.state_events.append(obj)
+        elif model_name == "BinarySecurityArchiveJob":
+            self.archive_jobs.append(obj)
+        elif model_name == "BinarySecurityStageItem":
+            self.stage_items.append(obj)
+        elif model_name == "BinarySecurityStageRun":
+            self.stage_runs.append(obj)
+        elif model_name == "BinarySecurityTask":
+            self.tasks.append(obj)
 
     def commit(self):
         pass
@@ -237,7 +250,6 @@ class _ModelAwareDb:
 class StatusMappingTests(unittest.TestCase):
     def test_status_from_downstream_payload_preserves_non_terminal_pending_statuses(self):
         manager = TaskManager()
-
         self.assertEqual(
             manager._status_from_downstream_payload({"status": "pending"}, success_statuses={"passed", "success"}),
             "pending",
@@ -250,6 +262,163 @@ class StatusMappingTests(unittest.TestCase):
             manager._status_from_downstream_payload({"status": "running"}, success_statuses={"passed", "success"}),
             "running",
         )
+
+
+class ArchiveReclaimTests(unittest.TestCase):
+    def setUp(self):
+        self.manager = TaskManager()
+        self.manager.instance_id = "worker-a"
+        self.manager.cfg.scheduler.archive_reclaim_timeout_seconds = 300
+        self.manager.cfg.scheduler.archive_reclaim_max_attempts = 3
+
+    def _task(self):
+        return BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            status="running",
+            current_stage="dataflow_analysis",
+            workspace_root="/tmp/task-1",
+            created_at=_now(),
+            updated_at=_now(),
+        )
+
+    def _stage_run(self, *, status="running"):
+        return BinarySecurityStageRun(
+            id="sr-1",
+            task_id="task-1",
+            project_id="project-1",
+            stage_name="dataflow_analysis",
+            sequence_no=1,
+            status=status,
+            created_at=_now(),
+            updated_at=_now(),
+        )
+
+    def _item(self, *, status="success"):
+        return BinarySecurityStageItem(
+            id="item-1",
+            task_id="task-1",
+            project_id="project-1",
+            stage_run_id="sr-1",
+            stage_name="dataflow_analysis",
+            item_key="entry-1",
+            item_identity_key="entry-1::parent",
+            parent_key="parent",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa-1",
+            status=status,
+            created_at=_now(),
+            updated_at=_now(),
+        )
+
+    def _archive_job(self, *, status="running", attempts=1, started_delta_seconds=600):
+        now = _now()
+        started_at = now - timedelta(seconds=started_delta_seconds)
+        return BinarySecurityArchiveJob(
+            id="aj-1",
+            task_id="task-1",
+            project_id="project-1",
+            stage_name="dataflow_analysis",
+            item_id="item-1",
+            item_key="entry-1",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa-1",
+            archive_status=status,
+            owner_id=None,
+            attempts=attempts,
+            created_at=started_at,
+            started_at=started_at,
+            updated_at=started_at,
+        )
+
+    def test_reclaim_stale_running_archive_job_requeues_pending(self):
+        task = self._task()
+        stage_run = self._stage_run()
+        item = self._item()
+        job = self._archive_job()
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], archive_jobs=[job])
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            reclaimed = self.manager._reclaim_stale_archive_jobs()
+        self.assertEqual(reclaimed, 1)
+        self.assertEqual(job.archive_status, "pending")
+        self.assertIsNone(job.started_at)
+        self.assertIsNone(job.completed_at)
+        self.assertIsNone(job.archive_root)
+
+    def test_reclaim_stale_running_archive_job_exhausted_marks_failed(self):
+        task = self._task()
+        stage_run = self._stage_run()
+        item = self._item()
+        job = self._archive_job(attempts=4)
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], archive_jobs=[job])
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            reclaimed = self.manager._reclaim_stale_archive_jobs()
+        self.assertEqual(reclaimed, 1)
+        self.assertEqual(job.archive_status, "failed")
+        self.assertIn("reclaim exhausted", str(job.error_message))
+
+    def test_stop_cleanup_requeues_owned_running_archive_jobs(self):
+        task = self._task()
+        stage_run = self._stage_run()
+        item = self._item()
+        job = self._archive_job()
+        job.owner_id = "worker-a"
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], archive_jobs=[job])
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            reclaimed = self.manager._requeue_owned_running_archive_jobs()
+        self.assertEqual(reclaimed, 1)
+        self.assertEqual(job.archive_status, "pending")
+
+    def test_stage_success_blocked_when_archive_not_finished(self):
+        task = self._task()
+        upstream_run = BinarySecurityStageRun(
+            id="sr-upstream",
+            task_id="task-1",
+            project_id="project-1",
+            stage_name="binary_to_source",
+            sequence_no=1,
+            status="success",
+            created_at=_now(),
+            updated_at=_now(),
+        )
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="task-1",
+            project_id="project-1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="success",
+            created_at=_now(),
+            updated_at=_now(),
+        )
+        stage_run = self._stage_run(status="success")
+        stage_run.sequence_no = 3
+        item = self._item(status="success")
+        job = self._archive_job(status="running")
+        db = _ModelAwareDb(tasks=[task], stage_runs=[upstream_run, entry_run, stage_run], stage_items=[item], archive_jobs=[job])
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            blocked = self.manager._stage_archive_success_blocked(task, "dataflow_analysis", [item])
+            status = self.manager._business_stage_status(task, "dataflow_analysis", stage_run, [item])
+            next_stage = self.manager._next_incomplete_stage(db, task)
+        self.assertTrue(blocked)
+        self.assertEqual(status, "running")
+        self.assertEqual(next_stage, "dataflow_analysis")
+
+    def test_stage_success_allowed_after_archive_success(self):
+        task = self._task()
+        stage_run = self._stage_run(status="success")
+        item = self._item(status="success")
+        job = self._archive_job(status="success")
+        job.archive_root = "/tmp/archive"
+        job.completed_at = _now()
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], archive_jobs=[job])
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            blocked = self.manager._stage_archive_success_blocked(task, "dataflow_analysis", [item])
+            status = self.manager._business_stage_status(task, "dataflow_analysis", stage_run, [item])
+        self.assertFalse(blocked)
+        self.assertEqual(status, "success")
 
 
 class _ScalarResult:

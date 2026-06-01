@@ -55,6 +55,7 @@ from app.model import (
 from app.observability import (
     observe_archive_action,
     observe_archive_duration,
+    observe_archive_reclaim,
     observe_control_operation,
     observe_control_operation_duration,
     observe_control_operation_lease_lost,
@@ -1140,6 +1141,7 @@ class TaskManager:
             task.cancel()
         if archive_active:
             await asyncio.gather(*archive_active, return_exceptions=True)
+        await asyncio.to_thread(self._requeue_owned_running_archive_jobs)
         active = list(self._workers.values())
         for task in active:
             task.cancel()
@@ -7518,6 +7520,7 @@ class TaskManager:
         while self._running:
             try:
                 with observe_scheduler_loop("archive_dispatch"):
+                    await asyncio.to_thread(self._reclaim_stale_archive_jobs)
                     await self._schedule_archive_workers()
             except asyncio.CancelledError:
                 raise
@@ -7564,10 +7567,229 @@ class TaskManager:
                 )
             else:
                 await self._process_archive_job(job_id)
+        except asyncio.CancelledError:
+            if work_type == "copy":
+                await asyncio.to_thread(self._requeue_running_archive_job_if_owned, job_id, "archive worker cancelled")
+            raise
         finally:
             async with self._archive_worker_lock:
                 self._archive_workers.discard(asyncio.current_task())
             self._observe_worker_counts()
+
+    def _archive_reclaim_timeout_seconds(self) -> int:
+        return max(30, int(getattr(self.cfg.scheduler, "archive_reclaim_timeout_seconds", 300) or 300))
+
+    def _archive_reclaim_max_attempts(self) -> int:
+        return max(1, int(getattr(self.cfg.scheduler, "archive_reclaim_max_attempts", 3) or 3))
+
+    def _active_archive_job_ids(self) -> set[str]:
+        active_job_ids: set[str] = set()
+        for worker in self._archive_workers:
+            if worker.done():
+                continue
+            name = str(worker.get_name() or "")
+            prefix = "binary-security-archive-"
+            if not name.startswith(prefix):
+                continue
+            job_id = name.split("-")[-1]
+            if job_id:
+                active_job_ids.add(job_id)
+        return active_job_ids
+
+    def _requeue_running_archive_job_if_owned(self, job_id: str, reason: str) -> bool:
+        db = get_session_factory()()
+        try:
+            job = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.id == job_id).first()
+            if job is None or str(job.archive_status or "").strip() != "running":
+                return False
+            if str(job.owner_id or "").strip() != str(self.instance_id or "").strip():
+                return False
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == job.task_id).first()
+            if task is None:
+                return False
+            item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == job.item_id).first()
+            self._requeue_archive_jobs(
+                db,
+                task,
+                [job],
+                stage_name=job.stage_name,
+                event_type="downstream_archive_job_owner_lost",
+                event_message="归档 worker 中断，归档任务已自动回退重排队",
+            )
+            self._record_event(
+                db,
+                task,
+                "downstream_archive_job_owner_lost",
+                "归档 worker 中断，运行中的归档任务已自动回退重排队",
+                stage_name=job.stage_name,
+                item=item,
+                level="warning",
+                payload={
+                    "archive_job_id": job.id,
+                    "owner_id_before": self.instance_id,
+                    "resolution_reason": reason,
+                },
+            )
+            observe_archive_reclaim("owner_cleanup")
+            db.commit()
+            return True
+        except Exception:
+            db.rollback()
+            return False
+        finally:
+            db.close()
+
+    def _requeue_owned_running_archive_jobs(self) -> int:
+        db = get_session_factory()()
+        try:
+            jobs = (
+                db.query(BinarySecurityArchiveJob)
+                .filter(
+                    BinarySecurityArchiveJob.archive_status == "running",
+                    BinarySecurityArchiveJob.owner_id == self.instance_id,
+                )
+                .order_by(BinarySecurityArchiveJob.updated_at.asc(), BinarySecurityArchiveJob.id.asc())
+                .all()
+            )
+            if not jobs:
+                return 0
+            tasks_by_id = {
+                str(task.id): task
+                for task in db.query(BinarySecurityTask).filter(
+                    BinarySecurityTask.id.in_([str(job.task_id) for job in jobs if job.task_id])
+                ).all()
+            }
+            reclaimed = 0
+            for job in jobs:
+                task = tasks_by_id.get(str(job.task_id))
+                if task is None:
+                    continue
+                item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == job.item_id).first()
+                self._requeue_archive_jobs(
+                    db,
+                    task,
+                    [job],
+                    stage_name=job.stage_name,
+                    event_type="downstream_archive_job_owner_lost",
+                    event_message="归档实例停止，运行中的归档任务已自动回退重排队",
+                )
+                self._record_event(
+                    db,
+                    task,
+                    "downstream_archive_job_owner_lost",
+                    "归档实例停止，运行中的归档任务已自动回退重排队",
+                    stage_name=job.stage_name,
+                    item=item,
+                    level="warning",
+                    payload={
+                        "archive_job_id": job.id,
+                        "owner_id_before": self.instance_id,
+                        "resolution_reason": "stop_cleanup",
+                    },
+                )
+                reclaimed += 1
+            if reclaimed:
+                observe_archive_reclaim("stop_cleanup")
+                db.commit()
+            else:
+                db.rollback()
+            return reclaimed
+        except Exception:
+            db.rollback()
+            return 0
+        finally:
+            db.close()
+
+    def _reclaim_stale_archive_jobs(self) -> int:
+        db = get_session_factory()()
+        try:
+            active_job_ids = self._active_archive_job_ids()
+            timeout_seconds = self._archive_reclaim_timeout_seconds()
+            max_attempts = self._archive_reclaim_max_attempts()
+            now = _now()
+            jobs = (
+                db.query(BinarySecurityArchiveJob)
+                .filter(BinarySecurityArchiveJob.archive_status == "running")
+                .order_by(BinarySecurityArchiveJob.updated_at.asc(), BinarySecurityArchiveJob.id.asc())
+                .all()
+            )
+            reclaimed = 0
+            for job in jobs:
+                if str(job.id or "") in active_job_ids:
+                    continue
+                if job.archive_root or job.completed_at:
+                    continue
+                last_progress_at = job.updated_at or job.started_at or job.created_at
+                if last_progress_at is None:
+                    continue
+                if (now - last_progress_at).total_seconds() < timeout_seconds:
+                    continue
+                task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == job.task_id).first()
+                if task is None:
+                    continue
+                item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == job.item_id).first()
+                attempts = int(job.attempts or 0)
+                owner_before = str(job.owner_id or "").strip() or None
+                if attempts > max_attempts:
+                    job.archive_status = "failed"
+                    job.error_message = "archive worker lost after claim; reclaim exhausted"
+                    job.completed_at = now
+                    job.updated_at = now
+                    self._record_event(
+                        db,
+                        task,
+                        "downstream_archive_job_reclaim_failed",
+                        "归档任务在运行态丢失且已超过自动回收预算，需人工处理",
+                        stage_name=job.stage_name,
+                        item=item,
+                        level="warning",
+                        payload={
+                            "archive_job_id": job.id,
+                            "attempts": attempts,
+                            "owner_id_before": owner_before,
+                            "resolution_reason": "archive_reclaim_exhausted",
+                            "timeout_seconds": timeout_seconds,
+                        },
+                    )
+                    observe_archive_reclaim("failed")
+                    reclaimed += 1
+                    continue
+                self._requeue_archive_jobs(
+                    db,
+                    task,
+                    [job],
+                    stage_name=job.stage_name,
+                    event_type="downstream_archive_job_requeued_after_reclaim",
+                    event_message="归档任务在运行态丢失，已自动回退重排队",
+                )
+                self._record_event(
+                    db,
+                    task,
+                    "downstream_archive_job_owner_lost",
+                    "归档任务长时间无进展且无本地 worker 持有，判定为运行态丢失",
+                    stage_name=job.stage_name,
+                    item=item,
+                    level="warning",
+                    payload={
+                        "archive_job_id": job.id,
+                        "attempts": attempts,
+                        "owner_id_before": owner_before,
+                        "resolution_reason": "stale_running_archive_job",
+                        "timeout_seconds": timeout_seconds,
+                    },
+                )
+                observe_archive_reclaim("requeued")
+                reclaimed += 1
+            if reclaimed:
+                db.commit()
+            else:
+                db.rollback()
+            return reclaimed
+        except Exception:
+            db.rollback()
+            return 0
+        finally:
+            db.close()
 
     async def _state_reducer_loop(self) -> None:
         interval_seconds = max(1, int(self.cfg.scheduler.poll_interval_seconds or 5))
@@ -12115,15 +12337,20 @@ class TaskManager:
             return "waiting_confirmation"
         statuses = [self._normalize_downstream_status(item.status) or item.status for item in items]
         aggregated_item_status = self._aggregate_item_statuses(statuses) if statuses else None
+        archive_gated = self._stage_archive_success_blocked(task, stage_name, items)
         if self._is_streaming_tail_stage(task, stage_name) and any(
             self._is_streaming_active_item_status(item.status)
             for item in items
         ):
             return "running"
+        if archive_gated and aggregated_item_status in {"success", "partial_success"}:
+            return "running"
         if stage_run:
             normalized_run_status = self._normalize_downstream_status(stage_run.status) or str(stage_run.status or "")
             if normalized_run_status in {"pending", "queued", "running", "dispatching"} and aggregated_item_status not in {None, "pending"}:
                 return aggregated_item_status
+            if archive_gated and normalized_run_status in {"success", "partial_success"}:
+                return "running"
             if normalized_run_status in {
                 "success",
                 "partial_success",
@@ -12272,11 +12499,37 @@ class TaskManager:
         )
 
     def _archive_job_abnormal_reason(self, job: BinarySecurityArchiveJob) -> BinarySecurityAbnormalReason | None:
-        if str(job.archive_status or "") != "failed":
+        normalized_status = str(job.archive_status or "").strip()
+        if normalized_status == "running" and not job.archive_root and not job.completed_at:
+            return self._build_abnormal_reason(
+                category="archive",
+                code="archive_stale_running",
+                title="归档任务长时间运行未收敛",
+                message="归档任务处于 running 且长时间未完成，可能发生了 worker 中断或回收延迟。",
+                source_layer="archive",
+                status=normalized_status,
+                service="binary-security",
+                stage_name=job.stage_name,
+                item_key=job.item_key,
+                downstream_task_id=job.downstream_task_id,
+                downstream_service=job.downstream_service,
+                first_seen_at=job.started_at or job.created_at,
+                last_seen_at=job.updated_at,
+                evidence=[
+                    self._abnormal_reason_evidence("stage_name", "阶段", job.stage_name),
+                    self._abnormal_reason_evidence("item_key", "条目", job.item_key),
+                    self._abnormal_reason_evidence("downstream_task_id", "下游任务 ID", job.downstream_task_id),
+                    self._abnormal_reason_evidence("owner_id", "归档 owner", job.owner_id),
+                ],
+                recommended_action="优先检查归档 worker 是否中断，以及是否触发了自动回收。",
+                terminal=False,
+            )
+        if normalized_status != "failed":
             return None
+        code = "archive_reclaim_exhausted" if "reclaim exhausted" in str(job.error_message or "").lower() else "archive_failed"
         return self._build_abnormal_reason(
             category="archive",
-            code="archive_failed",
+            code=code,
             title="归档任务失败",
             message=self._abnormal_reason_message(job.error_message, "阶段产物归档失败"),
             source_layer="archive",
@@ -12616,6 +12869,53 @@ class TaskManager:
         if terminal and all(status == "success" for status in terminal):
             return "success"
         return "pending"
+
+    def _stage_requires_archive_success_gate(self, task: BinarySecurityTask, stage_name: str) -> bool:
+        return self._is_streaming_tail_stage(task, stage_name) and stage_name in {"dataflow_analysis", "vuln_scan"}
+
+    def _stage_archive_jobs_by_item(self, db: Session, task_id: str, stage_name: str) -> dict[str, list[BinarySecurityArchiveJob]]:
+        jobs = (
+            db.query(BinarySecurityArchiveJob)
+            .filter(
+                BinarySecurityArchiveJob.task_id == task_id,
+                BinarySecurityArchiveJob.stage_name == stage_name,
+            )
+            .order_by(BinarySecurityArchiveJob.created_at.asc(), BinarySecurityArchiveJob.id.asc())
+            .all()
+        )
+        grouped: dict[str, list[BinarySecurityArchiveJob]] = {}
+        for job in jobs:
+            grouped.setdefault(str(job.item_id or ""), []).append(job)
+        return grouped
+
+    def _stage_archive_success_blocked(
+        self,
+        task: BinarySecurityTask,
+        stage_name: str,
+        items: list[BinarySecurityStageItem],
+        *,
+        db: Session | None = None,
+    ) -> bool:
+        if not items or not self._stage_requires_archive_success_gate(task, stage_name):
+            return False
+        session = db
+        owns_session = False
+        if session is None:
+            session = get_session_factory()()
+            owns_session = True
+        try:
+            jobs_by_item = self._stage_archive_jobs_by_item(session, task.id, stage_name)
+            for item in items:
+                normalized_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip()
+                if normalized_status not in ARCHIVE_SUCCESS_MAPPED_STATUSES:
+                    continue
+                item_jobs = jobs_by_item.get(str(item.id or ""), [])
+                if item_jobs and any(str(job.archive_status or "").strip() != "success" for job in item_jobs):
+                    return True
+            return False
+        finally:
+            if owns_session:
+                session.close()
 
     def _build_stage_overview_nodes(
         self,
@@ -14297,6 +14597,8 @@ class TaskManager:
                 if item_status in {"pending", "queued", "running", "dispatching"}:
                     return stage_name
                 if self._stage_has_nonterminal_items(items):
+                    return stage_name
+                if self._stage_archive_success_blocked(task, stage_name, items, db=db):
                     return stage_name
             if run.status == "partial_success":
                 if not self._partial_success_advancement_enabled(task, stage_name):

@@ -49,6 +49,8 @@ data:
       downstream_reconcile_grace_seconds: 30
       shutdown_grace_seconds: 10
       archive_job_concurrency: 4
+      archive_reclaim_timeout_seconds: 300
+      archive_reclaim_max_attempts: 3
       downstream_sync_concurrency: 8
       downstream_action_concurrency: 8
       downstream_request_timeout_seconds: 120

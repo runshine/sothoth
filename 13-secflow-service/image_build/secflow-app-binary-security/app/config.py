@@ -107,6 +107,8 @@ class SchedulerConfig(BaseModel):
     downstream_reconcile_grace_seconds: int = 30
     shutdown_grace_seconds: int = 10
     archive_job_concurrency: int = 4
+    archive_reclaim_timeout_seconds: int = 300
+    archive_reclaim_max_attempts: int = 3
     downstream_sync_concurrency: int = 8
     downstream_sync_batch_size: int = 50
     downstream_action_concurrency: int = 8
