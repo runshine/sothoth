@@ -2856,6 +2856,7 @@ class TaskManager:
         task: BinarySecurityTask,
         *,
         target_stage: str,
+        phase: str = "prepare",
     ) -> dict[str, Any]:
         plan = self._retry_plan(task)
         retry_item_keys = [str(item_key).strip() for item_key in list(plan.get("retry_item_keys") or []) if str(item_key).strip()]
@@ -2868,6 +2869,7 @@ class TaskManager:
             retry_item_keys=retry_item_keys,
             item_actions=item_actions,
             affected_stages=affected_stages,
+            phase=phase,
         )
         return {
             "target_stage": target_stage,
@@ -6793,7 +6795,7 @@ class TaskManager:
             )
         db.flush()
         refreshed_actions = self._retry_item_actions(task)
-        result = self._build_retry_prepare_result(db, task, target_stage=target_stage)
+        result = self._build_retry_prepare_result(db, task, target_stage=target_stage, phase="verify")
         validation = dict(result.get("validation") or {})
         if not bool(validation.get("validated")):
             result = {
@@ -7976,33 +7978,60 @@ class TaskManager:
                     )
                     observed_terminal_status = status
             else:
-                stage_run.status = "waiting_confirmation" if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION else ("running" if active_stage_status else status)
-                stage_run.finished_at = None if active_stage_status else _now()
-                if not active_stage_status:
-                    observe_stage_duration(
-                        stage=stage_name,
-                        result=stage_run.status,
-                        duration_seconds=_elapsed_seconds_since(stage_run.started_at),
+                if (
+                    observed_terminal_status in terminal_failure_statuses
+                    and self._is_streaming_tail_stage(task, stage_name)
+                    and not bool(payload.get("stage_retry_mode"))
+                    and not bool(payload.get("task_retry_mode"))
+                ):
+                    stage_run.status = "pending"
+                    stage_run.finished_at = None
+                    stage_run.last_error = None
+                    self._merge_stage_run_output_summary(task, stage_run, {"status_synced": True, "sync_status": "pending"})
+                    self._update_task_stage_summary_entry(task, stage_run)
+                    self._record_event(
+                        db,
+                        task,
+                        "stage_worker_terminal_ignored_for_empty_streaming_tail",
+                        "空流式尾段的历史终态事件已忽略，等待真实子项状态收敛",
+                        level="warning",
+                        stage_name=stage_name,
+                        payload={
+                            "state_event_id": event.id,
+                            "observed_status": observed_terminal_status,
+                        },
                     )
-                await self._persist_stage_run_output_summary_async(task, stage_run, summary)
-                stage_run.counts = self._stage_counts(db, stage_run)
-                if status in {"failed", "partial_success", "downstream_missing"}:
-                    stage_run.last_error = summary.get("error")
-                self._merge_task_stage_summary_entry(
-                    task,
-                    stage_run,
-                    {
-                        **(
-                            {
-                                "failure_code": summary.get("failure_code"),
-                                "failure_category": summary.get("failure_category"),
-                                "failure_message": summary.get("failure_message"),
-                            }
-                            if summary.get("failure_code")
-                            else {}
-                        ),
-                    },
-                )
+                    active_stage_status = True
+                    status = "pending"
+                    observed_terminal_status = "pending"
+                else:
+                    stage_run.status = "waiting_confirmation" if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION else ("running" if active_stage_status else status)
+                    stage_run.finished_at = None if active_stage_status else _now()
+                    if not active_stage_status:
+                        observe_stage_duration(
+                            stage=stage_name,
+                            result=stage_run.status,
+                            duration_seconds=_elapsed_seconds_since(stage_run.started_at),
+                        )
+                    await self._persist_stage_run_output_summary_async(task, stage_run, summary)
+                    stage_run.counts = self._stage_counts(db, stage_run)
+                    if status in {"failed", "partial_success", "downstream_missing"}:
+                        stage_run.last_error = summary.get("error")
+                    self._merge_task_stage_summary_entry(
+                        task,
+                        stage_run,
+                        {
+                            **(
+                                {
+                                    "failure_code": summary.get("failure_code"),
+                                    "failure_category": summary.get("failure_category"),
+                                    "failure_message": summary.get("failure_message"),
+                                }
+                                if summary.get("failure_code")
+                                else {}
+                            ),
+                        },
+                    )
         else:
             existing_items = self._stage_items(db, task.id, stage_name)
             if existing_items:
@@ -8172,14 +8201,6 @@ class TaskManager:
                     stage_name=stage_name,
                     payload={"status": status, "state_event_id": event.id},
                 )
-            task.status = "failed"
-            task.last_error = (
-                summary.get("failure_message")
-                or summary.get("error")
-                or stage_run.last_error
-            )
-            self._invalidate_task_execution(task)
-            task.finished_at = _now()
             self._record_event(
                 db,
                 task,
@@ -8201,6 +8222,7 @@ class TaskManager:
                     ),
                 },
             )
+            self._finalize_task(db, task)
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
             return
         if bool(payload.get("stage_retry_mode")) or bool(payload.get("task_retry_mode")):
@@ -10066,25 +10088,51 @@ class TaskManager:
             if vuln_run and vuln_run.status in {"success", "partial_success"}:
                 next_stage = None
             else:
-                task.status = "failed"
+                next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
+                next_stage_items = self._stage_items(db, task.id, next_stage)
+                next_stage_status = (
+                    self._normalize_downstream_status(next_stage_run.status) or str(next_stage_run.status or "").strip()
+                    if next_stage_run is not None
+                    else "pending"
+                )
+                if next_stage_items:
+                    item_status = self._aggregate_item_statuses([item.status for item in next_stage_items])
+                    if item_status in {"pending", "queued", "running", "dispatching"}:
+                        next_stage_status = item_status
+                if next_stage_status in {"failed", "downstream_missing", "cancelled"} and next_stage_items and not self._stage_has_nonterminal_items(next_stage_items):
+                    task.status = "failed"
+                    task.current_stage = next_stage
+                    task.dispatcher_instance_id = None
+                    task.dispatch_started_at = None
+                    task.lease_expires_at = None
+                    task.finished_at = _now()
+                    task.last_error = next_stage_run.last_error if next_stage_run is not None else task.last_error
+                    self._last_task_heartbeat_at.pop(task.id, None)
+                    stage_summaries = self._build_stage_summaries(db, task, self._stage_sequence_for_task(task), stage_runs, db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all())
+                    items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
+                    archive_jobs = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id).all()
+                    self._sync_task_abnormal_reason_snapshot(db, task, self._task_abnormal_reason(task, stage_summaries, items, archive_jobs))
+                    return
+                task.status = "running" if next_stage_status in {"running", "dispatching", "applying"} else "pending"
                 task.current_stage = next_stage
                 task.dispatcher_instance_id = None
                 task.dispatch_started_at = None
                 task.lease_expires_at = None
-                task.finished_at = _now()
+                task.finished_at = None
+                task.last_error = None
                 self._last_task_heartbeat_at.pop(task.id, None)
                 self._record_event(
                     db,
                     task,
-                    "task_finalize_blocked_by_incomplete_stage",
-                    f"任务仍有未完成阶段，拒绝收口为终态: {next_stage}",
+                    "task_finalize_deferred_for_incomplete_stage",
+                    f"任务仍有未完成阶段，保持活跃状态等待继续推进: {next_stage}",
                     level="warning",
                     stage_name=next_stage,
+                    payload={"stage_status": next_stage_status},
                 )
-                stage_summaries = self._build_stage_summaries(db, task, self._stage_sequence_for_task(task), stage_runs, db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all())
-                items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
-                archive_jobs = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id).all()
-                self._sync_task_abnormal_reason_snapshot(db, task, self._task_abnormal_reason(task, stage_summaries, items, archive_jobs))
+                self._sync_task_abnormal_reason_snapshot(db, task, None)
+                if next_stage_status in {"pending", "queued"} or next_stage_run is None:
+                    self._enqueue_task(task.id)
                 return
         else:
             runs_by_stage = {str(run.stage_name or "").strip(): run for run in stage_runs}
@@ -10097,31 +10145,24 @@ class TaskManager:
                 None,
             )
             if missing_enabled_stage and not (vuln_run and vuln_run.status in {"success", "partial_success"}):
-                task.status = "failed"
+                task.status = "pending"
                 task.current_stage = missing_enabled_stage
                 task.dispatcher_instance_id = None
                 task.dispatch_started_at = None
                 task.lease_expires_at = None
-                task.finished_at = _now()
+                task.finished_at = None
+                task.last_error = None
                 self._last_task_heartbeat_at.pop(task.id, None)
                 self._record_event(
                     db,
                     task,
-                    "task_finalize_blocked_by_missing_stage",
-                    f"任务缺少已启用阶段的执行记录，拒绝收口为终态: {missing_enabled_stage}",
+                    "task_finalize_deferred_for_missing_stage",
+                    f"任务缺少已启用阶段的执行记录，保持活跃状态等待补跑: {missing_enabled_stage}",
                     level="warning",
                     stage_name=missing_enabled_stage,
                 )
-                stage_summaries = self._build_stage_summaries(
-                    db,
-                    task,
-                    self._stage_sequence_for_task(task),
-                    stage_runs,
-                    db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all(),
-                )
-                items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
-                archive_jobs = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id).all()
-                self._sync_task_abnormal_reason_snapshot(db, task, self._task_abnormal_reason(task, stage_summaries, items, archive_jobs))
+                self._sync_task_abnormal_reason_snapshot(db, task, None)
+                self._enqueue_task(task.id)
                 return
         statuses = [run.status for run in stage_runs]
         if statuses and all(status == "success" for status in statuses):
@@ -13852,12 +13893,41 @@ class TaskManager:
             run = runs_by_stage.get(stage_name)
             if run is None:
                 return stage_name
+            items = self._stage_items(db, task.id, stage_name)
+            if items:
+                item_status = self._aggregate_item_statuses([item.status for item in items])
+                if item_status in {"pending", "queued", "running", "dispatching"}:
+                    return stage_name
+                if self._stage_has_nonterminal_items(items):
+                    return stage_name
             if run.status == "partial_success":
                 if not self._partial_success_advancement_enabled(task, stage_name):
                     return stage_name
                 continue
-            if run.status != "success":
+            normalized_status = self._normalize_downstream_status(run.status) or str(run.status or "").strip()
+            if normalized_status in {"pending", "queued", "running", "dispatching"}:
                 return stage_name
+            if normalized_status not in {"success", "failed", "cancelled", "downstream_missing", "partial_success", "skipped"}:
+                return stage_name
+        return None
+
+    def _first_failed_terminal_stage(self, db: Session, task: BinarySecurityTask) -> str | None:
+        stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+        runs_by_stage = {str(run.stage_name or "").strip(): run for run in stage_runs}
+        failure_statuses = {"failed", "downstream_missing", "cancelled", "partial_success"}
+        for stage_name in self._stage_sequence_for_task(task):
+            if not self._stage_enabled(task, stage_name):
+                continue
+            run = runs_by_stage.get(stage_name)
+            if run is None:
+                continue
+            normalized_status = self._normalize_downstream_status(run.status) or str(run.status or "").strip()
+            if normalized_status not in failure_statuses:
+                continue
+            items = self._stage_items(db, task.id, stage_name)
+            if items and self._stage_has_nonterminal_items(items):
+                continue
+            return stage_name
         return None
 
     def _retry_plan(self, task: BinarySecurityTask) -> dict[str, Any]:
@@ -14183,23 +14253,34 @@ class TaskManager:
             return "downstream_missing"
         return statuses[0]
 
+    def _is_active_item_status(self, status: str | None) -> bool:
+        normalized = self._normalize_downstream_status(status) or str(status or "").strip().lower()
+        return normalized in {"pending", "queued", "running", "dispatching"}
+
+    def _is_terminal_item_status(self, status: str | None) -> bool:
+        normalized = self._normalize_downstream_status(status) or str(status or "").strip().lower()
+        return normalized in {"success", "failed", "cancelled", "downstream_missing", "skipped", "partial_success"}
+
+    def _stage_has_active_items(self, items: list[BinarySecurityStageItem]) -> bool:
+        return any(self._is_active_item_status(item.status) for item in items)
+
+    def _stage_has_nonterminal_items(self, items: list[BinarySecurityStageItem]) -> bool:
+        return any(not self._is_terminal_item_status(item.status) for item in items)
+
     def _stage_has_live_downstream_children(
         self,
         items: list[BinarySecurityStageItem],
     ) -> bool:
-        live_statuses = {"pending", "queued", "running", "dispatching"}
-        return any(
-            str(item.status or "").strip().lower() in live_statuses
-            and str(item.downstream_task_id or "").strip()
-            for item in items
-        )
+        return self._stage_has_active_items(items)
 
     def _empty_streaming_stage_run_status(self, task: BinarySecurityTask, stage_run: BinarySecurityStageRun) -> str:
         if not self._streaming_mode_enabled(task) or not self._is_streaming_tail_stage(task, stage_run.stage_name):
             return "pending"
         current = str(stage_run.status or "").strip()
-        if current in {"failed", "downstream_missing", "cancelled", "partial_success", "success"}:
+        if current == "success":
             return current
+        if current in {"failed", "downstream_missing", "cancelled", "partial_success"}:
+            return "pending"
         if current in {"running", "dispatching"}:
             return "running"
         if current in {"queued", "pending"}:
@@ -14547,6 +14628,27 @@ class TaskManager:
             task.current_operation_id = active_operation.id
             return
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+        runs_by_stage = {str(run.stage_name or "").strip(): run for run in stage_runs}
+        if (
+            task.status == "failed"
+            and not stage_runs
+            and not db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).first()
+        ):
+            self._invalidate_task_execution(task)
+            task.finished_at = task.finished_at or _now()
+            return
+        for stage_name in self._stage_sequence_for_task(task):
+            if not self._stage_enabled(task, stage_name):
+                continue
+            stage_run = runs_by_stage.get(stage_name)
+            stage_items = self._stage_items(db, task.id, stage_name)
+            stage_run_status = str(stage_run.status or "").strip() if stage_run is not None else ""
+            if stage_items or (
+                self._is_streaming_tail_stage(task, stage_name)
+                and stage_run_status in {"failed", "downstream_missing", "cancelled", "partial_success"}
+            ):
+                self._refresh_stage_from_authoritative_items(db, task, stage_name)
+        stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
         statuses = [run.status for run in stage_runs]
         vuln_run = next((run for run in stage_runs if run.stage_name == "vuln_scan"), None)
         if any(status in {"running", "dispatching"} for status in statuses):
@@ -14561,10 +14663,6 @@ class TaskManager:
             task.finished_at = None
             task.last_error = None
             self._clear_task_abnormal_reason_snapshot(db, task)
-            return
-        if task.status == "failed" and not self._task_has_active_reconcile_items(db, task):
-            self._invalidate_task_execution(task)
-            task.finished_at = task.finished_at or _now()
             return
         stage_retry_mode = task.execution_mode in {"stage_retry", "stage_retry_failed_items", "stage_retry_full"} and bool(task.target_stage_name)
         task_retry_mode = task.execution_mode in {"task_retry", "task_retry_failed_items"} and bool(task.target_stage_name)
@@ -14600,19 +14698,11 @@ class TaskManager:
             tail_stages = set(self._streaming_tail_stage_names(task))
             if str(failed_stage_run.stage_name or "").strip() in tail_stages:
                 failed_stage_run = None
-        if failed_stage_run is not None and not stage_retry_mode and not task_retry_mode:
-            task.status = "failed"
-            task.current_stage = failed_stage_run.stage_name or task.current_stage
-            task.dispatcher_instance_id = None
-            task.dispatch_started_at = None
-            task.lease_expires_at = None
-            task.finished_at = task.finished_at or _now()
-            return
         next_stage = self._next_incomplete_stage(db, task)
         next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
         next_stage_status = next_stage_run.status if next_stage_run else "pending"
-        if next_stage and next_stage_status in {"pending", "queued"}:
-            task.status = "pending"
+        if next_stage and str(next_stage_status or "").strip() in {"pending", "queued", "running", "dispatching"}:
+            task.status = "running" if str(next_stage_status or "").strip() in {"running", "dispatching"} else "pending"
             task.current_stage = next_stage
             task.finished_at = None
             task.dispatcher_instance_id = None
@@ -14625,14 +14715,37 @@ class TaskManager:
                 summary["stale_reason"] = None
                 summary["stale_from_stage"] = None
                 task.summary = summary
-            self._record_event(
-                db,
-                task,
-                "task_requeued_after_downstream_sync",
-                f"下游状态同步完成，任务继续进入阶段: {next_stage}",
-                stage_name=next_stage,
-            )
-            self._enqueue_task(task.id)
+            self._clear_task_abnormal_reason_snapshot(db, task)
+            if str(next_stage_status or "").strip() in {"pending", "queued"}:
+                self._record_event(
+                    db,
+                    task,
+                    "task_requeued_after_downstream_sync",
+                    f"下游状态同步完成，任务继续进入阶段: {next_stage}",
+                    stage_name=next_stage,
+                )
+                self._enqueue_task(task.id)
+            return
+        if failed_stage_run is not None and not stage_retry_mode and not task_retry_mode and not next_stage:
+            task.status = "failed"
+            task.current_stage = failed_stage_run.stage_name or task.current_stage
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.lease_expires_at = None
+            task.finished_at = task.finished_at or _now()
+            return
+        if failed_stage_run is not None and not stage_retry_mode and not task_retry_mode:
+            failed_items = self._stage_items(db, task.id, str(failed_stage_run.stage_name or ""))
+            if failed_items and not self._stage_has_nonterminal_items(failed_items):
+                task.status = "failed"
+                task.current_stage = failed_stage_run.stage_name or task.current_stage
+                task.dispatcher_instance_id = None
+                task.dispatch_started_at = None
+                task.lease_expires_at = None
+                task.finished_at = task.finished_at or _now()
+                return
+        if task.status == "failed" and not self._task_has_active_reconcile_items(db, task):
+            self._finalize_task(db, task)
             return
         self._finalize_task(db, task)
 
@@ -15682,6 +15795,7 @@ class TaskManager:
         retry_item_keys: list[str],
         item_actions: list[dict[str, Any]],
         affected_stages: list[str],
+        phase: str = "prepare",
     ) -> dict[str, Any]:
         stage_items = self._stage_items(db, task.id, target_stage)
         keyed_items = {
@@ -15699,24 +15813,45 @@ class TaskManager:
                 continue
             validated_item_count += 1
             action = next((row for row in item_actions if str(row.get("item_key") or "") == item_key), None)
+            if action is None:
+                action = next(
+                    (
+                        row
+                        for row in item_actions
+                        if self._stage_item_identity(str(row.get("item_key") or ""), row.get("parent_key")) == item_key
+                    ),
+                    None,
+                )
             strategy = str((action or {}).get("strategy") or "").strip()
             if strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
-                if str(item.downstream_task_id or "").strip():
+                old_task_id = str((action or {}).get("old_downstream_task_id") or "").strip()
+                current_task_id = str(item.downstream_task_id or "").strip()
+                if phase == "prepare":
+                    if str(item.status or "").strip() not in {"pending", "queued", "dispatching", "running", "failed", "cancelled", "downstream_missing"}:
+                        issues.append({"item_key": item_key, "issue": "status_not_retryable", "status": item.status})
+                    continue
+                if phase == "verify":
+                    if not current_task_id:
+                        issues.append({"item_key": item_key, "issue": "replacement_binding_missing"})
+                    elif old_task_id and old_task_id == current_task_id:
+                        issues.append({"item_key": item_key, "issue": "replacement_reused_old_child", "downstream_task_id": current_task_id})
+                elif current_task_id:
                     issues.append({"item_key": item_key, "issue": "binding_not_cleared", "downstream_task_id": item.downstream_task_id})
                 if any(
                     [
-                        item.downstream_status,
-                        item.sync_status,
-                        item.last_synced_at,
-                        item.downstream_raw_status,
-                        item.downstream_mapped_status,
-                        item.sync_observation_error_message,
-                        item.sync_observation_error_type,
-                        item.sync_observation_http_status,
+                        getattr(item, "downstream_status", None),
+                        getattr(item, "sync_status", None),
+                        getattr(item, "last_synced_at", None),
+                        getattr(item, "downstream_raw_status", None),
+                        getattr(item, "downstream_mapped_status", None),
+                        getattr(item, "sync_observation_error_message", None),
+                        getattr(item, "sync_observation_error_type", None),
+                        getattr(item, "sync_observation_http_status", None),
                     ]
                 ):
                     issues.append({"item_key": item_key, "issue": "stale_sync_snapshot_present"})
-                if str(item.status or "").strip() != "pending":
+                allowed_statuses = {"pending", "queued", "dispatching", "running"} if phase == "verify" else {"pending"}
+                if str(item.status or "").strip() not in allowed_statuses:
                     issues.append({"item_key": item_key, "issue": "status_not_reset", "status": item.status})
                 if item.finished_at is not None:
                     issues.append({"item_key": item_key, "issue": "finished_at_not_cleared"})
@@ -15736,7 +15871,8 @@ class TaskManager:
             if stage_run is None:
                 continue
             if stage_name == target_stage:
-                if str(stage_run.status or "").strip() not in {"pending", "queued", "running"}:
+                allowed_target_statuses = {"pending", "queued", "running", "dispatching"} if phase == "verify" else {"pending", "queued", "running"}
+                if str(stage_run.status or "").strip() not in allowed_target_statuses:
                     issues.append({"stage_name": stage_name, "issue": "target_stage_not_reset", "status": stage_run.status})
             elif str(stage_run.status or "").strip() not in {"pending", "queued"}:
                 issues.append({"stage_name": stage_name, "issue": "downstream_stage_not_reset", "status": stage_run.status})
@@ -16865,7 +17001,7 @@ class TaskManager:
         if not stage_sequence:
             return False, "当前任务没有可执行阶段", None
 
-        target_stage = self._next_incomplete_stage(db, task)
+        target_stage = self._first_failed_terminal_stage(db, task) or self._next_incomplete_stage(db, task)
         if target_stage is None:
             return False, "当前任务所有阶段都已成功，没有可继续的后续阶段", None
 
