@@ -6,7 +6,16 @@ from fastapi.testclient import TestClient
 
 from app.config import get_config
 from app.main import create_app
-from app.models.database import SchedulerWorker, SchedulerWorkerSlotReservation, TriggerTask, WorkflowDefinition, WorkflowExecution, get_db_session
+from app.models.database import (
+    RunIndex,
+    SchedulerWorker,
+    SchedulerWorkerSlotReservation,
+    TriggerTask,
+    WorkflowDefinition,
+    WorkflowExecution,
+    WorkflowExecutionEvent,
+    get_db_session,
+)
 from app.services.dataflow_worker_client import DataflowWorkerError
 from app.services.runtime_config_service import get_runtime_config_service
 from app.services.scheduler import SchedulerService
@@ -160,7 +169,7 @@ def test_scheduler_claim_allows_multiple_running_executions_per_definition(
 
     db = get_db_session()
     try:
-        running = db.query(WorkflowExecution).filter(WorkflowExecution.status == "running").all()
+        running = db.query(WorkflowExecution).filter(WorkflowExecution.status == "starting").all()
         pending = db.query(WorkflowExecution).filter(WorkflowExecution.status == "pending").all()
         assert len(running) == 2
         assert {item.owner_pod_id for item in running} == {"pod-a", "pod-b"}
@@ -238,6 +247,13 @@ def test_worker_capacity_default_is_five(service_config_path: Path):
     assert runtime_config["scheduler"]["worker_capacity"] == 5
 
 
+def test_database_pool_size_default_is_forty(service_config_path: Path):
+    config = get_config()
+    assert config.database.pool_size == 40
+    assert config.database.max_overflow == 20
+    assert config.database.pool_timeout == 30
+
+
 def test_start_execution_now_allows_unlimited_worker_capacity(
     service_config_path: Path,
     framework_config_payload: dict,
@@ -268,8 +284,8 @@ def test_start_execution_now_allows_unlimited_worker_capacity(
         trigger = db.get(TriggerTask, "tt-sched-unlimited-now")
         assert execution is not None
         assert trigger is not None
-        assert execution.status == "running"
-        assert trigger.status == "running"
+        assert execution.status == "starting"
+        assert trigger.status == "dispatching"
         assert execution.owner_pod_id == "standalone-pod"
     finally:
         db.close()
@@ -313,9 +329,9 @@ def test_worker_capacity_zero_starts_all_assigned_jobs(
     try:
         executions = db.query(WorkflowExecution).filter(WorkflowExecution.id.in_(execution_ids)).all()
         triggers = db.query(TriggerTask).filter(TriggerTask.id.in_([f"tt-sched-unlimited-assigned-{idx}" for idx in range(3)])).all()
-        assert {item.status for item in executions} == {"running"}
-        assert {item.status for item in triggers} == {"running"}
-        assert {item.dispatch_status for item in executions} == {"running"}
+        assert {item.status for item in executions} == {"starting"}
+        assert {item.status for item in triggers} == {"dispatching"}
+        assert {item.dispatch_status for item in executions} == {"starting"}
     finally:
         db.close()
 
@@ -359,9 +375,9 @@ def test_worker_claims_already_dispatching_assigned_job(
         trigger = db.get(TriggerTask, "tt-sched-assigned-dispatching")
         assert execution is not None
         assert trigger is not None
-        assert execution.status == "running"
-        assert trigger.status == "running"
-        assert execution.dispatch_status == "running"
+        assert execution.status == "starting"
+        assert trigger.status == "dispatching"
+        assert execution.dispatch_status == "starting"
     finally:
         db.close()
 
@@ -541,6 +557,98 @@ def test_manager_chooses_lowest_load_worker_with_db_supplement(
         db.close()
 
 
+def test_manager_dispatch_fails_over_when_worker_capacity_exceeded(
+    service_config_path: Path,
+    framework_config_payload: dict,
+    monkeypatch,
+):
+    config = get_config()
+    config.scheduler.role = "manager"
+    config.dataflow_worker.dispatch_max_retries = 1
+
+    db = get_db_session()
+    try:
+        db.add_all([
+            SchedulerWorker(
+                pod_id="worker-full",
+                host_name="worker-full",
+                capacity=3,
+                running_count=0,
+                status="active",
+                metadata_json={"advertise_url": "http://worker-full"},
+            ),
+            SchedulerWorker(
+                pod_id="worker-free",
+                host_name="worker-free",
+                capacity=3,
+                running_count=0,
+                status="active",
+                metadata_json={"advertise_url": "http://worker-free"},
+            ),
+        ])
+        execution_id = _create_pending_execution(db, framework_config_payload, suffix="manager-capacity-failover")
+        for idx in range(3):
+            _create_pending_execution(
+                db,
+                framework_config_payload,
+                suffix=f"manager-capacity-running-{idx}",
+                status="running",
+                trigger_status="running",
+                worker_url="http://worker-full",
+                worker_job_id=f"job-running-{idx}",
+                owner_pod_id="worker-full",
+                dispatch_status="running",
+            )
+        db.commit()
+    finally:
+        db.close()
+
+    calls: list[str] = []
+
+    class FakeClient:
+        def __init__(self, base_url: str):
+            self.base_url = base_url
+
+        def create_job(self, payload: dict) -> dict:
+            calls.append(self.base_url)
+            if self.base_url == "http://worker-full":
+                raise DataflowWorkerError('{"detail":"capacity_exceeded"}')
+            return {"id": payload["execution_id"], "status": "queued"}
+
+        def list_jobs(self) -> list[dict]:
+            return []
+
+    monkeypatch.setattr("app.services.scheduler.get_dataflow_worker_client", lambda base_url=None: FakeClient(base_url or ""))
+    monkeypatch.setattr(
+        SchedulerService,
+        "_rank_dataflow_workers",
+        lambda self, db, execution_id: [("worker-full", "http://worker-full"), ("worker-free", "http://worker-free")],
+    )
+
+    assert SchedulerService().start_execution_now(execution_id) is True
+    assert calls == ["http://worker-full", "http://worker-free"]
+
+    db = get_db_session()
+    try:
+        execution = db.get(WorkflowExecution, execution_id)
+        assert execution is not None
+        assert execution.owner_pod_id == "worker-free"
+        assert execution.worker_url == "http://worker-free"
+        assert execution.dispatch_status == "queued"
+        assert db.query(SchedulerWorkerSlotReservation).filter(SchedulerWorkerSlotReservation.execution_id == execution_id).first() is None
+        assert (
+            db.query(WorkflowExecutionEvent)
+            .filter(
+                WorkflowExecutionEvent.execution_id == execution_id,
+                WorkflowExecutionEvent.event_type == "worker_dispatch_requeued",
+            )
+            .count()
+            == 0
+        )
+    finally:
+        db.close()
+
+
 def test_manager_dispatch_requires_registry_worker(
     service_config_path: Path,
     framework_config_payload: dict,
@@ -589,8 +697,8 @@ def test_worker_jobs_api_claims_and_starts_assigned_execution(
     assert response.status_code == 200
     payload = response.json()
     assert payload["id"] == execution_id
-    assert payload["status"] == "running"
-    assert payload["phase"] == "running"
+    assert payload["status"] == "starting"
+    assert payload["phase"] == "starting"
     assert started == [execution_id]
 
     list_response = client.get("/api/v1/jobs")
@@ -605,12 +713,12 @@ def test_worker_jobs_api_claims_and_starts_assigned_execution(
         trigger = db.get(TriggerTask, "tt-sched-worker-api")
         assert execution is not None
         assert trigger is not None
-        assert execution.status == "running"
-        assert trigger.status == "running"
+        assert execution.status == "starting"
+        assert trigger.status == "dispatching"
         assert execution.owner_pod_id == "worker-pod"
         assert execution.worker_url == "http://worker-pod"
         assert execution.worker_job_id == execution_id
-        assert execution.dispatch_status == "running"
+        assert execution.dispatch_status == "starting"
     finally:
         db.close()
 
@@ -687,6 +795,42 @@ def test_worker_jobs_api_rejects_when_capacity_exhausted(
     assert response.json()["detail"] == "capacity_exceeded"
 
 
+def test_worker_jobs_api_excludes_prebound_execution_from_capacity(
+    service_config_path: Path,
+    framework_config_payload: dict,
+    monkeypatch,
+):
+    config = get_config()
+    config.scheduler.role = "worker"
+    config.scheduler.pod_id = "worker-prebound-capacity-pod"
+    config.scheduler.worker_capacity = 1
+
+    db = get_db_session()
+    try:
+        execution_id = _create_pending_execution(
+            db,
+            framework_config_payload,
+            suffix="worker-prebound-capacity",
+            worker_url="http://worker-prebound-capacity-pod",
+            worker_job_id="exec-sched-worker-prebound-capacity",
+            owner_pod_id="worker-prebound-capacity-pod",
+            dispatch_status="dispatching",
+        )
+    finally:
+        db.close()
+
+    started: list[str] = []
+    monkeypatch.setattr(SchedulerService, "_schedule_execution_thread", lambda self, execution_id: started.append(execution_id))
+
+    client = TestClient(create_app())
+    response = client.post("/api/v1/jobs", json={"execution_id": execution_id, "worker_url": "http://worker-prebound-capacity-pod"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == execution_id
+    assert payload["status"] == "starting"
+    assert started == [execution_id]
+
+
 def test_cluster_capacity_api_returns_worker_jobs(
     service_config_path: Path,
     framework_config_payload: dict,
@@ -715,6 +859,21 @@ def test_cluster_capacity_api_returns_worker_jobs(
             owner_pod_id="worker-capacity-pod",
             dispatch_status="running",
         )
+        db.add(
+            RunIndex(
+                id="ri-capacity-view",
+                project_id="default",
+                source_type="execution_workspace",
+                source_key="/tmp/capacity-view",
+                source_hash="capacity-view",
+                run_name="capacity-view-run",
+                run_root_path="/tmp/capacity-view-run",
+                linked_task_id="tt-sched-capacity-view",
+                linked_execution_id=execution_id,
+                status="running",
+            )
+        )
+        db.commit()
     finally:
         db.close()
 
@@ -749,6 +908,7 @@ def test_cluster_capacity_api_returns_worker_jobs(
     assert payload["workers"][0]["active_jobs"][0]["execution_id"] == execution_id
     assert payload["workers"][0]["active_jobs"][0]["task_id"] == "tt-sched-capacity-view"
     assert payload["workers"][0]["active_jobs"][0]["mapped"] is True
+    assert payload["workers"][0]["active_jobs"][0]["run_path"] == "/tmp/capacity-view-run"
 
 
 def test_cluster_capacity_api_degrades_when_worker_probe_fails(

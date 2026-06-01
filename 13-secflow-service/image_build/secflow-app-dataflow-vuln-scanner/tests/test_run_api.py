@@ -4,6 +4,7 @@ import json
 import signal
 import time
 import uuid
+from datetime import timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -1256,6 +1257,57 @@ def test_run_process_state_uses_startup_grace_before_marking_stale(service_confi
         assert trigger.status == "running"
 
 
+def test_reconcile_stale_runtime_without_process_requeues_instead_of_failing(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_stale_no_process_20260508_010203"
+    bound = _create_execution_bound_run(client, run_root)
+
+    with get_db_session() as db:
+        run_index = db.get(RunIndex, bound["run_id"])
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        trigger = db.get(TriggerTask, bound["task_id"])
+        assert run_index is not None and execution is not None and trigger is not None
+        old_started_at = now_local() - timedelta(seconds=120)
+        run_index.status = "running"
+        execution.status = "starting"
+        execution.public_status = "dispatching"
+        execution.dispatch_status = "starting"
+        execution.owner_pod_id = "worker-stale-no-process"
+        execution.worker_url = "http://worker-stale-no-process:8080"
+        execution.worker_job_id = execution.id
+        execution.started_at = old_started_at
+        execution.process_pid = None
+        execution.process_started_at = None
+        execution.process_status = None
+        trigger.status = "dispatching"
+        trigger.started_at = old_started_at
+        db.add_all([run_index, execution, trigger])
+        db.commit()
+
+        service = get_execution_service()
+        assert service._reconcile_stale_runtime(db, run_index=run_index, trigger=trigger, execution=execution) is True
+        db.commit()
+        db.refresh(execution)
+        db.refresh(trigger)
+        assert execution.status == "pending"
+        assert execution.owner_pod_id is None
+        assert execution.worker_job_id is None
+        assert execution.worker_url is None
+        assert execution.dispatch_status is None
+        assert execution.process_status == "not_started"
+        assert trigger.status == "pending"
+        event = (
+            db.query(WorkflowExecutionEvent)
+            .filter(
+                WorkflowExecutionEvent.execution_id == execution.id,
+                WorkflowExecutionEvent.event_type == "worker_job_requeued_before_process_start",
+            )
+            .first()
+        )
+        assert event is not None
+
+
 def test_run_delete_active_run_stops_process_and_removes_records(service_config_path, monkeypatch):
     app = create_app()
     client = TestClient(app)
@@ -1473,8 +1525,8 @@ def test_run_retry_execution_uses_resume_cli_argv(service_config_path, monkeypat
         assert request_payload["resume_extra_cycles"] == 2
         assert request_payload["model"] == "mock/override"
         assert "thinking" not in request_payload
-        assert execution.status in {"pending", "dispatching", "running"}
-        assert execution.dispatch_status in {"queued", "pending", None}
+        assert execution.status in {"pending", "dispatching", "starting", "running"}
+        assert execution.dispatch_status in {"queued", "pending", "starting", None}
 
 
 def test_run_status_prefers_active_run_meta_over_stale_terminal_state(service_config_path):

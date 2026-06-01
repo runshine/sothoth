@@ -82,7 +82,7 @@ def test_cleanup_does_not_mutate_running_execution(service_config_path):
         executions = db.query(WorkflowExecution).order_by(WorkflowExecution.attempt_no.asc()).all()
         assert len(executions) == 1
         assert executions[0].status == "running"
-        assert executions[0].message == f"started by {scheduler.pod_id}"
+        assert executions[0].message == f"starting by {scheduler.pod_id}"
         trigger = db.get(TriggerTask, executions[0].trigger_task_id)
         assert trigger is not None
         assert trigger.retry_count == 0
@@ -269,5 +269,60 @@ def test_cleanup_requeues_stuck_dispatch_execution(service_config_path):
         assert execution.dispatch_status is None
         assert trigger.status == "pending"
         assert reservation is None
+    finally:
+        db.close()
+
+
+def test_cleanup_requeues_stuck_starting_execution_before_process_launch(service_config_path):
+    db = get_db_session()
+    try:
+        execution_id = "exec-stuck-starting-timeout"
+        trigger = TriggerTask(
+            id="tt-stuck-starting-timeout",
+            workflow_definition_id="wfd-stuck-starting-timeout",
+            project_id="default",
+            trigger_type="manual",
+            input_tasks_json={"tasks": []},
+            priority=100,
+            status="dispatching",
+            submitted_by="tester",
+            retry_count=0,
+            max_retry_count=3,
+            latest_execution_id=execution_id,
+        )
+        execution = WorkflowExecution(
+            id=execution_id,
+            trigger_task_id=trigger.id,
+            workflow_definition_id=trigger.workflow_definition_id,
+            project_id="default",
+            attempt_no=1,
+            status="starting",
+            owner_pod_id="worker-starting-timeout",
+            worker_url="http://worker-starting-timeout:8080",
+            worker_job_id="job-starting-timeout",
+            dispatch_status="starting",
+            process_pid=None,
+            process_started_at=None,
+            updated_at=now_local() - timedelta(minutes=5),
+        )
+        db.add_all([trigger, execution])
+        db.commit()
+    finally:
+        db.close()
+
+    SchedulerService()._cleanup_once()
+
+    db = get_db_session()
+    try:
+        execution = db.get(WorkflowExecution, execution_id)
+        trigger = db.get(TriggerTask, "tt-stuck-starting-timeout")
+        assert execution is not None
+        assert trigger is not None
+        assert execution.status == "pending"
+        assert execution.owner_pod_id is None
+        assert execution.worker_job_id is None
+        assert execution.dispatch_status is None
+        assert execution.process_status == "not_started"
+        assert trigger.status == "pending"
     finally:
         db.close()

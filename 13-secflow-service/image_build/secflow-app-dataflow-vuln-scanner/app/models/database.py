@@ -598,6 +598,7 @@ def get_engine():
             kwargs.update({
                 "pool_size": config.database.pool_size,
                 "max_overflow": config.database.max_overflow,
+                "pool_timeout": config.database.pool_timeout,
             })
         else:
             kwargs["connect_args"] = {"check_same_thread": False}

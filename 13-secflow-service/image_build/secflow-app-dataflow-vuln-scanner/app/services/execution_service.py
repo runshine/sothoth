@@ -38,6 +38,7 @@ from app.models.database import (
     RunIndexResult,
     RunIndexResultReview,
     RunIndexSession,
+    SchedulerWorkerSlotReservation,
     TriggerTask,
     VulnReportSubmission,
     WorkflowDefinition,
@@ -5494,6 +5495,14 @@ class ExecutionService:
         ):
             return True
         process_state = self._run_process_state(db, run_index, trigger=trigger, execution=execution)
+        if self._requeue_stale_starting_without_process(
+            db,
+            run_index=run_index,
+            trigger=trigger,
+            execution=execution,
+            process_state=process_state,
+        ):
+            return True
         if not bool(process_state.get("stale")):
             return False
 
@@ -5508,6 +5517,16 @@ class ExecutionService:
         )
         if resolution is None:
             return False
+
+        if self._requeue_stale_runtime_without_process(
+            db,
+            run_index=run_index,
+            trigger=trigger,
+            execution=execution,
+            message=resolution["message"],
+            process_state=process_state,
+        ):
+            return True
 
         terminal_status = resolution["terminal_status"]
         message = resolution["message"]
@@ -5568,6 +5587,112 @@ class ExecutionService:
                 level="warning",
                 payload_json={"reason": "stale_runtime_reconciled", "process_state": process_state},
             )
+        return True
+
+    def _requeue_stale_starting_without_process(
+        self,
+        db: Session,
+        *,
+        run_index: RunIndex | None,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+        process_state: dict[str, Any],
+    ) -> bool:
+        if execution is None:
+            return False
+        if execution.process_pid or execution.process_started_at:
+            return False
+        execution_status = str(execution.status or "").strip().lower()
+        dispatch_status = str(execution.dispatch_status or "").strip().lower()
+        if "starting" not in {execution_status, dispatch_status}:
+            return False
+        started_at = execution.started_at or (trigger.started_at if trigger is not None else None)
+        if started_at is None:
+            return False
+        startup_grace = self._process_start_grace_seconds()
+        if int(max((now_local() - started_at).total_seconds(), 0)) <= startup_grace:
+            return False
+        return self._requeue_stale_runtime_without_process(
+            db,
+            run_index=run_index,
+            trigger=trigger,
+            execution=execution,
+            message="starting runtime exceeded startup grace without process registration",
+            process_state={**process_state, "source": "stale_starting_without_process"},
+        )
+
+    def _requeue_stale_runtime_without_process(
+        self,
+        db: Session,
+        *,
+        run_index: RunIndex | None,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+        message: str,
+        process_state: dict[str, Any],
+    ) -> bool:
+        if execution is None:
+            return False
+        if execution.process_pid or execution.process_started_at:
+            return False
+        execution_status = _canonical_task_status(execution.status)
+        trigger_status = _canonical_task_status(trigger.status) if trigger is not None else ""
+        if execution_status not in {"dispatching", "running"} and trigger_status not in {"dispatching", "running"}:
+            return False
+
+        worker_url = execution.worker_url
+        owner_pod_id = execution.owner_pod_id
+        worker_job_id = execution.worker_job_id
+        requeue_message = f"stale runtime had no process registration, requeued: {message}"
+        (
+            db.query(SchedulerWorkerSlotReservation)
+            .filter(SchedulerWorkerSlotReservation.execution_id == execution.id)
+            .delete(synchronize_session=False)
+        )
+        execution.worker_url = None
+        execution.worker_job_id = None
+        execution.owner_pod_id = None
+        execution.status = "pending"
+        execution.public_status = "pending"
+        execution.control_state = "none"
+        execution.dispatch_status = None
+        execution.dispatch_error = message
+        execution.process_status = "not_started"
+        execution.process_pid = None
+        execution.process_started_at = None
+        execution.process_finished_at = None
+        execution.started_at = None
+        execution.finished_at = None
+        execution.message = requeue_message
+        if trigger is not None:
+            trigger.status = "pending"
+            trigger.public_status = "pending"
+            trigger.control_state = "none"
+            trigger.started_at = None
+            trigger.finished_at = None
+            trigger.message = requeue_message
+            db.add(trigger)
+        self._sync_runtime_state_snapshots(trigger=trigger, execution=execution, public_status="pending", control_state="none")
+        db.add(execution)
+        self._refresh_task_list_projection_for_execution(db, execution)
+        db.flush()
+        if run_index is not None:
+            self._write_run_control_state(run_index.run_root_path, status_text="pending", message=requeue_message)
+            get_run_index_service().sync_execution_run(db, execution)
+        self.record_event(
+            db,
+            execution_id=execution.id,
+            event_type="worker_job_requeued_before_process_start",
+            message=requeue_message,
+            level="warning",
+            payload_json={
+                "reason": "stale_runtime_without_process",
+                "process_state": process_state,
+                "worker_url": worker_url,
+                "owner_pod_id": owner_pod_id,
+                "worker_job_id": worker_job_id,
+            },
+        )
         return True
 
     def reconcile_stale_active_executions(self, db: Session, *, limit: int = 200) -> int:
@@ -6485,6 +6610,33 @@ class ExecutionService:
         trigger: TriggerTask,
     ) -> int:
         if os.environ.get("SECFLOW_DATAFLOW_CLI_IN_PROCESS") == "1":
+            now = now_local()
+            execution.status = "running"
+            execution.process_pid = os.getpid()
+            execution.process_host = get_config().scheduler.pod_id
+            execution.process_status = "running"
+            execution.process_started_at = now
+            execution.process_finished_at = None
+            execution.dispatch_status = "running"
+            trigger.status = "running"
+            trigger.message = "run_vuln_scan.py running"
+            self._sync_runtime_state_snapshots(trigger=trigger, execution=execution, public_status="running", control_state="none")
+            db.add(execution)
+            db.add(trigger)
+            self._refresh_task_list_projection_for_execution(db, execution)
+            db.commit()
+            self.record_event(
+                db,
+                execution_id=execution.id,
+                event_type="run_vuln_scan_process_started",
+                message=f"run_vuln_scan.py in-process started pid={os.getpid()}",
+                payload_json={
+                    "pid": os.getpid(),
+                    "pod_id": get_config().scheduler.pod_id,
+                    "host_name": get_config().scheduler.host_name,
+                    "in_process": True,
+                },
+            )
             import run_vuln_scan
 
             try:
@@ -6509,8 +6661,12 @@ class ExecutionService:
         execution.process_status = "running"
         execution.process_started_at = now
         execution.process_finished_at = None
+        execution.dispatch_status = "running"
+        trigger.status = "running"
+        trigger.message = "run_vuln_scan.py running"
         self._sync_runtime_state_snapshots(trigger=trigger, execution=execution, public_status="running", control_state="none")
         db.add(execution)
+        db.add(trigger)
         self._refresh_task_list_projection_for_execution(db, execution)
         db.commit()
         self._try_write_cli_process_file(
@@ -6606,15 +6762,18 @@ class ExecutionService:
         run_dir = Path(plan["run_dir"])
         self._write_dataflow_cli_task_preview(plan)
         execution.workspace_root = abs_path(run_dir)
-        execution.status = "running"
-        execution.message = "run_vuln_scan.py running"
+        if str(execution.status or "").strip().lower() not in {"starting", "dispatching"}:
+            execution.status = "starting"
+        execution.message = "run_vuln_scan.py starting"
         if execution.started_at is None:
             execution.started_at = now_local()
         if trigger.started_at is None:
             trigger.started_at = execution.started_at
-        trigger.status = "running"
-        trigger.message = "run_vuln_scan.py running"
-        self._sync_runtime_state_snapshots(trigger=trigger, execution=execution, public_status="running", control_state="none")
+        trigger.status = "dispatching"
+        trigger.message = "run_vuln_scan.py starting"
+        execution.dispatch_status = "starting"
+        execution.process_status = "not_started"
+        self._sync_runtime_state_snapshots(trigger=trigger, execution=execution, public_status="dispatching", control_state="none")
         db.add(execution)
         db.add(trigger)
         self._refresh_task_list_projection_for_task_id(db, trigger.id)
@@ -6659,7 +6818,7 @@ class ExecutionService:
                 db,
                 execution_id=execution.id,
                 event_type="execution_started",
-                message="run_vuln_scan.py started",
+                message="run_vuln_scan.py launch requested",
                 payload_json={
                     "workspace_root": abs_path(run_dir),
                     "owner_pod_id": execution.owner_pod_id,

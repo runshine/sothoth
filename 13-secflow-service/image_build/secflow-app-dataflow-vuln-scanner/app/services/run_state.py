@@ -19,6 +19,7 @@ RUN_QUEUE_STATES = {
     "pending",
     "queued",
     "dispatching",
+    "starting",
 }
 
 RUN_CONTROL_REQUEST_STATES = {

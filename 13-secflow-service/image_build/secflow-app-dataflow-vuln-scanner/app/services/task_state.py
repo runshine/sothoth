@@ -43,7 +43,7 @@ _RUN_FAILURE_STATUSES = {
 
 _RUN_CANCELLED_STATUSES = {"cancelled", "canceled", "interrupted", "stopped", "deleted"}
 _RUN_SUCCESS_STATUSES = {"success", "succeeded", "completed", "passed"}
-_DISPATCH_ACTIVE_STATUSES = {"queued", "dispatching", "accepted"}
+_DISPATCH_ACTIVE_STATUSES = {"queued", "dispatching", "starting", "accepted"}
 _RUNNING_ALIASES = {"running", "processing", "in_progress", "started"}
 _PENDING_ALIASES = {"pending", "ready", "ready_to_start", "not_started", "unassigned"}
 _RUNTIME_RECONCILED_FAILURE_MESSAGES = {

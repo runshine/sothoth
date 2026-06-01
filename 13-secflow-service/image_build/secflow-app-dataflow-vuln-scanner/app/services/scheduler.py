@@ -21,6 +21,7 @@ from app.models.database import (
     TriggerTask,
     WorkflowDefinition,
     WorkflowExecution,
+    WorkflowExecutionEvent,
     get_db_session,
 )
 from app.observability.service_ops import observe_service_operation
@@ -38,10 +39,10 @@ from app.time_utils import now_local
 
 logger = logging.getLogger(__name__)
 
-ACTIVE_JOB_STATUSES = {"queued", "pending", "running", "cancel_requested", "delete_requested"}
+ACTIVE_JOB_STATUSES = {"queued", "pending", "dispatching", "starting", "running", "cancel_requested", "delete_requested"}
 TERMINAL_EXECUTION_STATUSES = {"succeeded", "failed", "cancelled"}
-WORKER_SLOT_OCCUPYING_DISPATCH_STATUSES = {"queued", "dispatching", "running", "cancel_requested", "delete_requested"}
-WORKER_SLOT_OCCUPYING_EXECUTION_STATUSES = {"dispatching", "running", "cancel_requested", "delete_requested"}
+WORKER_SLOT_OCCUPYING_DISPATCH_STATUSES = {"queued", "dispatching", "starting", "running", "cancel_requested", "delete_requested"}
+WORKER_SLOT_OCCUPYING_EXECUTION_STATUSES = {"dispatching", "starting", "running", "cancel_requested", "delete_requested"}
 
 
 @dataclasses.dataclass
@@ -254,23 +255,21 @@ class SchedulerService:
             ),
         )
 
-    def _running_count_for_worker(self, db: Session, pod_id: str) -> int:
-        return int(
-            db.query(WorkflowExecution)
-            .filter(
-                WorkflowExecution.owner_pod_id == pod_id,
-                self._active_execution_filter(),
-            )
-            .count()
-            or 0
+    def _running_count_for_worker(self, db: Session, pod_id: str, *, exclude_execution_id: str | None = None) -> int:
+        query = db.query(WorkflowExecution).filter(
+            WorkflowExecution.owner_pod_id == pod_id,
+            self._active_execution_filter(),
         )
+        if exclude_execution_id:
+            query = query.filter(WorkflowExecution.id != exclude_execution_id)
+        return int(query.count() or 0)
 
     def _started_count_for_worker(self, db: Session, pod_id: str) -> int:
         return int(
             db.query(WorkflowExecution)
             .filter(
                 WorkflowExecution.owner_pod_id == pod_id,
-                WorkflowExecution.status.in_(["running", "cancel_requested", "delete_requested"]),
+                WorkflowExecution.status.in_(["starting", "running", "cancel_requested", "delete_requested"]),
             )
             .count()
             or 0
@@ -728,11 +727,11 @@ class SchedulerService:
             )
             .update(
                 {
-                    WorkflowExecution.status: "running",
+                    WorkflowExecution.status: "starting",
                     WorkflowExecution.started_at: now,
-                    WorkflowExecution.dispatch_status: "running",
+                    WorkflowExecution.dispatch_status: "starting",
                     WorkflowExecution.dispatch_error: None,
-                    WorkflowExecution.message: f"started by worker {self.pod_id}",
+                    WorkflowExecution.message: f"starting on worker {self.pod_id}",
                 },
                 synchronize_session=False,
             )
@@ -742,9 +741,9 @@ class SchedulerService:
             .filter(TriggerTask.id == trigger.id, TriggerTask.status.in_(["pending", "dispatching"]))
             .update(
                 {
-                    TriggerTask.status: "running",
+                    TriggerTask.status: "dispatching",
                     TriggerTask.started_at: now,
-                    TriggerTask.message: f"started by worker {self.pod_id}",
+                    TriggerTask.message: f"starting on worker {self.pod_id}",
                 },
                 synchronize_session=False,
             )
@@ -753,7 +752,14 @@ class SchedulerService:
             db.rollback()
             return None
         db.commit()
-        logger.info("started assigned execution %s on worker %s", execution.id, self.pod_id)
+        get_execution_service().record_event(
+            db,
+            execution_id=execution.id,
+            event_type="worker_job_starting",
+            message=f"worker job starting on {self.pod_id}",
+            payload_json={"worker_pod_id": self.pod_id},
+        )
+        logger.info("starting assigned execution %s on worker %s", execution.id, self.pod_id)
         return execution.id
 
     def _claim_next_execution(self) -> str | None:
@@ -785,10 +791,12 @@ class SchedulerService:
                     )
                     .update(
                         {
-                            WorkflowExecution.status: "running",
+                            WorkflowExecution.status: "starting",
                             WorkflowExecution.owner_pod_id: self.pod_id,
                             WorkflowExecution.started_at: now,
-                            WorkflowExecution.message: f"started by {self.pod_id}",
+                            WorkflowExecution.dispatch_status: "starting",
+                            WorkflowExecution.dispatch_error: None,
+                            WorkflowExecution.message: f"starting by {self.pod_id}",
                         },
                         synchronize_session=False,
                     )
@@ -801,9 +809,9 @@ class SchedulerService:
                     .filter(TriggerTask.id == trigger.id, TriggerTask.status == "pending")
                     .update(
                         {
-                            TriggerTask.status: "running",
+                            TriggerTask.status: "dispatching",
                             TriggerTask.started_at: now,
-                            TriggerTask.message: f"started by {self.pod_id}",
+                            TriggerTask.message: f"starting by {self.pod_id}",
                         },
                         synchronize_session=False,
                     )
@@ -812,7 +820,14 @@ class SchedulerService:
                     db.rollback()
                     continue
                 db.commit()
-                logger.info("started execution %s on pod %s", execution.id, self.pod_id)
+                get_execution_service().record_event(
+                    db,
+                    execution_id=execution.id,
+                    event_type="worker_job_starting",
+                    message=f"worker job starting on {self.pod_id}",
+                    payload_json={"worker_pod_id": self.pod_id, "mode": "standalone_claim"},
+                )
+                logger.info("starting execution %s on pod %s", execution.id, self.pod_id)
                 return execution.id
             return None
         finally:
@@ -842,10 +857,12 @@ class SchedulerService:
                 )
                 .update(
                     {
-                        WorkflowExecution.status: "running",
+                        WorkflowExecution.status: "starting",
                         WorkflowExecution.owner_pod_id: self.pod_id,
                         WorkflowExecution.started_at: now,
-                        WorkflowExecution.message: f"started immediately by {self.pod_id}",
+                        WorkflowExecution.dispatch_status: "starting",
+                        WorkflowExecution.dispatch_error: None,
+                        WorkflowExecution.message: f"starting immediately by {self.pod_id}",
                     },
                     synchronize_session=False,
                 )
@@ -855,9 +872,9 @@ class SchedulerService:
                 .filter(TriggerTask.id == trigger.id, TriggerTask.status == "pending")
                 .update(
                     {
-                        TriggerTask.status: "running",
+                        TriggerTask.status: "dispatching",
                         TriggerTask.started_at: now,
-                        TriggerTask.message: f"started immediately by {self.pod_id}",
+                        TriggerTask.message: f"starting immediately by {self.pod_id}",
                     },
                     synchronize_session=False,
                 )
@@ -866,7 +883,14 @@ class SchedulerService:
                 db.rollback()
                 return None
             db.commit()
-            logger.info("immediately started execution %s on pod %s", execution_id, self.pod_id)
+            get_execution_service().record_event(
+                db,
+                execution_id=execution_id,
+                event_type="worker_job_starting",
+                message=f"worker job starting on {self.pod_id}",
+                payload_json={"worker_pod_id": self.pod_id, "mode": "start_execution_now"},
+            )
+            logger.info("immediately starting execution %s on pod %s", execution_id, self.pod_id)
             return execution_id
         finally:
             db.close()
@@ -898,9 +922,64 @@ class SchedulerService:
 
     def _dispatch_execution_to_worker(self, execution_id: str) -> bool:
         db = get_db_session()
-        worker_url = ""
-        worker_pod_id = ""
+        try:
+            candidates = self._rank_dataflow_workers(db, execution_id)
+        finally:
+            db.close()
+
+        if not candidates:
+            raise DataflowWorkerError("no healthy registry worker available")
+
+        attempts = max(1, int(get_config().dataflow_worker.dispatch_max_retries or 1))
+        tried_worker_ids: set[str] = set()
+        last_worker_url = ""
+        last_worker_pod_id = ""
         last_error = ""
+        capacity_errors: list[dict[str, str]] = []
+
+        for worker_pod_id, worker_url in candidates:
+            if worker_pod_id in tried_worker_ids:
+                continue
+            tried_worker_ids.add(worker_pod_id)
+            last_worker_url = worker_url
+            last_worker_pod_id = worker_pod_id
+            if not self._reserve_dispatch_worker(execution_id, worker_pod_id, worker_url):
+                return False
+
+            for attempt in range(1, attempts + 1):
+                try:
+                    job = get_dataflow_worker_client(worker_url).create_job(
+                        {
+                            "execution_id": execution_id,
+                            "worker_url": worker_url,
+                            "worker_pod_id": worker_pod_id,
+                        }
+                    )
+                    self._mark_dispatch_success(execution_id, worker_url, job)
+                    return True
+                except DataflowWorkerError as exc:
+                    last_error = str(exc)
+                    if self._is_capacity_exceeded_error(last_error):
+                        capacity_errors.append({"worker_pod_id": worker_pod_id, "worker_url": worker_url, "error": last_error})
+                        self._reset_dispatch_reservation(execution_id)
+                        break
+                    if attempt < attempts:
+                        time.sleep(max(0, int(get_config().dataflow_worker.dispatch_retry_interval_seconds or 0)))
+            else:
+                self._mark_dispatch_failure(execution_id, worker_url, last_error or "dataflow worker dispatch failed", worker_pod_id=worker_pod_id)
+                return False
+
+        self._mark_dispatch_failure(
+            execution_id,
+            last_worker_url,
+            last_error or "dataflow worker capacity exceeded",
+            worker_pod_id=last_worker_pod_id,
+            payload_extra={"capacity_errors": capacity_errors},
+        )
+        return False
+
+    def _reserve_dispatch_worker(self, execution_id: str, worker_pod_id: str, worker_url: str) -> bool:
+        db = get_db_session()
         try:
             execution = db.get(WorkflowExecution, execution_id)
             if execution is None or execution.status != "pending":
@@ -908,17 +987,18 @@ class SchedulerService:
             trigger = db.get(TriggerTask, execution.trigger_task_id)
             if trigger is None or trigger.status != "pending":
                 return False
-            worker_pod_id, worker_url = self._choose_dataflow_worker(db, execution_id)
             message = f"dispatching to worker {worker_url}"
             lease_expires_at = now_local() + timedelta(seconds=max(1, int(get_config().scheduler.reservation_lease_seconds or 30)))
+            self._release_reservation(db, execution_id)
+            db.flush()
             updated_execution = (
                 db.query(WorkflowExecution)
                 .filter(
                     WorkflowExecution.id == execution_id,
                     WorkflowExecution.status == "pending",
-                    WorkflowExecution.owner_pod_id.is_(None),
-                    WorkflowExecution.worker_job_id.is_(None),
-                    or_(WorkflowExecution.dispatch_status.is_(None), WorkflowExecution.dispatch_status == ""),
+                    or_(WorkflowExecution.owner_pod_id.is_(None), WorkflowExecution.owner_pod_id == worker_pod_id),
+                    or_(WorkflowExecution.worker_job_id.is_(None), WorkflowExecution.worker_job_id == execution.id),
+                    or_(WorkflowExecution.dispatch_status.is_(None), WorkflowExecution.dispatch_status == "", WorkflowExecution.dispatch_status == "dispatching"),
                 )
                 .update(
                     {
@@ -953,39 +1033,47 @@ class SchedulerService:
                 )
             )
             db.commit()
+            return True
         finally:
             db.close()
 
-        attempts = max(1, int(get_config().dataflow_worker.dispatch_max_retries or 1))
-        for attempt in range(1, attempts + 1):
-            try:
-                job = get_dataflow_worker_client(worker_url).create_job(
-                    {
-                        "execution_id": execution_id,
-                        "worker_url": worker_url,
-                        "worker_pod_id": worker_pod_id,
-                    }
-                )
-                self._mark_dispatch_success(execution_id, worker_url, job)
-                return True
-            except DataflowWorkerError as exc:
-                last_error = str(exc)
-                if attempt < attempts:
-                    time.sleep(max(0, int(get_config().dataflow_worker.dispatch_retry_interval_seconds or 0)))
+    def _reset_dispatch_reservation(self, execution_id: str) -> None:
+        db = get_db_session()
+        try:
+            execution = db.get(WorkflowExecution, execution_id)
+            if execution is None:
+                return
+            trigger = db.get(TriggerTask, execution.trigger_task_id)
+            self._release_reservation(db, execution_id)
+            db.flush()
+            execution.owner_pod_id = None
+            execution.worker_url = None
+            execution.worker_job_id = None
+            execution.dispatch_status = None
+            execution.dispatch_error = None
+            execution.message = "worker capacity exceeded; trying another worker"
+            if trigger is not None and trigger.status == "pending":
+                trigger.message = execution.message
+                db.add(trigger)
+            db.add(execution)
+            db.commit()
+        finally:
+            db.close()
 
-        self._mark_dispatch_failure(execution_id, worker_url, last_error or "dataflow worker dispatch failed", worker_pod_id=worker_pod_id)
-        return False
+    @staticmethod
+    def _is_capacity_exceeded_error(error: str) -> bool:
+        return "capacity_exceeded" in str(error or "").lower()
 
     def _choose_dataflow_worker(self, db: Session, execution_id: str) -> tuple[str, str]:
+        candidates = self._rank_dataflow_workers(db, execution_id)
+        if not candidates:
+            raise DataflowWorkerError("no healthy registry worker available")
+        return candidates[0]
+
+    def _rank_dataflow_workers(self, db: Session, execution_id: str) -> list[tuple[str, str]]:
         workers = self._healthy_registry_workers(db)
         if not workers:
             raise DataflowWorkerError("no healthy registry worker available")
-        if len(workers) == 1:
-            worker = workers[0]
-            worker_url = self._worker_url_from_registry(worker)
-            if not worker_url:
-                raise DataflowWorkerError("no healthy registry worker available")
-            return str(worker.pod_id), worker_url
 
         registry_worker_urls: dict[str, str] = {}
         for worker in workers:
@@ -1010,7 +1098,14 @@ class SchedulerService:
             enumerate(ordered_pod_ids),
             key=lambda item: (counts[item[1]], (item[0] - salt) % len(ordered_pod_ids)),
         )
-        return best_pod_id, registry_worker_urls[best_pod_id]
+        return sorted(
+            ((pod_id, registry_worker_urls[pod_id]) for pod_id in ordered_pod_ids),
+            key=lambda item: (
+                counts[item[0]],
+                (ordered_pod_ids.index(item[0]) - salt) % len(ordered_pod_ids),
+                0 if item[0] == best_pod_id else 1,
+            ),
+        )
 
     def _healthy_registry_workers(self, db: Session) -> list[SchedulerWorker]:
         worker_timeout_at = now_local() - timedelta(seconds=get_config().scheduler.worker_timeout_seconds)
@@ -1102,7 +1197,7 @@ class SchedulerService:
             worker_url = worker_url or execution.worker_url or None
             if run_index is not None:
                 run_name = run_index.run_name
-                run_path = run_index.run_path
+                run_path = run_index.run_root_path
 
         return WorkerActiveJobResponse(
             execution_id=execution_id,
@@ -1130,7 +1225,8 @@ class SchedulerService:
             job_id = str(job.get("id") or job.get("job_id") or execution.worker_job_id or execution.id)
             execution.worker_url = worker_url
             execution.worker_job_id = job_id
-            execution.dispatch_status = str(job.get("status") or "queued")
+            job_phase = str(job.get("phase") or job.get("status") or "queued").strip().lower()
+            execution.dispatch_status = job_phase or "queued"
             execution.dispatch_error = None
             if execution.status == "pending":
                 execution.message = f"queued on worker {worker_url}"
@@ -1151,7 +1247,15 @@ class SchedulerService:
         finally:
             db.close()
 
-    def _mark_dispatch_failure(self, execution_id: str, worker_url: str, error: str, *, worker_pod_id: str | None = None) -> None:
+    def _mark_dispatch_failure(
+        self,
+        execution_id: str,
+        worker_url: str,
+        error: str,
+        *,
+        worker_pod_id: str | None = None,
+        payload_extra: dict[str, Any] | None = None,
+    ) -> None:
         db = get_db_session()
         try:
             execution = db.get(WorkflowExecution, execution_id)
@@ -1166,6 +1270,9 @@ class SchedulerService:
             execution.status = "pending"
             execution.public_status = "pending"
             execution.started_at = None
+            execution.process_pid = None
+            execution.process_started_at = None
+            execution.process_status = "not_started"
             trigger = db.get(TriggerTask, execution.trigger_task_id)
             if trigger is not None and trigger.status in {"pending", "dispatching"}:
                 trigger.status = "pending"
@@ -1175,14 +1282,124 @@ class SchedulerService:
             self._release_reservation(db, execution_id)
             db.add(execution)
             db.commit()
+            payload_json = {"worker_url": worker_url, "worker_pod_id": worker_pod_id, "error": error}
+            if payload_extra:
+                payload_json.update(payload_extra)
+            if self._has_recent_dispatch_requeue_event(db, execution_id, worker_url, worker_pod_id, error):
+                return
             get_execution_service().record_event(
                 db,
                 execution_id=execution_id,
                 event_type="worker_dispatch_requeued",
                 message=execution.message,
                 level="warning",
-                payload_json={"worker_url": worker_url, "worker_pod_id": worker_pod_id, "error": error},
+                payload_json=payload_json,
             )
+        finally:
+            db.close()
+
+    def _has_recent_dispatch_requeue_event(
+        self,
+        db: Session,
+        execution_id: str,
+        worker_url: str,
+        worker_pod_id: str | None,
+        error: str,
+    ) -> bool:
+        threshold = now_local() - timedelta(seconds=30)
+        events = (
+            db.query(WorkflowExecutionEvent)
+            .filter(
+                WorkflowExecutionEvent.execution_id == execution_id,
+                WorkflowExecutionEvent.event_type == "worker_dispatch_requeued",
+                WorkflowExecutionEvent.created_at >= threshold,
+            )
+            .order_by(WorkflowExecutionEvent.created_at.desc())
+            .limit(5)
+            .all()
+        )
+        for event in events:
+            payload = event.payload_json or {}
+            if (
+                str(payload.get("worker_url") or "") == str(worker_url or "")
+                and str(payload.get("worker_pod_id") or "") == str(worker_pod_id or "")
+                and str(payload.get("error") or "") == str(error or "")
+            ):
+                return True
+        return False
+
+    def _requeue_if_not_process_started(self, execution_id: str, error: str) -> bool:
+        db = get_db_session()
+        try:
+            execution = db.get(WorkflowExecution, execution_id)
+            if execution is None:
+                return False
+            if execution.process_pid or execution.process_started_at:
+                return False
+            if str(execution.status or "").strip().lower() not in {"dispatching", "starting", "running", "failed"}:
+                return False
+
+            trigger = db.get(TriggerTask, execution.trigger_task_id)
+            message = f"worker job start failed before process launch, requeued: {error}"
+            worker_url = execution.worker_url
+            owner_pod_id = execution.owner_pod_id
+            worker_job_id = execution.worker_job_id
+            self._release_reservation(db, execution_id)
+            execution.worker_url = None
+            execution.worker_job_id = None
+            execution.owner_pod_id = None
+            execution.status = "pending"
+            execution.public_status = "pending"
+            execution.control_state = "none"
+            execution.dispatch_status = None
+            execution.dispatch_error = error
+            execution.process_status = "not_started"
+            execution.process_pid = None
+            execution.process_started_at = None
+            execution.process_finished_at = None
+            execution.started_at = None
+            execution.finished_at = None
+            execution.message = message
+            if trigger is not None and str(trigger.status or "").strip().lower() in {"pending", "dispatching", "running", "failed"}:
+                trigger.status = "pending"
+                trigger.public_status = "pending"
+                trigger.control_state = "none"
+                trigger.started_at = None
+                trigger.finished_at = None
+                trigger.message = message
+                db.add(trigger)
+            db.add(execution)
+            db.commit()
+            get_execution_service().record_event(
+                db,
+                execution_id=execution_id,
+                event_type="worker_job_start_failed",
+                message=message,
+                level="warning",
+                payload_json={
+                    "error": error,
+                    "worker_url": worker_url,
+                    "owner_pod_id": owner_pod_id,
+                    "worker_job_id": worker_job_id,
+                    "process_pid": None,
+                },
+            )
+            get_execution_service().record_event(
+                db,
+                execution_id=execution_id,
+                event_type="worker_job_requeued_before_process_start",
+                message=message,
+                level="warning",
+                payload_json={"reason": "process_not_started", "error": error},
+            )
+            logger.warning(
+                "requeued execution %s before process start owner=%s job=%s error=%s",
+                execution_id,
+                owner_pod_id,
+                worker_job_id,
+                error,
+            )
+            return True
         finally:
             db.close()
 
@@ -1193,8 +1410,9 @@ class SchedulerService:
         async def runner() -> None:
             try:
                 await asyncio.to_thread(get_execution_service().run_claimed_execution, execution_id)
-            except Exception:
-                logger.exception("execution %s failed", execution_id)
+            except Exception as exc:
+                logger.exception("execution %s failed during startup/execution", execution_id)
+                await asyncio.to_thread(self._requeue_if_not_process_started, execution_id, str(exc))
             finally:
                 self._running_tasks.pop(execution_id, None)
                 await asyncio.to_thread(self._heartbeat_once)
@@ -1209,8 +1427,9 @@ class SchedulerService:
         def runner() -> None:
             try:
                 get_execution_service().run_claimed_execution(execution_id)
-            except Exception:
-                logger.exception("execution %s failed", execution_id)
+            except Exception as exc:
+                logger.exception("execution %s failed during startup/execution", execution_id)
+                self._requeue_if_not_process_started(execution_id, str(exc))
             finally:
                 self._running_tasks.pop(execution_id, None)
                 self._heartbeat_once()
@@ -1271,7 +1490,7 @@ class SchedulerService:
                 return self._job_payload(execution)
             if execution.worker_job_id and execution.owner_pod_id not in {None, self.pod_id}:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="execution is assigned to another worker")
-            current_used = self._running_count_for_worker(db, self.pod_id)
+            current_used = self._running_count_for_worker(db, self.pod_id, exclude_execution_id=execution.id)
             if not self.has_unlimited_capacity and current_used >= self.capacity:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="capacity_exceeded")
 
@@ -1303,11 +1522,7 @@ class SchedulerService:
             db.close()
 
         self._start_assigned_jobs()
-        latest = self.get_local_job(job["id"]) or job
-        if latest.get("phase") == "running" or job["id"] in self._running_tasks:
-            latest["status"] = "running"
-            latest["phase"] = "running"
-        return latest
+        return self.get_local_job(job["id"]) or job
 
     def cancel_local_job(self, job_id: str) -> dict[str, Any]:
         if not self.is_http_worker_role or self.role == "manager":
@@ -1319,7 +1534,7 @@ class SchedulerService:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="job not found")
             trigger = db.get(TriggerTask, execution.trigger_task_id)
             now = now_local()
-            if execution.status in {"pending", "dispatching"}:
+            if execution.status in {"pending", "dispatching", "starting"}:
                 execution.status = "cancelled"
                 execution.public_status = "cancelled"
                 execution.control_state = "none"
@@ -1437,6 +1652,8 @@ class SchedulerService:
         status_text = str(execution.status or "pending")
         if status_text == "pending" and execution.worker_job_id:
             status_text = "queued"
+        elif status_text == "starting":
+            status_text = "starting"
         elif status_text == "dispatching":
             status_text = "dispatching"
         elif status_text == "succeeded":
@@ -1491,8 +1708,8 @@ class SchedulerService:
                 .filter(
                     WorkflowExecution.owner_pod_id.isnot(None),
                     WorkflowExecution.worker_job_id.isnot(None),
-                    WorkflowExecution.status.in_(["pending", "dispatching"]),
-                    WorkflowExecution.dispatch_status.in_(["dispatching", "queued"]),
+                    WorkflowExecution.status.in_(["pending", "dispatching", "starting"]),
+                    WorkflowExecution.dispatch_status.in_(["dispatching", "queued", "starting"]),
                     WorkflowExecution.updated_at <= stale_dispatch_at,
                     TriggerTask.status.in_(["pending", "dispatching"]),
                 )
@@ -1508,6 +1725,9 @@ class SchedulerService:
                 execution.public_status = "pending"
                 execution.dispatch_status = None
                 execution.dispatch_error = "dispatch timed out and was requeued"
+                execution.process_status = "not_started"
+                execution.process_pid = None
+                execution.process_started_at = None
                 execution.message = "worker dispatch timed out and was requeued"
                 execution.started_at = None
                 db.add(execution)
@@ -1519,7 +1739,7 @@ class SchedulerService:
                 get_execution_service().record_event(
                     db,
                     execution_id=str(execution.id),
-                    event_type="worker_dispatch_requeued",
+                    event_type="worker_job_requeued_before_process_start",
                     message=execution.message,
                     level="warning",
                     payload_json={"reason": "dispatch_timeout"},
@@ -1530,7 +1750,7 @@ class SchedulerService:
                 .filter(
                     WorkflowExecution.owner_pod_id.is_(None),
                     WorkflowExecution.worker_job_id.isnot(None),
-                    WorkflowExecution.dispatch_status.in_(["queued", "dispatching"]),
+                    WorkflowExecution.dispatch_status.in_(["queued", "dispatching", "starting"]),
                 )
                 .all()
             )

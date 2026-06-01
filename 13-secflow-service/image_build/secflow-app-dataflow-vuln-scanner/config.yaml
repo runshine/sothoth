@@ -10,6 +10,9 @@ database:
   password: secflow
   name: secflow
   table_prefix: secflow_dataflow_vuln_scanner_
+  pool_size: 40
+  max_overflow: 20
+  pool_timeout: 30
 
 auth_service:
   enabled: false

@@ -22,8 +22,9 @@ class DatabaseConfig(BaseModel):
     password: str = ""
     name: str = "secflow"
     table_prefix: str = "secflow_dataflow_vuln_scanner_"
-    pool_size: int = 10
+    pool_size: int = 40
     max_overflow: int = 20
+    pool_timeout: int = 30
 
     @property
     def sqlalchemy_url(self) -> str:
