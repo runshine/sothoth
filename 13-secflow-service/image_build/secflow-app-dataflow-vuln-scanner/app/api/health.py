@@ -5,7 +5,6 @@ import logging
 from fastapi import APIRouter, HTTPException
 
 from app.build_info import build_service_meta
-from app.models.database import get_engine
 from app.runtime_state import build_runtime_status
 from app.schemas import HealthResponse, SuccessResponse
 from app.services.auth import get_auth_service
@@ -35,8 +34,6 @@ async def ready() -> SuccessResponse:
             status_code=503,
             detail=f"runtime bootstrap incomplete: {runtime_status.get('last_error') or 'waiting for db init'}",
         )
-    with get_engine().connect() as conn:
-        conn.exec_driver_sql("SELECT 1")
     await get_auth_service().startup_validate()
     try:
         get_project_service().startup_validate()

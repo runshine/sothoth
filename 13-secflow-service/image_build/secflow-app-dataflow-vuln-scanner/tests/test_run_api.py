@@ -1257,6 +1257,31 @@ def test_run_process_state_uses_startup_grace_before_marking_stale(service_confi
         assert trigger.status == "running"
 
 
+def test_ready_does_not_require_db_connection_after_runtime_ready(service_config_path, monkeypatch):
+    app = create_app()
+    client = TestClient(app)
+
+    monkeypatch.setattr(
+        "app.api.health.build_runtime_status",
+        lambda: {"ready": True, "last_error": None},
+    )
+
+    class _ForbiddenEngine:
+        def connect(self):
+            raise AssertionError("ready endpoint should not acquire a db connection")
+
+    async def _noop_auth_validate():
+        return None
+
+    monkeypatch.setattr("app.api.health.get_engine", lambda: _ForbiddenEngine(), raising=False)
+    monkeypatch.setattr("app.api.health.get_auth_service", lambda: type("_Auth", (), {"startup_validate": staticmethod(_noop_auth_validate)})())
+    monkeypatch.setattr("app.api.health.get_project_service", lambda: type("_Project", (), {"startup_validate": staticmethod(lambda: None)})())
+
+    response = client.get("/api/dataflow-vuln-scanner/ready")
+    assert response.status_code == 200
+    assert response.json()["message"] == "ready"
+
+
 def test_reconcile_stale_runtime_without_process_requeues_instead_of_failing(service_config_path):
     app = create_app()
     client = TestClient(app)
