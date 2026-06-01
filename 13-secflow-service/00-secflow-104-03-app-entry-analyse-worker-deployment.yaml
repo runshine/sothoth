@@ -51,8 +51,6 @@ spec:
           value: '5'
         - name: EA_WORKER_POLL_SECONDS
           value: '5'
-        - name: EA_AGENT_PROCESS_LIMIT
-          value: '8'
         - name: WORKER_ISOLATION_MODE
           value: none
         - name: EA_POD_IP
