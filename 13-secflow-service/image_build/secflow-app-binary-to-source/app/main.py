@@ -53,8 +53,9 @@ def _cached_summary(key: str, builder: Callable[[], Any]) -> Any:
 
 
 def _metrics_rows():
-    response = get_observability().metrics_response()
-    return parse_prometheus_metrics(response.body)
+    # Summary endpoints must stay cheap. The full metrics response builds a
+    # historical DB/filesystem snapshot, which is reserved for raw diagnostics.
+    return parse_prometheus_metrics(get_observability().prom.render())
 
 
 def _service_role() -> str:
