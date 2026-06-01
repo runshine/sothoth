@@ -15242,6 +15242,7 @@ class TaskManager:
                 "pipeline_mode": self._pipeline_mode(task),
             },
         )
+        self._refresh_stage_from_authoritative_items(db, task, "vuln_scan")
         return item
 
     def _prepare_stage_items_for_execution(

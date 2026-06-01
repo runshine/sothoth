@@ -967,6 +967,67 @@ class TaskManagerTests(unittest.TestCase):
         self.assertTrue(any(run.stage_name == "vuln_scan" for run in db.stage_runs))
         self.assertTrue(any(event.event_type == "streaming_vuln_item_seeded" for event in db.events))
 
+    def test_trigger_vuln_items_from_dataflow_result_refreshes_stale_cancelled_stage_run(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        stale_run = BinarySecurityStageRun(
+            id="sr-vuln",
+            task_id="t1",
+            project_id="p1",
+            stage_name="vuln_scan",
+            sequence_no=4,
+            status="cancelled",
+            finished_at=_now(),
+        )
+        stale_run.counts = {"total_items": 0, "cancelled_items": 0, "running_items": 0}
+        upstream_item = BinarySecurityStageItem(
+            id="si-df",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-df",
+            stage_name="dataflow_analysis",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="success",
+            downstream_service="dataflow_analyse",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stale_run], stage_items=[])
+
+        seeded = self.manager._trigger_vuln_items_from_dataflow_result(
+            db,
+            task,
+            {
+                "entry_key": "entry-1",
+                "module_key": "module-1",
+                "function_name": "handle_req",
+                "data_flow_file": "/tmp/flow.md",
+                "source_dir": "/tmp/source/module-1",
+            },
+            upstream_item=upstream_item,
+        )
+
+        self.assertIsNotNone(seeded)
+        self.assertEqual("pending", seeded.status)
+        self.assertEqual("pending", stale_run.status)
+        self.assertIsNone(stale_run.finished_at)
+        self.assertEqual(1, stale_run.counts["total_items"])
+        self.assertEqual(1, stale_run.counts["running_items"])
+        self.assertEqual("pending", task.stage_summary["vuln_scan"]["status"])
+        self.assertIsNone(task.stage_summary["vuln_scan"]["finished_at"])
+
     def test_trigger_vuln_items_from_dataflow_result_resets_stale_dispatching_vuln_item(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         task = BinarySecurityTask(
