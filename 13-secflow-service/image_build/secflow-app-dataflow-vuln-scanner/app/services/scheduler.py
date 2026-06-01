@@ -78,6 +78,7 @@ class SchedulerService:
         self._cluster_capacity_summary_snapshot: WorkerClusterCapacitySummaryResponse | None = None
         self._cluster_capacity_summary_snapshot_at = None
         self._cluster_capacity_summary_lock = threading.Lock()
+        self._active_reconcile_running = False
 
     @property
     def role(self) -> str:
@@ -153,6 +154,8 @@ class SchedulerService:
             self._tasks.append(asyncio.create_task(self._manager_dispatch_loop(), name="scheduler-manager-dispatch"))
         if self.runs_manager or self.runs_worker:
             self._tasks.append(asyncio.create_task(self._cleanup_loop(), name="scheduler-cleanup"))
+        if self.role in {"standalone", "api", "manager"}:
+            self._tasks.append(asyncio.create_task(self._active_reconcile_loop(), name="scheduler-active-reconcile"))
         logger.info("scheduler started role=%s worker_enabled=%s capacity=%s", self.role, self.runs_worker, self.capacity)
 
     async def stop(self) -> None:
@@ -1685,6 +1688,27 @@ class SchedulerService:
         while True:
             await asyncio.sleep(interval)
             await asyncio.to_thread(self._cleanup_once)
+
+    async def _active_reconcile_loop(self) -> None:
+        interval = max(1, int(get_config().scheduler.active_reconcile_interval_seconds or 30))
+        while True:
+            await asyncio.sleep(interval)
+            if self._active_reconcile_running:
+                continue
+            self._active_reconcile_running = True
+            try:
+                db = get_db_session()
+                try:
+                    get_execution_service().reconcile_active_tasks(
+                        db,
+                        limit=int(get_config().scheduler.active_reconcile_limit or 100),
+                    )
+                finally:
+                    db.close()
+            except Exception:
+                logger.exception("active reconcile loop failed")
+            finally:
+                self._active_reconcile_running = False
 
     def _cleanup_once(self) -> None:
         db = get_db_session()

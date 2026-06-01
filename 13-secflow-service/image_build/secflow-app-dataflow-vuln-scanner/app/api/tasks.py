@@ -9,6 +9,8 @@ from app.api.dependencies import ensure_project_access, get_current_or_machine_s
 from app.config import get_config
 from app.models.database import WorkflowExecution
 from app.schemas import (
+    ActiveTaskReconcileRequest,
+    ActiveTaskReconcileResponse,
     CreateEvolutionTaskRequest,
     DataflowTaskTimelineActionResponse,
     DataflowTaskTimelineResponse,
@@ -219,6 +221,25 @@ def get_task(task_id: str, subject=Depends(get_current_or_machine_subject), db: 
 async def rebuild_task_projection(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().rebuild_single_scan_task_projection(db, task_id, principal)
+
+
+@router.post("/tasks/runtime/reconcile-active", response_model=ActiveTaskReconcileResponse)
+async def reconcile_active_tasks(
+    payload: ActiveTaskReconcileRequest,
+    subject=Depends(get_current_or_machine_subject),
+    db: Session = Depends(get_db),
+):
+    principal, token = subject
+    if payload.project_id:
+        await ensure_project_access(payload.project_id, token)
+    return get_execution_service().reconcile_active_tasks(
+        db,
+        principal=principal,
+        project_id=payload.project_id,
+        statuses=payload.statuses,
+        limit=payload.limit,
+        dry_run=payload.dry_run,
+    )
 
 
 @router.get("/tasks/{task_id}/timeline", response_model=DataflowTaskTimelineResponse)

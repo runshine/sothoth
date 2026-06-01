@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi.encoders import jsonable_encoder
 from fastapi import HTTPException, status
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.artifacts.io import abs_path, ensure_dir, sanitize_name, write_json, write_task_manifest, write_text
@@ -53,6 +53,7 @@ from app.pi_vuln_core.runner import build_runtime_framework_config, run_framewor
 from app.pi_vuln_core.utils.logger import attach_log_file, detach_log_file
 from app.pi_vuln_core.utils.win_compat import ensure_event_loop_policy
 from app.schemas import (
+    ActiveTaskReconcileResponse,
     ArtifactRef,
     CreateEvolutionTaskRequest,
     DataflowAgentStateDirResponse,
@@ -141,6 +142,9 @@ _TASK_LIST_SORT_COLUMNS = {
     "public_status": DfvsTaskListProjection.public_status,
     "status": DfvsTaskListProjection.public_status,
 }
+
+_ACTIVE_RECONCILE_TRIGGER_STATUSES = {"running", "cancel_requested", "delete_requested", "dispatching"}
+_ACTIVE_RECONCILE_EXECUTION_STATUSES = {"running", "cancel_requested", "delete_requested", "dispatching", "starting", "pending"}
 
 _TIMELINE_STAGE_LABELS = {
     "dispatch": "调度/分发",
@@ -987,6 +991,189 @@ class ExecutionService:
         if execution is None:
             return
         self._refresh_task_list_projection_for_task_id(db, execution.trigger_task_id)
+
+    def _active_reconcile_statuses(self, statuses: list[str] | None = None) -> tuple[set[str], set[str]]:
+        normalized = {normalize_canonical_task_status(item) for item in (statuses or []) if str(item or "").strip()}
+        if not normalized:
+            return set(_ACTIVE_RECONCILE_TRIGGER_STATUSES), set(_ACTIVE_RECONCILE_EXECUTION_STATUSES)
+        trigger_statuses = {item for item in normalized if item in _ACTIVE_RECONCILE_TRIGGER_STATUSES}
+        execution_statuses = {item for item in normalized if item in _ACTIVE_RECONCILE_EXECUTION_STATUSES}
+        return (
+            trigger_statuses or set(_ACTIVE_RECONCILE_TRIGGER_STATUSES),
+            execution_statuses or set(_ACTIVE_RECONCILE_EXECUTION_STATUSES),
+        )
+
+    def _active_reconcile_candidates(
+        self,
+        db: Session,
+        *,
+        project_id: str | None = None,
+        statuses: list[str] | None = None,
+        limit: int = 100,
+    ) -> list[TriggerTask]:
+        trigger_statuses, execution_statuses = self._active_reconcile_statuses(statuses)
+        query = (
+            db.query(TriggerTask)
+            .outerjoin(DfvsTaskListProjection, DfvsTaskListProjection.task_id == TriggerTask.id)
+            .outerjoin(WorkflowExecution, WorkflowExecution.id == TriggerTask.latest_execution_id)
+            .filter(
+                or_(
+                    TriggerTask.status.in_(tuple(trigger_statuses)),
+                    WorkflowExecution.status.in_(tuple(execution_statuses)),
+                    DfvsTaskListProjection.public_status.in_(tuple(trigger_statuses)),
+                )
+            )
+            .order_by(TriggerTask.updated_at.asc(), TriggerTask.created_at.asc(), TriggerTask.id.asc())
+        )
+        if project_id:
+            query = query.filter(TriggerTask.project_id == project_id)
+        return query.limit(max(1, int(limit or 100))).all()
+
+    def _active_runtime_truth(
+        self,
+        db: Session,
+        *,
+        trigger: TriggerTask,
+        execution: WorkflowExecution | None,
+        run_index: RunIndex | None,
+    ) -> dict[str, Any]:
+        run_summary = self._run_summary_snapshot(run_index=run_index, latest_execution=execution)
+        effective_status, _, _, _ = self._effective_scan_task_runtime_state(
+            trigger=trigger,
+            execution=execution,
+            run_summary=run_summary,
+        )
+        process_state = self._run_process_state(db, run_index, trigger=trigger, execution=execution) if run_index is not None else {}
+        local_process = self._local_cli_process(execution.id) if execution is not None else None
+        orphaned_resolution = self._orphaned_control_request_resolution(
+            trigger=trigger,
+            execution=execution,
+            local_process=local_process,
+        )
+        active_runtime = self._has_active_execution_runtime(execution=execution, local_process=local_process)
+        if orphaned_resolution is not None:
+            classification = "orphaned_delete_requested" if str(orphaned_resolution.get("event_type")) == "task_delete_reconciled" else "orphaned_cancel_requested"
+        elif active_runtime or process_state.get("is_running"):
+            classification = "actually_running"
+        elif process_state.get("is_queued"):
+            classification = "actually_queued"
+        elif effective_status in {"failed", "cancelled", "success"}:
+            classification = "actually_terminal"
+        else:
+            classification = "runtime_lost"
+        return {
+            "classification": classification,
+            "effective_status": effective_status,
+            "process_state": process_state,
+            "orphaned_resolution": orphaned_resolution,
+            "run_summary": run_summary,
+        }
+
+    def reconcile_active_tasks(
+        self,
+        db: Session,
+        *,
+        principal: dict | None = None,
+        project_id: str | None = None,
+        statuses: list[str] | None = None,
+        limit: int = 100,
+        dry_run: bool = False,
+    ) -> ActiveTaskReconcileResponse:
+        if principal is not None and project_id:
+            self._ensure_project_access(principal, project_id)
+        triggers = self._active_reconcile_candidates(db, project_id=project_id, statuses=statuses, limit=limit)
+        reconciled_count = 0
+        requeued_count = 0
+        terminalized_count = 0
+        projection_refreshed_count = 0
+        sample_task_ids: list[str] = []
+        for trigger in triggers:
+            latest_execution = self._latest_execution_for_trigger(db, trigger.id)
+            run_index = self._source_run_index_for_trigger(db, trigger, latest_execution)
+            truth = self._active_runtime_truth(db, trigger=trigger, execution=latest_execution, run_index=run_index)
+            classification = str(truth["classification"])
+            effective_status = str(truth["effective_status"])
+            process_state = truth["process_state"] if isinstance(truth["process_state"], dict) else {}
+            projection_before = db.get(DfvsTaskListProjection, trigger.id)
+            projection_status_before = str(projection_before.public_status or "") if projection_before is not None else ""
+            projection_dispatch_before = str(projection_before.dispatch_status or "") if projection_before is not None else ""
+            latest_dispatch = str(latest_execution.dispatch_status or "") if latest_execution is not None else ""
+            effective_public_status = normalize_public_task_status(effective_status)
+            projection_drift = (
+                projection_before is None
+                or projection_status_before != effective_public_status
+                or projection_dispatch_before != latest_dispatch
+            )
+            needs_state_reconcile = classification in {
+                "actually_terminal",
+                "runtime_lost",
+                "orphaned_cancel_requested",
+                "orphaned_delete_requested",
+            }
+            if not needs_state_reconcile and not projection_drift:
+                continue
+            if dry_run:
+                reconciled_count += 1
+                if needs_state_reconcile:
+                    terminalized_count += 1
+                if projection_drift:
+                    projection_refreshed_count += 1
+                if len(sample_task_ids) < 20:
+                    sample_task_ids.append(trigger.id)
+                continue
+            changed = False
+            if self._reconcile_stale_runtime(db, run_index=run_index, trigger=trigger, execution=latest_execution):
+                changed = True
+                terminalized_count += 1
+            elif classification in {"orphaned_cancel_requested", "orphaned_delete_requested"} and truth.get("orphaned_resolution") is not None:
+                self._finalize_orphaned_control_request(
+                    db,
+                    trigger=trigger,
+                    execution=latest_execution,
+                    resolution=truth["orphaned_resolution"],
+                )
+                changed = True
+                terminalized_count += 1
+            elif classification == "runtime_lost":
+                self._mark_stale_runtime_exited(
+                    db,
+                    trigger=trigger,
+                    execution=latest_execution,
+                    message="stale active runtime assumed failed",
+                )
+                changed = True
+                terminalized_count += 1
+            if changed or projection_drift:
+                self._refresh_task_list_projection_for_task_id(db, trigger.id)
+                projection_refreshed_count += 1
+                reconciled_count += 1
+                if len(sample_task_ids) < 20:
+                    sample_task_ids.append(trigger.id)
+                logger.warning(
+                    "active_task_reconciled task_id=%s execution_id=%s projection_status_before=%s effective_status_after=%s dispatch_status_before=%s owner_pod_id_before=%s worker_job_id_before=%s process_state_source=%s resolution_reason=%s",
+                    trigger.id,
+                    latest_execution.id if latest_execution is not None else "",
+                    projection_status_before,
+                    effective_status,
+                    latest_dispatch,
+                    latest_execution.owner_pod_id if latest_execution is not None else "",
+                    latest_execution.worker_job_id if latest_execution is not None else "",
+                    process_state.get("source"),
+                    classification,
+                )
+                db.commit()
+            else:
+                db.rollback()
+        return ActiveTaskReconcileResponse(
+            scanned_count=len(triggers),
+            reconciled_count=reconciled_count,
+            requeued_count=requeued_count,
+            terminalized_count=terminalized_count,
+            projection_refreshed_count=projection_refreshed_count,
+            sample_task_ids=sample_task_ids,
+            dry_run=bool(dry_run),
+            message="active task reconcile completed",
+        )
 
     def _resolve_task_timeline_execution(
         self,

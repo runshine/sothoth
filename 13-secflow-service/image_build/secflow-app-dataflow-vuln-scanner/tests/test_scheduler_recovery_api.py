@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from app.models.database import SchedulerWorker, SchedulerWorkerSlotReservation, TriggerTask, WorkflowExecution, WorkflowExecutionEvent, get_db_session
+from app.models.database import DfvsTaskListProjection, SchedulerWorker, SchedulerWorkerSlotReservation, TriggerTask, WorkflowExecution, WorkflowExecutionEvent, get_db_session
 from app.schemas import ScanProfileCreateRequest, ScanTaskCreateRequest
 from app.services.execution_service import get_execution_service
 from app.services.scheduler import SchedulerService
@@ -389,5 +389,63 @@ def test_cleanup_reconciles_orphan_cancel_requested_execution(service_config_pat
             .first()
         )
         assert event is not None
+    finally:
+        db.close()
+
+
+def test_active_reconcile_refreshes_stale_running_projection(service_config_path):
+    db = get_db_session()
+    try:
+        execution_id = "exec-active-reconcile-stale-projection"
+        trigger = TriggerTask(
+            id="tt-active-reconcile-stale-projection",
+            workflow_definition_id="wfd-active-reconcile-stale-projection",
+            project_id="default",
+            trigger_type="manual",
+            input_tasks_json={"tasks": []},
+            priority=100,
+            status="failed",
+            public_status="failed",
+            message="stale active runtime assumed failed",
+            submitted_by="tester",
+            retry_count=0,
+            max_retry_count=3,
+            latest_execution_id=execution_id,
+        )
+        execution = WorkflowExecution(
+            id=execution_id,
+            trigger_task_id=trigger.id,
+            workflow_definition_id=trigger.workflow_definition_id,
+            project_id="default",
+            attempt_no=1,
+            status="failed",
+            public_status="failed",
+            dispatch_status="failed",
+            owner_pod_id="worker-a",
+            worker_job_id="job-a",
+            worker_url="http://worker-a:8080",
+            process_status="exited",
+            message="stale active runtime assumed failed",
+        )
+        db.add_all([trigger, execution])
+        db.flush()
+        get_execution_service()._rebuild_task_list_projections(db, [trigger])
+        projection = db.get(DfvsTaskListProjection, trigger.id)
+        assert projection is not None
+        projection.public_status = "running"
+        projection.dispatch_status = "running"
+        db.add(projection)
+        db.commit()
+    finally:
+        db.close()
+
+    db = get_db_session()
+    try:
+        response = get_execution_service().reconcile_active_tasks(db, limit=10)
+        assert response.reconciled_count >= 1
+        projection = db.get(DfvsTaskListProjection, "tt-active-reconcile-stale-projection")
+        assert projection is not None
+        assert projection.public_status == "failed"
+        assert projection.dispatch_status == "failed"
     finally:
         db.close()

@@ -1552,6 +1552,56 @@ def test_cancel_orphaned_requeued_task_converges_to_cancelled(service_config_pat
     assert reconciled is not None
 
 
+def test_reconcile_active_api_repairs_stale_running_projection(service_config_path, patch_mock_agent_runtime, monkeypatch):
+    _disable_scheduler_start(monkeypatch)
+    app = create_app()
+    client = TestClient(app)
+    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
+    created = _create_business_dataflow_task(
+        client,
+        profile_id=profile["profile_id"],
+        case_name="case-reconcile-active-api",
+        title="reconcile active api scan",
+    )
+    task_id = created["task_id"]
+
+    with get_db_session() as db:
+        trigger = db.get(TriggerTask, task_id)
+        execution = (
+            db.query(WorkflowExecution)
+            .filter(WorkflowExecution.trigger_task_id == task_id)
+            .order_by(WorkflowExecution.attempt_no.desc(), WorkflowExecution.created_at.desc())
+            .first()
+        )
+        projection = db.get(DfvsTaskListProjection, task_id)
+        assert trigger is not None and execution is not None and projection is not None
+        trigger.status = "failed"
+        trigger.public_status = "failed"
+        trigger.message = "stale active runtime assumed failed"
+        execution.status = "failed"
+        execution.public_status = "failed"
+        execution.dispatch_status = "failed"
+        execution.process_status = "exited"
+        execution.message = "stale active runtime assumed failed"
+        projection.public_status = "running"
+        projection.dispatch_status = "running"
+        db.add_all([trigger, execution, projection])
+        db.commit()
+
+    dry_run = client.post("/api/dataflow-vuln-scanner/tasks/runtime/reconcile-active", json={"limit": 20, "dry_run": True})
+    assert dry_run.status_code == 200
+    assert dry_run.json()["scanned_count"] >= 1
+
+    apply_run = client.post("/api/dataflow-vuln-scanner/tasks/runtime/reconcile-active", json={"limit": 20})
+    assert apply_run.status_code == 200
+    assert apply_run.json()["projection_refreshed_count"] >= 1
+
+    listing = client.get("/api/dataflow-vuln-scanner/tasks", params={"status": "running", "per_page": 200, "page": 1})
+    assert listing.status_code == 200
+    listed_ids = {item["task_id"] for item in (listing.json()["items"] or [])}
+    assert task_id not in listed_ids
+
+
 def test_project_filesystem_browser_uses_local_project_tree(service_config_path):
     config = get_config()
     project_root = config.fileserver_service.data_mount_path

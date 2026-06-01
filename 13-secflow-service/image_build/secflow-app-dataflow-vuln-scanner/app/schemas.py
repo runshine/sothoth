@@ -311,6 +311,25 @@ class ScanTaskProjectionRepairResponse(BaseModel):
     message: str
 
 
+class ActiveTaskReconcileRequest(BaseModel):
+    project_id: Optional[str] = None
+    limit: int = Field(default=100, ge=1, le=1000)
+    statuses: List[str] = Field(default_factory=list)
+    dry_run: bool = False
+
+
+class ActiveTaskReconcileResponse(BaseModel):
+    status: str = "success"
+    scanned_count: int = 0
+    reconciled_count: int = 0
+    requeued_count: int = 0
+    terminalized_count: int = 0
+    projection_refreshed_count: int = 0
+    sample_task_ids: List[str] = Field(default_factory=list)
+    dry_run: bool = False
+    message: str = ""
+
+
 class ScanTaskAttemptResponse(BaseModel):
     execution_id: str
     task_id: str

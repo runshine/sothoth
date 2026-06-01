@@ -168,6 +168,8 @@ class SchedulerConfig(BaseModel):
     worker_queue_depth: int = 0
     dispatch_batch_size: int = 8
     requeue_stuck_dispatch_after_seconds: int = 60
+    active_reconcile_interval_seconds: int = 30
+    active_reconcile_limit: int = 100
 
 
 class DataflowWorkerConfig(BaseModel):
