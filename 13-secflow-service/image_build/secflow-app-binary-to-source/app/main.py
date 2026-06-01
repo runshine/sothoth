@@ -23,6 +23,7 @@ from app.exception import setup_exception_handlers
 from app.model import get_engine, init_database
 from app.metrics_summary import build_ai_summary, build_generic_observability_summary, build_rest_api_summary, parse_prometheus_metrics
 from app.observability import get_observability
+from app.runtime_role import get_service_role
 from app.service.dispatcher import get_dispatcher
 from app.service.llm_provider import materialize_llm_provider
 from app.service.registry import get_registry_service
@@ -59,11 +60,7 @@ def _metrics_rows():
 
 
 def _service_role() -> str:
-    raw_role = os.environ.get("SECFLOW_B2S_ROLE") or os.environ.get("ROLE") or ""
-    normalized = str(raw_role).strip().lower()
-    if normalized == "manager":
-        return "api"
-    return normalized if normalized in {"api", "worker"} else "all"
+    return get_service_role()
 
 
 def _api_enabled() -> bool:

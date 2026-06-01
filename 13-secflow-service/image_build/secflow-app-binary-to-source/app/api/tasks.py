@@ -13,11 +13,11 @@ from sqlalchemy.orm import Session
 from app.build_info import build_service_meta
 from app.exception import NotFoundError, UnauthorizedError, ValidationError
 from app.model import B2STask, B2STaskItem, get_db
+from app.runtime_role import get_service_role
 from app.schemas import ActionResponse, B2SAgentSessionRuntimeResponse, B2SArtifactContentResponse, B2SCacheBatchDeleteRequest, B2SCacheBatchDeleteResponse, B2SCacheDeleteResponse, B2SCacheDetailResponse, B2SCacheListResponse, B2SServiceConfig, B2STaskTimelineResponse, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, SessionFileResponse, SessionIndexResponse, TaskBatchDeleteItemResult, TaskBatchDeleteRequest, TaskBatchDeleteResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskListResponse, TaskObservabilitySummary, TaskPrepareResponse, TaskRelationshipResponse, TaskResponse, TaskResultSummary, TokenUser
 from app.service.auth import get_auth_service
 from app.service.cache_service import get_cache_service
 from app.service.configcenter import get_configcenter_client
-from app.main import _service_role
 from app.service.config_service import get_config_service
 from app.service.project import get_project_service
 from app.service.pi_cluster import PiWorkerActiveJobSnapshot, PiWorkerSnapshot, fetch_worker_active_jobs, get_pi_cluster_monitor
@@ -136,7 +136,7 @@ async def health_check():
     return {
         "status": "ok",
         "service": "secflow-app-binary-to-source",
-        "role": _service_role(),
+        "role": get_service_role(),
         **build_service_meta(),
     }
 
