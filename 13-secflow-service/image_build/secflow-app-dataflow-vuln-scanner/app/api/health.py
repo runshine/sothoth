@@ -34,7 +34,12 @@ async def ready() -> SuccessResponse:
             status_code=503,
             detail=f"runtime bootstrap incomplete: {runtime_status.get('last_error') or 'waiting for db init'}",
         )
-    await get_auth_service().startup_validate()
+    try:
+        await get_auth_service().startup_validate()
+    except HTTPException as exc:
+        if exc.status_code in {502, 503}:
+            raise HTTPException(status_code=503, detail=exc.detail) from exc
+        raise
     try:
         get_project_service().startup_validate()
     except ProjectServiceError as exc:

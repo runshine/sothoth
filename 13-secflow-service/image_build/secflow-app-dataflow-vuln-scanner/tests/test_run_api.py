@@ -7,6 +7,7 @@ import uuid
 from datetime import timedelta
 from pathlib import Path
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import inspect, text
 
@@ -1280,6 +1281,29 @@ def test_ready_does_not_require_db_connection_after_runtime_ready(service_config
     response = client.get("/api/dataflow-vuln-scanner/ready")
     assert response.status_code == 200
     assert response.json()["message"] == "ready"
+
+
+def test_ready_returns_503_when_auth_service_unavailable(service_config_path, monkeypatch):
+    app = create_app()
+    client = TestClient(app)
+
+    monkeypatch.setattr(
+        "app.api.health.build_runtime_status",
+        lambda: {"ready": True, "last_error": None},
+    )
+
+    async def _failed_auth_validate():
+        raise HTTPException(status_code=503, detail="auth_service_unavailable")
+
+    monkeypatch.setattr(
+        "app.api.health.get_auth_service",
+        lambda: type("_Auth", (), {"startup_validate": staticmethod(_failed_auth_validate)})(),
+    )
+    monkeypatch.setattr("app.api.health.get_project_service", lambda: type("_Project", (), {"startup_validate": staticmethod(lambda: None)})())
+
+    response = client.get("/api/dataflow-vuln-scanner/ready")
+    assert response.status_code == 503
+    assert response.json()["detail"] == "auth_service_unavailable"
 
 
 def test_reconcile_stale_runtime_without_process_requeues_instead_of_failing(service_config_path):

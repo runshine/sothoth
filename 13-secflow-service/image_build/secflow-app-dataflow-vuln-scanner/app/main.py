@@ -25,6 +25,7 @@ from app.observability import build_metrics_response, observe_http_request, obse
 from app.metrics_summary import build_ai_summary, build_generic_observability_summary, build_rest_api_summary, parse_prometheus_metrics
 from app.runtime_bootstrap import get_runtime_bootstrap
 from app.services.auth import get_auth_service
+from app.services.http_client import close_all_shared_async_clients
 from app.services.llm_provider_sync import sync_providers_to_pi
 from app.services.project import get_project_service
 from app.services.registry import get_registry_service
@@ -83,6 +84,7 @@ async def lifespan(app: FastAPI):
         await get_scheduler_service().stop()
     if role in {"standalone", "api"}:
         await get_registry_service().stop()
+    await close_all_shared_async_clients()
 
 
 def create_app() -> FastAPI:

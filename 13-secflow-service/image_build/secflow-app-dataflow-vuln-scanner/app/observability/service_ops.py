@@ -6,9 +6,13 @@ from collections import defaultdict
 from typing import Mapping
 
 try:
-    from prometheus_client import Counter
+    from prometheus_client import Counter, Histogram
 except Exception:  # pragma: no cover - optional dependency fallback
     Counter = None
+    Histogram = None
+
+
+HTTP_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, math.inf)
 
 
 if Counter is not None:
@@ -17,14 +21,80 @@ if Counter is not None:
         "Total token validation cache hits in dataflow vuln scanner service",
         labelnames=("outcome",),
     )
+    _AUTH_TOKEN_VALIDATIONS = Counter(
+        "secflow_dfvs_auth_token_validations_total",
+        "Total auth token validation outcomes in dataflow vuln scanner service",
+        labelnames=("result", "source", "token_type"),
+    )
+    _AUTH_TOKEN_CACHE = Counter(
+        "secflow_dfvs_auth_token_cache_total",
+        "Total auth token cache operations in dataflow vuln scanner service",
+        labelnames=("result",),
+    )
+    _AUTH_UPSTREAM_REQUESTS = Counter(
+        "secflow_dfvs_auth_upstream_requests_total",
+        "Total upstream auth requests in dataflow vuln scanner service",
+        labelnames=("status",),
+    )
+    _SHARED_HTTP_CLIENT = Counter(
+        "secflow_dfvs_shared_http_client_total",
+        "Total shared http client lifecycle events in dataflow vuln scanner service",
+        labelnames=("service", "event"),
+    )
 else:
     _TOKEN_CACHE_HITS = None
+    _AUTH_TOKEN_VALIDATIONS = None
+    _AUTH_TOKEN_CACHE = None
+    _AUTH_UPSTREAM_REQUESTS = None
+    _SHARED_HTTP_CLIENT = None
+
+if Histogram is not None:
+    _AUTH_UPSTREAM_LATENCY = Histogram(
+        "secflow_dfvs_auth_upstream_latency_seconds",
+        "Latency of upstream auth requests in dataflow vuln scanner service",
+        labelnames=("operation",),
+        buckets=HTTP_DURATION_BUCKETS,
+    )
+else:
+    _AUTH_UPSTREAM_LATENCY = None
 
 
 def observe_token_cache_hit(outcome: str) -> None:
     if _TOKEN_CACHE_HITS is None:
         return
     _TOKEN_CACHE_HITS.labels(outcome=_normalize_label(outcome)).inc()
+
+
+def observe_auth_token_validation(*, result: str, source: str, token_type: str) -> None:
+    if _AUTH_TOKEN_VALIDATIONS is None:
+        return
+    _AUTH_TOKEN_VALIDATIONS.labels(
+        result=_normalize_label(result),
+        source=_normalize_label(source),
+        token_type=_normalize_label(token_type),
+    ).inc()
+
+
+def observe_auth_token_cache(result: str) -> None:
+    if _AUTH_TOKEN_CACHE is None:
+        return
+    _AUTH_TOKEN_CACHE.labels(result=_normalize_label(result)).inc()
+
+
+def observe_auth_upstream_request(*, status: str, operation: str, duration_seconds: float) -> None:
+    if _AUTH_UPSTREAM_REQUESTS is not None:
+        _AUTH_UPSTREAM_REQUESTS.labels(status=_normalize_label(status)).inc()
+    if _AUTH_UPSTREAM_LATENCY is not None:
+        _AUTH_UPSTREAM_LATENCY.labels(operation=_normalize_label(operation)).observe(max(float(duration_seconds), 0.0))
+
+
+def observe_shared_http_client(*, service: str, event: str) -> None:
+    if _SHARED_HTTP_CLIENT is None:
+        return
+    _SHARED_HTTP_CLIENT.labels(
+        service=_normalize_label(service),
+        event=_normalize_label(event),
+    ).inc()
 
 
 def _normalize_label(value: str | None) -> str:
@@ -118,7 +188,6 @@ class ServiceLatencyMetrics:
             )
 
 
-HTTP_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, math.inf)
 _service_latency_metrics = ServiceLatencyMetrics(HTTP_DURATION_BUCKETS)
 
 

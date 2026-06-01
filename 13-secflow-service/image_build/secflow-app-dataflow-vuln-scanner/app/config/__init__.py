@@ -41,6 +41,13 @@ class AuthServiceConfig(BaseModel):
     validate_machine_token_path: str = "/api/auth/validate-token"
     service_machine_token: Optional[str] = None
     timeout: int = 10
+    token_cache_enabled: bool = True
+    token_cache_ttl_seconds: int = 300
+    token_cache_max_entries: int = 10000
+    max_connections: int = 100
+    max_keepalive_connections: int = 20
+    keepalive_expiry_seconds: int = 15
+    retry_count: int = 0
 
     @property
     def human_validate_url(self) -> str:
