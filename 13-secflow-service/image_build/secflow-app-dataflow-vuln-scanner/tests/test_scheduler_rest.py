@@ -945,6 +945,72 @@ def test_cluster_capacity_api_degrades_when_worker_probe_fails(
     assert "probe failed" in (target["error"] or "")
 
 
+def test_pending_dispatch_skips_execution_in_backoff(service_config_path: Path, framework_config_payload: dict):
+    config = get_config()
+    config.scheduler.enabled = True
+    config.scheduler.role = "manager"
+
+    db = get_db_session()
+    try:
+        execution_id = _create_pending_execution(db, framework_config_payload, suffix="backoff-skip")
+    finally:
+        db.close()
+
+    scheduler = SchedulerService()
+    scheduler._schedule_dispatch_backoff(execution_id, reason="capacity_exceeded", worker_pod_id="worker-a")
+    assert scheduler._pending_worker_dispatch_execution_ids() == []
+    metrics = scheduler.dispatch_backoff_metrics()
+    assert metrics["backoff_scheduled_total"] >= 1
+    assert metrics["skipped_due_to_backoff_total"] >= 1
+
+
+def test_rank_workers_uses_db_snapshot_without_remote_job_probe(service_config_path: Path, framework_config_payload: dict, monkeypatch):
+    config = get_config()
+    config.scheduler.enabled = True
+    config.scheduler.role = "manager"
+
+    db = get_db_session()
+    try:
+        execution_id = _create_pending_execution(db, framework_config_payload, suffix="rank-no-probe")
+        db.add_all(
+            [
+                SchedulerWorker(
+                    pod_id="worker-rank-a",
+                    host_name="worker-rank-a",
+                    capacity=2,
+                    running_count=0,
+                    status="active",
+                    last_heartbeat_at=None,
+                    metadata_json={"advertise_url": "http://worker-rank-a"},
+                ),
+                SchedulerWorker(
+                    pod_id="worker-rank-b",
+                    host_name="worker-rank-b",
+                    capacity=2,
+                    running_count=0,
+                    status="active",
+                    last_heartbeat_at=None,
+                    metadata_json={"advertise_url": "http://worker-rank-b"},
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    def _fail_client(*args, **kwargs):
+        raise AssertionError("manager dispatch ranking should not probe worker jobs")
+
+    monkeypatch.setattr("app.services.scheduler.get_dataflow_worker_client", _fail_client)
+    scheduler = SchedulerService()
+    db = get_db_session()
+    try:
+        workers = scheduler._rank_dataflow_workers(db, execution_id)
+    finally:
+        db.close()
+    assert len(workers) == 2
+
+
 def test_worker_capacity_runtime_config_applies_to_heartbeat_and_capacity_view(
     service_config_path: Path,
 ):

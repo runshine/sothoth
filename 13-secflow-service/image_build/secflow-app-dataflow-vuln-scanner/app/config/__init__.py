@@ -177,10 +177,21 @@ class SchedulerConfig(BaseModel):
     requeue_stuck_dispatch_after_seconds: int = 60
     active_reconcile_interval_seconds: int = 30
     active_reconcile_limit: int = 100
+    dispatch_capacity_backoff_initial_seconds: int = 10
+    dispatch_capacity_backoff_max_seconds: int = 60
+    worker_capacity_cooldown_seconds: int = 10
+    worker_snapshot_cache_ttl_seconds: int = 3
     execution_degraded_consecutive_startup_failures: int = 3
     execution_degraded_stale_without_pid_count: int = 5
     execution_health_window_seconds: int = 600
     execution_degraded_cooldown_seconds: int = 600
+
+
+class RunIndexRefreshConfig(BaseModel):
+    light_refresh_debounce_seconds: int = 5
+    runtime_refresh_debounce_seconds: int = 20
+    max_concurrent_heavy_refreshes: int = 1
+    ready_validation_ttl_seconds: int = 10
 
 
 class DataflowWorkerConfig(BaseModel):
@@ -208,6 +219,7 @@ class Config(BaseModel):
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
     service: ServiceConfig = Field(default_factory=ServiceConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+    run_index_refresh: RunIndexRefreshConfig = Field(default_factory=RunIndexRefreshConfig)
     dataflow_worker: DataflowWorkerConfig = Field(default_factory=DataflowWorkerConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 

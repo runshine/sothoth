@@ -1306,6 +1306,33 @@ def test_ready_returns_503_when_auth_service_unavailable(service_config_path, mo
     assert response.json()["detail"] == "auth_service_unavailable"
 
 
+def test_ready_caches_auth_validation_for_ttl(service_config_path, monkeypatch):
+    app = create_app()
+    client = TestClient(app)
+    monkeypatch.setattr(
+        "app.api.health.build_runtime_status",
+        lambda: {"ready": True, "last_error": None},
+    )
+    monkeypatch.setattr("app.api.health.get_project_service", lambda: type("_Project", (), {"startup_validate": staticmethod(lambda: None)})())
+
+    calls = {"count": 0}
+
+    async def _counted_auth_validate():
+        calls["count"] += 1
+        return None
+
+    monkeypatch.setattr(
+        "app.api.health.get_auth_service",
+        lambda: type("_Auth", (), {"startup_validate": staticmethod(_counted_auth_validate)})(),
+    )
+
+    first = client.get("/api/dataflow-vuln-scanner/ready")
+    second = client.get("/api/dataflow-vuln-scanner/ready")
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert calls["count"] == 1
+
+
 def test_reconcile_stale_runtime_without_process_requeues_instead_of_failing(service_config_path):
     app = create_app()
     client = TestClient(app)
@@ -2111,6 +2138,59 @@ def test_run_table_migration_drops_legacy_rows_already_synced_by_hash(service_co
         assert db.get(RunIndex, "ri-existing-001") is not None
         assert db.get(RunIndex, "ri-legacy-duplicate") is None
         assert legacy_run_table not in set(inspect(db.bind).get_table_names())
+    finally:
+        db.close()
+
+def test_manager_role_does_not_refresh_existing_run_index(service_config_path, monkeypatch):
+    config = get_config()
+    config.scheduler.role = "manager"
+    run_root = service_config_path.parent / "manager_existing_run_index"
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    db = get_db_session()
+    try:
+        execution = WorkflowExecution(
+            id="exec-manager-existing-run-index",
+            trigger_task_id="trigger-manager-existing-run-index",
+            workflow_definition_id="wf-manager-existing-run-index",
+            project_id="default",
+            attempt_no=1,
+            status="running",
+            workspace_root=str(run_root.resolve()),
+        )
+        run_index = RunIndex(
+            id="ri-manager-existing-run-index",
+            project_id="default",
+            source_type="execution_workspace",
+            source_key=str(run_root.resolve()),
+            source_hash=run_source_hash("execution_workspace", str(run_root.resolve())),
+            run_name=run_root.name,
+            run_root_path=str(run_root.resolve()),
+            status="running",
+            linked_execution_id=execution.id,
+            duration_seconds=0,
+            model="",
+            provider="",
+            thinking="",
+            max_cycles=0,
+            cycles_used=0,
+            result_count=0,
+            passed_count=0,
+            failed_count=0,
+            workflow_mode="",
+        )
+        db.add_all([execution, run_index])
+        db.commit()
+
+        service = get_execution_service()
+
+        def _fail_refresh(*args, **kwargs):
+            raise AssertionError("manager should not refresh existing run index on hot path")
+
+        monkeypatch.setattr(run_index_service_module.get_run_index_service(), "refresh_run_index", _fail_refresh)
+        resolved = service._ensure_run_index_for_execution(db, execution)
+        assert resolved is not None
+        assert resolved.id == run_index.id
     finally:
         db.close()
 

@@ -101,6 +101,16 @@ scheduler:
   worker_queue_depth: 0
   dispatch_batch_size: 8
   requeue_stuck_dispatch_after_seconds: 60
+  dispatch_capacity_backoff_initial_seconds: 10
+  dispatch_capacity_backoff_max_seconds: 60
+  worker_capacity_cooldown_seconds: 10
+  worker_snapshot_cache_ttl_seconds: 3
+
+run_index_refresh:
+  light_refresh_debounce_seconds: 5
+  runtime_refresh_debounce_seconds: 20
+  max_concurrent_heavy_refreshes: 1
+  ready_validation_ttl_seconds: 10
 
 dataflow_worker:
   advertise_url_template: ""

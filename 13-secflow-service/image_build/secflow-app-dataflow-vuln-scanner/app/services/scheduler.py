@@ -85,6 +85,15 @@ class SchedulerService:
         self._stale_without_pid_timestamps: deque[float] = deque()
         self._requeued_before_process_start_timestamps: deque[float] = deque()
         self._degraded_until_monotonic: float = 0.0
+        self._dispatch_backoff_lock = threading.Lock()
+        self._dispatch_backoff_until_by_execution: dict[str, float] = {}
+        self._dispatch_backoff_attempts_by_execution: dict[str, int] = {}
+        self._worker_cooldown_until_by_pod: dict[str, float] = {}
+        self._worker_snapshot_cache_lock = threading.Lock()
+        self._worker_snapshot_cache: dict[tuple[str, bool], tuple[float, dict[str, WorkerLoadSnapshot]]] = {}
+        self._dispatch_capacity_conflict_total = 0
+        self._dispatch_backoff_scheduled_total = 0
+        self._dispatch_skipped_due_to_backoff_total = 0
 
     @property
     def role(self) -> str:
@@ -305,6 +314,149 @@ class SchedulerService:
     def local_running_count(self) -> int:
         return len(self._running_tasks)
 
+    def _now_monotonic(self) -> float:
+        return time.monotonic()
+
+    def _dispatch_backoff_initial_seconds(self) -> int:
+        return max(1, int(get_config().scheduler.dispatch_capacity_backoff_initial_seconds or 10))
+
+    def _dispatch_backoff_max_seconds(self) -> int:
+        return max(self._dispatch_backoff_initial_seconds(), int(get_config().scheduler.dispatch_capacity_backoff_max_seconds or 60))
+
+    def _worker_capacity_cooldown_seconds(self) -> int:
+        return max(1, int(get_config().scheduler.worker_capacity_cooldown_seconds or 10))
+
+    def _worker_snapshot_cache_ttl_seconds(self) -> int:
+        return max(1, int(get_config().scheduler.worker_snapshot_cache_ttl_seconds or 3))
+
+    def _prune_dispatch_backoff_locked(self, now_monotonic: float) -> None:
+        expired_execution_ids = [
+            execution_id
+            for execution_id, deadline in self._dispatch_backoff_until_by_execution.items()
+            if deadline <= now_monotonic
+        ]
+        for execution_id in expired_execution_ids:
+            self._dispatch_backoff_until_by_execution.pop(execution_id, None)
+            self._dispatch_backoff_attempts_by_execution.pop(execution_id, None)
+        expired_worker_ids = [
+            worker_id
+            for worker_id, deadline in self._worker_cooldown_until_by_pod.items()
+            if deadline <= now_monotonic
+        ]
+        for worker_id in expired_worker_ids:
+            self._worker_cooldown_until_by_pod.pop(worker_id, None)
+
+    def _execution_dispatch_backoff_remaining_seconds(self, execution_id: str) -> float:
+        execution_key = str(execution_id or "").strip()
+        if not execution_key:
+            return 0.0
+        with self._dispatch_backoff_lock:
+            now_monotonic = self._now_monotonic()
+            self._prune_dispatch_backoff_locked(now_monotonic)
+            deadline = self._dispatch_backoff_until_by_execution.get(execution_key)
+            if not deadline:
+                return 0.0
+            return max(deadline - now_monotonic, 0.0)
+
+    def _worker_in_dispatch_cooldown(self, worker_pod_id: str) -> bool:
+        worker_key = str(worker_pod_id or "").strip()
+        if not worker_key:
+            return False
+        with self._dispatch_backoff_lock:
+            now_monotonic = self._now_monotonic()
+            self._prune_dispatch_backoff_locked(now_monotonic)
+            deadline = self._worker_cooldown_until_by_pod.get(worker_key)
+            return bool(deadline and deadline > now_monotonic)
+
+    def _schedule_dispatch_backoff(
+        self,
+        execution_id: str,
+        *,
+        reason: str,
+        worker_pod_id: str | None = None,
+        payload_extra: dict[str, Any] | None = None,
+    ) -> None:
+        execution_key = str(execution_id or "").strip()
+        if not execution_key:
+            return
+        now_monotonic = self._now_monotonic()
+        with self._dispatch_backoff_lock:
+            self._prune_dispatch_backoff_locked(now_monotonic)
+            attempts = int(self._dispatch_backoff_attempts_by_execution.get(execution_key, 0)) + 1
+            self._dispatch_backoff_attempts_by_execution[execution_key] = attempts
+            backoff_seconds = min(
+                self._dispatch_backoff_initial_seconds() * (2 ** max(attempts - 1, 0)),
+                self._dispatch_backoff_max_seconds(),
+            )
+            deadline = now_monotonic + backoff_seconds
+            self._dispatch_backoff_until_by_execution[execution_key] = deadline
+            if worker_pod_id:
+                self._worker_cooldown_until_by_pod[str(worker_pod_id)] = now_monotonic + self._worker_capacity_cooldown_seconds()
+            self._dispatch_backoff_scheduled_total += 1
+        logger.info(
+            "dispatch backoff scheduled execution=%s worker=%s backoff_seconds=%s reason=%s",
+            execution_key,
+            worker_pod_id,
+            backoff_seconds,
+            reason,
+        )
+        db = get_db_session()
+        try:
+            if self._has_recent_dispatch_backoff_event(db, execution_key, worker_pod_id, reason):
+                return
+            payload_json = {
+                "reason": reason,
+                "worker_pod_id": worker_pod_id,
+                "backoff_seconds": backoff_seconds,
+                "backoff_until_monotonic": deadline,
+                "attempt": attempts,
+            }
+            if payload_extra:
+                payload_json.update(payload_extra)
+            get_execution_service().record_event(
+                db,
+                execution_id=execution_key,
+                event_type="dispatch_backoff_scheduled",
+                message=f"dispatch backoff scheduled: {reason}",
+                level="warning",
+                payload_json=payload_json,
+            )
+        finally:
+            db.close()
+
+    def _clear_dispatch_backoff(self, execution_id: str) -> None:
+        execution_key = str(execution_id or "").strip()
+        if not execution_key:
+            return
+        with self._dispatch_backoff_lock:
+            self._dispatch_backoff_until_by_execution.pop(execution_key, None)
+            self._dispatch_backoff_attempts_by_execution.pop(execution_key, None)
+
+    def _has_recent_dispatch_backoff_event(
+        self,
+        db: Session,
+        execution_id: str,
+        worker_pod_id: str | None,
+        reason: str,
+    ) -> bool:
+        threshold = now_local() - timedelta(seconds=30)
+        events = (
+            db.query(WorkflowExecutionEvent)
+            .filter(
+                WorkflowExecutionEvent.execution_id == execution_id,
+                WorkflowExecutionEvent.event_type == "dispatch_backoff_scheduled",
+                WorkflowExecutionEvent.created_at >= threshold,
+            )
+            .order_by(WorkflowExecutionEvent.created_at.desc())
+            .limit(5)
+            .all()
+        )
+        for event in events:
+            payload = event.payload_json or {}
+            if str(payload.get("worker_pod_id") or "") == str(worker_pod_id or "") and str(payload.get("reason") or "") == str(reason or ""):
+                return True
+        return False
+
     def list_workers(self, db: Session) -> List[SchedulerWorkerResponse]:
         workers = db.query(SchedulerWorker).order_by(SchedulerWorker.last_heartbeat_at.desc()).all()
         return [SchedulerWorkerResponse.model_validate(item, from_attributes=True) for item in workers]
@@ -393,6 +545,21 @@ class SchedulerService:
         *,
         include_worker_jobs: bool,
     ) -> dict[str, WorkerLoadSnapshot]:
+        cache_key = (
+            ",".join(sorted(str(worker.pod_id) for worker in workers)),
+            bool(include_worker_jobs),
+        )
+        now_monotonic = self._now_monotonic()
+        with self._worker_snapshot_cache_lock:
+            cached = self._worker_snapshot_cache.get(cache_key)
+            if cached is not None:
+                cached_at, cached_value = cached
+                if now_monotonic - cached_at < self._worker_snapshot_cache_ttl_seconds():
+                    return {
+                        worker_id: dataclasses.replace(snapshot)
+                        for worker_id, snapshot in cached_value.items()
+                    }
+
         worker_timeout_at = now_local() - timedelta(seconds=get_config().scheduler.worker_timeout_seconds)
         snapshots: dict[str, WorkerLoadSnapshot] = {}
         for worker in workers:
@@ -462,6 +629,14 @@ class SchedulerService:
                     continue
                 running = str(job.get("status") or "").strip().lower() == "running"
                 self._add_execution_to_snapshot(snapshot, execution_id, "worker", running=running)
+        with self._worker_snapshot_cache_lock:
+            self._worker_snapshot_cache[cache_key] = (
+                now_monotonic,
+                {
+                    worker_id: dataclasses.replace(snapshot)
+                    for worker_id, snapshot in snapshots.items()
+                },
+            )
         return snapshots
 
     def _compute_cluster_capacity_summary(self, db: Session) -> WorkerClusterCapacitySummaryResponse:
@@ -538,6 +713,18 @@ class SchedulerService:
             age = (now_local() - self._cluster_capacity_summary_snapshot_at).total_seconds()
             return age >= 30
 
+    def dispatch_backoff_metrics(self) -> dict[str, Any]:
+        with self._dispatch_backoff_lock:
+            now_monotonic = self._now_monotonic()
+            self._prune_dispatch_backoff_locked(now_monotonic)
+            return {
+                "capacity_conflict_total": self._dispatch_capacity_conflict_total,
+                "backoff_scheduled_total": self._dispatch_backoff_scheduled_total,
+                "skipped_due_to_backoff_total": self._dispatch_skipped_due_to_backoff_total,
+                "active_execution_backoffs": len(self._dispatch_backoff_until_by_execution),
+                "active_worker_cooldowns": len(self._worker_cooldown_until_by_pod),
+            }
+
     def _set_cluster_capacity_summary_snapshot(
         self,
         snapshot: WorkerClusterCapacitySummaryResponse,
@@ -564,7 +751,7 @@ class SchedulerService:
     def get_cluster_capacity(self, db: Session) -> WorkerClusterCapacityResponse:
         started = time.perf_counter()
         workers, worker_timeout_at, queued_jobs = self._cluster_capacity_base(db)
-        snapshots = self._build_worker_load_snapshots(db, workers, include_worker_jobs=True)
+        snapshots = self._build_worker_load_snapshots(db, workers, include_worker_jobs=False)
         worker_rows: list[WorkerClusterWorkerResponse] = []
         active_executions = (
             db.query(WorkflowExecution, TriggerTask, RunIndex)
@@ -763,7 +950,15 @@ class SchedulerService:
             if limit is not None and limit > 0:
                 query = query.limit(limit)
             rows = query.all()
-            return [str(row[0]) for row in rows]
+            ready_execution_ids: list[str] = []
+            for row in rows:
+                execution_id = str(row[0])
+                if self._execution_dispatch_backoff_remaining_seconds(execution_id) > 0:
+                    with self._dispatch_backoff_lock:
+                        self._dispatch_skipped_due_to_backoff_total += 1
+                    continue
+                ready_execution_ids.append(execution_id)
+            return ready_execution_ids
         finally:
             db.close()
 
@@ -1011,7 +1206,8 @@ class SchedulerService:
             db.close()
 
         if not candidates:
-            raise DataflowWorkerError("no healthy registry worker available")
+            self._schedule_dispatch_backoff(execution_id, reason="no_healthy_worker_available")
+            return False
 
         attempts = max(1, int(get_config().dataflow_worker.dispatch_max_retries or 1))
         tried_worker_ids: set[str] = set()
@@ -1043,8 +1239,16 @@ class SchedulerService:
                 except DataflowWorkerError as exc:
                     last_error = str(exc)
                     if self._is_capacity_exceeded_error(last_error):
+                        with self._dispatch_backoff_lock:
+                            self._dispatch_capacity_conflict_total += 1
                         capacity_errors.append({"worker_pod_id": worker_pod_id, "worker_url": worker_url, "error": last_error})
                         self._reset_dispatch_reservation(execution_id)
+                        self._schedule_dispatch_backoff(
+                            execution_id,
+                            reason="capacity_exceeded",
+                            worker_pod_id=worker_pod_id,
+                            payload_extra={"worker_url": worker_url},
+                        )
                         break
                     if attempt < attempts:
                         time.sleep(max(0, int(get_config().dataflow_worker.dispatch_retry_interval_seconds or 0)))
@@ -1052,6 +1256,13 @@ class SchedulerService:
                 self._mark_dispatch_failure(execution_id, worker_url, last_error or "dataflow worker dispatch failed", worker_pod_id=worker_pod_id)
                 return False
 
+        if capacity_errors:
+            logger.info(
+                "dispatch deferred after worker capacity conflicts execution=%s conflicts=%s",
+                execution_id,
+                len(capacity_errors),
+            )
+            return False
         self._mark_dispatch_failure(
             execution_id,
             last_worker_url,
@@ -1176,7 +1387,7 @@ class SchedulerService:
             metadata = dict(getattr(worker, "metadata_json", {}) or {}) if worker is not None else {}
             execution_health = dict(metadata.get("execution_health") or {})
             degraded = str(getattr(worker, "status", "") or "").strip().lower() in {"degraded", "draining"}
-            if snapshot.probe_error or degraded:
+            if snapshot.probe_error or degraded or self._worker_in_dispatch_cooldown(worker_id):
                 counts[worker_id] = 1_000_000
                 continue
             counts[worker_id] = (
@@ -1310,6 +1521,7 @@ class SchedulerService:
         )
 
     def _mark_dispatch_success(self, execution_id: str, worker_url: str, job: dict[str, Any]) -> None:
+        self._clear_dispatch_backoff(execution_id)
         db = get_db_session()
         try:
             execution = db.get(WorkflowExecution, execution_id)

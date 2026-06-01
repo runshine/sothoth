@@ -1739,6 +1739,8 @@ class ExecutionService:
             )
         )
         if existing_run_index is not None:
+            if str(get_config().scheduler.role or "standalone").strip().lower() == "manager":
+                return existing_run_index
             return get_run_index_service().refresh_run_index(
                 db,
                 existing_run_index,

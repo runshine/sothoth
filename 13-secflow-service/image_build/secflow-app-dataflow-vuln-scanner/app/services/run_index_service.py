@@ -5,6 +5,7 @@ import logging
 import re
 import shlex
 import shutil
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -51,9 +52,15 @@ logger = logging.getLogger("dataflow_vuln.run_index")
 
 RUN_INDEX_LOG_SUMMARY_MAX_CHARS = 32768
 _SOURCE_MTIME_COMPARE_EPSILON = 1e-6
-_RUN_INDEX_LIGHT_REFRESH_DEBOUNCE_SECONDS = 1.0
-_RUN_INDEX_RUNTIME_REFRESH_DEBOUNCE_SECONDS = 2.0
 _RUN_INDEX_DEADLOCK_RETRY_ATTEMPTS = 3
+
+
+def _run_index_light_refresh_debounce_seconds() -> float:
+    return max(1.0, float(get_config().run_index_refresh.light_refresh_debounce_seconds or 5))
+
+
+def _run_index_runtime_refresh_debounce_seconds() -> float:
+    return max(_run_index_light_refresh_debounce_seconds(), float(get_config().run_index_refresh.runtime_refresh_debounce_seconds or 20))
 
 
 def _perf_elapsed_ms(started_at: float) -> float:
@@ -581,6 +588,23 @@ def _normalize_execution_request_root(root_path: str) -> Path:
 
 
 class RunIndexService:
+    def __init__(self) -> None:
+        self._refresh_state_lock = threading.Lock()
+        self._inflight_refresh_by_run_id: set[str] = set()
+        self._inflight_heavy_refreshes = 0
+        self._refresh_skipped_due_to_lock_total = 0
+        self._refresh_skipped_due_to_manager_role_total = 0
+        self._refresh_queue_rejected_total = 0
+
+    def refresh_metrics(self) -> dict[str, Any]:
+        with self._refresh_state_lock:
+            return {
+                "inflight_refreshes": self._inflight_heavy_refreshes,
+                "skipped_due_to_lock_total": self._refresh_skipped_due_to_lock_total,
+                "skipped_due_to_manager_role_total": self._refresh_skipped_due_to_manager_role_total,
+                "queue_rejected_total": self._refresh_queue_rejected_total,
+            }
+
     def _refresh_record_bindings(
         self,
         record: RunIndex,
@@ -1289,12 +1313,24 @@ class RunIndexService:
         run_root = Path(run_index.run_root_path)
         if not run_root.is_dir():
             return run_index
+        scheduler_role = str(get_config().scheduler.role or "standalone").strip().lower()
+        refresh_kind = "runtime" if include_runtime_assets or force_runtime_assets else "light"
+        if scheduler_role == "manager" and include_runtime_assets and not force_runtime_assets:
+            with self._refresh_state_lock:
+                self._refresh_skipped_due_to_manager_role_total += 1
+            logger.info(
+                "run_index_refresh_skip_manager_role run=%s refresh_kind=%s total_ms=%.2f",
+                run_root,
+                refresh_kind,
+                _perf_elapsed_ms(refresh_started),
+            )
+            return run_index
 
         if not force_runtime_assets and run_index.last_synced_at and not _run_index_needs_parser_resync(run_index):
             debounce_window = (
-                _RUN_INDEX_RUNTIME_REFRESH_DEBOUNCE_SECONDS
+                _run_index_runtime_refresh_debounce_seconds()
                 if include_runtime_assets
-                else _RUN_INDEX_LIGHT_REFRESH_DEBOUNCE_SECONDS
+                else _run_index_light_refresh_debounce_seconds()
             )
             refresh_age = max((now_local() - run_index.last_synced_at).total_seconds(), 0.0)
             if refresh_age < debounce_window:
@@ -1308,66 +1344,99 @@ class RunIndexService:
                     _perf_elapsed_ms(refresh_started),
                 )
                 return run_index
-
-        stored_source_mtime = _stored_source_mtime(run_index.source_mtime)
-        if (
-            not force_runtime_assets
-            and not _run_index_is_active(run_index)
-            and not _run_index_needs_parser_resync(run_index)
-        ):
-            hint_mtime = _compute_source_mtime_hint(run_root, run_index.atomic_work_path)
-            if _source_mtime_is_current(hint_mtime, stored_source_mtime):
+        run_id = str(run_index.id or "")
+        heavy_refresh = include_runtime_assets or force_runtime_assets
+        with self._refresh_state_lock:
+            if run_id and run_id in self._inflight_refresh_by_run_id:
+                self._refresh_skipped_due_to_lock_total += 1
                 logger.info(
-                    "run_index_refresh_skip_current run=%s include_runtime_assets=%s reason=mtime_hint_current status=%s total_ms=%.2f",
+                    "run_index_refresh_skip_inflight run=%s refresh_kind=%s total_ms=%.2f",
+                    run_root,
+                    refresh_kind,
+                    _perf_elapsed_ms(refresh_started),
+                )
+                return run_index
+            if heavy_refresh and self._inflight_heavy_refreshes >= max(1, int(get_config().run_index_refresh.max_concurrent_heavy_refreshes or 1)):
+                self._refresh_queue_rejected_total += 1
+                logger.info(
+                    "run_index_refresh_skip_capacity run=%s refresh_kind=%s inflight=%s total_ms=%.2f",
+                    run_root,
+                    refresh_kind,
+                    self._inflight_heavy_refreshes,
+                    _perf_elapsed_ms(refresh_started),
+                )
+                return run_index
+            if run_id:
+                self._inflight_refresh_by_run_id.add(run_id)
+            if heavy_refresh:
+                self._inflight_heavy_refreshes += 1
+
+        try:
+            stored_source_mtime = _stored_source_mtime(run_index.source_mtime)
+            if (
+                not force_runtime_assets
+                and not _run_index_is_active(run_index)
+                and not _run_index_needs_parser_resync(run_index)
+            ):
+                hint_mtime = _compute_source_mtime_hint(run_root, run_index.atomic_work_path)
+                if _source_mtime_is_current(hint_mtime, stored_source_mtime):
+                    logger.info(
+                        "run_index_refresh_skip_current run=%s include_runtime_assets=%s reason=mtime_hint_current status=%s total_ms=%.2f",
+                        run_root,
+                        include_runtime_assets,
+                        run_index.status,
+                        _perf_elapsed_ms(refresh_started),
+                    )
+                    return run_index
+            current_mtime = (
+                _compute_source_mtime(run_root)
+                if include_runtime_assets or force_runtime_assets
+                else _compute_source_mtime_hint(run_root, run_index.atomic_work_path)
+            )
+            if (
+                not force_runtime_assets
+                and _source_mtime_is_current(current_mtime, stored_source_mtime)
+                and not _run_index_needs_parser_resync(run_index)
+            ):
+                logger.info(
+                    "run_index_refresh_skip_current run=%s include_runtime_assets=%s reason=source_mtime_current status=%s total_ms=%.2f",
                     run_root,
                     include_runtime_assets,
                     run_index.status,
                     _perf_elapsed_ms(refresh_started),
                 )
                 return run_index
-        current_mtime = (
-            _compute_source_mtime(run_root)
-            if include_runtime_assets or force_runtime_assets
-            else _compute_source_mtime_hint(run_root, run_index.atomic_work_path)
-        )
-        if (
-            not force_runtime_assets
-            and _source_mtime_is_current(current_mtime, stored_source_mtime)
-            and not _run_index_needs_parser_resync(run_index)
-        ):
+            linked_execution = db.get(WorkflowExecution, run_index.linked_execution_id) if run_index.linked_execution_id else None
+            linked_task = db.get(TriggerTask, run_index.linked_task_id) if run_index.linked_task_id else None
+            sync_started = time.perf_counter()
+            run_index = self.sync_run_path(
+                db,
+                project_id=run_index.project_id,
+                run_root=run_root,
+                source_type=run_index.source_type,
+                linked_execution=linked_execution,
+                linked_task=linked_task,
+                profile_id=run_index.profile_id,
+                include_runtime_assets=include_runtime_assets,
+            )
+            sync_ms = _perf_elapsed_ms(sync_started)
+            db.commit()
             logger.info(
-                "run_index_refresh_skip_current run=%s include_runtime_assets=%s reason=source_mtime_current status=%s total_ms=%.2f",
+                "run_index_refresh run=%s include_runtime_assets=%s force_runtime_assets=%s status=%s sync_ms=%.2f total_ms=%.2f",
                 run_root,
                 include_runtime_assets,
+                force_runtime_assets,
                 run_index.status,
+                sync_ms,
                 _perf_elapsed_ms(refresh_started),
             )
             return run_index
-        linked_execution = db.get(WorkflowExecution, run_index.linked_execution_id) if run_index.linked_execution_id else None
-        linked_task = db.get(TriggerTask, run_index.linked_task_id) if run_index.linked_task_id else None
-        sync_started = time.perf_counter()
-        run_index = self.sync_run_path(
-            db,
-            project_id=run_index.project_id,
-            run_root=run_root,
-            source_type=run_index.source_type,
-            linked_execution=linked_execution,
-            linked_task=linked_task,
-            profile_id=run_index.profile_id,
-            include_runtime_assets=include_runtime_assets,
-        )
-        sync_ms = _perf_elapsed_ms(sync_started)
-        db.commit()
-        logger.info(
-            "run_index_refresh run=%s include_runtime_assets=%s force_runtime_assets=%s status=%s sync_ms=%.2f total_ms=%.2f",
-            run_root,
-            include_runtime_assets,
-            force_runtime_assets,
-            run_index.status,
-            sync_ms,
-            _perf_elapsed_ms(refresh_started),
-        )
-        return run_index
+        finally:
+            with self._refresh_state_lock:
+                if run_id:
+                    self._inflight_refresh_by_run_id.discard(run_id)
+                if heavy_refresh and self._inflight_heavy_refreshes > 0:
+                    self._inflight_heavy_refreshes -= 1
 
     def resolve_run(self, db: Session, *, project_id: str, run_name: str, root_path: str) -> RunIndex:
         normalized_root = _normalize_execution_request_root(root_path)

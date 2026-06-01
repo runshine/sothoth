@@ -80,7 +80,7 @@ spec:
             port: 8080
           initialDelaySeconds: 15
           periodSeconds: 15
-          timeoutSeconds: 5
+          timeoutSeconds: 8
           failureThreshold: 6
         livenessProbe:
           httpGet:
@@ -88,8 +88,8 @@ spec:
             port: 8080
           initialDelaySeconds: 30
           periodSeconds: 30
-          timeoutSeconds: 5
-          failureThreshold: 6
+          timeoutSeconds: 10
+          failureThreshold: 10
       volumes:
       - name: secflow-app-dataflow-vuln-scanner-config
         configMap:
@@ -183,7 +183,7 @@ spec:
             port: 8080
           initialDelaySeconds: 15
           periodSeconds: 15
-          timeoutSeconds: 5
+          timeoutSeconds: 8
           failureThreshold: 6
         livenessProbe:
           httpGet:
@@ -191,8 +191,8 @@ spec:
             port: 8080
           initialDelaySeconds: 30
           periodSeconds: 30
-          timeoutSeconds: 5
-          failureThreshold: 6
+          timeoutSeconds: 10
+          failureThreshold: 10
       volumes:
       - name: secflow-app-dataflow-vuln-scanner-config
         configMap:
@@ -300,7 +300,7 @@ spec:
             port: 8080
           initialDelaySeconds: 20
           periodSeconds: 20
-          timeoutSeconds: 5
+          timeoutSeconds: 8
           failureThreshold: 6
         livenessProbe:
           httpGet:
@@ -308,8 +308,8 @@ spec:
             port: 8080
           initialDelaySeconds: 30
           periodSeconds: 30
-          timeoutSeconds: 5
-          failureThreshold: 6
+          timeoutSeconds: 10
+          failureThreshold: 10
       volumes:
       - name: secflow-app-dataflow-vuln-scanner-config
         configMap:

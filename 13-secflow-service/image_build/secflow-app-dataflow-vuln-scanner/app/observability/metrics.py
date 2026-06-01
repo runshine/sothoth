@@ -446,6 +446,11 @@ def _collect_scheduler_metrics(db: Session, builder: MetricsBuilder) -> None:
     builder.metric("secflow_dataflow_scheduler_worker_capacity", "gauge", "Scheduler worker capacity.")
     builder.metric("secflow_dataflow_scheduler_running_count", "gauge", "Scheduler running worker count.")
     builder.metric("secflow_dataflow_scheduler_workers", "gauge", "Scheduler worker rows by status.")
+    builder.metric("secflow_dataflow_dispatch_capacity_conflict_total", "counter", "Worker dispatch capacity conflict events observed by this process.")
+    builder.metric("secflow_dataflow_dispatch_backoff_scheduled_total", "counter", "Dispatch backoff schedules observed by this process.")
+    builder.metric("secflow_dataflow_dispatch_skipped_due_to_backoff_total", "counter", "Dispatch attempts skipped because execution backoff was active.")
+    builder.metric("secflow_dataflow_worker_cooldown_active_count", "gauge", "Workers currently in local dispatch cooldown.")
+    builder.metric("secflow_dataflow_execution_backoff_active_count", "gauge", "Executions currently in local dispatch backoff.")
 
     workers = db.query(SchedulerWorker).all()
     db_capacity = sum(int(worker.capacity or 0) for worker in workers)
@@ -479,6 +484,12 @@ def _collect_scheduler_metrics(db: Session, builder: MetricsBuilder) -> None:
         ),
         {"kind": "scheduler_active_queue"},
     )
+    backoff_metrics = scheduler.dispatch_backoff_metrics()
+    builder.sample("secflow_dataflow_dispatch_capacity_conflict_total", backoff_metrics.get("capacity_conflict_total", 0))
+    builder.sample("secflow_dataflow_dispatch_backoff_scheduled_total", backoff_metrics.get("backoff_scheduled_total", 0))
+    builder.sample("secflow_dataflow_dispatch_skipped_due_to_backoff_total", backoff_metrics.get("skipped_due_to_backoff_total", 0))
+    builder.sample("secflow_dataflow_worker_cooldown_active_count", backoff_metrics.get("active_worker_cooldowns", 0))
+    builder.sample("secflow_dataflow_execution_backoff_active_count", backoff_metrics.get("active_execution_backoffs", 0))
 
 
 def _collect_scheduler_snapshot_metrics(builder: MetricsBuilder) -> None:
@@ -520,6 +531,8 @@ def _collect_scheduler_snapshot_metrics(builder: MetricsBuilder) -> None:
 def _collect_run_summary_metrics(db: Session, builder: MetricsBuilder) -> None:
     builder.metric("secflow_dataflow_run_status", "gauge", "Current run-index counts by status.")
     builder.metric("secflow_dataflow_run_summary_total", "gauge", "Aggregated run summary values across all indexed runs.")
+    builder.metric("secflow_dataflow_run_index_refresh_inflight", "gauge", "In-flight heavy run-index refreshes in this process.")
+    builder.metric("secflow_dataflow_run_index_refresh_skipped_total", "counter", "Run-index refreshes skipped by guardrails in this process.")
 
     for status_value, count in db.query(RunIndex.status, func.count(RunIndex.id)).group_by(RunIndex.status).all():
         builder.sample("secflow_dataflow_run_status", count, {"status": status_value or "unknown"})
@@ -536,6 +549,11 @@ def _collect_run_summary_metrics(db: Session, builder: MetricsBuilder) -> None:
     builder.sample("secflow_dataflow_run_summary_total", aggregates[2], {"field": "failed_count"})
     builder.sample("secflow_dataflow_run_summary_total", aggregates[3], {"field": "cycles_used"})
     builder.sample("secflow_dataflow_run_summary_total", aggregates[4], {"field": "duration_seconds"})
+    refresh_metrics = get_run_index_service().refresh_metrics()
+    builder.sample("secflow_dataflow_run_index_refresh_inflight", refresh_metrics.get("inflight_refreshes", 0))
+    builder.sample("secflow_dataflow_run_index_refresh_skipped_total", refresh_metrics.get("skipped_due_to_lock_total", 0), {"reason": "lock"})
+    builder.sample("secflow_dataflow_run_index_refresh_skipped_total", refresh_metrics.get("skipped_due_to_manager_role_total", 0), {"reason": "manager_role"})
+    builder.sample("secflow_dataflow_run_index_refresh_skipped_total", refresh_metrics.get("queue_rejected_total", 0), {"reason": "capacity"})
 
 
 def _latest_cycle_rows(db: Session) -> list[tuple[RunIndexCycle, str]]:
