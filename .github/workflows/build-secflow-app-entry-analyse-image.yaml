@@ -109,6 +109,8 @@ jobs:
       contents: read
       packages: write
     steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
       - name: Login to Docker Hub
         run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
 
@@ -117,22 +119,14 @@ jobs:
 
       - name: Create and push multi-arch manifest (latest)
         run: |
-          docker manifest create ghcr.io/runshine/secflow-app-entry-analyse:latest \
-            --amend ghcr.io/runshine/secflow-app-entry-analyse:amd64-latest \
-            --amend ghcr.io/runshine/secflow-app-entry-analyse:arm64-latest
-          docker manifest push ghcr.io/runshine/secflow-app-entry-analyse:latest
-          # docker manifest create runshine0819/secflow-app-entry-analyse:latest \
-            # --amend runshine0819/secflow-app-entry-analyse:amd64-latest \
-            # --amend runshine0819/secflow-app-entry-analyse:arm64-latest || true
-          # docker manifest push runshine0819/secflow-app-entry-analyse:latest || true
+          docker buildx imagetools create \
+            --tag ghcr.io/runshine/secflow-app-entry-analyse:latest \
+            ghcr.io/runshine/secflow-app-entry-analyse:amd64-latest \
+            ghcr.io/runshine/secflow-app-entry-analyse:arm64-latest
 
       - name: Create and push multi-arch manifest (date tag)
         run: |
-          docker manifest create ghcr.io/runshine/secflow-app-entry-analyse:${{ needs.prepare.outputs.date_tag }} \
-            --amend ghcr.io/runshine/secflow-app-entry-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
-            --amend ghcr.io/runshine/secflow-app-entry-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
-          docker manifest push ghcr.io/runshine/secflow-app-entry-analyse:${{ needs.prepare.outputs.date_tag }}
-          # docker manifest create runshine0819/secflow-app-entry-analyse:${{ needs.prepare.outputs.date_tag }} \
-            # --amend runshine0819/secflow-app-entry-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
-            # --amend runshine0819/secflow-app-entry-analyse:arm64-${{ needs.prepare.outputs.date_tag }} || true
-          # docker manifest push runshine0819/secflow-app-entry-analyse:${{ needs.prepare.outputs.date_tag }} || true
+          docker buildx imagetools create \
+            --tag ghcr.io/runshine/secflow-app-entry-analyse:${{ needs.prepare.outputs.date_tag }} \
+            ghcr.io/runshine/secflow-app-entry-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
+            ghcr.io/runshine/secflow-app-entry-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
