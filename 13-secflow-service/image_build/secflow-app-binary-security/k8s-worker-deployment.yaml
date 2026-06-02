@@ -41,6 +41,8 @@ spec:
                   fieldPath: status.podIP
           ports:
             - containerPort: 8080
+            - containerPort: 18080
+              name: probe
           volumeMounts:
             - name: secflow-app-binary-security-config
               mountPath: /app/config.yaml
@@ -57,26 +59,26 @@ spec:
           startupProbe:
             httpGet:
               path: /api/app/binary-security/health
-              port: 8080
+              port: 18080
             periodSeconds: 10
-            timeoutSeconds: 5
+            timeoutSeconds: 3
             failureThreshold: 18
           livenessProbe:
             httpGet:
               path: /api/app/binary-security/health
-              port: 8080
+              port: 18080
             initialDelaySeconds: 30
-            periodSeconds: 30
+            periodSeconds: 10
             timeoutSeconds: 10
-            failureThreshold: 5
+            failureThreshold: 6
           readinessProbe:
             httpGet:
               path: /api/app/binary-security/ready
-              port: 8080
+              port: 18080
             initialDelaySeconds: 15
-            periodSeconds: 15
-            timeoutSeconds: 10
-            failureThreshold: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
           lifecycle:
             preStop:
               exec:

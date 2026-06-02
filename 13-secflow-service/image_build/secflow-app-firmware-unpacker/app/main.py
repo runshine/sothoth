@@ -8,6 +8,7 @@ import os
 import sys
 import time
 from contextlib import asynccontextmanager
+from contextlib import suppress
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -22,15 +23,72 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.requests import Request as FastAPIRequest
 
 from app.api.firmware import router as firmware_router
+from app.build_info import build_service_meta
 from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
 from app.logging_utils import configure_container_logging
-from app.runtime import start_runtime, stop_runtime
+from app.probe_server import ThreadedProbeServer
+from app.runtime import runtime_snapshot, start_runtime, stop_runtime
 from app.services.observability import record_api_request
 
 
 configure_container_logging("secflow-app-firmware-unpacker")
 logger = logging.getLogger(__name__)
+_probe_server: ThreadedProbeServer | None = None
+
+
+def _probe_payload() -> dict[str, object]:
+    runtime = runtime_snapshot()
+    running = bool(runtime.get("running"))
+    shutting_down = bool(runtime.get("shutting_down"))
+    ready = running and not shutting_down and not str(runtime.get("startup_error") or "").strip()
+    return {
+        "service": "secflow-app-firmware-unpacker",
+        "started_at": runtime.get("started_at"),
+        "updated_at": time.time(),
+        "shutting_down": shutting_down,
+        "startup_phase": "ready" if ready else ("stopping" if shutting_down else "booting"),
+        "liveness_ok": running and not shutting_down,
+        "readiness_ok": ready,
+        "last_error": runtime.get("startup_error"),
+        "reason": None if ready else (runtime.get("startup_error") or "runtime not ready"),
+        "checks": {
+            "registry": {"ok": bool(runtime.get("registry"))},
+            "dispatcher": {"ok": bool(runtime.get("dispatcher"))},
+            "worker_heartbeat": {"ok": bool(runtime.get("worker_heartbeat"))},
+            "cluster_maintenance": {"ok": bool(runtime.get("cluster_maintenance"))},
+            "cleanup_loop": {"ok": bool(runtime.get("cleanup_loop"))},
+            "evolution_loop": {"ok": bool(runtime.get("evolution_loop"))},
+        },
+        "role": ",".join(runtime.get("roles") or []),
+        "roles": runtime.get("roles") or [],
+        **build_service_meta(),
+    }
+
+
+def _ensure_probe_server_started() -> None:
+    global _probe_server
+    if _probe_server is not None:
+        _probe_server.start()
+        return
+    config = get_config()
+    port = int(os.environ.get("SECFLOW_FIRMWARE_UNPACKER_PROBE_PORT", str(int(config.app.port) + 1000)))
+    _probe_server = ThreadedProbeServer(
+        host=config.app.host,
+        port=port,
+        payload_provider=_probe_payload,
+        health_paths=("/health", "/api/app/firmware-unpacker/health"),
+        ready_paths=("/ready", "/api/app/firmware-unpacker/ready"),
+    )
+    _probe_server.start()
+
+
+def _stop_probe_server() -> None:
+    global _probe_server
+    if _probe_server is not None:
+        with suppress(Exception):
+            _probe_server.stop()
+        _probe_server = None
 
 
 def verify_auth_service_or_exit() -> None:
@@ -85,6 +143,7 @@ async def lifespan(app: FastAPI):
         logging.getLogger().setLevel(
             getattr(logging, config.logging.level.upper(), logging.INFO)
         )
+        _ensure_probe_server_started()
         await start_runtime()
         logger.info("secflow-app-firmware-unpacker started")
     except Exception as exc:
@@ -97,6 +156,8 @@ async def lifespan(app: FastAPI):
         await stop_runtime()
     except Exception as exc:
         logger.warning("service shutdown warning: %s", exc)
+    finally:
+        _stop_probe_server()
 
 
 app = FastAPI(

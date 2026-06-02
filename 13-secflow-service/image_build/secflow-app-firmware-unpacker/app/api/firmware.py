@@ -19,6 +19,7 @@ from app.api.dependencies import ensure_project_access, get_current_subject
 from app.build_info import build_service_meta
 from app.exception import ForbiddenError, InternalError, NotFoundError, ValidationError
 from app.model import FirmwareEvolutionJob, FirmwareEvolutionRound, ServiceConfig, TaskStatus, UnpackTask, UnpackTaskEvent, get_db_session
+from app.runtime import runtime_snapshot
 from app.schemas import (
     ActionResponse,
     BatchDeleteRequest,
@@ -2585,13 +2586,49 @@ def _list_llm_config_file_summaries() -> dict:
 @router.get("/health", response_model=HealthResponse)
 @router.get("/api/app/firmware-unpacker/health", response_model=HealthResponse)
 async def health_check():
-    return {"status": "ok", "owner_id": get_worker_id(), **build_service_meta()}
+    runtime = runtime_snapshot()
+    ready = bool(runtime.get("running")) and not bool(runtime.get("shutting_down")) and not str(runtime.get("startup_error") or "").strip()
+    return {
+        "status": "ok" if runtime.get("running") and not runtime.get("shutting_down") else "degraded",
+        "owner_id": get_worker_id(),
+        "service": "secflow-app-firmware-unpacker",
+        "role": ",".join(runtime.get("roles") or []),
+        "started_at": runtime.get("started_at"),
+        "updated_at": now_local().isoformat(),
+        "shutting_down": bool(runtime.get("shutting_down")),
+        "startup_phase": "ready" if ready else ("stopping" if runtime.get("shutting_down") else "booting"),
+        "liveness_ok": bool(runtime.get("running")) and not bool(runtime.get("shutting_down")),
+        "readiness_ok": ready,
+        "last_error": runtime.get("startup_error"),
+        "reason": None if ready else (runtime.get("startup_error") or "runtime not ready"),
+        "checks": {
+            "registry": {"ok": bool(runtime.get("registry"))},
+            "dispatcher": {"ok": bool(runtime.get("dispatcher"))},
+            "worker_heartbeat": {"ok": bool(runtime.get("worker_heartbeat"))},
+            "cluster_maintenance": {"ok": bool(runtime.get("cluster_maintenance"))},
+            "cleanup_loop": {"ok": bool(runtime.get("cleanup_loop"))},
+            "evolution_loop": {"ok": bool(runtime.get("evolution_loop"))},
+        },
+        **build_service_meta(),
+    }
 
 
 @router.get("/ready", response_model=ReadyResponse)
 @router.get("/api/app/firmware-unpacker/ready", response_model=ReadyResponse)
 async def ready_check():
-    return {"status": "ready", "owner_id": get_worker_id()}
+    runtime = runtime_snapshot()
+    ready = bool(runtime.get("running")) and not bool(runtime.get("shutting_down")) and not str(runtime.get("startup_error") or "").strip()
+    return {
+        "status": "ready" if ready else "not_ready",
+        "owner_id": get_worker_id(),
+        "service": "secflow-app-firmware-unpacker",
+        "role": ",".join(runtime.get("roles") or []),
+        "started_at": runtime.get("started_at"),
+        "updated_at": now_local().isoformat(),
+        "shutting_down": bool(runtime.get("shutting_down")),
+        "last_error": runtime.get("startup_error"),
+        "reason": None if ready else (runtime.get("startup_error") or "runtime not ready"),
+    }
 
 
 @router.get("/api/app/firmware-unpacker/cluster", response_model=ClusterInfoResponse)

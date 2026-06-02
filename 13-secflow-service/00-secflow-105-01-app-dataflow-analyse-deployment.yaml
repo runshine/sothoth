@@ -29,6 +29,8 @@ spec:
             value: /data/files
         ports:
         - containerPort: 8080
+        - containerPort: 18080
+          name: probe
         volumeMounts:
         - name: secflow-app-dataflow-analyse-config
           mountPath: /app/service.yaml
@@ -45,15 +47,19 @@ spec:
         livenessProbe:
           httpGet:
             path: /api/app/dataflow-analyse/health
-            port: 8080
+            port: 18080
           initialDelaySeconds: 30
-          periodSeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 6
         readinessProbe:
           httpGet:
-            path: /api/app/dataflow-analyse/health
-            port: 8080
+            path: /api/app/dataflow-analyse/ready
+            port: 18080
           initialDelaySeconds: 15
-          periodSeconds: 15
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 3
       volumes:
       - name: secflow-app-dataflow-analyse-config
         configMap:

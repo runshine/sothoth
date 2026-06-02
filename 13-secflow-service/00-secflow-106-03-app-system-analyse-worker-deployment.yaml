@@ -69,6 +69,8 @@ spec:
             value: "10"
         ports:
         - containerPort: 8080
+        - containerPort: 18080
+          name: probe
         volumeMounts:
         - name: secflow-app-system-analyse-config
           mountPath: /app/service.yaml
@@ -85,25 +87,26 @@ spec:
         livenessProbe:
           httpGet:
             path: /api/app/system-analyse/livez
-            port: 8080
+            port: 18080
           initialDelaySeconds: 30
-          periodSeconds: 30
-          timeoutSeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 6
         readinessProbe:
           httpGet:
             path: /api/app/system-analyse/readyz
-            port: 8080
+            port: 18080
           initialDelaySeconds: 15
-          periodSeconds: 15
-          timeoutSeconds: 15
-          failureThreshold: 5
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 3
         startupProbe:
           httpGet:
             path: /api/app/system-analyse/livez
-            port: 8080
+            port: 18080
           initialDelaySeconds: 10
           periodSeconds: 10
-          timeoutSeconds: 15
+          timeoutSeconds: 3
           failureThreshold: 60
       volumes:
       - name: secflow-app-system-analyse-config

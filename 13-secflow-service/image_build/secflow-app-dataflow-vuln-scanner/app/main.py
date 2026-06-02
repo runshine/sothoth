@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 from threading import Lock
@@ -16,11 +17,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api import router
+from app.api.health import collect_probe_snapshot, mark_probe_state
 from app.config import get_config, load_config
 from app.models.database import get_engine, init_database
 from app.pi_vuln_core.config.loader import ConfigValidationError
 from app.pi_vuln_core.runner import load_framework_config_from_path, run_framework_config
 from app.pi_vuln_core.utils.win_compat import ensure_event_loop_policy
+from app.probe_server import ThreadedProbeServer
 from app.observability import build_metrics_response, observe_http_request, observe_http_request_inflight
 from app.metrics_summary import build_ai_summary, build_generic_observability_summary, build_rest_api_summary, parse_prometheus_metrics
 from app.runtime_bootstrap import get_runtime_bootstrap
@@ -40,6 +43,7 @@ logger = logging.getLogger(__name__)
 _SUMMARY_CACHE_TTL_SECONDS = 5.0
 _summary_cache: dict[str, tuple[float, Any]] = {}
 _summary_cache_lock = Lock()
+_probe_server: ThreadedProbeServer | None = None
 
 
 def _cached_summary(key: str, builder: Callable[[], Any]) -> Any:
@@ -59,6 +63,30 @@ def _metrics_rows():
     return parse_prometheus_metrics(response.body)
 
 
+def _ensure_probe_server_started() -> None:
+    global _probe_server
+    if _probe_server is not None:
+        _probe_server.start()
+        return
+    port = int((getattr(get_config().app, "port", 8080) or 8080) + 1000)
+    port = int(os.environ.get("SECFLOW_DATAFLOW_VULN_SCANNER_PROBE_PORT", str(port)))
+    _probe_server = ThreadedProbeServer(
+        host="0.0.0.0",
+        port=port,
+        payload_provider=collect_probe_snapshot,
+        health_paths=("/health", "/api/dataflow-vuln-scanner/health"),
+        ready_paths=("/ready", "/api/dataflow-vuln-scanner/ready"),
+    )
+    _probe_server.start()
+
+
+def _stop_probe_server() -> None:
+    global _probe_server
+    if _probe_server is not None:
+        _probe_server.stop()
+        _probe_server = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("starting secflow dataflow vuln scanner service...")
@@ -66,25 +94,44 @@ async def lifespan(app: FastAPI):
     role = get_scheduler_service().role
     logger.info("secflow dataflow vuln scanner role=%s", role)
     sync_providers_to_pi()
+    mark_probe_state(
+        shutting_down=False,
+        services_ready=False,
+        auth_ready=False,
+        project_ready=False,
+        registry_ready=False,
+        startup_error=None,
+    )
+    _ensure_probe_server_started()
 
     async def _after_db_ready() -> None:
         with get_engine().connect() as conn:
             conn.exec_driver_sql("SELECT 1")
         await get_auth_service().startup_validate()
+        mark_probe_state(auth_ready=True)
         get_project_service().startup_validate()
+        mark_probe_state(project_ready=True)
         if role in {"standalone", "api"}:
             await get_registry_service().start()
+            mark_probe_state(registry_ready=True)
         if role != "api":
             await get_scheduler_service().start()
+        mark_probe_state(services_ready=True, startup_error=None)
 
-    await get_runtime_bootstrap().start(_after_db_ready)
+    try:
+        await get_runtime_bootstrap().start(_after_db_ready)
+    except Exception as exc:
+        mark_probe_state(startup_error=str(exc), services_ready=False)
+        raise
     yield
+    mark_probe_state(shutting_down=True, services_ready=False)
     await get_runtime_bootstrap().stop()
     if role != "api":
         await get_scheduler_service().stop()
     if role in {"standalone", "api"}:
         await get_registry_service().stop()
     await close_all_shared_async_clients()
+    _stop_probe_server()
 
 
 def create_app() -> FastAPI:

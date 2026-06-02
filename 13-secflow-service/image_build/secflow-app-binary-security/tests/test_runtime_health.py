@@ -74,6 +74,28 @@ class RuntimeHealthTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(["operation_dispatch"], detail["missing_loops"])
 
+    def test_collect_probe_snapshot_contains_startup_phase_and_last_error(self):
+        fake_runtime = {"running": False, "loops": {}, "loop_details": {}}
+        with patch("app.runtime_health.get_config") as mock_get_config, patch(
+            "app.runtime_health.get_task_manager"
+        ) as mock_get_task_manager, patch(
+            "app.runtime_health.snapshot_startup_state"
+        ) as mock_snapshot:
+            mock_get_config.return_value.scheduler.enabled = False
+            mock_get_task_manager.return_value.runtime_status.return_value = fake_runtime
+            mock_snapshot.return_value = {
+                "started_at": 123.0,
+                "startup_ready": False,
+                "startup_error": "boom",
+                "auth_ready": False,
+                "registry_ready": False,
+                "database_ready": False,
+                "shutting_down": False,
+            }
+            payload = runtime_health.collect_probe_snapshot()
+        self.assertEqual("booting", payload["startup_phase"])
+        self.assertEqual("boom", payload["last_error"])
+
 
 if __name__ == "__main__":
     unittest.main()

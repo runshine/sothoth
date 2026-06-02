@@ -73,8 +73,6 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> Token
 @router.get("/health")
 async def health_check():
     return {
-        "service": "secflow-app-binary-security",
-        "role": str(__import__("os").environ.get("SECFLOW_BINARY_SECURITY_ROLE") or "all").strip().lower() or "all",
         **build_service_meta(),
         **collect_liveness(),
     }

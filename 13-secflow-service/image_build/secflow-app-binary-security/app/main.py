@@ -8,6 +8,7 @@ import os
 import sys
 import time
 from contextlib import asynccontextmanager
+from contextlib import suppress
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -18,6 +19,7 @@ from fastapi.requests import Request as FastAPIRequest
 from fastapi.responses import Response
 
 from app.api.tasks import router
+from app.build_info import build_service_meta
 from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
 from app.metrics_aggregate import get_metrics_aggregator
@@ -31,6 +33,8 @@ from app.observability import (
     observe_downstream_request,
     render_metrics,
 )
+from app.probe_server import ThreadedProbeServer
+from app.runtime_health import collect_probe_snapshot, mark_startup_state
 from app.service.http_client import close_all_async_clients
 from app.service.reducer_metrics_snapshot import close_reducer_metrics_snapshot_store
 from app.service.reducer_metrics_snapshot import get_reducer_metrics_snapshot_store
@@ -45,6 +49,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
+_probe_server: ThreadedProbeServer | None = None
 
 
 def _service_role() -> str:
@@ -180,23 +185,31 @@ def verify_auth_service_or_exit() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     logger.info("正在启动 SecFlow Binary Security 服务...")
+    mark_startup_state(shutting_down=False, startup_ready=False, startup_error=None)
     try:
         load_config()
+        _ensure_probe_server_started()
         init_database()
+        mark_startup_state(database_ready=True)
         with get_engine().connect() as conn:
             conn.exec_driver_sql("SELECT 1")
         verify_auth_service_or_exit()
+        mark_startup_state(auth_ready=True)
         if _registry_enabled():
             await get_registry_service().start()
+            mark_startup_state(registry_ready=True)
         if _scheduler_enabled():
             await get_task_manager().start()
+        mark_startup_state(startup_ready=True, startup_error=None)
     except Exception as exc:
+        mark_startup_state(startup_ready=False, startup_error=str(exc))
         logger.exception("Binary Security 服务启动失败: %s", exc)
         sys.exit(1)
 
     logger.info("SecFlow Binary Security 服务启动成功")
     yield
     try:
+        mark_startup_state(shutting_down=True, startup_ready=False)
         if _scheduler_enabled():
             await get_task_manager().stop()
         if _registry_enabled():
@@ -206,6 +219,9 @@ async def lifespan(_: FastAPI):
         await close_all_async_clients()
     except Exception as exc:
         logger.warning("Binary Security 服务关闭警告: %s", exc)
+    finally:
+        mark_startup_state(registry_ready=False, auth_ready=False, database_ready=False)
+        _stop_probe_server()
 
 
 app = FastAPI(
@@ -222,6 +238,39 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _probe_payload() -> dict[str, object]:
+    snapshot = collect_probe_snapshot()
+    return {
+        "service": "secflow-app-binary-security",
+        **snapshot,
+        **build_service_meta(),
+    }
+
+
+def _ensure_probe_server_started() -> None:
+    global _probe_server
+    if _probe_server is not None:
+        _probe_server.start()
+        return
+    port = int(os.environ.get("SECFLOW_BINARY_SECURITY_PROBE_PORT", "18080"))
+    _probe_server = ThreadedProbeServer(
+        host="0.0.0.0",
+        port=port,
+        payload_provider=_probe_payload,
+        health_paths=("/health", "/api/app/binary-security/health"),
+        ready_paths=("/ready", "/api/app/binary-security/ready"),
+    )
+    _probe_server.start()
+
+
+def _stop_probe_server() -> None:
+    global _probe_server
+    if _probe_server is not None:
+        with suppress(Exception):
+            _probe_server.stop()
+        _probe_server = None
 
 
 @app.middleware("http")

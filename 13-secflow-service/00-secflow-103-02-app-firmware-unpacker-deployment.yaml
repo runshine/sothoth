@@ -84,6 +84,8 @@ spec:
                   divisor: 1Mi
           ports:
             - containerPort: 8080
+            - containerPort: 18080
+              name: probe
           volumeMounts:
             - name: secflow-app-firmware-unpacker-config
               mountPath: /app/config.yaml
@@ -100,26 +102,26 @@ spec:
           startupProbe:
             httpGet:
               path: /api/app/firmware-unpacker/health
-              port: 8080
+              port: 18080
             periodSeconds: 10
-            timeoutSeconds: 15
+            timeoutSeconds: 3
             failureThreshold: 18
           livenessProbe:
             httpGet:
               path: /api/app/firmware-unpacker/health
-              port: 8080
+              port: 18080
             initialDelaySeconds: 30
-            periodSeconds: 30
-            timeoutSeconds: 15
-            failureThreshold: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
           readinessProbe:
             httpGet:
               path: /api/app/firmware-unpacker/ready
-              port: 8080
+              port: 18080
             initialDelaySeconds: 15
-            periodSeconds: 15
-            timeoutSeconds: 15
-            failureThreshold: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
       volumes:
         - name: secflow-app-firmware-unpacker-config
           configMap:
@@ -217,6 +219,8 @@ spec:
                   divisor: 1Mi
           ports:
             - containerPort: 8080
+            - containerPort: 18080
+              name: probe
           volumeMounts:
             - name: secflow-app-firmware-unpacker-config
               mountPath: /app/config.yaml
@@ -233,26 +237,26 @@ spec:
           startupProbe:
             httpGet:
               path: /api/app/firmware-unpacker/health
-              port: 8080
+              port: 18080
             periodSeconds: 10
-            timeoutSeconds: 15
+            timeoutSeconds: 3
             failureThreshold: 18
           livenessProbe:
             httpGet:
               path: /api/app/firmware-unpacker/health
-              port: 8080
+              port: 18080
             initialDelaySeconds: 30
-            periodSeconds: 30
-            timeoutSeconds: 15
-            failureThreshold: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
           readinessProbe:
             httpGet:
               path: /api/app/firmware-unpacker/ready
-              port: 8080
+              port: 18080
             initialDelaySeconds: 15
-            periodSeconds: 15
-            timeoutSeconds: 15
-            failureThreshold: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
       volumes:
         - name: secflow-app-firmware-unpacker-config
           configMap:
@@ -350,6 +354,8 @@ spec:
                   divisor: 1Mi
           ports:
             - containerPort: 8080
+            - containerPort: 18080
+              name: probe
           volumeMounts:
             - name: secflow-app-firmware-unpacker-config
               mountPath: /app/config.yaml
@@ -366,26 +372,26 @@ spec:
           startupProbe:
             httpGet:
               path: /api/app/firmware-unpacker/health
-              port: 8080
+              port: 18080
             periodSeconds: 10
-            timeoutSeconds: 15
+            timeoutSeconds: 3
             failureThreshold: 18
           livenessProbe:
             httpGet:
               path: /api/app/firmware-unpacker/health
-              port: 8080
+              port: 18080
             initialDelaySeconds: 30
-            periodSeconds: 30
-            timeoutSeconds: 15
-            failureThreshold: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
           readinessProbe:
             httpGet:
               path: /api/app/firmware-unpacker/ready
-              port: 8080
+              port: 18080
             initialDelaySeconds: 15
-            periodSeconds: 15
-            timeoutSeconds: 15
-            failureThreshold: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
       volumes:
         - name: secflow-app-firmware-unpacker-config
           configMap:

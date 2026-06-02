@@ -4,15 +4,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import signal
 import sys
 import threading
 from contextlib import suppress
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -24,8 +21,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "app"))
 
 from app.config import get_config, get_runtime_roles, load_config
 from app.logging_utils import configure_container_logging
-from app.runtime import start_runtime, stop_runtime
-from app.services.observability import generate_metrics_payload, metrics_content_type
+from app.probe_server import ThreadedProbeServer
+from app.runtime import runtime_snapshot, start_runtime, stop_runtime
 
 
 configure_container_logging("secflow-app-firmware-unpacker")
@@ -53,52 +50,59 @@ class _RuntimeState:
 
 
 _STATE = _RuntimeState()
+_PROBE_SERVER: ThreadedProbeServer | None = None
 
 
-class _HealthHandler(BaseHTTPRequestHandler):
-    server_version = "secflow-fw-background/1.0"
-
-    def do_GET(self) -> None:  # noqa: N802
-        if self.path not in {
-            "/api/app/firmware-unpacker/health",
-            "/api/app/firmware-unpacker/ready",
-            "/metrics",
-        }:
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-
-        if self.path == "/metrics":
-            payload = generate_metrics_payload()
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", metrics_content_type())
-            self.end_headers()
-            self.wfile.write(payload)
-            return
-
-        payload = _STATE.snapshot()
-        is_ready_path = self.path.endswith("/ready")
-        status = HTTPStatus.OK if (not is_ready_path or _STATE.ready.is_set()) else HTTPStatus.SERVICE_UNAVAILABLE
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-
-    def log_message(self, format: str, *args: object) -> None:
-        logger.debug("background health server: " + format, *args)
+def _probe_payload() -> dict[str, object]:
+    runtime = runtime_snapshot()
+    ready = _STATE.ready.is_set() and bool(runtime.get("running")) and not _STATE.stopping.is_set() and not str(runtime.get("startup_error") or "").strip()
+    return {
+        "status": "ready" if ready else ("stopping" if _STATE.stopping.is_set() else "starting"),
+        "role": ",".join(sorted(get_runtime_roles())),
+        "roles": sorted(get_runtime_roles()),
+        "error": _STATE.last_error or runtime.get("startup_error"),
+        "service": "secflow-app-firmware-unpacker",
+        "started_at": runtime.get("started_at"),
+        "updated_at": time.time(),
+        "shutting_down": _STATE.stopping.is_set() or bool(runtime.get("shutting_down")),
+        "startup_phase": "ready" if ready else ("stopping" if _STATE.stopping.is_set() else "booting"),
+        "liveness_ok": bool(runtime.get("running")) and not _STATE.stopping.is_set(),
+        "readiness_ok": ready,
+        "last_error": _STATE.last_error or runtime.get("startup_error"),
+        "reason": None if ready else (_STATE.last_error or runtime.get("startup_error") or "background runtime not ready"),
+        "checks": {
+            "dispatcher": {"ok": bool(runtime.get("dispatcher"))},
+            "worker_heartbeat": {"ok": bool(runtime.get("worker_heartbeat"))},
+            "cluster_maintenance": {"ok": bool(runtime.get("cluster_maintenance"))},
+            "cleanup_loop": {"ok": bool(runtime.get("cleanup_loop"))},
+            "evolution_loop": {"ok": bool(runtime.get("evolution_loop"))},
+        },
+    }
 
 
-def _start_health_server() -> ThreadingHTTPServer:
+def _start_probe_server() -> None:
+    global _PROBE_SERVER
+    if _PROBE_SERVER is not None:
+        _PROBE_SERVER.start()
+        return
     config = get_config()
-    server = ThreadingHTTPServer((config.app.host, int(config.app.port)), _HealthHandler)
-    thread = threading.Thread(
-        target=server.serve_forever,
-        name="fw-background-health",
-        kwargs={"poll_interval": 0.5},
-        daemon=True,
+    port = int(os.environ.get("SECFLOW_FIRMWARE_UNPACKER_PROBE_PORT", str(int(config.app.port) + 1000)))
+    _PROBE_SERVER = ThreadedProbeServer(
+        host=config.app.host,
+        port=port,
+        payload_provider=_probe_payload,
+        health_paths=("/health", "/api/app/firmware-unpacker/health"),
+        ready_paths=("/ready", "/api/app/firmware-unpacker/ready"),
     )
-    thread.start()
-    logger.info("background health server started on %s:%s", config.app.host, config.app.port)
-    return server
+    _PROBE_SERVER.start()
+
+
+def _stop_probe_server() -> None:
+    global _PROBE_SERVER
+    if _PROBE_SERVER is not None:
+        with suppress(Exception):
+            _PROBE_SERVER.stop()
+        _PROBE_SERVER = None
 
 
 def _install_signal_handlers(stop_event: threading.Event) -> None:
@@ -115,15 +119,15 @@ def main() -> int:
     stop_event = threading.Event()
     _install_signal_handlers(stop_event)
 
-    health_server: ThreadingHTTPServer | None = None
     try:
         config = load_config()
         logging.getLogger().setLevel(
             getattr(logging, config.logging.level.upper(), logging.INFO)
         )
-        health_server = _start_health_server()
+        _start_probe_server()
         asyncio.run(start_runtime())
         _STATE.ready.set()
+        _STATE.set_error(None)
         logger.info("firmware unpacker background runtime started with roles: %s", ",".join(sorted(get_runtime_roles())))
         stop_event.wait()
         return 0
@@ -139,9 +143,4 @@ def main() -> int:
         _STATE.stopping.set()
         with suppress(Exception):
             asyncio.run(stop_runtime())
-        if health_server is not None:
-            with suppress(Exception):
-                health_server.shutdown()
-            with suppress(Exception):
-                health_server.server_close()
-            logger.info("background health server stopped")
+        _stop_probe_server()

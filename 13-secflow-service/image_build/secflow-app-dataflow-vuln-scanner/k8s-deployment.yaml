@@ -61,6 +61,8 @@ spec:
               key: service-machine-token
         ports:
         - containerPort: 8080
+        - containerPort: 18080
+          name: probe
         volumeMounts:
         - name: secflow-app-dataflow-vuln-scanner-config
           mountPath: /app/config.yaml
@@ -77,19 +79,19 @@ spec:
         readinessProbe:
           httpGet:
             path: /api/dataflow-vuln-scanner/ready
-            port: 8080
+            port: 18080
           initialDelaySeconds: 15
-          periodSeconds: 15
-          timeoutSeconds: 8
-          failureThreshold: 6
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 3
         livenessProbe:
           httpGet:
             path: /api/dataflow-vuln-scanner/health
-            port: 8080
+            port: 18080
           initialDelaySeconds: 30
-          periodSeconds: 30
-          timeoutSeconds: 10
-          failureThreshold: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 6
       volumes:
       - name: secflow-app-dataflow-vuln-scanner-config
         configMap:
@@ -164,6 +166,8 @@ spec:
               key: service-machine-token
         ports:
         - containerPort: 8080
+        - containerPort: 18080
+          name: probe
         volumeMounts:
         - name: secflow-app-dataflow-vuln-scanner-config
           mountPath: /app/config.yaml
@@ -180,19 +184,19 @@ spec:
         readinessProbe:
           httpGet:
             path: /api/dataflow-vuln-scanner/ready
-            port: 8080
+            port: 18080
           initialDelaySeconds: 15
-          periodSeconds: 15
-          timeoutSeconds: 8
-          failureThreshold: 6
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 3
         livenessProbe:
           httpGet:
             path: /api/dataflow-vuln-scanner/health
-            port: 8080
+            port: 18080
           initialDelaySeconds: 30
-          periodSeconds: 30
-          timeoutSeconds: 10
-          failureThreshold: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 6
       volumes:
       - name: secflow-app-dataflow-vuln-scanner-config
         configMap:
@@ -281,6 +285,8 @@ spec:
               key: service-machine-token
         ports:
         - containerPort: 8080
+        - containerPort: 18080
+          name: probe
         volumeMounts:
         - name: secflow-app-dataflow-vuln-scanner-config
           mountPath: /app/config.yaml
@@ -297,19 +303,19 @@ spec:
         readinessProbe:
           httpGet:
             path: /api/dataflow-vuln-scanner/ready
-            port: 8080
+            port: 18080
           initialDelaySeconds: 20
-          periodSeconds: 20
-          timeoutSeconds: 8
-          failureThreshold: 6
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 3
         livenessProbe:
           httpGet:
             path: /api/dataflow-vuln-scanner/health
-            port: 8080
+            port: 18080
           initialDelaySeconds: 30
-          periodSeconds: 30
-          timeoutSeconds: 10
-          failureThreshold: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 6
       volumes:
       - name: secflow-app-dataflow-vuln-scanner-config
         configMap:

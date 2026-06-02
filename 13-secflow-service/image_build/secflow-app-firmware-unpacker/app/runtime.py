@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 
 from app.config import get_runtime_roles, runtime_has_role
 from app.model import init_database
@@ -33,6 +34,9 @@ _runtime_state = {
     "evolution_loop": False,
     "dispatcher": False,
     "registry": False,
+    "startup_error": None,
+    "started_at": 0.0,
+    "shutting_down": False,
 }
 
 
@@ -49,6 +53,10 @@ async def start_runtime() -> None:
         if _runtime_started:
             return
         try:
+            _runtime_state["shutting_down"] = False
+            _runtime_state["startup_error"] = None
+            if not _runtime_state["started_at"]:
+                _runtime_state["started_at"] = time.time()
             _verify_auth_service_or_exit()
             init_database()
             roles = get_runtime_roles()
@@ -78,6 +86,7 @@ async def start_runtime() -> None:
             if _runtime_state["worker_registered"]:
                 deregister_worker()
                 _runtime_state["worker_registered"] = False
+            _runtime_state["startup_error"] = "runtime_start_failed"
             _runtime_started = False
             raise
 
@@ -98,6 +107,7 @@ async def stop_runtime() -> None:
         if not _runtime_started:
             return
         _runtime_started = False
+        _runtime_state["shutting_down"] = True
 
     try:
         if _runtime_state["dispatcher"]:
@@ -118,3 +128,21 @@ async def stop_runtime() -> None:
         logger.warning("firmware unpacker runtime shutdown warning: %s", exc)
     else:
         logger.info("firmware unpacker runtime stopped")
+
+
+def runtime_snapshot() -> dict[str, object]:
+    with _runtime_lock:
+        return {
+            "started_at": _runtime_state.get("started_at") or None,
+            "running": bool(_runtime_started),
+            "shutting_down": bool(_runtime_state.get("shutting_down")),
+            "startup_error": _runtime_state.get("startup_error"),
+            "worker_registered": bool(_runtime_state.get("worker_registered")),
+            "worker_heartbeat": bool(_runtime_state.get("worker_heartbeat")),
+            "cluster_maintenance": bool(_runtime_state.get("cluster_maintenance")),
+            "cleanup_loop": bool(_runtime_state.get("cleanup_loop")),
+            "evolution_loop": bool(_runtime_state.get("evolution_loop")),
+            "dispatcher": bool(_runtime_state.get("dispatcher")),
+            "registry": bool(_runtime_state.get("registry")),
+            "roles": sorted(get_runtime_roles()),
+        }
