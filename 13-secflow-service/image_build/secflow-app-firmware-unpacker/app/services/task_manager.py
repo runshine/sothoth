@@ -379,15 +379,26 @@ def get_executor() -> ThreadPoolExecutor:
     return _executor
 
 
+def _submit_background(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
+    future = get_executor().submit(fn, *args, **kwargs)
+
+    def _log_background_failure(completed_future: Future) -> None:
+        try:
+            completed_future.result()
+        except Exception:
+            logger.exception(
+                "background task failed: fn=%s",
+                getattr(fn, "__name__", repr(fn)),
+            )
+    future.add_done_callback(_log_background_failure)
+    return future
+
+
 def _cleanup_completed_futures() -> None:
     with _futures_lock:
         done_ids = [task_id for task_id, future in _futures.items() if future.done()]
         for task_id in done_ids:
             _futures.pop(task_id, None)
-
-
-def _submit_background(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
-    return get_executor().submit(func, *args, **kwargs)
 
 
 def _active_future_count() -> int:
