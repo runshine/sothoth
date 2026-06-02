@@ -2192,6 +2192,10 @@ class SchedulerService:
             db.commit()
             get_execution_service().reconcile_terminal_runtime_leaks(db)
             db.commit()
+            get_execution_service().repair_enqueued_task_list_projections(
+                db,
+                batch_size=100,
+            )
         finally:
             db.close()
 

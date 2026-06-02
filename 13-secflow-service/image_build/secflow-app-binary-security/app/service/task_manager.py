@@ -5972,6 +5972,10 @@ class TaskManager:
                     "downstream_ref_count": len(downstream_refs),
                 },
             )
+            # Persist the normalized cancelled state before issuing downstream
+            # cancel requests so archive/status writers do not block on these
+            # rows while we wait on external IO.
+            db.commit()
             if downstream_refs:
                 await self._cancel_downstream_refs(db, task, downstream_refs, token)
             return [stage.stage_name for stage in active_stage_runs]
@@ -6006,6 +6010,10 @@ class TaskManager:
             },
         )
         observe_task_error("cancel", stage=str(task.current_stage or "none"), result="accepted")
+        # Commit parent/stage-item cancellation first so concurrent archive
+        # apply and downstream sync updates do not wait on a long-running
+        # transaction while we perform metadata writes and downstream IO.
+        db.commit()
         await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=TASK_STATUS_CANCELLING)
         await self._cancel_local_worker(task.id)
         for item in running_items:
@@ -10030,7 +10038,7 @@ class TaskManager:
         item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == job.item_id).first()
         if task is None or item is None:
             return
-        if task.status == "cancelled":
+        if str(task.status or "").strip() in {TASK_STATUS_CANCELLING, "cancelled"}:
             job.archive_status = "success"
             job.error_message = None
             job.completed_at = job.completed_at or _now()
@@ -10039,7 +10047,7 @@ class TaskManager:
                 db,
                 task,
                 "downstream_archive_job_ignored",
-                "归档完成事件晚于取消事件到达，已忽略以避免恢复已取消任务",
+                "归档完成事件到达时任务已进入取消链路，已忽略以避免恢复已取消阶段状态",
                 level="warning",
                 stage_name=item.stage_name,
                 item=item,
@@ -10047,6 +10055,7 @@ class TaskManager:
                     "archive_job_id": job.id,
                     "state_event_id": state_event_id,
                     "archive_root": archived_root or job.archive_root,
+                    "task_status": task.status,
                 },
             )
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)

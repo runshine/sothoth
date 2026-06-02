@@ -345,11 +345,118 @@ class ExecutionService:
     def __init__(self) -> None:
         self._process_lock = threading.RLock()
         self._active_cli_processes: dict[str, subprocess.Popen] = {}
+        self._projection_repair_lock = threading.Lock()
+        self._projection_repair_projects: set[str] = set()
 
     def _ensure_project_access(self, principal: dict, project_id: str) -> None:
         project_ids = _project_ids(principal)
         if project_ids and project_id not in project_ids:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="project access denied")
+
+    def _projection_repair_scope_project_ids(self, principal: dict, project_id: str | None = None) -> list[str]:
+        normalized_project_id = str(project_id or "").strip()
+        if normalized_project_id:
+            self._ensure_project_access(principal, normalized_project_id)
+            return [normalized_project_id]
+        project_ids = [str(item).strip() for item in _project_ids(principal) if str(item).strip()]
+        return sorted(set(project_ids))
+
+    def _count_missing_task_list_projections(
+        self,
+        db: Session,
+        principal: dict,
+        *,
+        project_id: str | None = None,
+    ) -> int:
+        scope_project_ids = self._projection_repair_scope_project_ids(principal, project_id)
+        query = (
+            db.query(func.count(TriggerTask.id))
+            .outerjoin(DfvsTaskListProjection, DfvsTaskListProjection.task_id == TriggerTask.id)
+            .filter(DfvsTaskListProjection.task_id.is_(None))
+        )
+        if scope_project_ids:
+            query = query.filter(TriggerTask.project_id.in_(scope_project_ids))
+        return int(query.scalar() or 0)
+
+    def enqueue_projection_repair(
+        self,
+        principal: dict,
+        *,
+        project_id: str | None = None,
+    ) -> bool:
+        scope_project_ids = self._projection_repair_scope_project_ids(principal, project_id)
+        if not scope_project_ids:
+            return False
+        enqueued = False
+        with self._projection_repair_lock:
+            for item in scope_project_ids:
+                if item in self._projection_repair_projects:
+                    continue
+                self._projection_repair_projects.add(item)
+                enqueued = True
+        return enqueued
+
+    def repair_enqueued_task_list_projections(
+        self,
+        db: Session,
+        *,
+        batch_size: int = 100,
+    ) -> dict[str, int]:
+        with self._projection_repair_lock:
+            project_ids = list(self._projection_repair_projects)
+        if not project_ids:
+            return {"projects_processed": 0, "repaired_count": 0}
+
+        processed_projects = 0
+        repaired_count = 0
+        for project_id in project_ids:
+            normalized_project_id = str(project_id or "").strip()
+            if not normalized_project_id:
+                with self._projection_repair_lock:
+                    self._projection_repair_projects.discard(project_id)
+                continue
+            missing_ids = [
+                str(task_id)
+                for task_id, in (
+                    db.query(TriggerTask.id)
+                    .outerjoin(DfvsTaskListProjection, DfvsTaskListProjection.task_id == TriggerTask.id)
+                    .filter(
+                        TriggerTask.project_id == normalized_project_id,
+                        DfvsTaskListProjection.task_id.is_(None),
+                    )
+                    .order_by(TriggerTask.created_at.desc(), TriggerTask.id.desc())
+                    .limit(max(1, int(batch_size)))
+                    .all()
+                )
+            ]
+            if not missing_ids:
+                with self._projection_repair_lock:
+                    self._projection_repair_projects.discard(normalized_project_id)
+                continue
+            triggers = db.query(TriggerTask).filter(TriggerTask.id.in_(missing_ids)).all()
+            self._rebuild_task_list_projections(db, triggers)
+            db.commit()
+            repaired_count += len(triggers)
+            processed_projects += 1
+            remaining_missing = int(
+                db.query(func.count(TriggerTask.id))
+                .outerjoin(DfvsTaskListProjection, DfvsTaskListProjection.task_id == TriggerTask.id)
+                .filter(
+                    TriggerTask.project_id == normalized_project_id,
+                    DfvsTaskListProjection.task_id.is_(None),
+                )
+                .scalar()
+                or 0
+            )
+            with self._projection_repair_lock:
+                if remaining_missing <= 0:
+                    self._projection_repair_projects.discard(normalized_project_id)
+                else:
+                    self._projection_repair_projects.add(normalized_project_id)
+        return {
+            "projects_processed": processed_projects,
+            "repaired_count": repaired_count,
+        }
 
     def _definition_or_404(self, db: Session, definition_id: str) -> WorkflowDefinition:
         definition = db.get(WorkflowDefinition, definition_id)
@@ -5390,7 +5497,15 @@ class ExecutionService:
         sort_by: str | None = None,
         sort_order: str | None = None,
     ) -> ScanTaskListResponse:
-        self._backfill_missing_task_list_projections(db, principal, project_id=project_id)
+        projection_total_missing = self._count_missing_task_list_projections(
+            db,
+            principal,
+            project_id=project_id,
+        )
+        projection_backfill_pending = projection_total_missing > 0
+        projection_backfill_enqueued = False
+        if projection_backfill_pending:
+            projection_backfill_enqueued = self.enqueue_projection_repair(principal, project_id=project_id)
         query = self._list_task_projection_query(
             db,
             principal,
@@ -5417,6 +5532,9 @@ class ExecutionService:
             page=safe_page,
             per_page=safe_per_page,
             page_size=safe_per_page,
+            projection_backfill_pending=projection_backfill_pending,
+            projection_backfill_enqueued=projection_backfill_enqueued,
+            projection_total_missing=projection_total_missing,
         )
 
     def get_scan_task_stats(
@@ -5434,7 +5552,14 @@ class ExecutionService:
         mode: str | None = None,
         parent_task_id: str | None = None,
     ) -> ScanTaskStatsResponse:
-        self._backfill_missing_task_list_projections(db, principal, project_id=project_id)
+        projection_total_missing = self._count_missing_task_list_projections(
+            db,
+            principal,
+            project_id=project_id,
+        )
+        projection_backfill_pending = projection_total_missing > 0
+        if projection_backfill_pending:
+            self.enqueue_projection_repair(principal, project_id=project_id)
         query = self._list_task_projection_query(
             db,
             principal,
@@ -5475,6 +5600,7 @@ class ExecutionService:
             succeeded=counts.get("succeeded", 0),
             failed=counts.get("failed", 0),
             cancelled=counts.get("cancelled", 0),
+            projection_backfill_pending=projection_backfill_pending,
         )
 
     def get_scan_task(self, db: Session, task_id: str, principal: dict) -> ScanTaskDetailResponse:

@@ -299,6 +299,9 @@ class ScanTaskListResponse(BaseModel):
     page: int = 1
     per_page: int = 100
     page_size: int = 100
+    projection_backfill_pending: bool = False
+    projection_backfill_enqueued: bool = False
+    projection_total_missing: int = 0
 
 
 class ScanTaskStatsResponse(BaseModel):
@@ -308,6 +311,7 @@ class ScanTaskStatsResponse(BaseModel):
     succeeded: int = 0
     failed: int = 0
     cancelled: int = 0
+    projection_backfill_pending: bool = False
 
 class ScanTaskProjectionRepairResponse(BaseModel):
     status: str = "success"
