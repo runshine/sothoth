@@ -5362,6 +5362,12 @@ class TaskManager:
                     skipped_count += 1
                     continue
                 should_apply = observed_apply_state and mapped_status != before_status
+                if should_apply and mapped_status in {"pending", "queued", "running"}:
+                    should_apply = self._should_apply_downstream_intermediate_status(
+                        item,
+                        mapped_status=mapped_status,
+                        payload=payload,
+                    )
                 if should_apply:
                     apply_error_message = None if mapped_status in {"queued", "running", "success"} else (
                         payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message
@@ -9165,6 +9171,26 @@ class TaskManager:
             error_message=error_message,
         )
 
+    def _should_apply_downstream_intermediate_status(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        mapped_status: str,
+        payload: dict[str, Any] | None,
+    ) -> bool:
+        before_status = str(item.status or "").strip().lower()
+        if mapped_status == "running":
+            return before_status in {"pending", "queued", "running", "dispatching"}
+        if mapped_status == "queued":
+            return before_status in {"running", "queued"}
+        if mapped_status == "pending":
+            if before_status != "running":
+                return False
+            if str(item.downstream_service or "").strip() == "entry_analyse":
+                return self._entry_payload_matches_stage_item(item, payload)
+            return True
+        return False
+
     def _mark_stage_item_sync_observation(
         self,
         item: BinarySecurityStageItem,
@@ -9212,9 +9238,15 @@ class TaskManager:
             payload_task_id = str(payload.get("task_id") or payload.get("id") or "").strip()
             if payload_task_id and current_downstream_task_id and payload_task_id != current_downstream_task_id:
                 return
-            if mapped_status in {"queued", "running"}:
+            should_apply = self._should_apply_downstream_intermediate_status(
+                item,
+                mapped_status=mapped_status,
+                payload=payload,
+            )
+            if should_apply:
                 item.status = mapped_status
-                item.started_at = item.started_at or _now()
+                if mapped_status in {"queued", "running"}:
+                    item.started_at = item.started_at or _now()
                 item.finished_at = None
                 item.error_message = None
             self._mark_stage_item_sync_observation(
@@ -9224,7 +9256,7 @@ class TaskManager:
                 status_raw=self._string_or_none(payload.get("status")),
                 mapped_status=mapped_status,
                 downstream_status=self._string_or_none(payload.get("status")),
-                state_applied=True,
+                state_applied=should_apply,
             )
             session.commit()
         except Exception:
@@ -10769,8 +10801,10 @@ class TaskManager:
             return False
         if self._streaming_mode_enabled(task) and self._is_streaming_tail_stage(task, task.current_stage):
             return False
-        if self._has_local_task_execution_owner(task.id) or self._task_has_active_streaming_stage_workers(task.id):
+        if self._task_has_active_streaming_stage_workers(task.id):
             return False
+        if self._has_local_task_execution_owner(task.id):
+            return self._task_has_stale_active_reconcile_items(db, task)
         if not str(task.dispatcher_instance_id or "").strip():
             return True
         if not self._lease_is_active(task, db=db):
@@ -10815,6 +10849,16 @@ class TaskManager:
             return False
         return any(
             self._stage_item_in_active_reconcile_scope(task, item)
+            for item in self._stage_items(db, task.id, active_stage_name)
+        )
+
+    def _task_has_stale_active_reconcile_items(self, db: Session, task: BinarySecurityTask) -> bool:
+        active_stage_name = self._active_reconcile_stage_name(task)
+        if not active_stage_name:
+            return False
+        return any(
+            self._stage_item_in_active_reconcile_scope(task, item)
+            and self._item_downstream_sync_stale(item)
             for item in self._stage_items(db, task.id, active_stage_name)
         )
 

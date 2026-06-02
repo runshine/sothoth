@@ -1488,8 +1488,9 @@ class TaskManagerTests(unittest.TestCase):
             workspace_root="/tmp/ws",
             policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
         )
+        db = _AppendingModelAwareDb(tasks=[task])
 
-        self.assertFalse(self.manager._task_needs_downstream_reconcile(task))
+        self.assertFalse(self.manager._task_needs_downstream_reconcile(db, task))
 
     def test_claim_streaming_stage_items_marks_pending_item_dispatching(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -22259,6 +22260,35 @@ def _test_task_needs_downstream_reconcile_skips_locally_owned_running_task(self)
     self.assertFalse(manager._task_needs_downstream_reconcile(db, task))
 
 
+def _test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-3b",
+        project_id="p1",
+        status="running",
+        dispatcher_instance_id=manager.instance_id,
+        current_stage="entry_analysis",
+        dispatch_started_at=_now() - timedelta(minutes=5),
+        lease_expires_at=_now() + timedelta(minutes=5),
+        updated_at=_now() - timedelta(minutes=5),
+    )
+    item = BinarySecurityStageItem(
+        id="si-3b",
+        task_id="task-3b",
+        project_id="p1",
+        stage_run_id="sr-3b",
+        stage_name="entry_analysis",
+        item_key="container",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-3b",
+        result={},
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item])
+    manager._register_task_execution_owner(task.id, "primary_task_worker")
+    self.assertTrue(manager._task_needs_downstream_reconcile(db, task))
+
+
 def _test_persist_child_sync_observation_records_observation_persist_failed(self):
     manager = TaskManager()
     task = BinarySecurityTask(id="task-5", project_id="p1", name="demo", status="running")
@@ -22337,6 +22367,200 @@ def _test_apply_child_state_with_savepoint_records_state_apply_failed(self):
     failed_events = [event for event in db.events if event.event_type == "child_state_apply_failed"]
     self.assertTrue(failed_events)
     self.assertIn("apply boom", failed_events[-1].payload.get("apply_error", ""))
+
+
+def _test_refresh_polled_child_sync_snapshot_rewinds_running_to_pending(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(id="task-7", project_id="p1", name="demo", status="running")
+    item = BinarySecurityStageItem(
+        id="si-7",
+        task_id="task-7",
+        project_id="p1",
+        stage_run_id="sr-7",
+        stage_name="entry_analysis",
+        item_key="source_project-tar",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-7",
+        result={"sync_status": "transport_error"},
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item])
+
+    with patch.object(task_manager_module, "get_session_factory", return_value=lambda: db):
+        manager._refresh_polled_child_sync_snapshot(
+            task_id="task-7",
+            item_id="si-7",
+            payload={"task_id": "eat-7", "status": "pending", "parent_stage_item_id": "si-7"},
+        )
+
+    self.assertEqual("pending", item.status)
+    observation = dict((item.result or {}).get("sync_observation") or {})
+    self.assertTrue(observation.get("state_applied"))
+    self.assertEqual("pending", observation.get("mapped_status"))
+
+
+def _test_refresh_polled_child_sync_snapshot_keeps_dispatching_pending_unapplied(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(id="task-8", project_id="p1", name="demo", status="running")
+    item = BinarySecurityStageItem(
+        id="si-8",
+        task_id="task-8",
+        project_id="p1",
+        stage_run_id="sr-8",
+        stage_name="entry_analysis",
+        item_key="source_project",
+        status="dispatching",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-8",
+        result={},
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item])
+
+    with patch.object(task_manager_module, "get_session_factory", return_value=lambda: db):
+        manager._refresh_polled_child_sync_snapshot(
+            task_id="task-8",
+            item_id="si-8",
+            payload={"task_id": "eat-8", "status": "pending", "parent_stage_item_id": "si-8"},
+        )
+
+    self.assertEqual("dispatching", item.status)
+    observation = dict((item.result or {}).get("sync_observation") or {})
+    self.assertFalse(observation.get("state_applied"))
+    self.assertEqual("pending", observation.get("mapped_status"))
+
+
+def _test_sync_downstream_status_rewinds_running_entry_item_to_pending(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-9",
+        project_id="p1",
+        name="demo",
+        status="running",
+        current_stage="entry_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    run = BinarySecurityStageRun(
+        id="sr-9",
+        task_id="task-9",
+        project_id="p1",
+        stage_name="entry_analysis",
+        sequence_no=1,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si-9",
+        task_id="task-9",
+        project_id="p1",
+        stage_run_id="sr-9",
+        stage_name="entry_analysis",
+        item_key="network",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-9",
+        result={"downstream_status": "running"},
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
+
+    async def _fetch(_task, _item, _token):
+        return {"task_id": "eat-9", "status": "pending", "parent_stage_item_id": "si-9"}
+
+    async def _noop_write(*_args, **_kwargs):
+        return None
+
+    original_fetch = manager._fetch_downstream_task_payload
+    original_write = manager._write_task_metadata_async
+    original_enqueue = manager._enqueue_task
+    try:
+        manager._fetch_downstream_task_payload = _fetch
+        manager._write_task_metadata_async = _noop_write
+        manager._enqueue_task = lambda *_args, **_kwargs: None
+        asyncio.run(
+            manager.sync_downstream_status(
+                db,
+                project_id="p1",
+                task_id="task-9",
+                stage_name="entry_analysis",
+                apply_state=True,
+                force=True,
+            )
+        )
+    finally:
+        manager._fetch_downstream_task_payload = original_fetch
+        manager._write_task_metadata_async = original_write
+        manager._enqueue_task = original_enqueue
+
+    self.assertEqual("pending", item.status)
+
+
+def _test_sync_downstream_status_keeps_dispatching_pending_for_entry_item(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-10",
+        project_id="p1",
+        name="demo",
+        status="running",
+        current_stage="entry_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    run = BinarySecurityStageRun(
+        id="sr-10",
+        task_id="task-10",
+        project_id="p1",
+        stage_name="entry_analysis",
+        sequence_no=1,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si-10",
+        task_id="task-10",
+        project_id="p1",
+        stage_run_id="sr-10",
+        stage_name="entry_analysis",
+        item_key="container",
+        status="dispatching",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-10",
+        result={"downstream_status": "pending"},
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
+
+    async def _fetch(_task, _item, _token):
+        return {"task_id": "eat-10", "status": "pending", "parent_stage_item_id": "si-10"}
+
+    async def _noop_write(*_args, **_kwargs):
+        return None
+
+    original_fetch = manager._fetch_downstream_task_payload
+    original_write = manager._write_task_metadata_async
+    original_enqueue = manager._enqueue_task
+    try:
+        manager._fetch_downstream_task_payload = _fetch
+        manager._write_task_metadata_async = _noop_write
+        manager._enqueue_task = lambda *_args, **_kwargs: None
+        asyncio.run(
+            manager.sync_downstream_status(
+                db,
+                project_id="p1",
+                task_id="task-10",
+                stage_name="entry_analysis",
+                apply_state=True,
+                force=True,
+            )
+        )
+    finally:
+        manager._fetch_downstream_task_payload = original_fetch
+        manager._write_task_metadata_async = original_write
+        manager._enqueue_task = original_enqueue
+
+    self.assertEqual("dispatching", item.status)
 
 
 def _test_task_list_response_exposes_runtime_lease_and_sync_view(self):
@@ -22501,10 +22725,15 @@ TaskManagerTests.test_task_heartbeat_controller_refreshes_owned_running_task = _
 TaskManagerTests.test_task_heartbeat_controller_skips_task_without_owner = _test_task_heartbeat_controller_skips_task_without_owner
 TaskManagerTests.test_task_heartbeat_controller_refreshes_running_task_without_dispatcher_ownership = _test_task_heartbeat_controller_refreshes_running_task_without_dispatcher_ownership
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_locally_owned_running_task = _test_task_needs_downstream_reconcile_skips_locally_owned_running_task
+TaskManagerTests.test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items = _test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items
 TaskManagerTests.test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged = _test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged
 TaskManagerTests.test_active_operation_ignores_expired_claim_lease = _test_active_operation_ignores_expired_claim_lease
 TaskManagerTests.test_persist_child_sync_observation_records_observation_persist_failed = _test_persist_child_sync_observation_records_observation_persist_failed
 TaskManagerTests.test_apply_child_state_with_savepoint_records_state_apply_failed = _test_apply_child_state_with_savepoint_records_state_apply_failed
+TaskManagerTests.test_refresh_polled_child_sync_snapshot_rewinds_running_to_pending = _test_refresh_polled_child_sync_snapshot_rewinds_running_to_pending
+TaskManagerTests.test_refresh_polled_child_sync_snapshot_keeps_dispatching_pending_unapplied = _test_refresh_polled_child_sync_snapshot_keeps_dispatching_pending_unapplied
+TaskManagerTests.test_sync_downstream_status_rewinds_running_entry_item_to_pending = _test_sync_downstream_status_rewinds_running_entry_item_to_pending
+TaskManagerTests.test_sync_downstream_status_keeps_dispatching_pending_for_entry_item = _test_sync_downstream_status_keeps_dispatching_pending_for_entry_item
 TaskManagerTests.test_task_list_response_exposes_runtime_lease_and_sync_view = _test_task_list_response_exposes_runtime_lease_and_sync_view
 TaskManagerTests.test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent = _test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent
 TaskManagerTests.test_requeue_released_running_locked_skips_streaming_tail_with_active_items = _test_requeue_released_running_locked_skips_streaming_tail_with_active_items
