@@ -59,6 +59,8 @@ spec:
           value: '5'
         - name: EA_WORKER_POLL_SECONDS
           value: '5'
+        - name: EA_WORKER_HEALTH_PORT
+          value: '18080'
         - name: WORKER_ISOLATION_MODE
           value: none
         - name: EA_POD_IP
@@ -79,29 +81,32 @@ spec:
         image: ghcr.io/runshine/secflow-app-entry-analyse:latest
         imagePullPolicy: Always
         name: secflow-app-entry-analyse-worker-adaptive
+        ports:
+        - containerPort: 18080
+          protocol: TCP
         startupProbe:
           httpGet:
-            path: /api/app/entry-analyse/health
-            port: 3000
-          initialDelaySeconds: 10
+            path: /healthz
+            port: 18080
+          initialDelaySeconds: 0
           periodSeconds: 10
           timeoutSeconds: 5
-          failureThreshold: 18
+          failureThreshold: 24
         readinessProbe:
           httpGet:
-            path: /api/app/entry-analyse/health
-            port: 3000
-          initialDelaySeconds: 30
-          periodSeconds: 15
-          timeoutSeconds: 10
+            path: /readyz
+            port: 18080
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 5
           failureThreshold: 6
         livenessProbe:
           httpGet:
-            path: /api/app/entry-analyse/health
-            port: 3000
-          initialDelaySeconds: 60
-          periodSeconds: 30
-          timeoutSeconds: 10
+            path: /healthz
+            port: 18080
+          initialDelaySeconds: 30
+          periodSeconds: 20
+          timeoutSeconds: 5
           failureThreshold: 6
         resources:
           requests:
