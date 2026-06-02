@@ -177,9 +177,9 @@ class SchedulerConfig(BaseModel):
     requeue_stuck_dispatch_after_seconds: int = 60
     active_reconcile_interval_seconds: int = 30
     active_reconcile_limit: int = 100
-    dispatch_capacity_backoff_initial_seconds: int = 10
+    dispatch_capacity_backoff_initial_seconds: int = 60
     dispatch_capacity_backoff_max_seconds: int = 60
-    worker_capacity_cooldown_seconds: int = 10
+    worker_capacity_cooldown_seconds: int = 60
     worker_snapshot_cache_ttl_seconds: int = 3
     execution_degraded_consecutive_startup_failures: int = 3
     execution_degraded_stale_without_pid_count: int = 5

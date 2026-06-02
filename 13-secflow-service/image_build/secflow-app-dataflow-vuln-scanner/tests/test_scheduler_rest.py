@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -19,6 +20,7 @@ from app.models.database import (
 from app.services.dataflow_worker_client import DataflowWorkerError
 from app.services.runtime_config_service import get_runtime_config_service
 from app.services.scheduler import SchedulerService
+from app.time_utils import now_local
 
 
 def _create_pending_execution(
@@ -962,6 +964,37 @@ def test_pending_dispatch_skips_execution_in_backoff(service_config_path: Path, 
     metrics = scheduler.dispatch_backoff_metrics()
     assert metrics["backoff_scheduled_total"] >= 1
     assert metrics["skipped_due_to_backoff_total"] >= 1
+
+    db = get_db_session()
+    try:
+        execution = db.get(WorkflowExecution, execution_id)
+        assert execution is not None
+        assert execution.dispatch_backoff_reason == "capacity_exceeded"
+        assert execution.dispatch_backoff_until is not None
+        assert (execution.dispatch_backoff_until - now_local()).total_seconds() >= 50
+    finally:
+        db.close()
+
+
+def test_pending_dispatch_query_respects_persisted_backoff_across_scheduler_instances(service_config_path: Path, framework_config_payload: dict):
+    config = get_config()
+    config.scheduler.enabled = True
+    config.scheduler.role = "manager"
+
+    db = get_db_session()
+    try:
+        execution_id = _create_pending_execution(db, framework_config_payload, suffix="persisted-backoff")
+        execution = db.get(WorkflowExecution, execution_id)
+        assert execution is not None
+        execution.dispatch_backoff_until = now_local() + timedelta(seconds=60)
+        execution.dispatch_backoff_reason = "capacity_exceeded"
+        db.add(execution)
+        db.commit()
+    finally:
+        db.close()
+
+    scheduler = SchedulerService()
+    assert execution_id not in scheduler._pending_worker_dispatch_execution_ids()
 
 
 def test_rank_workers_uses_db_snapshot_without_remote_job_probe(service_config_path: Path, framework_config_payload: dict, monkeypatch):

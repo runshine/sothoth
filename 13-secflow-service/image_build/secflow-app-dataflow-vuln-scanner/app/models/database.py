@@ -133,6 +133,9 @@ class WorkflowExecution(Base):
     worker_job_id = Column(String(128))
     dispatch_status = Column(String(32))
     dispatch_error = Column(Text)
+    dispatch_backoff_until = Column(DateTime)
+    dispatch_backoff_reason = Column(String(128))
+    dispatch_backoff_attempt = Column(Integer, nullable=False, default=0)
     process_pid = Column(Integer)
     process_host = Column(String(256))
     process_status = Column(String(32))
@@ -432,6 +435,9 @@ class DfvsTaskListProjection(Base):
     dispatch_status = Column(String(32), nullable=True)
     slot_binding_state = Column(String(64), nullable=True)
     slot_binding_reason = Column(String(255), nullable=True)
+    dispatch_backoff_until = Column(DateTime, nullable=True)
+    dispatch_backoff_reason = Column(String(128), nullable=True)
+    resolved_status_source = Column(String(64), nullable=True)
     latest_run_id = Column(String(64), nullable=True)
     latest_run_status = Column(String(32), nullable=True)
     run_name = Column(String(255), nullable=True)
@@ -998,6 +1004,9 @@ def run_auto_migrations(connection: Connection | None = None) -> None:
         (tables["workflow_execution"], "worker_job_id", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN worker_job_id VARCHAR(128) NULL"),
         (tables["workflow_execution"], "dispatch_status", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN dispatch_status VARCHAR(32) NULL"),
         (tables["workflow_execution"], "dispatch_error", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN dispatch_error TEXT NULL"),
+        (tables["workflow_execution"], "dispatch_backoff_until", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN dispatch_backoff_until DATETIME NULL"),
+        (tables["workflow_execution"], "dispatch_backoff_reason", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN dispatch_backoff_reason VARCHAR(128) NULL"),
+        (tables["workflow_execution"], "dispatch_backoff_attempt", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN dispatch_backoff_attempt INTEGER NOT NULL DEFAULT 0"),
         (tables["workflow_execution"], "process_pid", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN process_pid INTEGER NULL"),
         (tables["workflow_execution"], "process_host", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN process_host VARCHAR(256) NULL"),
         (tables["workflow_execution"], "process_status", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN process_status VARCHAR(32) NULL"),
@@ -1005,6 +1014,9 @@ def run_auto_migrations(connection: Connection | None = None) -> None:
         (tables["workflow_execution"], "process_finished_at", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN process_finished_at DATETIME NULL"),
         (tables["run_index"], "source_hash", f"ALTER TABLE {tables['run_index']} ADD COLUMN source_hash VARCHAR(64) NOT NULL DEFAULT ''"),
         (tables["scheduler_worker"], "metadata_json", f"ALTER TABLE {tables['scheduler_worker']} ADD COLUMN metadata_json {_column_sql(dialect, 'JSON')} NULL"),
+        (DfvsTaskListProjection.__tablename__, "dispatch_backoff_until", f"ALTER TABLE {DfvsTaskListProjection.__tablename__} ADD COLUMN dispatch_backoff_until DATETIME NULL"),
+        (DfvsTaskListProjection.__tablename__, "dispatch_backoff_reason", f"ALTER TABLE {DfvsTaskListProjection.__tablename__} ADD COLUMN dispatch_backoff_reason VARCHAR(128) NULL"),
+        (DfvsTaskListProjection.__tablename__, "resolved_status_source", f"ALTER TABLE {DfvsTaskListProjection.__tablename__} ADD COLUMN resolved_status_source VARCHAR(64) NULL"),
     ]
     index_migrations = [
         (table_name, index_name, _render_index_sql(table_name, index_name, sql_template, dialect))
@@ -1122,6 +1134,12 @@ def run_auto_migrations(connection: Connection | None = None) -> None:
                     "WHEN LOWER(COALESCE(dispatch_status, '')) = 'cancel_requested' OR LOWER(COALESCE(process_status, '')) = 'stop_requested' OR LOWER(COALESCE(message, '')) LIKE '%cancel requested%' THEN 'cancel_requested' "
                     "ELSE 'none' END "
                     "WHERE control_state IS NULL OR control_state = ''"
+                ))
+            if _column_exists(inspector, tables["workflow_execution"], "dispatch_backoff_attempt"):
+                active_connection.execute(text(
+                    f"UPDATE {tables['workflow_execution']} "
+                    "SET dispatch_backoff_attempt = 0 "
+                    "WHERE dispatch_backoff_attempt IS NULL OR dispatch_backoff_attempt < 0"
                 ))
 
         if dialect == "mysql" and RunIndex.__tablename__ in inspector.get_table_names():

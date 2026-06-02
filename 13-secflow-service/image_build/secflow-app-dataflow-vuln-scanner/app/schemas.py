@@ -229,6 +229,9 @@ class ScanTaskResponse(BaseModel):
     dispatch_status: Optional[str] = None
     slot_binding_state: Optional[str] = None
     slot_binding_reason: Optional[str] = None
+    dispatch_backoff_until: Optional[datetime] = None
+    dispatch_backoff_reason: Optional[str] = None
+    resolved_status_source: Optional[str] = None
     run_name: Optional[str] = None
     runs_root: Optional[str] = None
     run_path: Optional[str] = None
@@ -273,6 +276,9 @@ class ScanTaskListItemResponse(BaseModel):
     dispatch_status: Optional[str] = None
     slot_binding_state: Optional[str] = None
     slot_binding_reason: Optional[str] = None
+    dispatch_backoff_until: Optional[datetime] = None
+    dispatch_backoff_reason: Optional[str] = None
+    resolved_status_source: Optional[str] = None
     latest_run_id: Optional[str] = None
     latest_run_status: Optional[str] = None
     run_name: Optional[str] = None
@@ -342,6 +348,9 @@ class ScanTaskAttemptResponse(BaseModel):
     dispatch_status: Optional[str] = None
     slot_binding_state: Optional[str] = None
     slot_binding_reason: Optional[str] = None
+    dispatch_backoff_until: Optional[datetime] = None
+    dispatch_backoff_reason: Optional[str] = None
+    resolved_status_source: Optional[str] = None
     dispatch_error: Optional[str] = None
     process_pid: Optional[int] = None
     process_host: Optional[str] = None

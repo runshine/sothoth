@@ -1636,10 +1636,12 @@ def test_task_detail_never_exposes_unbound_running_slot_state(service_config_pat
         trigger.started_at = old_started_at
         execution.status = "running"
         execution.public_status = "running"
-        execution.dispatch_status = "running"
+        execution.dispatch_status = None
         execution.owner_pod_id = None
         execution.worker_job_id = None
         execution.worker_url = None
+        execution.dispatch_backoff_reason = "capacity_exceeded"
+        execution.dispatch_backoff_until = now_local() + timedelta(seconds=60)
         execution.started_at = old_started_at
         execution.process_pid = None
         execution.process_started_at = None
@@ -1652,6 +1654,8 @@ def test_task_detail_never_exposes_unbound_running_slot_state(service_config_pat
     payload = detail.json()
     assert payload["status"] == "pending"
     assert payload["slot_binding_state"] != "unbound_running"
+    assert payload["dispatch_backoff_reason"] == "capacity_exceeded"
+    assert payload["resolved_status_source"] == "dispatch_backoff"
 
 
 def test_project_filesystem_browser_uses_local_project_tree(service_config_path):

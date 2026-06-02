@@ -318,13 +318,13 @@ class SchedulerService:
         return time.monotonic()
 
     def _dispatch_backoff_initial_seconds(self) -> int:
-        return max(1, int(get_config().scheduler.dispatch_capacity_backoff_initial_seconds or 10))
+        return max(60, int(get_config().scheduler.dispatch_capacity_backoff_initial_seconds or 60))
 
     def _dispatch_backoff_max_seconds(self) -> int:
         return max(self._dispatch_backoff_initial_seconds(), int(get_config().scheduler.dispatch_capacity_backoff_max_seconds or 60))
 
     def _worker_capacity_cooldown_seconds(self) -> int:
-        return max(1, int(get_config().scheduler.worker_capacity_cooldown_seconds or 10))
+        return max(60, int(get_config().scheduler.worker_capacity_cooldown_seconds or 60))
 
     def _worker_snapshot_cache_ttl_seconds(self) -> int:
         return max(1, int(get_config().scheduler.worker_snapshot_cache_ttl_seconds or 3))
@@ -350,6 +350,13 @@ class SchedulerService:
         execution_key = str(execution_id or "").strip()
         if not execution_key:
             return 0.0
+        db = get_db_session()
+        try:
+            execution = db.get(WorkflowExecution, execution_key)
+            if execution is not None and execution.dispatch_backoff_until is not None:
+                return max((execution.dispatch_backoff_until - now_local()).total_seconds(), 0.0)
+        finally:
+            db.close()
         with self._dispatch_backoff_lock:
             now_monotonic = self._now_monotonic()
             self._prune_dispatch_backoff_locked(now_monotonic)
@@ -402,13 +409,32 @@ class SchedulerService:
         )
         db = get_db_session()
         try:
+            execution = db.get(WorkflowExecution, execution_key)
+            if execution is not None:
+                execution.dispatch_backoff_until = now_local() + timedelta(seconds=backoff_seconds)
+                execution.dispatch_backoff_reason = reason
+                execution.dispatch_backoff_attempt = attempts
+                execution.status = "pending"
+                execution.public_status = "pending"
+                execution.dispatch_status = None
+                execution.owner_pod_id = None
+                execution.worker_job_id = None
+                execution.worker_url = None
+                trigger = db.get(TriggerTask, execution.trigger_task_id)
+                if trigger is not None and str(trigger.status or "").strip().lower() in {"pending", "dispatching", "running"}:
+                    trigger.status = "pending"
+                    trigger.public_status = "pending"
+                    trigger.message = execution.message or f"dispatch backoff scheduled: {reason}"
+                    db.add(trigger)
+                db.add(execution)
+                db.commit()
             if self._has_recent_dispatch_backoff_event(db, execution_key, worker_pod_id, reason):
                 return
             payload_json = {
                 "reason": reason,
                 "worker_pod_id": worker_pod_id,
                 "backoff_seconds": backoff_seconds,
-                "backoff_until_monotonic": deadline,
+                "backoff_until": execution.dispatch_backoff_until.isoformat() if execution is not None and execution.dispatch_backoff_until is not None else None,
                 "attempt": attempts,
             }
             if payload_extra:
@@ -431,6 +457,18 @@ class SchedulerService:
         with self._dispatch_backoff_lock:
             self._dispatch_backoff_until_by_execution.pop(execution_key, None)
             self._dispatch_backoff_attempts_by_execution.pop(execution_key, None)
+        db = get_db_session()
+        try:
+            execution = db.get(WorkflowExecution, execution_key)
+            if execution is None:
+                return
+            execution.dispatch_backoff_until = None
+            execution.dispatch_backoff_reason = None
+            execution.dispatch_backoff_attempt = 0
+            db.add(execution)
+            db.commit()
+        finally:
+            db.close()
 
     def _has_recent_dispatch_backoff_event(
         self,
@@ -590,6 +628,8 @@ class SchedulerService:
             owner_pod_id = str(execution.owner_pod_id or "").strip()
             snapshot = snapshots.get(owner_pod_id)
             if snapshot is None:
+                continue
+            if not owner_pod_id:
                 continue
             running = str(execution.status or "").strip().lower() == "running" or str(execution.dispatch_status or "").strip().lower() == "running"
             self._add_execution_to_snapshot(snapshot, str(execution.id), "db", running=running)
@@ -1007,13 +1047,13 @@ class SchedulerService:
             db.query(WorkflowExecution)
             .filter(
                 WorkflowExecution.id == execution.id,
-                WorkflowExecution.status.in_(["pending", "dispatching"]),
+                WorkflowExecution.status.in_(["pending", "dispatching", "starting"]),
                 WorkflowExecution.owner_pod_id == self.pod_id,
                 WorkflowExecution.dispatch_status.in_(["queued", "dispatching"]),
             )
             .update(
                 {
-                    WorkflowExecution.status: "dispatching",
+                    WorkflowExecution.status: "starting",
                     WorkflowExecution.dispatch_status: "starting",
                     WorkflowExecution.dispatch_error: None,
                     WorkflowExecution.message: f"starting on worker {self.pod_id}",
@@ -1074,7 +1114,7 @@ class SchedulerService:
                     )
                     .update(
                         {
-                            WorkflowExecution.status: "dispatching",
+                            WorkflowExecution.status: "starting",
                             WorkflowExecution.owner_pod_id: self.pod_id,
                             WorkflowExecution.dispatch_status: "starting",
                             WorkflowExecution.dispatch_error: None,
@@ -1137,7 +1177,7 @@ class SchedulerService:
                 )
                 .update(
                     {
-                        WorkflowExecution.status: "dispatching",
+                        WorkflowExecution.status: "starting",
                         WorkflowExecution.owner_pod_id: self.pod_id,
                         WorkflowExecution.dispatch_status: "starting",
                         WorkflowExecution.dispatch_error: None,
@@ -1345,6 +1385,9 @@ class SchedulerService:
             execution.worker_job_id = None
             execution.dispatch_status = None
             execution.dispatch_error = None
+            execution.dispatch_backoff_until = None
+            execution.dispatch_backoff_reason = None
+            execution.dispatch_backoff_attempt = 0
             execution.message = "worker capacity exceeded; trying another worker"
             if trigger is not None and trigger.status == "pending":
                 trigger.message = execution.message

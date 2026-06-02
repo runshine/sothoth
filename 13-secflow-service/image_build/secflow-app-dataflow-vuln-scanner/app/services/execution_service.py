@@ -751,6 +751,9 @@ class ExecutionService:
             dispatch_status=row.dispatch_status,
             slot_binding_state=row.slot_binding_state,
             slot_binding_reason=row.slot_binding_reason,
+            dispatch_backoff_until=row.dispatch_backoff_until,
+            dispatch_backoff_reason=row.dispatch_backoff_reason,
+            resolved_status_source=row.resolved_status_source,
             latest_run_id=row.latest_run_id,
             latest_run_status=row.latest_run_status,
             run_name=row.run_name,
@@ -856,7 +859,7 @@ class ExecutionService:
             run_index = run_index_map.get(str(trigger.id))
             run_summary = self._run_summary_snapshot(run_index=run_index, latest_execution=latest_execution)
             run_locator = self._run_locator_for_execution(latest_execution, trigger)
-            effective_status, effective_message, effective_started_at, effective_finished_at = self._effective_scan_task_runtime_state(
+            effective_status, effective_message, effective_started_at, effective_finished_at, resolved_status_source = self._effective_scan_task_runtime_state(
                 trigger=trigger,
                 execution=latest_execution,
                 run_summary=run_summary,
@@ -911,6 +914,9 @@ class ExecutionService:
             row.dispatch_status = latest_execution.dispatch_status if latest_execution is not None else None
             row.slot_binding_state = slot_binding_state
             row.slot_binding_reason = slot_binding_reason
+            row.dispatch_backoff_until = latest_execution.dispatch_backoff_until if latest_execution is not None else None
+            row.dispatch_backoff_reason = latest_execution.dispatch_backoff_reason if latest_execution is not None else None
+            row.resolved_status_source = resolved_status_source
             row.latest_run_id = run_index.id if run_index is not None else None
             row.latest_run_status = str(run_summary.get("status") or "").strip() or None
             row.run_name = (str(run_index.run_name or "").strip() if run_index is not None else "") or run_locator.get("run_name")
@@ -1041,7 +1047,7 @@ class ExecutionService:
         run_index: RunIndex | None,
     ) -> dict[str, Any]:
         run_summary = self._run_summary_snapshot(run_index=run_index, latest_execution=execution)
-        effective_status, _, _, _ = self._effective_scan_task_runtime_state(
+        effective_status, _, _, _, _ = self._effective_scan_task_runtime_state(
             trigger=trigger,
             execution=execution,
             run_summary=run_summary,
@@ -1933,7 +1939,7 @@ class ExecutionService:
             db.flush()
             latest_execution = self._latest_execution_for_trigger(db, trigger.id)
         abnormal_reason = self._task_abnormal_reason(trigger, latest_execution, run_summary)
-        effective_task_status, effective_task_message, effective_started_at, effective_finished_at = self._effective_scan_task_runtime_state(
+        effective_task_status, effective_task_message, effective_started_at, effective_finished_at, resolved_status_source = self._effective_scan_task_runtime_state(
             trigger=trigger,
             execution=latest_execution,
             run_summary=run_summary,
@@ -1992,6 +1998,9 @@ class ExecutionService:
             dispatch_status=latest_execution.dispatch_status if latest_execution is not None else None,
             slot_binding_state=slot_binding_state,
             slot_binding_reason=slot_binding_reason,
+            dispatch_backoff_until=latest_execution.dispatch_backoff_until if latest_execution is not None else None,
+            dispatch_backoff_reason=latest_execution.dispatch_backoff_reason if latest_execution is not None else None,
+            resolved_status_source=resolved_status_source,
             run_name=run_locator["run_name"],
             runs_root=run_locator["runs_root"],
             run_path=run_locator["run_path"],
@@ -2163,7 +2172,7 @@ class ExecutionService:
                 "review_profile": review_profile,
                 **latest_run,
             }
-        effective_status, effective_message, effective_started_at, effective_finished_at = self._effective_scan_task_runtime_state(
+        effective_status, effective_message, effective_started_at, effective_finished_at, resolved_status_source = self._effective_scan_task_runtime_state(
             trigger=trigger,
             execution=latest_execution,
             run_summary=latest_run,
@@ -2205,6 +2214,9 @@ class ExecutionService:
             dispatch_status=latest_execution.dispatch_status if latest_execution is not None else None,
             slot_binding_state=slot_binding_state,
             slot_binding_reason=slot_binding_reason,
+            dispatch_backoff_until=latest_execution.dispatch_backoff_until if latest_execution is not None else None,
+            dispatch_backoff_reason=latest_execution.dispatch_backoff_reason if latest_execution is not None else None,
+            resolved_status_source=resolved_status_source,
             run_name=run_locator["run_name"],
             runs_root=run_locator["runs_root"],
             run_path=run_locator["run_path"],
@@ -2220,7 +2232,7 @@ class ExecutionService:
         trigger: TriggerTask,
         execution: WorkflowExecution | None,
         run_summary: dict[str, Any] | None,
-    ) -> tuple[str, str | None, datetime | None, datetime | None]:
+    ) -> tuple[str, str | None, datetime | None, datetime | None, str]:
         trigger_message = str(trigger.message or "").strip() or None
         trigger_started_at = trigger.started_at
         trigger_finished_at = trigger.finished_at
@@ -2257,11 +2269,35 @@ class ExecutionService:
             run_started_at=run_summary.get("started_at"),
             run_finished_at=run_summary.get("finished_at"),
         )
+        has_runtime_evidence = False
+        if execution is not None:
+            has_runtime_evidence = any(
+                [
+                    bool(str(execution.owner_pod_id or "").strip()),
+                    bool(str(execution.worker_job_id or "").strip()),
+                    bool(execution.process_pid),
+                    bool(execution.process_started_at),
+                    str(dispatch_status or "").strip().lower() in {"queued", "dispatching", "starting", "running"},
+                ]
+            )
+            if (
+                resolved.status == "running"
+                and not has_runtime_evidence
+                and str(dispatch_status or "").strip().lower() not in {"queued", "dispatching", "starting", "running"}
+            ):
+                backoff_until = execution.dispatch_backoff_until
+                backoff_reason = str(execution.dispatch_backoff_reason or "").strip() or "unbound_no_runtime_evidence"
+                message = execution_message or trigger_message
+                if backoff_until is not None:
+                    message = message or f"dispatch backoff active: {backoff_reason}"
+                    return ("pending", message, trigger_started_at or execution_started_at, None, "dispatch_backoff")
+                return ("pending", message, trigger_started_at or execution_started_at, None, "unbound_no_runtime_evidence")
         return (
             resolved.status,
             resolved.message,
             resolved.started_at,
             resolved.finished_at,
+            resolved.source,
         )
 
     def _unbound_active_runtime_evidence(
@@ -2611,6 +2647,9 @@ class ExecutionService:
             dispatch_status=execution.dispatch_status,
             slot_binding_state=slot_binding_state,
             slot_binding_reason=slot_binding_reason,
+            dispatch_backoff_until=execution.dispatch_backoff_until,
+            dispatch_backoff_reason=execution.dispatch_backoff_reason,
+            resolved_status_source="attempt",
             dispatch_error=execution.dispatch_error,
             process_pid=execution.process_pid,
             process_host=execution.process_host,
@@ -5012,7 +5051,7 @@ class ExecutionService:
 
             auto_report_enabled = bool(task_metadata.get("auto_report_vulnerabilities", True))
             abnormal_reason = dict(trigger.latest_abnormal_reason_json) if isinstance(trigger.latest_abnormal_reason_json, dict) else None
-            effective_status, effective_message, effective_started_at, effective_finished_at = self._effective_scan_task_runtime_state(
+            effective_status, effective_message, effective_started_at, effective_finished_at, resolved_status_source = self._effective_scan_task_runtime_state(
                 trigger=trigger,
                 execution=latest_execution,
                 run_summary=run_summary,
@@ -5072,6 +5111,9 @@ class ExecutionService:
                     dispatch_status=latest_execution.dispatch_status if latest_execution is not None else None,
                     slot_binding_state=slot_binding_state,
                     slot_binding_reason=slot_binding_reason,
+                    dispatch_backoff_until=latest_execution.dispatch_backoff_until if latest_execution is not None else None,
+                    dispatch_backoff_reason=latest_execution.dispatch_backoff_reason if latest_execution is not None else None,
+                    resolved_status_source=resolved_status_source,
                     run_name=run_locator.get("run_name"),
                     runs_root=run_locator.get("runs_root"),
                     run_path=run_locator.get("run_path"),
