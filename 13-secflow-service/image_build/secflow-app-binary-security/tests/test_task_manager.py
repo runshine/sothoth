@@ -20916,8 +20916,183 @@ def _test_defer_item_after_downstream_transport_error_records_child_sync_failed(
     self.assertTrue(deferred_events[-1].payload.get("client_recreated"))
 
 
+def _test_defer_item_after_downstream_transport_error_preserves_vuln_replacement_marker(self):
+    task = BinarySecurityTask(id="t1", project_id="p1", name="demo", status="running")
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="vuln_scan",
+        item_key="IPSEC-f1",
+        status="queued",
+        downstream_service="dataflow_vuln_scanner",
+        downstream_task_id=None,
+        result={"sync_observation": {
+            "replacement_in_progress": True,
+            "binding_cleared": True,
+            "verification_status": "pending",
+            "old_downstream_task_id": "tt-old",
+        }},
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+    exc = UpstreamError("下游服务 GET 超时: http://scanner/tasks/tt-old")
+    result = self.manager._defer_item_after_downstream_transport_error(
+        db,
+        task,
+        item,
+        operation="vuln_scan",
+        exc=exc,
+        response_item={"entry_key": "IPSEC-f1"},
+    )
+
+    sync_observation = item.result.get("sync_observation", {})
+    self.assertEqual("pending", item.status)
+    self.assertEqual("pending", result["status"])
+    self.assertTrue(sync_observation.get("replacement_in_progress"))
+    self.assertTrue(sync_observation.get("binding_cleared"))
+    self.assertEqual("tt-old", sync_observation.get("old_downstream_task_id"))
+
+
+def _test_sync_downstream_status_vuln_recreate_skips_old_cancelled_terminal(self):
+    task = BinarySecurityTask(
+        id="s1",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/tmp",
+    )
+    run = BinarySecurityStageRun(
+        id="sr1",
+        task_id="s1",
+        project_id="p1",
+        stage_name="vuln_scan",
+        sequence_no=5,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="s1",
+        project_id="p1",
+        stage_run_id="sr1",
+        stage_name="vuln_scan",
+        item_key="IPSEC-f1",
+        parent_key="IPSEC",
+        status="cancelled",
+        downstream_service="dataflow_vuln_scanner",
+        downstream_task_id="tt-old",
+        result={"sync_observation": {
+            "replacement_in_progress": True,
+            "binding_cleared": True,
+            "verification_status": "pending",
+            "old_downstream_task_id": "tt-old",
+        }},
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
+
+    original_fetch = self.manager._fetch_downstream_task_payload
+    async def _fetch(_task, _item, _token):
+        return {"task_id": "tt-old", "status": "cancelled"}
+
+    self.manager._fetch_downstream_task_payload = _fetch
+    try:
+        resp = asyncio.run(
+            self.manager.sync_downstream_status(
+                db,
+                project_id="p1",
+                task_id="s1",
+                stage_name="vuln_scan",
+                apply_state=True,
+            )
+        )
+    finally:
+        self.manager._fetch_downstream_task_payload = original_fetch
+
+    self.assertEqual("cancelled", item.status)
+    self.assertEqual(1, resp.skipped_downstream_count)
+    skipped_events = [event for event in db.events if event.event_type == "downstream_status_sync_skipped"]
+    self.assertTrue(skipped_events)
+    self.assertFalse(bool(skipped_events[-1].payload.get("state_applied")))
+
+
+def _test_sync_downstream_status_vuln_recreate_missing_child_is_observation_only(self):
+    task = BinarySecurityTask(
+        id="s1",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/tmp",
+    )
+    run = BinarySecurityStageRun(
+        id="sr1",
+        task_id="s1",
+        project_id="p1",
+        stage_name="vuln_scan",
+        sequence_no=5,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="s1",
+        project_id="p1",
+        stage_run_id="sr1",
+        stage_name="vuln_scan",
+        item_key="IPSEC-f1",
+        parent_key="IPSEC",
+        status="queued",
+        downstream_service="dataflow_vuln_scanner",
+        downstream_task_id="tt-missing",
+        result={"sync_observation": {
+            "replacement_in_progress": True,
+            "binding_cleared": True,
+            "verification_status": "pending",
+            "old_downstream_task_id": "tt-old",
+        }},
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
+
+    original_fetch = self.manager._fetch_downstream_task_payload
+    async def _raise_missing(*_args, **_kwargs):
+        raise NotFoundError("Task not found")
+
+    self.manager._fetch_downstream_task_payload = _raise_missing
+    try:
+        resp = asyncio.run(
+            self.manager.sync_downstream_status(
+                db,
+                project_id="p1",
+                task_id="s1",
+                stage_name="vuln_scan",
+                apply_state=True,
+            )
+        )
+    finally:
+        self.manager._fetch_downstream_task_payload = original_fetch
+
+    self.assertEqual("queued", item.status)
+    self.assertEqual(1, resp.skipped_downstream_count)
+    sync_observation = item.result.get("sync_observation", {})
+    self.assertEqual("binding_missing_during_recreate", sync_observation.get("sync_status"))
+    skipped_events = [event for event in db.events if event.event_type == "downstream_status_sync_skipped"]
+    self.assertTrue(skipped_events)
+    self.assertEqual("binding_missing_during_recreate", skipped_events[-1].payload.get("error_type"))
+
+
 TaskManagerTests.test_apply_child_task_status_change_dispatching_preserves_not_started_timestamps = _test_apply_child_task_status_change_dispatching_preserves_not_started_timestamps
 TaskManagerTests.test_apply_child_task_status_change_terminal_failure_sets_finished_at = _test_apply_child_task_status_change_terminal_failure_sets_finished_at
+TaskManagerTests.test_defer_item_after_downstream_transport_error_preserves_vuln_replacement_marker = _test_defer_item_after_downstream_transport_error_preserves_vuln_replacement_marker
+TaskManagerTests.test_sync_downstream_status_vuln_recreate_skips_old_cancelled_terminal = _test_sync_downstream_status_vuln_recreate_skips_old_cancelled_terminal
+TaskManagerTests.test_sync_downstream_status_vuln_recreate_missing_child_is_observation_only = _test_sync_downstream_status_vuln_recreate_missing_child_is_observation_only
 
 
 def _test_upsert_stage_item_preserves_sync_metadata_on_refresh(self):

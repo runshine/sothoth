@@ -4626,7 +4626,17 @@ class TaskManager:
                         )
                     continue
                 terminal_status = mapped_status in {"success", "partial_success", "failed", "cancelled", "downstream_missing"}
-                if terminal_status and current_item_status in {"success", "partial_success", "failed", "cancelled", "downstream_missing"} and current_item_status != mapped_status:
+                replacement_state = self._replacement_in_progress_state(item)
+                if (
+                    terminal_status
+                    and current_item_status in {"success", "partial_success", "failed", "cancelled", "downstream_missing"}
+                    and self._should_preserve_terminal_status(
+                        item,
+                        mapped_status=mapped_status,
+                        current_item_status=current_item_status,
+                        payload=payload,
+                    )
+                ):
                     mapped_status = current_item_status
                     downstream_status = current_item_status
                 if terminal_status:
@@ -4674,6 +4684,44 @@ class TaskManager:
                         skipped_count += 1
                         continue
                     if mapped_status == "downstream_missing":
+                        if item.stage_name == "vuln_scan" and (
+                            replacement_state["replacement_in_progress"] or replacement_state["binding_cleared"]
+                        ):
+                            self._mark_stage_item_sync_observation(
+                                item,
+                                sync_status="binding_missing_during_recreate",
+                                error_message="旧下游绑定在重建期间已失效，本次仅记录观测",
+                                status_raw=downstream_status,
+                                mapped_status="downstream_missing",
+                                downstream_status=downstream_status,
+                                state_applied=False,
+                            )
+                            skipped_count += 1
+                            if force or mapped_status != before_status or record_noop_events:
+                                self._record_event(
+                                    db,
+                                    task,
+                                    "downstream_status_sync_skipped",
+                                    "旧下游绑定在重建期间已失效，本次不将不存在状态回写到父任务",
+                                    stage_name=item.stage_name,
+                                    item=item,
+                                    level="warning",
+                                    payload={
+                                        "downstream_service": item.downstream_service,
+                                        "downstream_task_id": item.downstream_task_id,
+                                        "http_status": None,
+                                        "error_type": "binding_missing_during_recreate",
+                                        "status_raw": downstream_status,
+                                        "mapped_status": mapped_status,
+                                        "state_applied": False,
+                                        "before_status": before_status,
+                                        "downstream_status": downstream_status,
+                                        "after_status": before_status,
+                                        "replacement_in_progress": True,
+                                        "old_downstream_task_id": replacement_state["old_downstream_task_id"],
+                                    },
+                                )
+                            continue
                         should_apply = observed_apply_state and (mapped_status != before_status or force)
                         if should_apply:
                             self._enqueue_downstream_terminal_event(
@@ -4983,6 +5031,46 @@ class TaskManager:
                 # The exception is raised by downstream fetch only. Rolling the
                 # whole session back here would also discard already-synced
                 # sibling items from earlier loop iterations.
+                replacement_state = self._replacement_in_progress_state(item)
+                if item.stage_name == "vuln_scan" and (
+                    replacement_state["replacement_in_progress"] or replacement_state["binding_cleared"]
+                ):
+                    self._mark_stage_item_sync_observation(
+                        item,
+                        sync_status="binding_missing_during_recreate",
+                        error_message="旧下游绑定在重建期间已失效，本次仅记录观测",
+                        http_status=404,
+                        error_type="binding_missing_during_recreate",
+                        status_raw="downstream_missing",
+                        mapped_status="downstream_missing",
+                        downstream_status="downstream_missing",
+                        state_applied=False,
+                    )
+                    skipped_count += 1
+                    self._record_event(
+                        db,
+                        task,
+                        "downstream_status_sync_skipped",
+                        "旧下游绑定在重建期间已失效，本次不将不存在状态回写到父任务",
+                        level="warning",
+                        stage_name=item_stage_name,
+                        item=item,
+                        payload={
+                            "downstream_service": item_downstream_service,
+                            "downstream_task_id": item_downstream_task_id,
+                            "http_status": 404,
+                            "error_type": "binding_missing_during_recreate",
+                            "status_raw": "downstream_missing",
+                            "mapped_status": "downstream_missing",
+                            "state_applied": False,
+                            "before_status": before_status,
+                            "downstream_status": "downstream_missing",
+                            "after_status": before_status,
+                            "replacement_in_progress": True,
+                            "old_downstream_task_id": replacement_state["old_downstream_task_id"],
+                        },
+                    )
+                    continue
                 notfound_apply_state = bool(apply_state)
                 if not notfound_apply_state and stage_name and not item_id:
                     notfound_apply_state = bool(
@@ -16690,8 +16778,12 @@ class TaskManager:
         response_item: dict[str, Any],
     ) -> dict[str, Any]:
         has_downstream_ref = bool(str(item.downstream_task_id or "").strip())
+        replacement_state = self._replacement_in_progress_state(item)
         deferred_mode = "reconcile" if has_downstream_ref else "redispatch"
-        deferred_status = "running" if has_downstream_ref else "queued"
+        if replacement_state["replacement_in_progress"] and replacement_state["binding_cleared"] and not has_downstream_ref:
+            deferred_status = "queued"
+        else:
+            deferred_status = "running" if has_downstream_ref else "queued"
         self._apply_child_task_status_change(
             session,
             task=task,
@@ -16712,6 +16804,13 @@ class TaskManager:
                 "deferred_mode": deferred_mode,
             },
         )
+        if replacement_state["replacement_in_progress"]:
+            self._mark_replacement_in_progress(
+                item,
+                old_downstream_task_id=replacement_state["old_downstream_task_id"],
+                binding_cleared=replacement_state["binding_cleared"],
+                verification_status=replacement_state["verification_status"] or "pending",
+            )
         session.commit()
         self._record_downstream_item_disposition(
             session,
@@ -16830,6 +16929,66 @@ class TaskManager:
         ):
             result.pop(key, None)
         item.result = result
+
+    def _mark_replacement_in_progress(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        old_downstream_task_id: str | None,
+        binding_cleared: bool,
+        verification_status: str = "pending",
+    ) -> None:
+        result = dict(item.result or {})
+        sync_observation = dict(result.get("sync_observation") or {})
+        sync_observation["replacement_in_progress"] = True
+        sync_observation["old_downstream_task_id"] = str(old_downstream_task_id or "").strip() or None
+        sync_observation["binding_cleared"] = bool(binding_cleared)
+        sync_observation["verification_status"] = str(verification_status or "pending")
+        result["sync_observation"] = sync_observation
+        item.result = result
+
+    def _replacement_in_progress_state(self, item: BinarySecurityStageItem) -> dict[str, Any]:
+        result = dict(item.result or {})
+        sync_observation = dict(result.get("sync_observation") or {})
+        return {
+            "replacement_in_progress": bool(sync_observation.get("replacement_in_progress")),
+            "binding_cleared": bool(sync_observation.get("binding_cleared")),
+            "verification_status": str(sync_observation.get("verification_status") or "").strip().lower() or None,
+            "old_downstream_task_id": str(sync_observation.get("old_downstream_task_id") or "").strip() or None,
+        }
+
+    def _clear_replacement_in_progress(self, item: BinarySecurityStageItem) -> None:
+        result = dict(item.result or {})
+        sync_observation = dict(result.get("sync_observation") or {})
+        changed = False
+        for key in ("replacement_in_progress", "binding_cleared", "verification_status", "old_downstream_task_id"):
+            if key in sync_observation:
+                sync_observation.pop(key, None)
+                changed = True
+        if changed:
+            result["sync_observation"] = sync_observation
+            item.result = result
+
+    def _should_preserve_terminal_status(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        mapped_status: str | None,
+        current_item_status: str | None,
+        payload: dict[str, Any],
+    ) -> bool:
+        if not mapped_status or not current_item_status or current_item_status == mapped_status:
+            return False
+        if item.stage_name != "vuln_scan":
+            return True
+        replacement_state = self._replacement_in_progress_state(item)
+        if replacement_state["replacement_in_progress"] or replacement_state["binding_cleared"] or replacement_state["verification_status"] == "pending":
+            return False
+        observed_task_id = str(payload.get("task_id") or payload.get("id") or "").strip() or None
+        current_task_id = str(item.downstream_task_id or "").strip() or None
+        if observed_task_id and current_task_id and observed_task_id != current_task_id:
+            return False
+        return True
 
     def _retry_item_action_snapshot(
         self,
@@ -16967,6 +17126,20 @@ class TaskManager:
                         issues.append({"item_key": item_key, "issue": "replacement_binding_missing"})
                     elif old_task_id and old_task_id == current_task_id:
                         issues.append({"item_key": item_key, "issue": "replacement_reused_old_child", "downstream_task_id": current_task_id})
+                    replacement_state = self._replacement_in_progress_state(item)
+                    if (
+                        replacement_state["replacement_in_progress"]
+                        and replacement_state["binding_cleared"]
+                        and str(item.status or "").strip() in {"failed", "cancelled", "downstream_missing"}
+                    ):
+                        issues.append(
+                            {
+                                "item_key": item_key,
+                                "issue": "replacement_terminal_reapplied_from_old_child",
+                                "status": item.status,
+                                "old_downstream_task_id": replacement_state["old_downstream_task_id"],
+                            }
+                        )
                 elif current_task_id:
                     issues.append({"item_key": item_key, "issue": "binding_not_cleared", "downstream_task_id": item.downstream_task_id})
                 if any(
@@ -17137,6 +17310,12 @@ class TaskManager:
                 "old_downstream_status": observed_status,
             },
         )
+        self._mark_replacement_in_progress(
+            item,
+            old_downstream_task_id=old_task_id,
+            binding_cleared=False,
+            verification_status="pending",
+        )
         if old_task_id:
             self._record_downstream_item_disposition(
                 session,
@@ -17225,6 +17404,12 @@ class TaskManager:
             )
         self._clear_item_downstream_runtime_state(item)
         item.finished_at = None
+        self._mark_replacement_in_progress(
+            item,
+            old_downstream_task_id=old_task_id,
+            binding_cleared=True,
+            verification_status="pending",
+        )
         self._record_downstream_item_disposition(
             session,
             task,
@@ -17396,6 +17581,7 @@ class TaskManager:
         item.started_at = item.started_at or _now()
         item.finished_at = None
         item.error_message = None
+        self._clear_replacement_in_progress(item)
         self._record_downstream_item_disposition(
             session,
             task,
