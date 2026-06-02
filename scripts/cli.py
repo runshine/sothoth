@@ -709,7 +709,7 @@ def kubectl_delete(component: Component) -> None:
 
 def apply_managed_group(group_key: str, env: dict[str, str]) -> None:
     group = get_k8s_groups([group_key])[0]
-    image_registry_prefix = env.get("IMAGE_REGISTRY_PREFIX", "") if group.key == "secflow" else ""
+    image_registry_prefix = env.get("IMAGE_REGISTRY_PREFIX", "")
     if group.pre_deploy_shell:
         run_shell(group.pre_deploy_shell, cwd=group.directory, env=env)
     for manifest_path in group.manifest_paths():
