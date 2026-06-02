@@ -42,7 +42,7 @@ spec:
         - name: FILESERVER_ROOT
           value: /data/files
         - name: EA_TASK_LEASE_SECONDS
-          value: '120'
+          value: '300'
         - name: EA_TASK_LEASE_RENEW_INTERVAL_SECONDS
           value: '30'
         - name: EA_TASK_CANCEL_POLL_INTERVAL_SECONDS
