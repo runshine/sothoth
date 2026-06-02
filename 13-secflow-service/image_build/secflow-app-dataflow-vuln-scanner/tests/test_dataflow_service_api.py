@@ -1658,6 +1658,63 @@ def test_task_detail_never_exposes_unbound_running_slot_state(service_config_pat
     assert payload["resolved_status_source"] == "dispatch_backoff"
 
 
+def test_task_detail_downgrades_capacity_requeue_message_without_backoff_fields(service_config_path, patch_mock_agent_runtime, monkeypatch):
+    _disable_scheduler_start(monkeypatch)
+    app = create_app()
+    client = TestClient(app)
+    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
+    created = _create_business_dataflow_task(
+        client,
+        profile_id=profile["profile_id"],
+        case_name="case-capacity-requeue-message",
+        title="capacity requeue message scan",
+    )
+    task_id = created["task_id"]
+
+    with get_db_session() as db:
+        trigger = db.get(TriggerTask, task_id)
+        execution = (
+            db.query(WorkflowExecution)
+            .filter(WorkflowExecution.trigger_task_id == task_id)
+            .order_by(WorkflowExecution.attempt_no.desc(), WorkflowExecution.created_at.desc())
+            .first()
+        )
+        run_index = (
+            db.query(RunIndex)
+            .filter(RunIndex.linked_task_id == task_id)
+            .order_by(RunIndex.created_at.desc())
+            .first()
+        )
+        assert trigger is not None and execution is not None and run_index is not None
+        old_started_at = now_local() - timedelta(seconds=120)
+        trigger.status = "running"
+        trigger.public_status = "running"
+        trigger.started_at = old_started_at
+        execution.status = "running"
+        execution.public_status = "running"
+        execution.dispatch_status = None
+        execution.owner_pod_id = None
+        execution.worker_job_id = None
+        execution.worker_url = None
+        execution.dispatch_backoff_reason = None
+        execution.dispatch_backoff_until = None
+        execution.message = "worker capacity exceeded; trying another worker"
+        execution.started_at = old_started_at
+        execution.process_pid = None
+        execution.process_started_at = None
+        run_index.status = "running"
+        db.add_all([trigger, execution, run_index])
+        db.commit()
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}")
+    assert detail.status_code == 200
+    payload = detail.json()
+    assert payload["status"] == "pending"
+    assert payload["slot_binding_state"] == "unbound"
+    assert payload["dispatch_backoff_reason"] is None
+    assert payload["resolved_status_source"] == "capacity_requeue_message"
+
+
 def test_project_filesystem_browser_uses_local_project_tree(service_config_path):
     config = get_config()
     project_root = config.fileserver_service.data_mount_path

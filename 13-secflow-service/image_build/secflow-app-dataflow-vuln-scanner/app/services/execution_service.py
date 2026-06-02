@@ -127,10 +127,24 @@ _RUNTIME_RECONCILED_FAILURE_MESSAGES = {
     "stale active runtime assumed failed",
     "runtime heartbeat lost; assumed failed",
 }
+_CAPACITY_REQUEUE_MESSAGES = {
+    "worker capacity exceeded; trying another worker",
+}
 
 
 def _is_runtime_reconciled_failure_message(message: str | None) -> bool:
     return str(message or "").strip().lower() in _RUNTIME_RECONCILED_FAILURE_MESSAGES
+
+
+def _is_capacity_requeue_message(*messages: str | None) -> bool:
+    normalized_targets = {item.lower() for item in _CAPACITY_REQUEUE_MESSAGES}
+    for message in messages:
+        normalized = str(message or "").strip().lower()
+        if normalized and normalized in normalized_targets:
+            return True
+    return False
+
+
 _CANONICAL_TASK_STATUSES = {"pending", "running", "succeeded", "failed", "cancelled"}
 
 _TASK_LIST_SORT_COLUMNS = {
@@ -2280,6 +2294,12 @@ class ExecutionService:
                     str(dispatch_status or "").strip().lower() in {"queued", "dispatching", "starting", "running"},
                 ]
             )
+            capacity_requeue_message = _is_capacity_requeue_message(
+                execution_message,
+                trigger_message,
+                dispatch_error,
+                preferred_error_message,
+            )
             if (
                 resolved.status == "running"
                 and not has_runtime_evidence
@@ -2291,6 +2311,14 @@ class ExecutionService:
                 if backoff_until is not None:
                     message = message or f"dispatch backoff active: {backoff_reason}"
                     return ("pending", message, trigger_started_at or execution_started_at, None, "dispatch_backoff")
+                if capacity_requeue_message:
+                    return (
+                        "pending",
+                        message or "worker capacity exceeded; trying another worker",
+                        trigger_started_at or execution_started_at,
+                        None,
+                        "capacity_requeue_message",
+                    )
                 return ("pending", message, trigger_started_at or execution_started_at, None, "unbound_no_runtime_evidence")
         return (
             resolved.status,
@@ -2442,7 +2470,16 @@ class ExecutionService:
             )
             return False
 
-        message = "unbound active execution requeued after no-runtime confirmation"
+        capacity_requeue_message = _is_capacity_requeue_message(
+            execution.message,
+            trigger.message if trigger is not None else None,
+            execution.dispatch_error,
+        )
+        message = (
+            "worker capacity exceeded; trying another worker"
+            if capacity_requeue_message
+            else "unbound active execution requeued after no-runtime confirmation"
+        )
         execution.worker_url = None
         execution.worker_job_id = None
         execution.owner_pod_id = None
