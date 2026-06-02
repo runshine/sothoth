@@ -3,16 +3,16 @@ set -euo pipefail
 
 NAMESPACE="${NAMESPACE:-secflow-ns}"
 DEFAULT_IMAGE_TAG="${DEFAULT_IMAGE_TAG:-latest}"
-B2S_IMAGE_REPO="${B2S_IMAGE_REPO:-10.43.208.68/ghcr.io/runshine/secflow-app-binary-to-source}"
-BIN_EVOLUTION_IMAGE_REPO="${BIN_EVOLUTION_IMAGE_REPO:-10.43.208.68/ghcr.io/runshine/secflow-app-binary-evolution-center}"
-BIN_SECURITY_IMAGE_REPO="${BIN_SECURITY_IMAGE_REPO:-10.43.208.68/ghcr.io/runshine/secflow-app-binary-security}"
-ENTRY_ANALYSE_IMAGE_REPO="${ENTRY_ANALYSE_IMAGE_REPO:-10.43.208.68/ghcr.io/runshine/secflow-app-entry-analyse}"
-DATAFLOW_ANALYSE_IMAGE_REPO="${DATAFLOW_ANALYSE_IMAGE_REPO:-10.43.208.68/ghcr.io/runshine/secflow-app-dataflow-analyse}"
-SYSTEM_ANALYSE_IMAGE_REPO="${SYSTEM_ANALYSE_IMAGE_REPO:-10.43.208.68/ghcr.io/runshine/secflow-app-system-analyse}"
-FRONTEND_IMAGE_REPO="${FRONTEND_IMAGE_REPO:-10.43.208.68/ghcr.io/runshine/secflow-frontend}"
-RESOURCE_IMAGE_REPO="${RESOURCE_IMAGE_REPO:-10.43.208.68/ghcr.io/runshine/secflow-platform-resource}"
-GATEWAY_WORKER_IMAGE_REPO="${GATEWAY_WORKER_IMAGE_REPO:-10.43.208.68/ghcr.io/runshine/secflow-platform-resource-file-gateway-worker}"
-FW_UNPACKER_IMAGE_REPO="${FW_UNPACKER_IMAGE_REPO:-10.43.208.68/ghcr.io/runshine/secflow-app-firmware-unpacker}"
+B2S_IMAGE_REPO="${B2S_IMAGE_REPO:-ghcr.io/runshine/secflow-app-binary-to-source}"
+BIN_EVOLUTION_IMAGE_REPO="${BIN_EVOLUTION_IMAGE_REPO:-ghcr.io/runshine/secflow-app-binary-evolution-center}"
+BIN_SECURITY_IMAGE_REPO="${BIN_SECURITY_IMAGE_REPO:-ghcr.io/runshine/secflow-app-binary-security}"
+ENTRY_ANALYSE_IMAGE_REPO="${ENTRY_ANALYSE_IMAGE_REPO:-ghcr.io/runshine/secflow-app-entry-analyse}"
+DATAFLOW_ANALYSE_IMAGE_REPO="${DATAFLOW_ANALYSE_IMAGE_REPO:-ghcr.io/runshine/secflow-app-dataflow-analyse}"
+SYSTEM_ANALYSE_IMAGE_REPO="${SYSTEM_ANALYSE_IMAGE_REPO:-ghcr.io/runshine/secflow-app-system-analyse}"
+FRONTEND_IMAGE_REPO="${FRONTEND_IMAGE_REPO:-ghcr.io/runshine/secflow-frontend}"
+RESOURCE_IMAGE_REPO="${RESOURCE_IMAGE_REPO:-ghcr.io/runshine/secflow-platform-resource}"
+GATEWAY_WORKER_IMAGE_REPO="${GATEWAY_WORKER_IMAGE_REPO:-ghcr.io/runshine/secflow-platform-resource-file-gateway-worker}"
+FW_UNPACKER_IMAGE_REPO="${FW_UNPACKER_IMAGE_REPO:-ghcr.io/runshine/secflow-app-firmware-unpacker}"
 ENTRY_ANALYSE_WORKER_REPLICAS="${ENTRY_ANALYSE_WORKER_REPLICAS:-4}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -56,10 +56,10 @@ Examples:
   ./update_k8s_image_all.sh latest
   ./update_k8s_image_all.sh --tag 20260508-abcdef0
   ./update_k8s_image_all.sh --binary-evolution-image 20260512-abcdef0
-  ./update_k8s_image_all.sh --entry-analyse-image 10.43.208.68/ghcr.io/runshine/secflow-app-entry-analyse:latest
+  ./update_k8s_image_all.sh --entry-analyse-image ghcr.io/runshine/secflow-app-entry-analyse:latest
   ./update_k8s_image_all.sh --binary-security-image 20260513-af453b4
   ./update_k8s_image_all.sh --resource-image 20260403
-  ./update_k8s_image_all.sh --gateway-worker-image 10.43.208.68/ghcr.io/runshine/secflow-platform-resource-file-gateway-worker:latest
+  ./update_k8s_image_all.sh --gateway-worker-image ghcr.io/runshine/secflow-platform-resource-file-gateway-worker:latest
   ./update_k8s_image_all.sh --firmware-unpacker-image 20260428
 
 Behavior:
@@ -67,7 +67,7 @@ Behavior:
   - global tag: update all secflow-* deployments in the namespace to the same tag for managed repos.
   - Always force rollout restart for secflow-* deployments, so unchanged tags such as :latest are pulled again.
   - Managed repos:
-      10.43.208.68/ghcr.io/runshine/*
+      ghcr.io/runshine/*
       runshine0819/secflow-*
   - b2s image: override binary-to-source manager/worker image.
   - binary-evolution image: override binary-evolution-center manager/worker image.
@@ -100,7 +100,7 @@ resolve_image() {
 
 is_managed_repo() {
   local repo="${1:-}"
-  [[ "${repo}" == 10.43.208.68/ghcr.io/runshine/* || "${repo}" == runshine0819/secflow-* ]]
+  [[ "${repo}" == ghcr.io/runshine/* || "${repo}" == runshine0819/secflow-* ]]
 }
 
 image_repo() {
