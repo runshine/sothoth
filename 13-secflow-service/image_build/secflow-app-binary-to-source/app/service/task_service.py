@@ -15,7 +15,7 @@ from typing import Any
 from urllib.parse import urlencode
 from uuid import uuid4
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -3551,7 +3551,7 @@ def build_task_response(db: Session, task: B2STask) -> TaskResponse:
 
 
 def build_task_list_stats(db: Session, tasks: list[B2STask]) -> B2STaskListStatsResponse:
-    counts = {
+    task_counts = {
         "pending": 0,
         "running": 0,
         "success": 0,
@@ -3567,16 +3567,59 @@ def build_task_list_stats(db: Session, tasks: list[B2STask]) -> B2STaskListStats
             normalized = "partial"
         elif normalized == "completed":
             normalized = "success"
-        if normalized in counts:
-            counts[normalized] += 1
+        if normalized in task_counts:
+            task_counts[normalized] += 1
+    item_counts = {
+        "pending_items": 0,
+        "queued_items": 0,
+        "running_items": 0,
+        "cancelling_items": 0,
+        "success_items": 0,
+        "partial_items": 0,
+        "failed_items": 0,
+        "cancelled_items": 0,
+    }
+    task_ids = [str(task.id) for task in tasks if getattr(task, "id", None)]
+    if task_ids:
+        rows = (
+            db.query(B2STaskItem.status, func.count(B2STaskItem.id))
+            .filter(B2STaskItem.task_id.in_(task_ids))
+            .group_by(B2STaskItem.status)
+            .all()
+        )
+        status_field_map = {
+            "pending": "pending_items",
+            "queued": "queued_items",
+            "running": "running_items",
+            "cancelling": "cancelling_items",
+            "success": "success_items",
+            "partial": "partial_items",
+            "failed": "failed_items",
+            "cancelled": "cancelled_items",
+        }
+        for status, count in rows:
+            field = status_field_map.get(str(status or "").strip().lower())
+            if field:
+                item_counts[field] = int(count or 0)
+    total_items = sum(item_counts.values())
     return B2STaskListStatsResponse(
         total=len(tasks),
-        pending=counts["pending"],
-        running=counts["running"],
-        success=counts["success"],
-        partial=counts["partial"],
-        failed=counts["failed"],
-        cancelled=counts["cancelled"],
+        pending=task_counts["pending"],
+        running=task_counts["running"],
+        success=task_counts["success"],
+        partial=task_counts["partial"],
+        failed=task_counts["failed"],
+        cancelled=task_counts["cancelled"],
+        task_count=len(tasks),
+        total_items=total_items,
+        pending_items=item_counts["pending_items"],
+        queued_items=item_counts["queued_items"],
+        running_items=item_counts["running_items"],
+        cancelling_items=item_counts["cancelling_items"],
+        success_items=item_counts["success_items"],
+        partial_items=item_counts["partial_items"],
+        failed_items=item_counts["failed_items"],
+        cancelled_items=item_counts["cancelled_items"],
     )
 
 
