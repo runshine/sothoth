@@ -432,8 +432,6 @@ def get_cluster_snapshot() -> dict:
     from app.model import TaskStatus, UnpackTask, WorkerInstance, get_db_session
     from app.services.task_manager import get_concurrency_snapshot
 
-    reclaim_orphaned_tasks()
-
     db = get_db_session()
     try:
         workers = db.query(WorkerInstance).order_by(WorkerInstance.started_at.asc()).all()

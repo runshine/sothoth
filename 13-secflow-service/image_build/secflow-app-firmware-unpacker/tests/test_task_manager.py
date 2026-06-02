@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -205,7 +206,7 @@ class TaskManagerLeaseTests(unittest.TestCase):
         db = get_db_session()
         try:
             task = db.query(UnpackTask).filter(UnpackTask.id == "t-claim").first()
-            self.assertEqual(TaskStatus.RUNNING.value, task.status)
+            self.assertEqual(TaskStatus.CLAIMED.value, task.status)
             self.assertEqual("pod-a:123:owner", task.owner_id)
             self.assertEqual("queued", task.current_stage)
             self.assertIsNone(task.lease_expires_at)
@@ -367,6 +368,35 @@ class TaskManagerLeaseTests(unittest.TestCase):
             self.assertEqual(TaskStatus.FAILED.value, task.status)
             self.assertIsNone(task.owner_id)
             self.assertIn("owner pod lost", (task.result_message or "") + (task.error_message or ""))
+        finally:
+            db.close()
+
+    def test_recover_recent_running_task_with_missing_owner_keeps_running_during_startup_grace(self):
+        recent = now_local() - timedelta(seconds=30)
+        self._add_task(
+            "t-recent-running",
+            status=TaskStatus.RUNNING.value,
+            owner_id="dead-owner",
+            lease_expires_at=recent - timedelta(seconds=5),
+            last_progress_at=recent,
+        )
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == "t-recent-running").first()
+            task.dispatch_claimed_at = recent
+            task.started_at = recent
+            task.runner_started_at = recent
+            db.commit()
+        finally:
+            db.close()
+
+        task_manager_module.recover_orphaned_tasks()
+
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == "t-recent-running").first()
+            self.assertEqual(TaskStatus.RUNNING.value, task.status)
+            self.assertEqual("dead-owner", task.owner_id)
         finally:
             db.close()
 

@@ -364,7 +364,19 @@ def _skill_generation_job_lease_deadline(now: Optional[datetime] = None) -> date
 
 
 def _runner_start_grace_seconds() -> int:
-    return 60
+    return 180
+
+
+def _is_task_in_startup_grace(task: Any, now: Optional[datetime] = None) -> bool:
+    current_time = now or now_local()
+    grace = timedelta(seconds=_runner_start_grace_seconds())
+    dispatch_claimed_at = getattr(task, "dispatch_claimed_at", None)
+    started_at = getattr(task, "started_at", None)
+    runner_started_at = getattr(task, "runner_started_at", None)
+    for candidate in (runner_started_at, started_at, dispatch_claimed_at):
+        if candidate and candidate + grace >= current_time:
+            return True
+    return False
 
 
 def get_executor() -> ThreadPoolExecutor:
@@ -2368,6 +2380,7 @@ def recover_orphaned_tasks() -> None:
             owner_id = str(task.owner_id or "").strip()
             cancel_requested_at = task.cancel_requested_at
             owner_missing = not owner_id or owner_id not in active_owner_ids
+            startup_grace = _is_task_in_startup_grace(task, now)
             local_owned = owner_id == current_owner
             runner_pid = getattr(task, "runner_pid", None)
             runner_alive = _is_process_alive(runner_pid) if local_owned and runner_pid else False
@@ -2391,7 +2404,7 @@ def recover_orphaned_tasks() -> None:
                 and task.dispatch_claimed_at + timedelta(seconds=_runner_start_grace_seconds()) < now
             )
             if task.status == TaskStatus.CLAIMED.value:
-                if owner_missing or claim_stale:
+                if claim_stale or (owner_missing and not startup_grace):
                     _reset_claim(task.id)
                     action_counts["claim_reset"] = int(action_counts.get("claim_reset", 0)) + 1
                 continue
@@ -2430,7 +2443,7 @@ def recover_orphaned_tasks() -> None:
                     action_counts["cancel_sigkill_sent"] = int(action_counts.get("cancel_sigkill_sent", 0)) + 1
                 continue
             if task.status == TaskStatus.CANCELLING.value:
-                if owner_missing:
+                if owner_missing and not startup_grace:
                     _finalize_orphaned_task(task.id, reason="Task owner pod lost", owner_lost=True)
                     action_counts["orphaned_cancelled"] = int(action_counts.get("orphaned_cancelled", 0)) + 1
                 elif cancel_timed_out or progress_stale:
@@ -2439,7 +2452,7 @@ def recover_orphaned_tasks() -> None:
                     action_counts["cancel_timeout"] = int(action_counts.get("cancel_timeout", 0)) + 1
                 continue
             if task.status == TaskStatus.RUNNING.value:
-                if owner_missing:
+                if owner_missing and not startup_grace:
                     _finalize_orphaned_task(task.id, reason="Task owner pod lost", owner_lost=True)
                     action_counts["owner_lost"] = int(action_counts.get("owner_lost", 0)) + 1
                 elif local_owned and runner_not_started:
@@ -2597,14 +2610,18 @@ def recover_orphaned_tasks() -> None:
                 getattr(job, "owner_id", None),
                 exc,
             )
-    if action_counts:
+    noisy_keys = {"progress_refreshed", "evolution_progress_refreshed"}
+    meaningful_action_counts = {
+        key: value for key, value in action_counts.items() if key not in noisy_keys and int(value or 0) > 0
+    }
+    if meaningful_action_counts:
         logger.info(
             "recover orphaned tasks summary owner_id=%s active_workers=%s scanned_tasks=%s scanned_evolution_jobs=%s actions=%s",
             current_owner,
             len(active_owner_ids),
             len(tasks),
             len(evolution_jobs),
-            action_counts,
+            meaningful_action_counts,
         )
     record_orphan_recovery(
         scanned_tasks=len(tasks),
