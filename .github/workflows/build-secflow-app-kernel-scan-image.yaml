@@ -60,15 +60,75 @@ jobs:
             --platform linux/amd64 \
             --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --file 13-secflow-service/image_build/secflow-app-kernel-scan/Dockerfile \
-            --tag ghcr.io/runshine/secflow-app-kernel-scan:latest \
-            --tag ghcr.io/runshine/secflow-app-kernel-scan:${{ needs.prepare.outputs.date_tag }} \
-            --tag ghcr.io/runshine/secflow-app-kernel-scan:latest \
-            --tag ghcr.io/runshine/secflow-app-kernel-scan:${{ needs.prepare.outputs.date_tag }} \
+            --tag ghcr.io/runshine/secflow-app-kernel-scan:amd64-latest \
+            --tag ghcr.io/runshine/secflow-app-kernel-scan:amd64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-app-kernel-scan/
 
       - name: Push amd64 image
         run: |
-          docker push ghcr.io/runshine/secflow-app-kernel-scan:latest
-          docker push ghcr.io/runshine/secflow-app-kernel-scan:${{ needs.prepare.outputs.date_tag }}
-          docker push ghcr.io/runshine/secflow-app-kernel-scan:latest
-          docker push ghcr.io/runshine/secflow-app-kernel-scan:${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/secflow-app-kernel-scan:amd64-latest
+          docker push ghcr.io/runshine/secflow-app-kernel-scan:amd64-${{ needs.prepare.outputs.date_tag }}
+
+  build-arm64:
+    needs: prepare
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Restore Android tool cache
+        uses: actions/cache@v4
+        with:
+          path: 13-secflow-service/image_build/secflow-app-kernel-scan/tools
+          key: secflow-app-kernel-scan-android-tools-v3-${{ hashFiles('13-secflow-service/image_build/secflow-app-kernel-scan/scripts/prepare-android-tools.sh') }}
+          restore-keys: |
+            secflow-app-kernel-scan-android-tools-v3-
+
+      - name: Prepare Android tool cache
+        run: |
+          bash 13-secflow-service/image_build/secflow-app-kernel-scan/scripts/prepare-android-tools.sh
+
+      - name: Login to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
+      - name: Build arm64 image
+        run: |
+          docker build \
+            --platform linux/arm64 \
+            --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
+            --file 13-secflow-service/image_build/secflow-app-kernel-scan/Dockerfile \
+            --tag ghcr.io/runshine/secflow-app-kernel-scan:arm64-latest \
+            --tag ghcr.io/runshine/secflow-app-kernel-scan:arm64-${{ needs.prepare.outputs.date_tag }} \
+            13-secflow-service/image_build/secflow-app-kernel-scan/
+
+      - name: Push arm64 image
+        run: |
+          docker push ghcr.io/runshine/secflow-app-kernel-scan:arm64-latest
+          docker push ghcr.io/runshine/secflow-app-kernel-scan:arm64-${{ needs.prepare.outputs.date_tag }}
+
+  merge-manifest:
+    needs: [prepare, build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Login to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
+      - name: Create and push multi-arch manifest (latest)
+        run: |
+          docker manifest create ghcr.io/runshine/secflow-app-kernel-scan:latest \
+            --amend ghcr.io/runshine/secflow-app-kernel-scan:amd64-latest \
+            --amend ghcr.io/runshine/secflow-app-kernel-scan:arm64-latest
+          docker manifest push ghcr.io/runshine/secflow-app-kernel-scan:latest
+
+      - name: Create and push multi-arch manifest (date tag)
+        run: |
+          docker manifest create ghcr.io/runshine/secflow-app-kernel-scan:${{ needs.prepare.outputs.date_tag }} \
+            --amend ghcr.io/runshine/secflow-app-kernel-scan:amd64-${{ needs.prepare.outputs.date_tag }} \
+            --amend ghcr.io/runshine/secflow-app-kernel-scan:arm64-${{ needs.prepare.outputs.date_tag }}
+          docker manifest push ghcr.io/runshine/secflow-app-kernel-scan:${{ needs.prepare.outputs.date_tag }}
