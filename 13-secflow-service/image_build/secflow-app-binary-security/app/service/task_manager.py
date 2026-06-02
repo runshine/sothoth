@@ -14778,6 +14778,8 @@ class TaskManager:
                 continue
             run = runs_by_stage.get(stage_name)
             if run is None:
+                if self._is_streaming_tail_stage(task, stage_name) and self._continue_stage_input_error(db, task, stage_name):
+                    continue
                 return stage_name
             items = self._stage_items(db, task.id, stage_name)
             if items:
@@ -14788,6 +14790,8 @@ class TaskManager:
                     return stage_name
                 if self._stage_archive_success_blocked(task, stage_name, items, db=db):
                     return stage_name
+            elif self._is_streaming_tail_stage(task, stage_name) and self._continue_stage_input_error(db, task, stage_name):
+                continue
             if run.status == "partial_success":
                 if not self._partial_success_advancement_enabled(task, stage_name):
                     return stage_name
@@ -14812,13 +14816,15 @@ class TaskManager:
         for stage_name in self._stage_sequence_for_task(task):
             if not self._stage_enabled(task, stage_name):
                 continue
+            items = self._stage_items(db, task.id, stage_name)
+            if any(self._normalize_item_status(item.status) in {"failed", "cancelled", "downstream_missing"} for item in items):
+                return stage_name
             run = runs_by_stage.get(stage_name)
             if run is None:
                 continue
             normalized_status = self._normalize_downstream_status(run.status) or str(run.status or "").strip()
             if normalized_status not in failure_statuses:
                 continue
-            items = self._stage_items(db, task.id, stage_name)
             if items and self._stage_has_nonterminal_items(items):
                 continue
             return stage_name
@@ -16810,10 +16816,13 @@ class TaskManager:
                     ]
                 ):
                     issues.append({"item_key": item_key, "issue": "stale_sync_snapshot_present"})
+                normalized_status = str(item.status or "").strip()
                 allowed_statuses = {"pending", "queued", "dispatching", "running"} if phase == "verify" else {"pending"}
-                if str(item.status or "").strip() not in allowed_statuses:
+                if phase == "verify" and current_task_id and normalized_status == "success":
+                    allowed_statuses = allowed_statuses | {"success"}
+                if normalized_status not in allowed_statuses:
                     issues.append({"item_key": item_key, "issue": "status_not_reset", "status": item.status})
-                if item.finished_at is not None:
+                if normalized_status != "success" and item.finished_at is not None:
                     issues.append({"item_key": item_key, "issue": "finished_at_not_cleared"})
             elif strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS:
                 if str(item.status or "").strip() != "success":
