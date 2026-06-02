@@ -77,7 +77,7 @@ from app.tool_dispatcher import parse_tool_version, read_family_manifest, resolv
 from app.time_utils import ensure_local, now_local
 from app.unpacker_engine_config import TOOLS_STORE_DIR, get_max_retries
 from app.unpacker_engine import TOOLS_DIR
-from app.unpacker_engine_logs import TASK_RESULT_CACHE_FILENAME, list_round_dirs as _list_round_dirs, read_text_tail
+from app.unpacker_engine_logs import TASK_RESULT_CACHE_FILENAME, TOKEN_FIELDS, list_round_dirs as _list_round_dirs, read_text_tail
 
 
 router = APIRouter(tags=["Firmware Unpacker"])
@@ -339,6 +339,9 @@ def _phase_payload(
     current_round: Optional[int] = None,
     total_rounds: Optional[int] = None,
     duration_seconds: Optional[int] = None,
+    token_total: Optional[int] = None,
+    input_tokens: Optional[int] = None,
+    output_tokens: Optional[int] = None,
 ) -> dict:
     return {
         "key": key,
@@ -349,6 +352,9 @@ def _phase_payload(
         "current_round": current_round,
         "total_rounds": total_rounds,
         "duration_seconds": duration_seconds,
+        "token_total": token_total,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
     }
 
 
@@ -359,6 +365,112 @@ def _read_json_file(path: Path) -> dict | list | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _read_token_total(path: Path) -> Optional[int]:
+    payload = _read_json_file(path)
+    if not isinstance(payload, dict):
+        return None
+    return _normalize_round_tokens(payload)["total"]
+
+
+def _token_delta(current: dict, previous: Optional[dict] = None) -> dict[str, int]:
+    previous = previous or {}
+    return {
+        field: max(0, _safe_int(current.get(field)) - _safe_int(previous.get(field)))
+        for field in TOKEN_FIELDS
+    }
+
+
+def _uses_shared_executor_session(run_root: Path) -> bool:
+    payload = _read_json_file(run_root / "sessions" / "index.json")
+    items = payload.get("items") if isinstance(payload, dict) else []
+    if not isinstance(items, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and str(item.get("role") or "").strip().lower() == "executor"
+        and str(item.get("name") or "").strip().lower() == "shared"
+        for item in items
+    )
+
+
+def _read_executor_round_token_total(run_root: Path, round_id: int) -> Optional[int]:
+    current = _read_json_file(_round_dir(run_root, round_id) / "executor_tokens.json")
+    if not isinstance(current, dict):
+        return None
+    if not _uses_shared_executor_session(run_root) or round_id <= 1:
+        return _normalize_round_tokens(current)["total"]
+    previous = _read_json_file(_round_dir(run_root, round_id - 1) / "executor_tokens.json")
+    return _normalize_round_tokens(_token_delta(current, previous if isinstance(previous, dict) else None))["total"]
+
+
+def _read_executor_round_token_breakdown(run_root: Path, round_id: int) -> dict[str, int]:
+    current_path = _round_dir(run_root, round_id) / "executor_tokens.json"
+    if not current_path.exists():
+        return {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "total": 0}
+    previous = None
+    if _uses_shared_executor_session(run_root) and round_id > 1:
+        previous = _read_json_file(_round_dir(run_root, round_id - 1) / "executor_tokens.json")
+    return _token_breakdown_from_path(
+        current_path,
+        previous=previous if isinstance(previous, dict) else None,
+        shared_executor=_uses_shared_executor_session(run_root) and round_id > 1,
+    )
+
+
+def _read_token_breakdown(path: Path) -> dict[str, int]:
+    return _token_breakdown_from_path(path)
+
+
+def _read_run_token_total(run_root: Path) -> int:
+    shared_executor = _uses_shared_executor_session(run_root)
+    previous_executor: dict = {}
+    total = 0
+    for token_file in sorted(run_root.glob("round_*/*_tokens.json")):
+        payload = _read_json_file(token_file)
+        if not isinstance(payload, dict):
+            continue
+        if token_file.name == "executor_tokens.json" and shared_executor:
+            total += _normalize_round_tokens(_token_delta(payload, previous_executor))["total"]
+            previous_executor = payload
+        else:
+            total += _normalize_round_tokens(payload)["total"]
+    return total
+
+
+def _read_run_token_breakdown(run_root: Path) -> dict[str, int]:
+    shared_executor = _uses_shared_executor_session(run_root)
+    previous_executor: dict = {}
+    totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "total": 0}
+    for token_file in sorted(run_root.glob("round_*/*_tokens.json")):
+        payload = _read_json_file(token_file)
+        if not isinstance(payload, dict):
+            continue
+        normalized = (
+            _normalize_round_tokens(_token_delta(payload, previous_executor))
+            if token_file.name == "executor_tokens.json" and shared_executor
+            else _normalize_round_tokens(payload)
+        )
+        if token_file.name == "executor_tokens.json" and shared_executor:
+            previous_executor = payload
+        for key in totals:
+            totals[key] += _safe_int(normalized.get(key))
+    return totals
+
+
+def _token_breakdown_from_path(path: Path, *, previous: Optional[dict] = None, shared_executor: bool = False) -> dict[str, int]:
+    payload = _read_json_file(path)
+    if not isinstance(payload, dict):
+        return {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "total": 0}
+    normalized = _normalize_round_tokens(_token_delta(payload, previous)) if shared_executor else _normalize_round_tokens(payload)
+    return {
+        "input": _safe_int(normalized.get("input")),
+        "output": _safe_int(normalized.get("output")),
+        "cache_read": _safe_int(normalized.get("cache_read")),
+        "cache_write": _safe_int(normalized.get("cache_write")),
+        "total": _safe_int(normalized.get("total")),
+    }
 
 
 def _mtime_iso(path: Path) -> Optional[str]:
@@ -501,9 +613,15 @@ def _get_task_progress(task_id: str) -> dict:
     stage5_path = _round_log_path(run_dir, 0, "stage5_skill_generate.json")
     cleaner_path = _round_log_path(run_dir, 0, "cleaner_messages.json")
     cleaner_log_path = _round_log_path(run_dir, 0, "cleaner.log")
+    cleaner_tokens_path = _round_log_path(run_dir, 0, "cleaner_tokens.json")
+    cleaner_token_total = _read_token_total(cleaner_tokens_path)
+    cleaner_token_breakdown = _read_token_breakdown(cleaner_tokens_path)
     cleaner_log_artifact_path = cleaner_log_path if cleaner_log_path.exists() else cleaner_path
     tool_reviewer_messages = _round_log_path(run_dir, 0, "reviewer_messages.json")
     tool_reviewer_transcript = _round_log_path(run_dir, 0, "reviewer_transcript.log")
+    tool_reviewer_tokens_path = _round_log_path(run_dir, 0, "reviewer_tokens.json")
+    tool_reviewer_token_total = _read_token_total(tool_reviewer_tokens_path)
+    tool_reviewer_token_breakdown = _read_token_breakdown(tool_reviewer_tokens_path)
     round_dirs = _llm_round_dirs(run_dir)
     executor_logs = [path / "executor_messages.json" for path in round_dirs if (path / "executor_messages.json").exists()]
     verifier_logs = [path / "reviewer_messages.json" for path in round_dirs if (path / "reviewer_messages.json").exists()]
@@ -649,6 +767,9 @@ def _get_task_progress(task_id: str) -> dict:
             "summary": "任务正在重置工作目录并准备重试",
             "current_round": None,
             "total_rounds": total_llm_rounds,
+            "token_total": _read_run_token_total(run_dir),
+            "input_tokens": _read_run_token_breakdown(run_dir).get("input", 0),
+            "output_tokens": _read_run_token_breakdown(run_dir).get("output", 0),
             "phases": phases,
         }
 
@@ -698,6 +819,9 @@ def _get_task_progress(task_id: str) -> dict:
                     "success" if cleaner_path.exists() or _cleaner_session_closed() else ("running" if task_status == "running" else "pending"),
                     "正在收尾清理输出目录" if task_status == "running" and not (cleaner_path.exists() or _cleaner_session_closed()) else "清理已完成",
                     _mtime_iso_text(cleaner_path) or _mtime_iso_text(cleaner_log_artifact_path),
+                    token_total=cleaner_token_total,
+                    input_tokens=cleaner_token_breakdown.get("input", 0),
+                    output_tokens=cleaner_token_breakdown.get("output", 0),
                 ),
             ]
         )
@@ -810,6 +934,12 @@ def _get_task_progress(task_id: str) -> dict:
             except Exception:
                 return None
 
+        def _round_metric_token_total(round_id: int, role: str) -> Optional[int]:
+            if role == "executor":
+                return _read_executor_round_token_total(run_dir, round_id)
+            token_total = _read_token_total(_round_dir(run_dir, round_id) / f"{role}_tokens.json")
+            return token_total if token_total is not None else None
+
         tool_review_phase: dict[str, Any] | None = None
         if has_tool_review:
             review_status = "success"
@@ -830,6 +960,9 @@ def _get_task_progress(task_id: str) -> dict:
                 review_detail,
                 _mtime_iso_text(tool_reviewer_messages),
                 duration_seconds=_tool_review_duration_seconds(),
+                token_total=tool_reviewer_token_total,
+                input_tokens=tool_reviewer_token_breakdown.get("input", 0),
+                output_tokens=tool_reviewer_token_breakdown.get("output", 0),
             )
         elif not matched_tool and (
             executor_logs
@@ -899,6 +1032,9 @@ def _get_task_progress(task_id: str) -> dict:
                             current_round=round_id,
                             total_rounds=total_llm_rounds,
                             duration_seconds=unpack_duration,
+                            token_total=_round_metric_token_total(round_id, "executor"),
+                            input_tokens=_read_executor_round_token_breakdown(run_dir, round_id).get("input", 0),
+                            output_tokens=_read_executor_round_token_breakdown(run_dir, round_id).get("output", 0),
                         )
                     )
 
@@ -952,6 +1088,9 @@ def _get_task_progress(task_id: str) -> dict:
                             current_round=round_id,
                             total_rounds=total_llm_rounds,
                             duration_seconds=review_duration,
+                            token_total=_round_metric_token_total(round_id, "reviewer"),
+                            input_tokens=_read_token_breakdown(_round_dir(run_dir, round_id) / "reviewer_tokens.json").get("input", 0),
+                            output_tokens=_read_token_breakdown(_round_dir(run_dir, round_id) / "reviewer_tokens.json").get("output", 0),
                         )
                     )
                 elif executor_done or recursive_done or (task_current_stage == "recursive_expand" and running_llm_recursive_round == round_id):
@@ -997,6 +1136,9 @@ def _get_task_progress(task_id: str) -> dict:
             cleanup_status,
             cleanup_detail,
             _mtime_iso_text(cleaner_path) or _mtime_iso_text(cleaner_log_artifact_path),
+            token_total=cleaner_token_total,
+            input_tokens=cleaner_token_breakdown.get("input", 0),
+            output_tokens=cleaner_token_breakdown.get("output", 0),
         ))
 
     terminal_task_status = task_status if task_status in {"success", "failed", "cancelled"} else None
@@ -1112,12 +1254,16 @@ def _get_task_progress(task_id: str) -> dict:
         duration_seconds = max(0, int(round((phase_end - phase_start).total_seconds())))
         phase["duration_seconds"] = duration_seconds
 
+    run_token_breakdown = _read_run_token_breakdown(run_dir)
     return {
         "task_id": task_id,
         "current_phase": current_phase,
         "summary": summary,
         "current_round": overall_current_round,
         "total_rounds": overall_total_rounds,
+        "token_total": run_token_breakdown.get("total", 0),
+        "input_tokens": run_token_breakdown.get("input", 0),
+        "output_tokens": run_token_breakdown.get("output", 0),
         "phases": phases,
     }
 
@@ -1523,6 +1669,8 @@ def _read_round_metrics(run_root: Path) -> dict:
         return _round_metric_empty()
 
     items: list[dict] = []
+    shared_executor = _uses_shared_executor_session(run_root)
+    previous_executor_tokens: dict = {}
     for round_dir in _list_round_dirs(run_root):
         round_id = _round_number_from_dir(round_dir)
         if round_id is None or round_id == 0:
@@ -1543,8 +1691,19 @@ def _read_round_metrics(run_root: Path) -> dict:
         executor = payload.get("executor") if isinstance(payload.get("executor"), dict) else {}
         reviewer = payload.get("reviewer") if isinstance(payload.get("reviewer"), dict) else {}
         tokens_payload = payload.get("tokens") if isinstance(payload.get("tokens"), dict) else {}
+        raw_executor_tokens = tokens_payload.get("executor") if isinstance(tokens_payload.get("executor"), dict) else {}
+        executor_tokens = (
+            _token_delta(raw_executor_tokens, previous_executor_tokens)
+            if shared_executor
+            else raw_executor_tokens
+        )
+        previous_executor_tokens = raw_executor_tokens
+        reviewer_tokens = tokens_payload.get("reviewer") if isinstance(tokens_payload.get("reviewer"), dict) else {}
         round_tokens = _normalize_round_tokens(
-            tokens_payload.get("round_total") if isinstance(tokens_payload.get("round_total"), dict) else {}
+            {
+                field: _safe_int(executor_tokens.get(field)) + _safe_int(reviewer_tokens.get(field))
+                for field in TOKEN_FIELDS
+            }
         )
         output_snapshot = payload.get("output_snapshot") if isinstance(payload.get("output_snapshot"), dict) else {}
         output_delta = payload.get("output_delta") if isinstance(payload.get("output_delta"), dict) else {}
@@ -1587,6 +1746,8 @@ def _read_round_metrics(run_root: Path) -> dict:
                 "session_file": reviewer.get("session_file"),
             },
             "tokens": round_tokens,
+            "executor_tokens": _normalize_round_tokens(executor_tokens),
+            "reviewer_tokens": _normalize_round_tokens(reviewer_tokens),
             "output_snapshot": {
                 "output_file_count": _safe_int(output_snapshot.get("output_file_count")),
                 "output_dir_count": _safe_int(output_snapshot.get("output_dir_count")),
@@ -1659,14 +1820,13 @@ def _read_round_metrics(run_root: Path) -> dict:
         reviewer = item.get("reviewer") if isinstance(item.get("reviewer"), dict) else {}
         stage_summary["llm_unpack"]["round_count"] += 1
         stage_summary["llm_unpack"]["duration_seconds"] += _safe_float(executor.get("duration_seconds"))
-        raw_tokens = item.get("raw", {}).get("tokens", {}) if isinstance(item.get("raw"), dict) else {}
         stage_summary["llm_unpack"]["token_total"] += _token_total_from_mapping(
-            raw_tokens.get("executor") if isinstance(raw_tokens, dict) else {}
+            item.get("executor_tokens")
         )
         stage_summary["review"]["round_count"] += 1
         stage_summary["review"]["duration_seconds"] += _safe_float(reviewer.get("duration_seconds"))
         stage_summary["review"]["token_total"] += _token_total_from_mapping(
-            raw_tokens.get("reviewer") if isinstance(raw_tokens, dict) else {}
+            item.get("reviewer_tokens")
         )
 
     return {
@@ -2034,6 +2194,10 @@ def _get_task_result(task_id: str) -> dict:
     if isinstance(cached_payload, dict):
         summary = cached_payload.get("summary") if isinstance(cached_payload.get("summary"), dict) else {}
         summary["event_count"] = _count_task_events(task_id)
+        run_tokens = _read_run_token_breakdown(run_root)
+        summary["token_total"] = run_tokens.get("total", 0)
+        summary["input_tokens"] = run_tokens.get("input", 0)
+        summary["output_tokens"] = run_tokens.get("output", 0)
         return {
             "task_id": task_id,
             "available": bool(cached_payload.get("available", False)),
@@ -2126,6 +2290,9 @@ def _get_task_result(task_id: str) -> dict:
             "started_at": started_at,
             "completed_at": completed_at,
             "duration_seconds": duration_seconds,
+            "token_total": _read_run_token_breakdown(run_root).get("total", 0),
+            "input_tokens": _read_run_token_breakdown(run_root).get("input", 0),
+            "output_tokens": _read_run_token_breakdown(run_root).get("output", 0),
         },
     }
 

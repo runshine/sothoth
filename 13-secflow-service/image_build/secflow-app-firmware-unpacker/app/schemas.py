@@ -155,6 +155,9 @@ class TaskProgressPhaseResponse(BaseModel):
     current_round: Optional[int] = None
     total_rounds: Optional[int] = None
     duration_seconds: Optional[int] = None
+    token_total: Optional[int] = None
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
 
 
 class TaskProgressResponse(BaseModel):
@@ -163,6 +166,9 @@ class TaskProgressResponse(BaseModel):
     summary: Optional[str] = None
     current_round: Optional[int] = None
     total_rounds: Optional[int] = None
+    token_total: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
     phases: List[TaskProgressPhaseResponse]
 
 
@@ -212,6 +218,9 @@ class TaskResultSummaryResponse(BaseModel):
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
     duration_seconds: Optional[int] = None
+    token_total: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 class TaskResultResponse(BaseModel):

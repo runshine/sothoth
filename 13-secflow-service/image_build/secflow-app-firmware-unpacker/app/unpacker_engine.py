@@ -282,6 +282,7 @@ def _run_recursive_expand(
     output_root = Path(output_path)
     round_dir.mkdir(parents=True, exist_ok=True)
     processed: set[str] = set()
+    failed_blacklist: set[str] = set()
     failed_items: list[dict[str, Any]] = []
     completed_rounds = 0
     stopped_reason = "no_new_files"
@@ -289,6 +290,7 @@ def _run_recursive_expand(
     successful_items = 0
     deleted_source_items = 0
     failed_items_count = 0
+    skipped_blacklist_items = 0
     total_new_paths = 0
     if event_callback:
         event_callback(
@@ -319,6 +321,18 @@ def _run_recursive_expand(
                     continue
                 resolved = str(candidate.resolve())
                 if resolved in processed:
+                    continue
+                if resolved in failed_blacklist:
+                    skipped_blacklist_items += 1
+                    _append_stage_log(
+                        round_dir,
+                        "recursive_expand.log",
+                        "recursive expand item skipped",
+                        round=round_index,
+                        source_path=str(candidate),
+                        resolved_path=resolved,
+                        reason="failed_blacklist",
+                    )
                     continue
                 fmt = _eligible_recursive_format(candidate)
                 if not fmt:
@@ -360,10 +374,12 @@ def _run_recursive_expand(
                 }
                 if not result.get("success"):
                     failed_items_count += 1
+                    failed_blacklist.add(resolved)
                     failed_items.append(
                         {
                             "round": round_index,
                             "source_path": str(candidate),
+                            "resolved_path": resolved,
                             "detected_format": fmt,
                             "handler": result.get("handler"),
                             "error": result.get("error"),
@@ -403,9 +419,11 @@ def _run_recursive_expand(
             "attempted_items": attempted_items,
             "successful_items": successful_items,
             "failed_items": failed_items_count,
+            "skipped_blacklist_items": skipped_blacklist_items,
             "deleted_source_items": deleted_source_items,
             "total_new_paths": total_new_paths,
         },
+        "failed_blacklist": sorted(failed_blacklist),
         "failed_items": failed_items,
     }
     _write_json_log(round_dir, "recursive_expand_manifest.json", manifest)
@@ -1748,7 +1766,10 @@ def run_unpack(
             activity_callback=_report_activity,
         )
         _normalize_output_reports(output_path)
-        _write_token_summary(log_dir)
+        _write_token_summary(
+            log_dir,
+            cumulative_agent_names={"executor"} if _get_reuse_agent_between_rounds("executor") else set(),
+        )
 
     except RuntimeError as exc:
         if str(exc) == "__CANCELLED__":

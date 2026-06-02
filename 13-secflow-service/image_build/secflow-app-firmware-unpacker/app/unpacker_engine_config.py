@@ -97,6 +97,20 @@ def get_agent_run_timeout_seconds() -> int:
         return 3600
 
 
+def get_agent_thinking_level() -> str | None:
+    try:
+        from app.model import get_config_value, get_db_session
+
+        db = get_db_session()
+        try:
+            value = str(get_config_value(db, "agent_thinking_level", default="") or "").strip().lower()
+        finally:
+            db.close()
+    except Exception:
+        value = ""
+    return value if value in {"off", "minimal", "low", "medium", "high", "xhigh"} else None
+
+
 def get_agent_timeout_retry_enabled() -> bool:
     try:
         from app.model import get_config_value, get_db_session

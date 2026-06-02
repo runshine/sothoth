@@ -20,6 +20,7 @@ from app.unpacker_engine_config import (
     ROLE_CONFIG_FILE_KEYS,
     ROLE_MODEL_CONFIG_KEYS,
     build_settings_json,
+    get_agent_thinking_level,
     get_agent_run_timeout_seconds,
     get_agent_timeout_max_retries,
     get_agent_timeout_retry_enabled,
@@ -55,6 +56,7 @@ class PiRpcClient:
         system_prompt_file=None,
         model=None,
         tools=None,
+        thinking_level=None,
         session_dir=None,
         session_path=None,
     ):
@@ -67,6 +69,8 @@ class PiRpcClient:
             args.extend(["--append-system-prompt", system_prompt_file])
         if model:
             args.extend(["--model", model])
+        if thinking_level:
+            args.extend(["--thinking", str(thinking_level)])
         if tools:
             args.extend(["--tools", ",".join(tools)])
         return args
@@ -235,6 +239,7 @@ class PiRpcClient:
                 system_prompt_file=self._system_prompt_file,
                 model=resolved_model,
                 tools=self._tools,
+                thinking_level=get_agent_thinking_level(),
                 session_dir=self._session_dir,
                 session_path=self._session_path,
             )

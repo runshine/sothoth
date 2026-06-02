@@ -448,6 +448,7 @@ DEFAULT_CONFIGS = [
     ("max_concurrent", "3", "int", "兼容旧版本：单个 Worker 最大并发解包任务数"),
     ("max_retries", "3", "int", "pi agent 最大重试轮数"),
     ("agent_run_timeout_seconds", "3600", "int", "单次智能体输入最大运行时长（秒），-1=不限制"),
+    ("agent_thinking_level", "", "string", "全局 pi agent thinking 级别：留空=使用 pi 默认行为；可选 off/minimal/low/medium/high/xhigh"),
     ("agent_timeout_retry_enabled", "true", "bool", "单次智能体输入超时后是否自动重试"),
     ("agent_timeout_max_retries", "3", "int", "单次智能体输入超时后的最大自动重试次数，-1=无限"),
     ("max_retries_reached_action", "success", "string", "达到最大重试轮数后默认动作：success=按通过处理，failed=按失败处理"),

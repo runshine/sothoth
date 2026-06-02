@@ -227,12 +227,22 @@ def save_agent_log(client: Any, log, log_dir: Path | None, name: str) -> dict[st
     return token_stats
 
 
-def write_token_summary(log_dir: Path | None) -> None:
+def _token_delta(current: dict[str, Any], previous: dict[str, Any] | None = None) -> dict[str, int]:
+    previous = previous or {}
+    return {
+        field: max(0, int(current.get(field, 0) or 0) - int(previous.get(field, 0) or 0))
+        for field in TOKEN_FIELDS
+    }
+
+
+def write_token_summary(log_dir: Path | None, *, cumulative_agent_names: set[str] | None = None) -> None:
     if log_dir is None:
         return
 
+    cumulative_agent_names = cumulative_agent_names or set()
     total = {field: 0 for field in TOKEN_FIELDS}
     by_agent: dict[str, dict[str, Any]] = {}
+    previous_by_agent: dict[str, dict[str, Any]] = {}
     for token_file in sorted(log_dir.glob("round_*/*_tokens.json")):
         try:
             rel_key = str(token_file.relative_to(log_dir))
@@ -241,9 +251,16 @@ def write_token_summary(log_dir: Path | None) -> None:
         key = rel_key.replace("_tokens.json", "")
         try:
             token_data = json.loads(token_file.read_text())
-            by_agent[key] = token_data
+            agent_name = token_file.name.removesuffix("_tokens.json")
+            normalized_tokens = (
+                _token_delta(token_data, previous_by_agent.get(agent_name))
+                if agent_name in cumulative_agent_names
+                else _token_delta(token_data)
+            )
+            previous_by_agent[agent_name] = token_data
+            by_agent[key] = normalized_tokens
             for field in TOKEN_FIELDS:
-                total[field] = total.get(field, 0) + token_data.get(field, 0)
+                total[field] = total.get(field, 0) + normalized_tokens.get(field, 0)
         except Exception:
             continue
 
