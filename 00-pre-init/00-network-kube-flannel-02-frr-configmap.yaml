@@ -71,8 +71,8 @@ data:
       source /etc/frr/frr-role
       if [ "$ROLE" = "route-reflector" ]; then
         # RR的flannel.1234 IP固定为10.42.0.1
-        echo "FLANNEL_IP=10.42.0.0" >> /etc/frr/frr-role
-        echo "RR_FLANNEL_IP=10.42.0.0" >> /etc/frr/frr-role
+        echo "FLANNEL_IP=${FLANNEL_NETWORK_BASE}" >> /etc/frr/frr-role
+        echo "RR_FLANNEL_IP=${FLANNEL_NETWORK_BASE}" >> /etc/frr/frr-role
       else
         # 客户端尝试获取自己的flannel.1234 IP
         CLIENT_IP=$(ip -4 addr show flannel.1234 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
@@ -80,7 +80,7 @@ data:
           echo "FLANNEL_IP=$CLIENT_IP" >> /etc/frr/frr-role
         fi
         # RR的IP固定为10.42.0.1
-        echo "RR_FLANNEL_IP=10.42.0.0" >> /etc/frr/frr-role
+        echo "RR_FLANNEL_IP=${FLANNEL_NETWORK_BASE}" >> /etc/frr/frr-role
       fi
     fi
     
@@ -103,12 +103,12 @@ data:
     if [ -z "$FLANNEL_IP" ]; then
       FLANNEL_IP=$(ip -4 addr show flannel.1234 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
       if [ -z "$FLANNEL_IP" ] && [ "$ROLE" = "route-reflector" ]; then
-        FLANNEL_IP="10.42.0.0"
+        FLANNEL_IP="${FLANNEL_NETWORK_BASE}"
       fi
     fi
     
     if [ -z "$RR_FLANNEL_IP" ] && [ "$ROLE" = "client" ]; then
-      RR_FLANNEL_IP="10.42.0.0"
+      RR_FLANNEL_IP="${FLANNEL_NETWORK_BASE}"
     fi
     
     cp /etc/tmp-frr/* /etc/frr/ 
@@ -139,16 +139,16 @@ data:
     neighbor RR-CLIENTS timers 3 10
     !
     ! 客户端组配置 - 监听整个Flannel网络范围
-    bgp listen range 10.42.0.0/16 peer-group RR-CLIENTS
+    bgp listen range ${FLANNEL_NETWORK_CIDR} peer-group RR-CLIENTS
     !
     ! 网络通告
-    network 10.42.0.0/16
+    network ${FLANNEL_NETWORK_CIDR}
     !
     ! 路由重分发
     redistribute static
     !
     address-family ipv4 unicast
-    network 10.42.0.0/16
+    network ${FLANNEL_NETWORK_CIDR}
     redistribute static
     exit-address-family
     !
@@ -175,13 +175,13 @@ data:
     neighbor $RR_FLANNEL_IP timers 3 10
     !
     ! 网络通告
-    network 10.42.0.0/16
+    network ${FLANNEL_NETWORK_CIDR}
     !
     ! 路由重分发
     redistribute static
     !
     address-family ipv4 unicast
-    network 10.42.0.0/16
+    network ${FLANNEL_NETWORK_CIDR}
     redistribute static
     exit-address-family
     !

@@ -15,4 +15,4 @@ spec:
       targetPort: 3306
       protocol: TCP
       name: mysql-external
-  loadBalancerIP: "172.31.30.100"  # 必须在static-ips-pool范围内
+  loadBalancerIP: "${METALLB_SHARED_LB_IP}"  # 必须在static-ips-pool范围内

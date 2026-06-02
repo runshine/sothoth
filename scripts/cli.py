@@ -22,17 +22,48 @@ from workspace import (
 DEFAULT_NAMESPACE = os.environ.get("NAMESPACE", "secflow-ns")
 DEFAULT_IMAGE_REGISTRY_PREFIX = os.environ.get("IMAGE_REGISTRY_PREFIX", "")
 DEFAULT_BASE_DOMAIN = os.environ.get("BASE_DOMAIN", "")
+DEFAULT_FLANNEL_NETWORK_CIDR = os.environ.get("FLANNEL_NETWORK_CIDR", "10.42.0.0/16")
+DEFAULT_FLANNEL_NETWORK_BASE = os.environ.get("FLANNEL_NETWORK_BASE", "10.42.0.0")
+DEFAULT_NFS_SERVER = os.environ.get("NFS_SERVER", "172.31.30.81")
+DEFAULT_NFS_PATH = os.environ.get("NFS_PATH", "/nvme/share_k8s")
+DEFAULT_METALLB_SHARED_POOL_RANGE = os.environ.get(
+    "METALLB_SHARED_POOL_RANGE", "172.31.30.100-172.31.30.110"
+)
+DEFAULT_METALLB_STATIC_POOL_RANGE = os.environ.get(
+    "METALLB_STATIC_POOL_RANGE", "172.31.30.111-172.31.30.120"
+)
+DEFAULT_METALLB_SHARED_LB_IP = os.environ.get("METALLB_SHARED_LB_IP", "172.31.30.100")
+DEFAULT_INGRESS_NGINX_LB_IP = os.environ.get("INGRESS_NGINX_LB_IP", "172.31.30.101")
+DEFAULT_SETUP_TLS_SECRETS = os.environ.get("SETUP_TLS_SECRETS", "1")
 IMAGES_ENV = SECFLOW_DIR / "images.env"
 DEPLOY_PRESETS = {
     "blue": {
         "namespace": "secflow-ns",
         "image_registry_prefix": "172.31.30.52:5000",
         "base_domain": "ai.icsl.huawei.com",
+        "flannel_network_cidr": "10.42.0.0/16",
+        "flannel_network_base": "10.42.0.0",
+        "nfs_server": "172.31.30.81",
+        "nfs_path": "/nvme/share_k8s",
+        "metallb_shared_pool_range": "172.31.30.100-172.31.30.110",
+        "metallb_static_pool_range": "172.31.30.111-172.31.30.120",
+        "metallb_shared_lb_ip": "172.31.30.100",
+        "ingress_nginx_lb_ip": "172.31.30.101",
+        "setup_tls_secrets": "1",
     },
     "green": {
         "namespace": "secflow-ns",
         "image_registry_prefix": "10.43.208.68/hub-proxy",
         "base_domain": "ai.icsl.huawei.com",
+        "flannel_network_cidr": "10.244.0.0/16",
+        "flannel_network_base": "10.244.0.0",
+        "nfs_server": "30.250.0.4",
+        "nfs_path": "/k8s",
+        "metallb_shared_pool_range": "30.250.0.200-30.250.0.210",
+        "metallb_static_pool_range": "30.250.0.211-30.250.0.220",
+        "metallb_shared_lb_ip": "30.250.0.200",
+        "ingress_nginx_lb_ip": "30.250.0.201",
+        "setup_tls_secrets": "0",
     },
 }
 
@@ -453,6 +484,19 @@ def parse_shared_args(args: argparse.Namespace) -> dict[str, str]:
         "SERVICE_ACCOUNT_NAME": args.service_account_name or f"{namespace}-server",
         "CLUSTER_ROLE_NAME": args.cluster_role_name or f"{namespace}-role",
         "CLUSTER_ROLE_BINDING_NAME": args.cluster_role_binding_name or f"{namespace}-binding",
+        "FLANNEL_NETWORK_CIDR": preset.get("flannel_network_cidr", DEFAULT_FLANNEL_NETWORK_CIDR),
+        "FLANNEL_NETWORK_BASE": preset.get("flannel_network_base", DEFAULT_FLANNEL_NETWORK_BASE),
+        "NFS_SERVER": preset.get("nfs_server", DEFAULT_NFS_SERVER),
+        "NFS_PATH": preset.get("nfs_path", DEFAULT_NFS_PATH),
+        "METALLB_SHARED_POOL_RANGE": preset.get(
+            "metallb_shared_pool_range", DEFAULT_METALLB_SHARED_POOL_RANGE
+        ),
+        "METALLB_STATIC_POOL_RANGE": preset.get(
+            "metallb_static_pool_range", DEFAULT_METALLB_STATIC_POOL_RANGE
+        ),
+        "METALLB_SHARED_LB_IP": preset.get("metallb_shared_lb_ip", DEFAULT_METALLB_SHARED_LB_IP),
+        "INGRESS_NGINX_LB_IP": preset.get("ingress_nginx_lb_ip", DEFAULT_INGRESS_NGINX_LB_IP),
+        "SETUP_TLS_SECRETS": preset.get("setup_tls_secrets", DEFAULT_SETUP_TLS_SECRETS),
     }
 
 
@@ -516,6 +560,14 @@ def print_header(
         print(f"Secflow Dir: {SECFLOW_DIR}")
         print(f"Image Prefix: {config['IMAGE_REGISTRY_PREFIX'] or '<default>'}")
         print(f"Base Domain: {config['BASE_DOMAIN'] or '<default>'}")
+    if {"pre-init", "external"} & set(group_names):
+        print(f"Flannel Network: {config['FLANNEL_NETWORK_CIDR']}")
+        print(f"NFS: {config['NFS_SERVER']}:{config['NFS_PATH']}")
+        print(f"MetalLB Shared Pool: {config['METALLB_SHARED_POOL_RANGE']}")
+        print(f"MetalLB Static Pool: {config['METALLB_STATIC_POOL_RANGE']}")
+        print(f"MetalLB Shared IP: {config['METALLB_SHARED_LB_IP']}")
+        print(f"Ingress LB IP: {config['INGRESS_NGINX_LB_IP']}")
+        print(f"Setup TLS Secrets: {config['SETUP_TLS_SECRETS']}")
     if components is not None:
         print("Components: " + " ".join(component.name for component in components))
     print("==========================================")
@@ -682,7 +734,8 @@ def command_deploy(args: argparse.Namespace) -> int:
     group_keys = resolve_k8s_group_keys(args.group)
     if args.components and "secflow" not in group_keys:
         raise SystemExit("Components can only be selected when the secflow group is included")
-    if "secflow" in group_keys and args.preset is None:
+    preset_groups = {"pre-init", "external", "secflow"}
+    if preset_groups & set(group_keys) and args.preset is None:
         args.preset = prompt_for_preset()
     config = parse_shared_args(args)
     components = resolve_component_names(args.components) if "secflow" in group_keys else []

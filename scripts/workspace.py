@@ -128,7 +128,7 @@ K8S_GROUPS: tuple[K8sGroup, ...] = (
         description="Ingress and external exposure resources",
         aliases=("99",),
         exclude_files=("14-sothoth-00-ingress.yaml",),
-        pre_deploy_shell="source ../00-pre-init/setup-k8s-tls-secrets.sh && main",
+        pre_deploy_shell='if [[ "${SETUP_TLS_SECRETS:-1}" == "1" ]]; then source ../00-pre-init/setup-k8s-tls-secrets.sh && main; fi',
     ),
 )
 
