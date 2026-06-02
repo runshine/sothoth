@@ -3334,7 +3334,10 @@ def _enrich_evolution_job_payload(
     job_root: Path | None,
 ) -> dict[str, Any]:
     enriched = dict(payload or {})
-    enriched["run_root"] = str(job_root) if job_root is not None else None
+    runtime_root = job_root
+    if runtime_root is not None and not runtime_root.exists():
+        runtime_root = Path("/data/secflow-app-firmware-unpacker")
+    enriched["run_root"] = str(runtime_root) if runtime_root is not None else None
     enriched["session_root"] = str(job_root / "sessions") if job_root is not None else None
     enriched["task_output_path"] = str(getattr(task, "output_path", "") or "").strip() or None
     dispatcher_source_path = _resolve_evolution_dispatcher_tool_path(task) if task is not None else None
