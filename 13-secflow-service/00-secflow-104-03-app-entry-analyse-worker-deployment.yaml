@@ -4,7 +4,7 @@ metadata:
   name: secflow-app-entry-analyse-worker
   namespace: secflow-ns
 spec:
-  replicas: 4
+  replicas: 8
   revisionHistoryLimit: 3
   selector:
     matchLabels:
