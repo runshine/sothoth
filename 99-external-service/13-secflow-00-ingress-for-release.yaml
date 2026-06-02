@@ -24,10 +24,10 @@ metadata:
     nginx.ingress.kubernetes.io/websocket-services: "secflow-platform-agent"
 spec:
   ingressClassName: nginx
-  tls:
-  - hosts:
-      - secflow.ai.icsl.huawei.com
-    secretName: wildcard-secflow-tls
+  # tls:
+  # - hosts:
+  #     - secflow.ai.icsl.huawei.com
+  #   secretName: wildcard-secflow-tls
   rules:
   - host: secflow.ai.icsl.huawei.com
     http:

@@ -501,6 +501,18 @@ class BinarySecurityTaskStateLease(Base):
     updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
 
 
+class BinarySecurityTaskRuntimeLease(Base):
+    __tablename__ = "secflow_binary_security_task_runtime_lease"
+
+    task_id = Column(String(32), primary_key=True)
+    execution_epoch = Column(Integer, nullable=False, default=0)
+    owner_instance_id = Column(String(128), nullable=False, index=True)
+    lease_expires_at = Column(DateTime, nullable=False, index=True)
+    heartbeat_at = Column(DateTime, nullable=False, index=True)
+    created_at = Column(DateTime, default=now_local, nullable=False)
+    updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
+
+
 class BinarySecurityProjectConfig(Base, JsonMixin):
     __tablename__ = "secflow_binary_security_project_config"
 
@@ -790,6 +802,17 @@ def _ensure_compat_columns(engine) -> None:
         _execute_compat_statements(statements)
     else:
         Base.metadata.tables[operation_table].create(bind=engine, checkfirst=True)
+    runtime_lease_table = BinarySecurityTaskRuntimeLease.__tablename__
+    if inspector.has_table(runtime_lease_table):
+        indexes = {index["name"] for index in inspector.get_indexes(runtime_lease_table)}
+        index_statements = []
+        if "ix_bstrl_owner_expires" not in indexes:
+            index_statements.append(
+                f"CREATE INDEX ix_bstrl_owner_expires ON {runtime_lease_table} (owner_instance_id, lease_expires_at)"
+            )
+        _execute_compat_statements(index_statements)
+    else:
+        Base.metadata.tables[runtime_lease_table].create(bind=engine, checkfirst=True)
 
 
 def get_db():

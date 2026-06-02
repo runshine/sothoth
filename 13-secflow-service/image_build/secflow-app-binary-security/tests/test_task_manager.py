@@ -25,6 +25,7 @@ from app.model import (
     BinarySecurityStateEvent,
     BinarySecurityTask,
     BinarySecurityTaskOperation,
+    BinarySecurityTaskRuntimeLease,
     BinarySecurityTaskStateLease,
     TASK_TYPE_BINARY,
     TASK_TYPE_BINARY_MODULE,
@@ -164,6 +165,11 @@ class _FakeDb:
         pass
 
 
+class _NestedTransaction:
+    def rollback(self):
+        return None
+
+
 class _ModelAwareDb:
     def __init__(
         self,
@@ -175,6 +181,7 @@ class _ModelAwareDb:
         events=None,
         state_events=None,
         state_leases=None,
+        runtime_leases=None,
         operations=None,
         project_configs=None,
         service_configs=None,
@@ -186,6 +193,7 @@ class _ModelAwareDb:
         self.events = list(events or [])
         self.state_events = list(state_events or [])
         self.state_leases = list(state_leases or [])
+        self.runtime_leases = list(runtime_leases or [])
         self.operations = list(operations or [])
         self.project_configs = list(project_configs or [])
         self.service_configs = list(service_configs or [])
@@ -207,6 +215,8 @@ class _ModelAwareDb:
             return _FakeQuery(self.state_events)
         if model_name == "BinarySecurityTaskStateLease":
             return _FakeQuery(self.state_leases)
+        if model_name == "BinarySecurityTaskRuntimeLease":
+            return _FakeQuery(self.runtime_leases)
         if model_name == "BinarySecurityTaskOperation":
             return _FakeQuery(self.operations)
         if model_name == "BinarySecurityProjectConfig":
@@ -230,12 +240,17 @@ class _ModelAwareDb:
             self.stage_runs.append(obj)
         elif model_name == "BinarySecurityTask":
             self.tasks.append(obj)
+        elif model_name == "BinarySecurityTaskRuntimeLease":
+            self.runtime_leases.append(obj)
 
     def commit(self):
         pass
 
     def flush(self):
         pass
+
+    def begin_nested(self):
+        return _NestedTransaction()
 
     def refresh(self, obj):
         return obj
@@ -12441,7 +12456,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         finally:
             self.manager._fetch_downstream_task_payload = original_fetch
 
-        failed_events = [event for event in db.events if event.event_type == "downstream_status_sync_failed"]
+        failed_events = [event for event in db.events if event.event_type == "child_transport_failed"]
         self.assertEqual("running", item.status)
         self.assertEqual("running", run.status)
         self.assertEqual("running", task.status)
@@ -12506,7 +12521,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         finally:
             self.manager._fetch_downstream_task_payload = original_fetch
 
-        failed_events = [event for event in db.events if event.event_type == "downstream_status_sync_failed"]
+        failed_events = [event for event in db.events if event.event_type == "child_transport_failed"]
         self.assertEqual("running", item.status)
         self.assertEqual("running", run.status)
         self.assertEqual("running", task.status)
@@ -20871,7 +20886,7 @@ def _test_apply_child_task_status_change_terminal_failure_sets_finished_at(self)
     self.assertIsNotNone(item.finished_at)
 
 
-def _test_defer_item_after_downstream_transport_error_records_child_sync_failed(self):
+def _test_defer_item_after_downstream_transport_error_records_child_transport_failed(self):
     task = BinarySecurityTask(id="t1", project_id="p1", name="demo", status="running")
     item = BinarySecurityStageItem(
         id="si1",
@@ -20902,7 +20917,7 @@ def _test_defer_item_after_downstream_transport_error_records_child_sync_failed(
 
     self.assertEqual("running", item.status)
     self.assertEqual("transport_error", item.result.get("sync_status"))
-    child_events = [event for event in db.events if event.event_type == "child_sync_failed"]
+    child_events = [event for event in db.events if event.event_type == "child_transport_failed"]
     self.assertTrue(child_events)
     self.assertEqual("transport_error", child_events[-1].payload.get("sync_status"))
     self.assertEqual("reconcile", child_events[-1].payload.get("deferred_mode"))
@@ -21153,7 +21168,7 @@ def _test_upsert_stage_item_preserves_sync_metadata_on_refresh(self):
 
 
 TaskManagerTests.test_apply_child_task_status_change_records_timeline_and_sync_metadata = _test_apply_child_task_status_change_records_timeline_and_sync_metadata
-TaskManagerTests.test_defer_item_after_downstream_transport_error_records_child_sync_failed = _test_defer_item_after_downstream_transport_error_records_child_sync_failed
+TaskManagerTests.test_defer_item_after_downstream_transport_error_records_child_transport_failed = _test_defer_item_after_downstream_transport_error_records_child_transport_failed
 TaskManagerTests.test_upsert_stage_item_preserves_sync_metadata_on_refresh = _test_upsert_stage_item_preserves_sync_metadata_on_refresh
 
 
@@ -21843,6 +21858,8 @@ def _test_task_heartbeat_controller_refreshes_owned_running_task(self):
         manager._register_task_execution_owner(task.id, "primary_task_worker")
         original_lease = task.lease_expires_at
         manager._refresh_task_heartbeats_once()
+        self.assertEqual(1, len(db.runtime_leases))
+        self.assertEqual(task.id, db.runtime_leases[0].task_id)
         self.assertIsNotNone(task.lease_expires_at)
         self.assertGreater(task.lease_expires_at, original_lease)
     finally:
@@ -21884,8 +21901,140 @@ def _test_task_needs_downstream_reconcile_skips_locally_owned_running_task(self)
         lease_expires_at=_now() - timedelta(seconds=1),
         updated_at=_now() - timedelta(minutes=5),
     )
+    db = _AppendingModelAwareDb(tasks=[task])
     manager._register_task_execution_owner(task.id, "primary_task_worker")
-    self.assertFalse(manager._task_needs_downstream_reconcile(task))
+    self.assertFalse(manager._task_needs_downstream_reconcile(db, task))
+
+
+def _test_persist_child_sync_observation_records_observation_persist_failed(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(id="task-5", project_id="p1", name="demo", status="running")
+    item = BinarySecurityStageItem(
+        id="si-5",
+        task_id="task-5",
+        project_id="p1",
+        stage_run_id="sr-5",
+        stage_name="entry_analysis",
+        item_key="IPSEC",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-5",
+    )
+    db = _FlakyCommitDb(
+        tasks=[task],
+        stage_items=[item],
+        events=[],
+        fail_flushes=1,
+        error_factory=lambda: RuntimeError("persist boom"),
+    )
+
+    ok = manager._persist_child_sync_observation(
+        db,
+        task=task,
+        item=item,
+        change_source="downstream_sync",
+        sync_status="skipped",
+        error_message="temporary timeout",
+        error_type="timeout",
+        status_raw="running",
+        mapped_status="running",
+        downstream_status="running",
+        state_applied=False,
+    )
+
+    self.assertFalse(ok)
+    failed_events = [event for event in db.events if event.event_type == "child_observation_persist_failed"]
+    self.assertTrue(failed_events)
+    self.assertIn("persist boom", failed_events[-1].payload.get("persist_error", ""))
+
+
+def _test_apply_child_state_with_savepoint_records_state_apply_failed(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(id="task-6", project_id="p1", name="demo", status="running")
+    item = BinarySecurityStageItem(
+        id="si-6",
+        task_id="task-6",
+        project_id="p1",
+        stage_run_id="sr-6",
+        stage_name="entry_analysis",
+        item_key="IPSEC",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-6",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+    ok = manager._apply_child_state_with_savepoint(
+        db,
+        task=task,
+        item=item,
+        change_source="downstream_sync",
+        target_status="success",
+        sync_status="synced",
+        downstream_status_raw="success",
+        downstream_status_mapped="success",
+        downstream_status="success",
+        error_message=None,
+        http_status=None,
+        error_type=None,
+        apply_fn=lambda: (_ for _ in ()).throw(RuntimeError("apply boom")),
+    )
+
+    self.assertFalse(ok)
+    failed_events = [event for event in db.events if event.event_type == "child_state_apply_failed"]
+    self.assertTrue(failed_events)
+    self.assertIn("apply boom", failed_events[-1].payload.get("apply_error", ""))
+
+
+def _test_task_list_response_exposes_runtime_lease_and_sync_view(self):
+    manager = TaskManager()
+    now_value = _now()
+    task = BinarySecurityTask(
+        id="task-4",
+        project_id="p1",
+        name="demo",
+        status="running",
+        firmware_path="/tmp/fw.bin",
+        dispatcher_instance_id="legacy-owner",
+        lease_expires_at=now_value + timedelta(seconds=10),
+    )
+    item = BinarySecurityStageItem(
+        id="si-1",
+        task_id="task-4",
+        project_id="p1",
+        stage_run_id="sr-1",
+        stage_name="entry_analysis",
+        item_key="IPSEC",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+        result={
+            "downstream_status_synced_at": now_value.isoformat(),
+            "sync_observation": {
+                "last_synced_at": now_value.isoformat(),
+                "error_type": "timeout",
+                "error_message": "temporary timeout",
+            },
+        },
+    )
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id="task-4",
+        execution_epoch=0,
+        owner_instance_id="runtime-owner",
+        heartbeat_at=now_value,
+        lease_expires_at=now_value + timedelta(seconds=120),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], runtime_leases=[lease])
+
+    response = manager._task_list_response(db, task, stage_items=[item])
+
+    self.assertEqual("runtime-owner", response.task_lease_owner_instance_id)
+    self.assertEqual(lease.lease_expires_at, response.task_lease_expires_at)
+    self.assertEqual("runtime_lease", response.task_lease_source)
+    self.assertEqual(now_value, response.last_successful_downstream_sync_at)
+    self.assertEqual(now_value, response.last_sync_attempt_at)
+    self.assertEqual("timeout", response.last_sync_error_type)
+    self.assertEqual("temporary timeout", response.last_sync_error_message)
 
 
 TaskManagerTests.test_stage_item_response_falls_back_to_downstream_payload_status = _test_stage_item_response_falls_back_to_downstream_payload_status
@@ -21904,6 +22053,9 @@ TaskManagerTests.test_service_base_urls_use_service_roots = _test_service_base_u
 TaskManagerTests.test_task_heartbeat_controller_refreshes_owned_running_task = _test_task_heartbeat_controller_refreshes_owned_running_task
 TaskManagerTests.test_task_heartbeat_controller_skips_task_without_owner = _test_task_heartbeat_controller_skips_task_without_owner
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_locally_owned_running_task = _test_task_needs_downstream_reconcile_skips_locally_owned_running_task
+TaskManagerTests.test_persist_child_sync_observation_records_observation_persist_failed = _test_persist_child_sync_observation_records_observation_persist_failed
+TaskManagerTests.test_apply_child_state_with_savepoint_records_state_apply_failed = _test_apply_child_state_with_savepoint_records_state_apply_failed
+TaskManagerTests.test_task_list_response_exposes_runtime_lease_and_sync_view = _test_task_list_response_exposes_runtime_lease_and_sync_view
 
 
 if __name__ == "__main__":

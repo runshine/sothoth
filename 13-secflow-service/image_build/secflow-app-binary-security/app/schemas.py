@@ -150,6 +150,13 @@ class BinarySecurityTaskResponse(BaseModel):
     is_queued: bool = False
     queue_position: Optional[int] = None
     dispatcher_instance_id: Optional[str] = None
+    task_lease_owner_instance_id: Optional[str] = None
+    task_lease_expires_at: Optional[datetime] = None
+    task_lease_source: Optional[str] = None
+    last_successful_downstream_sync_at: Optional[datetime] = None
+    last_sync_attempt_at: Optional[datetime] = None
+    last_sync_error_type: Optional[str] = None
+    last_sync_error_message: Optional[str] = None
     created_by: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
