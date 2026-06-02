@@ -25,6 +25,10 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: metadata.name
+          - name: SA_POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
           - name: TZ
             value: Asia/Shanghai
           - name: PORT
