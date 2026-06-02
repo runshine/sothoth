@@ -3652,15 +3652,22 @@ class TaskManager:
             logger.exception("binary-security enqueue operation failed: %s", operation_id)
 
     def _active_operation(self, db: Session, task_id: str) -> BinarySecurityTaskOperation | None:
-        return (
+        now_value = _now()
+        operations = (
             db.query(BinarySecurityTaskOperation)
             .filter(
                 BinarySecurityTaskOperation.task_id == task_id,
                 BinarySecurityTaskOperation.status.in_(list(TASK_OPERATION_ACTIVE_STATUSES)),
             )
             .order_by(BinarySecurityTaskOperation.created_at.desc(), BinarySecurityTaskOperation.id.desc())
-            .first()
+            .all()
         )
+        for operation in operations:
+            lease_expires_at = getattr(operation, "claim_lease_expires_at", None)
+            if lease_expires_at is not None and lease_expires_at < now_value:
+                continue
+            return operation
+        return None
 
     def _operation_lease_expires_at(self, *, now_value: datetime | None = None, ttl_seconds: int = TASK_OPERATION_LOCK_TTL_SECONDS) -> datetime:
         base = now_value or _now()
@@ -12079,7 +12086,9 @@ class TaskManager:
         return max(1, retries)
 
     def _sleep_after_retryable_lock_error(self, attempt: int) -> None:
-        time.sleep(0.1 * max(1, int(attempt)))
+        attempt_no = max(1, int(attempt))
+        backoff_seconds = {1: 1.0, 2: 3.0, 3: 5.0}.get(attempt_no, 5.0)
+        time.sleep(backoff_seconds)
 
     def _delete_stage_items_for_stages(
         self,
@@ -12659,6 +12668,39 @@ class TaskManager:
         item.result = merged_result
         return preserved_keys
 
+    def _child_sync_observation_would_change(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        sync_status: str,
+        synced_at: datetime | None = None,
+        error_message: str | None = None,
+        http_status: int | None = None,
+        error_type: str | None = None,
+        status_raw: str | None = None,
+        mapped_status: str | None = None,
+        downstream_status: str | None = None,
+        state_applied: bool | None = None,
+    ) -> bool:
+        del synced_at
+        current_result = dict(item.result or {})
+        current_observation = dict(current_result.get("sync_observation") or {})
+        current_sync_status = self._string_or_none(current_result.get("sync_status"))
+        current_downstream_status = self._string_or_none(current_result.get("downstream_status"))
+        comparable_pairs = (
+            (current_sync_status, self._string_or_none(sync_status)),
+            (self._string_or_none(current_observation.get("sync_status")), self._string_or_none(sync_status)),
+            (self._string_or_none(current_observation.get("error_message")), self._string_or_none(error_message)),
+            (self._int_or_none(current_observation.get("http_status")), self._int_or_none(http_status)),
+            (self._string_or_none(current_observation.get("error_type")), self._string_or_none(error_type)),
+            (self._string_or_none(current_observation.get("status_raw")), self._string_or_none(status_raw)),
+            (self._string_or_none(current_observation.get("mapped_status")), self._string_or_none(mapped_status)),
+            (self._string_or_none(current_observation.get("downstream_status")), self._string_or_none(downstream_status)),
+            (self._bool_or_none(current_observation.get("state_applied")), self._bool_or_none(state_applied)),
+            (current_downstream_status, self._string_or_none(downstream_status) or current_downstream_status),
+        )
+        return any(before != after for before, after in comparable_pairs)
+
     def _merge_stage_item_output_ref(self, item: BinarySecurityStageItem, **updates: Any) -> list[str]:
         current_output_ref = dict(item.output_ref or {})
         preserved_keys = [key for key in updates.keys() if key in current_output_ref]
@@ -12769,6 +12811,19 @@ class TaskManager:
     ) -> bool:
         before_status = str(item.status or "").strip().lower() or None
         after_status = str(item.status or "").strip().lower() or None
+        if not self._child_sync_observation_would_change(
+            item,
+            sync_status=sync_status,
+            synced_at=synced_at,
+            error_message=error_message,
+            http_status=http_status,
+            error_type=error_type,
+            status_raw=status_raw,
+            mapped_status=mapped_status,
+            downstream_status=downstream_status,
+            state_applied=state_applied,
+        ):
+            return True
         max_attempts = self._retryable_write_attempts()
         for attempt in range(max_attempts):
             try:

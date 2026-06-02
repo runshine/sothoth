@@ -22124,6 +22124,100 @@ def _test_task_heartbeat_controller_skips_task_without_owner(self):
         task_manager_module.get_session_factory = original_factory
 
 
+def _test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged(self):
+    manager = TaskManager()
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="entry-1",
+        status="running",
+    )
+    synced_at = _now()
+    item.result = {
+        "sync_status": "skipped",
+        "downstream_status": "running",
+        "sync_observation": {
+            "sync_status": "skipped",
+            "last_synced_at": synced_at.isoformat(),
+            "error_message": None,
+            "http_status": None,
+            "error_type": None,
+            "status_raw": "running",
+            "mapped_status": "running",
+            "downstream_status": "running",
+            "state_applied": False,
+        },
+    }
+    task = BinarySecurityTask(id="t1", project_id="p1", status="running")
+
+    class _FlushTrackingDb(_AppendingModelAwareDb):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.flush_calls = 0
+
+        def flush(self):
+            self.flush_calls += 1
+
+    db = _FlushTrackingDb(tasks=[task], stage_items=[item], events=[])
+    persisted = manager._persist_child_sync_observation(
+        db,
+        task=task,
+        item=item,
+        change_source="downstream_sync",
+        sync_status="skipped",
+        synced_at=synced_at,
+        error_message=None,
+        http_status=None,
+        error_type=None,
+        status_raw="running",
+        mapped_status="running",
+        downstream_status="running",
+        state_applied=False,
+    )
+
+    self.assertTrue(persisted)
+    self.assertEqual(0, db.flush_calls)
+
+
+def _test_active_operation_ignores_expired_claim_lease(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="source-task",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/output",
+        workspace_root="/workspace",
+    )
+    expired = BinarySecurityTaskOperation(
+        id="op-expired",
+        task_id="t1",
+        project_id="p1",
+        operation_type="retry_failed_items",
+        status="running",
+        claim_lease_expires_at=_now() - timedelta(seconds=30),
+    )
+    fresh = BinarySecurityTaskOperation(
+        id="op-fresh",
+        task_id="t1",
+        project_id="p1",
+        operation_type="retry_stage_full",
+        status="queued",
+        claim_lease_expires_at=_now() + timedelta(minutes=5),
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[expired, fresh])
+
+    active = manager._active_operation(db, "t1")
+
+    self.assertIsNotNone(active)
+    self.assertEqual("op-fresh", active.id)
+
+
 def _test_task_needs_downstream_reconcile_skips_locally_owned_running_task(self):
     manager = TaskManager()
     task = BinarySecurityTask(
@@ -22288,6 +22382,8 @@ TaskManagerTests.test_service_base_urls_use_service_roots = _test_service_base_u
 TaskManagerTests.test_task_heartbeat_controller_refreshes_owned_running_task = _test_task_heartbeat_controller_refreshes_owned_running_task
 TaskManagerTests.test_task_heartbeat_controller_skips_task_without_owner = _test_task_heartbeat_controller_skips_task_without_owner
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_locally_owned_running_task = _test_task_needs_downstream_reconcile_skips_locally_owned_running_task
+TaskManagerTests.test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged = _test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged
+TaskManagerTests.test_active_operation_ignores_expired_claim_lease = _test_active_operation_ignores_expired_claim_lease
 TaskManagerTests.test_persist_child_sync_observation_records_observation_persist_failed = _test_persist_child_sync_observation_records_observation_persist_failed
 TaskManagerTests.test_apply_child_state_with_savepoint_records_state_apply_failed = _test_apply_child_state_with_savepoint_records_state_apply_failed
 TaskManagerTests.test_task_list_response_exposes_runtime_lease_and_sync_view = _test_task_list_response_exposes_runtime_lease_and_sync_view
