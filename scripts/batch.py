@@ -15,9 +15,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
+from selection import SelectionOption, resolve_named_targets
+from workspace import discover_batch_repos, resolve_batch_group_keys
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-IMAGE_BUILD_DIR = ROOT_DIR / "13-secflow-service" / "image_build"
 FAILURE_TAIL_LINES = 8
 SUMMARY_BAR_WIDTH = 32
 
@@ -113,13 +113,19 @@ class ProgressTracker:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a make target across selected 13-secflow-service image build directories."
+        description="Run a make target across selected managed image build directories."
+    )
+    parser.add_argument(
+        "--group",
+        action="append",
+        default=[],
+        help="only include repositories from this managed group; repeatable",
     )
     parser.add_argument(
         "--repo",
         action="append",
         default=[],
-        help="only include repositories with this exact name; repeatable",
+        help="only include repositories with this name or alias; repeatable",
     )
     parser.add_argument(
         "--jobs",
@@ -158,27 +164,37 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def discover_repos(matches: Iterable[str], repo_names: Iterable[str]) -> list[Path]:
-    if not IMAGE_BUILD_DIR.is_dir():
-        return []
-    repos = sorted(
-        path
-        for path in IMAGE_BUILD_DIR.iterdir()
-        if path.is_dir()
-        and not path.name.startswith(".")
-        and (path / "Dockerfile").exists()
-    )
-    selected_names = {name for name in repo_names if name}
+def discover_repos(group_keys: list[str], matches: Iterable[str], repo_names: Iterable[str]) -> list[Path]:
+    repos = discover_batch_repos(group_keys)
+    selected_names = [name for name in repo_names if name]
     if selected_names:
-        repos = [repo for repo in repos if repo.name in selected_names]
+        options = [
+            SelectionOption(
+                value=repo.name,
+                display_name=repo.display_name,
+                description=f"{repo.group.display_name}/{repo.name}",
+                aliases=repo.aliases,
+            )
+            for repo in repos
+        ]
+        resolved_names = resolve_named_targets(
+            selected_names,
+            options=options,
+            item_label="repositories",
+            example="0 or 1,4 or platform-auth,agent-helper",
+            unknown_label="repository",
+            no_selection_message="No repositories selected",
+        )
+        allowed = set(resolved_names)
+        repos = [repo for repo in repos if repo.name in allowed]
     match_terms = [term for term in matches if term]
     if match_terms:
         repos = [
             repo
             for repo in repos
-            if any(term in repo.name for term in match_terms)
+            if any(term in repo.name or term in repo.display_name for term in match_terms)
         ]
-    return repos
+    return [repo.path for repo in repos]
 
 
 def format_seconds(seconds: float) -> str:
@@ -538,10 +554,11 @@ def print_auto_heal_summary(tasks: list[TaskState]) -> None:
 
 def main() -> int:
     args = parse_args()
-    repos = discover_repos(args.match, args.repo)
+    group_keys = resolve_batch_group_keys(args.group)
+    repos = discover_repos(group_keys, args.match, args.repo)
     if not repos:
         print(
-            f"No matching image build directories found under {IMAGE_BUILD_DIR}.",
+            f"No matching image build directories found in groups: {', '.join(group_keys)}.",
             file=sys.stderr,
         )
         return 1

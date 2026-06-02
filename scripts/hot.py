@@ -17,13 +17,11 @@ import urllib.request
 from contextlib import suppress
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from pathlib import Path
 from threading import Lock
 
 from selection import SelectionOption, resolve_named_targets
+from workspace import discover_k8s_deployments, get_k8s_groups, resolve_k8s_group_keys
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-SECFLOW_DIR = ROOT_DIR / "13-secflow-service"
 DEFAULT_NAMESPACE = os.environ.get("NAMESPACE", "secflow-ns")
 DEFAULT_TIMEOUT_SECONDS = 300
 PROGRESS_REFRESH_SECONDS = 0.2
@@ -36,30 +34,6 @@ MANIFEST_ACCEPT_HEADERS = ",".join(
         "application/vnd.docker.distribution.manifest.v2+json",
     )
 )
-
-
-def discover_deployments() -> list[str]:
-    deployments: list[str] = []
-    for path in sorted(SECFLOW_DIR.glob("*.yaml")):
-        lines = path.read_text().splitlines()
-        for index, line in enumerate(lines):
-            if line.strip() != "kind: Deployment":
-                continue
-            for offset in range(index + 1, min(index + 20, len(lines))):
-                match = re.match(r"^\s*name:\s*([^\s#]+)", lines[offset])
-                if match:
-                    deployments.append(match.group(1))
-                    break
-
-    seen: set[str] = set()
-    resolved: list[str] = []
-    for deployment in deployments:
-        if deployment in seen:
-            continue
-        seen.add(deployment)
-        resolved.append(deployment)
-    return resolved
-
 
 @dataclass
 class DeploymentResult:
@@ -233,11 +207,16 @@ class ProgressTracker:
 
 
 def parse_args() -> argparse.Namespace:
-    available_deployments = discover_deployments()
     parser = argparse.ArgumentParser(
         description=(
             "Restart one or all Kubernetes deployments in parallel and watch rollout status."
         )
+    )
+    parser.add_argument(
+        "--group",
+        action="append",
+        default=[],
+        help="only include deployments from this managed group; repeatable",
     )
     parser.add_argument(
         "deployments",
@@ -277,8 +256,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     args = parser.parse_args()
+    args.group_keys = resolve_k8s_group_keys(args.group)
+    available_deployments = discover_k8s_deployments(args.group_keys)
     if not available_deployments:
-        parser.error(f"no deployments discovered from {SECFLOW_DIR}")
+        group_names = ", ".join(group.display_name for group in get_k8s_groups(args.group_keys))
+        parser.error(f"no deployments discovered from groups: {group_names}")
     if args.jobs == 0:
         args.jobs = len(available_deployments)
     args.available_deployments = available_deployments
@@ -738,6 +720,7 @@ def main() -> int:
         f"Restarting {len(deployments)} deployment(s) in namespace "
         f"{args.namespace} with concurrency={max_workers}"
     )
+    print("Groups:", ", ".join(group.display_name for group in get_k8s_groups(args.group_keys)))
     print("Targets:", ", ".join(deployments))
     if args.skip_if_image_unchanged:
         print("Mode: skip rollout when registry digest matches running image digest")

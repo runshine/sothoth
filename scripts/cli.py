@@ -12,12 +12,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from selection import SelectionOption, resolve_named_targets
+from workspace import (
+    SCRIPTS_DIR,
+    SECFLOW_DIR,
+    get_k8s_groups,
+    resolve_k8s_group_keys,
+)
 
-
-ROOT_DIR = Path(__file__).resolve().parent.parent
-SCRIPTS_DIR = ROOT_DIR / "scripts"
-SECFLOW_DIR = ROOT_DIR / "13-secflow-service"
-IMAGE_BUILD_DIR = SECFLOW_DIR / "image_build"
 DEFAULT_NAMESPACE = os.environ.get("NAMESPACE", "secflow-ns")
 DEFAULT_IMAGE_REGISTRY_PREFIX = os.environ.get("IMAGE_REGISTRY_PREFIX", "")
 DEFAULT_BASE_DOMAIN = os.environ.get("BASE_DOMAIN", "")
@@ -426,13 +427,14 @@ def run(cmd: list[str], *, env: dict[str, str] | None = None, check: bool = True
     subprocess.run(cmd, check=check, env=env)
 
 
-def discover_batch_repos() -> list[Path]:
-    if not IMAGE_BUILD_DIR.is_dir():
-        return []
-    return sorted(
-        path
-        for path in IMAGE_BUILD_DIR.iterdir()
-        if path.is_dir() and not path.name.startswith(".") and (path / "Dockerfile").exists()
+def run_shell(command: str, *, cwd: Path, env: dict[str, str] | None = None, check: bool = True) -> None:
+    subprocess.run(
+        command,
+        shell=True,
+        executable="/bin/bash",
+        cwd=cwd,
+        env=env,
+        check=check,
     )
 
 
@@ -500,39 +502,22 @@ def prompt_for_preset() -> str:
     return response
 
 
-def resolve_batch_repo_names(targets: list[str]) -> list[str]:
-    repos = discover_batch_repos()
-    if not repos:
-        raise SystemExit(f"No Docker build directories found under {IMAGE_BUILD_DIR}")
-
-    options = [
-        SelectionOption(
-            value=repo.name,
-            display_name=repo.name.removeprefix("secflow-"),
-            description=repo.name,
-            aliases=(repo.name,),
-        )
-        for repo in repos
-    ]
-    resolved_names = resolve_named_targets(
-        targets,
-        options=options,
-        item_label="services",
-        example="0 or 1,4 or platform-auth,app-kernel-scan",
-        unknown_label="service",
-        no_selection_message="No services selected",
-    )
-    return [] if len(resolved_names) == len(repos) else resolved_names
-
-
-def print_header(title: str, config: dict[str, str], components: list[Component]) -> None:
+def print_header(
+    title: str,
+    config: dict[str, str],
+    group_names: list[str],
+    components: list[Component] | None = None,
+) -> None:
     print("==========================================")
     print(title)
-    print(f"Namespace: {config['NAMESPACE']}")
-    print(f"Secflow Dir: {SECFLOW_DIR}")
-    print(f"Image Prefix: {config['IMAGE_REGISTRY_PREFIX'] or '<default>'}")
-    print(f"Base Domain: {config['BASE_DOMAIN'] or '<default>'}")
-    print("Components: " + " ".join(component.name for component in components))
+    print("Groups: " + " ".join(group_names))
+    if "secflow" in group_names:
+        print(f"Namespace: {config['NAMESPACE']}")
+        print(f"Secflow Dir: {SECFLOW_DIR}")
+        print(f"Image Prefix: {config['IMAGE_REGISTRY_PREFIX'] or '<default>'}")
+        print(f"Base Domain: {config['BASE_DOMAIN'] or '<default>'}")
+    if components is not None:
+        print("Components: " + " ".join(component.name for component in components))
     print("==========================================")
 
 
@@ -597,17 +582,21 @@ def render_manifest_text(manifest_path: Path, env: dict[str, str], image_registr
     return text
 
 
+def kubectl_apply_manifest(manifest_path: Path, env: dict[str, str], image_registry_prefix: str) -> None:
+    rendered_text = render_manifest_text(manifest_path, env, image_registry_prefix)
+    subprocess.run(
+        ["kubectl", "apply", "-f", "-"],
+        input=rendered_text,
+        text=True,
+        check=True,
+        env=env,
+    )
+
+
 def kubectl_apply(component: Component, env: dict[str, str], image_registry_prefix: str) -> None:
     for file_name in component.files:
         manifest_path = SECFLOW_DIR / file_name
-        rendered_text = render_manifest_text(manifest_path, env, image_registry_prefix)
-        subprocess.run(
-            ["kubectl", "apply", "-f", "-"],
-            input=rendered_text,
-            text=True,
-            check=True,
-            env=env,
-        )
+        kubectl_apply_manifest(manifest_path, env, image_registry_prefix)
 
 
 def kubectl_delete(component: Component) -> None:
@@ -617,6 +606,31 @@ def kubectl_delete(component: Component) -> None:
             ["kubectl", "delete", "-f", str(manifest_path), "--ignore-not-found"],
             check=False,
         )
+
+
+def apply_managed_group(group_key: str, env: dict[str, str]) -> None:
+    group = get_k8s_groups([group_key])[0]
+    image_registry_prefix = env.get("IMAGE_REGISTRY_PREFIX", "") if group.key == "secflow" else ""
+    if group.pre_deploy_shell:
+        run_shell(group.pre_deploy_shell, cwd=group.directory, env=env)
+    for manifest_path in group.manifest_paths():
+        kubectl_apply_manifest(manifest_path, env, image_registry_prefix)
+    if group.post_deploy_shell:
+        run_shell(group.post_deploy_shell, cwd=group.directory, env=env)
+
+
+def delete_managed_group(group_key: str, env: dict[str, str]) -> None:
+    group = get_k8s_groups([group_key])[0]
+    if group.pre_clean_shell:
+        run_shell(group.pre_clean_shell, cwd=group.directory, env=env, check=False)
+    for manifest_path in reversed(group.manifest_paths()):
+        run(
+            ["kubectl", "delete", "-f", str(manifest_path), "--ignore-not-found"],
+            env=env,
+            check=False,
+        )
+    if group.post_clean_shell:
+        run_shell(group.post_clean_shell, cwd=group.directory, env=env, check=False)
 
 
 def wait_component(namespace: str, component: Component, *, delete: bool = False) -> None:
@@ -665,36 +679,60 @@ def build_command_env(config: dict[str, str]) -> dict[str, str]:
 
 
 def command_deploy(args: argparse.Namespace) -> int:
-    if args.preset is None:
+    group_keys = resolve_k8s_group_keys(args.group)
+    if args.components and "secflow" not in group_keys:
+        raise SystemExit("Components can only be selected when the secflow group is included")
+    if "secflow" in group_keys and args.preset is None:
         args.preset = prompt_for_preset()
     config = parse_shared_args(args)
-    components = resolve_component_names(args.components)
+    components = resolve_component_names(args.components) if "secflow" in group_keys else []
     env = build_command_env(config)
     try:
-        print_header("Deploying SecFlow to Kubernetes", config, components)
-        total_steps = len(components) + (0 if args.skip_wait else 1) + 3
+        print_header(
+            "Deploying managed Kubernetes groups",
+            config,
+            group_keys,
+            components if "secflow" in group_keys else None,
+        )
 
-        for index, component in enumerate(components, start=1):
+        step = 0
+        total_steps = len([group for group in group_keys if group != "secflow"]) + len(components)
+        if "secflow" in group_keys and not args.skip_wait:
+            total_steps += 1
+        if "secflow" in group_keys:
+            total_steps += 2
+
+        for group_key in group_keys:
+            if group_key == "secflow":
+                continue
+            step += 1
             print()
-            print(f"[{index}/{total_steps}] {component.description}...")
+            print(f"[{step}/{total_steps}] Deploying group {group_key}...")
+            apply_managed_group(group_key, env)
+
+        for component in components:
+            step += 1
+            print()
+            print(f"[{step}/{total_steps}] {component.description}...")
             kubectl_apply(component, env, config["IMAGE_REGISTRY_PREFIX"])
 
-        step = len(components)
-        if not args.skip_wait:
+        if "secflow" in group_keys and not args.skip_wait:
             step += 1
             print()
             print(f"[{step}/{total_steps}] Waiting for selected deployments to be ready...")
             for component in components:
                 wait_component(config["NAMESPACE"], component)
 
-        print()
-        print(f"[{step + 1}/{total_steps}] Checking deployment status...")
-        show_cluster_status(config["NAMESPACE"])
+        if "secflow" in group_keys:
+            print()
+            print(f"[{step + 1}/{total_steps}] Checking deployment status...")
+            show_cluster_status(config["NAMESPACE"])
 
-        print()
-        print(f"[{step + 2}/{total_steps}] Deployment completed!")
-        print()
-        print(f"[{step + 3}/{total_steps}] Done.")
+            print()
+            print(f"[{step + 2}/{total_steps}] Deployment completed!")
+        else:
+            print()
+            print("Deployment completed!")
         return 0
     except subprocess.CalledProcessError as exc:
         print(f"Command failed with exit code {exc.returncode}", file=sys.stderr)
@@ -702,40 +740,62 @@ def command_deploy(args: argparse.Namespace) -> int:
 
 
 def command_clean(args: argparse.Namespace) -> int:
+    group_keys = resolve_k8s_group_keys(args.group)
+    if args.components and "secflow" not in group_keys:
+        raise SystemExit("Components can only be selected when the secflow group is included")
     config = parse_shared_args(args)
-    components = list(reversed(resolve_component_names(args.components)))
+    components = list(reversed(resolve_component_names(args.components))) if "secflow" in group_keys else []
     env = build_command_env(config)
     try:
-        print_header("Cleaning up SecFlow from Kubernetes", config, components)
-        total_steps = len(components) + (0 if args.skip_wait else 1) + 3
+        print_header(
+            "Cleaning managed Kubernetes groups",
+            config,
+            group_keys,
+            components if "secflow" in group_keys else None,
+        )
+        step = 0
+        total_steps = len([group for group in group_keys if group != "secflow"]) + len(components)
+        if "secflow" in group_keys and not args.skip_wait:
+            total_steps += 1
+        if "secflow" in group_keys:
+            total_steps += 2
 
-        for index, component in enumerate(components, start=1):
+        for group_key in reversed(group_keys):
+            if group_key == "secflow":
+                continue
+            step += 1
             print()
-            print(f"[{index}/{total_steps}] Removing {component.name}...")
+            print(f"[{step}/{total_steps}] Removing group {group_key}...")
+            delete_managed_group(group_key, env)
+
+        for component in components:
+            step += 1
+            print()
+            print(f"[{step}/{total_steps}] Removing {component.name}...")
             kubectl_delete(component)
 
-        step = len(components)
-        if not args.skip_wait:
+        if "secflow" in group_keys and not args.skip_wait:
             step += 1
             print()
             print(f"[{step}/{total_steps}] Waiting for selected deployments to terminate...")
             for component in components:
                 wait_component(config["NAMESPACE"], component, delete=True)
 
-        print()
-        print(f"[{step + 1}/{total_steps}] Checking remaining resources...")
-        show_cluster_status(config["NAMESPACE"])
-
-        print()
-        print(f"[{step + 2}/{total_steps}] Cleanup completed!")
-
-        if args.delete_namespace:
+        if "secflow" in group_keys:
             print()
-            print(f"[{step + 3}/{total_steps}] Deleting namespace {config['NAMESPACE']}...")
-            run(["kubectl", "delete", "namespace", config["NAMESPACE"]], check=False)
+            print(f"[{step + 1}/{total_steps}] Checking remaining resources...")
+            show_cluster_status(config["NAMESPACE"])
+
+            print()
+            print(f"[{step + 2}/{total_steps}] Cleanup completed!")
+
+            if args.delete_namespace:
+                print()
+                print(f"Deleting namespace {config['NAMESPACE']}...")
+                run(["kubectl", "delete", "namespace", config["NAMESPACE"]], check=False)
         else:
             print()
-            print(f"[{step + 3}/{total_steps}] Done.")
+            print("Cleanup completed!")
         return 0
     except subprocess.CalledProcessError as exc:
         print(f"Command failed with exit code {exc.returncode}", file=sys.stderr)
@@ -751,6 +811,8 @@ def forward_to_script(script_name: str, args: list[str]) -> int:
 
 def command_batch(args: argparse.Namespace) -> int:
     forward_args = []
+    for group in args.group:
+        forward_args.extend(["--group", group])
     for repo in args.repo:
         forward_args.extend(["--repo", repo])
     if args.jobs is not None:
@@ -766,9 +828,10 @@ def command_batch(args: argparse.Namespace) -> int:
 
 
 def forward_batch_target(args: argparse.Namespace, make_target: str) -> int:
-    repo_names = resolve_batch_repo_names(args.targets)
     forward_args = []
-    for repo in repo_names:
+    for group in args.group:
+        forward_args.extend(["--group", group])
+    for repo in args.targets:
         forward_args.extend(["--repo", repo])
     if args.jobs is not None:
         forward_args.extend(["--jobs", str(args.jobs)])
@@ -782,6 +845,8 @@ def forward_batch_target(args: argparse.Namespace, make_target: str) -> int:
 
 def command_hot(args: argparse.Namespace) -> int:
     forward_args = []
+    for group in args.group:
+        forward_args.extend(["--group", group])
     if args.skip_if_image_unchanged:
         forward_args.append("--skip-if-image-unchanged")
     if args.namespace:
@@ -801,6 +866,7 @@ def command_status(args: argparse.Namespace) -> int:
 
 
 def add_batch_passthrough_arguments(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--group", action="append", default=[], help="managed image group name; repeatable")
     command.add_argument("--jobs", type=int)
     command.add_argument("--dry-run", action="store_true")
     command.add_argument("--plain", action="store_true")
@@ -808,10 +874,11 @@ def add_batch_passthrough_arguments(command: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Unified SecFlow scripts entrypoint.")
+    parser = argparse.ArgumentParser(description="Unified managed scripts entrypoint.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_shared_k8s_arguments(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--group", action="append", default=[], help="managed group name; repeatable")
         command.add_argument("--namespace")
         command.add_argument("--image-registry-prefix")
         command.add_argument("--base-domain")
@@ -821,7 +888,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     deploy = subparsers.add_parser(
         "deploy",
-        help="Apply 13-secflow-service Kubernetes manifests",
+        help="Apply managed Kubernetes groups",
     )
     add_shared_k8s_arguments(deploy)
     deploy.add_argument("--preset", choices=sorted(DEPLOY_PRESETS))
@@ -829,14 +896,15 @@ def build_parser() -> argparse.ArgumentParser:
     deploy.add_argument("components", nargs="*")
     deploy.set_defaults(func=command_deploy)
 
-    clean = subparsers.add_parser("clean", help="Delete 13-secflow-service Kubernetes manifests")
+    clean = subparsers.add_parser("clean", help="Delete managed Kubernetes groups")
     add_shared_k8s_arguments(clean)
     clean.add_argument("--skip-wait", action="store_true")
     clean.add_argument("--delete-namespace", action="store_true")
     clean.add_argument("components", nargs="*")
     clean.set_defaults(func=command_clean)
 
-    hot = subparsers.add_parser("hot", help="Restart SecFlow Kubernetes deployments")
+    hot = subparsers.add_parser("hot", help="Restart managed Kubernetes deployments")
+    hot.add_argument("--group", action="append", default=[], help="managed group name; repeatable")
     hot.add_argument("--namespace", default=DEFAULT_NAMESPACE)
     hot.add_argument("--jobs", type=int)
     hot.add_argument("--timeout", type=int)
@@ -844,7 +912,8 @@ def build_parser() -> argparse.ArgumentParser:
     hot.add_argument("deployments", nargs="*")
     hot.set_defaults(func=command_hot)
 
-    batch = subparsers.add_parser("batch", help="Forward to batch.py")
+    batch = subparsers.add_parser("batch", help="Forward to batch.py for managed image groups")
+    batch.add_argument("--group", action="append", default=[], help="managed image group name; repeatable")
     batch.add_argument("--repo", action="append", default=[])
     batch.add_argument("--jobs", type=int)
     batch.add_argument("--match", action="append", default=[])
@@ -854,7 +923,7 @@ def build_parser() -> argparse.ArgumentParser:
     batch.set_defaults(func=command_batch)
 
     for target in BATCH_TARGETS:
-        command = subparsers.add_parser(target, help=f"Run make {target} across selected services")
+        command = subparsers.add_parser(target, help=f"Run make {target} across selected managed image repos")
         add_batch_passthrough_arguments(command)
         command.set_defaults(func=lambda args, target=target: forward_batch_target(args, target))
 

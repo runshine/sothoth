@@ -9,9 +9,9 @@ data:
     database:
       host: "mysql.sothothv2-ns.svc.cluster.local"
       port: 3306
-      username: "secflow_ea"
+      username: "secflow"
       password: "Huawei12#$"
-      name: "secflow_entry_analyse"
+      name: "secflow"
       table_prefix: "secflow_app_ea_"
       pool_size: 10
       max_overflow: 20
