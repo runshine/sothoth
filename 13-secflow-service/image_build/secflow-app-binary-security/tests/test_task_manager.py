@@ -5350,6 +5350,21 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("artifacts", stored)
         self.assertNotIn("downstream", stored)
 
+    def test_compact_result_for_storage_keeps_entry_artifact_root_without_archive_root_alias(self):
+        compact = self.manager._compact_result_for_storage(
+            "entry_analysis",
+            {
+                "module_key": "m1",
+                "module_name": "openssl",
+                "artifact_root": "/tmp/archive/openssl",
+                "entries": [{"function_name": "main", "file_name": "main.c"}],
+                "source_dir": "/tmp/archive/openssl",
+            },
+        )
+
+        self.assertEqual("/tmp/archive/openssl", compact["artifact_root"])
+        self.assertNotIn("archive_root", compact)
+
     def test_finalize_task_prefers_partial_success_after_vuln_stage(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
         db = _ModelAwareDb(
@@ -13091,6 +13106,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             downstream_service="dataflow_analyse",
             downstream_task_id="dfa_1",
         )
+        item.result = {"kept": "yes"}
         job = BinarySecurityArchiveJob(
             id="job1",
             task_id="t1",
@@ -13105,6 +13121,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         job.payload = {
             "mapped_status": "success",
             "downstream_payload": {"task_id": "dfa_1", "status": "success"},
+            "archive_copy_stats": {"copied_files": 2},
         }
         db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[job])
 
@@ -13135,6 +13152,54 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("success", item.status)
         self.assertEqual("success", job.archive_status)
         self.assertEqual([("t1", "dataflow_analysis")], reconciled)
+        self.assertEqual("yes", item.result.get("kept"))
+        self.assertNotIn("archive_root", item.result)
+        self.assertEqual("/tmp/archive", item.output_ref.get("archive_root"))
+        self.assertEqual({"copied_files": 2}, item.output_ref.get("archive_copy_stats"))
+
+    def test_archive_downstream_output_records_copy_stats_only_in_output_ref(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="source",
+                status="running",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="entry_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(Path(tmpdir) / "output"),
+                workspace_root=tmpdir,
+            )
+            item = BinarySecurityStageItem(
+                id="si1",
+                task_id="t1",
+                project_id="p1",
+                stage_run_id="sr1",
+                stage_name="entry_analysis",
+                item_key="entry-1",
+                status="running",
+                downstream_service="entry_analyse",
+                downstream_task_id="eat_1",
+            )
+            item.result = {"kept": "yes"}
+            db = _AppendingModelAwareDb(tasks=[task], stage_items=[item])
+            source_dir = Path(tmpdir) / "worker-output"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            (source_dir / "result.json").write_text("{\"ok\":true}", encoding="utf-8")
+
+            archive_result = self.manager._archive_downstream_output(
+                db,
+                task,
+                item,
+                semantic_key="entry-1",
+                extra_paths=[source_dir],
+            )
+
+            self.assertEqual("archived", archive_result.status)
+            self.assertEqual("yes", item.result.get("kept"))
+            self.assertNotIn("archive_copy_stats", item.result)
+            self.assertIn("archive_copy_stats", item.output_ref)
 
     def test_task_detail_refreshes_active_stage_from_items_before_building_summary(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -14440,6 +14505,90 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("/archive/fw", rows[0]["unpacked_root"])
         self.assertEqual("/archive/fw", rows[0]["source_root"])
 
+    def test_binary_system_analysis_inputs_fallback_to_archive_job_refs(self):
+        task = BinarySecurityTask(id="t1", project_id="p1", name="binary-task", task_type=TASK_TYPE_BINARY, status="running", firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
+        task.summary = {"firmware_unpack_results": [{"firmware_key": None, "unpacked_root": None}]}
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="firmware_unpack",
+            item_key="fw.bin",
+            item_name="fw.bin",
+            status="success",
+        )
+        item.input_ref = {"filename": "fw.bin", "path": "/input/fw.bin"}
+        item.result = {
+            "firmware_key": "fw.bin",
+            "firmware_name": "fw",
+            "filename": "fw.bin",
+            "input_path": "/input/fw.bin",
+        }
+        archive_job = BinarySecurityArchiveJob(
+            id="aj1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            item_id="si1",
+            archive_status="success",
+            archive_root="/archive/from-job",
+        )
+        db = _ModelAwareDb(stage_items=[item], archive_jobs=[archive_job])
+
+        rows = self.manager._system_analysis_inputs(task, db=db)
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("/archive/from-job", rows[0]["unpacked_root"])
+        self.assertEqual("/archive/from-job", rows[0]["source_root"])
+
+    def test_system_analysis_modules_from_item_falls_back_to_archive_job_artifact_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_root = Path(tmp)
+            (artifact_root / "system_analysis_modules.json").write_text(
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "module_key": "m1",
+                                "module_name": "m1",
+                                "rank": 1,
+                                "risk_level": "high",
+                                "risk_score": 9,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            task = BinarySecurityTask(id="t1", project_id="p1", name="binary-task", task_type=TASK_TYPE_BINARY, status="running", firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
+            item = BinarySecurityStageItem(
+                id="si1",
+                task_id="t1",
+                project_id="p1",
+                stage_run_id="sr1",
+                stage_name="system_analysis",
+                item_key="fw.bin",
+                item_name="fw.bin",
+                status="success",
+                downstream_service="system_analyse",
+                downstream_task_id="sat-1",
+            )
+            archive_job = BinarySecurityArchiveJob(
+                id="aj1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="system_analysis",
+                item_id="si1",
+                archive_status="success",
+            )
+            archive_job.payload = {"artifact_root": str(artifact_root)}
+
+            modules = self.manager._system_analysis_modules_from_item(task, item, archive_jobs=[archive_job])
+
+            self.assertEqual(1, len(modules))
+            self.assertEqual("m1", modules[0]["module_key"])
+
     def test_prepare_stage_items_for_execution_rejects_empty_item_key(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="binary-task", task_type=TASK_TYPE_BINARY, status="running", firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
         stage_run = BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="system_analysis", sequence_no=2, status="running")
@@ -15127,6 +15276,92 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             },
             response.downstream_summary,
         )
+
+    def test_stage_item_response_fills_archive_refs_from_archive_job(self):
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="dataflow_analysis",
+            item_key="entry-1",
+            status="success",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa-1",
+        )
+        item.result = {"kept": "yes"}
+        archive_job = BinarySecurityArchiveJob(
+            id="aj1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            item_id="si1",
+            archive_status="success",
+            archive_root="/archive/dfa-1",
+        )
+        archive_job.payload = {
+            "artifact_root": "/artifact/dfa-1",
+            "archive_copy_stats": {"copied_files": 3},
+        }
+
+        response = self.manager._stage_item_response(item, archive_jobs=[archive_job])
+
+        self.assertEqual("yes", response.result.get("kept"))
+        self.assertEqual("/archive/dfa-1", response.result.get("archive_root"))
+        self.assertEqual("/artifact/dfa-1", response.result.get("artifact_root"))
+        self.assertEqual({"copied_files": 3}, response.result.get("archive_copy_stats"))
+        self.assertEqual("/archive/dfa-1", response.output_ref.get("archive_root"))
+        self.assertEqual("/artifact/dfa-1", response.output_ref.get("artifact_root"))
+        self.assertEqual({"copied_files": 3}, response.output_ref.get("archive_copy_stats"))
+        self.assertEqual("aj1", response.output_ref.get("archive_job_id"))
+        self.assertEqual("success", response.output_ref.get("archive_status"))
+
+    def test_get_task_stage_items_page_includes_archive_refs_from_jobs(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="dataflow_analysis",
+            item_key="entry-1",
+            status="success",
+            downstream_service="dataflow_analyse",
+            downstream_task_id="dfa-1",
+        )
+        archive_job = BinarySecurityArchiveJob(
+            id="aj1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            item_id="si1",
+            archive_status="success",
+            archive_root="/archive/dfa-1",
+        )
+        archive_job.payload = {"archive_copy_stats": {"copied_files": 5}}
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[archive_job])
+
+        response = self.manager.get_task_stage_items_page(
+            db,
+            project_id="p1",
+            task_id="t1",
+            stage_name="dataflow_analysis",
+        )
+
+        self.assertEqual(1, response.total)
+        self.assertEqual("/archive/dfa-1", response.items[0].output_ref.get("archive_root"))
+        self.assertEqual({"copied_files": 5}, response.items[0].output_ref.get("archive_copy_stats"))
 
     def test_stage_worker_terminal_event_rebuilds_system_analysis_from_items(self):
         with tempfile.TemporaryDirectory() as tmp:

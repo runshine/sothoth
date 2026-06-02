@@ -1894,7 +1894,11 @@ class TaskManager:
         ctx = self._build_task_detail_context(db, project_id=project_id, task_id=task_id)
         base = self._task_response(db, ctx.task, queue_info=ctx.queue_info, detail_ctx=ctx).model_dump()
         base.pop("execution_epoch", None)
-        stage_item_responses = [self._stage_item_response(item) for item in ctx.stage_items[:DETAIL_STAGE_ITEMS_LIMIT]]
+        archive_jobs_by_item = self._archive_jobs_by_item_id(ctx.archive_jobs)
+        stage_item_responses = [
+            self._stage_item_response(item, archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []))
+            for item in ctx.stage_items[:DETAIL_STAGE_ITEMS_LIMIT]
+        ]
         archive_job_responses = self._archive_job_responses(db, ctx.task, ctx.archive_jobs)
         return BinarySecurityTaskDetailResponse(
             **base,
@@ -1945,13 +1949,14 @@ class TaskManager:
         )
         total = query.count()
         rows = query.offset((page - 1) * per_page).limit(per_page).all()
+        archive_jobs_by_item = self._stage_archive_jobs_by_item(db, task.id, normalized_stage_name)
         return BinarySecurityStageItemPageResponse(
             task_id=task.id,
             stage_name=normalized_stage_name,
             total=total,
             page=page,
             per_page=per_page,
-            items=[self._stage_item_response(item) for item in rows],
+            items=[self._stage_item_response(item, archive_jobs=archive_jobs_by_item.get(str(item.id or ""), [])) for item in rows],
         )
 
     def get_orchestration_observability(self, db: Session, *, project_id: str, task_id: str) -> dict[str, Any]:
@@ -13730,6 +13735,82 @@ class TaskManager:
             grouped.setdefault(str(job.item_id or ""), []).append(job)
         return grouped
 
+    @staticmethod
+    def _archive_jobs_by_item_id(archive_jobs: list[BinarySecurityArchiveJob]) -> dict[str, list[BinarySecurityArchiveJob]]:
+        grouped: dict[str, list[BinarySecurityArchiveJob]] = {}
+        for job in archive_jobs:
+            grouped.setdefault(str(getattr(job, "item_id", "") or ""), []).append(job)
+        return grouped
+
+    def _resolved_stage_item_archive_refs(
+        self,
+        item: BinarySecurityStageItem,
+        archive_jobs: list[BinarySecurityArchiveJob] | None = None,
+    ) -> dict[str, Any]:
+        current_output_ref = dict(item.output_ref or {})
+        current_result = dict(item.result or {})
+        resolved: dict[str, Any] = {}
+        for key in ("artifact_root", "archive_root", "archive_copy_stats"):
+            current_value = current_output_ref.get(key)
+            if current_value is None:
+                current_value = current_result.get(key)
+            if current_value is not None:
+                resolved[key] = current_value
+        if archive_jobs:
+            ordered_jobs = sorted(
+                archive_jobs,
+                key=lambda job: (
+                    getattr(job, "updated_at", None) or getattr(job, "completed_at", None) or getattr(job, "created_at", None) or datetime.min,
+                    str(getattr(job, "id", "") or ""),
+                ),
+            )
+            for job in reversed(ordered_jobs):
+                if "archive_root" not in resolved and getattr(job, "archive_root", None):
+                    resolved["archive_root"] = job.archive_root
+                payload = dict(getattr(job, "payload", None) or {})
+                if "artifact_root" not in resolved and payload.get("artifact_root"):
+                    resolved["artifact_root"] = payload.get("artifact_root")
+                if "archive_copy_stats" not in resolved and payload.get("archive_copy_stats") is not None:
+                    resolved["archive_copy_stats"] = dict(payload.get("archive_copy_stats") or {})
+                if "archive_job_id" not in resolved and getattr(job, "id", None):
+                    resolved["archive_job_id"] = job.id
+                if "archive_status" not in resolved and getattr(job, "archive_status", None):
+                    resolved["archive_status"] = job.archive_status
+                if all(
+                    key in resolved
+                    for key in ("archive_root", "artifact_root", "archive_copy_stats", "archive_job_id", "archive_status")
+                ):
+                    break
+        if "artifact_root" not in resolved and resolved.get("archive_root"):
+            resolved["artifact_root"] = resolved["archive_root"]
+        return resolved
+
+    def _stage_item_archive_root(
+        self,
+        item: BinarySecurityStageItem,
+        archive_jobs: list[BinarySecurityArchiveJob] | None = None,
+    ) -> str:
+        resolved = self._resolved_stage_item_archive_refs(item, archive_jobs=archive_jobs)
+        return str(
+            resolved.get("archive_root")
+            or resolved.get("artifact_root")
+            or dict(item.output_ref or {}).get("unpacked_root")
+            or dict(item.result or {}).get("unpacked_root")
+            or ""
+        ).strip()
+
+    def _stage_item_artifact_root(
+        self,
+        item: BinarySecurityStageItem,
+        archive_jobs: list[BinarySecurityArchiveJob] | None = None,
+    ) -> str:
+        resolved = self._resolved_stage_item_archive_refs(item, archive_jobs=archive_jobs)
+        return str(
+            resolved.get("artifact_root")
+            or resolved.get("archive_root")
+            or ""
+        ).strip()
+
     def _stage_archive_success_blocked(
         self,
         task: BinarySecurityTask,
@@ -14864,8 +14945,25 @@ class TaskManager:
             "can_confirm_modules": can_confirm_modules,
         }
 
-    def _stage_item_response(self, item: BinarySecurityStageItem) -> BinarySecurityStageItemResponse:
+    def _stage_item_response(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        archive_jobs: list[BinarySecurityArchiveJob] | None = None,
+    ) -> BinarySecurityStageItemResponse:
         result = dict(item.result or {})
+        output_ref = dict(item.output_ref or {})
+        resolved_archive_refs = self._resolved_stage_item_archive_refs(item, archive_jobs=archive_jobs)
+        for key in ("artifact_root", "archive_root", "archive_copy_stats", "archive_job_id", "archive_status"):
+            value = resolved_archive_refs.get(key)
+            if value is None:
+                continue
+            output_ref.setdefault(key, value)
+        for key in ("artifact_root", "archive_root", "archive_copy_stats"):
+            value = resolved_archive_refs.get(key)
+            if value is None:
+                continue
+            result.setdefault(key, value)
         downstream_status, sync_observation, repaired = self._effective_stage_item_downstream_status(item, result=result)
         downstream_payload = dict(result.get("downstream") or {})
         last_synced_at = result.get("downstream_status_synced_at")
@@ -14907,7 +15005,7 @@ class TaskManager:
             downstream_cancel_phase=self._string_or_none(downstream_payload.get("cancel_phase")),
             downstream_summary=self._stage_item_downstream_summary(item, result=result),
             input_ref=item.input_ref,
-            output_ref=item.output_ref,
+            output_ref=output_ref,
             result=result,
             error_message=item.error_message,
             abnormal_reason=self._stage_item_abnormal_reason(item),
@@ -15754,8 +15852,6 @@ class TaskManager:
         modules = self._parse_system_analysis_modules(artifact_root, firmware, result_payload)
         item.result = {
             **self._lightweight_system_analysis_input(firmware),
-            "artifact_root": str(artifact_root),
-            "archive_root": str(artifact_root),
             "modules": self._lightweight_modules_for_storage(modules),
             "module_count": len(modules),
             "downstream": self._lightweight_downstream_payload(payload),
@@ -15787,11 +15883,9 @@ class TaskManager:
             downstream_service=item.downstream_service,
         )
         runtime_output_path = str(metadata_sources[0]) if metadata_sources else ""
-        unpacked_root = str(archived_dir) if archived_dir else str(
-            (item.output_ref or {}).get("archive_root")
-            or result.get("archive_root")
-            or result.get("unpacked_root")
-            or runtime_output_path
+        unpacked_root = str(archived_dir) if archived_dir else (
+            self._stage_item_archive_root(item)
+            or str(result.get("unpacked_root") or runtime_output_path)
         )
         item.result = {
             **result,
@@ -16083,12 +16177,7 @@ class TaskManager:
             }
             if not module["module_key"] or not module["module_name"]:
                 continue
-            artifact_root_value = (
-                output_ref.get("artifact_root")
-                or output_ref.get("archive_root")
-                or result.get("artifact_root")
-                or result.get("archive_root")
-            )
+            artifact_root_value = self._stage_item_artifact_root(item)
             entries = [dict(entry) for entry in result.get("entries") or [] if isinstance(entry, dict)]
             if artifact_root_value:
                 artifact_root = Path(str(artifact_root_value))
@@ -16144,12 +16233,17 @@ class TaskManager:
             for item in items
             if item.status in {"failed", "cancelled", "downstream_missing"}
         ]
+        archive_jobs_by_item = self._stage_archive_jobs_by_item(db, task.id, "system_analysis")
         all_modules: list[dict[str, Any]] = []
         for item in items:
             if item.status != "success":
                 continue
             result = dict(item.result or {})
-            item_modules = self._system_analysis_modules_from_item(task, item)
+            item_modules = self._system_analysis_modules_from_item(
+                task,
+                item,
+                archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []),
+            )
             all_modules.extend(item_modules)
             success.append({**result, "modules": self._lightweight_modules_for_storage(item_modules), "module_count": len(item_modules)})
         status = self._aggregate_item_statuses([item.status for item in items])
@@ -16662,12 +16756,7 @@ class TaskManager:
                 **self._entry_contract_fields(output_ref),
                 "module_key": str(result.get("module_key") or input_ref.get("module_key") or item.item_key or ""),
                 "module_name": str(result.get("module_name") or input_ref.get("module_name") or item.item_name or ""),
-                "artifact_root": (
-                    output_ref.get("artifact_root")
-                    or output_ref.get("archive_root")
-                    or result.get("artifact_root")
-                    or result.get("archive_root")
-                ),
+                "artifact_root": self._stage_item_artifact_root(item),
                 "source_dir": self._resolve_entry_source_dir({**input_ref, **result, **output_ref}) or str(task.firmware_path or ""),
             }
             entries = [dict(row) for row in result.get("entries") or [] if isinstance(row, dict)]
@@ -19950,13 +20039,16 @@ class TaskManager:
 
     def _system_analysis_inputs_from_firmware_items(self, db: Session, task: BinarySecurityTask) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
+        archive_jobs_by_item = self._stage_archive_jobs_by_item(db, task.id, "firmware_unpack")
         for item in self._stage_items(db, task.id, "firmware_unpack"):
             if self._normalize_item_status(item.status) != "success":
                 continue
             input_ref = dict(item.input_ref or {})
-            output_ref = dict(item.output_ref or {})
             result = dict(item.result or {})
-            archive_root = str(output_ref.get("archive_root") or output_ref.get("unpacked_root") or result.get("archive_root") or result.get("unpacked_root") or "").strip()
+            archive_root = self._stage_item_archive_root(
+                item,
+                archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []),
+            )
             candidate = self._normalize_system_analysis_input(
                 {
                     **input_ref,
@@ -20223,8 +20315,6 @@ class TaskManager:
             modules = self._parse_system_analysis_modules(archive_root, firmware, result_payload)
             result = {
                 **self._lightweight_system_analysis_input(firmware),
-                "artifact_root": str(archive_root),
-                "archive_root": str(archive_root),
                 "module_count": len(modules),
                 "modules_file": str(archive_root / "system_analysis_modules.json"),
                 "modules_preview": self._lightweight_modules_for_storage(modules),
@@ -20456,9 +20546,15 @@ class TaskManager:
             )
         return rows
 
-    def _system_analysis_modules_from_item(self, task: BinarySecurityTask, item: BinarySecurityStageItem) -> list[dict[str, Any]]:
+    def _system_analysis_modules_from_item(
+        self,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        archive_jobs: list[BinarySecurityArchiveJob] | None = None,
+    ) -> list[dict[str, Any]]:
         result = dict(item.result or {})
-        artifact_root = Path(str((item.output_ref or {}).get("archive_root") or result.get("archive_root") or result.get("artifact_root") or ""))
+        artifact_root = Path(self._stage_item_artifact_root(item, archive_jobs=archive_jobs))
         modules_file = artifact_root / "system_analysis_modules.json"
         if modules_file.is_file():
             try:
@@ -21830,7 +21926,6 @@ class TaskManager:
                 entries = archived_entries
             result = {
                 **entry_input,
-                "artifact_root": str(archived_dir),
                 "entries": entries,
                 "source_dir": entry_input["source_dir"],
                 "downstream": payload,
@@ -22995,7 +23090,6 @@ class TaskManager:
                 **dataflow_result,
                 "workspace_root": artifacts.get("workspace_root"),
                 "artifact_files": artifacts.get("files", []),
-                "archive_root": str(archived_dir),
                 "downstream": self._lightweight_downstream_payload(payload),
                 "artifacts": artifacts,
             }
