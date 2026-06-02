@@ -203,6 +203,26 @@ HEARTBEAT_UPDATES_TOTAL = Counter(
     "Total task heartbeat update attempts.",
     labelnames=("result",),
 )
+DISPATCH_RECLAIM_TOTAL = Counter(
+    "secflow_binary_security_dispatch_reclaim_total",
+    "Total parent task dispatch reclaim outcomes by reason.",
+    labelnames=("reason",),
+)
+RUNNING_REQUEUE_TOTAL = Counter(
+    "secflow_binary_security_running_requeue_total",
+    "Total running-task requeue outcomes by reason.",
+    labelnames=("reason",),
+)
+RUNTIME_LEASE_OWNER_MISMATCH_TOTAL = Counter(
+    "secflow_binary_security_runtime_lease_owner_mismatch_total",
+    "Total runtime lease owner mismatch or stale-owner recoveries.",
+    labelnames=("reason",),
+)
+STREAMING_PARENT_RECOVERED_TOTAL = Counter(
+    "secflow_binary_security_streaming_parent_recovered_total",
+    "Total streaming-tail parent state recoveries.",
+    labelnames=("stage", "from_status"),
+)
 TASK_HEARTBEAT_CANDIDATES = Gauge(
     "secflow_binary_security_task_heartbeat_candidates",
     "Current number of task heartbeat candidates owned by this pod.",
@@ -610,6 +630,25 @@ def observe_archive_reclaim(result: str) -> None:
 
 def observe_heartbeat_update(result: str) -> None:
     HEARTBEAT_UPDATES_TOTAL.labels(result=result).inc()
+
+
+def observe_dispatch_reclaim(reason: str) -> None:
+    DISPATCH_RECLAIM_TOTAL.labels(reason=str(reason or "unknown")).inc()
+
+
+def observe_running_requeue(reason: str) -> None:
+    RUNNING_REQUEUE_TOTAL.labels(reason=str(reason or "unknown")).inc()
+
+
+def observe_runtime_lease_owner_mismatch(reason: str) -> None:
+    RUNTIME_LEASE_OWNER_MISMATCH_TOTAL.labels(reason=str(reason or "unknown")).inc()
+
+
+def observe_streaming_parent_recovered(*, stage: str, from_status: str) -> None:
+    STREAMING_PARENT_RECOVERED_TOTAL.labels(
+        stage=str(stage or "unknown"),
+        from_status=str(from_status or "unknown"),
+    ).inc()
 
 
 def observe_task_heartbeat_candidates(count: int) -> None:

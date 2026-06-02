@@ -45,6 +45,7 @@ from app.model import (
     BinarySecurityStageItem,
     BinarySecurityStageRun,
     BinarySecurityStateEvent,
+    BinarySecurityCoordinatorLease,
     BinarySecurityTask,
     BinarySecurityTaskStateLease,
     BinarySecurityTaskRuntimeLease,
@@ -64,8 +65,11 @@ from app.observability import (
     observe_control_operation_superseded,
     observe_archive_job_statuses,
     observe_downstream_reconcile_observation,
+    observe_dispatch_reclaim,
     observe_heartbeat_update,
     observe_queue_depths,
+    observe_running_requeue,
+    observe_runtime_lease_owner_mismatch,
     observe_scheduler_loop,
     observe_slot_usage,
     observe_stage_duration,
@@ -88,6 +92,7 @@ from app.observability import (
     observe_task_lifecycle,
     observe_task_operation,
     observe_worker_counts,
+    observe_streaming_parent_recovered,
     render_metrics,
 )
 from app.schemas import (
@@ -880,6 +885,7 @@ PIPELINE_MODE_BARRIER = "barrier"
 PIPELINE_MODE_MIXED_STREAMING = "mixed_streaming"
 STREAMING_TAIL_STAGES = ("entry_analysis", "dataflow_analysis", "vuln_scan")
 STREAMING_ACTIVE_ITEM_STATUSES = frozenset({"pending", "queued", "dispatching", "running"})
+PARENT_RECLAIM_COORDINATOR_LEASE = "parent_reclaim"
 
 
 class StaleTaskExecution(RuntimeError):
@@ -1348,6 +1354,15 @@ class TaskManager:
     def _next_runtime_lease_expiry(self, *, now_value: datetime | None = None) -> datetime:
         return (now_value or _now()) + timedelta(seconds=self._task_lease_ttl_seconds())
 
+    def _coordinator_lease_ttl_seconds(self) -> int:
+        configured = getattr(self.cfg.scheduler, "coordinator_lease_ttl_seconds", None)
+        if configured is None:
+            return max(30, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15) * 4)
+        try:
+            return max(30, int(configured))
+        except (TypeError, ValueError):
+            return max(30, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15) * 4)
+
     def _runtime_lease_for_task(self, db: Session, task_id: str) -> BinarySecurityTaskRuntimeLease | None:
         normalized_task_id = str(task_id or "").strip()
         if not normalized_task_id:
@@ -1358,13 +1373,17 @@ class TaskManager:
             .first()
         )
 
-    def _clear_runtime_lease(self, db: Session, task_id: str) -> None:
+    def _clear_runtime_lease(self, db: Session, task_id: str, *, owner_instance_id: str | None = None) -> None:
         normalized_task_id = str(task_id or "").strip()
         if not normalized_task_id:
             return
-        db.query(BinarySecurityTaskRuntimeLease).filter(
+        query = db.query(BinarySecurityTaskRuntimeLease).filter(
             BinarySecurityTaskRuntimeLease.task_id == normalized_task_id
-        ).delete(synchronize_session=False)
+        )
+        normalized_owner = str(owner_instance_id or "").strip()
+        if normalized_owner:
+            query = query.filter(BinarySecurityTaskRuntimeLease.owner_instance_id == normalized_owner)
+        query.delete(synchronize_session=False)
 
     def _upsert_runtime_lease(
         self,
@@ -1397,12 +1416,76 @@ class TaskManager:
         remaining = _seconds_until(lease.lease_expires_at)
         return remaining is not None and remaining > 0
 
+    def _runtime_lease_context(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> tuple[BinarySecurityTaskRuntimeLease | None, str | None, datetime | None]:
+        lease = self._runtime_lease_for_task(db, task.id)
+        owner: str | None = None
+        if lease is not None:
+            owner = str(lease.owner_instance_id or "").strip() or None
+        expires_at = lease.lease_expires_at if lease is not None else task.lease_expires_at
+        return lease, owner, expires_at
+
+    def _acquire_coordinator_lease(self, lease_name: str) -> bool:
+        normalized_name = str(lease_name or "").strip()
+        if not normalized_name:
+            return False
+        now_value = _now()
+        lease_expires_at = now_value + timedelta(seconds=self._coordinator_lease_ttl_seconds())
+        table_name = BinarySecurityCoordinatorLease.__tablename__
+        with get_engine().begin() as connection:
+            updated = connection.execute(
+                text(
+                    f"""
+                    UPDATE {table_name}
+                       SET owner_instance_id = :owner,
+                           heartbeat_at = :now_value,
+                           lease_expires_at = :lease_expires_at,
+                           updated_at = :now_value
+                     WHERE lease_name = :lease_name
+                       AND (
+                            owner_instance_id = :owner
+                            OR lease_expires_at IS NULL
+                            OR lease_expires_at <= :now_value
+                       )
+                    """
+                ),
+                {
+                    "owner": self.instance_id,
+                    "now_value": now_value,
+                    "lease_expires_at": lease_expires_at,
+                    "lease_name": normalized_name,
+                },
+            )
+            if int(getattr(updated, "rowcount", 0) or 0) > 0:
+                return True
+            try:
+                connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO {table_name}
+                            (lease_name, owner_instance_id, heartbeat_at, lease_expires_at, created_at, updated_at)
+                        VALUES
+                            (:lease_name, :owner, :now_value, :lease_expires_at, :now_value, :now_value)
+                        """
+                    ),
+                    {
+                        "lease_name": normalized_name,
+                        "owner": self.instance_id,
+                        "now_value": now_value,
+                        "lease_expires_at": lease_expires_at,
+                    },
+                )
+                return True
+            except IntegrityError:
+                return False
+
     def _should_keep_task_heartbeat(self, db: Session, task: BinarySecurityTask | None) -> bool:
         if task is None:
             return False
         if str(task.status or "").strip().lower() != "running":
-            return False
-        if str(task.dispatcher_instance_id or "").strip() != self.instance_id:
             return False
         if str(task.status or "").strip() == TASK_STATUS_CANCELLING:
             return False
@@ -1418,7 +1501,6 @@ class TaskManager:
         task = session.query(BinarySecurityTask).filter(
             BinarySecurityTask.id == task_id,
             BinarySecurityTask.status == "running",
-            BinarySecurityTask.dispatcher_instance_id == self.instance_id,
         ).first()
         if task is not None:
             self._upsert_runtime_lease(session, task, now_value=now_value, owner_instance_id=self.instance_id)
@@ -1446,7 +1528,7 @@ class TaskManager:
                 if not self._should_keep_task_heartbeat(session, task):
                     if not self._has_local_task_execution_owner(task_id):
                         self._last_task_heartbeat_at.pop(task_id, None)
-                        self._clear_runtime_lease(session, task_id)
+                        self._clear_runtime_lease(session, task_id, owner_instance_id=self.instance_id)
                         session.commit()
                     observe_heartbeat_update("controller_skipped")
                     continue
@@ -4636,11 +4718,20 @@ class TaskManager:
         if not force and self._last_queue_reconcile_at and (now - self._last_queue_reconcile_at).total_seconds() < interval:
             return
         self._last_queue_reconcile_at = now
-        stale_dispatching_reclaimed = self._reclaim_stale_dispatching_locked(db)
-        stale_stage_item_reclaimed = self._reclaim_stale_streaming_stage_items_locked(db)
-        stale_running_reclaimed = self._reclaim_stale_running_locked(db)
-        released_running_requeued = self._requeue_released_running_locked(db)
-        if stale_dispatching_reclaimed or stale_stage_item_reclaimed or stale_running_reclaimed or released_running_requeued:
+        (
+            stale_dispatching_reclaimed,
+            stale_stage_item_reclaimed,
+            stale_running_reclaimed,
+            released_running_requeued,
+            recovered_missing_terminal_events,
+        ) = self._run_parent_reclaim_pass(db)
+        if (
+            stale_dispatching_reclaimed
+            or stale_stage_item_reclaimed
+            or stale_running_reclaimed
+            or released_running_requeued
+            or recovered_missing_terminal_events
+        ):
             # Persist the reclaimed task state before seeding Redis queues.
             # Otherwise the surrounding loop closes the session and rolls the
             # reclaim back, leaving tasks permanently stuck on dead workers.
@@ -4666,6 +4757,26 @@ class TaskManager:
             await get_task_queue().push_task(task_id)
         for operation_id in operation_ids:
             await get_task_queue().push_operation(operation_id)
+
+    def _run_parent_reclaim_pass(self, db: Session) -> tuple[bool, bool, bool, bool, bool]:
+        if not isinstance(db, Session):
+            return (
+                self._reclaim_stale_dispatching_locked(db),
+                self._reclaim_stale_streaming_stage_items_locked(db),
+                self._reclaim_stale_running_locked(db),
+                self._requeue_released_running_locked(db),
+                self._recover_missing_stage_terminal_events_locked(db),
+            )
+        if not self._acquire_coordinator_lease(PARENT_RECLAIM_COORDINATOR_LEASE):
+            return False, False, False, False, False
+        return (
+            self._reclaim_stale_dispatching_locked(db),
+            self._reclaim_stale_streaming_stage_items_locked(db),
+            self._reclaim_stale_running_locked(db),
+            self._requeue_released_running_locked(db),
+            self._recover_missing_stage_terminal_events_locked(db),
+        )
+
     async def sync_downstream_status(
         self,
         db: Session,
@@ -10170,11 +10281,13 @@ class TaskManager:
             raise
 
     def _dispatch_once(self, db: Session) -> list[str]:
-        stale_reclaimed = self._reclaim_stale_dispatching_locked(db)
-        stale_stage_item_reclaimed = self._reclaim_stale_streaming_stage_items_locked(db)
-        stale_running_reclaimed = self._reclaim_stale_running_locked(db)
-        released_running_requeued = self._requeue_released_running_locked(db)
-        recovered_missing_terminal_events = self._recover_missing_stage_terminal_events_locked(db)
+        (
+            stale_reclaimed,
+            stale_stage_item_reclaimed,
+            stale_running_reclaimed,
+            released_running_requeued,
+            recovered_missing_terminal_events,
+        ) = self._run_parent_reclaim_pass(db)
         service_config = self._load_service_config(db)
         active_count = self._active_dispatch_count(db)
         slots = max(0, service_config.max_concurrent_tasks - active_count)
@@ -10184,11 +10297,7 @@ class TaskManager:
         return claimed_ids
 
     def _dispatch_task_by_id(self, db: Session, task_id: str) -> str | None:
-        self._reclaim_stale_dispatching_locked(db)
-        self._reclaim_stale_streaming_stage_items_locked(db)
-        self._reclaim_stale_running_locked(db)
-        self._requeue_released_running_locked(db)
-        self._recover_missing_stage_terminal_events_locked(db)
+        self._run_parent_reclaim_pass(db)
         service_config = self._load_service_config(db)
         active_count = self._active_dispatch_count(db)
         if active_count >= service_config.max_concurrent_tasks:
@@ -10296,7 +10405,7 @@ class TaskManager:
                     or str(task.status or "").strip().lower() in TASK_TERMINAL_STATUSES
                     or (not self._has_local_task_execution_owner(task_id) and not self._task_has_active_streaming_stage_workers(task_id))
                 ):
-                    self._clear_runtime_lease(cleanup_db, task_id)
+                    self._clear_runtime_lease(cleanup_db, task_id, owner_instance_id=self.instance_id)
                     cleanup_db.commit()
             except Exception:
                 cleanup_db.rollback()
@@ -10660,10 +10769,10 @@ class TaskManager:
             return False
         if self._streaming_mode_enabled(task) and self._is_streaming_tail_stage(task, task.current_stage):
             return False
+        if self._has_local_task_execution_owner(task.id) or self._task_has_active_streaming_stage_workers(task.id):
+            return False
         if not str(task.dispatcher_instance_id or "").strip():
             return True
-        if str(task.dispatcher_instance_id or "").strip() == self.instance_id and self._has_local_task_execution_owner(task.id):
-            return False
         if not self._lease_is_active(task, db=db):
             return True
         lease = self._runtime_lease_for_task(db, task.id)
@@ -10989,6 +11098,12 @@ class TaskManager:
                 continue
             if task.id in local_workers and str(task.dispatcher_instance_id or "").strip() == self.instance_id:
                 continue
+            lease, runtime_lease_owner, runtime_lease_expires_at = self._runtime_lease_context(db, task)
+            if self._runtime_lease_is_active(lease):
+                continue
+            active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
+            if active_item_count > 0:
+                continue
             lease_remaining = _seconds_until(task.lease_expires_at)
             if lease_remaining is None:
                 elapsed_seconds = _elapsed_seconds_since(task.dispatch_started_at)
@@ -10996,17 +11111,33 @@ class TaskManager:
                     continue
             elif lease_remaining > 0:
                 continue
+            dispatcher_instance_id = str(task.dispatcher_instance_id or "").strip() or None
+            dispatch_started_at = task.dispatch_started_at
+            task_lease_expires_at = task.lease_expires_at
             task.status = "pending"
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
             task.lease_expires_at = None
             task.last_error = None
+            observe_dispatch_reclaim("dispatch_timeout")
             self._record_event(
                 db,
                 task,
                 "dispatch_reclaimed",
                 "调度超时，任务已回收并重新进入队列",
                 level="warning",
+                stage_name=task.current_stage,
+                payload={
+                    "dispatcher_instance_id": dispatcher_instance_id,
+                    "dispatch_started_at": _isoformat_or_none(dispatch_started_at),
+                    "task_lease_expires_at": _isoformat_or_none(task_lease_expires_at),
+                    "runtime_lease_owner": runtime_lease_owner,
+                    "runtime_lease_expires_at": _isoformat_or_none(runtime_lease_expires_at),
+                    "active_stage_name": active_stage_name or task.current_stage,
+                    "active_item_count": active_item_count,
+                    "reclaim_reason": "dispatch_timeout",
+                    "has_downstream_refs": has_downstream_refs,
+                },
             )
             reclaimed = True
         if reclaimed:
@@ -11098,10 +11229,10 @@ class TaskManager:
                 continue
             if task.id in local_workers and str(task.dispatcher_instance_id or "").strip() == self.instance_id:
                 continue
-            lease = self._runtime_lease_for_task(db, task.id)
+            lease, runtime_lease_owner, runtime_lease_expires_at = self._runtime_lease_context(db, task)
             heartbeat_at = (lease.heartbeat_at if lease is not None else None) or task.updated_at or task.dispatch_started_at
             elapsed_seconds = _elapsed_seconds_since(heartbeat_at)
-            lease_remaining = _seconds_until(lease.lease_expires_at) if lease is not None else _seconds_until(task.lease_expires_at)
+            lease_remaining = _seconds_until(runtime_lease_expires_at)
             if lease_remaining is not None and lease_remaining > 0:
                 continue
             if elapsed_seconds is None or elapsed_seconds < max(timeout_seconds, self._task_reclaim_grace_seconds()):
@@ -11109,6 +11240,13 @@ class TaskManager:
             if self._has_local_task_execution_owner(task.id) or self._task_has_active_streaming_stage_workers(task.id):
                 continue
             stage_name = task.current_stage or self._stage_sequence_for_task(task)[0]
+            if self._recover_streaming_parent_running_state_locked(
+                db,
+                task,
+                reason="stale_running_reconcile",
+            ):
+                observe_runtime_lease_owner_mismatch("expired_runtime_lease_with_active_tail")
+                continue
             stage_run = db.query(BinarySecurityStageRun).filter(
                 BinarySecurityStageRun.task_id == task.id,
                 BinarySecurityStageRun.stage_name == stage_name,
@@ -11142,6 +11280,8 @@ class TaskManager:
                         "queued_only": queued_only,
                         "has_downstream_refs": has_downstream_refs,
                         "active_item_count": len(active_items),
+                        "runtime_lease_owner": runtime_lease_owner,
+                        "runtime_lease_expires_at": _isoformat_or_none(runtime_lease_expires_at),
                     },
                 )
                 reclaimed = True
@@ -11236,17 +11376,31 @@ class TaskManager:
         for task in released_rows:
             if self._task_has_active_cancel_operation(db, task) or str(task.status or "").strip() == TASK_STATUS_CANCELLING:
                 continue
+            lease = self._runtime_lease_for_task(db, task.id)
+            if self._runtime_lease_is_active(lease):
+                continue
+            if self._has_local_task_execution_owner(task.id) or self._task_has_active_streaming_stage_workers(task.id):
+                continue
+            if self._recover_streaming_parent_running_state_locked(
+                db,
+                task,
+                reason="released_running_reconcile",
+            ):
+                observe_runtime_lease_owner_mismatch("released_running_with_active_tail")
+                continue
             stage_name = task.current_stage or self._stage_sequence_for_task(task)[0]
             active_items = db.query(BinarySecurityStageItem).filter(
                 BinarySecurityStageItem.task_id == task.id,
                 BinarySecurityStageItem.stage_name == stage_name,
                 BinarySecurityStageItem.status.in_(["pending", "queued", "running"]),
             ).all()
-            if not active_items:
+            has_downstream_refs = any(str(item.downstream_task_id or "").strip() for item in active_items)
+            if active_items or has_downstream_refs:
                 continue
             task.status = "pending"
             task.updated_at = _now()
             task.last_error = None
+            observe_running_requeue("released_without_owner")
             self._record_event(
                 db,
                 task,
@@ -11257,6 +11411,8 @@ class TaskManager:
                 payload={
                     "stage_name": stage_name,
                     "active_item_count": len(active_items),
+                    "runtime_lease_owner": None,
+                    "runtime_lease_stale": True,
                 },
             )
             requeued = True
@@ -12082,6 +12238,75 @@ class TaskManager:
         if not active_item_ids:
             return False
         return bool(active_worker_item_ids.intersection(active_item_ids))
+
+    def _streaming_tail_active_context(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> tuple[str | None, int, bool]:
+        if not self._streaming_mode_enabled(task):
+            return None, 0, False
+        active_stage_name: str | None = None
+        active_item_count = 0
+        has_downstream_refs = False
+        for stage_name in self._streaming_tail_stage_names(task):
+            items = self._stage_items(db, task.id, stage_name)
+            active_items = [item for item in items if self._is_streaming_active_item_status(item.status)]
+            if active_items and active_stage_name is None:
+                active_stage_name = stage_name
+            active_item_count += len(active_items)
+            if any(str(item.downstream_task_id or "").strip() for item in active_items):
+                has_downstream_refs = True
+        return active_stage_name, active_item_count, has_downstream_refs
+
+    def _task_has_active_streaming_tail_state(self, db: Session, task: BinarySecurityTask) -> bool:
+        _, active_item_count, _ = self._streaming_tail_active_context(db, task)
+        return active_item_count > 0
+
+    def _recover_streaming_parent_running_state_locked(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        record_event: bool = False,
+        reason: str | None = None,
+    ) -> bool:
+        active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
+        if active_item_count <= 0:
+            return False
+        previous_status = str(task.status or "").strip()
+        previous_dispatcher = str(task.dispatcher_instance_id or "").strip() or None
+        task.status = "running"
+        task.current_stage = active_stage_name or task.current_stage
+        task.dispatcher_instance_id = None
+        task.dispatch_started_at = None
+        task.lease_expires_at = None
+        task.finished_at = None
+        task.last_error = None
+        self._clear_task_abnormal_reason_snapshot(db, task)
+        if record_event:
+            self._record_event(
+                db,
+                task,
+                "streaming_parent_state_recovered",
+                f"流式尾段存在活跃子项，父任务状态已收敛为 running: {task.current_stage}",
+                level="warning",
+                stage_name=task.current_stage,
+                payload={
+                    "from_status": previous_status,
+                    "to_status": "running",
+                    "active_stage_name": task.current_stage,
+                    "active_item_count": active_item_count,
+                    "had_downstream_refs": has_downstream_refs,
+                    "previous_dispatcher_instance_id": previous_dispatcher,
+                    "reason": reason,
+                },
+            )
+            observe_streaming_parent_recovered(
+                stage=str(task.current_stage or "unknown"),
+                from_status=previous_status or "unknown",
+            )
+        return True
 
     def _task_operation_token(self) -> str:
         return uuid.uuid4().hex
@@ -16655,6 +16880,13 @@ class TaskManager:
             ):
                 self._refresh_stage_from_authoritative_items(db, task, stage_name)
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+        if self._recover_streaming_parent_running_state_locked(
+            db,
+            task,
+            record_event=current_status == "dispatching",
+            reason="refresh_task_status_after_sync",
+        ):
+            return
         statuses = [run.status for run in stage_runs]
         vuln_run = next((run for run in stage_runs if run.stage_name == "vuln_scan"), None)
         if any(status in {"running", "dispatching"} for status in statuses):

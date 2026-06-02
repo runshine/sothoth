@@ -22124,6 +22124,30 @@ def _test_task_heartbeat_controller_skips_task_without_owner(self):
         task_manager_module.get_session_factory = original_factory
 
 
+def _test_task_heartbeat_controller_refreshes_running_task_without_dispatcher_ownership(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-3",
+        project_id="p1",
+        status="running",
+        dispatcher_instance_id="other-worker",
+        dispatch_started_at=_now(),
+        lease_expires_at=_now() + timedelta(seconds=5),
+    )
+    db = _AppendingModelAwareDb(tasks=[task])
+    original_factory = task_manager_module.get_session_factory
+    try:
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+        manager._register_task_execution_owner(task.id, "primary_task_worker")
+        original_lease = task.lease_expires_at
+        manager._refresh_task_heartbeats_once()
+        self.assertEqual(1, len(db.runtime_leases))
+        self.assertEqual(manager.instance_id, db.runtime_leases[0].owner_instance_id)
+        self.assertGreater(task.lease_expires_at, original_lease)
+    finally:
+        task_manager_module.get_session_factory = original_factory
+
+
 def _test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged(self):
     manager = TaskManager()
     item = BinarySecurityStageItem(
@@ -22366,6 +22390,100 @@ def _test_task_list_response_exposes_runtime_lease_and_sync_view(self):
     self.assertEqual("temporary timeout", response.last_sync_error_message)
 
 
+def _test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-streaming-recover",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-z",
+        dispatch_started_at=_now() - timedelta(minutes=3),
+        lease_expires_at=_now() - timedelta(seconds=10),
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    system_run = BinarySecurityStageRun(
+        id="sr-sys",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="system_analysis",
+        sequence_no=1,
+        status="success",
+    )
+    entry_run = BinarySecurityStageRun(
+        id="sr-entry",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="entry_analysis",
+        sequence_no=2,
+        status="pending",
+    )
+    item = BinarySecurityStageItem(
+        id="si-entry",
+        task_id=task.id,
+        project_id="p1",
+        stage_run_id="sr-entry",
+        stage_name="entry_analysis",
+        item_key="module-a",
+        item_name="module-a",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[system_run, entry_run], stage_items=[item], events=[])
+
+    manager._refresh_task_status_after_sync(db, task)
+
+    self.assertEqual("running", task.status)
+    self.assertEqual("entry_analysis", task.current_stage)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+    self.assertTrue(any(event.event_type == "streaming_parent_state_recovered" for event in db.events))
+
+
+def _test_requeue_released_running_locked_skips_streaming_tail_with_active_items(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-tail-active",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    item = BinarySecurityStageItem(
+        id="si-tail-active",
+        task_id=task.id,
+        project_id="p1",
+        stage_run_id="sr-entry",
+        stage_name="entry_analysis",
+        item_key="module-a",
+        item_name="module-a",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+    changed = manager._requeue_released_running_locked(db)
+
+    self.assertFalse(changed)
+    self.assertEqual("running", task.status)
+    self.assertFalse(any(event.event_type == "running_execution_requeued" for event in db.events))
+
+
 TaskManagerTests.test_stage_item_response_falls_back_to_downstream_payload_status = _test_stage_item_response_falls_back_to_downstream_payload_status
 TaskManagerTests.test_task_reconcile_candidate_items_scans_all_stages_with_downstream_refs = _test_task_reconcile_candidate_items_scans_all_stages_with_downstream_refs
 TaskManagerTests.test_task_sync_cooldown_elapsed_uses_all_candidate_items = _test_task_sync_cooldown_elapsed_uses_all_candidate_items
@@ -22381,12 +22499,15 @@ TaskManagerTests.test_downstream_clients_use_scheduler_request_timeout = _test_d
 TaskManagerTests.test_service_base_urls_use_service_roots = _test_service_base_urls_use_service_roots
 TaskManagerTests.test_task_heartbeat_controller_refreshes_owned_running_task = _test_task_heartbeat_controller_refreshes_owned_running_task
 TaskManagerTests.test_task_heartbeat_controller_skips_task_without_owner = _test_task_heartbeat_controller_skips_task_without_owner
+TaskManagerTests.test_task_heartbeat_controller_refreshes_running_task_without_dispatcher_ownership = _test_task_heartbeat_controller_refreshes_running_task_without_dispatcher_ownership
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_locally_owned_running_task = _test_task_needs_downstream_reconcile_skips_locally_owned_running_task
 TaskManagerTests.test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged = _test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged
 TaskManagerTests.test_active_operation_ignores_expired_claim_lease = _test_active_operation_ignores_expired_claim_lease
 TaskManagerTests.test_persist_child_sync_observation_records_observation_persist_failed = _test_persist_child_sync_observation_records_observation_persist_failed
 TaskManagerTests.test_apply_child_state_with_savepoint_records_state_apply_failed = _test_apply_child_state_with_savepoint_records_state_apply_failed
 TaskManagerTests.test_task_list_response_exposes_runtime_lease_and_sync_view = _test_task_list_response_exposes_runtime_lease_and_sync_view
+TaskManagerTests.test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent = _test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent
+TaskManagerTests.test_requeue_released_running_locked_skips_streaming_tail_with_active_items = _test_requeue_released_running_locked_skips_streaming_tail_with_active_items
 
 
 if __name__ == "__main__":
