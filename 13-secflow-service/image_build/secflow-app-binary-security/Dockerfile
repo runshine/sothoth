@@ -1,13 +1,20 @@
-FROM mcr.microsoft.com/devcontainers/python:1-3.11-bookworm
+FROM public.ecr.aws/docker/library/python:3.11-slim
 
 WORKDIR /app
 
 ARG SECFLOW_BUILD_VERSION=""
-ENV TZ=Asia/Shanghai
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+ENV TZ=Asia/Shanghai \
+    VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:$PATH"
 
-RUN python -m venv /app/venv
-ENV PATH="/app/venv/bin:$PATH"
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo $TZ > /etc/timezone \
+    && python -m venv "${VIRTUAL_ENV}"
 
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r /app/requirements.txt

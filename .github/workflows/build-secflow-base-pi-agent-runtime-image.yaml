@@ -1,0 +1,78 @@
+name: build-secflow-base-pi-agent-runtime-image
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'v2.*'
+    paths:
+      - .github/workflows/build-secflow-base-pi-agent-runtime-image.yaml
+      - 13-secflow-service/image_build/secflow-base-pi-agent-runtime/**
+      - 13-secflow-service/image_build/secflow-base-python311-runtime/**
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      date_tag: ${{ steps.date.outputs.date_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+      - name: Generate date tag
+        id: date
+        env:
+          MAIN_REPO_SHA: ${{ github.sha }}
+        run: |
+          SHORT_SHA="${MAIN_REPO_SHA::7}"
+          COMMIT_TS="$(git show -s --format=%ct "${MAIN_REPO_SHA}")"
+          DATE_TAG="$(TZ=Asia/Shanghai date -d "@${COMMIT_TS}" +'%Y%m%d-%H%M%S')-${SHORT_SHA}"
+          echo "date_tag=${DATE_TAG}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./13-secflow-service/image_build/secflow-base-pi-agent-runtime
+          file: ./13-secflow-service/image_build/secflow-base-pi-agent-runtime/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }}
+            SECFLOW_PYTHON_RUNTIME_IMAGE=ghcr.io/runshine/secflow-base-python311-runtime:20260602
+          cache-from: type=gha,scope=secflow-base-pi-agent-runtime
+          cache-to: type=gha,scope=secflow-base-pi-agent-runtime,mode=max
+          tags: |
+            ghcr.io/runshine/secflow-base-pi-agent-runtime:latest
+            ghcr.io/runshine/secflow-base-pi-agent-runtime:20260602
+            ghcr.io/runshine/secflow-base-pi-agent-runtime:${{ needs.prepare.outputs.date_tag }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/secflow-base-pi-agent-runtime:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/secflow-base-pi-agent-runtime:20260602
+            ${{ secrets.DOCKERHUB_USERNAME }}/secflow-base-pi-agent-runtime:${{ needs.prepare.outputs.date_tag }}

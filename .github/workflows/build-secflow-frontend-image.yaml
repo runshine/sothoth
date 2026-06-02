@@ -44,27 +44,26 @@ jobs:
         with:
           submodules: 'true'
           token: ${{ secrets.PRIVATE_REPO_PAT }}
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
       - name: Login to Docker Hub
         run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
 
       - name: Login to GitHub Container Registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
 
-      - name: Build amd64 image
+      - name: Build and push amd64 image
         run: |
-          docker build \
+          docker buildx build \
+            --platform linux/amd64 \
             --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
+            --cache-from type=gha,scope=secflow-frontend-amd64 \
+            --cache-to type=gha,scope=secflow-frontend-amd64,mode=max \
             --file ./13-secflow-service/image_build/secflow-frontend/Dockerfile \
             --tag ghcr.io/runshine/secflow-frontend:amd64-latest \
             --tag ghcr.io/runshine/secflow-frontend:amd64-${{ needs.prepare.outputs.date_tag }} \
+            --push \
             ./13-secflow-service/image_build/secflow-frontend/
-
-      - name: Push amd64 image
-        run: |
-          # docker push runshine0819/secflow-frontend:amd64-latest
-          docker push ghcr.io/runshine/secflow-frontend:amd64-latest
-          # docker push runshine0819/secflow-frontend:amd64-${{ needs.prepare.outputs.date_tag }}
-          docker push ghcr.io/runshine/secflow-frontend:amd64-${{ needs.prepare.outputs.date_tag }}
 
   build-arm64:
     needs: prepare
@@ -78,6 +77,8 @@ jobs:
         with:
           submodules: 'true'
           token: ${{ secrets.PRIVATE_REPO_PAT }}
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: clean to default
         run: sed -i 's/https:\/\/secflow.819819.xyz//g' ./13-secflow-service/image_build/secflow-frontend/clients/base.ts
@@ -93,21 +94,18 @@ jobs:
       - name: Login to GitHub Container Registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
 
-      - name: Build arm64 image
+      - name: Build and push arm64 image
         run: |
-          docker build \
+          docker buildx build \
+            --platform linux/arm64 \
             --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
+            --cache-from type=gha,scope=secflow-frontend-arm64 \
+            --cache-to type=gha,scope=secflow-frontend-arm64,mode=max \
             --file ./13-secflow-service/image_build/secflow-frontend/Dockerfile \
             --tag ghcr.io/runshine/secflow-frontend:arm64-latest \
             --tag ghcr.io/runshine/secflow-frontend:arm64-${{ needs.prepare.outputs.date_tag }} \
+            --push \
             ./13-secflow-service/image_build/secflow-frontend/
-
-      - name: Push arm64 image
-        run: |
-          # docker push runshine0819/secflow-frontend:arm64-latest
-          docker push ghcr.io/runshine/secflow-frontend:arm64-latest
-          # docker push runshine0819/secflow-frontend:arm64-${{ needs.prepare.outputs.date_tag }}
-          docker push ghcr.io/runshine/secflow-frontend:arm64-${{ needs.prepare.outputs.date_tag }}
 
   merge-manifest:
     needs: [prepare, build-amd64, build-arm64]
