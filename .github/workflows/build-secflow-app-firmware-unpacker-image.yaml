@@ -51,8 +51,8 @@ jobs:
           docker build \
             --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --file 13-secflow-service/image_build/secflow-app-firmware-unpacker/Dockerfile \
-            --tag ghcr.io/runshine/secflow-app-firmware-unpacker:latest \
-            --tag ghcr.io/runshine/secflow-app-firmware-unpacker:${{ needs.prepare.outputs.date_tag }} \
+            --tag ghcr.io/runshine/secflow-app-firmware-unpacker:amd64-latest \
+            --tag ghcr.io/runshine/secflow-app-firmware-unpacker:amd64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-app-firmware-unpacker/
 
       - name: Push amd64 image
@@ -82,8 +82,8 @@ jobs:
           docker build \
             --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --file 13-secflow-service/image_build/secflow-app-firmware-unpacker/Dockerfile \
-            --tag ghcr.io/runshine/secflow-app-firmware-unpacker:latest \
-            --tag ghcr.io/runshine/secflow-app-firmware-unpacker:${{ needs.prepare.outputs.date_tag }} \
+            --tag ghcr.io/runshine/secflow-app-firmware-unpacker:arm64-latest \
+            --tag ghcr.io/runshine/secflow-app-firmware-unpacker:arm64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-app-firmware-unpacker/
 
       - name: Push arm64 image
@@ -107,13 +107,13 @@ jobs:
       - name: Create and push multi-arch manifest (latest)
         run: |
           docker manifest create ghcr.io/runshine/secflow-app-firmware-unpacker:latest \
-            --amend ghcr.io/runshine/secflow-app-firmware-unpacker:latest \
-            --amend ghcr.io/runshine/secflow-app-firmware-unpacker:latest
+            --amend ghcr.io/runshine/secflow-app-firmware-unpacker:amd64-latest \
+            --amend ghcr.io/runshine/secflow-app-firmware-unpacker:arm64-latest
           docker manifest push ghcr.io/runshine/secflow-app-firmware-unpacker:latest
 
       - name: Create and push multi-arch manifest (date tag)
         run: |
           docker manifest create ghcr.io/runshine/secflow-app-firmware-unpacker:${{ needs.prepare.outputs.date_tag }} \
-            --amend ghcr.io/runshine/secflow-app-firmware-unpacker:${{ needs.prepare.outputs.date_tag }} \
-            --amend ghcr.io/runshine/secflow-app-firmware-unpacker:${{ needs.prepare.outputs.date_tag }}
+            --amend ghcr.io/runshine/secflow-app-firmware-unpacker:amd64-${{ needs.prepare.outputs.date_tag }} \
+            --amend ghcr.io/runshine/secflow-app-firmware-unpacker:arm64-${{ needs.prepare.outputs.date_tag }}
           docker manifest push ghcr.io/runshine/secflow-app-firmware-unpacker:${{ needs.prepare.outputs.date_tag }}

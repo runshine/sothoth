@@ -53,16 +53,16 @@ jobs:
           docker build \
             --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --file 13-secflow-service/image_build/secflow-app-binary-to-source/Dockerfile \
-            --tag ghcr.io/runshine/secflow-app-binary-to-source:latest \
-            --tag ghcr.io/runshine/secflow-app-binary-to-source:${{ needs.prepare.outputs.date_tag }} \
+            --tag ghcr.io/runshine/secflow-app-binary-to-source:amd64-latest \
+            --tag ghcr.io/runshine/secflow-app-binary-to-source:amd64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-app-binary-to-source/
 
       - name: Push amd64 image
         run: |
           # docker push runshine0819/secflow-app-binary-to-source:latest
-          docker push ghcr.io/runshine/secflow-app-binary-to-source:latest
-          # docker push runshine0819/secflow-app-binary-to-source:${{ needs.prepare.outputs.date_tag }}
-          docker push ghcr.io/runshine/secflow-app-binary-to-source:${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/secflow-app-binary-to-source:amd64-latest
+          # docker push runshine0819/secflow-app-binary-to-source:amd64-${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/secflow-app-binary-to-source:amd64-${{ needs.prepare.outputs.date_tag }}
 
   build-arm64:
     needs: prepare
@@ -86,16 +86,16 @@ jobs:
           docker build \
             --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --file 13-secflow-service/image_build/secflow-app-binary-to-source/Dockerfile \
-            --tag ghcr.io/runshine/secflow-app-binary-to-source:latest \
-            --tag ghcr.io/runshine/secflow-app-binary-to-source:${{ needs.prepare.outputs.date_tag }} \
+            --tag ghcr.io/runshine/secflow-app-binary-to-source:arm64-latest \
+            --tag ghcr.io/runshine/secflow-app-binary-to-source:arm64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-app-binary-to-source/
 
       - name: Push arm64 image
         run: |
           # docker push runshine0819/secflow-app-binary-to-source:latest
-          docker push ghcr.io/runshine/secflow-app-binary-to-source:latest
-          # docker push runshine0819/secflow-app-binary-to-source:${{ needs.prepare.outputs.date_tag }}
-          docker push ghcr.io/runshine/secflow-app-binary-to-source:${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/secflow-app-binary-to-source:arm64-latest
+          # docker push runshine0819/secflow-app-binary-to-source:arm64-${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/secflow-app-binary-to-source:arm64-${{ needs.prepare.outputs.date_tag }}
 
   merge-manifest:
     needs: [prepare, build-amd64, build-arm64]
@@ -113,21 +113,21 @@ jobs:
       - name: Create and push multi-arch manifest (latest)
         run: |
           # docker manifest create runshine0819/secflow-app-binary-to-source:latest \
-            # --amend runshine0819/secflow-app-binary-to-source:latest \
-            # --amend runshine0819/secflow-app-binary-to-source:latest
+            # --amend runshine0819/secflow-app-binary-to-source:amd64-latest \
+            # --amend runshine0819/secflow-app-binary-to-source:arm64-latest
           docker manifest create ghcr.io/runshine/secflow-app-binary-to-source:latest \
-            --amend ghcr.io/runshine/secflow-app-binary-to-source:latest \
-            --amend ghcr.io/runshine/secflow-app-binary-to-source:latest
+            --amend ghcr.io/runshine/secflow-app-binary-to-source:amd64-latest \
+            --amend ghcr.io/runshine/secflow-app-binary-to-source:arm64-latest
           # docker manifest push runshine0819/secflow-app-binary-to-source:latest
           docker manifest push ghcr.io/runshine/secflow-app-binary-to-source:latest
 
       - name: Create and push multi-arch manifest (date tag)
         run: |
           # docker manifest create runshine0819/secflow-app-binary-to-source:${{ needs.prepare.outputs.date_tag }} \
-            # --amend runshine0819/secflow-app-binary-to-source:${{ needs.prepare.outputs.date_tag }} \
-            # --amend runshine0819/secflow-app-binary-to-source:${{ needs.prepare.outputs.date_tag }}
+            # --amend runshine0819/secflow-app-binary-to-source:amd64-${{ needs.prepare.outputs.date_tag }} \
+            # --amend runshine0819/secflow-app-binary-to-source:arm64-${{ needs.prepare.outputs.date_tag }}
           docker manifest create ghcr.io/runshine/secflow-app-binary-to-source:${{ needs.prepare.outputs.date_tag }} \
-            --amend ghcr.io/runshine/secflow-app-binary-to-source:${{ needs.prepare.outputs.date_tag }} \
-            --amend ghcr.io/runshine/secflow-app-binary-to-source:${{ needs.prepare.outputs.date_tag }}
+            --amend ghcr.io/runshine/secflow-app-binary-to-source:amd64-${{ needs.prepare.outputs.date_tag }} \
+            --amend ghcr.io/runshine/secflow-app-binary-to-source:arm64-${{ needs.prepare.outputs.date_tag }}
           # docker manifest push runshine0819/secflow-app-binary-to-source:${{ needs.prepare.outputs.date_tag }}
           docker manifest push ghcr.io/runshine/secflow-app-binary-to-source:${{ needs.prepare.outputs.date_tag }}

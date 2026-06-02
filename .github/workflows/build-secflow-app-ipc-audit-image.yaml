@@ -55,8 +55,8 @@ jobs:
           docker build \
             --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --file 13-secflow-service/image_build/secflow-app-ipc-audit/Dockerfile \
-            --tag ghcr.io/runshine/secflow-app-ipc-audit:latest \
-            --tag ghcr.io/runshine/secflow-app-ipc-audit:${{ needs.prepare.outputs.date_tag }} \
+            --tag ghcr.io/runshine/secflow-app-ipc-audit:amd64-latest \
+            --tag ghcr.io/runshine/secflow-app-ipc-audit:amd64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-app-ipc-audit/
 
       - name: Push amd64 image
@@ -87,8 +87,8 @@ jobs:
           docker build \
             --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --file 13-secflow-service/image_build/secflow-app-ipc-audit/Dockerfile \
-            --tag ghcr.io/runshine/secflow-app-ipc-audit:latest \
-            --tag ghcr.io/runshine/secflow-app-ipc-audit:${{ needs.prepare.outputs.date_tag }} \
+            --tag ghcr.io/runshine/secflow-app-ipc-audit:arm64-latest \
+            --tag ghcr.io/runshine/secflow-app-ipc-audit:arm64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-app-ipc-audit/
 
       - name: Push arm64 image
@@ -112,13 +112,13 @@ jobs:
       - name: Create and push multi-arch manifest (latest)
         run: |
           docker manifest create ghcr.io/runshine/secflow-app-ipc-audit:latest \
-            --amend ghcr.io/runshine/secflow-app-ipc-audit:latest \
-            --amend ghcr.io/runshine/secflow-app-ipc-audit:latest
+            --amend ghcr.io/runshine/secflow-app-ipc-audit:amd64-latest \
+            --amend ghcr.io/runshine/secflow-app-ipc-audit:arm64-latest
           docker manifest push ghcr.io/runshine/secflow-app-ipc-audit:latest
 
       - name: Create and push multi-arch manifest (date tag)
         run: |
           docker manifest create ghcr.io/runshine/secflow-app-ipc-audit:${{ needs.prepare.outputs.date_tag }} \
-            --amend ghcr.io/runshine/secflow-app-ipc-audit:${{ needs.prepare.outputs.date_tag }} \
-            --amend ghcr.io/runshine/secflow-app-ipc-audit:${{ needs.prepare.outputs.date_tag }}
+            --amend ghcr.io/runshine/secflow-app-ipc-audit:amd64-${{ needs.prepare.outputs.date_tag }} \
+            --amend ghcr.io/runshine/secflow-app-ipc-audit:arm64-${{ needs.prepare.outputs.date_tag }}
           docker manifest push ghcr.io/runshine/secflow-app-ipc-audit:${{ needs.prepare.outputs.date_tag }}
