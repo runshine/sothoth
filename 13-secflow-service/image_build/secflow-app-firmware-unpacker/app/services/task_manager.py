@@ -92,6 +92,7 @@ EVOLUTION_SUCCESS = "success"
 EVOLUTION_FAILED = "failed"
 EVOLUTION_CANCELLED = "cancelled"
 EVOLUTION_MAX_ROUNDS = 3
+RETRY_PREPARING_TIMEOUT_SECONDS = 300
 
 
 def _executor_capacity() -> int:
@@ -2184,6 +2185,9 @@ def retry_task(task_id: str) -> tuple[bool, Optional[str], str]:
                 reason="task_retry_reset",
                 created_by="task_manager",
             )
+            # Opportunistically wake cleanup processing so retry_preparing does not
+            # depend on the periodic cleanup loop to make forward progress.
+            _submit_background(process_workspace_cleanup_jobs, 1)
         except Exception as exc:
             _fail_retry_preparing_task(task.id, f"异步重试任务入队失败: {exc}")
             return False, None, f"任务重试入队失败: {exc}"
@@ -2454,11 +2458,27 @@ def recover_orphaned_tasks() -> None:
             local_owned = owner_id == current_owner
             runner_pid = getattr(job, "runner_pid", None)
             runner_alive = _is_process_alive(runner_pid) if local_owned and runner_pid else False
+            registered_pid = _get_registered_evolution_pid(str(job.id))
+            registered_runner_alive = _is_process_alive(registered_pid) if local_owned and registered_pid else False
             runner_not_started = bool(
                 local_owned
                 and not runner_pid
                 and job.started_at
                 and job.started_at + timedelta(seconds=_runner_start_grace_seconds()) < now
+            )
+            local_runner_missing = bool(
+                local_owned
+                and str(job.status or "") == EVOLUTION_RUNNING
+                and (
+                    (runner_pid and not runner_alive)
+                    or (registered_pid and not registered_runner_alive)
+                    or (
+                        not runner_pid
+                        and not registered_pid
+                        and job.started_at
+                        and job.started_at + timedelta(seconds=_runner_start_grace_seconds()) < now
+                    )
+                )
             )
             cancel_timed_out = bool(
                 cancel_requested_at
@@ -2538,9 +2558,12 @@ def recover_orphaned_tasks() -> None:
                 elif local_owned and runner_not_started:
                     _finalize_orphaned_evolution_job(job.id, reason="Evolution runner was not started")
                     action_counts["evolution_runner_not_started"] = int(action_counts.get("evolution_runner_not_started", 0)) + 1
-                elif local_owned and not runner_alive:
+                elif local_owned and not runner_alive and runner_pid:
                     _finalize_orphaned_evolution_job(job.id, reason="Evolution runner process exited unexpectedly")
                     action_counts["evolution_runner_exited"] = int(action_counts.get("evolution_runner_exited", 0)) + 1
+                elif local_runner_missing:
+                    _finalize_orphaned_evolution_job(job.id, reason="Evolution runner process missing or exited unexpectedly")
+                    action_counts["evolution_runner_missing"] = int(action_counts.get("evolution_runner_missing", 0)) + 1
                 elif local_owned and runner_alive:
                     _update_evolution_progress_for_owner(
                         job.id,
@@ -2988,6 +3011,35 @@ def _fail_retry_preparing_task(task_id: str, error_message: str) -> None:
         _write_task_result_cache(task_id)
     finally:
         db.close()
+
+
+def _recover_stuck_retry_preparing_tasks() -> int:
+    from app.model import TaskStatus, UnpackTask, get_db_session
+
+    now = now_local()
+    cutoff = now - timedelta(seconds=RETRY_PREPARING_TIMEOUT_SECONDS)
+    db = get_db_session()
+    recovered = 0
+    try:
+        tasks = (
+            db.query(UnpackTask)
+            .filter(
+                UnpackTask.status == TaskStatus.RETRY_PREPARING.value,
+                ((UnpackTask.last_progress_at.is_(None)) | (UnpackTask.last_progress_at < cutoff)),
+            )
+            .all()
+        )
+        task_ids = [str(task.id) for task in tasks]
+    finally:
+        db.close()
+
+    for task_id in task_ids:
+        _fail_retry_preparing_task(
+            task_id,
+            f"重试准备超时超过 {RETRY_PREPARING_TIMEOUT_SECONDS}s，已自动回退为失败状态",
+        )
+        recovered += 1
+    return recovered
 
 
 def _derive_run_root_from_output_path(output_path: str) -> Path:
@@ -4745,8 +4797,23 @@ def _update_task_error(task_id: str, error: str, *, run_token: Optional[str] = N
 def _dispatch_loop() -> None:
     while not _dispatcher_stop.wait(timeout=_dispatch_interval_seconds()):
         try:
+            recovered_retry_preparing = _recover_stuck_retry_preparing_tasks()
+            if recovered_retry_preparing:
+                logger.warning(
+                    "recovered stuck retry_preparing tasks: count=%s timeout_seconds=%s",
+                    recovered_retry_preparing,
+                    RETRY_PREPARING_TIMEOUT_SECONDS,
+                )
             recover_orphaned_tasks()
             _schedule_pending_tasks()
+            processed_evolution_jobs = process_evolution_jobs(max(1, _claim_batch_size()))
+            if processed_evolution_jobs:
+                logger.info(
+                    "processed pending evolution jobs: count=%s owner_active=%s runtime_max=%s",
+                    processed_evolution_jobs,
+                    get_local_active_task_count(),
+                    _runtime_max_concurrent_for_logs(),
+                )
         except Exception as exc:
             logger.warning("task dispatch warning: %s", exc)
 
