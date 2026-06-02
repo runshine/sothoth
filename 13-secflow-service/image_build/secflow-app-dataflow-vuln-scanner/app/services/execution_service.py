@@ -1418,15 +1418,10 @@ class ExecutionService:
 
     def _source_run_index_for_trigger(self, db: Session, trigger: TriggerTask, execution: WorkflowExecution | None) -> RunIndex | None:
         if execution is not None:
-            run_index = self._ensure_run_index_for_execution(db, execution, trigger)
+            run_index = self._find_run_index_for_execution(db, execution)
             if run_index is not None:
                 return run_index
-        return (
-            db.query(RunIndex)
-            .filter(RunIndex.linked_task_id == trigger.id)
-            .order_by(RunIndex.started_at.desc(), RunIndex.created_at.desc())
-            .first()
-        )
+        return self._find_latest_run_index_for_task(db, trigger.id)
 
     def _default_evolution_title(self, source_title: str) -> str:
         title = f"Evolution of {str(source_title or '').strip()}".strip()
@@ -1740,9 +1735,9 @@ class ExecutionService:
         if execution is None:
             return {}
         try:
-            run_index = get_run_index_service().get_run_index_by_execution(db, execution) if execution.workspace_root else None
-            if run_index is None:
-                run_index = self._ensure_run_index_for_execution(db, execution, trigger)
+            run_index = self._find_run_index_for_execution(db, execution)
+            if run_index is None and trigger is not None:
+                run_index = self._find_latest_run_index_for_task(db, trigger.id)
             if run_index is None:
                 return {}
             return get_run_index_service().get_run_summary(db, run_index)
@@ -1750,7 +1745,31 @@ class ExecutionService:
             db.rollback()
             return {}
 
-    def _ensure_run_index_for_execution(
+    def _find_latest_run_index_for_task(self, db: Session, task_id: str | None) -> RunIndex | None:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return None
+        return (
+            db.query(RunIndex)
+            .filter(RunIndex.linked_task_id == normalized_task_id)
+            .order_by(RunIndex.started_at.desc(), RunIndex.created_at.desc(), RunIndex.id.desc())
+            .first()
+        )
+
+    def _find_run_index_for_execution(self, db: Session, execution: WorkflowExecution | None) -> RunIndex | None:
+        if execution is None:
+            return None
+        run_index = get_run_index_service().get_run_index_by_execution(db, execution) if execution.workspace_root else None
+        if run_index is not None:
+            return run_index
+        return (
+            db.query(RunIndex)
+            .filter(RunIndex.linked_execution_id == execution.id)
+            .order_by(RunIndex.last_synced_at.desc(), RunIndex.created_at.desc(), RunIndex.id.desc())
+            .first()
+        )
+
+    def _refresh_run_index_for_execution(
         self,
         db: Session,
         execution: WorkflowExecution | None,
@@ -1776,27 +1795,17 @@ class ExecutionService:
                     if Path(planned_run_dir).resolve() == run_root.resolve():
                         self._write_dataflow_cli_task_preview(plan)
                 except Exception:
-                    # Resolver paths should be best-effort; the caller will
-                    # still return 404 if the run directory cannot be prepared.
                     pass
         if not run_root.is_dir():
             return None
-        existing_run_index = (
-            get_run_index_service().get_run_index_by_execution(db, execution)
-            or (
-                db.query(RunIndex)
-                .filter(RunIndex.linked_execution_id == execution.id)
-                .order_by(RunIndex.last_synced_at.desc(), RunIndex.created_at.desc(), RunIndex.id.desc())
-                .first()
-            )
-        )
+        existing_run_index = self._find_run_index_for_execution(db, execution)
         if existing_run_index is not None:
             if str(get_config().scheduler.role or "standalone").strip().lower() == "manager":
                 return existing_run_index
             return get_run_index_service().refresh_run_index(
                 db,
                 existing_run_index,
-                include_runtime_assets=False,
+                include_runtime_assets=include_runtime_assets,
             )
         return get_run_index_service().sync_run_path(
             db,
@@ -1806,6 +1815,24 @@ class ExecutionService:
             linked_execution=execution,
             linked_task=trigger or db.get(TriggerTask, execution.trigger_task_id),
             profile_id=(trigger.profile_id if trigger else None),
+            include_runtime_assets=include_runtime_assets,
+        )
+
+    def _ensure_run_index_for_execution(
+        self,
+        db: Session,
+        execution: WorkflowExecution | None,
+        trigger: TriggerTask | None = None,
+        *,
+        include_runtime_assets: bool = False,
+    ) -> RunIndex | None:
+        existing_run_index = self._find_run_index_for_execution(db, execution)
+        if existing_run_index is not None:
+            return existing_run_index
+        return self._refresh_run_index_for_execution(
+            db,
+            execution,
+            trigger,
             include_runtime_assets=include_runtime_assets,
         )
 
@@ -5286,12 +5313,12 @@ class ExecutionService:
         latest_execution = self._latest_execution_for_trigger(db, trigger.id)
         latest_execution_ms = _perf_elapsed_ms(latest_execution_started)
 
-        ensure_run_index_ms = 0.0
-        run_index = None
-        if latest_execution is not None:
-            ensure_run_index_started = time.perf_counter()
-            run_index = self._ensure_run_index_for_execution(db, latest_execution, trigger)
-            ensure_run_index_ms = _perf_elapsed_ms(ensure_run_index_started)
+        run_index_lookup_started = time.perf_counter()
+        run_index = self._find_run_index_for_execution(db, latest_execution)
+        if run_index is None:
+            run_index = self._find_latest_run_index_for_task(db, trigger.id)
+        ensure_run_index_ms = _perf_elapsed_ms(run_index_lookup_started)
+        run_index_mode = "snapshot" if run_index is not None else "missing"
 
         reconcile_started = time.perf_counter()
         if self._reconcile_stale_runtime(db, run_index=run_index, trigger=trigger, execution=latest_execution):
@@ -5309,6 +5336,9 @@ class ExecutionService:
             trigger_lookup_ms=trigger_lookup_ms,
             latest_execution_ms=latest_execution_ms,
             ensure_run_index_ms=ensure_run_index_ms,
+            run_index_mode=run_index_mode,
+            run_index_refresh_requested=False,
+            run_index_found=run_index is not None,
             reconcile_ms=reconcile_ms,
             build_detail_ms=build_detail_ms,
             total_ms=_perf_elapsed_ms(request_started),

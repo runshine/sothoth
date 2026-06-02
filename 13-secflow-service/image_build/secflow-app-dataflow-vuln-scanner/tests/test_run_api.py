@@ -2213,6 +2213,29 @@ def test_task_list_survives_run_summary_sync_failure(service_config_path, monkey
     assert task["run"]["path"] == bound["run_root"]
 
 
+def test_ensure_run_index_prefers_existing_snapshot_without_refresh(service_config_path, monkeypatch):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "ensure_snapshot_only_20260602_010203"
+    bound = _create_execution_bound_run(client, run_root, title="ensure snapshot only")
+
+    db = get_db_session()
+    try:
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        assert execution is not None
+        service = get_execution_service()
+
+        def _fail_refresh(*args, **kwargs):
+            raise AssertionError("should not refresh existing run index on ensure path")
+
+        monkeypatch.setattr(run_index_service_module.get_run_index_service(), "refresh_run_index", _fail_refresh)
+        resolved = service._ensure_run_index_for_execution(db, execution)
+        assert resolved is not None
+        assert resolved.linked_execution_id == execution.id
+    finally:
+        db.close()
+
+
 def test_task_create_defaults_normal_purpose_and_shared_agent_dirs(service_config_path):
     app = create_app()
     client = TestClient(app)

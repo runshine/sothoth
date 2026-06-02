@@ -13,6 +13,7 @@ from app.main import create_app
 from app.artifacts.io import write_json
 from app.models.database import DfvsTaskListProjection, RunIndex, TriggerTask, WorkflowDefinitionVersion, WorkflowExecution, WorkflowExecutionEvent, get_db_session
 from app.services.execution_service import get_execution_service
+from app.services.run_index_service import get_run_index_service
 from app.time_utils import isoformat_local, now_local
 
 
@@ -1713,6 +1714,70 @@ def test_task_detail_downgrades_capacity_requeue_message_without_backoff_fields(
     assert payload["slot_binding_state"] == "unbound"
     assert payload["dispatch_backoff_reason"] is None
     assert payload["resolved_status_source"] == "capacity_requeue_message"
+
+
+def test_task_detail_uses_existing_run_snapshot_without_refresh(service_config_path, patch_mock_agent_runtime, monkeypatch):
+    _disable_scheduler_start(monkeypatch)
+    app = create_app()
+    client = TestClient(app)
+    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
+    created = _create_business_dataflow_task(
+        client,
+        profile_id=profile["profile_id"],
+        case_name="case-detail-snapshot-only",
+        title="detail snapshot only scan",
+    )
+    task_id = created["task_id"]
+
+    def _fail_refresh(*args, **kwargs):
+        raise AssertionError("task detail should not refresh run index")
+
+    def _fail_sync(*args, **kwargs):
+        raise AssertionError("task detail should not sync run path")
+
+    monkeypatch.setattr(get_run_index_service(), "refresh_run_index", _fail_refresh)
+    monkeypatch.setattr(get_run_index_service(), "sync_run_path", _fail_sync)
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}")
+    assert detail.status_code == 200
+    payload = detail.json()
+    assert payload["task_id"] == task_id
+    assert payload["run"]["name"]
+    assert payload["run"]["path"]
+
+
+def test_task_detail_without_run_index_returns_fast_snapshot(service_config_path, patch_mock_agent_runtime, monkeypatch):
+    _disable_scheduler_start(monkeypatch)
+    app = create_app()
+    client = TestClient(app)
+    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
+    created = _create_business_dataflow_task(
+        client,
+        profile_id=profile["profile_id"],
+        case_name="case-detail-without-run-index",
+        title="detail without run index scan",
+    )
+    task_id = created["task_id"]
+
+    with get_db_session() as db:
+        db.query(RunIndex).filter(RunIndex.linked_task_id == task_id).delete()
+        db.commit()
+
+    def _fail_refresh(*args, **kwargs):
+        raise AssertionError("task detail should not refresh missing run index")
+
+    def _fail_sync(*args, **kwargs):
+        raise AssertionError("task detail should not sync missing run path")
+
+    monkeypatch.setattr(get_run_index_service(), "refresh_run_index", _fail_refresh)
+    monkeypatch.setattr(get_run_index_service(), "sync_run_path", _fail_sync)
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}")
+    assert detail.status_code == 200
+    payload = detail.json()
+    assert payload["task_id"] == task_id
+    assert payload["run"]["name"]
+    assert payload["run"]["path"]
 
 
 def test_project_filesystem_browser_uses_local_project_tree(service_config_path):
