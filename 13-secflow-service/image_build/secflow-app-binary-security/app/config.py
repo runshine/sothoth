@@ -104,6 +104,12 @@ class SchedulerConfig(BaseModel):
     downstream_reconcile_interval_seconds: int = 30
     readless_reconcile_interval_seconds: int = 300
     heartbeat_update_interval_seconds: int = 15
+    operation_lease_ttl_seconds: int = 60
+    operation_heartbeat_interval_seconds: int = 15
+    stale_operation_requeue_interval_seconds: int = 15
+    operation_step_batch_size: int = 10
+    worker_ready_loop_stale_seconds: int = 90
+    worker_liveness_loop_stale_seconds: int = 180
     downstream_reconcile_grace_seconds: int = 30
     shutdown_grace_seconds: int = 10
     archive_job_concurrency: int = 4

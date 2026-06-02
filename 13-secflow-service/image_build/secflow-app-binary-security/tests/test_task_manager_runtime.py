@@ -50,6 +50,29 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
         )
         self.assertEqual(0, status["workers"]["stage_item_workers"])
 
+    def test_runtime_status_marks_stale_loop_details(self):
+        self.manager._running = True
+
+        class _Task:
+            def done(self):
+                return False
+
+        self.manager._operation_loop_task = _Task()
+        self.manager.cfg.scheduler.worker_ready_loop_stale_seconds = 30
+        self.manager.cfg.queue.block_timeout_seconds = 5
+        self.manager._loop_heartbeats["operation_dispatch"] = _now() - timedelta(seconds=60)
+
+        status = self.manager.runtime_status()
+
+        self.assertTrue(status["loops"]["operation_dispatch"])
+        self.assertTrue(status["loop_details"]["operation_dispatch"]["stale"])
+
+    def test_operation_lease_uses_short_configured_ttl(self):
+        self.manager.cfg.scheduler.operation_lease_ttl_seconds = 60
+        now_value = _now()
+        expires_at = self.manager._operation_lease_expires_at(now_value=now_value)
+        self.assertEqual(60, int((expires_at - now_value).total_seconds()))
+
 
 class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
     async def test_dispatch_loop_reconciles_queues_even_when_task_queue_is_busy(self):
@@ -150,6 +173,56 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(["called", "called"], pop_calls)
         logger_exception.assert_not_called()
+
+    async def test_retry_target_stage_sync_batches_specific_item_ids(self):
+        manager = TaskManager()
+        manager.cfg.scheduler.operation_step_batch_size = 2
+        task = BinarySecurityTask(id="task-1", project_id="project-1")
+        task.summary = {
+            "retry_plan": {
+                "item_actions": [
+                    {"item_id": "item-1"},
+                    {"item_id": "item-2"},
+                    {"item_id": "item-3"},
+                ]
+            }
+        }
+        operation = task_manager_module.BinarySecurityTaskOperation(
+            id="op-1",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type="stage_retry_failed_items",
+            target_stage="entry_analysis",
+            operation_token="token-1",
+            status="running",
+        )
+
+        class _Db:
+            def __init__(self):
+                self.commits = 0
+
+            def commit(self):
+                self.commits += 1
+
+        db = _Db()
+        calls = []
+
+        async def _sync_downstream_status(_db, **kwargs):
+            calls.append(kwargs["item_ids"])
+            return None
+
+        manager.sync_downstream_status = _sync_downstream_status
+
+        payload = await manager._operation_sync_retry_target_stage_state(db, task, operation)
+
+        self.assertEqual([["item-1", "item-2"], ["item-3"]], calls)
+        self.assertEqual(3, payload["synced_items"])
+        self.assertEqual(3, payload["total_items"])
+        self.assertEqual(2, db.commits)
+        self.assertEqual(
+            3,
+            operation.resume_cursor["sync_target_stage_state"]["processed_count"],
+        )
 
     async def test_state_reducer_loop_recovers_from_observe_failure(self):
         manager = TaskManager()

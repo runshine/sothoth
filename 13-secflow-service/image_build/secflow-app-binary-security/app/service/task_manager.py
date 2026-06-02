@@ -916,9 +916,106 @@ class TaskManager:
         self._state_reducer_consecutive_crash_count = 0
         self._task_list_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
         self._task_list_cache_lock = threading.Lock()
+        self._loop_heartbeats: dict[str, datetime] = {}
+        self._last_stale_operation_requeue_at: datetime | None = None
 
     def _downstream_tasks(self):
         return get_downstream_task_controller(self)
+
+    def _operation_lease_ttl_seconds(self) -> int:
+        return max(30, int(getattr(self.cfg.scheduler, "operation_lease_ttl_seconds", 60) or 60))
+
+    def _operation_heartbeat_interval_seconds(self) -> int:
+        configured = int(getattr(self.cfg.scheduler, "operation_heartbeat_interval_seconds", 15) or 15)
+        return max(5, min(configured, max(5, int(self._operation_lease_ttl_seconds() / 2))))
+
+    def _stale_operation_requeue_interval_seconds(self) -> int:
+        configured = int(getattr(self.cfg.scheduler, "stale_operation_requeue_interval_seconds", 15) or 15)
+        return max(5, configured)
+
+    def _operation_step_batch_size(self) -> int:
+        return max(1, int(getattr(self.cfg.scheduler, "operation_step_batch_size", 10) or 10))
+
+    def _loop_stale_threshold_seconds(self, loop_name: str) -> int:
+        configured = int(getattr(self.cfg.scheduler, "worker_ready_loop_stale_seconds", 90) or 90)
+        interval_seconds = {
+            "task_dispatch": max(1, int(getattr(self.cfg.queue, "block_timeout_seconds", 5) or 5)),
+            "operation_dispatch": max(1, int(getattr(self.cfg.queue, "block_timeout_seconds", 5) or 5)),
+            "archive_dispatch": max(1, int(getattr(self.cfg.scheduler, "poll_interval_seconds", 5) or 5)),
+            "stage_item_dispatch": max(1, int(getattr(self.cfg.scheduler, "stage_poll_interval_seconds", 5) or 5)),
+            "downstream_reconcile": max(1, int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30) or 30)),
+            "readless_reconcile": max(1, int(getattr(self.cfg.scheduler, "readless_reconcile_interval_seconds", 300) or 300)),
+            "state_reducer": max(1, int(getattr(self.cfg.scheduler, "poll_interval_seconds", 5) or 5)),
+            "reducer_metrics_snapshot": max(5, int(getattr(self.cfg.scheduler, "poll_interval_seconds", 5) or 5)),
+            "task_heartbeat": max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 15) or 15)),
+        }.get(loop_name, configured)
+        return max(configured, interval_seconds * 2 + 15)
+
+    def _mark_loop_heartbeat(self, loop_name: str, *, now_value: datetime | None = None) -> None:
+        self._loop_heartbeats[str(loop_name)] = now_value or _now()
+
+    def _loop_runtime_detail(self, loop_name: str, task: asyncio.Task | None) -> dict[str, Any]:
+        alive = bool(task and not task.done())
+        heartbeat_at = self._loop_heartbeats.get(loop_name)
+        heartbeat_age_seconds = _elapsed_seconds_since(heartbeat_at)
+        stale_after_seconds = self._loop_stale_threshold_seconds(loop_name)
+        stale = bool(alive and heartbeat_at and heartbeat_age_seconds is not None and heartbeat_age_seconds > stale_after_seconds)
+        return {
+            "alive": alive,
+            "heartbeat_at": _isoformat_or_none(heartbeat_at),
+            "heartbeat_age_seconds": None if heartbeat_age_seconds is None else round(float(heartbeat_age_seconds), 3),
+            "stale_after_seconds": stale_after_seconds,
+            "stale": stale,
+        }
+
+    def _maybe_requeue_stale_operations(self, db: Session) -> bool:
+        now_value = _now()
+        if self._last_stale_operation_requeue_at is not None:
+            elapsed = (now_value - self._last_stale_operation_requeue_at).total_seconds()
+            if elapsed < self._stale_operation_requeue_interval_seconds():
+                return False
+        changed = self._requeue_stale_operations(db)
+        self._last_stale_operation_requeue_at = now_value
+        return changed
+
+    async def _operation_progress_heartbeat(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+        *,
+        step_name: str,
+        resume_cursor: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+        record_event: bool = False,
+    ) -> None:
+        merged_payload = dict(self._operation_step_snapshot(operation, step_name).get("payload") or {})
+        if payload:
+            merged_payload.update(payload)
+        self._set_operation_step_state(
+            operation,
+            step_name=step_name,
+            status="running",
+            payload=merged_payload,
+            resume_cursor=resume_cursor if resume_cursor is not None else dict(operation.resume_cursor or {}),
+            increment_attempt=False,
+        )
+        now_value = _now()
+        operation.heartbeat_at = now_value
+        operation.claim_lease_expires_at = self._operation_lease_expires_at(now_value=now_value)
+        operation.updated_at = now_value
+        if record_event:
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "operation_step_progress_heartbeat",
+                f"后台操作步骤进度已刷新: {step_name}",
+                stage_name=operation.target_stage,
+                payload={"step_name": step_name, **merged_payload},
+            )
+        db.commit()
+        await asyncio.sleep(0)
 
     async def _downstream_get_task(
         self,
@@ -1379,6 +1476,7 @@ class TaskManager:
         while self._running:
             started = time.perf_counter()
             try:
+                self._mark_loop_heartbeat("task_heartbeat")
                 await asyncio.to_thread(self._refresh_task_heartbeats_once)
             except asyncio.CancelledError:
                 raise
@@ -1386,6 +1484,7 @@ class TaskManager:
                 logger.exception("binary-security task heartbeat loop crashed and recovered")
                 await asyncio.sleep(1)
             finally:
+                self._mark_loop_heartbeat("task_heartbeat")
                 observe_task_heartbeat_loop_duration(time.perf_counter() - started)
             await asyncio.sleep(interval_seconds)
 
@@ -3671,7 +3770,8 @@ class TaskManager:
 
     def _operation_lease_expires_at(self, *, now_value: datetime | None = None, ttl_seconds: int = TASK_OPERATION_LOCK_TTL_SECONDS) -> datetime:
         base = now_value or _now()
-        return base + timedelta(seconds=max(30, int(ttl_seconds)))
+        effective_ttl = self._operation_lease_ttl_seconds() if ttl_seconds == TASK_OPERATION_LOCK_TTL_SECONDS else max(30, int(ttl_seconds))
+        return base + timedelta(seconds=effective_ttl)
 
     def _claim_operation_by_id(self, db: Session, operation_id: str) -> BinarySecurityTaskOperation | None:
         now_value = _now()
@@ -3732,7 +3832,7 @@ class TaskManager:
         return bool(updated)
 
     async def _operation_lease_heartbeat(self, operation_id: str) -> None:
-        interval_seconds = max(5, int(TASK_OPERATION_LOCK_TTL_SECONDS / 3))
+        interval_seconds = self._operation_heartbeat_interval_seconds()
         while self._running:
             db = get_session_factory()()
             try:
@@ -4574,6 +4674,7 @@ class TaskManager:
         task_id: str,
         stage_name: str | None = None,
         item_id: str | None = None,
+        item_ids: list[str] | None = None,
         force: bool = False,
         token: str | None = None,
         record_request_event: bool = True,
@@ -4584,6 +4685,8 @@ class TaskManager:
         batch_size = max(1, int(getattr(self.cfg.scheduler, "downstream_sync_batch_size", 50) or 50))
         if stage_name and stage_name not in self._stage_sequence_for_task(task):
             raise ValidationError(f"无效阶段: {stage_name}")
+        if item_id and item_ids:
+            raise ValidationError("item_id 与 item_ids 不能同时指定")
         items = self._task_reconcile_candidate_items(
             db,
             task,
@@ -4591,9 +4694,15 @@ class TaskManager:
             item_id=item_id,
             force=force,
         )
+        if item_ids:
+            ordered_ids = [str(current_id).strip() for current_id in list(item_ids or []) if str(current_id).strip()]
+            matched = {str(item.id): item for item in items if str(item.id or "").strip()}
+            items = [matched[current_id] for current_id in ordered_ids if current_id in matched]
         if item_id and not items:
             raise NotFoundError("阶段子任务不存在")
-        if not item_id and items:
+        if item_ids and not items:
+            raise NotFoundError("阶段子任务不存在")
+        if not item_id and not item_ids and items:
             items = sorted(
                 items,
                 key=lambda current_item: self._stage_item_sync_priority(current_item),
@@ -4609,6 +4718,7 @@ class TaskManager:
                 payload={
                     "stage_name": stage_name,
                     "item_id": item_id,
+                    "item_ids": [str(item.id) for item in items] if item_ids else None,
                     "force": force,
                     "batch_size": batch_size,
                     "candidate_item_count": len(items),
@@ -6597,6 +6707,8 @@ class TaskManager:
             db = session_factory()
             try:
                 with observe_scheduler_loop("operation_dispatch"):
+                    self._mark_loop_heartbeat("operation_dispatch")
+                    self._maybe_requeue_stale_operations(db)
                     operation_id = await get_task_queue().pop_operation(self.cfg.queue.block_timeout_seconds)
                     if operation_id:
                         async with self._operation_worker_lock:
@@ -6607,7 +6719,8 @@ class TaskManager:
                                     name=f"binary-security-operation-{operation_id}",
                                 )
                     else:
-                        self._requeue_stale_operations(db)
+                        self._maybe_requeue_stale_operations(db)
+                    self._mark_loop_heartbeat("operation_dispatch")
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -7125,18 +7238,53 @@ class TaskManager:
         operation: BinarySecurityTaskOperation,
     ) -> dict[str, Any]:
         target_stage = str(operation.target_stage or "").strip()
-        await self.sync_downstream_status(
-            db,
-            project_id=task.project_id,
-            task_id=task.id,
-            stage_name=target_stage,
-            force=True,
-            token=self._service_token(),
-            record_request_event=False,
-            record_noop_events=False,
-            apply_state=(target_stage != "entry_analysis"),
-        )
-        payload = {"target_stage": target_stage, "synced": True}
+        item_ids = [
+            str(action.get("item_id") or "").strip()
+            for action in self._retry_item_actions(task)
+            if str(action.get("item_id") or "").strip()
+        ]
+        batch_size = self._operation_step_batch_size()
+        cursor = dict(operation.resume_cursor or {})
+        step_cursor = dict(cursor.get(TASK_OPERATION_STEP_SYNC_TARGET_STAGE_STATE) or {})
+        offset = max(0, int(step_cursor.get("offset") or 0))
+        synced_count = 0
+        for batch_start in range(offset, len(item_ids), batch_size):
+            batch_item_ids = item_ids[batch_start:batch_start + batch_size]
+            await self.sync_downstream_status(
+                db,
+                project_id=task.project_id,
+                task_id=task.id,
+                stage_name=target_stage,
+                item_ids=batch_item_ids,
+                force=True,
+                token=self._service_token(),
+                record_request_event=False,
+                record_noop_events=False,
+                apply_state=(target_stage != "entry_analysis"),
+            )
+            synced_count += len(batch_item_ids)
+            next_offset = batch_start + len(batch_item_ids)
+            await self._operation_progress_heartbeat(
+                db,
+                task,
+                operation,
+                step_name=TASK_OPERATION_STEP_SYNC_TARGET_STAGE_STATE,
+                resume_cursor={
+                    "current_step": TASK_OPERATION_STEP_SYNC_TARGET_STAGE_STATE,
+                    TASK_OPERATION_STEP_SYNC_TARGET_STAGE_STATE: {
+                        "offset": next_offset,
+                        "processed_count": next_offset,
+                        "total_count": len(item_ids),
+                    },
+                },
+                payload={
+                    "batch_size": len(batch_item_ids),
+                    "processed_count": next_offset,
+                    "remaining_count": max(0, len(item_ids) - next_offset),
+                    "total_count": len(item_ids),
+                },
+            )
+        payload = {"target_stage": target_stage, "synced": True, "synced_items": synced_count, "total_items": len(item_ids)}
         operation.result_payload = {**dict(operation.result_payload or {}), "sync_target_stage_state": payload}
         return payload
 
@@ -7182,6 +7330,7 @@ class TaskManager:
         operation: BinarySecurityTaskOperation,
     ) -> dict[str, Any]:
         cleaned = 0
+        batch_size = self._operation_step_batch_size()
         for action in self._retry_item_actions(task):
             if str(action.get("strategy") or "").strip() != RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
                 continue
@@ -7262,6 +7411,14 @@ class TaskManager:
                 payload={"item_id": item.id, "item_key": item.item_key, "old_downstream_task_id": old_task_id},
             )
             cleaned += 1
+            if cleaned % batch_size == 0:
+                await self._operation_progress_heartbeat(
+                    db,
+                    task,
+                    operation,
+                    step_name=TASK_OPERATION_STEP_CLEANUP_ABNORMAL_CHILDREN,
+                    payload={"processed_count": cleaned},
+                )
         operation.result_payload = {**dict(operation.result_payload or {}), "cleanup": {"cleaned_items": cleaned}}
         return {"cleaned_items": cleaned}
 
@@ -7272,6 +7429,7 @@ class TaskManager:
         operation: BinarySecurityTaskOperation,
     ) -> dict[str, Any]:
         created_count = 0
+        batch_size = self._operation_step_batch_size()
         for action in self._retry_item_actions(task):
             strategy = str(action.get("strategy") or "").strip()
             if strategy != RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
@@ -7323,6 +7481,14 @@ class TaskManager:
                         },
                     )
                     created_count += 1
+                    if created_count % batch_size == 0:
+                        await self._operation_progress_heartbeat(
+                            db,
+                            task,
+                            operation,
+                            step_name=TASK_OPERATION_STEP_CREATE_REPLACEMENT_CHILDREN,
+                            payload={"processed_count": created_count},
+                        )
                     continue
             service, token, payload = self._retry_recreate_payload_for_item(task, item)
             self._record_operation_event(
@@ -7395,6 +7561,14 @@ class TaskManager:
                 payload={"item_id": item.id, "item_key": item.item_key, "service": service, "new_downstream_task_id": new_task_id},
             )
             created_count += 1
+            if created_count % batch_size == 0:
+                await self._operation_progress_heartbeat(
+                    db,
+                    task,
+                    operation,
+                    step_name=TASK_OPERATION_STEP_CREATE_REPLACEMENT_CHILDREN,
+                    payload={"processed_count": created_count},
+                )
         operation.result_payload = {**dict(operation.result_payload or {}), "create": {"created_items": created_count}}
         return {"created_items": created_count}
 
@@ -7419,6 +7593,8 @@ class TaskManager:
                 "item_actions": self._retry_item_actions(task),
             }
         target_stage = str(operation.target_stage or "").strip()
+        processed_count = 0
+        batch_size = self._operation_step_batch_size()
         for action in self._retry_item_actions(task):
             item_id = str(action.get("item_id") or "").strip()
             item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == item_id).first()
@@ -7497,6 +7673,15 @@ class TaskManager:
                     "new_downstream_task_id": item.downstream_task_id,
                 },
             )
+            processed_count += 1
+            if processed_count % batch_size == 0:
+                await self._operation_progress_heartbeat(
+                    db,
+                    task,
+                    operation,
+                    step_name=TASK_OPERATION_STEP_VERIFY_RETRY_BINDINGS,
+                    payload={"processed_count": processed_count},
+                )
         db.flush()
         refreshed_actions = self._retry_item_actions(task)
         result = self._build_retry_prepare_result(db, task, target_stage=target_stage, phase="verify")
@@ -7688,6 +7873,7 @@ class TaskManager:
             db = session_factory()
             try:
                 with observe_scheduler_loop("task_dispatch"):
+                    self._mark_loop_heartbeat("task_dispatch")
                     task_id = await get_task_queue().pop_task(self.cfg.queue.block_timeout_seconds)
                     if task_id:
                         claimed_id = self._dispatch_task_by_id(db, task_id)
@@ -7700,6 +7886,7 @@ class TaskManager:
                                     )
                     await self._reconcile_work_queues(db)
                     await self._observe_runtime_metrics(db)
+                    self._mark_loop_heartbeat("task_dispatch")
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -7714,6 +7901,7 @@ class TaskManager:
             db = session_factory()
             try:
                 with observe_scheduler_loop("stage_item_dispatch"):
+                    self._mark_loop_heartbeat("stage_item_dispatch")
                     claimed_ids = self._claim_streaming_stage_items(db)
                     if claimed_ids:
                         async with self._stage_item_worker_lock:
@@ -7726,6 +7914,7 @@ class TaskManager:
                                     name=f"binary-security-stage-item-{item_id}",
                                 )
                     await self._observe_runtime_metrics(db)
+                    self._mark_loop_heartbeat("stage_item_dispatch")
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -8024,8 +8213,10 @@ class TaskManager:
         while self._running:
             try:
                 with observe_scheduler_loop("archive_dispatch"):
+                    self._mark_loop_heartbeat("archive_dispatch")
                     await asyncio.to_thread(self._reclaim_stale_archive_jobs)
                     await self._schedule_archive_workers()
+                    self._mark_loop_heartbeat("archive_dispatch")
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -8392,6 +8583,7 @@ class TaskManager:
             db = get_session_factory()()
             try:
                 with observe_scheduler_loop("state_reducer"):
+                    self._mark_loop_heartbeat("state_reducer")
                     await asyncio.to_thread(self._observe_state_runtime_metrics, db)
                     processed = 0
                     for _ in range(max(1, int(self.cfg.scheduler.downstream_action_concurrency or 1))):
@@ -8407,6 +8599,7 @@ class TaskManager:
                         loop_ok_at=time.time(),
                         consecutive_crash_count=0,
                     )
+                    self._mark_loop_heartbeat("state_reducer")
                     if processed:
                         continue
             except asyncio.CancelledError:
@@ -8428,10 +8621,13 @@ class TaskManager:
         interval_seconds = max(5, int(self.cfg.scheduler.poll_interval_seconds or 5))
         # Publish one snapshot immediately on startup so the dashboard has a
         # current baseline even before the reducer processes the first event.
+        self._mark_loop_heartbeat("reducer_metrics_snapshot")
         await self._publish_reducer_metrics_snapshot()
+        self._mark_loop_heartbeat("reducer_metrics_snapshot")
         while self._running:
             await asyncio.sleep(interval_seconds)
             await self._publish_reducer_metrics_snapshot()
+            self._mark_loop_heartbeat("reducer_metrics_snapshot")
 
     async def _publish_reducer_metrics_snapshot(self) -> None:
         try:
@@ -9465,6 +9661,7 @@ class TaskManager:
             db = get_session_factory()()
             try:
                 with observe_scheduler_loop("downstream_reconcile"):
+                    self._mark_loop_heartbeat("downstream_reconcile")
                     task_refs = await asyncio.to_thread(self._list_tasks_needing_downstream_sync, db)
                     token = self._service_token()
                     results = await self._run_with_limits(
@@ -9498,6 +9695,7 @@ class TaskManager:
                         except Exception:
                             db.rollback()
                     await self._observe_runtime_metrics(db, reconcile_candidates=len(task_refs))
+                    self._mark_loop_heartbeat("downstream_reconcile")
             finally:
                 db.close()
             await asyncio.sleep(interval_seconds)
@@ -10401,28 +10599,21 @@ class TaskManager:
         return (now_value or _now()) + timedelta(seconds=self._lease_timeout_seconds(db))
 
     def runtime_status(self) -> dict[str, object]:
-        loop_task_alive = bool(self._loop_task and not self._loop_task.done())
-        operation_loop_alive = bool(getattr(self, "_operation_loop_task", None) and not self._operation_loop_task.done())
-        archive_loop_alive = bool(self._archive_loop_task and not self._archive_loop_task.done())
-        stage_item_loop_alive = bool(self._stage_item_loop_task and not self._stage_item_loop_task.done())
-        reconcile_loop_alive = bool(self._downstream_reconcile_task and not self._downstream_reconcile_task.done())
-        readless_reconcile_loop_alive = bool(self._readless_reconcile_task and not self._readless_reconcile_task.done())
-        state_reducer_loop_alive = bool(self._state_reducer_loop_task and not self._state_reducer_loop_task.done())
-        reducer_metrics_snapshot_loop_alive = bool(
-            self._reducer_metrics_snapshot_loop_task and not self._reducer_metrics_snapshot_loop_task.done()
-        )
+        loop_details = {
+            "task_dispatch": self._loop_runtime_detail("task_dispatch", self._loop_task),
+            "operation_dispatch": self._loop_runtime_detail("operation_dispatch", getattr(self, "_operation_loop_task", None)),
+            "archive_dispatch": self._loop_runtime_detail("archive_dispatch", self._archive_loop_task),
+            "stage_item_dispatch": self._loop_runtime_detail("stage_item_dispatch", self._stage_item_loop_task),
+            "downstream_reconcile": self._loop_runtime_detail("downstream_reconcile", self._downstream_reconcile_task),
+            "readless_reconcile": self._loop_runtime_detail("readless_reconcile", self._readless_reconcile_task),
+            "state_reducer": self._loop_runtime_detail("state_reducer", self._state_reducer_loop_task),
+            "reducer_metrics_snapshot": self._loop_runtime_detail("reducer_metrics_snapshot", self._reducer_metrics_snapshot_loop_task),
+            "task_heartbeat": self._loop_runtime_detail("task_heartbeat", self._task_heartbeat_loop_task),
+        }
         return {
             "running": self._running,
-            "loops": {
-                "task_dispatch": loop_task_alive,
-                "operation_dispatch": operation_loop_alive,
-                "archive_dispatch": archive_loop_alive,
-                "stage_item_dispatch": stage_item_loop_alive,
-                "downstream_reconcile": reconcile_loop_alive,
-                "readless_reconcile": readless_reconcile_loop_alive,
-                "state_reducer": state_reducer_loop_alive,
-                "reducer_metrics_snapshot": reducer_metrics_snapshot_loop_alive,
-            },
+            "loops": {loop_name: bool(detail.get("alive")) for loop_name, detail in loop_details.items() if loop_name != "task_heartbeat"},
+            "loop_details": loop_details,
             "workers": {
                 "task_workers": len([task for task in self._workers.values() if not task.done()]),
                 "operation_workers": len([task for task in self._operation_workers.values() if not task.done()]),
@@ -11888,7 +12079,8 @@ class TaskManager:
 
     def _task_operation_lock_expires_at(self, *, now_value: datetime | None = None, ttl_seconds: int = TASK_OPERATION_LOCK_TTL_SECONDS) -> datetime:
         base = now_value or _now()
-        return base + timedelta(seconds=max(30, int(ttl_seconds)))
+        effective_ttl = self._operation_lease_ttl_seconds() if ttl_seconds == TASK_OPERATION_LOCK_TTL_SECONDS else max(30, int(ttl_seconds))
+        return base + timedelta(seconds=effective_ttl)
 
     def _raise_task_operation_locked(self, task_id: str) -> None:
         connection = get_engine().connect()
@@ -12318,13 +12510,17 @@ class TaskManager:
         await run_readless_sync_loop(
             should_stop=lambda: not self._running,
             interval_seconds=interval_seconds,
-            before_tick=None,
+            before_tick=self._before_readless_reconcile_tick,
             candidate_ids_loader=self._load_readless_reconcile_candidate_ids,
             process_one=self._process_readless_reconcile_task,
             observe=self._observe_readless_reconcile_stats,
             loop_context=observe_scheduler_loop,
             loop_name="readless_reconcile",
         )
+
+    async def _before_readless_reconcile_tick(self) -> bool:
+        self._mark_loop_heartbeat("readless_reconcile")
+        return True
 
     def _load_readless_reconcile_candidate_ids(self) -> list[str]:
         candidate_session = get_session_factory()()
@@ -12362,7 +12558,9 @@ class TaskManager:
             session.close()
 
     async def _process_readless_reconcile_task(self, task_id: str) -> tuple[bool, bool]:
-        return await asyncio.to_thread(self._process_readless_reconcile_task_sync, task_id)
+        result = await asyncio.to_thread(self._process_readless_reconcile_task_sync, task_id)
+        self._mark_loop_heartbeat("readless_reconcile")
+        return result
 
     def _observe_readless_reconcile_stats(self, stats: ReadlessSyncStats) -> None:
         observe_task_readless_reconcile(
