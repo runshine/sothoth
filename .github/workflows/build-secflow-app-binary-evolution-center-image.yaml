@@ -56,14 +56,14 @@ jobs:
           docker build \
             --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --file 13-secflow-service/image_build/secflow-app-binary-evolution-center/Dockerfile \
-            --tag ghcr.io/runshine/secflow-app-binary-evolution-center:amd64-latest \
-            --tag ghcr.io/runshine/secflow-app-binary-evolution-center:amd64-${{ needs.prepare.outputs.date_tag }} \
+            --tag ghcr.io/runshine/secflow-app-binary-evolution-center:latest \
+            --tag ghcr.io/runshine/secflow-app-binary-evolution-center:${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-app-binary-evolution-center/
 
       - name: Push amd64 image
         run: |
-          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:amd64-latest
-          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:amd64-${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:latest
+          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:${{ needs.prepare.outputs.date_tag }}
 
   build-arm64:
     needs: prepare
@@ -87,14 +87,14 @@ jobs:
           docker build \
             --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --file 13-secflow-service/image_build/secflow-app-binary-evolution-center/Dockerfile \
-            --tag ghcr.io/runshine/secflow-app-binary-evolution-center:arm64-latest \
-            --tag ghcr.io/runshine/secflow-app-binary-evolution-center:arm64-${{ needs.prepare.outputs.date_tag }} \
+            --tag ghcr.io/runshine/secflow-app-binary-evolution-center:latest \
+            --tag ghcr.io/runshine/secflow-app-binary-evolution-center:${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-app-binary-evolution-center/
 
       - name: Push arm64 image
         run: |
-          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:arm64-latest
-          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:arm64-${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:latest
+          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:${{ needs.prepare.outputs.date_tag }}
 
   merge-manifest:
     needs: [prepare, build-amd64, build-arm64]
@@ -112,13 +112,13 @@ jobs:
       - name: Create and push multi-arch manifest (latest)
         run: |
           docker manifest create ghcr.io/runshine/secflow-app-binary-evolution-center:latest \
-            --amend ghcr.io/runshine/secflow-app-binary-evolution-center:amd64-latest \
-            --amend ghcr.io/runshine/secflow-app-binary-evolution-center:arm64-latest
+            --amend ghcr.io/runshine/secflow-app-binary-evolution-center:latest \
+            --amend ghcr.io/runshine/secflow-app-binary-evolution-center:latest
           docker manifest push ghcr.io/runshine/secflow-app-binary-evolution-center:latest
 
       - name: Create and push multi-arch manifest (date tag)
         run: |
           docker manifest create ghcr.io/runshine/secflow-app-binary-evolution-center:${{ needs.prepare.outputs.date_tag }} \
-            --amend ghcr.io/runshine/secflow-app-binary-evolution-center:amd64-${{ needs.prepare.outputs.date_tag }} \
-            --amend ghcr.io/runshine/secflow-app-binary-evolution-center:arm64-${{ needs.prepare.outputs.date_tag }}
+            --amend ghcr.io/runshine/secflow-app-binary-evolution-center:${{ needs.prepare.outputs.date_tag }} \
+            --amend ghcr.io/runshine/secflow-app-binary-evolution-center:${{ needs.prepare.outputs.date_tag }}
           docker manifest push ghcr.io/runshine/secflow-app-binary-evolution-center:${{ needs.prepare.outputs.date_tag }}

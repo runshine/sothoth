@@ -48,16 +48,16 @@ jobs:
             -f 100-agent-service-image/01-secflow-agent-service-agent-helper/Dockerfile \
             --build-arg TARGETARCH=${{ matrix.arch }} \
             --build-arg SECFLOW_BUILD_VERSION=${{ steps.date.outputs.date_tag }} \
-            -t ghcr.io/runshine/secflow-agent-service-agent-helper:latest-${{ matrix.arch }} \
-            -t ghcr.io/runshine/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}-${{ matrix.arch }} \
+            -t ghcr.io/runshine/secflow-agent-service-agent-helper:latest \
+            -t ghcr.io/runshine/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }} \
             100-agent-service-image/01-secflow-agent-service-agent-helper/
 
       - name: Push arch images
         run: |
-          # docker push runshine0819/secflow-agent-service-agent-helper:latest-${{ matrix.arch }}
-          docker push ghcr.io/runshine/secflow-agent-service-agent-helper:latest-${{ matrix.arch }}
-          # docker push runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}-${{ matrix.arch }}
-          docker push ghcr.io/runshine/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}-${{ matrix.arch }}
+          # docker push runshine0819/secflow-agent-service-agent-helper:latest
+          docker push ghcr.io/runshine/secflow-agent-service-agent-helper:latest
+          # docker push runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}
+          docker push ghcr.io/runshine/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}
 
   publish-multiarch-manifest:
     runs-on: ubuntu-latest
@@ -89,21 +89,21 @@ jobs:
       - name: Create and push Docker Hub manifests
         run: |
           # docker manifest create runshine0819/secflow-agent-service-agent-helper:latest \
-            # runshine0819/secflow-agent-service-agent-helper:latest-amd64 \
-            # runshine0819/secflow-agent-service-agent-helper:latest-arm64
+            # runshine0819/secflow-agent-service-agent-helper:latest \
+            # runshine0819/secflow-agent-service-agent-helper:latest
           # docker manifest create runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }} \
-            # runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}-amd64 \
-            # runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}-arm64
+            # runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }} \
+            # runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}
           # docker manifest push runshine0819/secflow-agent-service-agent-helper:latest
           # docker manifest push runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}
 
       - name: Create and push GHCR manifests
         run: |
           docker manifest create ghcr.io/runshine/secflow-agent-service-agent-helper:latest \
-            ghcr.io/runshine/secflow-agent-service-agent-helper:latest-amd64 \
-            ghcr.io/runshine/secflow-agent-service-agent-helper:latest-arm64
+            ghcr.io/runshine/secflow-agent-service-agent-helper:latest \
+            ghcr.io/runshine/secflow-agent-service-agent-helper:latest
           docker manifest create ghcr.io/runshine/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }} \
-            ghcr.io/runshine/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}-amd64 \
-            ghcr.io/runshine/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}-arm64
+            ghcr.io/runshine/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }} \
+            ghcr.io/runshine/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}
           docker manifest push ghcr.io/runshine/secflow-agent-service-agent-helper:latest
           docker manifest push ghcr.io/runshine/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}

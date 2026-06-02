@@ -71,14 +71,14 @@ jobs:
           docker build \
             --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --file 13-secflow-service/image_build/secflow-app-system-analyse/Dockerfile \
-            --tag ghcr.io/runshine/secflow-app-system-analyse:amd64-latest \
-            --tag ghcr.io/runshine/secflow-app-system-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
+            --tag ghcr.io/runshine/secflow-app-system-analyse:latest \
+            --tag ghcr.io/runshine/secflow-app-system-analyse:${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-app-system-analyse/
 
       - name: Push amd64 image
         run: |
-          docker push ghcr.io/runshine/secflow-app-system-analyse:amd64-latest
-          docker push ghcr.io/runshine/secflow-app-system-analyse:amd64-${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/secflow-app-system-analyse:latest
+          docker push ghcr.io/runshine/secflow-app-system-analyse:${{ needs.prepare.outputs.date_tag }}
 
   build-arm64:
     needs: prepare
@@ -120,14 +120,14 @@ jobs:
           docker build \
             --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --file 13-secflow-service/image_build/secflow-app-system-analyse/Dockerfile \
-            --tag ghcr.io/runshine/secflow-app-system-analyse:arm64-latest \
-            --tag ghcr.io/runshine/secflow-app-system-analyse:arm64-${{ needs.prepare.outputs.date_tag }} \
+            --tag ghcr.io/runshine/secflow-app-system-analyse:latest \
+            --tag ghcr.io/runshine/secflow-app-system-analyse:${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-app-system-analyse/
 
       - name: Push arm64 image
         run: |
-          docker push ghcr.io/runshine/secflow-app-system-analyse:arm64-latest
-          docker push ghcr.io/runshine/secflow-app-system-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/secflow-app-system-analyse:latest
+          docker push ghcr.io/runshine/secflow-app-system-analyse:${{ needs.prepare.outputs.date_tag }}
 
   merge-manifest:
     needs: [prepare, build-amd64, build-arm64]
@@ -149,10 +149,10 @@ jobs:
       - name: Create and push GHCR manifests
         run: |
           docker manifest create ghcr.io/runshine/secflow-app-system-analyse:latest \
-            ghcr.io/runshine/secflow-app-system-analyse:amd64-latest \
-            ghcr.io/runshine/secflow-app-system-analyse:arm64-latest
+            ghcr.io/runshine/secflow-app-system-analyse:latest \
+            ghcr.io/runshine/secflow-app-system-analyse:latest
           docker manifest create ghcr.io/runshine/secflow-app-system-analyse:${{ needs.prepare.outputs.date_tag }} \
-            ghcr.io/runshine/secflow-app-system-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
-            ghcr.io/runshine/secflow-app-system-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
+            ghcr.io/runshine/secflow-app-system-analyse:${{ needs.prepare.outputs.date_tag }} \
+            ghcr.io/runshine/secflow-app-system-analyse:${{ needs.prepare.outputs.date_tag }}
           docker manifest push ghcr.io/runshine/secflow-app-system-analyse:latest
           docker manifest push ghcr.io/runshine/secflow-app-system-analyse:${{ needs.prepare.outputs.date_tag }}
