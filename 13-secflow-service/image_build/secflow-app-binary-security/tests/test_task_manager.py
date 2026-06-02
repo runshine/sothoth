@@ -10850,7 +10850,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             downstream_service="binary_to_source",
             downstream_task_id="b2s-new",
             status="success",
-            finished_at=datetime.utcnow(),
+            finished_at=_now(),
         )
         operation = BinarySecurityTaskOperation(
             id="op1",
@@ -16431,7 +16431,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(remaining, -600)
 
     def test_seconds_until_prefers_nearest_future_interpretation(self):
-        lease_value = datetime.utcnow() + timedelta(minutes=5)
+        lease_value = _now() + timedelta(minutes=5)
         remaining = _seconds_until(lease_value)
         self.assertIsNotNone(remaining)
         self.assertGreater(remaining, 0)

@@ -336,7 +336,7 @@ class BinarySecurityEvent(Base, JsonMixin):
     event_type = Column(String(64), nullable=False, index=True)
     message = Column(Text, nullable=False)
     payload_json = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    created_at = Column(DateTime, default=now_local, nullable=False, index=True)
 
     @property
     def payload(self) -> dict[str, Any]:
@@ -519,7 +519,7 @@ class BinarySecurityProjectConfig(Base, JsonMixin):
     id = Column(Integer, primary_key=True, autoincrement=True)
     project_id = Column(String(64), nullable=False, unique=True, index=True)
     config_json = Column(Text, nullable=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
 
     @property
     def config(self) -> dict[str, Any]:
@@ -536,7 +536,7 @@ class BinarySecurityServiceConfig(Base, JsonMixin):
     id = Column(Integer, primary_key=True, autoincrement=True)
     config_key = Column(String(64), nullable=False, unique=True, index=True)
     config_json = Column(Text, nullable=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
 
     @property
     def config(self) -> dict[str, Any]:

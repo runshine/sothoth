@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
+import time
 from typing import Any
 
 from app.config import get_config
@@ -81,10 +81,10 @@ def _reducer_readiness() -> tuple[bool, dict[str, Any]]:
 
 
 def _db_ready_check() -> dict[str, Any]:
-    started_at = datetime.utcnow()
+    started_at = time.perf_counter()
     with get_engine().connect() as connection:
         connection.execute(text("SELECT 1"))
-    latency_ms = max(0.0, (datetime.utcnow() - started_at).total_seconds() * 1000.0)
+    latency_ms = max(0.0, (time.perf_counter() - started_at) * 1000.0)
     return {"ok": True, "detail": {"ping": "ok", "latency_ms": round(latency_ms, 3)}}
 
 
