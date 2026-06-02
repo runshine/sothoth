@@ -32,14 +32,14 @@ spec:
             - name: PROVISIONER_NAME
               value: k8s-sigs.io/nfs-subdir-external-provisioner
             - name: NFS_SERVER
-              value: ${NFS_SERVER}
+              value: 172.31.30.81
             - name: NFS_PATH
-              value: ${NFS_PATH}  # 需要根据实际情况修改NFS共享路径
+              value: /nvme/share_k8s  # 需要根据实际情况修改NFS共享路径
       volumes:
         - name: nfs-client-root
           nfs:
-            server: ${NFS_SERVER}
-            path: ${NFS_PATH}     # 确保NFS服务器上的这个目录存在且有写权限
+            server: 172.31.30.81
+            path: /nvme/share_k8s     # 确保NFS服务器上的这个目录存在且有写权限
 ---
 apiVersion: v1
 kind: ServiceAccount

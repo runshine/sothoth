@@ -613,6 +613,52 @@ def rewrite_image_reference(image: str, prefix: str) -> str:
     return image.replace(cleaned, rewritten, 1)
 
 
+def render_blue_default_overrides(manifest_path: Path, text: str, env: dict[str, str]) -> str:
+    replacements_by_manifest = {
+        "00-network-kube-flannel-00-init.yaml": (
+            (f'"Network": "{DEFAULT_FLANNEL_NETWORK_CIDR}"', "FLANNEL_NETWORK_CIDR", DEFAULT_FLANNEL_NETWORK_CIDR),
+        ),
+        "00-network-kube-flannel-02-frr-configmap.yaml": (
+            (f"FLANNEL_IP={DEFAULT_FLANNEL_NETWORK_BASE}", "FLANNEL_NETWORK_BASE", DEFAULT_FLANNEL_NETWORK_BASE),
+            (f"RR_FLANNEL_IP={DEFAULT_FLANNEL_NETWORK_BASE}", "FLANNEL_NETWORK_BASE", DEFAULT_FLANNEL_NETWORK_BASE),
+            (f'FLANNEL_IP="{DEFAULT_FLANNEL_NETWORK_BASE}"', "FLANNEL_NETWORK_BASE", DEFAULT_FLANNEL_NETWORK_BASE),
+            (f'RR_FLANNEL_IP="{DEFAULT_FLANNEL_NETWORK_BASE}"', "FLANNEL_NETWORK_BASE", DEFAULT_FLANNEL_NETWORK_BASE),
+            (DEFAULT_FLANNEL_NETWORK_CIDR, "FLANNEL_NETWORK_CIDR", DEFAULT_FLANNEL_NETWORK_CIDR),
+        ),
+        "01-storageclass-01-nfs-client-provisioner.yaml": (
+            (DEFAULT_NFS_SERVER, "NFS_SERVER", DEFAULT_NFS_SERVER),
+            (DEFAULT_NFS_PATH, "NFS_PATH", DEFAULT_NFS_PATH),
+        ),
+        "02-metallb-01-ip-address-pool.yaml": (
+            (DEFAULT_METALLB_SHARED_POOL_RANGE, "METALLB_SHARED_POOL_RANGE", DEFAULT_METALLB_SHARED_POOL_RANGE),
+            (DEFAULT_METALLB_STATIC_POOL_RANGE, "METALLB_STATIC_POOL_RANGE", DEFAULT_METALLB_STATIC_POOL_RANGE),
+        ),
+        "03-nginx-ingress-00-install.yaml": (
+            (f'"{DEFAULT_INGRESS_NGINX_LB_IP}"', "INGRESS_NGINX_LB_IP", DEFAULT_INGRESS_NGINX_LB_IP),
+        ),
+        "00-kube-00-coredns-metallb.yaml": (
+            (f'"{DEFAULT_METALLB_SHARED_LB_IP}"', "METALLB_SHARED_LB_IP", DEFAULT_METALLB_SHARED_LB_IP),
+        ),
+        "01-mysql-01-mysql-metallb-for-debug.yaml": (
+            (f'"{DEFAULT_METALLB_SHARED_LB_IP}"', "METALLB_SHARED_LB_IP", DEFAULT_METALLB_SHARED_LB_IP),
+        ),
+        "02-vpn-access-00-openvpn-metallb.yaml": (
+            (f'"{DEFAULT_METALLB_SHARED_LB_IP}"', "METALLB_SHARED_LB_IP", DEFAULT_METALLB_SHARED_LB_IP),
+        ),
+        "06-nacos-01-register-metallb-for-debug.yaml": (
+            (f'"{DEFAULT_METALLB_SHARED_LB_IP}"', "METALLB_SHARED_LB_IP", DEFAULT_METALLB_SHARED_LB_IP),
+        ),
+        "09-redis-00-metallb-for-debug.yaml": (
+            (f'"{DEFAULT_METALLB_SHARED_LB_IP}"', "METALLB_SHARED_LB_IP", DEFAULT_METALLB_SHARED_LB_IP),
+        ),
+    }
+    for original, env_key, default_value in replacements_by_manifest.get(manifest_path.name, ()):
+        value = env.get(env_key, default_value)
+        if value != default_value:
+            text = text.replace(original, original.replace(default_value, value))
+    return text
+
+
 def render_manifest_text(manifest_path: Path, env: dict[str, str], image_registry_prefix: str) -> str:
     text = manifest_path.read_text()
     text = re.sub(
@@ -620,6 +666,7 @@ def render_manifest_text(manifest_path: Path, env: dict[str, str], image_registr
         lambda match: env.get(match.group(1), match.group(0)),
         text,
     )
+    text = render_blue_default_overrides(manifest_path, text, env)
     if image_registry_prefix:
         text = re.sub(
             r'(^\s*[A-Za-z0-9_-]*image:\s*["\']?)([^"\s\'#]+)(["\']?)',

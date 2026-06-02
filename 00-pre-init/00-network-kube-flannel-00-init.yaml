@@ -90,7 +90,7 @@ data:
     }
   net-conf.json: |
     {
-      "Network": "${FLANNEL_NETWORK_CIDR}",
+      "Network": "10.42.0.0/16",
       "EnableNFTables": false,
       "Backend": {
         "Type": "vxlan",

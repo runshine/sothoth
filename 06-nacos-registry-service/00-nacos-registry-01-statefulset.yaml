@@ -68,7 +68,7 @@ spec:
       containers:
         - name: nacos
           imagePullPolicy: Always
-          image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/nacos/nacos-server:latest
+          image: nacos/nacos-server:latest
           resources:
             requests:
               memory: "2Gi"
