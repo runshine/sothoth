@@ -80,24 +80,24 @@ spec:
               path: /api/dataflow-vuln-scanner/health
               port: 8080
             periodSeconds: 10
-            timeoutSeconds: 15
-            failureThreshold: 18
+            timeoutSeconds: 20
+            failureThreshold: 24
           livenessProbe:
             httpGet:
               path: /api/dataflow-vuln-scanner/health
               port: 8080
-            initialDelaySeconds: 30
+            initialDelaySeconds: 60
             periodSeconds: 30
-            timeoutSeconds: 15
-            failureThreshold: 6
+            timeoutSeconds: 20
+            failureThreshold: 10
           readinessProbe:
             httpGet:
               path: /api/dataflow-vuln-scanner/ready
               port: 8080
-            initialDelaySeconds: 15
+            initialDelaySeconds: 30
             periodSeconds: 15
-            timeoutSeconds: 15
-            failureThreshold: 6
+            timeoutSeconds: 20
+            failureThreshold: 10
       volumes:
         - name: secflow-app-dataflow-vuln-scanner-config
           configMap:
