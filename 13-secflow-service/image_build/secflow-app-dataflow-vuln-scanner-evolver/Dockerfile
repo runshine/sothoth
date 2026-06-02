@@ -1,5 +1,4 @@
 FROM public.ecr.aws/docker/library/python:3.11-slim
-ARG SECFLOW_BUILD_VERSION=""
 
 WORKDIR /app
 
@@ -16,13 +15,8 @@ ENV PATH="/app/venv/bin:$PATH"
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY app/ /app/app/
+COPY cli.py /app/cli.py
+COPY core/ /app/core/
 COPY config.yaml /app/config.yaml
-RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
-EXPOSE 8080
-
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "from urllib.request import urlopen; urlopen('http://localhost:8080/api/app/binary-evolution/health', timeout=5)" || exit 1
-
-CMD ["python", "-m", "app.main"]
+CMD ["python", "cli.py", "--help"]

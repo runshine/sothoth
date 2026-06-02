@@ -32,6 +32,10 @@ def _prefix(name: str) -> str:
     return f"{get_config().database.table_prefix}{name}"
 
 
+def _constraint_suffix(name: str) -> str:
+    return hashlib.sha1(name.encode("utf-8", errors="surrogatepass")).hexdigest()[:8]
+
+
 def run_source_hash(source_type: str | None, source_key: str | None) -> str:
     payload = f"{source_type or ''}\0{source_key or ''}".encode("utf-8", errors="surrogatepass")
     return hashlib.sha256(payload).hexdigest()
@@ -395,8 +399,8 @@ class SchedulerWorkerSlotReservation(Base):
     __tablename__ = _prefix("scheduler_worker_slot_reservation")
 
     reservation_id = Column("id", String(64), primary_key=True)
-    worker_pod_id = Column(String(512), ForeignKey(f"{SchedulerWorker.__tablename__}.pod_id"), nullable=False)
-    execution_id = Column(String(64), ForeignKey(f"{WorkflowExecution.__tablename__}.id"), nullable=False, unique=True)
+    worker_pod_id = Column(String(512), ForeignKey(f"{SchedulerWorker.__tablename__}.pod_id", name=f"fk_dfvs_swsr_worker_{_constraint_suffix(__tablename__)}"), nullable=False)
+    execution_id = Column(String(64), ForeignKey(f"{WorkflowExecution.__tablename__}.id", name=f"fk_dfvs_swsr_exec_{_constraint_suffix(__tablename__)}"), nullable=False, unique=True)
     status = Column(String(32), nullable=False, default="reserved")
     lease_expires_at = Column(DateTime, nullable=False)
     created_at = Column(DateTime, default=now_utc)

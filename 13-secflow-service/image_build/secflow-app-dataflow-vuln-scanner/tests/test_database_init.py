@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from sqlalchemy.dialects import mysql
+from sqlalchemy.schema import CreateTable
 from sqlalchemy.exc import OperationalError
 
 from app.models import database
@@ -131,6 +133,18 @@ def test_mysql_core_tables_include_runtime_config_and_reservation():
         assert database._mysql_core_tables_exist(FakeConnection()) is True
     finally:
         database.inspect = original_inspect
+
+
+def test_scheduler_slot_reservation_mysql_foreign_key_names_are_short():
+    ddl = str(CreateTable(database.SchedulerWorkerSlotReservation.__table__).compile(dialect=mysql.dialect()))
+
+    assert "fk_dfvs_swsr_worker_" in ddl
+    assert "fk_dfvs_swsr_exec_" in ddl
+    assert "scheduler_worker_slot_reservation_ibfk" not in ddl
+
+    for foreign_key in database.SchedulerWorkerSlotReservation.__table__.foreign_key_constraints:
+        assert foreign_key.name is not None
+        assert len(foreign_key.name) <= 64
 
 
 def test_init_database_retries_mysql_concurrent_ddl(monkeypatch):

@@ -4,7 +4,6 @@ set -euo pipefail
 NAMESPACE="${NAMESPACE:-secflow-ns}"
 DEFAULT_IMAGE_TAG="${DEFAULT_IMAGE_TAG:-latest}"
 B2S_IMAGE_REPO="${B2S_IMAGE_REPO:-ghcr.io/runshine/secflow-app-binary-to-source}"
-BIN_EVOLUTION_IMAGE_REPO="${BIN_EVOLUTION_IMAGE_REPO:-ghcr.io/runshine/secflow-app-binary-evolution-center}"
 BIN_SECURITY_IMAGE_REPO="${BIN_SECURITY_IMAGE_REPO:-ghcr.io/runshine/secflow-app-binary-security}"
 ENTRY_ANALYSE_IMAGE_REPO="${ENTRY_ANALYSE_IMAGE_REPO:-ghcr.io/runshine/secflow-app-entry-analyse}"
 DATAFLOW_ANALYSE_IMAGE_REPO="${DATAFLOW_ANALYSE_IMAGE_REPO:-ghcr.io/runshine/secflow-app-dataflow-analyse}"
@@ -20,10 +19,6 @@ B2S_MANAGER_DEPLOYMENT="secflow-app-binary-to-source-manager"
 B2S_WORKER_DEPLOYMENT="secflow-app-binary-to-source-worker"
 B2S_MANAGER_CONTAINER="secflow-app-binary-to-source-manager"
 B2S_WORKER_CONTAINER="secflow-app-binary-to-source-worker"
-BIN_EVOLUTION_MANAGER_DEPLOYMENT="secflow-app-binary-evolution-center-manager"
-BIN_EVOLUTION_WORKER_DEPLOYMENT="secflow-app-binary-evolution-center-worker"
-BIN_EVOLUTION_MANAGER_CONTAINER="secflow-app-binary-evolution-center-manager"
-BIN_EVOLUTION_WORKER_CONTAINER="secflow-app-binary-evolution-center-worker"
 BIN_SECURITY_API_DEPLOYMENT="secflow-app-binary-security"
 BIN_SECURITY_WORKER_DEPLOYMENT="secflow-app-binary-security-worker"
 BIN_SECURITY_REDUCER_DEPLOYMENT="secflow-app-binary-security-reducer"
@@ -49,13 +44,12 @@ usage() {
 Usage:
   ./update_k8s_image_all.sh
   ./update_k8s_image_all.sh [global_tag]
-  ./update_k8s_image_all.sh --tag <tag> [--b2s-image <image_or_tag>] [--binary-evolution-image <image_or_tag>] [--binary-security-image <image_or_tag>] [--entry-analyse-image <image_or_tag>] [--dataflow-analyse-image <image_or_tag>] [--system-analyse-image <image_or_tag>] [--frontend-image <image_or_tag>] [--resource-image <image_or_tag>] [--gateway-worker-image <image_or_tag>] [--firmware-unpacker-image <image_or_tag>]
+  ./update_k8s_image_all.sh --tag <tag> [--b2s-image <image_or_tag>] [--binary-security-image <image_or_tag>] [--entry-analyse-image <image_or_tag>] [--dataflow-analyse-image <image_or_tag>] [--system-analyse-image <image_or_tag>] [--frontend-image <image_or_tag>] [--resource-image <image_or_tag>] [--gateway-worker-image <image_or_tag>] [--firmware-unpacker-image <image_or_tag>]
 
 Examples:
   ./update_k8s_image_all.sh
   ./update_k8s_image_all.sh latest
   ./update_k8s_image_all.sh --tag 20260508-abcdef0
-  ./update_k8s_image_all.sh --binary-evolution-image 20260512-abcdef0
   ./update_k8s_image_all.sh --entry-analyse-image ghcr.io/runshine/secflow-app-entry-analyse:latest
   ./update_k8s_image_all.sh --binary-security-image 20260513-af453b4
   ./update_k8s_image_all.sh --resource-image 20260403
@@ -70,7 +64,6 @@ Behavior:
       ghcr.io/runshine/*
       runshine0819/secflow-*
   - b2s image: override binary-to-source manager/worker image.
-  - binary-evolution image: override binary-evolution-center manager/worker image.
   - binary-security image: override binary-security api/worker image.
   - entry-analyse image: override entry-analyse api/scheduler/worker image.
   - dataflow-analyse image: override dataflow-analyse api/worker image.
@@ -174,7 +167,6 @@ scale_deployment_if_exists() {
 }
 
 B2S_IMAGE_ARG=""
-BIN_EVOLUTION_IMAGE_ARG=""
 BIN_SECURITY_IMAGE_ARG=""
 ENTRY_ANALYSE_IMAGE_ARG=""
 DATAFLOW_ANALYSE_IMAGE_ARG=""
@@ -197,10 +189,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --b2s-image)
       B2S_IMAGE_ARG="${2:-}"
-      shift 2
-      ;;
-    --binary-evolution-image)
-      BIN_EVOLUTION_IMAGE_ARG="${2:-}"
       shift 2
       ;;
     --binary-security-image)
@@ -250,7 +238,6 @@ done
 
 GLOBAL_TAG="${GLOBAL_TAG_ARG:-${DEFAULT_IMAGE_TAG}}"
 B2S_IMAGE="$(resolve_image "${B2S_IMAGE_ARG}" "${B2S_IMAGE_REPO}")"
-BIN_EVOLUTION_IMAGE="$(resolve_image "${BIN_EVOLUTION_IMAGE_ARG}" "${BIN_EVOLUTION_IMAGE_REPO}")"
 BIN_SECURITY_IMAGE="$(resolve_image "${BIN_SECURITY_IMAGE_ARG}" "${BIN_SECURITY_IMAGE_REPO}")"
 ENTRY_ANALYSE_IMAGE="$(resolve_image "${ENTRY_ANALYSE_IMAGE_ARG}" "${ENTRY_ANALYSE_IMAGE_REPO}")"
 DATAFLOW_ANALYSE_IMAGE="$(resolve_image "${DATAFLOW_ANALYSE_IMAGE_ARG}" "${DATAFLOW_ANALYSE_IMAGE_REPO}")"
@@ -302,8 +289,6 @@ maybe_set_explicit_image "${BIN_SECURITY_REDUCER_DEPLOYMENT}" "secflow-app-binar
 maybe_set_explicit_image "${FRONTEND_DEPLOYMENT}" "${FRONTEND_CONTAINER}" "${FRONTEND_IMAGE}"
 maybe_set_explicit_image "${B2S_MANAGER_DEPLOYMENT}" "${B2S_MANAGER_CONTAINER}" "${B2S_IMAGE}"
 maybe_set_explicit_image "${B2S_WORKER_DEPLOYMENT}" "${B2S_WORKER_CONTAINER}" "${B2S_IMAGE}"
-maybe_set_explicit_image "${BIN_EVOLUTION_MANAGER_DEPLOYMENT}" "${BIN_EVOLUTION_MANAGER_CONTAINER}" "${BIN_EVOLUTION_IMAGE}"
-maybe_set_explicit_image "${BIN_EVOLUTION_WORKER_DEPLOYMENT}" "${BIN_EVOLUTION_WORKER_CONTAINER}" "${BIN_EVOLUTION_IMAGE}"
 maybe_set_explicit_image "secflow-app-firmware-unpacker-api" "secflow-app-firmware-unpacker" "${FW_UNPACKER_IMAGE}"
 maybe_set_explicit_image "secflow-app-firmware-unpacker-dispatcher" "secflow-app-firmware-unpacker" "${FW_UNPACKER_IMAGE}"
 maybe_set_explicit_image "secflow-app-firmware-unpacker-cleanup" "secflow-app-firmware-unpacker" "${FW_UNPACKER_IMAGE}"
@@ -325,9 +310,6 @@ while IFS=$'\t' read -r workload_kind workload_name containers; do
     case "${workload_name}:${container}" in
       "${B2S_MANAGER_DEPLOYMENT}:${B2S_MANAGER_CONTAINER}"|"${B2S_WORKER_DEPLOYMENT}:${B2S_WORKER_CONTAINER}")
         [[ -n "${B2S_IMAGE}" ]] && requested_tag="${B2S_IMAGE}"
-        ;;
-      "${BIN_EVOLUTION_MANAGER_DEPLOYMENT}:${BIN_EVOLUTION_MANAGER_CONTAINER}"|"${BIN_EVOLUTION_WORKER_DEPLOYMENT}:${BIN_EVOLUTION_WORKER_CONTAINER}")
-        [[ -n "${BIN_EVOLUTION_IMAGE}" ]] && requested_tag="${BIN_EVOLUTION_IMAGE}"
         ;;
       "${BIN_SECURITY_API_DEPLOYMENT}:secflow-app-binary-security"|"${BIN_SECURITY_WORKER_DEPLOYMENT}:secflow-app-binary-security-worker"|"${BIN_SECURITY_REDUCER_DEPLOYMENT}:secflow-app-binary-security-reducer")
         [[ -n "${BIN_SECURITY_IMAGE}" ]] && requested_tag="${BIN_SECURITY_IMAGE}"
