@@ -270,6 +270,7 @@ class ArchiveReclaimTests(unittest.TestCase):
         self.manager.instance_id = "worker-a"
         self.manager.cfg.scheduler.archive_reclaim_timeout_seconds = 300
         self.manager.cfg.scheduler.archive_reclaim_max_attempts = 3
+        self.manager.cfg.scheduler.archive_copy_missing_source_retry_schedule_seconds = [60, 120, 180]
 
     def _task(self):
         return BinarySecurityTask(
@@ -419,6 +420,69 @@ class ArchiveReclaimTests(unittest.TestCase):
             status = self.manager._business_stage_status(task, "dataflow_analysis", stage_run, [item])
         self.assertFalse(blocked)
         self.assertEqual(status, "success")
+
+    def test_run_archive_copy_job_missing_source_schedules_delayed_retry(self):
+        task = self._task()
+        item = self._item()
+        job = self._archive_job(status="running", attempts=1)
+        job.payload = {"mapped_status": "success", "downstream_payload": {}}
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[job])
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            archived_root, error, retry_scheduled = self.manager._run_archive_copy_job(job.id)
+        self.assertIsNone(archived_root)
+        self.assertIsNone(error)
+        self.assertTrue(retry_scheduled)
+        self.assertEqual("pending", job.archive_status)
+        self.assertEqual(1, job.payload.get("copy_retry_attempt"))
+        self.assertEqual([60, 120, 180], job.payload.get("copy_retry_schedule_seconds"))
+        self.assertIsNotNone(job.payload.get("copy_retry_next_at"))
+        event_types = [event.event_type for event in db.events]
+        self.assertIn("downstream_archive_job_delayed_retry_scheduled", event_types)
+
+    def test_run_archive_copy_job_missing_source_exhausted_marks_failed(self):
+        task = self._task()
+        item = self._item()
+        job = self._archive_job(status="running", attempts=4)
+        job.payload = {
+            "mapped_status": "success",
+            "downstream_payload": {},
+            "copy_retry_attempt": 3,
+            "copy_retry_schedule_seconds": [60, 120, 180],
+        }
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[job])
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            archived_root, error, retry_scheduled = self.manager._run_archive_copy_job(job.id)
+        self.assertIsNone(archived_root)
+        self.assertFalse(retry_scheduled)
+        self.assertEqual("下游产物归档未完成", error)
+        self.assertEqual("failed", job.archive_status)
+        self.assertEqual("下游产物归档未完成", job.error_message)
+        self.assertEqual(3, job.payload.get("copy_retry_attempt"))
+        event_types = [event.event_type for event in db.events]
+        self.assertIn("downstream_archive_job_retry_exhausted", event_types)
+
+    def test_claim_archive_job_skips_not_ready_retry_and_claims_next_ready_job(self):
+        task = self._task()
+        item = self._item()
+        now = _now()
+        delayed_job = self._archive_job(status="pending", attempts=1)
+        delayed_job.id = "aj-delayed"
+        delayed_job.payload = {
+            "mapped_status": "success",
+            "copy_retry_next_at": (now + timedelta(seconds=60)).isoformat(),
+            "copy_retry_attempt": 1,
+        }
+        ready_job = self._archive_job(status="pending", attempts=0)
+        ready_job.id = "aj-ready"
+        ready_job.downstream_task_id = "dfa-2"
+        ready_job.item_id = "item-2"
+        ready_job.payload = {"mapped_status": "success"}
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[delayed_job, ready_job])
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            claimed = self.manager._claim_archive_job()
+        self.assertEqual("aj-ready", claimed)
+        self.assertEqual("pending", delayed_job.archive_status)
+        self.assertEqual("running", ready_job.archive_status)
 
 
 class _ScalarResult:
@@ -15384,12 +15448,12 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 payload={"workspace_root": str(workspace)},
             )
 
-            self.assertIsNotNone(target)
-            assert target is not None
-            self.assertTrue((target / "result.json").is_file())
-            self.assertFalse((target / "output").exists())
-            self.assertEqual("system-analyse", target.parent.name)
-            self.assertEqual("fw1__down1", target.name)
+            self.assertEqual("archived", target.status)
+            assert target.target_dir is not None
+            self.assertTrue((target.target_dir / "result.json").is_file())
+            self.assertFalse((target.target_dir / "output").exists())
+            self.assertEqual("system-analyse", target.target_dir.parent.name)
+            self.assertEqual("fw1__down1", target.target_dir.name)
 
     def test_resolve_downstream_output_sources_reads_nested_result_output_root(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -15472,10 +15536,10 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 payload={"output_path": str(workspace / "run" / "firmware-unpacker" / "fw1")},
             )
 
-            self.assertIsNotNone(target)
-            assert target is not None
-            self.assertTrue((target / "summary.md").is_file())
-            self.assertEqual("firmware-unpacker", target.parent.name)
+            self.assertEqual("archived", target.status)
+            assert target.target_dir is not None
+            self.assertTrue((target.target_dir / "summary.md").is_file())
+            self.assertEqual("firmware-unpacker", target.target_dir.parent.name)
 
     def test_archive_downstream_output_does_not_copy_other_downstream_tasks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -15514,11 +15578,11 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 payload={"output_path": str(service_root)},
             )
 
-            self.assertIsNotNone(target)
-            assert target is not None
-            self.assertTrue((target / "entry-details.json").is_file())
-            self.assertFalse((target / "eat_other").exists())
-            self.assertFalse((target / "foreign.txt").exists())
+            self.assertEqual("archived", target.status)
+            assert target.target_dir is not None
+            self.assertTrue((target.target_dir / "entry-details.json").is_file())
+            self.assertFalse((target.target_dir / "eat_other").exists())
+            self.assertFalse((target.target_dir / "foreign.txt").exists())
 
     def test_archive_downstream_output_skips_empty_sources_without_creating_target(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -15553,7 +15617,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 payload={"workspace_root": str(workspace)},
             )
 
-            self.assertIsNone(target)
+            self.assertEqual("source_not_ready", target.status)
+            self.assertIsNone(target.target_dir)
+            self.assertGreaterEqual(len(target.source_candidates), 1)
             self.assertFalse((root / "task-output" / "system-analyse" / "fw1__down1").exists())
 
     def test_archive_job_payload_uses_compact_downstream_payload(self):

@@ -109,6 +109,7 @@ class SchedulerConfig(BaseModel):
     archive_job_concurrency: int = 4
     archive_reclaim_timeout_seconds: int = 300
     archive_reclaim_max_attempts: int = 3
+    archive_copy_missing_source_retry_schedule_seconds: list[int] = [60, 120, 180]
     downstream_sync_concurrency: int = 8
     downstream_sync_batch_size: int = 50
     downstream_action_concurrency: int = 8

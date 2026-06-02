@@ -163,6 +163,7 @@ DB_ARTIFACT_PREVIEW_LIMIT = 50
 DB_EVENT_PAYLOAD_LIMIT_BYTES = 32768
 DETAIL_STAGE_ITEMS_LIMIT = 100
 MODULE_TASK_INPUT_KEY = "module-input"
+ARCHIVE_COPY_MISSING_SOURCE_RETRY_REASON = "source_not_ready"
 
 # Compatibility exports for older tests and call sites that monkey-patch
 # downstream client factories from task_manager directly.
@@ -216,6 +217,13 @@ def _seconds_until(value: datetime | None) -> float | None:
     # not incorrectly remain fresh for ~8 extra hours under UTC comparison, and
     # fresh UTC timestamps do not expire ~8 hours early under local comparison.
     return min(candidates, key=lambda remaining: abs(remaining))
+
+
+@dataclass
+class _ArchiveOutputResult:
+    status: str
+    target_dir: Path | None = None
+    source_candidates: list[str] = field(default_factory=list)
 
 
 def _slug(value: str) -> str:
@@ -5353,6 +5361,7 @@ class TaskManager:
                 if item.stage_name == "firmware_unpack":
                     self._refresh_firmware_unpack_item_result(task, item, archived_dir=Path(job.archive_root) if job.archive_root else None)
                 touched_stage_names.add(item.stage_name)
+            job.payload = self._clear_archive_job_retry_metadata(job)
             job.archive_status = "pending"
             job.owner_id = None
             job.error_message = None
@@ -7750,6 +7759,97 @@ class TaskManager:
     def _archive_reclaim_max_attempts(self) -> int:
         return max(1, int(getattr(self.cfg.scheduler, "archive_reclaim_max_attempts", 3) or 3))
 
+    def _archive_copy_missing_source_retry_schedule_seconds(self) -> list[int]:
+        raw_schedule = getattr(self.cfg.scheduler, "archive_copy_missing_source_retry_schedule_seconds", None)
+        values = raw_schedule if isinstance(raw_schedule, list) else [60, 120, 180]
+        schedule = [max(1, int(value)) for value in values if str(value).strip()]
+        return schedule or [60, 120, 180]
+
+    def _archive_job_retry_attempt(self, job: BinarySecurityArchiveJob) -> int:
+        return max(0, int((job.payload or {}).get("copy_retry_attempt") or 0))
+
+    def _archive_job_retry_next_at(self, job: BinarySecurityArchiveJob) -> datetime | None:
+        raw = (job.payload or {}).get("copy_retry_next_at")
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(str(raw))
+        except Exception:
+            return None
+
+    def _archive_job_ready_for_retry(self, job: BinarySecurityArchiveJob, *, now: datetime | None = None) -> bool:
+        next_retry_at = self._archive_job_retry_next_at(job)
+        if next_retry_at is None:
+            return True
+        return _seconds_until(next_retry_at) is None or _seconds_until(next_retry_at) <= 0
+
+    def _clear_archive_job_retry_metadata(self, job: BinarySecurityArchiveJob) -> dict[str, Any]:
+        payload = dict(job.payload or {})
+        for key in (
+            "copy_retry_reason",
+            "copy_retry_attempt",
+            "copy_retry_next_at",
+            "copy_retry_schedule_seconds",
+            "last_missing_source_observed_at",
+            "last_source_candidates",
+        ):
+            payload.pop(key, None)
+        return payload
+
+    def _schedule_archive_job_missing_source_retry(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem | None,
+        job: BinarySecurityArchiveJob,
+        *,
+        source_candidates: list[str],
+    ) -> tuple[bool, int | None, datetime | None]:
+        schedule = self._archive_copy_missing_source_retry_schedule_seconds()
+        retry_attempt = self._archive_job_retry_attempt(job)
+        if retry_attempt >= len(schedule):
+            return False, None, None
+        retry_delay_seconds = int(schedule[retry_attempt])
+        next_retry_at = _now() + timedelta(seconds=retry_delay_seconds)
+        payload = self._clear_archive_job_retry_metadata(job)
+        payload.update(
+            {
+                "copy_retry_reason": ARCHIVE_COPY_MISSING_SOURCE_RETRY_REASON,
+                "copy_retry_attempt": retry_attempt + 1,
+                "copy_retry_next_at": next_retry_at.isoformat(),
+                "copy_retry_schedule_seconds": schedule,
+                "last_missing_source_observed_at": _now().isoformat(),
+                "last_source_candidates": list(source_candidates),
+            }
+        )
+        job.payload = payload
+        job.archive_status = "pending"
+        job.owner_id = None
+        job.error_message = None
+        job.archive_root = None
+        job.started_at = None
+        job.completed_at = None
+        job.updated_at = _now()
+        self._record_event(
+            db,
+            task,
+            "downstream_archive_job_delayed_retry_scheduled",
+            f"下游产物暂未就绪，已安排 {retry_delay_seconds}s 后重试归档",
+            stage_name=job.stage_name,
+            item=item,
+            level="warning",
+            payload={
+                "archive_job_id": job.id,
+                "retry_attempt": retry_attempt + 1,
+                "retry_delay_seconds": retry_delay_seconds,
+                "next_retry_at": next_retry_at.isoformat(),
+                "source_candidates": list(source_candidates),
+                "downstream_task_id": job.downstream_task_id,
+                "resolution_reason": ARCHIVE_COPY_MISSING_SOURCE_RETRY_REASON,
+            },
+        )
+        return True, retry_delay_seconds, next_retry_at
+
     def _active_archive_job_ids(self) -> set[str]:
         active_job_ids: set[str] = set()
         for worker in self._archive_workers:
@@ -9173,6 +9273,18 @@ class TaskManager:
                 )
                 if job is None:
                     return None
+                if not self._archive_job_ready_for_retry(job):
+                    db.rollback()
+                    delayed_job_exists = (
+                        db.query(BinarySecurityArchiveJob)
+                        .filter(BinarySecurityArchiveJob.archive_status == "pending")
+                        .order_by(BinarySecurityArchiveJob.created_at.asc(), BinarySecurityArchiveJob.id.asc())
+                        .all()
+                    )
+                    next_ready = next((candidate for candidate in delayed_job_exists if self._archive_job_ready_for_retry(candidate)), None)
+                    if next_ready is None:
+                        return None
+                    job = next_ready
                 duplicate_active = (
                     db.query(BinarySecurityArchiveJob)
                     .filter(
@@ -9214,7 +9326,9 @@ class TaskManager:
             db.close()
 
     async def _process_archive_job(self, job_id: str) -> None:
-        archived_root, error = await asyncio.to_thread(self._run_archive_copy_job, job_id)
+        archived_root, error, retry_scheduled = await asyncio.to_thread(self._run_archive_copy_job, job_id)
+        if retry_scheduled:
+            return
         if error:
             observe_archive_action("copy", "failed")
             await asyncio.to_thread(
@@ -9247,13 +9361,13 @@ class TaskManager:
                 db.close()
             await asyncio.sleep(max(1, self.cfg.scheduler.stage_poll_interval_seconds))
 
-    def _run_archive_copy_job(self, job_id: str) -> tuple[str | None, str | None]:
+    def _run_archive_copy_job(self, job_id: str) -> tuple[str | None, str | None, bool]:
         session_factory = get_session_factory()
         db = session_factory()
         try:
             job = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.id == job_id).first()
             if job is None or job.archive_status != "running":
-                return None, "archive job is not running"
+                return None, "archive job is not running", False
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == job.task_id).first()
             item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == job.item_id).first()
             if task is None or item is None:
@@ -9261,16 +9375,16 @@ class TaskManager:
                 job.error_message = "任务或阶段子任务不存在"
                 job.completed_at = _now()
                 db.commit()
-                return None, job.error_message
+                return None, job.error_message, False
             if task.status == "cancelled":
                 job.archive_status = "failed"
                 job.error_message = "任务已取消，跳过归档复制"
                 job.completed_at = _now()
                 job.updated_at = _now()
                 db.commit()
-                return None, job.error_message
+                return None, job.error_message, False
             payload = dict(job.payload or {})
-            archived_dir = self._archive_downstream_output(
+            archive_result = self._archive_downstream_output(
                 db,
                 task,
                 item,
@@ -9278,16 +9392,62 @@ class TaskManager:
                 payload=payload.get("downstream_payload") or {},
                 extra_paths=payload.get("extra_paths") or None,
             )
+            if archive_result.status == "source_not_ready":
+                scheduled, retry_delay_seconds, next_retry_at = self._schedule_archive_job_missing_source_retry(
+                    db,
+                    task,
+                    item,
+                    job,
+                    source_candidates=archive_result.source_candidates,
+                )
+                if scheduled:
+                    db.commit()
+                    return None, None, True
+                exhausted_attempt = self._archive_job_retry_attempt(job)
+                job.archive_status = "failed"
+                job.error_message = "下游产物归档未完成"
+                job.completed_at = _now()
+                job.updated_at = _now()
+                job.payload = {
+                    **self._clear_archive_job_retry_metadata(job),
+                    "archive_copy_stats": dict((item.output_ref or {}).get("archive_copy_stats") or {}),
+                    "copy_retry_reason": ARCHIVE_COPY_MISSING_SOURCE_RETRY_REASON,
+                    "copy_retry_attempt": exhausted_attempt,
+                    "copy_retry_schedule_seconds": self._archive_copy_missing_source_retry_schedule_seconds(),
+                    "last_missing_source_observed_at": _now().isoformat(),
+                    "last_source_candidates": list(archive_result.source_candidates),
+                }
+                self._record_event(
+                    db,
+                    task,
+                    "downstream_archive_job_retry_exhausted",
+                    "下游产物长时间未就绪，归档延迟重试已耗尽",
+                    stage_name=job.stage_name,
+                    item=item,
+                    level="warning",
+                    payload={
+                        "archive_job_id": job.id,
+                        "retry_attempt": exhausted_attempt,
+                        "retry_delay_seconds": retry_delay_seconds,
+                        "next_retry_at": next_retry_at.isoformat() if next_retry_at else None,
+                        "source_candidates": list(archive_result.source_candidates),
+                        "downstream_task_id": job.downstream_task_id,
+                        "resolution_reason": "archive_source_retry_exhausted",
+                    },
+                )
+                db.commit()
+                return None, job.error_message, False
+            archived_dir = archive_result.target_dir
             if not archived_dir:
                 job.archive_status = "failed"
                 job.error_message = "下游产物归档未完成"
                 job.completed_at = _now()
                 job.updated_at = _now()
                 db.commit()
-                return None, job.error_message
+                return None, job.error_message, False
             copy_stats = dict((item.output_ref or {}).get("archive_copy_stats") or {})
             job.payload = {
-                **dict(job.payload or {}),
+                **self._clear_archive_job_retry_metadata(job),
                 "archive_copy_stats": copy_stats,
             }
             observe_archive_duration(
@@ -9300,7 +9460,7 @@ class TaskManager:
             job.error_message = None
             job.updated_at = _now()
             db.commit()
-            return str(archived_dir), None
+            return str(archived_dir), None, False
         except Exception as exc:
             db.rollback()
             try:
@@ -9318,7 +9478,7 @@ class TaskManager:
                     db.commit()
             except Exception:
                 db.rollback()
-            return None, str(exc)
+            return None, str(exc), False
         finally:
             db.close()
 
@@ -12708,7 +12868,13 @@ class TaskManager:
             )
         if normalized_status != "failed":
             return None
-        code = "archive_reclaim_exhausted" if "reclaim exhausted" in str(job.error_message or "").lower() else "archive_failed"
+        error_text = str(job.error_message or "").lower()
+        if "reclaim exhausted" in error_text:
+            code = "archive_reclaim_exhausted"
+        elif "下游产物归档未完成" in str(job.error_message or "").strip() and int((job.payload or {}).get("copy_retry_attempt") or 0) >= len(self._archive_copy_missing_source_retry_schedule_seconds()):
+            code = "archive_source_retry_exhausted"
+        else:
+            code = "archive_failed"
         return self._build_abnormal_reason(
             category="archive",
             code=code,
@@ -19858,7 +20024,7 @@ class TaskManager:
         semantic_key: str,
         payload: dict[str, Any] | None = None,
         extra_paths: list[str | Path] | None = None,
-    ) -> Path | None:
+    ) -> _ArchiveOutputResult:
         target_dir = self._service_output_path(task, item.downstream_service or item.stage_name, semantic_key, item.downstream_task_id)
         sources = self._resolve_downstream_output_sources(
             payload,
@@ -19890,7 +20056,11 @@ class TaskManager:
                     "sources": [str(path) for path in sources],
                 },
             )
-            return None
+            return _ArchiveOutputResult(
+                status="source_not_ready",
+                target_dir=None,
+                source_candidates=[str(path) for path in sources],
+            )
         ensure_dir(target_dir)
         copy_stats = {
             "copied_files": 0,
@@ -19947,7 +20117,11 @@ class TaskManager:
             **(getattr(item, "result", None) or {}),
             "archive_copy_stats": copy_stats,
         }
-        return target_dir
+        return _ArchiveOutputResult(
+            status="archived",
+            target_dir=target_dir,
+            source_candidates=[str(path) for path in existing_sources],
+        )
 
     def _materialize_stage_artifact(
         self,
