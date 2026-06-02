@@ -30,7 +30,7 @@ from app.services.execution_service import get_execution_service
 from app.services.run_index_service import get_run_index_service
 from app.services.run_inspector import inspect_cycle_detail, inspect_run_detail
 from app.services.scheduler import get_scheduler_service
-from app.time_utils import now_local
+from app.time_utils import isoformat_local, now_local
 
 
 def _new_id(prefix: str) -> str:
@@ -1480,6 +1480,123 @@ def test_reconcile_unbound_running_with_local_process_is_preserved(service_confi
                 .first()
             )
             assert event is not None
+        finally:
+            service._forget_cli_process(execution.id, fake_process)
+
+
+def test_run_process_state_detects_terminal_runtime_conflict(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_terminal_runtime_conflict_20260602_010203"
+    bound = _create_execution_bound_run(client, run_root)
+
+    with get_db_session() as db:
+        run_index = db.get(RunIndex, bound["run_id"])
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        trigger = db.get(TriggerTask, bound["task_id"])
+        assert run_index is not None and execution is not None and trigger is not None
+        now = now_local()
+        run_index.status = "cancelled"
+        run_index.last_activity_at = now
+        execution.status = "cancelled"
+        execution.public_status = "cancelled"
+        execution.process_pid = 5353
+        execution.process_status = "running"
+        execution.process_started_at = now
+        trigger.status = "cancelled"
+        trigger.public_status = "cancelled"
+        trigger.finished_at = now
+        db.add_all([run_index, execution, trigger])
+        db.commit()
+
+        service = get_execution_service()
+        fake_process = _FakeCliProcess(pid=5353)
+        service._register_cli_process(execution.id, fake_process)
+        try:
+            process_state = service._run_process_state(db, run_index, trigger=trigger, execution=execution)
+            assert process_state["source"] == "terminal_state_conflict"
+            assert process_state["is_running"] is True
+
+            service._forget_cli_process(execution.id, fake_process)
+            _write_json(run_root / "run" / "_meta" / "process.json", {
+                "execution_id": execution.id,
+                "trigger_task_id": trigger.id,
+                "pid": 5353,
+                "pod_id": "worker-terminal-conflict",
+                "status": "running",
+                "heartbeat_at": isoformat_local(now_local()) or "",
+                "updated_at": isoformat_local(now_local()) or "",
+            })
+            process_state = service._run_process_state(db, run_index, trigger=trigger, execution=execution)
+            assert process_state["source"] == "terminal_state_conflict"
+            assert process_state["display_status"] == "runtime_leak_detected"
+            assert process_state["is_running"] is True
+            assert process_state["can_retry"] is False
+            assert service._reconcile_terminal_run_state(db, run_index=run_index, trigger=trigger, execution=execution) is False
+            blocked = (
+                db.query(WorkflowExecutionEvent)
+                .filter(
+                    WorkflowExecutionEvent.execution_id == execution.id,
+                    WorkflowExecutionEvent.event_type == "terminal_state_reconcile_blocked_by_live_runtime",
+                )
+                .first()
+            )
+            assert blocked is not None
+        finally:
+            service._forget_cli_process(execution.id, fake_process)
+
+
+def test_reconcile_terminal_runtime_leaks_requests_stop(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_terminal_runtime_leak_reconcile_20260602_010203"
+    bound = _create_execution_bound_run(client, run_root)
+
+    with get_db_session() as db:
+        run_index = db.get(RunIndex, bound["run_id"])
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        trigger = db.get(TriggerTask, bound["task_id"])
+        assert run_index is not None and execution is not None and trigger is not None
+        now = now_local()
+        run_index.status = "failed"
+        run_index.last_activity_at = now
+        execution.status = "failed"
+        execution.public_status = "failed"
+        execution.process_pid = 7878
+        execution.process_status = "running"
+        execution.process_started_at = now
+        trigger.status = "failed"
+        trigger.public_status = "failed"
+        db.add_all([run_index, execution, trigger])
+        db.commit()
+
+        service = get_execution_service()
+        fake_process = _FakeCliProcess(pid=7878)
+        service._register_cli_process(execution.id, fake_process)
+        try:
+            assert service.reconcile_terminal_runtime_leaks(db, limit=10) == 1
+            db.refresh(execution)
+            assert execution.process_status == "stop_requested"
+            assert fake_process.signals
+            assert fake_process.signals[-1] == signal.SIGINT
+            detect_event = (
+                db.query(WorkflowExecutionEvent)
+                .filter(
+                    WorkflowExecutionEvent.execution_id == execution.id,
+                    WorkflowExecutionEvent.event_type == "runtime_leak_detected",
+                )
+                .first()
+            )
+            stop_event = (
+                db.query(WorkflowExecutionEvent)
+                .filter(
+                    WorkflowExecutionEvent.execution_id == execution.id,
+                    WorkflowExecutionEvent.event_type == "runtime_leak_stop_requested",
+                )
+                .first()
+            )
+            assert detect_event is not None
+            assert stop_event is not None
         finally:
             service._forget_cli_process(execution.id, fake_process)
 

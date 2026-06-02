@@ -38,6 +38,7 @@ from app.models.database import (
     RunIndexResult,
     RunIndexResultReview,
     RunIndexSession,
+    SchedulerWorker,
     SchedulerWorkerSlotReservation,
     TriggerTask,
     VulnReportSubmission,
@@ -2392,7 +2393,7 @@ class ExecutionService:
             )
             evidence["has_recent_run_activity"] = bool(
                 process_state.get("is_running")
-                and source in {"local_process", "process_file_heartbeat"}
+                and source in {"local_process", "process_file_heartbeat", "startup_grace", "terminal_state_conflict"}
             )
 
         if evidence["has_worker_job_id"] and evidence["has_owner_pod_id"]:
@@ -3940,6 +3941,180 @@ class ExecutionService:
         }:
             return True
         return False
+
+    def _runtime_evidence_snapshot(
+        self,
+        db: Session,
+        *,
+        run_index: RunIndex | None,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+        checked_at: datetime | None = None,
+        local_process: subprocess.Popen | None = None,
+    ) -> dict[str, Any]:
+        checked = checked_at or now_local()
+        stale_after = self._process_heartbeat_stale_after_seconds()
+        startup_grace = self._process_start_grace_seconds()
+        payload: dict[str, Any] = {
+            "checked_at": checked,
+            "stale_after_seconds": stale_after,
+            "startup_grace_seconds": startup_grace,
+            "local_process": local_process,
+            "has_local_process": local_process is not None,
+            "has_fresh_process_heartbeat": False,
+            "has_recent_run_activity": False,
+            "live_runtime_evidence": False,
+            "process_payload": {},
+            "process_file_status": "",
+            "heartbeat_age_seconds": None,
+            "last_activity_age_seconds": None,
+            "last_activity_at": "",
+        }
+        if execution is not None and local_process is None:
+            local_process = self._local_cli_process(execution.id)
+            payload["local_process"] = local_process
+            payload["has_local_process"] = local_process is not None
+        if run_index is not None:
+            process_payload = self._read_run_process_file(run_index.run_root_path)
+            payload["process_payload"] = process_payload if isinstance(process_payload, dict) else {}
+            if process_payload:
+                heartbeat_at = self._parse_process_timestamp(
+                    process_payload.get("heartbeat_at")
+                    or process_payload.get("updated_at")
+                    or process_payload.get("started_at")
+                )
+                heartbeat_age = int(max((checked - heartbeat_at).total_seconds(), 0)) if heartbeat_at else None
+                file_status = str(process_payload.get("status") or "").strip().lower()
+                payload["process_file_status"] = file_status
+                payload["heartbeat_age_seconds"] = heartbeat_age
+                payload["process_file_execution_id"] = str(process_payload.get("execution_id") or "")
+                payload["process_file_pod_id"] = str(process_payload.get("pod_id") or "")
+                payload["process_file_pid"] = process_payload.get("pid")
+                if file_status in {"running", "timeout_requested", "stop_requested", "delete_requested"} and heartbeat_age is not None and heartbeat_age <= stale_after:
+                    payload["has_fresh_process_heartbeat"] = True
+            last_activity_at = getattr(run_index, "last_activity_at", None)
+            if last_activity_at is not None:
+                last_activity_age = int(max((checked - last_activity_at).total_seconds(), 0))
+                payload["last_activity_age_seconds"] = last_activity_age
+                payload["last_activity_at"] = isoformat_local(last_activity_at) or ""
+                if last_activity_age <= stale_after and is_run_active(str(run_index.status or "").strip().lower()):
+                    payload["has_recent_run_activity"] = True
+        payload["live_runtime_evidence"] = bool(
+            payload["has_local_process"]
+            or payload["has_fresh_process_heartbeat"]
+            or payload["has_recent_run_activity"]
+        )
+        return payload
+
+    @staticmethod
+    def _process_state_blocks_terminal_reconcile(process_state: dict[str, Any]) -> bool:
+        source = str(process_state.get("source") or "").strip().lower()
+        if source == "terminal_state_conflict":
+            return True
+        if not bool(process_state.get("is_running")):
+            return False
+        return source in {
+            "local_process",
+            "process_file_heartbeat",
+            "recent_run_activity",
+            "startup_grace",
+            "runtime_leak_detected",
+        }
+
+    def _record_terminal_reconcile_blocked(
+        self,
+        db: Session,
+        *,
+        run_index: RunIndex | None,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+        process_state: dict[str, Any],
+    ) -> None:
+        if execution is None:
+            return
+        self.record_event(
+            db,
+            execution_id=execution.id,
+            event_type="terminal_state_reconcile_blocked_by_live_runtime",
+            message="terminal reconcile blocked because live runtime evidence still exists",
+            level="warning",
+            payload_json={
+                "task_id": trigger.id if trigger is not None else execution.trigger_task_id,
+                "execution_id": execution.id,
+                "run_index_id": run_index.id if run_index is not None else None,
+                "run_name": run_index.run_name if run_index is not None else None,
+                "trigger_status_before": str(trigger.status or "") if trigger is not None else "",
+                "execution_status_before": str(execution.status or ""),
+                "process_pid": execution.process_pid,
+                "owner_pod_id": execution.owner_pod_id,
+                "process_file_status": process_state.get("process_file_status"),
+                "heartbeat_age_seconds": process_state.get("heartbeat_age_seconds"),
+                "last_activity_at": process_state.get("last_activity_at"),
+                "resolution_reason": "live_runtime_evidence",
+                "process_state": process_state,
+            },
+        )
+
+    def _terminal_runtime_conflict_stop_payload(
+        self,
+        db: Session,
+        *,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+        run_index: RunIndex | None,
+    ) -> dict[str, Any] | None:
+        if execution is None or run_index is None:
+            return None
+        checked_at = now_local()
+        local_process = self._local_cli_process(execution.id)
+        process_state = self._run_process_state(
+            db,
+            run_index,
+            trigger=trigger,
+            execution=execution,
+        )
+        if not self._process_state_blocks_terminal_reconcile(process_state):
+            return None
+
+        execution.process_status = "stop_requested"
+        if not str(execution.message or "").strip():
+            execution.message = "runtime leak stop requested"
+        db.add(execution)
+        if trigger is not None and not str(trigger.message or "").strip():
+            trigger.message = "runtime leak stop requested"
+            db.add(trigger)
+        self._write_run_control_state(
+            run_index.run_root_path,
+            status_text="cancel_requested",
+            message="runtime leak stop requested",
+        )
+
+        payload: dict[str, Any] = {
+            "task_id": trigger.id if trigger is not None else execution.trigger_task_id,
+            "execution_id": execution.id,
+            "run_name": run_index.run_name,
+            "process_state": process_state,
+            "requested_at": isoformat_local(checked_at) or "",
+            "signal": "db_flag_only",
+            "local_process_found": False,
+        }
+        if local_process is not None:
+            stop_payload = self._signal_local_cli_process(execution.id, wait=True)
+            payload.update({
+                "signal": str(stop_payload.get("signal") or "sigint"),
+                "exit_code": stop_payload.get("exit_code"),
+                "pid": stop_payload.get("pid") or local_process.pid,
+                "local_process_found": True,
+            })
+        self.record_event(
+            db,
+            execution_id=execution.id,
+            event_type="runtime_leak_stop_requested",
+            message="runtime leak stop requested",
+            level="warning",
+            payload_json=payload,
+        )
+        return payload
 
     def _orphaned_control_request_resolution(
         self,
@@ -5857,11 +6032,35 @@ class ExecutionService:
         trigger_status = str(trigger.status or "").strip().lower() if trigger is not None else ""
         execution_status = str(execution.status or "").strip().lower() if execution is not None else ""
         local_process = self._local_cli_process(execution.id) if execution is not None else None
+        runtime_evidence = self._runtime_evidence_snapshot(
+            db,
+            run_index=run_index,
+            trigger=trigger,
+            execution=execution,
+            checked_at=checked_at,
+            local_process=local_process,
+        )
+        process_payload = runtime_evidence.get("process_payload") if isinstance(runtime_evidence.get("process_payload"), dict) else {}
+        if process_payload:
+            base.update(
+                {
+                    "pid": process_payload.get("pid"),
+                    "pod_id": process_payload.get("pod_id") or "",
+                    "process_file_status": runtime_evidence.get("process_file_status") or "",
+                    "process_file_execution_id": process_payload.get("execution_id") or "",
+                    "heartbeat_at": process_payload.get("heartbeat_at") or process_payload.get("updated_at") or "",
+                    "heartbeat_age_seconds": runtime_evidence.get("heartbeat_age_seconds"),
+                }
+            )
+        if runtime_evidence.get("last_activity_age_seconds") is not None:
+            base["last_activity_at"] = runtime_evidence.get("last_activity_at") or ""
+            base["last_activity_age_seconds"] = runtime_evidence.get("last_activity_age_seconds")
         orphaned_resolution = self._orphaned_control_request_resolution(
             trigger=trigger,
             execution=execution,
             local_process=local_process,
         )
+        terminal_linked = _public_task_status(trigger_status) in {"success", "failed", "cancelled"} or _public_task_status(execution_status) in {"success", "failed", "cancelled"}
         if orphaned_resolution is not None:
             base.update(
                 {
@@ -5875,7 +6074,43 @@ class ExecutionService:
                 }
             )
             return base
-        if _public_task_status(trigger_status) in {"success", "failed", "cancelled"} or _public_task_status(execution_status) in {"success", "failed", "cancelled"}:
+        if terminal_linked and bool(runtime_evidence.get("live_runtime_evidence")):
+            base.update(
+                {
+                    "can_retry": False,
+                    "is_running": True,
+                    "is_queued": False,
+                    "display_status": "runtime_leak_detected",
+                    "display_label": "终态残留进程",
+                    "severity": "warning",
+                    "reason": "任务已终态，但本地 run_vuln_scan.py 仍有运行证据，等待后台回收或强制停止",
+                    "source": "terminal_state_conflict",
+                }
+            )
+            return base
+        if execution is not None and local_process is not None:
+            base.update(
+                {
+                    "can_retry": False,
+                    "is_running": True,
+                    "pid": local_process.pid,
+                    "pod_id": get_config().scheduler.pod_id,
+                    "reason": "当前 Pod 仍持有 run_vuln_scan.py 进程，不能重试；如需停止请先取消 Run",
+                    "source": "local_process",
+                }
+            )
+            return base
+        if bool(runtime_evidence.get("has_fresh_process_heartbeat")):
+            base.update(
+                {
+                    "can_retry": False,
+                    "is_running": True,
+                    "reason": "共享心跳显示 run_vuln_scan.py 仍在运行，不能重试；如需停止请先取消 Run",
+                    "source": "process_file_heartbeat",
+                }
+            )
+            return base
+        if terminal_linked:
             base.update(
                 {
                     "can_retry": True,
@@ -5897,52 +6132,12 @@ class ExecutionService:
             )
             return base
 
-        if execution is not None:
-            if local_process is not None:
-                base.update(
-                    {
-                        "can_retry": False,
-                        "is_running": True,
-                        "pid": local_process.pid,
-                        "pod_id": get_config().scheduler.pod_id,
-                        "reason": "当前 Pod 仍持有 run_vuln_scan.py 进程，不能重试；如需停止请先取消 Run",
-                        "source": "local_process",
-                    }
-                )
-                return base
-
         startup_grace = self._process_start_grace_seconds()
         base["startup_grace_seconds"] = startup_grace
-        process_payload = self._read_run_process_file(run_index.run_root_path)
         if process_payload:
-            heartbeat_at = self._parse_process_timestamp(
-                process_payload.get("heartbeat_at")
-                or process_payload.get("updated_at")
-                or process_payload.get("started_at")
-            )
-            heartbeat_age = int(max((checked_at - heartbeat_at).total_seconds(), 0)) if heartbeat_at else None
-            file_status = str(process_payload.get("status") or "").strip().lower()
-            base.update(
-                {
-                    "pid": process_payload.get("pid"),
-                    "pod_id": process_payload.get("pod_id") or "",
-                    "process_file_status": file_status,
-                    "process_file_execution_id": process_payload.get("execution_id") or "",
-                    "heartbeat_at": process_payload.get("heartbeat_at") or process_payload.get("updated_at") or "",
-                    "heartbeat_age_seconds": heartbeat_age,
-                }
-            )
+            file_status = str(runtime_evidence.get("process_file_status") or "").strip().lower()
+            heartbeat_age = runtime_evidence.get("heartbeat_age_seconds")
             if file_status in {"running", "timeout_requested", "stop_requested", "delete_requested"}:
-                if heartbeat_age is not None and heartbeat_age <= stale_after:
-                    base.update(
-                        {
-                            "can_retry": False,
-                            "is_running": True,
-                            "reason": "共享心跳显示 run_vuln_scan.py 仍在运行，不能重试；如需停止请先取消 Run",
-                            "source": "process_file_heartbeat",
-                        }
-                    )
-                    return base
                 base.update(
                     {
                         "can_retry": True,
@@ -5955,6 +6150,8 @@ class ExecutionService:
                         "source": "stale_process_heartbeat",
                     }
                 )
+                if heartbeat_age is not None:
+                    base["heartbeat_age_seconds"] = heartbeat_age
                 return base
 
         if is_run_active(run_status) or is_run_active(trigger_status) or is_run_active(execution_status):
@@ -5979,6 +6176,20 @@ class ExecutionService:
                         }
                     )
                     return base
+
+        if bool(runtime_evidence.get("has_recent_run_activity")):
+            base.update(
+                {
+                    "can_retry": False,
+                    "is_running": True,
+                    "display_status": "runtime_suspected_active",
+                    "display_label": "运行迹象存在",
+                    "severity": "warning",
+                    "reason": "Run 最近仍有活动记录，等待下一轮心跳或进程状态确认",
+                    "source": "recent_run_activity",
+                }
+            )
+            return base
 
         if is_run_active(run_status) or is_run_active(trigger_status) or is_run_active(execution_status):
             base.update(
@@ -6006,6 +6217,8 @@ class ExecutionService:
         process_state: dict[str, Any],
     ) -> str:
         current = str(current_status or "").strip().lower()
+        if str(process_state.get("source") or "").strip().lower() == "terminal_state_conflict":
+            return "running"
         orphaned_resolution = self._orphaned_control_request_resolution(trigger=trigger, execution=execution)
         if orphaned_resolution is not None:
             return str(orphaned_resolution.get("terminal_status") or "cancelled")
@@ -6199,6 +6412,16 @@ class ExecutionService:
         run_status = _public_task_status(run_index.status)
         if run_status not in {"success", "failed", "cancelled"}:
             return False
+        process_state = self._run_process_state(db, run_index, trigger=trigger, execution=execution)
+        if self._process_state_blocks_terminal_reconcile(process_state):
+            self._record_terminal_reconcile_blocked(
+                db,
+                run_index=run_index,
+                trigger=trigger,
+                execution=execution,
+                process_state=process_state,
+            )
+            return False
 
         trigger_status = _public_task_status(trigger.status) if trigger is not None else ""
         execution_status = _public_task_status(execution.status) if execution is not None else ""
@@ -6266,6 +6489,64 @@ class ExecutionService:
                 },
             )
         return True
+
+    def reconcile_terminal_runtime_leaks(self, db: Session, *, limit: int = 100) -> int:
+        reconciled = 0
+        recent_cutoff = now_local() - timedelta(seconds=self._process_heartbeat_stale_after_seconds())
+        rows = (
+            db.query(WorkflowExecution)
+            .outerjoin(RunIndex, RunIndex.linked_execution_id == WorkflowExecution.id)
+            .filter(
+                WorkflowExecution.status.in_(("success", "failed", "cancelled")),
+                or_(
+                    WorkflowExecution.process_pid.isnot(None),
+                    WorkflowExecution.process_status.in_(("running", "starting", "stop_requested", "delete_requested")),
+                    RunIndex.last_activity_at >= recent_cutoff,
+                ),
+            )
+            .order_by(WorkflowExecution.updated_at.asc(), WorkflowExecution.created_at.asc())
+            .limit(limit)
+            .all()
+        )
+        for execution in rows:
+            trigger = db.get(TriggerTask, execution.trigger_task_id)
+            run_index = self._ensure_run_index_for_execution(db, execution, trigger)
+            process_state = self._run_process_state(db, run_index, trigger=trigger, execution=execution) if run_index is not None else {}
+            if not self._process_state_blocks_terminal_reconcile(process_state):
+                continue
+            stop_payload = self._terminal_runtime_conflict_stop_payload(
+                db,
+                trigger=trigger,
+                execution=execution,
+                run_index=run_index,
+            )
+            if stop_payload is None:
+                db.rollback()
+                continue
+            self.record_event(
+                db,
+                execution_id=execution.id,
+                event_type="runtime_leak_detected",
+                message="terminal task still has live runtime evidence",
+                level="warning",
+                payload_json={
+                    "task_id": trigger.id if trigger is not None else execution.trigger_task_id,
+                    "execution_id": execution.id,
+                    "run_name": run_index.run_name if run_index is not None else None,
+                    "trigger_status_before": str(trigger.status or "") if trigger is not None else "",
+                    "execution_status_before": str(execution.status or ""),
+                    "process_pid": execution.process_pid,
+                    "owner_pod_id": execution.owner_pod_id,
+                    "process_file_status": process_state.get("process_file_status"),
+                    "heartbeat_age_seconds": process_state.get("heartbeat_age_seconds"),
+                    "last_activity_at": process_state.get("last_activity_at"),
+                    "resolution_reason": "terminal_state_conflict",
+                },
+            )
+            self._refresh_task_list_projection_for_execution(db, execution)
+            db.commit()
+            reconciled += 1
+        return reconciled
 
     def _reconcile_stale_runtime(
         self,

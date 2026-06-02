@@ -2190,6 +2190,8 @@ class SchedulerService:
             db.commit()
             get_execution_service().reconcile_stale_active_executions(db)
             db.commit()
+            get_execution_service().reconcile_terminal_runtime_leaks(db)
+            db.commit()
         finally:
             db.close()
 
