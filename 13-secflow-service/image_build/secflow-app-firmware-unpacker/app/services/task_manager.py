@@ -386,6 +386,10 @@ def _cleanup_completed_futures() -> None:
             _futures.pop(task_id, None)
 
 
+def _submit_background(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
+    return get_executor().submit(func, *args, **kwargs)
+
+
 def _active_future_count() -> int:
     _cleanup_completed_futures()
     with _futures_lock:
