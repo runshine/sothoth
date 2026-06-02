@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api import tasks as tasks_api
+from app.service.task_service import build_task_list_stats
 from app.schemas import TaskResponse, TokenUser
 
 
@@ -44,6 +45,28 @@ class _FakeSession:
 
     def query(self, *args, **kwargs):
         return _FakeQuery(self._tasks)
+
+
+class _FakeGroupedQuery:
+    def __init__(self, rows: list[tuple[str, int]]) -> None:
+        self._rows = rows
+
+    def filter(self, *args, **kwargs):
+        return self
+
+    def group_by(self, *args, **kwargs):
+        return self
+
+    def all(self) -> list[tuple[str, int]]:
+        return self._rows
+
+
+class _FakeStatsSession:
+    def __init__(self, rows: list[tuple[str, int]]) -> None:
+        self._rows = rows
+
+    def query(self, *args, **kwargs):
+        return _FakeGroupedQuery(self._rows)
 
 
 class TaskListApiTests(unittest.TestCase):
@@ -107,6 +130,40 @@ class TaskListApiTests(unittest.TestCase):
         payload = resp.json()
         self.assertEqual(payload["total"], 1)
         self.assertEqual(payload["items"][0]["id"], fake_task.id)
+
+    def test_build_task_list_stats_includes_project_item_aggregates(self) -> None:
+        tasks = [
+            SimpleNamespace(id="task-1", status="running"),
+            SimpleNamespace(id="task-2", status="partial_success"),
+            SimpleNamespace(id="task-3", status="completed"),
+        ]
+        db = _FakeStatsSession([
+            ("pending", 2),
+            ("queued", 3),
+            ("running", 4),
+            ("cancelling", 1),
+            ("success", 5),
+            ("partial", 6),
+            ("failed", 7),
+            ("cancelled", 8),
+        ])
+
+        stats = build_task_list_stats(db, tasks)
+
+        self.assertEqual(stats.total, 3)
+        self.assertEqual(stats.task_count, 3)
+        self.assertEqual(stats.running, 1)
+        self.assertEqual(stats.partial, 1)
+        self.assertEqual(stats.success, 1)
+        self.assertEqual(stats.total_items, 36)
+        self.assertEqual(stats.pending_items, 2)
+        self.assertEqual(stats.queued_items, 3)
+        self.assertEqual(stats.running_items, 4)
+        self.assertEqual(stats.cancelling_items, 1)
+        self.assertEqual(stats.success_items, 5)
+        self.assertEqual(stats.partial_items, 6)
+        self.assertEqual(stats.failed_items, 7)
+        self.assertEqual(stats.cancelled_items, 8)
 
 
 if __name__ == "__main__":

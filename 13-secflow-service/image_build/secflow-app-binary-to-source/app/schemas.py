@@ -780,6 +780,16 @@ class B2STaskListStatsResponse(BaseModel):
     partial: int = 0
     failed: int = 0
     cancelled: int = 0
+    task_count: int = 0
+    total_items: int = 0
+    pending_items: int = 0
+    queued_items: int = 0
+    running_items: int = 0
+    cancelling_items: int = 0
+    success_items: int = 0
+    partial_items: int = 0
+    failed_items: int = 0
+    cancelled_items: int = 0
 
 
 class ReviewAnalyticsAttempt(BaseModel):
