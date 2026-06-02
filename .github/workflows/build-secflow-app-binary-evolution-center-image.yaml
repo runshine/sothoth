@@ -62,8 +62,8 @@ jobs:
 
       - name: Push amd64 image
         run: |
-          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:latest
-          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:amd64-latest
+          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:amd64-${{ needs.prepare.outputs.date_tag }}
 
   build-arm64:
     needs: prepare
@@ -93,8 +93,8 @@ jobs:
 
       - name: Push arm64 image
         run: |
-          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:latest
-          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:arm64-latest
+          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:arm64-${{ needs.prepare.outputs.date_tag }}
 
   merge-manifest:
     needs: [prepare, build-amd64, build-arm64]

@@ -57,8 +57,8 @@ jobs:
 
       - name: Push amd64 image
         run: |
-          docker push ghcr.io/runshine/secflow-app-firmware-unpacker:latest
-          docker push ghcr.io/runshine/secflow-app-firmware-unpacker:${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/secflow-app-firmware-unpacker:amd64-latest
+          docker push ghcr.io/runshine/secflow-app-firmware-unpacker:amd64-${{ needs.prepare.outputs.date_tag }}
 
   build-arm64:
     needs: prepare
@@ -88,8 +88,8 @@ jobs:
 
       - name: Push arm64 image
         run: |
-          docker push ghcr.io/runshine/secflow-app-firmware-unpacker:latest
-          docker push ghcr.io/runshine/secflow-app-firmware-unpacker:${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/secflow-app-firmware-unpacker:arm64-latest
+          docker push ghcr.io/runshine/secflow-app-firmware-unpacker:arm64-${{ needs.prepare.outputs.date_tag }}
 
   merge-manifest:
     needs: [prepare, build-amd64, build-arm64]

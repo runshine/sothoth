@@ -59,8 +59,8 @@ jobs:
 
       - name: Push amd64 image
         run: |
-          docker push ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:latest
-          docker push ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:amd64-latest
+          docker push ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:amd64-${{ needs.prepare.outputs.date_tag }}
 
   build-arm64:
     needs: prepare
@@ -90,8 +90,8 @@ jobs:
 
       - name: Push arm64 image
         run: |
-          docker push ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:latest
-          docker push ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:arm64-latest
+          docker push ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:arm64-${{ needs.prepare.outputs.date_tag }}
 
   merge-manifest:
     needs: [prepare, build-amd64, build-arm64]
