@@ -168,8 +168,12 @@ class _TaskDetailContext:
     item_stats: dict[str, dict[str, int]] = field(default_factory=dict)
     last_successful_sync_at: datetime | None = None
     last_sync_attempt_at: datetime | None = None
+    last_sync_error_at: datetime | None = None
     last_sync_error_type: str | None = None
     last_sync_error_message: str | None = None
+    active_sync_error_item_count: int = 0
+    never_synced_item_count: int = 0
+    stale_synced_item_count: int = 0
 DB_ENTRY_PREVIEW_LIMIT = 50
 DB_ARTIFACT_PREVIEW_LIMIT = 50
 DB_EVENT_PAYLOAD_LIMIT_BYTES = 32768
@@ -2254,7 +2258,16 @@ class TaskManager:
                 abnormal_reason = None
         if abnormal_reason is None:
             abnormal_reason = self._task_abnormal_reason(task, stage_summaries, stage_items, archive_jobs)
-        last_successful_sync_at, last_sync_attempt_at, last_sync_error_type, last_sync_error_message = self._task_sync_status_view(stage_items)
+        (
+            last_successful_sync_at,
+            last_sync_attempt_at,
+            last_sync_error_at,
+            last_sync_error_type,
+            last_sync_error_message,
+            active_sync_error_item_count,
+            never_synced_item_count,
+            stale_synced_item_count,
+        ) = self._task_sync_status_view(stage_items)
         return _TaskDetailContext(
             task=task,
             queue_info=self._build_queue_info(db, project_id=project_id),
@@ -2268,8 +2281,12 @@ class TaskManager:
             item_stats=self._item_stats(stage_items),
             last_successful_sync_at=last_successful_sync_at,
             last_sync_attempt_at=last_sync_attempt_at,
+            last_sync_error_at=last_sync_error_at,
             last_sync_error_type=last_sync_error_type,
             last_sync_error_message=last_sync_error_message,
+            active_sync_error_item_count=active_sync_error_item_count,
+            never_synced_item_count=never_synced_item_count,
+            stale_synced_item_count=stale_synced_item_count,
         )
 
     def _build_light_task_detail_context(self, db: Session, *, project_id: str, task_id: str) -> _TaskDetailContext:
@@ -2351,8 +2368,12 @@ class TaskManager:
             item_stats=item_stats,
             last_successful_sync_at=sync_times[0],
             last_sync_attempt_at=sync_times[1],
-            last_sync_error_type=sync_times[2],
-            last_sync_error_message=sync_times[3],
+            last_sync_error_at=sync_times[2],
+            last_sync_error_type=sync_times[3],
+            last_sync_error_message=sync_times[4],
+            active_sync_error_item_count=sync_times[5],
+            never_synced_item_count=sync_times[6],
+            stale_synced_item_count=sync_times[7],
         )
 
     def _archive_job_responses(
@@ -13677,10 +13698,12 @@ class TaskManager:
         current_result = dict(item.result or {})
         preserved_keys = [key for key in self._preserved_child_result_keys() if key in current_result]
         sync_observation = dict(current_result.get("sync_observation") or {})
+        observed_at = synced_at or _now()
+        observed_at_iso = observed_at.isoformat()
+        sync_observation["last_attempt_at"] = observed_at_iso
         sync_observation.update(
             {
                 "sync_status": sync_status,
-                "last_synced_at": (synced_at or _now()).isoformat(),
                 "error_message": error_message,
                 "http_status": http_status,
                 "error_type": error_type,
@@ -13690,10 +13713,24 @@ class TaskManager:
                 "state_applied": state_applied,
             }
         )
+        if error_message or error_type:
+            sync_observation["last_error_at"] = observed_at_iso
+        elif state_applied or downstream_status or downstream_status_mapped or downstream_status_raw:
+            sync_observation["last_success_at"] = observed_at_iso
+            sync_observation["last_synced_at"] = observed_at_iso
+            sync_observation["last_error_at"] = None
+            sync_observation["error_message"] = None
+            sync_observation["error_type"] = None
+            sync_observation["http_status"] = None
         merged_result = {
             **current_result,
             "sync_status": sync_status,
-            "downstream_status_synced_at": sync_observation["last_synced_at"],
+            "last_sync_attempt_at": observed_at_iso,
+            "downstream_status_synced_at": sync_observation.get("last_success_at") or sync_observation.get("last_synced_at"),
+            "last_sync_success_at": sync_observation.get("last_success_at") or sync_observation.get("last_synced_at"),
+            "last_sync_error_at": sync_observation.get("last_error_at"),
+            "last_sync_error_message": sync_observation.get("error_message"),
+            "last_sync_error_type": sync_observation.get("error_type"),
             "downstream_status": downstream_status or current_result.get("downstream_status"),
             "sync_observation": sync_observation,
         }
@@ -15447,18 +15484,28 @@ class TaskManager:
     def _task_sync_status_view(
         self,
         items: list[BinarySecurityStageItem] | None,
-    ) -> tuple[datetime | None, datetime | None, str | None, str | None]:
+    ) -> tuple[datetime | None, datetime | None, datetime | None, str | None, str | None, int, int, int]:
         latest_success: datetime | None = None
         latest_attempt: datetime | None = None
+        latest_error_at: datetime | None = None
         latest_error_type: str | None = None
         latest_error_message: str | None = None
+        active_sync_error_item_count = 0
+        never_synced_item_count = 0
+        stale_synced_item_count = 0
+        now = _now()
         for item in items or []:
             last_synced_at = self._stage_item_last_synced_at_value(item)
             if last_synced_at is not None and (latest_success is None or last_synced_at > latest_success):
                 latest_success = last_synced_at
             result = dict(item.result or {})
             sync_observation = dict(result.get("sync_observation") or {})
-            raw_attempt = sync_observation.get("last_synced_at") or result.get("downstream_status_synced_at")
+            raw_attempt = (
+                sync_observation.get("last_attempt_at")
+                or sync_observation.get("last_synced_at")
+                or result.get("last_sync_attempt_at")
+                or result.get("downstream_status_synced_at")
+            )
             parsed_attempt: datetime | None = None
             if isinstance(raw_attempt, str) and raw_attempt.strip():
                 try:
@@ -15467,9 +15514,35 @@ class TaskManager:
                     parsed_attempt = None
             if parsed_attempt is not None and (latest_attempt is None or parsed_attempt > latest_attempt):
                 latest_attempt = parsed_attempt
-                latest_error_type = self._string_or_none(sync_observation.get("error_type"))
-                latest_error_message = self._string_or_none(sync_observation.get("error_message"))
-        return latest_success, latest_attempt, latest_error_type, latest_error_message
+            raw_error_at = sync_observation.get("last_error_at") or result.get("last_sync_error_at")
+            parsed_error_at: datetime | None = None
+            if isinstance(raw_error_at, str) and raw_error_at.strip():
+                try:
+                    parsed_error_at = datetime.fromisoformat(raw_error_at)
+                except ValueError:
+                    parsed_error_at = None
+            error_type = self._string_or_none(sync_observation.get("error_type")) or self._string_or_none(result.get("last_sync_error_type"))
+            error_message = self._string_or_none(sync_observation.get("error_message")) or self._string_or_none(result.get("last_sync_error_message"))
+            if parsed_error_at is not None:
+                active_sync_error_item_count += 1
+                if latest_error_at is None or parsed_error_at > latest_error_at:
+                    latest_error_at = parsed_error_at
+                    latest_error_type = error_type
+                    latest_error_message = error_message
+            if last_synced_at is None and parsed_attempt is not None:
+                never_synced_item_count += 1
+            if last_synced_at is not None and (now - last_synced_at).total_seconds() >= max(60, int(self.cfg.scheduler.downstream_reconcile_interval_seconds or 30) * 3):
+                stale_synced_item_count += 1
+        return (
+            latest_success,
+            latest_attempt,
+            latest_error_at,
+            latest_error_type,
+            latest_error_message,
+            active_sync_error_item_count,
+            never_synced_item_count,
+            stale_synced_item_count,
+        )
 
     def _task_list_response(
         self,
@@ -15500,7 +15573,16 @@ class TaskManager:
             except Exception:
                 abnormal_reason = None
         lease_owner, lease_expires_at, lease_source = self._task_runtime_lease_view(db, task)
-        last_successful_sync_at, last_sync_attempt_at, last_sync_error_type, last_sync_error_message = self._task_sync_status_view(stage_items)
+        (
+            last_successful_sync_at,
+            last_sync_attempt_at,
+            last_sync_error_at,
+            last_sync_error_type,
+            last_sync_error_message,
+            active_sync_error_item_count,
+            never_synced_item_count,
+            stale_synced_item_count,
+        ) = self._task_sync_status_view(stage_items)
         manual_operation_state = self._build_task_list_manual_operation_state(
             task,
             stage_summaries=stage_summaries,
@@ -15526,8 +15608,12 @@ class TaskManager:
             task_lease_source=lease_source,
             last_successful_downstream_sync_at=last_successful_sync_at,
             last_sync_attempt_at=last_sync_attempt_at,
+            last_sync_error_at=last_sync_error_at,
             last_sync_error_type=last_sync_error_type,
             last_sync_error_message=last_sync_error_message,
+            active_sync_error_item_count=active_sync_error_item_count,
+            never_synced_item_count=never_synced_item_count,
+            stale_synced_item_count=stale_synced_item_count,
             created_by=task.created_by,
             created_at=task.created_at,
             updated_at=task.updated_at,
@@ -15837,11 +15923,24 @@ class TaskManager:
         if detail_ctx is not None:
             last_successful_sync_at = detail_ctx.last_successful_sync_at
             last_sync_attempt_at = detail_ctx.last_sync_attempt_at
+            last_sync_error_at = detail_ctx.last_sync_error_at
             last_sync_error_type = detail_ctx.last_sync_error_type
             last_sync_error_message = detail_ctx.last_sync_error_message
+            active_sync_error_item_count = detail_ctx.active_sync_error_item_count
+            never_synced_item_count = detail_ctx.never_synced_item_count
+            stale_synced_item_count = detail_ctx.stale_synced_item_count
         else:
             stage_items_for_sync = self._stage_items(db, task.id)
-            last_successful_sync_at, last_sync_attempt_at, last_sync_error_type, last_sync_error_message = self._task_sync_status_view(stage_items_for_sync)
+            (
+                last_successful_sync_at,
+                last_sync_attempt_at,
+                last_sync_error_at,
+                last_sync_error_type,
+                last_sync_error_message,
+                active_sync_error_item_count,
+                never_synced_item_count,
+                stale_synced_item_count,
+            ) = self._task_sync_status_view(stage_items_for_sync)
         manual_operation_state = self._build_manual_operation_state(
             db,
             task,
@@ -15878,8 +15977,12 @@ class TaskManager:
             task_lease_source=lease_source,
             last_successful_downstream_sync_at=last_successful_sync_at,
             last_sync_attempt_at=last_sync_attempt_at,
+            last_sync_error_at=last_sync_error_at,
             last_sync_error_type=last_sync_error_type,
             last_sync_error_message=last_sync_error_message,
+            active_sync_error_item_count=active_sync_error_item_count,
+            never_synced_item_count=never_synced_item_count,
+            stale_synced_item_count=stale_synced_item_count,
             created_by=task.created_by,
             created_at=task.created_at,
             updated_at=task.updated_at,
@@ -16082,7 +16185,9 @@ class TaskManager:
             result.setdefault(key, value)
         downstream_status, sync_observation, repaired = self._effective_stage_item_downstream_status(item, result=result)
         downstream_payload = dict(result.get("downstream") or {})
-        last_synced_at = result.get("downstream_status_synced_at")
+        last_synced_at = result.get("last_sync_success_at") or result.get("downstream_status_synced_at")
+        last_attempt_at = result.get("last_sync_attempt_at") or sync_observation.get("last_attempt_at") or sync_observation.get("last_synced_at")
+        last_error_at = result.get("last_sync_error_at") or sync_observation.get("last_error_at")
         raw_sync_status = result.get("sync_status")
         sync_status = str(raw_sync_status).strip().lower() if raw_sync_status is not None else None
         if sync_status == "transport_error" and (downstream_status or last_synced_at):
@@ -16105,8 +16210,26 @@ class TaskManager:
                 parsed_last_synced_at = datetime.fromisoformat(last_synced_at)
             except ValueError:
                 parsed_last_synced_at = None
+        parsed_last_attempt_at = last_attempt_at
+        if isinstance(last_attempt_at, str):
+            try:
+                parsed_last_attempt_at = datetime.fromisoformat(last_attempt_at)
+            except ValueError:
+                parsed_last_attempt_at = None
+        parsed_last_error_at = last_error_at
+        if isinstance(last_error_at, str):
+            try:
+                parsed_last_error_at = datetime.fromisoformat(last_error_at)
+            except ValueError:
+                parsed_last_error_at = None
         binding = self._downstream_binding_snapshot(item)
         binding_state = self._downstream_binding_state(item)
+        freshness_state = self._stage_item_sync_freshness_state(
+            item,
+            last_attempt_at=parsed_last_attempt_at if isinstance(parsed_last_attempt_at, datetime) else None,
+            last_success_at=parsed_last_synced_at if isinstance(parsed_last_synced_at, datetime) else None,
+            last_error_at=parsed_last_error_at if isinstance(parsed_last_error_at, datetime) else None,
+        )
         return BinarySecurityStageItemResponse(
             id=item.id,
             stage_name=item.stage_name,
@@ -16137,6 +16260,12 @@ class TaskManager:
             abnormal_reason=self._stage_item_abnormal_reason(item),
             sync_status=str(sync_status) if sync_status is not None else None,
             last_synced_at=parsed_last_synced_at,
+            last_sync_attempt_at=parsed_last_attempt_at if isinstance(parsed_last_attempt_at, datetime) else None,
+            last_sync_success_at=parsed_last_synced_at if isinstance(parsed_last_synced_at, datetime) else None,
+            last_sync_error_at=parsed_last_error_at if isinstance(parsed_last_error_at, datetime) else None,
+            last_sync_error_message=self._string_or_none(sync_observation.get("error_message")) or self._string_or_none(result.get("last_sync_error_message")),
+            last_sync_error_type=self._string_or_none(sync_observation.get("error_type")) or self._string_or_none(result.get("last_sync_error_type")),
+            sync_freshness_state=freshness_state,
             downstream_raw_status=self._string_or_none(sync_observation.get("status_raw")),
             downstream_mapped_status=self._string_or_none(sync_observation.get("mapped_status")),
             downstream_state_applied=self._bool_or_none(sync_observation.get("state_applied")),
@@ -16146,6 +16275,29 @@ class TaskManager:
             started_at=item.started_at,
             finished_at=item.finished_at,
         )
+
+    def _stage_item_sync_freshness_state(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        last_attempt_at: datetime | None,
+        last_success_at: datetime | None,
+        last_error_at: datetime | None,
+    ) -> str:
+        if not item.downstream_task_id:
+            return "not_applicable"
+        if last_success_at is None and last_error_at is not None:
+            return "never_succeeded"
+        if last_success_at is not None and last_error_at is not None and last_error_at > last_success_at:
+            return "failing_after_success"
+        if last_success_at is not None:
+            stale_after_seconds = max(60, int(self.cfg.scheduler.downstream_reconcile_interval_seconds or 30) * 3)
+            if (_now() - last_success_at).total_seconds() >= stale_after_seconds:
+                return "stale_success"
+            return "healthy"
+        if last_attempt_at is not None:
+            return "never_succeeded"
+        return "not_applicable"
 
     def _stage_item_downstream_summary(
         self,

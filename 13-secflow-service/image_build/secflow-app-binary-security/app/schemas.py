@@ -155,8 +155,12 @@ class BinarySecurityTaskResponse(BaseModel):
     task_lease_source: Optional[str] = None
     last_successful_downstream_sync_at: Optional[datetime] = None
     last_sync_attempt_at: Optional[datetime] = None
+    last_sync_error_at: Optional[datetime] = None
     last_sync_error_type: Optional[str] = None
     last_sync_error_message: Optional[str] = None
+    active_sync_error_item_count: int = 0
+    never_synced_item_count: int = 0
+    stale_synced_item_count: int = 0
     created_by: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -359,6 +363,12 @@ class BinarySecurityStageItemResponse(BaseModel):
     abnormal_reason: Optional[BinarySecurityAbnormalReason] = None
     sync_status: Optional[str] = None
     last_synced_at: Optional[datetime] = None
+    last_sync_attempt_at: Optional[datetime] = None
+    last_sync_success_at: Optional[datetime] = None
+    last_sync_error_at: Optional[datetime] = None
+    last_sync_error_message: Optional[str] = None
+    last_sync_error_type: Optional[str] = None
+    sync_freshness_state: Optional[str] = None
     downstream_raw_status: Optional[str] = None
     downstream_mapped_status: Optional[str] = None
     downstream_state_applied: Optional[bool] = None
