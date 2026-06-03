@@ -115,14 +115,31 @@ def test_task_list_stats_and_backfill_projection(service_config_path, patch_mock
             params={"project_id": "default", "page": 1, "per_page": 20, "sort_by": "created_at", "sort_order": "desc"},
         )
         assert list_response.status_code == 200
-        listed_ids = [item["task_id"] for item in list_response.json()["items"]]
+        list_payload = list_response.json()
+        listed_ids = [item["task_id"] for item in list_payload["items"]]
         assert created_ids[0] in listed_ids
-        assert created_ids[1] in listed_ids
+        assert list_payload["projection_backfill_enqueued"] is True
 
         stats_response = client.get("/api/dataflow-vuln-scanner/tasks/stats", params={"project_id": "default"})
         assert stats_response.status_code == 200
         stats = stats_response.json()
-        assert stats["total"] >= 2
+        assert stats["total"] >= 1
+
+        with get_db_session() as db:
+            get_execution_service().repair_enqueued_task_list_projections(db)
+            db.commit()
+
+        list_response_after_repair = client.get(
+            "/api/dataflow-vuln-scanner/tasks",
+            params={"project_id": "default", "page": 1, "per_page": 20, "sort_by": "created_at", "sort_order": "desc"},
+        )
+        assert list_response_after_repair.status_code == 200
+        listed_ids_after_repair = [item["task_id"] for item in list_response_after_repair.json()["items"]]
+        assert created_ids[1] in listed_ids_after_repair
+
+        stats_response_after_repair = client.get("/api/dataflow-vuln-scanner/tasks/stats", params={"project_id": "default"})
+        assert stats_response_after_repair.status_code == 200
+        assert stats_response_after_repair.json()["total"] >= 2
 
         with get_db_session() as db:
             projection = db.get(DfvsTaskListProjection, created_ids[1])
@@ -171,3 +188,35 @@ def test_task_projection_rebuild_endpoints(service_config_path, patch_mock_agent
         batch_payload = batch_response.json()
         assert batch_payload["project_id"] == "default"
         assert batch_payload["repaired_count"] >= 1
+
+
+def test_task_projection_refresh_is_idempotent_upsert(service_config_path, patch_mock_agent_runtime):
+    app = create_app()
+    with TestClient(app) as client:
+        profile_response = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload())
+        assert profile_response.status_code == 201
+        profile_id = profile_response.json()["profile_id"]
+
+        task_response = client.post(
+            "/api/dataflow-vuln-scanner/tasks",
+            json={
+                "project_id": "default",
+                "profile_id": profile_id,
+                "title": "projection upsert demo",
+                "task_markdown": "# Package List\n\n- demo-upsert.tar.gz\n",
+                "artifact_refs": [],
+                "runtime_overrides": {},
+            },
+        )
+        assert task_response.status_code == 201
+        task_id = task_response.json()["task_id"]
+
+        with get_db_session() as db:
+            service = get_execution_service()
+            service._refresh_task_list_projection_for_task_id(db, task_id)
+            service._refresh_task_list_projection_for_task_id(db, task_id)
+            db.commit()
+
+            rows = db.query(DfvsTaskListProjection).filter(DfvsTaskListProjection.task_id == task_id).all()
+            assert len(rows) == 1
+            assert rows[0].task_id == task_id

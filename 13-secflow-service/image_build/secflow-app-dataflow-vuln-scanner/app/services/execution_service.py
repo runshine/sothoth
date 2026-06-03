@@ -23,7 +23,9 @@ from typing import Any, Dict, List, Optional
 from fastapi.encoders import jsonable_encoder
 from fastapi import HTTPException, status
 from sqlalchemy import func, or_
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 
 from app.artifacts.io import abs_path, ensure_dir, sanitize_name, write_json, write_task_manifest, write_text
 from app.config import get_config
@@ -105,6 +107,14 @@ from app.time_utils import UTC_PLUS_8, isoformat_local, now_local
 logger = logging.getLogger("dataflow_vuln.execution")
 
 _PROJECTION_REPAIR_ENQUEUE_COOLDOWN_SECONDS = 60.0
+_RUNTIME_BINDING_REPAIR_REASON = "runtime_binding_repaired"
+_NORMALIZED_TIMELINE_MESSAGES = {
+    "worker_job_start_failed": "startup metadata write failed; task requeued before process start",
+    "worker_job_requeued_before_process_start": "task list projection write conflict; requeued before process start",
+    "stale_runtime_kept_running": "runtime binding incomplete; preserved by run evidence",
+    "runtime_binding_repaired": "runtime binding repaired from run/process evidence",
+    "runtime_binding_repair_requested": "runtime binding repair requested from run/process evidence",
+}
 
 
 def _perf_elapsed_ms(started_at: float) -> float:
@@ -350,6 +360,252 @@ class ExecutionService:
         self._projection_repair_lock = threading.Lock()
         self._projection_repair_projects: set[str] = set()
         self._projection_repair_last_enqueued_at: dict[str, float] = {}
+
+    def _projection_row_values(
+        self,
+        *,
+        trigger: TriggerTask,
+        latest_execution: WorkflowExecution | None,
+        row: DfvsTaskListProjection,
+    ) -> dict[str, Any]:
+        return {
+            "task_id": trigger.id,
+            "project_id": row.project_id,
+            "title": row.title,
+            "profile_id": row.profile_id,
+            "profile_version": row.profile_version,
+            "priority": row.priority,
+            "created_by": row.created_by,
+            "task_purpose": row.task_purpose,
+            "task_origin_type": row.task_origin_type,
+            "parent_task_id": row.parent_task_id,
+            "parent_task_type": row.parent_task_type,
+            "parent_stage_name": row.parent_stage_name,
+            "parent_stage_item_id": row.parent_stage_item_id,
+            "parent_stage_item_key": row.parent_stage_item_key,
+            "origin_mode": row.origin_mode,
+            "origin_label": row.origin_label,
+            "parent_task_display": row.parent_task_display,
+            "public_status": row.public_status,
+            "control_state": row.control_state,
+            "message": row.message,
+            "abnormal_reason_title": row.abnormal_reason_title,
+            "abnormal_reason_code": row.abnormal_reason_code,
+            "abnormal_reason_category": row.abnormal_reason_category,
+            "latest_execution_id": row.latest_execution_id,
+            "latest_attempt_no": row.latest_attempt_no,
+            "owner_pod_id": row.owner_pod_id,
+            "dispatch_status": row.dispatch_status,
+            "slot_binding_state": row.slot_binding_state,
+            "slot_binding_reason": row.slot_binding_reason,
+            "dispatch_backoff_until": row.dispatch_backoff_until,
+            "dispatch_backoff_reason": row.dispatch_backoff_reason,
+            "resolved_status_source": row.resolved_status_source,
+            "latest_run_id": row.latest_run_id,
+            "latest_run_status": row.latest_run_status,
+            "run_name": row.run_name,
+            "run_path": row.run_path,
+            "runs_root": row.runs_root,
+            "run_model": row.run_model,
+            "run_provider": row.run_provider,
+            "run_thinking": row.run_thinking,
+            "run_workflow_mode": row.run_workflow_mode,
+            "run_max_cycles": row.run_max_cycles,
+            "run_cycles_used": row.run_cycles_used,
+            "run_result_count": row.run_result_count,
+            "run_passed_count": row.run_passed_count,
+            "run_failed_count": row.run_failed_count,
+            "run_duration_seconds": row.run_duration_seconds,
+            "run_start_epoch": row.run_start_epoch,
+            "auto_report_vulnerabilities": row.auto_report_vulnerabilities,
+            "vuln_report_enabled": row.vuln_report_enabled,
+            "vuln_report_status": row.vuln_report_status,
+            "vuln_report_total": row.vuln_report_total,
+            "vuln_report_reported": row.vuln_report_reported,
+            "vuln_report_failed": row.vuln_report_failed,
+            "vuln_report_pending": row.vuln_report_pending,
+            "started_at": row.started_at,
+            "finished_at": row.finished_at,
+            "created_at": row.created_at or trigger.created_at or now_local(),
+            "updated_at": now_local(),
+        }
+
+    def _persist_task_list_projection(
+        self,
+        db: Session,
+        *,
+        trigger: TriggerTask,
+        latest_execution: WorkflowExecution | None,
+        row: DfvsTaskListProjection,
+    ) -> None:
+        values = self._projection_row_values(trigger=trigger, latest_execution=latest_execution, row=row)
+        update_values = {key: value for key, value in values.items() if key not in {"task_id", "created_at"}}
+        dialect_name = str(getattr(db.bind.dialect, "name", "") or "").lower() if getattr(db, "bind", None) is not None else ""
+        if dialect_name == "sqlite":
+            insert_stmt = sqlite_insert(DfvsTaskListProjection).values(**values)
+            db.execute(insert_stmt.on_conflict_do_update(index_elements=["task_id"], set_=update_values))
+            return
+        insert_stmt = mysql_insert(DfvsTaskListProjection).values(**values)
+        db.execute(insert_stmt.on_duplicate_key_update(**update_values))
+
+    def _has_execution_event(self, db: Session, execution_id: str, event_type: str) -> bool:
+        return bool(
+            db.query(WorkflowExecutionEvent.id)
+            .filter(
+                WorkflowExecutionEvent.execution_id == execution_id,
+                WorkflowExecutionEvent.event_type == event_type,
+            )
+            .first()
+        )
+
+    def _normalized_timeline_message(
+        self,
+        event_type: str,
+        message: str | None,
+        payload: dict[str, Any] | None,
+    ) -> tuple[str, dict[str, Any]]:
+        payload_dict = dict(payload or {})
+        normalized = _NORMALIZED_TIMELINE_MESSAGES.get(event_type)
+        if not normalized:
+            return str(message or ""), payload_dict
+        payload_dict.setdefault("raw_error", str(message or ""))
+        if event_type in {"worker_job_start_failed", "worker_job_requeued_before_process_start"}:
+            payload_dict.setdefault("reason_code", "projection_duplicate_conflict")
+            payload_dict.setdefault("reason_category", "startup_metadata_write_conflict")
+        elif event_type == "stale_runtime_kept_running":
+            payload_dict.setdefault("reason_code", "runtime_binding_incomplete_preserved")
+            payload_dict.setdefault("reason_category", "runtime_binding")
+        elif event_type == "runtime_binding_repaired":
+            payload_dict.setdefault("reason_code", "runtime_binding_repaired")
+            payload_dict.setdefault("reason_category", "runtime_binding")
+        elif event_type == "runtime_binding_repair_requested":
+            payload_dict.setdefault("reason_code", "runtime_binding_repair_requested")
+            payload_dict.setdefault("reason_category", "runtime_binding")
+        return normalized, payload_dict
+
+    def _runtime_binding_incomplete(self, *, execution: WorkflowExecution | None) -> bool:
+        if execution is None:
+            return False
+        if _canonical_task_status(execution.status) != "running":
+            return False
+        return not all(
+            (
+                str(execution.owner_pod_id or "").strip(),
+                str(execution.worker_job_id or "").strip(),
+                bool(execution.process_pid),
+                execution.process_started_at is not None,
+            )
+        )
+
+    def _repair_runtime_binding_if_possible(
+        self,
+        db: Session,
+        *,
+        run_index: RunIndex | None,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+        process_state: dict[str, Any] | None = None,
+    ) -> bool:
+        if execution is None or not self._runtime_binding_incomplete(execution=execution):
+            return False
+        local_process = self._local_cli_process(execution.id)
+        runtime_evidence = self._runtime_evidence_snapshot(
+            db,
+            run_index=run_index,
+            trigger=trigger,
+            execution=execution,
+            local_process=local_process,
+        )
+        if not bool(runtime_evidence.get("live_runtime_evidence")):
+            return False
+
+        if not self._has_execution_event(db, execution.id, "runtime_binding_repair_requested"):
+            self.record_event(
+                db,
+                execution_id=execution.id,
+                event_type="runtime_binding_repair_requested",
+                message="runtime binding repair requested from run/process evidence",
+                level="warning",
+                payload_json={
+                    "task_id": trigger.id if trigger is not None else execution.trigger_task_id,
+                    "run_index_id": run_index.id if run_index is not None else None,
+                    "runtime_evidence": {
+                        "has_local_process": bool(runtime_evidence.get("has_local_process")),
+                        "has_fresh_process_heartbeat": bool(runtime_evidence.get("has_fresh_process_heartbeat")),
+                        "has_recent_run_activity": bool(runtime_evidence.get("has_recent_run_activity")),
+                    },
+                    "process_state": process_state or {},
+                },
+            )
+
+        scheduler_config = get_config().scheduler
+        now = now_local()
+        process_payload = runtime_evidence.get("process_payload") if isinstance(runtime_evidence.get("process_payload"), dict) else {}
+        if not str(execution.owner_pod_id or "").strip():
+            execution.owner_pod_id = str(process_payload.get("pod_id") or "").strip() or scheduler_config.pod_id
+        if not str(execution.worker_job_id or "").strip():
+            execution.worker_job_id = execution.id
+        if not execution.process_pid:
+            pid_value = None
+            if local_process is not None:
+                pid_value = int(local_process.pid)
+            else:
+                raw_pid = process_payload.get("pid")
+                try:
+                    pid_value = int(raw_pid) if raw_pid is not None else None
+                except (TypeError, ValueError):
+                    pid_value = None
+            if pid_value:
+                execution.process_pid = pid_value
+        if execution.process_started_at is None:
+            started_at = self._parse_process_timestamp(
+                process_payload.get("started_at")
+                or process_payload.get("updated_at")
+                or process_payload.get("heartbeat_at")
+            )
+            execution.process_started_at = started_at or (run_index.started_at if run_index is not None else None) or execution.started_at or now
+        if execution.started_at is None:
+            execution.started_at = execution.process_started_at or now
+        execution.status = "running"
+        execution.dispatch_status = "running"
+        execution.process_status = "running"
+        execution.process_host = str(execution.process_host or execution.owner_pod_id or scheduler_config.pod_id or "").strip() or None
+        if str(execution.message or "").strip() == "stale active runtime kept running by run evidence":
+            execution.message = "run_vuln_scan.py running"
+        if trigger is not None:
+            trigger.status = "running"
+            if str(trigger.message or "").strip() == "stale active runtime kept running by run evidence":
+                trigger.message = "run_vuln_scan.py running"
+        self._sync_runtime_state_snapshots(
+            trigger=trigger,
+            execution=execution,
+            public_status="running",
+            control_state="none",
+        )
+        db.add(execution)
+        if trigger is not None:
+            db.add(trigger)
+        if run_index is not None:
+            get_run_index_service().sync_execution_run(db, execution)
+        self._refresh_task_list_projection_for_execution(db, execution)
+        db.flush()
+        if not self._has_execution_event(db, execution.id, "runtime_binding_repaired"):
+            self.record_event(
+                db,
+                execution_id=execution.id,
+                event_type="runtime_binding_repaired",
+                message="runtime binding repaired from run/process evidence",
+                level="info",
+                payload_json={
+                    "task_id": trigger.id if trigger is not None else execution.trigger_task_id,
+                    "run_index_id": run_index.id if run_index is not None else None,
+                    "owner_pod_id": execution.owner_pod_id,
+                    "worker_job_id": execution.worker_job_id,
+                    "process_pid": execution.process_pid,
+                    "process_started_at": isoformat_local(execution.process_started_at) or "",
+                },
+            )
+        return True
 
     def _ensure_project_access(self, principal: dict, project_id: str) -> None:
         project_ids = _project_ids(principal)
@@ -1008,9 +1264,8 @@ class ExecutionService:
                 enabled=bool(self._trigger_task_metadata(trigger).get("auto_report_vulnerabilities", True)),
                 counts=report_counts_by_task.get(str(trigger.id)),
             )
-            row = db.get(DfvsTaskListProjection, trigger.id)
-            if row is None:
-                row = DfvsTaskListProjection(task_id=trigger.id)
+            existing_row = db.get(DfvsTaskListProjection, trigger.id)
+            row = existing_row if existing_row is not None else DfvsTaskListProjection(task_id=trigger.id)
             row.project_id = trigger.project_id
             row.title = self._trigger_title(trigger)
             row.profile_id = self._task_effective_profile_id(trigger)
@@ -1076,7 +1331,16 @@ class ExecutionService:
             row.finished_at = effective_finished_at
             row.created_at = trigger.created_at
             row.updated_at = trigger.updated_at
-            db.add(row)
+            self._persist_task_list_projection(
+                db,
+                trigger=trigger,
+                latest_execution=latest_execution,
+                row=row,
+            )
+            if existing_row is not None:
+                values = self._projection_row_values(trigger=trigger, latest_execution=latest_execution, row=row)
+                for key, value in values.items():
+                    setattr(existing_row, key, value)
         db.flush()
 
     def _backfill_missing_task_list_projections(
@@ -6719,6 +6983,14 @@ class ExecutionService:
             process_state=process_state,
         ):
             return True
+        if self._repair_runtime_binding_if_possible(
+            db,
+            run_index=run_index,
+            trigger=trigger,
+            execution=execution,
+            process_state=process_state,
+        ):
+            return True
         if not bool(process_state.get("stale")):
             return False
 
@@ -6803,6 +7075,15 @@ class ExecutionService:
                         payload_json={"reason": "stale_runtime_recovery_pending", "process_state": process_state},
                     )
                 return True
+            repaired = self._repair_runtime_binding_if_possible(
+                db,
+                run_index=run_index,
+                trigger=trigger,
+                execution=execution,
+                process_state=process_state,
+            )
+            if repaired:
+                return True
             if execution is not None:
                 execution.message = "stale active runtime kept running by run evidence"
                 db.add(execution)
@@ -6819,14 +7100,15 @@ class ExecutionService:
             if execution is not None:
                 self._refresh_task_list_projection_for_execution(db, execution)
                 db.flush()
-                self.record_event(
-                    db,
-                    execution_id=execution.id,
-                    event_type="stale_runtime_kept_running",
-                    message="stale active runtime kept running by run evidence",
-                    level="warning",
-                    payload_json={"reason": "stale_runtime_kept_running", "process_state": process_state},
-                )
+                if not self._has_execution_event(db, execution.id, "stale_runtime_kept_running"):
+                    self.record_event(
+                        db,
+                        execution_id=execution.id,
+                        event_type="stale_runtime_kept_running",
+                        message="stale active runtime kept running by run evidence",
+                        level="warning",
+                        payload_json={"reason": "stale_runtime_kept_running", "process_state": process_state},
+                    )
             return True
 
         self._mark_stale_runtime_exited(
@@ -7918,7 +8200,8 @@ class ExecutionService:
         level: str = "info",
         payload_json: dict[str, Any] | None = None,
     ) -> WorkflowExecutionEvent:
-        safe_payload = jsonable_encoder(payload_json or {})
+        normalized_message, normalized_payload = self._normalized_timeline_message(event_type, message, payload_json)
+        safe_payload = jsonable_encoder(normalized_payload or {})
         event = WorkflowExecutionEvent(
             id=_new_id("evt"),
             execution_id=execution_id,
@@ -7926,7 +8209,7 @@ class ExecutionService:
             stage_id=stage_id,
             round_no=round_no,
             level=level,
-            message=message,
+            message=normalized_message,
             payload_json=safe_payload,
         )
         db.add(event)

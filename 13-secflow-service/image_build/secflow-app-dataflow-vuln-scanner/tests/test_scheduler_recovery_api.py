@@ -328,6 +328,76 @@ def test_cleanup_requeues_stuck_starting_execution_before_process_launch(service
         db.close()
 
 
+def test_requeue_before_process_start_records_normalized_reason_metadata(service_config_path):
+    db = get_db_session()
+    try:
+        execution_id = "exec-projection-conflict-requeue"
+        trigger = TriggerTask(
+            id="tt-projection-conflict-requeue",
+            workflow_definition_id="wfd-projection-conflict-requeue",
+            project_id="default",
+            trigger_type="manual",
+            input_tasks_json={"tasks": []},
+            priority=100,
+            status="dispatching",
+            submitted_by="tester",
+            retry_count=0,
+            max_retry_count=3,
+            latest_execution_id=execution_id,
+        )
+        execution = WorkflowExecution(
+            id=execution_id,
+            trigger_task_id=trigger.id,
+            workflow_definition_id=trigger.workflow_definition_id,
+            project_id="default",
+            attempt_no=1,
+            status="starting",
+            owner_pod_id="worker-0",
+            worker_url="http://worker-0:8080",
+            worker_job_id="job-0",
+            dispatch_status="starting",
+            process_pid=None,
+            process_started_at=None,
+        )
+        db.add_all([trigger, execution])
+        db.commit()
+    finally:
+        db.close()
+
+    scheduler = SchedulerService()
+    assert scheduler._requeue_if_not_process_started(
+        execution_id,
+        "IntegrityError: Duplicate entry 'tt-projection-conflict-requeue' for key 'task_list_projection.PRIMARY'",
+    )
+
+    db = get_db_session()
+    try:
+        events = (
+            db.query(WorkflowExecutionEvent)
+            .filter(WorkflowExecutionEvent.execution_id == execution_id)
+            .order_by(WorkflowExecutionEvent.created_at.asc())
+            .all()
+        )
+        assert {event.event_type for event in events} >= {
+            "worker_job_start_failed",
+            "worker_job_requeued_before_process_start",
+        }
+        for event in events:
+            if event.event_type not in {"worker_job_start_failed", "worker_job_requeued_before_process_start"}:
+                continue
+            payload = event.payload_json or {}
+            assert event.message in {
+                "startup metadata write failed; task requeued before process start",
+                "task list projection write conflict; requeued before process start",
+            }
+            assert payload["reason_category"] == "startup_metadata_write_conflict"
+            assert payload["projection_write_involved"] is True
+            assert payload["session_rollback_applied"] is True
+            assert "raw_error" in payload
+    finally:
+        db.close()
+
+
 def test_cleanup_reconciles_orphan_cancel_requested_execution(service_config_path):
     db = get_db_session()
     try:
