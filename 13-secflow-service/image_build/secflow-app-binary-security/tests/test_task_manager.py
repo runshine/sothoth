@@ -3258,6 +3258,53 @@ class TaskManagerTests(unittest.TestCase):
         self.assertIsInstance(detail.stage_items_total, int)
         self.assertIsInstance(detail.stage_items, list)
 
+    def test_get_task_overview_uses_lightweight_context_without_archive_retry_support(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/in",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="running",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            sequence_no=1,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="i1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="firmware_unpack",
+            item_key="fw1",
+            status="running",
+            downstream_service="firmware_unpacker",
+            downstream_task_id="d1",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], archive_jobs=[], events=[])
+
+        with patch.object(self.manager, "_build_task_detail_context", side_effect=AssertionError("heavy context used")), patch.object(
+            self.manager,
+            "_archive_retry_support",
+            side_effect=AssertionError("archive retry support should be skipped for overview"),
+        ), patch.object(
+            self.manager,
+            "_archive_full_retry_support",
+            side_effect=AssertionError("archive full retry support should be skipped for overview"),
+        ):
+            response = self.manager.get_task_overview(db, project_id="p1", task_id="t1")
+
+        self.assertEqual("t1", response.task_id)
+        self.assertTrue(any(node.node_id == "business:firmware_unpack" for node in response.nodes))
+
     def test_list_tasks_keeps_read_path_side_effect_free_when_stage_is_running(self):
         task = BinarySecurityTask(
             id="t1",
@@ -9367,70 +9414,6 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(supported)
         self.assertIn("目标状态", reason or "")
-
-    def test_build_stage_overview_nodes_sets_archive_retry_support(self):
-        task = BinarySecurityTask(
-            id="t1",
-            project_id="p1",
-            name="task",
-            task_type=TASK_TYPE_BINARY,
-            firmware_source="project_filesystem",
-            firmware_path="/tmp/in",
-            output_root="/tmp/out",
-            workspace_root="/tmp/ws",
-            status="failed",
-        )
-        item = BinarySecurityStageItem(
-            id="i1",
-            task_id="t1",
-            project_id="p1",
-            stage_name="firmware_unpack",
-            item_key="fw1",
-            status="failed",
-            downstream_service="firmware_unpacker",
-            downstream_task_id="d1",
-        )
-        summaries = [
-            BinarySecurityStageSummary(
-                stage_name="firmware_unpack",
-                sequence_no=1,
-                status="failed",
-                retry_supported=True,
-                failed_items=1,
-                total_items=1,
-            )
-        ]
-        archive_jobs = [
-            BinarySecurityArchiveJobResponse(
-                id="aj1",
-                stage_name="firmware_unpack",
-                item_id="i1",
-                item_key="fw1",
-                archive_status="failed",
-                retry_supported=True,
-            )
-        ]
-        db = _ModelAwareDb(
-            tasks=[task],
-            stage_items=[item],
-            archive_jobs=[
-                BinarySecurityArchiveJob(
-                    id="aj1",
-                    task_id="t1",
-                    project_id="p1",
-                    stage_name="firmware_unpack",
-                    item_id="i1",
-                    item_key="fw1",
-                    archive_status="failed",
-                )
-            ],
-        )
-        db.archive_jobs[0].payload = {"mapped_status": "success"}
-
-        nodes = self.manager._build_stage_overview_nodes(db, task, summaries, archive_jobs, [item])
-        by_node_id = {node.node_id: node for node in nodes}
-
-        self.assertTrue(by_node_id["archive:firmware_unpack"].retry_supported)
 
     def test_build_manual_operation_state_exposes_can_retry_archive(self):
         task = BinarySecurityTask(

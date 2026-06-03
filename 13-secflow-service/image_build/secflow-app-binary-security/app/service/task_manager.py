@@ -2163,8 +2163,8 @@ class TaskManager:
         return self._build_orchestration_observability(db, task)
 
     def get_task_overview(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityOverviewResponse:
-        ctx = self._build_task_detail_context(db, project_id=project_id, task_id=task_id)
-        archive_job_responses = self._archive_job_responses(db, ctx.task, ctx.archive_jobs)
+        ctx = self._build_task_overview_context(db, project_id=project_id, task_id=task_id)
+        archive_job_responses = self._archive_job_responses(db, ctx.task, ctx.archive_jobs, include_retry_support=False)
         return BinarySecurityOverviewResponse(
             task_id=ctx.task.id,
             nodes=self._build_stage_overview_nodes(
@@ -2173,6 +2173,7 @@ class TaskManager:
                 ctx.stage_summaries,
                 archive_job_responses,
                 ctx.stage_items,
+                include_archive_retry_support=False,
             ),
         )
 
@@ -2350,15 +2351,105 @@ class TaskManager:
             last_sync_error_message=sync_times[3],
         )
 
+    def _build_task_overview_context(self, db: Session, *, project_id: str, task_id: str) -> _TaskDetailContext:
+        task = self._task_or_404(db, project_id, task_id)
+        stage_runs = (
+            db.query(BinarySecurityStageRun)
+            .filter(BinarySecurityStageRun.task_id == task.id)
+            .order_by(BinarySecurityStageRun.sequence_no.asc())
+            .all()
+        )
+        stage_items = (
+            db.query(BinarySecurityStageItem)
+            .options(
+                load_only(
+                    BinarySecurityStageItem.id,
+                    BinarySecurityStageItem.task_id,
+                    BinarySecurityStageItem.project_id,
+                    BinarySecurityStageItem.stage_run_id,
+                    BinarySecurityStageItem.stage_name,
+                    BinarySecurityStageItem.item_key,
+                    BinarySecurityStageItem.item_name,
+                    BinarySecurityStageItem.parent_key,
+                    BinarySecurityStageItem.item_identity_key,
+                    BinarySecurityStageItem.status,
+                    BinarySecurityStageItem.downstream_service,
+                    BinarySecurityStageItem.downstream_task_id,
+                    BinarySecurityStageItem.result_json,
+                    BinarySecurityStageItem.error_message,
+                    BinarySecurityStageItem.started_at,
+                    BinarySecurityStageItem.finished_at,
+                    BinarySecurityStageItem.created_at,
+                    BinarySecurityStageItem.updated_at,
+                )
+            )
+            .filter(BinarySecurityStageItem.task_id == task.id)
+            .order_by(BinarySecurityStageItem.created_at.asc(), BinarySecurityStageItem.id.asc())
+            .all()
+        )
+        archive_jobs = (
+            db.query(BinarySecurityArchiveJob)
+            .options(
+                load_only(
+                    BinarySecurityArchiveJob.id,
+                    BinarySecurityArchiveJob.task_id,
+                    BinarySecurityArchiveJob.project_id,
+                    BinarySecurityArchiveJob.stage_name,
+                    BinarySecurityArchiveJob.item_id,
+                    BinarySecurityArchiveJob.item_key,
+                    BinarySecurityArchiveJob.downstream_service,
+                    BinarySecurityArchiveJob.downstream_task_id,
+                    BinarySecurityArchiveJob.archive_status,
+                    BinarySecurityArchiveJob.archive_root,
+                    BinarySecurityArchiveJob.error_message,
+                    BinarySecurityArchiveJob.payload_json,
+                    BinarySecurityArchiveJob.attempts,
+                    BinarySecurityArchiveJob.created_at,
+                    BinarySecurityArchiveJob.started_at,
+                    BinarySecurityArchiveJob.completed_at,
+                    BinarySecurityArchiveJob.updated_at,
+                    BinarySecurityArchiveJob.owner_id,
+                )
+            )
+            .filter(BinarySecurityArchiveJob.task_id == task.id)
+            .order_by(BinarySecurityArchiveJob.created_at.asc(), BinarySecurityArchiveJob.id.asc())
+            .all()
+        )
+        stage_sequence = self._stage_sequence_for_task(task)
+        stage_summaries = self._build_stage_summaries(db, task, stage_sequence, stage_runs, stage_items)
+        abnormal_reason = None
+        if isinstance(task.latest_abnormal_reason, dict):
+            try:
+                abnormal_reason = BinarySecurityAbnormalReason(**task.latest_abnormal_reason)
+            except Exception:
+                abnormal_reason = None
+        if abnormal_reason is None:
+            abnormal_reason = self._task_abnormal_reason(task, stage_summaries, stage_items, archive_jobs)
+        return _TaskDetailContext(
+            task=task,
+            queue_info={},
+            stage_sequence=stage_sequence,
+            stage_runs=stage_runs,
+            stage_items=stage_items,
+            archive_jobs=archive_jobs,
+            stage_summaries=stage_summaries,
+            abnormal_reason=abnormal_reason,
+        )
+
     def _archive_job_responses(
         self,
         db: Session,
         task: BinarySecurityTask,
         archive_jobs: list[BinarySecurityArchiveJob],
+        *,
+        include_retry_support: bool = True,
     ) -> list[BinarySecurityArchiveJobResponse]:
         archive_job_responses: list[BinarySecurityArchiveJobResponse] = []
         for job in archive_jobs:
-            retry_supported, retry_reason = self._archive_job_retry_support(db, task, job)
+            if include_retry_support:
+                retry_supported, retry_reason = self._archive_job_retry_support(db, task, job)
+            else:
+                retry_supported, retry_reason = False, None
             archive_job_responses.append(
                 BinarySecurityArchiveJobResponse(
                     id=job.id,
@@ -14557,6 +14648,8 @@ class TaskManager:
         stage_summaries: list[BinarySecurityStageSummary],
         archive_jobs: list[BinarySecurityArchiveJobResponse],
         stage_items: list[BinarySecurityStageItem],
+        *,
+        include_archive_retry_support: bool = True,
     ) -> list[BinarySecurityOverviewNode]:
         stage_sequence = self._stage_sequence_for_task(task)
         summaries_by_stage = {summary.stage_name: summary for summary in stage_summaries}
@@ -14657,8 +14750,12 @@ class TaskManager:
                 archive_status = "pending"
             if stage_name == "system_analysis" and summary.status == "waiting_confirmation":
                 archive_status = "pending"
-            archive_retry_supported, archive_retry_reason, _ = self._archive_retry_support(db, task, stage_name)
-            archive_retry_full_supported, archive_retry_full_reason, _, _ = self._archive_full_retry_support(db, task, stage_name)
+            if include_archive_retry_support:
+                archive_retry_supported, archive_retry_reason, _ = self._archive_retry_support(db, task, stage_name)
+                archive_retry_full_supported, archive_retry_full_reason, _, _ = self._archive_full_retry_support(db, task, stage_name)
+            else:
+                archive_retry_supported, archive_retry_reason = False, None
+                archive_retry_full_supported, archive_retry_full_reason = False, None
             archive_abnormal_reason = next((job.abnormal_reason for job in reversed(stage_jobs) if job.abnormal_reason), None)
             nodes.append(
                 BinarySecurityOverviewNode(
