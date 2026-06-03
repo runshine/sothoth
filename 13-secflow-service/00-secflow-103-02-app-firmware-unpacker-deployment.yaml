@@ -46,6 +46,8 @@ spec:
               value: /app/config.yaml
             - name: FIRMWARE_UNPACKER_CONFIG
               value: /app/config.yaml
+            - name: SECFLOW_FIRMWARE_UNPACKER_PROBE_PORT
+              value: "18080"
             - name: FIRMWARE_UNPACKER_RUNTIME_ROLE
               value: api
             - name: UNPACKER_AGENT_DIR
@@ -181,6 +183,8 @@ spec:
               value: /app/config.yaml
             - name: FIRMWARE_UNPACKER_CONFIG
               value: /app/config.yaml
+            - name: SECFLOW_FIRMWARE_UNPACKER_PROBE_PORT
+              value: "18080"
             - name: FIRMWARE_UNPACKER_RUNTIME_ROLE
               value: dispatcher,worker
             - name: UNPACKER_AGENT_DIR
@@ -316,6 +320,8 @@ spec:
               value: /app/config.yaml
             - name: FIRMWARE_UNPACKER_CONFIG
               value: /app/config.yaml
+            - name: SECFLOW_FIRMWARE_UNPACKER_PROBE_PORT
+              value: "18080"
             - name: FIRMWARE_UNPACKER_RUNTIME_ROLE
               value: cleanup-worker
             - name: UNPACKER_AGENT_DIR

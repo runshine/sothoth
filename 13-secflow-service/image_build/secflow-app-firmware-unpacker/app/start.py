@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Startup script for the threaded Gunicorn WSGI adapter."""
+"""Startup script for the firmware unpacker API process."""
 
 from __future__ import annotations
 
@@ -28,50 +28,32 @@ def _env_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
-def _default_workers() -> int:
-    # Task runners are subprocesses, but concurrency limits are calculated per
-    # service process. Keep one Gunicorn worker by default to avoid Pod-level
-    # overcommit from multiple independent dispatchers.
-    return 1
-
-
-def build_gunicorn_argv() -> list[str]:
+def build_uvicorn_argv() -> list[str]:
     config = get_config()
-    workers = _env_int("GUNICORN_WORKERS", _default_workers())
-    # Keep request concurrency high enough for list/query APIs while avoiding
-    # the runaway memory and context-switch overhead of the historical 512-thread default.
-    threads = _env_int("GUNICORN_THREADS", 128)
-    timeout = _env_int("GUNICORN_TIMEOUT", 600)
-    keepalive = _env_int("GUNICORN_KEEPALIVE", 10)
+    timeout_keep_alive = _env_int("UVICORN_TIMEOUT_KEEP_ALIVE", 10)
+    backlog = _env_int("UVICORN_BACKLOG", 2048)
 
     return [
-        "gunicorn",
-        "--bind",
-        f"{config.app.host}:{config.app.port}",
-        "--workers",
-        str(workers),
-        "--threads",
-        str(threads),
-        "--worker-class",
-        "gthread",
-        "--timeout",
-        str(timeout),
-        "--keep-alive",
-        str(keepalive),
-        "--access-logfile",
-        "-",
-        "--error-logfile",
-        "-",
-        "--capture-output",
-        "app.wsgi:app",
+        "uvicorn",
+        "app.main:app",
+        "--host",
+        str(config.app.host),
+        "--port",
+        str(config.app.port),
+        "--timeout-keep-alive",
+        str(timeout_keep_alive),
+        "--backlog",
+        str(backlog),
+        "--proxy-headers",
+        "--no-server-header",
     ]
 
 
 def main() -> int:
-    import gunicorn.app.wsgiapp
+    import uvicorn
 
-    sys.argv = build_gunicorn_argv()
-    gunicorn.app.wsgiapp.run()
+    sys.argv = build_uvicorn_argv()
+    uvicorn.main()
     return 0
 
 
