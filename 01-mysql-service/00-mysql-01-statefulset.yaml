@@ -44,6 +44,9 @@ spec:
             - name: mysql-config
               mountPath: /etc/mysql/conf.d/90-binlog-retention.cnf
               subPath: 90-binlog-retention.cnf
+            - name: mysql-custom-config
+              mountPath: /etc/mysql/conf.d/custom.cnf
+              subPath: custom.cnf
           livenessProbe:
             exec:
               command: ["mysqladmin", "ping", "-uroot", "-pHuawei12#$"]
@@ -64,3 +67,6 @@ spec:
         - name: mysql-config
           configMap:
             name: mysql-config
+        - name: mysql-custom-config
+          configMap:
+            name: mysql-custom-config
