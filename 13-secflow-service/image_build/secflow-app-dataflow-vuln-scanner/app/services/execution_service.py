@@ -104,6 +104,8 @@ from app.time_utils import UTC_PLUS_8, isoformat_local, now_local
 
 logger = logging.getLogger("dataflow_vuln.execution")
 
+_PROJECTION_REPAIR_ENQUEUE_COOLDOWN_SECONDS = 60.0
+
 
 def _perf_elapsed_ms(started_at: float) -> float:
     return round((time.perf_counter() - started_at) * 1000, 2)
@@ -347,6 +349,7 @@ class ExecutionService:
         self._active_cli_processes: dict[str, subprocess.Popen] = {}
         self._projection_repair_lock = threading.Lock()
         self._projection_repair_projects: set[str] = set()
+        self._projection_repair_last_enqueued_at: dict[str, float] = {}
 
     def _ensure_project_access(self, principal: dict, project_id: str) -> None:
         project_ids = _project_ids(principal)
@@ -392,7 +395,11 @@ class ExecutionService:
             for item in scope_project_ids:
                 if item in self._projection_repair_projects:
                     continue
+                last_enqueued_at = float(self._projection_repair_last_enqueued_at.get(item) or 0.0)
+                if last_enqueued_at > 0 and (time.monotonic() - last_enqueued_at) < _PROJECTION_REPAIR_ENQUEUE_COOLDOWN_SECONDS:
+                    continue
                 self._projection_repair_projects.add(item)
+                self._projection_repair_last_enqueued_at[item] = time.monotonic()
                 enqueued = True
         return enqueued
 
@@ -5497,15 +5504,8 @@ class ExecutionService:
         sort_by: str | None = None,
         sort_order: str | None = None,
     ) -> ScanTaskListResponse:
-        projection_total_missing = self._count_missing_task_list_projections(
-            db,
-            principal,
-            project_id=project_id,
-        )
-        projection_backfill_pending = projection_total_missing > 0
-        projection_backfill_enqueued = False
-        if projection_backfill_pending:
-            projection_backfill_enqueued = self.enqueue_projection_repair(principal, project_id=project_id)
+        request_started = time.perf_counter()
+        projection_backfill_enqueued = self.enqueue_projection_repair(principal, project_id=project_id)
         query = self._list_task_projection_query(
             db,
             principal,
@@ -5526,15 +5526,25 @@ class ExecutionService:
         total = query.order_by(None).count()
         rows = query.offset((safe_page - 1) * safe_per_page).limit(safe_per_page).all()
         items = [self._projection_to_task_list_item(row) for row in rows]
+        _log_api_timing(
+            "GET /tasks",
+            project_id=project_id or "",
+            page=safe_page,
+            per_page=safe_per_page,
+            total=total,
+            row_count=len(rows),
+            projection_backfill_enqueued=projection_backfill_enqueued,
+            total_ms=_perf_elapsed_ms(request_started),
+        )
         return ScanTaskListResponse(
             items=items,
             total=total,
             page=safe_page,
             per_page=safe_per_page,
             page_size=safe_per_page,
-            projection_backfill_pending=projection_backfill_pending,
+            projection_backfill_pending=projection_backfill_enqueued,
             projection_backfill_enqueued=projection_backfill_enqueued,
-            projection_total_missing=projection_total_missing,
+            projection_total_missing=0,
         )
 
     def get_scan_task_stats(
@@ -5552,14 +5562,8 @@ class ExecutionService:
         mode: str | None = None,
         parent_task_id: str | None = None,
     ) -> ScanTaskStatsResponse:
-        projection_total_missing = self._count_missing_task_list_projections(
-            db,
-            principal,
-            project_id=project_id,
-        )
-        projection_backfill_pending = projection_total_missing > 0
-        if projection_backfill_pending:
-            self.enqueue_projection_repair(principal, project_id=project_id)
+        request_started = time.perf_counter()
+        projection_backfill_enqueued = self.enqueue_projection_repair(principal, project_id=project_id)
         query = self._list_task_projection_query(
             db,
             principal,
@@ -5593,6 +5597,13 @@ class ExecutionService:
             normalized = normalize_public_task_status(public_status)
             counts[normalized] = counts.get(normalized, 0) + int(count or 0)
             total += int(count or 0)
+        _log_api_timing(
+            "GET /tasks/stats",
+            project_id=project_id or "",
+            total=total,
+            projection_backfill_enqueued=projection_backfill_enqueued,
+            total_ms=_perf_elapsed_ms(request_started),
+        )
         return ScanTaskStatsResponse(
             total=total,
             pending=counts.get("pending", 0),
@@ -5600,7 +5611,7 @@ class ExecutionService:
             succeeded=counts.get("succeeded", 0),
             failed=counts.get("failed", 0),
             cancelled=counts.get("cancelled", 0),
-            projection_backfill_pending=projection_backfill_pending,
+            projection_backfill_pending=projection_backfill_enqueued,
         )
 
     def get_scan_task(self, db: Session, task_id: str, principal: dict) -> ScanTaskDetailResponse:
