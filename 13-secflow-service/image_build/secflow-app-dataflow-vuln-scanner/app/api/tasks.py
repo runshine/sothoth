@@ -127,6 +127,7 @@ async def list_tasks(
     per_page: Optional[int] = Query(None, ge=10, le=1000),
     mode: Optional[str] = Query(None),
     parent_task_id: Optional[str] = Query(None),
+    parent_stage_item_id: Optional[str] = Query(None),
     sort_by: Optional[str] = Query(None),
     sort_order: Optional[str] = Query(None),
     subject=Depends(get_current_or_machine_subject),
@@ -158,6 +159,7 @@ async def list_tasks(
         per_page=per_page,
         mode=mode,
         parent_task_id=parent_task_id,
+        parent_stage_item_id=parent_stage_item_id,
         sort_by=sort_by,
         sort_order=sort_order,
     )
@@ -174,6 +176,7 @@ async def get_task_stats(
     model: Optional[str] = Query(None),
     mode: Optional[str] = Query(None),
     parent_task_id: Optional[str] = Query(None),
+    parent_stage_item_id: Optional[str] = Query(None),
     subject=Depends(get_current_or_machine_subject),
     db: Session = Depends(get_db),
 ):
@@ -192,6 +195,7 @@ async def get_task_stats(
         model=model,
         mode=mode,
         parent_task_id=parent_task_id,
+        parent_stage_item_id=parent_stage_item_id,
     )
 
 

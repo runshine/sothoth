@@ -342,6 +342,14 @@ class BinarySecurityStageItemResponse(BaseModel):
     downstream_service: Optional[str] = None
     downstream_task_id: Optional[str] = None
     downstream_status: Optional[str] = None
+    downstream_binding_state: Optional[str] = None
+    downstream_create_attempts: int = 0
+    downstream_create_last_attempt_at: Optional[datetime] = None
+    downstream_create_next_retry_at: Optional[datetime] = None
+    downstream_create_last_error: Optional[str] = None
+    downstream_create_last_error_type: Optional[str] = None
+    downstream_create_recoverable: Optional[bool] = None
+    downstream_binding_message: Optional[str] = None
     downstream_cancel_phase: Optional[str] = None
     downstream_summary: Optional[dict[str, Any]] = None
     input_ref: dict[str, Any] = Field(default_factory=dict)

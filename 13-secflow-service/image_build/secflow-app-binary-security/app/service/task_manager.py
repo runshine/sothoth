@@ -176,6 +176,10 @@ DB_EVENT_PAYLOAD_LIMIT_BYTES = 32768
 DETAIL_STAGE_ITEMS_LIMIT = 100
 MODULE_TASK_INPUT_KEY = "module-input"
 ARCHIVE_COPY_MISSING_SOURCE_RETRY_REASON = "source_not_ready"
+DOWNSTREAM_CREATE_RETRY_BACKOFF_SECONDS = (10, 30, 60, 120)
+DOWNSTREAM_CREATE_RETRY_MAX_ATTEMPTS = 10
+DOWNSTREAM_CREATE_RETRY_MAX_WINDOW_SECONDS = 15 * 60
+_UNSET = object()
 
 # Compatibility exports for older tests and call sites that monkey-patch
 # downstream client factories from task_manager directly.
@@ -668,6 +672,7 @@ def _downstream_origin_payload(task: BinarySecurityTask, item: BinarySecuritySta
         "parent_stage_name": _stage_item_attr(item, "stage_name"),
         "parent_stage_item_id": _stage_item_attr(item, "id"),
         "parent_stage_item_key": _stage_item_attr(item, "item_key"),
+        "create_dedupe_key": f"{_stage_item_attr(item, 'stage_name') or 'stage'}:{_stage_item_attr(item, 'id') or _stage_item_attr(item, 'item_key') or ''}",
     }
 
 
@@ -3420,6 +3425,7 @@ class TaskManager:
                 )
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
+        validation_affected_stages = list(affected_stages)
         downstream_stages = stage_sequence[target_index + 1:]
         all_downstream_refs = self._retry_downstream_refs_for_stages(db, task, downstream_stages)
         self._invalidate_task_execution(task)
@@ -3429,7 +3435,7 @@ class TaskManager:
         if self._streaming_mode_enabled(task) and target_stage in STREAMING_TAIL_STAGES:
             cleared_business_stages = await self._cleanup_streaming_retry_descendants(db, task, target_stage, retry_items)
             cleared_archive_stages = list(cleared_business_stages)
-            affected_stages = [target_stage, *cleared_business_stages]
+            validation_affected_stages = [target_stage]
             for downstream_stage in cleared_business_stages:
                 downstream_run = db.query(BinarySecurityStageRun).filter(
                     BinarySecurityStageRun.task_id == task.id,
@@ -3468,7 +3474,7 @@ class TaskManager:
                 "cleared_archive_stages": cleared_archive_stages,
                 "retry_item_keys": sorted(retry_item_keys),
                 "item_actions": self._retry_item_actions(task),
-                "affected_stages": affected_stages,
+                "affected_stages": validation_affected_stages,
             },
         )
         return affected_stages
@@ -3524,6 +3530,10 @@ class TaskManager:
             sync_observation.setdefault("status_raw", normalized_display or display_status)
             sync_observation["mapped_status"] = normalized_item
             repaired = True
+        if not display_status and str(item.downstream_task_id or "").strip():
+            binding_state = self._downstream_binding_state(item)
+            if binding_state == "created_pending_sync":
+                display_status = "pending"
         return display_status, sync_observation, repaired
 
     def _repair_stage_item_terminal_downstream_observation(
@@ -3598,6 +3608,15 @@ class TaskManager:
         for item in self._retry_target_items(db, task, target_stage=target_stage):
             active_payload = await self._active_downstream_payload(task, item, token)
             strategy, observed_status = self._classify_retry_downstream_strategy(item, active_payload=active_payload)
+            if active_payload is None and str(item.downstream_task_id or "").strip():
+                normalized_current_status = (
+                    self._map_downstream_status(str(item.status or ""))
+                    or self._latest_observed_downstream_status(item)
+                    or (str(item.status or "").strip().lower() or None)
+                )
+                if normalized_current_status in RETRY_CHILD_ABNORMAL_STATUSES:
+                    strategy = RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL
+                    observed_status = normalized_current_status
             action = self._retry_item_action_snapshot(
                 item,
                 strategy=strategy,
@@ -3691,6 +3710,8 @@ class TaskManager:
         deleted_state_event_count = self._delete_state_event_rows_for_stages(db, task.id, affected_stages)
         deleted_timeline_event_count = self._delete_timeline_rows_for_stages(db, task.id, affected_stages)
         for stage_name in affected_stages:
+            if phase == "prepare" and self._streaming_mode_enabled(task) and target_stage in STREAMING_TAIL_STAGES and stage_name != target_stage:
+                continue
             stage_run = db.query(BinarySecurityStageRun).filter(
                 BinarySecurityStageRun.task_id == task.id,
                 BinarySecurityStageRun.stage_name == stage_name,
@@ -4954,9 +4975,24 @@ class TaskManager:
         auth_token = token or self._service_token()
         ready_items: list[BinarySecurityStageItem] = []
         for item in items:
-            item_stage_name = item.stage_name
-            item_downstream_service = item.downstream_service
-            item_downstream_task_id = item.downstream_task_id
+            if self._item_needs_downstream_binding_reconcile(item):
+                recovered, outcome = await self._attempt_vuln_downstream_binding_recovery(
+                    db,
+                    task,
+                    item,
+                    token=auth_token,
+                    force=force,
+                )
+                if recovered:
+                    synced_count += 1
+                    touched_stages.add(item.stage_name)
+                else:
+                    if outcome in {"retry_not_due", "invalid_input", "failed_final", "create_failed"}:
+                        skipped_count += 1
+                    else:
+                        failed_count += 1
+                if not str(item.downstream_task_id or "").strip():
+                    continue
             if not item.downstream_service or not item.downstream_task_id:
                 skipped_count += 1
                 if record_noop_events:
@@ -4968,6 +5004,7 @@ class TaskManager:
                         level="warning",
                         stage_name=item.stage_name,
                         item=item,
+                        payload={"binding_state": self._downstream_binding_state(item)},
                     )
                 continue
             ready_items.append(item)
@@ -10968,7 +11005,11 @@ class TaskManager:
         active_stage_name = self._active_reconcile_stage_name(task)
         if not active_stage_name or str(item.stage_name or "").strip() != active_stage_name:
             return False
-        if not str(item.downstream_service or "").strip() or not str(item.downstream_task_id or "").strip():
+        if not str(item.downstream_service or "").strip():
+            return False
+        if self._item_needs_downstream_binding_reconcile(item):
+            return True
+        if not str(item.downstream_task_id or "").strip():
             return False
         return self._item_needs_downstream_sync(item, for_task_status=str(task.status or "").strip().lower() or None)
 
@@ -11027,13 +11068,30 @@ class TaskManager:
         item_id: str | None = None,
         force: bool = False,
     ) -> list[BinarySecurityStageItem]:
-        items = self._task_stage_items_with_downstream_refs(db, task, stage_name=stage_name)
+        query = db.query(BinarySecurityStageItem).filter(
+            BinarySecurityStageItem.task_id == task.id,
+            BinarySecurityStageItem.downstream_service.isnot(None),
+        )
+        if stage_name:
+            query = query.filter(BinarySecurityStageItem.stage_name == stage_name)
+        items = query.order_by(
+            BinarySecurityStageItem.updated_at.asc(),
+            BinarySecurityStageItem.created_at.asc(),
+            BinarySecurityStageItem.id.asc(),
+        ).all()
         if item_id:
             items = [item for item in items if str(item.id or "").strip() == str(item_id or "").strip()]
         if force:
             return items
         candidates: list[BinarySecurityStageItem] = []
         for item in items:
+            if (
+                str(item.stage_name or "").strip() == "vuln_scan"
+                and not str(item.downstream_task_id or "").strip()
+                and self._item_needs_downstream_binding_reconcile(item)
+            ):
+                candidates.append(item)
+                continue
             if self._item_needs_downstream_sync(
                 item,
                 for_task_status=str(task.status or "").strip().lower() or None,
@@ -11149,6 +11207,244 @@ class TaskManager:
         if item_status in {"success", "cancelled", "downstream_missing", "partial_success"}:
             return self._item_needs_initial_downstream_sync(item)
         return False
+
+    def _downstream_binding_ready_for_retry(self, item: BinarySecurityStageItem, now_value: datetime | None = None) -> bool:
+        current_now = now_value or _now()
+        next_retry_at = self._downstream_binding_time(item, "next_retry_at")
+        if next_retry_at is None:
+            return True
+        return next_retry_at <= current_now
+
+    def _downstream_binding_retry_window_exhausted(self, item: BinarySecurityStageItem, now_value: datetime | None = None) -> bool:
+        current_now = now_value or _now()
+        attempts = self._downstream_binding_attempts(item)
+        if attempts >= DOWNSTREAM_CREATE_RETRY_MAX_ATTEMPTS:
+            return True
+        first_attempt_at = self._downstream_binding_time(item, "first_attempt_at")
+        if first_attempt_at is None:
+            return False
+        return (current_now - first_attempt_at).total_seconds() >= DOWNSTREAM_CREATE_RETRY_MAX_WINDOW_SECONDS
+
+    def _mark_downstream_binding_creating(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        message: str | None = None,
+    ) -> None:
+        current_now = _now()
+        first_attempt_at = self._downstream_binding_time(item, "first_attempt_at") or current_now
+        attempts = max(1, self._downstream_binding_attempts(item))
+        self._set_downstream_binding_snapshot(
+            item,
+            state="creating",
+            attempts=attempts,
+            first_attempt_at=first_attempt_at,
+            last_attempt_at=current_now,
+            next_retry_at=None,
+            last_error=None,
+            last_error_type=None,
+            recoverable=True,
+            message=message or "下游任务创建中",
+        )
+
+    def _mark_downstream_binding_created(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        message: str | None = None,
+    ) -> None:
+        self._set_downstream_binding_snapshot(
+            item,
+            state="created_pending_sync",
+            next_retry_at=None,
+            last_error=None,
+            last_error_type=None,
+            recoverable=None,
+            message=message or "下游任务已创建，状态待同步",
+        )
+
+    def _mark_downstream_binding_retry(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        error_message: str,
+        error_type: str | None,
+        recoverable: bool,
+    ) -> None:
+        current_now = _now()
+        previous_attempts = self._downstream_binding_attempts(item)
+        attempts = previous_attempts + 1
+        next_retry_at = None if not recoverable else current_now + timedelta(seconds=self._downstream_binding_retry_after(attempts))
+        state = "create_retrying" if recoverable and not self._downstream_binding_retry_window_exhausted(item, now_value=current_now) and attempts < DOWNSTREAM_CREATE_RETRY_MAX_ATTEMPTS else "create_failed"
+        if state == "create_failed":
+            next_retry_at = None
+        self._set_downstream_binding_snapshot(
+            item,
+            state=state,
+            attempts=attempts,
+            first_attempt_at=self._downstream_binding_time(item, "first_attempt_at") or current_now,
+            last_attempt_at=current_now,
+            next_retry_at=next_retry_at,
+            last_error=error_message,
+            last_error_type=error_type,
+            recoverable=recoverable,
+            message=(
+                "下游任务创建重试中" if state == "create_retrying"
+                else "下游任务创建失败"
+            ),
+        )
+
+    def _downstream_binding_status_message(self, item: BinarySecurityStageItem) -> str | None:
+        state = self._downstream_binding_state(item)
+        if state == "creating":
+            return "创建中，尚未拿到下游任务ID"
+        if state == "create_retrying":
+            return "正在自动重试创建，成功后可跳转"
+        if state == "create_failed":
+            return "创建失败，当前无下游任务可查看"
+        if state == "created_pending_sync":
+            return "下游已创建，状态待同步"
+        return None
+
+    async def _attempt_vuln_downstream_binding_recovery(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        token: str | None,
+        force: bool = False,
+    ) -> tuple[bool, str]:
+        if str(item.stage_name or "").strip() != "vuln_scan" or str(item.downstream_service or "").strip() != "dataflow_vuln_scanner":
+            return False, "not_vuln_scan"
+        if str(item.downstream_task_id or "").strip():
+            return False, "already_bound"
+        if not force and not self._downstream_binding_ready_for_retry(item):
+            return False, "retry_not_due"
+
+        reusable = await self._find_reusable_vuln_payload(task, item, token)
+        if reusable is not None:
+            item.downstream_task_id = reusable.get("task_id") or reusable.get("id") or item.downstream_task_id
+            mapped = self._map_downstream_status(str(reusable.get("status") or "")) or "pending"
+            if mapped in {"pending", "queued", "dispatching", "running"}:
+                item.status = mapped
+                item.finished_at = None
+            self._mark_downstream_binding_created(item, message="下游任务已恢复绑定，状态待同步")
+            self._record_downstream_item_disposition(
+                db,
+                task,
+                item,
+                event_type="downstream_child_recovered",
+                message=f"已恢复下游子任务绑定: {item.downstream_service}:{item.downstream_task_id or '-'}",
+                payload={
+                    "downstream_service": item.downstream_service,
+                    "downstream_task_id": item.downstream_task_id,
+                    "binding_state": self._downstream_binding_state(item),
+                    "status_raw": reusable.get("status"),
+                },
+            )
+            db.commit()
+            return True, "recovered"
+
+        if self._downstream_binding_retry_window_exhausted(item):
+            self._set_downstream_binding_snapshot(
+                item,
+                state="create_failed",
+                next_retry_at=None,
+                recoverable=False,
+                message="下游任务创建失败",
+            )
+            self._record_downstream_item_disposition(
+                db,
+                task,
+                item,
+                event_type="downstream_create_failed_final",
+                message="下游任务创建重试窗口已耗尽",
+                level="warning",
+                payload={
+                    "attempts": self._downstream_binding_attempts(item),
+                    "binding_state": "create_failed",
+                },
+            )
+            db.commit()
+            return False, "failed_final"
+
+        dataflow_result = self._validate_dataflow_output_contract(dict(item.input_ref or {}))
+        dataflow_input_dir = self._resolve_vuln_scan_dataflow_input_dir(dataflow_result)
+        source_dir = str(dataflow_result.get("source_root_path") or dataflow_result.get("source_dir") or "").strip()
+        if not dataflow_input_dir or not source_dir:
+            self._mark_downstream_binding_retry(
+                item,
+                error_message="数据流漏洞挖掘输入缺失，无法创建下游任务",
+                error_type="invalid_input",
+                recoverable=False,
+            )
+            db.commit()
+            return False, "invalid_input"
+
+        self._mark_downstream_binding_creating(item)
+        db.commit()
+        try:
+            created = await self._downstream_create_task(
+                db,
+                task,
+                item,
+                service="dataflow_vuln_scanner",
+                token=token,
+                payload={
+                    "title": f"{task.name}-{dataflow_result['function_name']}-scan",
+                    "data_flow_path": dataflow_input_dir,
+                    "source_dir": source_dir,
+                    "origin": _downstream_origin_payload(task, item),
+                },
+                event_payload={"binding_recovery": True},
+            )
+        except Exception as exc:
+            recoverable = self._is_retryable_downstream_transport_error(exc)
+            self._mark_downstream_binding_retry(
+                item,
+                error_message=self._extract_downstream_error_text(exc) or str(exc),
+                error_type=self._classify_downstream_sync_error(exc),
+                recoverable=recoverable,
+            )
+            self._record_downstream_item_disposition(
+                db,
+                task,
+                item,
+                event_type="downstream_create_retry_scheduled" if recoverable and self._downstream_binding_state(item) == "create_retrying" else "downstream_create_failed_final",
+                message="下游任务创建重试已排队" if recoverable and self._downstream_binding_state(item) == "create_retrying" else "下游任务创建失败",
+                level="warning",
+                payload={
+                    "binding_state": self._downstream_binding_state(item),
+                    "attempts": self._downstream_binding_attempts(item),
+                    "next_retry_at": _isoformat_or_none(self._downstream_binding_time(item, "next_retry_at")),
+                    "error": self._extract_downstream_error_text(exc) or str(exc),
+                    "error_type": self._classify_downstream_sync_error(exc),
+                },
+            )
+            db.commit()
+            return False, "create_failed"
+
+        item.downstream_task_id = created.get("task_id") or created.get("id") or item.downstream_task_id
+        item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
+        item.started_at = item.started_at or _now()
+        item.finished_at = None
+        item.error_message = None
+        self._mark_downstream_binding_created(item)
+        self._record_downstream_item_disposition(
+            db,
+            task,
+            item,
+            event_type="downstream_create_retry_attempted",
+            message="已重新创建下游任务并完成绑定",
+            payload={
+                "binding_state": self._downstream_binding_state(item),
+                "downstream_task_id": item.downstream_task_id,
+                "attempts": self._downstream_binding_attempts(item),
+            },
+        )
+        db.commit()
+        return True, "created"
 
     def _extract_http_status_from_exception(self, exc: Exception) -> int | None:
         message = str(exc or "")
@@ -13107,10 +13403,97 @@ class TaskManager:
             "downstream_status",
             "sync_observation",
             "downstream",
+            "downstream_binding",
             "archive_copy_stats",
             "archive_root",
             "artifact_root",
         )
+
+    def _downstream_binding_snapshot(self, item: BinarySecurityStageItem) -> dict[str, Any]:
+        result_payload = dict(item.result or {})
+        return dict(result_payload.get("downstream_binding") or {})
+
+    def _set_downstream_binding_snapshot(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        state: str | None = None,
+        attempts: int | None = None,
+        first_attempt_at: datetime | None | object = _UNSET,
+        last_attempt_at: datetime | None | object = _UNSET,
+        next_retry_at: datetime | None | object = _UNSET,
+        last_error: str | None | object = _UNSET,
+        last_error_type: str | None | object = _UNSET,
+        recoverable: bool | None | object = _UNSET,
+        message: str | None | object = _UNSET,
+    ) -> dict[str, Any]:
+        result_payload = dict(item.result or {})
+        binding = dict(result_payload.get("downstream_binding") or {})
+        if state is not None:
+            binding["state"] = str(state).strip()
+        if attempts is not None:
+            binding["attempts"] = max(0, int(attempts))
+        if first_attempt_at is not _UNSET:
+            binding["first_attempt_at"] = _isoformat_or_none(first_attempt_at if isinstance(first_attempt_at, datetime) else None) if first_attempt_at is not None else None
+        if last_attempt_at is not _UNSET:
+            binding["last_attempt_at"] = _isoformat_or_none(last_attempt_at if isinstance(last_attempt_at, datetime) else None) if last_attempt_at is not None else None
+        if next_retry_at is not _UNSET:
+            binding["next_retry_at"] = _isoformat_or_none(next_retry_at if isinstance(next_retry_at, datetime) else None) if next_retry_at is not None else None
+        if last_error is not _UNSET:
+            binding["last_error"] = str(last_error).strip() or None if last_error is not None else None
+        if last_error_type is not _UNSET:
+            binding["last_error_type"] = str(last_error_type).strip() or None if last_error_type is not None else None
+        if recoverable is not _UNSET:
+            binding["recoverable"] = bool(recoverable) if recoverable is not None else None
+        if message is not _UNSET:
+            binding["message"] = str(message).strip() or None if message is not None else None
+        result_payload["downstream_binding"] = binding
+        item.result = result_payload
+        return binding
+
+    def _downstream_binding_state(self, item: BinarySecurityStageItem) -> str:
+        binding = self._downstream_binding_snapshot(item)
+        task_id = str(item.downstream_task_id or "").strip()
+        downstream_status = self._string_or_none(binding.get("downstream_status")) or self._string_or_none(dict(item.result or {}).get("downstream_status"))
+        explicit = self._string_or_none(binding.get("state"))
+        if task_id:
+            return "bound" if downstream_status else "created_pending_sync"
+        if explicit:
+            return explicit
+        return "not_started"
+
+    def _downstream_binding_attempts(self, item: BinarySecurityStageItem) -> int:
+        binding = self._downstream_binding_snapshot(item)
+        try:
+            return max(0, int(binding.get("attempts") or 0))
+        except Exception:
+            return 0
+
+    def _downstream_binding_time(self, item: BinarySecurityStageItem, key: str) -> datetime | None:
+        binding = self._downstream_binding_snapshot(item)
+        return self._parse_comparable_datetime(binding.get(key))
+
+    def _downstream_binding_retry_after(self, attempts: int) -> int:
+        index = max(0, attempts - 1)
+        if index >= len(DOWNSTREAM_CREATE_RETRY_BACKOFF_SECONDS):
+            return DOWNSTREAM_CREATE_RETRY_BACKOFF_SECONDS[-1]
+        return DOWNSTREAM_CREATE_RETRY_BACKOFF_SECONDS[index]
+
+    def _item_needs_downstream_binding_reconcile(self, item: BinarySecurityStageItem) -> bool:
+        if str(item.downstream_service or "").strip() != "dataflow_vuln_scanner":
+            return False
+        if str(item.downstream_task_id or "").strip():
+            return False
+        if str(item.stage_name or "").strip() != "vuln_scan":
+            return False
+        item_status = str(item.status or "").strip().lower()
+        if item_status not in {"pending", "queued", "running", "dispatching"}:
+            return False
+        binding_state = self._downstream_binding_state(item)
+        if binding_state in {"creating", "create_retrying", "create_failed"}:
+            return True
+        sync_status = self._stage_item_sync_status_value(item)
+        return sync_status == "transport_error"
 
     def _preserve_child_result_metadata(self, result: dict[str, Any] | None) -> dict[str, Any]:
         current_result = dict(result or {})
@@ -13852,7 +14235,24 @@ class TaskManager:
             db.close()
 
     def _stage_counts(self, db: Session, stage_run: BinarySecurityStageRun) -> dict[str, int]:
-        items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.stage_run_id == stage_run.id).all()
+        raw_items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.stage_run_id == stage_run.id).all()
+        items: list[BinarySecurityStageItem] = []
+        seen_item_ids: set[str] = set()
+        seen_identity_keys: set[str] = set()
+        for item in raw_items:
+            item_id = str(item.id or "").strip()
+            if item_id and item_id in seen_item_ids:
+                continue
+            identity_key = str(getattr(item, "item_identity_key", "") or "").strip()
+            if not identity_key:
+                identity_key = self._stage_item_identity(item.item_key, item.parent_key)
+            if identity_key and identity_key in seen_identity_keys:
+                continue
+            if item_id:
+                seen_item_ids.add(item_id)
+            if identity_key:
+                seen_identity_keys.add(identity_key)
+            items.append(item)
         counts = {
             "total_items": len(items),
             "success_items": 0,
@@ -15705,6 +16105,8 @@ class TaskManager:
                 parsed_last_synced_at = datetime.fromisoformat(last_synced_at)
             except ValueError:
                 parsed_last_synced_at = None
+        binding = self._downstream_binding_snapshot(item)
+        binding_state = self._downstream_binding_state(item)
         return BinarySecurityStageItemResponse(
             id=item.id,
             stage_name=item.stage_name,
@@ -15718,6 +16120,14 @@ class TaskManager:
             downstream_service=item.downstream_service,
             downstream_task_id=item.downstream_task_id,
             downstream_status=downstream_status,
+            downstream_binding_state=binding_state,
+            downstream_create_attempts=max(0, int(binding.get("attempts") or 0)),
+            downstream_create_last_attempt_at=self._parse_comparable_datetime(binding.get("last_attempt_at")),
+            downstream_create_next_retry_at=self._parse_comparable_datetime(binding.get("next_retry_at")),
+            downstream_create_last_error=self._string_or_none(binding.get("last_error")),
+            downstream_create_last_error_type=self._string_or_none(binding.get("last_error_type")),
+            downstream_create_recoverable=self._bool_or_none(binding.get("recoverable")),
+            downstream_binding_message=self._string_or_none(binding.get("message")) or self._downstream_binding_status_message(item),
             downstream_cancel_phase=self._string_or_none(downstream_payload.get("cancel_phase")),
             downstream_summary=self._stage_item_downstream_summary(item, result=result),
             input_ref=item.input_ref,
@@ -16794,6 +17204,24 @@ class TaskManager:
         if not stage_run:
             return
         items = self._stage_items(db, task.id, stage_name)
+        deduped_items: list[BinarySecurityStageItem] = []
+        seen_item_ids: set[str] = set()
+        seen_identity_keys: set[str] = set()
+        for item in items:
+            item_id = str(item.id or "").strip()
+            if item_id and item_id in seen_item_ids:
+                continue
+            identity_key = str(getattr(item, "item_identity_key", "") or "").strip()
+            if not identity_key:
+                identity_key = self._stage_item_identity(item.item_key, item.parent_key)
+            if identity_key and identity_key in seen_identity_keys:
+                continue
+            if item_id:
+                seen_item_ids.add(item_id)
+            if identity_key:
+                seen_identity_keys.add(identity_key)
+            deduped_items.append(item)
+        items = deduped_items
         if items:
             status = self._aggregate_item_statuses([item.status for item in items])
         else:
@@ -17196,6 +17624,21 @@ class TaskManager:
                     stage_name=next_stage,
                 )
                 self._enqueue_task(task.id)
+            return
+        if (
+            not next_stage
+            and vuln_run is not None
+            and str(vuln_run.status or "").strip() in {"success", "partial_success"}
+            and str(task.status or "").strip() == "pending"
+            and current_status in {"pending", "dispatching", "running"}
+        ):
+            self._record_event(
+                db,
+                task,
+                "task_requeued_after_downstream_sync",
+                "下游状态同步完成，任务已回到待调度状态",
+                stage_name=str(vuln_run.stage_name or "").strip() or task.current_stage,
+            )
             return
         if failed_stage_run is not None and not stage_retry_mode and not task_retry_mode and not next_stage:
             task.status = "failed"
@@ -17891,7 +18334,29 @@ class TaskManager:
                     return {"outcome": "already_running", "payload": payload}
                 if normalized_status in {"running", "dispatching"} and payload and mapped == "pending":
                     return {"outcome": "already_running", "payload": payload}
+                if (
+                    stage_name == "vuln_scan"
+                    and normalized_status in {"failed", "cancelled", "downstream_missing"}
+                    and (payload is None or mapped in {None, "success", "partial_success", "failed", "cancelled", "downstream_missing"})
+                ):
+                    return {
+                        "outcome": "already_terminal",
+                        "payload": payload or {
+                            "task_id": str(item.downstream_task_id or "").strip(),
+                            "status": mapped or normalized_status,
+                        },
+                        "retry_outcome": "already_terminal",
+                    }
             if normalized_status not in {"running", "dispatching"}:
+                if stage_name == "vuln_scan" and normalized_status in {"failed", "cancelled", "downstream_missing"}:
+                    return {
+                        "outcome": "already_terminal",
+                        "payload": {
+                            "task_id": str(item.downstream_task_id or "").strip(),
+                            "status": normalized_status,
+                        },
+                        "retry_outcome": "already_terminal",
+                    }
                 try:
                     payload = await self._invoke_existing_downstream_retry(
                         stage_name,
@@ -18056,6 +18521,13 @@ class TaskManager:
         response_item: dict[str, Any],
     ) -> dict[str, Any]:
         has_downstream_ref = bool(str(item.downstream_task_id or "").strip())
+        if str(item.stage_name or "").strip() == "vuln_scan" and not has_downstream_ref:
+            self._mark_downstream_binding_retry(
+                item,
+                error_message=str(exc),
+                error_type=self._classify_downstream_sync_error(exc),
+                recoverable=True,
+            )
         replacement_state = self._replacement_in_progress_state(item)
         deferred_mode = "reconcile" if has_downstream_ref else "redispatch"
         if replacement_state["replacement_in_progress"] and replacement_state["binding_cleared"] and not has_downstream_ref:
@@ -18113,6 +18585,9 @@ class TaskManager:
                 "state_applied": False,
                 "deferred_mode": deferred_mode,
                 "item_status": item.status,
+                "binding_state": self._downstream_binding_state(item),
+                "binding_attempts": self._downstream_binding_attempts(item),
+                "binding_next_retry_at": _isoformat_or_none(self._downstream_binding_time(item, "next_retry_at")),
             },
         )
         session.commit()
@@ -20380,8 +20855,13 @@ class TaskManager:
             active_payload = await self._active_downstream_payload(task, item, token)
             retry_strategy = None
             retry_strategy_status = None
+            force_recreate_vuln_child = False
             if retrying:
                 retry_strategy, retry_strategy_status = self._classify_retry_downstream_strategy(item, active_payload=active_payload)
+                force_recreate_vuln_child = (
+                    str(stage_run.stage_name or "").strip() == "vuln_scan"
+                    and retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL
+                )
                 action_snapshot = await self._prepare_retry_child_for_reuse_or_recreate(
                     session,
                     task,
@@ -22439,8 +22919,13 @@ class TaskManager:
             active_payload = await self._active_downstream_payload(task, item, token)
             retry_strategy = None
             retry_strategy_status = None
+            force_recreate_vuln_child = False
             if retrying:
                 retry_strategy, retry_strategy_status = self._classify_retry_downstream_strategy(item, active_payload=active_payload)
+                force_recreate_vuln_child = (
+                    str(stage_run.stage_name or "").strip() == "vuln_scan"
+                    and retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL
+                )
                 action_snapshot = await self._prepare_retry_child_for_reuse_or_recreate(
                     session,
                     task,
@@ -23209,8 +23694,13 @@ class TaskManager:
             active_payload = await self._active_downstream_payload(task, item, token)
             retry_strategy = None
             retry_strategy_status = None
+            force_recreate_vuln_child = False
             if retrying:
                 retry_strategy, retry_strategy_status = self._classify_retry_downstream_strategy(item, active_payload=active_payload)
+                force_recreate_vuln_child = (
+                    str(stage_run.stage_name or "").strip() == "vuln_scan"
+                    and retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL
+                )
                 action_snapshot = await self._prepare_retry_child_for_reuse_or_recreate(
                     session,
                     task,
@@ -23602,8 +24092,28 @@ class TaskManager:
             active_payload = await self._active_downstream_payload(task, item, token)
             retry_strategy = None
             retry_strategy_status = None
+            force_recreate_vuln_child = False
+            original_item_status = self._map_downstream_status(str(item.status or "")) or (str(item.status or "").strip().lower() or None)
             if retrying:
                 retry_strategy, retry_strategy_status = self._classify_retry_downstream_strategy(item, active_payload=active_payload)
+                if (
+                    stage_run.stage_name == "vuln_scan"
+                    and active_payload is None
+                    and str(item.downstream_task_id or "").strip()
+                ):
+                    normalized_current_status = (
+                        original_item_status
+                        or self._latest_observed_downstream_status(item)
+                        or self._map_downstream_status(str(item.status or ""))
+                        or (str(item.status or "").strip().lower() or None)
+                    )
+                    if normalized_current_status in RETRY_CHILD_ABNORMAL_STATUSES:
+                        retry_strategy = RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL
+                        retry_strategy_status = normalized_current_status
+                force_recreate_vuln_child = (
+                    stage_run.stage_name == "vuln_scan"
+                    and retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL
+                )
                 action_snapshot = await self._prepare_retry_child_for_reuse_or_recreate(
                     session,
                     task,
@@ -23614,11 +24124,92 @@ class TaskManager:
                 )
                 self._store_retry_item_action(task, action_snapshot)
                 session.commit()
-                if retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
+                if force_recreate_vuln_child:
                     active_payload = None
+                    created = await self._recreate_vuln_downstream_task(
+                        session,
+                        task,
+                        item,
+                        dataflow_result,
+                        token,
+                        control={
+                            "outcome": "already_terminal",
+                            "error_message": str(item.error_message or "") or None,
+                        },
+                    )
+                    if created is not None:
+                        item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+                        item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
+                        self._mark_downstream_binding_created(item, message="下游已创建，状态待同步")
+                        self._record_downstream_item_disposition(
+                            session,
+                            task,
+                            item,
+                            event_type="retry_item_new_child_created",
+                            message="已创建新的下游子任务",
+                            payload={
+                                "stage_name": item.stage_name,
+                                "item_id": item.id,
+                                "item_key": item.item_key,
+                                "old_downstream_task_id": None,
+                                "new_downstream_task_id": item.downstream_task_id,
+                                "strategy": retry_strategy,
+                                "old_downstream_status": retry_strategy_status,
+                            },
+                        )
+                        session.commit()
+                        status, payload = await self._poll_until_terminal(
+                            lambda: self._downstream_fetch_item_payload(task, item, token or ""),
+                            success_statuses={"success", "succeeded", "completed"},
+                            failure_statuses={"failed", "cancelled"},
+                            task=task,
+                            item=item,
+                        )
+                        artifacts = await self._downstream_fetch_item_artifacts(item, token or "")
+                        archive_payload = {
+                            **payload,
+                            "artifacts": artifacts,
+                            "workspace_root": artifacts.get("workspace_root"),
+                        }
+                        mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "downstream_missing" if status == "downstream_missing" else "failed"
+                        item.status = mapped_status
+                        item.finished_at = _now()
+                        archived_dir, archive_job = await self._queue_archive_and_wait(
+                            session,
+                            task,
+                            item,
+                            payload=archive_payload,
+                            mapped_status=mapped_status,
+                            before_status="running",
+                        )
+                        if mapped_status != "success":
+                            item.error_message = payload.get("error") or payload.get("error_message")
+                            session.commit()
+                            return {"status": mapped_status, "error": item.error_message, "item": dataflow_result}
+                        if archived_dir is None:
+                            error = archive_job.error_message if archive_job is not None else "总任务产物归档失败"
+                            item.error_message = error
+                            session.commit()
+                            return {"status": "archive_blocked", "error": error, "item": dataflow_result, "archive_blocked": True}
+                        result = {
+                            **dataflow_result,
+                            "workspace_root": artifacts.get("workspace_root"),
+                            "artifact_files": artifacts.get("files", []),
+                            "downstream": self._lightweight_downstream_payload(payload),
+                            "artifacts": artifacts,
+                        }
+                        item.result = self._compact_result_for_storage(stage_run.stage_name, result)
+                        item.output_ref = {
+                            **(item.output_ref or {}),
+                            "workspace_root": artifacts.get("workspace_root"),
+                            "archive_root": str(archived_dir),
+                        }
+                        session.commit()
+                        return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
             if active_payload is not None:
                 item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
                 item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "pending"
+                self._mark_downstream_binding_created(item, message="下游已创建，状态待同步")
                 session.commit()
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, token or ""),
@@ -23634,6 +24225,7 @@ class TaskManager:
                     downstream_status = str(reusable_payload.get("status") or "").lower()
                     mapped_reusable_status = self._map_downstream_status(downstream_status)
                     item.downstream_task_id = reusable_payload.get("task_id") or reusable_payload.get("id") or item.downstream_task_id
+                    self._mark_downstream_binding_created(item, message="下游已创建，状态待同步")
                     await self._cleanup_duplicate_downstream_refs_for_item(
                         session,
                         task,
@@ -23655,7 +24247,7 @@ class TaskManager:
                         payload = dict(reusable_payload)
                         status = self._status_from_downstream_payload(payload, success_statuses={"success", "succeeded", "completed"})
                     created = None
-                elif retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
+                elif retrying and not force_recreate_vuln_child and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
                     control = await self._downstream_control_existing_task(
                         session,
                         stage_name=stage_run.stage_name,
@@ -23737,6 +24329,8 @@ class TaskManager:
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
+                    self._mark_downstream_binding_creating(item)
+                    session.commit()
                     dataflow_input_dir = self._resolve_vuln_scan_dataflow_input_dir(dataflow_result)
                     source_dir = str(dataflow_result.get("source_root_path") or dataflow_result.get("source_dir") or "")
                     if not dataflow_input_dir:
@@ -23759,6 +24353,7 @@ class TaskManager:
             if created is not None:
                 item.downstream_task_id = created.get("task_id") or item.downstream_task_id
                 item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
+                self._mark_downstream_binding_created(item, message="下游已创建，状态待同步")
                 self._record_downstream_item_disposition(
                     session,
                     task,

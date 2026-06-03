@@ -175,6 +175,7 @@ class ScanTaskCreateRequest(BaseModel):
     parent_stage_name: Optional[str] = None
     parent_stage_item_id: Optional[str] = None
     parent_stage_item_key: Optional[str] = None
+    create_dedupe_key: Optional[str] = None
     auto_report_vulnerabilities: bool = True
 
     @model_validator(mode="after")

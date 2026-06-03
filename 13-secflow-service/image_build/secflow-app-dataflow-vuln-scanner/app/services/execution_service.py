@@ -5167,6 +5167,29 @@ class ExecutionService:
         extra_task_metadata: dict[str, Any] | None = None,
     ) -> ScanTaskResponse:
         self._ensure_project_access(principal, payload.project_id)
+        normalized_origin = str(payload.task_origin_type or "").strip() or "manual"
+        normalized_parent_task_id = str(payload.parent_task_id or "").strip() or None
+        normalized_parent_stage_item_id = str(payload.parent_stage_item_id or "").strip() or None
+        normalized_create_dedupe_key = str(payload.create_dedupe_key or "").strip() or None
+        if normalized_origin == "binary_security" and normalized_parent_task_id and normalized_parent_stage_item_id:
+            existing_query = (
+                db.query(TriggerTask)
+                .filter(
+                    TriggerTask.project_id == payload.project_id,
+                    TriggerTask.task_origin_type == "binary_security",
+                    TriggerTask.parent_task_id == normalized_parent_task_id,
+                    TriggerTask.parent_stage_name == payload.parent_stage_name,
+                    TriggerTask.parent_stage_item_id == normalized_parent_stage_item_id,
+                )
+                .order_by(TriggerTask.created_at.desc(), TriggerTask.id.desc())
+            )
+            existing = existing_query.first()
+            if existing is not None:
+                existing_metadata = self._trigger_task_metadata(existing)
+                existing_dedupe = str(existing_metadata.get("create_dedupe_key") or "").strip() or None
+                if normalized_create_dedupe_key is None or existing_dedupe == normalized_create_dedupe_key or existing_dedupe is None:
+                    return self._scan_task_response(db, existing)
+
         workflow_service = get_workflow_service()
         definition = (
             workflow_service.get_or_create_default_profile_model(db, payload.project_id, principal)
@@ -5213,13 +5236,14 @@ class ExecutionService:
                 for agent_id, item in (payload.agent_state_roots or {}).items()
             },
             "task_title": requested_title,
-            "task_origin_type": str(payload.task_origin_type or "").strip() or "manual",
+            "task_origin_type": normalized_origin,
             "parent_project_id": payload.parent_project_id,
-            "parent_task_id": payload.parent_task_id,
+            "parent_task_id": normalized_parent_task_id,
             "parent_task_type": payload.parent_task_type,
             "parent_stage_name": payload.parent_stage_name,
-            "parent_stage_item_id": payload.parent_stage_item_id,
+            "parent_stage_item_id": normalized_parent_stage_item_id,
             "parent_stage_item_key": payload.parent_stage_item_key,
+            "create_dedupe_key": normalized_create_dedupe_key,
             "auto_report_vulnerabilities": bool(payload.auto_report_vulnerabilities),
         }
         if extra_task_metadata:
@@ -5283,13 +5307,13 @@ class ExecutionService:
                 actor=actor,
                 authorization_token=authorization_token,
             )
-            trigger.task_origin_type = str(payload.task_origin_type or "").strip() or "manual"
+            trigger.task_origin_type = normalized_origin
             trigger.task_purpose = self._normalize_task_purpose(payload.task_purpose)
             trigger.parent_project_id = payload.parent_project_id
-            trigger.parent_task_id = payload.parent_task_id
+            trigger.parent_task_id = normalized_parent_task_id
             trigger.parent_task_type = payload.parent_task_type
             trigger.parent_stage_name = payload.parent_stage_name
-            trigger.parent_stage_item_id = payload.parent_stage_item_id
+            trigger.parent_stage_item_id = normalized_parent_stage_item_id
             trigger.parent_stage_item_key = payload.parent_stage_item_key
         db.commit()
         db.refresh(trigger)
@@ -5409,6 +5433,7 @@ class ExecutionService:
         profile_id: str | None = None,
         mode: str | None = None,
         parent_task_id: str | None = None,
+        parent_stage_item_id: str | None = None,
         sort_by: str | None = None,
         sort_order: str | None = None,
     ):
@@ -5442,6 +5467,9 @@ class ExecutionService:
         normalized_parent_task_id = str(parent_task_id or "").strip()
         if normalized_parent_task_id:
             query = query.filter(TriggerTask.parent_task_id == normalized_parent_task_id)
+        normalized_parent_stage_item_id = str(parent_stage_item_id or "").strip()
+        if normalized_parent_stage_item_id:
+            query = query.filter(TriggerTask.parent_stage_item_id == normalized_parent_stage_item_id)
         sort_column = _TASK_LIST_SORT_COLUMNS.get(str(sort_by or "").strip(), TriggerTask.created_at)
         order_expr = sort_column.asc() if str(sort_order or "").lower() == "asc" else sort_column.desc()
         return query.order_by(order_expr, TriggerTask.id.desc())
@@ -5765,6 +5793,7 @@ class ExecutionService:
         per_page: int | None = None,
         mode: str | None = None,
         parent_task_id: str | None = None,
+        parent_stage_item_id: str | None = None,
         sort_by: str | None = None,
         sort_order: str | None = None,
     ) -> ScanTaskListResponse:
@@ -5782,6 +5811,7 @@ class ExecutionService:
             model=model,
             mode=mode,
             parent_task_id=parent_task_id,
+            parent_stage_item_id=parent_stage_item_id,
             sort_by=sort_by,
             sort_order=sort_order,
         )
@@ -5825,6 +5855,7 @@ class ExecutionService:
         model: str | None = None,
         mode: str | None = None,
         parent_task_id: str | None = None,
+        parent_stage_item_id: str | None = None,
     ) -> ScanTaskStatsResponse:
         request_started = time.perf_counter()
         projection_backfill_enqueued = self.enqueue_projection_repair(principal, project_id=project_id)
@@ -5840,6 +5871,7 @@ class ExecutionService:
             model=model,
             mode=mode,
             parent_task_id=parent_task_id,
+            parent_stage_item_id=parent_stage_item_id,
             sort_by="created_at",
             sort_order="desc",
         )

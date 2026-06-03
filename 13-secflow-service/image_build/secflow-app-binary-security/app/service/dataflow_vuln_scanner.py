@@ -38,6 +38,7 @@ class DataflowVulnScannerClient(JsonHttpClient):
         # /data/files/<project>/app/secflow-app-dataflow-vuln-scanner.  Do not
         # pass absolute workspace/output refs; send project-scoped input refs so
         # allow_absolute_input_refs can remain disabled.
+        origin_payload = dict(origin or {})
         return await self.post(
             f"{self.API_PREFIX}/tasks",
             token=token,
@@ -46,7 +47,7 @@ class DataflowVulnScannerClient(JsonHttpClient):
                 "title": title,
                 "data_flow": self._project_filesystem_ref(project_id, data_flow_path),
                 "source_dir": self._project_filesystem_ref(project_id, source_dir),
-                **(origin or {}),
+                **origin_payload,
             },
         )
 
@@ -61,6 +62,8 @@ class DataflowVulnScannerClient(JsonHttpClient):
         limit: int = 100,
         offset: int = 0,
         status: str | None = None,
+        parent_task_id: str | None = None,
+        parent_stage_item_id: str | None = None,
     ) -> list[dict]:
         params: dict[str, Any] = {
             "project_id": project_id,
@@ -69,6 +72,10 @@ class DataflowVulnScannerClient(JsonHttpClient):
         }
         if status:
             params["status"] = status
+        if parent_task_id:
+            params["parent_task_id"] = parent_task_id
+        if parent_stage_item_id:
+            params["parent_stage_item_id"] = parent_stage_item_id
         return await self.get(f"{self.API_PREFIX}/tasks", token=token, params=params)
 
     async def get_artifacts(self, task_id: str, token: str) -> dict:

@@ -159,6 +159,8 @@ class DownstreamTaskGateway:
                 limit=int(kwargs.get("limit", 100) or 100),
                 offset=int(kwargs.get("offset", 0) or 0),
                 status=kwargs.get("status"),
+                parent_task_id=kwargs.get("parent_task_id"),
+                parent_stage_item_id=kwargs.get("parent_stage_item_id"),
             )
             if isinstance(rows, dict):
                 return rows
