@@ -33,6 +33,8 @@ spec:
           value: Asia/Shanghai
         - name: CONFIG_PATH
           value: /app/config.yaml
+        - name: SECFLOW_DATAFLOW_VULN_SCANNER_PROBE_PORT
+          value: "18080"
         - name: SECFLOW_DATAFLOW_ROLE
           value: api
         - name: PI_MODELS_JSON
@@ -138,6 +140,8 @@ spec:
           value: Asia/Shanghai
         - name: CONFIG_PATH
           value: /app/config.yaml
+        - name: SECFLOW_DATAFLOW_VULN_SCANNER_PROBE_PORT
+          value: "18080"
         - name: SECFLOW_DATAFLOW_ROLE
           value: manager
         - name: PI_MODELS_JSON
@@ -215,7 +219,7 @@ metadata:
   namespace: secflow-ns
 spec:
   serviceName: secflow-app-dataflow-vuln-scanner-worker-headless
-  replicas: 2
+  replicas: 4
   selector:
     matchLabels:
       app: secflow-app-dataflow-vuln-scanner
@@ -257,6 +261,8 @@ spec:
           value: Asia/Shanghai
         - name: CONFIG_PATH
           value: /app/config.yaml
+        - name: SECFLOW_DATAFLOW_VULN_SCANNER_PROBE_PORT
+          value: "18080"
         - name: SECFLOW_DATAFLOW_ROLE
           value: worker
         - name: PI_MODELS_JSON
