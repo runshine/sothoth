@@ -41,6 +41,10 @@ spec:
             value: "false"
           - name: DFA_ENABLE_REGISTRY
             value: "true"
+          - name: DFA_DB_RETRY_MAX_ATTEMPTS
+            value: "5"
+          - name: DFA_DB_RETRY_BASE_DELAY_SECONDS
+            value: "1"
         ports:
         - containerPort: 8080
         - containerPort: 18080

@@ -7,8 +7,10 @@ data:
   custom.cnf: |
     [mysqld]
     max_connections = 400
-    wait_timeout = 120
-    interactive_timeout = 120
+    wait_timeout = 3600
+    interactive_timeout = 3600
+    net_read_timeout = 120
+    net_write_timeout = 300
     max_connect_errors = 1000
 
     innodb_buffer_pool_size = 4G
