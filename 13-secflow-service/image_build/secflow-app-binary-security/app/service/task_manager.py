@@ -239,6 +239,19 @@ def _seconds_until(value: datetime | None) -> float | None:
     return min(candidates, key=lambda remaining: abs(remaining))
 
 
+def _runtime_health_status_rank(status: str) -> int:
+    normalized = str(status or "").strip().lower()
+    if normalized == "unhealthy":
+        return 4
+    if normalized == "degraded":
+        return 3
+    if normalized == "unknown":
+        return 2
+    if normalized == "idle":
+        return 1
+    return 0
+
+
 @dataclass
 class _ArchiveOutputResult:
     status: str
@@ -907,6 +920,22 @@ class StaleTaskExecution(RuntimeError):
     """Raised when a stale task worker observes that its dispatch token is no longer current."""
 
 
+@dataclass
+class DownstreamSyncSupervisorState:
+    consecutive_error_count: int = 0
+    budget_exhausted: bool = False
+    next_retry_at: datetime | None = None
+    last_result: str | None = None
+
+
+@dataclass
+class OrchestrationSupervisorState:
+    consecutive_error_count: int = 0
+    budget_exhausted: bool = False
+    next_retry_at: datetime | None = None
+    last_result: str | None = None
+
+
 class TaskManager:
     def __init__(self) -> None:
         # Isolate per-manager runtime config so local mutations do not leak
@@ -918,6 +947,9 @@ class TaskManager:
         self._archive_loop_task: Optional[asyncio.Task] = None
         self._downstream_reconcile_task: Optional[asyncio.Task] = None
         self._readless_reconcile_task: Optional[asyncio.Task] = None
+        self._stage_item_sync_reconcile_task: Optional[asyncio.Task] = None
+        self._archive_runtime_reconcile_task: Optional[asyncio.Task] = None
+        self._state_repair_reconcile_task: Optional[asyncio.Task] = None
         self._state_reducer_loop_task: Optional[asyncio.Task] = None
         self._reducer_metrics_snapshot_loop_task: Optional[asyncio.Task] = None
         self._task_heartbeat_loop_task: Optional[asyncio.Task] = None
@@ -939,6 +971,7 @@ class TaskManager:
         self._task_list_cache_lock = threading.Lock()
         self._loop_heartbeats: dict[str, datetime] = {}
         self._last_stale_operation_requeue_at: datetime | None = None
+        self._last_stage_item_sync_reconcile_at: datetime | None = None
 
     def _downstream_tasks(self):
         return get_downstream_task_controller(self)
@@ -965,6 +998,9 @@ class TaskManager:
             "archive_dispatch": max(1, int(getattr(self.cfg.scheduler, "poll_interval_seconds", 5) or 5)),
             "stage_item_dispatch": max(1, int(getattr(self.cfg.scheduler, "stage_poll_interval_seconds", 5) or 5)),
             "downstream_reconcile": max(1, int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30) or 30)),
+            "stage_item_sync_reconcile": self._stage_item_sync_reconcile_interval_seconds(),
+            "archive_runtime_reconcile": self._archive_runtime_reconcile_interval_seconds(),
+            "state_repair_reconcile": self._state_repair_reconcile_interval_seconds(),
             "readless_reconcile": max(1, int(getattr(self.cfg.scheduler, "readless_reconcile_interval_seconds", 300) or 300)),
             "state_reducer": max(1, int(getattr(self.cfg.scheduler, "poll_interval_seconds", 5) or 5)),
             "reducer_metrics_snapshot": max(5, int(getattr(self.cfg.scheduler, "poll_interval_seconds", 5) or 5)),
@@ -974,6 +1010,55 @@ class TaskManager:
 
     def _mark_loop_heartbeat(self, loop_name: str, *, now_value: datetime | None = None) -> None:
         self._loop_heartbeats[str(loop_name)] = now_value or _now()
+
+    def _stage_downstream_sync_max_consecutive_errors(self) -> int:
+        return max(1, int(getattr(self.cfg.scheduler, "stage_downstream_sync_max_consecutive_errors", 10) or 10))
+
+    def _stage_downstream_sync_backoff_base_seconds(self) -> int:
+        return max(1, int(getattr(self.cfg.scheduler, "stage_downstream_sync_backoff_base_seconds", 2) or 2))
+
+    def _stage_downstream_sync_backoff_max_seconds(self) -> int:
+        base = self._stage_downstream_sync_backoff_base_seconds()
+        configured = int(getattr(self.cfg.scheduler, "stage_downstream_sync_backoff_max_seconds", 60) or 60)
+        return max(base, configured)
+
+    def _stage_item_sync_stale_seconds(self) -> int:
+        configured = int(getattr(self.cfg.scheduler, "stage_item_sync_stale_seconds", 300) or 300)
+        return max(
+            30,
+            configured,
+            int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30) or 30) * 3,
+        )
+
+    def _stage_item_sync_reconcile_interval_seconds(self) -> int:
+        configured = int(getattr(self.cfg.scheduler, "stage_item_sync_reconcile_interval_seconds", 30) or 30)
+        return max(5, configured)
+
+    def _stage_item_sync_reconcile_batch_size(self) -> int:
+        return max(1, int(getattr(self.cfg.scheduler, "stage_item_sync_reconcile_batch_size", 100) or 100))
+
+    def _stage_orchestration_max_consecutive_errors(self) -> int:
+        return max(1, int(getattr(self.cfg.scheduler, "stage_orchestration_max_consecutive_errors", 10) or 10))
+
+    def _stage_orchestration_backoff_base_seconds(self) -> int:
+        return max(1, int(getattr(self.cfg.scheduler, "stage_orchestration_backoff_base_seconds", 2) or 2))
+
+    def _stage_orchestration_backoff_max_seconds(self) -> int:
+        base = self._stage_orchestration_backoff_base_seconds()
+        configured = int(getattr(self.cfg.scheduler, "stage_orchestration_backoff_max_seconds", 60) or 60)
+        return max(base, configured)
+
+    def _archive_runtime_reconcile_interval_seconds(self) -> int:
+        return max(5, int(getattr(self.cfg.scheduler, "archive_runtime_reconcile_interval_seconds", 30) or 30))
+
+    def _archive_runtime_stale_seconds(self) -> int:
+        return max(30, int(getattr(self.cfg.scheduler, "archive_runtime_stale_seconds", 300) or 300))
+
+    def _state_repair_reconcile_interval_seconds(self) -> int:
+        return max(5, int(getattr(self.cfg.scheduler, "state_repair_reconcile_interval_seconds", 30) or 30))
+
+    def _state_repair_reconcile_batch_size(self) -> int:
+        return max(1, int(getattr(self.cfg.scheduler, "state_repair_reconcile_batch_size", 100) or 100))
 
     def _recover_loop_db_error(self, loop_name: str, db: Session | None, exc: Exception) -> None:
         if db is not None:
@@ -1225,6 +1310,18 @@ class TaskManager:
                 self._readless_reconcile_loop(),
                 name="binary-security-readless-reconcile",
             )
+            self._stage_item_sync_reconcile_task = asyncio.create_task(
+                self._stage_item_sync_reconcile_loop(),
+                name="binary-security-stage-item-sync-reconcile",
+            )
+            self._archive_runtime_reconcile_task = asyncio.create_task(
+                self._archive_runtime_reconcile_loop(),
+                name="binary-security-archive-runtime-reconcile",
+            )
+            self._state_repair_reconcile_task = asyncio.create_task(
+                self._state_repair_reconcile_loop(),
+                name="binary-security-state-repair-reconcile",
+            )
             self._task_heartbeat_loop_task = asyncio.create_task(
                 self._task_heartbeat_loop(),
                 name="binary-security-task-heartbeat",
@@ -1277,6 +1374,24 @@ class TaskManager:
             self._readless_reconcile_task.cancel()
             try:
                 await self._readless_reconcile_task
+            except asyncio.CancelledError:
+                pass
+        if self._stage_item_sync_reconcile_task:
+            self._stage_item_sync_reconcile_task.cancel()
+            try:
+                await self._stage_item_sync_reconcile_task
+            except asyncio.CancelledError:
+                pass
+        if self._archive_runtime_reconcile_task:
+            self._archive_runtime_reconcile_task.cancel()
+            try:
+                await self._archive_runtime_reconcile_task
+            except asyncio.CancelledError:
+                pass
+        if self._state_repair_reconcile_task:
+            self._state_repair_reconcile_task.cancel()
+            try:
+                await self._state_repair_reconcile_task
             except asyncio.CancelledError:
                 pass
         if self._task_heartbeat_loop_task:
@@ -2133,6 +2248,7 @@ class TaskManager:
             overview_nodes=[],
             orchestration_observability={},
             cleanup_snapshot=dict(ctx.task.cleanup_snapshot or {}),
+            runtime_health=self._build_task_runtime_health(db, ctx.task, ctx=ctx),
         )
 
     def get_task_stage_items_page(
@@ -2375,6 +2491,470 @@ class TaskManager:
             never_synced_item_count=sync_times[6],
             stale_synced_item_count=sync_times[7],
         )
+
+    def _runtime_health_age_status(
+        self,
+        age_seconds: float | None,
+        *,
+        healthy_threshold_seconds: int,
+        degraded_threshold_seconds: int,
+    ) -> str:
+        if age_seconds is None:
+            return "unknown"
+        if age_seconds <= max(1, int(healthy_threshold_seconds)):
+            return "healthy"
+        if age_seconds <= max(healthy_threshold_seconds, int(degraded_threshold_seconds)):
+            return "degraded"
+        return "unhealthy"
+
+    def _runtime_health_summary_message(self, overall_status: str) -> str:
+        if overall_status == "healthy":
+            return "当前父任务相关线程/协程运行正常"
+        if overall_status == "degraded":
+            return "存在保活老化或轻微状态漂移，建议关注 owner/heartbeat"
+        if overall_status == "unhealthy":
+            return "存在任务相关运行单元异常，可能影响当前阶段推进或收口"
+        if overall_status in {"idle", "terminal"}:
+            return "当前任务没有需要持续运行的父任务级线程/协程"
+        return "当前无法可靠判断父任务相关线程/协程状态"
+
+    def _build_runtime_health_unit(
+        self,
+        *,
+        unit_key: str,
+        unit_label: str,
+        unit_kind: str,
+        status: str,
+        owner_instance_id: str | None = None,
+        started_at: datetime | None = None,
+        last_heartbeat_at: datetime | None = None,
+        detail: str | None = None,
+        reason: str | None = None,
+        evidence: list[tuple[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        rendered_evidence = []
+        for label, value in evidence or []:
+            if value is None:
+                continue
+            if isinstance(value, datetime):
+                rendered_value = _isoformat_or_none(value)
+            else:
+                rendered_value = str(value)
+            rendered_evidence.append({"label": label, "value": rendered_value})
+        reference_at = last_heartbeat_at or started_at
+        return {
+            "unit_key": unit_key,
+            "unit_label": unit_label,
+            "unit_kind": unit_kind,
+            "status": status,
+            "task_scoped": True,
+            "owner_instance_id": owner_instance_id,
+            "started_at": started_at,
+            "last_heartbeat_at": last_heartbeat_at,
+            "age_seconds": _elapsed_seconds_since(reference_at),
+            "detail": detail,
+            "reason": reason,
+            "evidence": rendered_evidence,
+        }
+
+    def _build_task_runtime_health(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        ctx: _TaskDetailContext | None = None,
+    ) -> dict[str, Any]:
+        task_status = str(task.status or "").strip().lower()
+        terminal_statuses = {"success", "partial_success", "failed", "cancelled", "downstream_missing"}
+        active_task_statuses = {"pending", "dispatching", "running"}
+        heartbeat_interval_seconds = max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 15) or 15))
+        operation_heartbeat_interval_seconds = max(5, int(getattr(self.cfg.scheduler, "operation_heartbeat_interval_seconds", 15) or 15))
+        worker_stale_seconds = max(heartbeat_interval_seconds * 3, int(getattr(self.cfg.scheduler, "worker_ready_loop_stale_seconds", 90) or 90))
+        sync_stale_seconds = max(60, int(getattr(self.cfg.scheduler, "stage_item_sync_stale_seconds", 300) or 300))
+        stage_items = list(ctx.stage_items) if ctx is not None else self._stage_items(db, task.id, task.current_stage or "")
+        last_successful_sync_at = ctx.last_successful_sync_at if ctx is not None else None
+        last_sync_attempt_at = ctx.last_sync_attempt_at if ctx is not None else None
+        last_sync_error_at = ctx.last_sync_error_at if ctx is not None else None
+        active_sync_error_item_count = int(ctx.active_sync_error_item_count or 0) if ctx is not None else 0
+        never_synced_item_count = int(ctx.never_synced_item_count or 0) if ctx is not None else 0
+        stale_synced_item_count = int(ctx.stale_synced_item_count or 0) if ctx is not None else 0
+        active_operation = self._active_operation(db, task.id)
+        lease_owner, lease_expires_at, lease_source = self._task_runtime_lease_view(db, task)
+        local_worker = self._workers.get(task.id)
+        local_worker_alive = bool(local_worker is not None and not local_worker.done())
+        last_task_heartbeat_at = self._last_task_heartbeat_at.get(task.id)
+        has_local_owner = self._has_local_task_execution_owner(task.id)
+        owner_count = self._task_execution_owner_count(task.id)
+        operation_lock_owner = str(task.operation_lock_owner or "").strip() or None
+        operation_lock_heartbeat_at = task.operation_lock_heartbeat_at
+        operation_lock_expires_at = task.operation_lock_expires_at
+        active_stage_items = [
+            item
+            for item in stage_items
+            if str(item.status or "").strip().lower() in {"pending", "queued", "dispatching", "running"}
+        ]
+        local_stage_worker_count = sum(
+            1
+            for item in active_stage_items
+            if (worker := self._stage_item_workers.get(str(item.id or ""))) is not None and not worker.done()
+        )
+        stage_worker_reference = max(
+            (
+                timestamp
+                for timestamp in (
+                    *[item.updated_at for item in active_stage_items if getattr(item, "updated_at", None) is not None],
+                    *[item.started_at for item in active_stage_items if getattr(item, "started_at", None) is not None],
+                )
+                if timestamp is not None
+            ),
+            default=None,
+        )
+        active_archive_jobs = (
+            db.query(BinarySecurityArchiveJob)
+            .filter(
+                BinarySecurityArchiveJob.task_id == task.id,
+                BinarySecurityArchiveJob.archive_status.in_(["pending", "running", "archived", "applying"]),
+            )
+            .all()
+        )
+        local_archive_jobs = [
+            job
+            for job in active_archive_jobs
+            if str(job.owner_id or "").strip() == self.instance_id
+        ]
+        latest_archive_heartbeat_at = max(
+            (job.updated_at or job.started_at for job in active_archive_jobs if (job.updated_at or job.started_at) is not None),
+            default=None,
+        )
+        archive_worker_alive = bool(local_archive_jobs) and any(not worker.done() for worker in self._archive_workers)
+        units: list[dict[str, Any]] = []
+
+        if task_status in active_task_statuses:
+            task_worker_status = "healthy" if (local_worker_alive and has_local_owner) else "degraded" if (local_worker_alive or has_local_owner or lease_expires_at) else "unhealthy"
+            if not local_worker_alive and not has_local_owner and lease_expires_at is None:
+                task_worker_status = "unhealthy"
+            units.append(
+                self._build_runtime_health_unit(
+                    unit_key="task_worker",
+                    unit_label="主任务执行协程",
+                    unit_kind="coroutine",
+                    status=task_worker_status,
+                    owner_instance_id=str(task.dispatcher_instance_id or "").strip() or lease_owner,
+                    started_at=task.started_at,
+                    last_heartbeat_at=last_task_heartbeat_at,
+                    detail="负责当前父任务阶段推进与调度衔接",
+                    reason=(
+                        "本地任务协程与执行 owner 正常存在"
+                        if task_worker_status == "healthy"
+                        else "主任务协程存在但 owner/lease 信号不完整"
+                        if task_worker_status == "degraded"
+                        else "任务处于活动态，但当前看不到稳定的本地执行协程或 owner"
+                    ),
+                    evidence=[
+                        ("local_worker_alive", local_worker_alive),
+                        ("local_owner_count", owner_count),
+                        ("lease_owner", lease_owner),
+                        ("lease_source", lease_source),
+                        ("lease_expires_at", lease_expires_at),
+                    ],
+                )
+            )
+        else:
+            units.append(
+                self._build_runtime_health_unit(
+                    unit_key="task_worker",
+                    unit_label="主任务执行协程",
+                    unit_kind="coroutine",
+                    status="done" if task_status in terminal_statuses else "idle",
+                    owner_instance_id=str(task.dispatcher_instance_id or "").strip() or None,
+                    started_at=task.started_at,
+                    last_heartbeat_at=last_task_heartbeat_at,
+                    detail="负责当前父任务阶段推进与调度衔接",
+                    reason="任务当前不要求持续持有主执行协程",
+                    evidence=[("task_status", task_status or "-")],
+                )
+            )
+
+        if active_stage_items:
+            stage_age_seconds = _elapsed_seconds_since(stage_worker_reference)
+            if local_stage_worker_count > 0:
+                stage_status = self._runtime_health_age_status(
+                    stage_age_seconds,
+                    healthy_threshold_seconds=heartbeat_interval_seconds * 2,
+                    degraded_threshold_seconds=worker_stale_seconds,
+                )
+            else:
+                stage_status = "unhealthy" if task_status in {"dispatching", "running"} else "degraded"
+            units.append(
+                self._build_runtime_health_unit(
+                    unit_key="stage_workers",
+                    unit_label="阶段子任务协程",
+                    unit_kind="coroutine",
+                    status=stage_status,
+                    owner_instance_id=self.instance_id if local_stage_worker_count > 0 else None,
+                    started_at=min((item.started_at for item in active_stage_items if item.started_at is not None), default=None),
+                    last_heartbeat_at=stage_worker_reference,
+                    detail=f"当前有 {len(active_stage_items)} 个活跃阶段子任务，{local_stage_worker_count} 个由本实例协程驱动",
+                    reason=(
+                        "阶段子任务协程活跃，最近状态刷新正常"
+                        if stage_status == "healthy"
+                        else "阶段子任务仍在推进，但最近活动已接近陈旧窗口"
+                        if stage_status == "degraded"
+                        else "存在活跃阶段子任务，但当前没有看到对应的本地协程驱动"
+                    ),
+                    evidence=[
+                        ("active_stage_items", len(active_stage_items)),
+                        ("local_stage_worker_count", local_stage_worker_count),
+                        ("current_stage", task.current_stage),
+                    ],
+                )
+            )
+        else:
+            units.append(
+                self._build_runtime_health_unit(
+                    unit_key="stage_workers",
+                    unit_label="阶段子任务协程",
+                    unit_kind="coroutine",
+                    status="done" if task_status in terminal_statuses else "idle",
+                    detail="当前没有需要父任务驱动的活跃阶段子任务",
+                    reason="阶段子任务协程当前未启用",
+                    evidence=[("current_stage", task.current_stage or "-")],
+                )
+            )
+
+        if active_archive_jobs:
+            archive_age_seconds = _elapsed_seconds_since(latest_archive_heartbeat_at)
+            archive_status = "healthy" if archive_worker_alive else self._runtime_health_age_status(
+                archive_age_seconds,
+                healthy_threshold_seconds=heartbeat_interval_seconds * 2,
+                degraded_threshold_seconds=worker_stale_seconds,
+            )
+            if archive_status == "healthy" and not local_archive_jobs:
+                archive_status = "degraded"
+            units.append(
+                self._build_runtime_health_unit(
+                    unit_key="archive_workers",
+                    unit_label="产物归档协程",
+                    unit_kind="archive",
+                    status=archive_status,
+                    owner_instance_id=self.instance_id if local_archive_jobs else (str(active_archive_jobs[0].owner_id or "").strip() or None),
+                    started_at=min((job.started_at for job in active_archive_jobs if job.started_at is not None), default=None),
+                    last_heartbeat_at=latest_archive_heartbeat_at,
+                    detail=f"当前有 {len(active_archive_jobs)} 个归档单元处于活跃链路",
+                    reason=(
+                        "归档协程与归档任务记录保持一致"
+                        if archive_status == "healthy"
+                        else "存在归档链路，但当前由其它实例持有或心跳接近陈旧"
+                        if archive_status == "degraded"
+                        else "归档任务仍处于活跃态，但当前缺少稳定的运行协程证据"
+                    ),
+                    evidence=[
+                        ("active_archive_jobs", len(active_archive_jobs)),
+                        ("local_archive_jobs", len(local_archive_jobs)),
+                    ],
+                )
+            )
+        else:
+            units.append(
+                self._build_runtime_health_unit(
+                    unit_key="archive_workers",
+                    unit_label="产物归档协程",
+                    unit_kind="archive",
+                    status="done" if task_status in terminal_statuses else "idle",
+                    detail="当前没有活跃的归档收口任务",
+                    reason="归档协程当前未启用",
+                )
+            )
+
+        if active_operation is not None or operation_lock_owner or operation_lock_expires_at:
+            operation_heartbeat = (active_operation.heartbeat_at if active_operation is not None else None) or operation_lock_heartbeat_at
+            operation_age_status = self._runtime_health_age_status(
+                _elapsed_seconds_since(operation_heartbeat),
+                healthy_threshold_seconds=operation_heartbeat_interval_seconds * 2,
+                degraded_threshold_seconds=max(operation_heartbeat_interval_seconds * 4, worker_stale_seconds),
+            )
+            local_operation_alive = bool(
+                active_operation is not None
+                and str(active_operation.owner_instance_id or "").strip() == self.instance_id
+                and (worker := self._operation_workers.get(str(active_operation.id or ""))) is not None
+                and not worker.done()
+            )
+            operation_status = operation_age_status
+            if local_operation_alive and operation_status == "unknown":
+                operation_status = "healthy"
+            if active_operation is None and operation_lock_owner and operation_status != "healthy":
+                operation_status = "degraded"
+            units.append(
+                self._build_runtime_health_unit(
+                    unit_key="task_operation",
+                    unit_label="任务操作协程 / 锁",
+                    unit_kind="operation",
+                    status=operation_status,
+                    owner_instance_id=(
+                        str(active_operation.owner_instance_id or "").strip()
+                        if active_operation is not None
+                        else operation_lock_owner
+                    ) or None,
+                    started_at=active_operation.started_at if active_operation is not None else None,
+                    last_heartbeat_at=operation_heartbeat,
+                    detail=(
+                        f"当前操作类型：{active_operation.operation_type}"
+                        if active_operation is not None
+                        else "当前存在任务级 operation lock"
+                    ),
+                    reason=(
+                        "任务级操作协程和锁状态正常"
+                        if operation_status == "healthy"
+                        else "当前仍有操作中的锁或 worker，但心跳已有老化"
+                        if operation_status == "degraded"
+                        else "任务级操作存在明显的锁/心跳漂移"
+                    ),
+                    evidence=[
+                        ("operation_type", active_operation.operation_type if active_operation is not None else None),
+                        ("operation_status", active_operation.status if active_operation is not None else None),
+                        ("operation_lock_owner", operation_lock_owner),
+                        ("operation_lock_expires_at", operation_lock_expires_at),
+                    ],
+                )
+            )
+        else:
+            units.append(
+                self._build_runtime_health_unit(
+                    unit_key="task_operation",
+                    unit_label="任务操作协程 / 锁",
+                    unit_kind="operation",
+                    status="done" if task_status in terminal_statuses else "idle",
+                    detail="当前没有活跃的手工操作或任务级 operation lock",
+                    reason="任务操作协程当前未启用",
+                )
+            )
+
+        if task_status in active_task_statuses or has_local_owner or lease_expires_at is not None:
+            heartbeat_status = self._runtime_health_age_status(
+                _elapsed_seconds_since(last_task_heartbeat_at),
+                healthy_threshold_seconds=heartbeat_interval_seconds * 2,
+                degraded_threshold_seconds=max(worker_stale_seconds, heartbeat_interval_seconds * 4),
+            )
+            if last_task_heartbeat_at is None and lease_expires_at is not None:
+                heartbeat_status = "degraded" if _seconds_until(lease_expires_at) and _seconds_until(lease_expires_at) > 0 else "unhealthy"
+            units.append(
+                self._build_runtime_health_unit(
+                    unit_key="task_heartbeat",
+                    unit_label="任务保活单元",
+                    unit_kind="task_owner",
+                    status=heartbeat_status,
+                    owner_instance_id=lease_owner,
+                    started_at=task.started_at,
+                    last_heartbeat_at=last_task_heartbeat_at,
+                    detail="维护任务级 lease 与保活心跳",
+                    reason=(
+                        "心跳与 lease 都在有效窗口内"
+                        if heartbeat_status == "healthy"
+                        else "当前仍有 lease/owner 证据，但心跳已接近阈值"
+                        if heartbeat_status == "degraded"
+                        else "任务保活信号已经明显老化或缺失"
+                    ),
+                    evidence=[
+                        ("lease_owner", lease_owner),
+                        ("lease_source", lease_source),
+                        ("lease_expires_at", lease_expires_at),
+                        ("local_owner_count", owner_count),
+                    ],
+                )
+            )
+        else:
+            units.append(
+                self._build_runtime_health_unit(
+                    unit_key="task_heartbeat",
+                    unit_label="任务保活单元",
+                    unit_kind="task_owner",
+                    status="done" if task_status in terminal_statuses else "idle",
+                    detail="当前没有需要持续保活的任务级 lease",
+                    reason="任务保活单元当前未启用",
+                )
+            )
+
+        if task.current_stage in {"entry_analysis", "dataflow_analysis", "vuln_scan"} or last_sync_attempt_at or last_successful_sync_at or active_sync_error_item_count > 0:
+            sync_age_reference = last_successful_sync_at or last_sync_attempt_at
+            if active_sync_error_item_count > 0 and task_status in active_task_statuses:
+                sync_status = "degraded"
+            else:
+                sync_status = self._runtime_health_age_status(
+                    _elapsed_seconds_since(sync_age_reference),
+                    healthy_threshold_seconds=max(30, sync_stale_seconds // 3),
+                    degraded_threshold_seconds=sync_stale_seconds,
+                )
+            if sync_age_reference is None and never_synced_item_count > 0:
+                sync_status = "degraded"
+            units.append(
+                self._build_runtime_health_unit(
+                    unit_key="downstream_sync",
+                    unit_label="下游同步/收口协程",
+                    unit_kind="sync",
+                    status=sync_status,
+                    owner_instance_id=str(task.dispatcher_instance_id or "").strip() or lease_owner,
+                    started_at=task.started_at,
+                    last_heartbeat_at=sync_age_reference,
+                    detail="负责父任务对子任务状态的同步与收口观察",
+                    reason=(
+                        "最近一次下游同步仍在新鲜窗口内"
+                        if sync_status == "healthy"
+                        else "存在同步错误、未同步项或同步时间接近陈旧窗口"
+                        if sync_status == "degraded"
+                        else "下游同步长时间没有新鲜进展"
+                    ),
+                    evidence=[
+                        ("last_successful_sync_at", last_successful_sync_at),
+                        ("last_sync_attempt_at", last_sync_attempt_at),
+                        ("last_sync_error_at", last_sync_error_at),
+                        ("active_sync_error_item_count", active_sync_error_item_count),
+                        ("never_synced_item_count", never_synced_item_count),
+                        ("stale_synced_item_count", stale_synced_item_count),
+                    ],
+                )
+            )
+        else:
+            units.append(
+                self._build_runtime_health_unit(
+                    unit_key="downstream_sync",
+                    unit_label="下游同步/收口协程",
+                    unit_kind="sync",
+                    status="done" if task_status in terminal_statuses else "idle",
+                    detail="当前阶段不要求父任务持续执行下游同步收口",
+                    reason="下游同步单元当前未启用",
+                )
+            )
+
+        healthy_unit_count = sum(1 for unit in units if unit["status"] == "healthy")
+        degraded_unit_count = sum(1 for unit in units if unit["status"] == "degraded")
+        unhealthy_unit_count = sum(1 for unit in units if unit["status"] == "unhealthy")
+        active_unit_count = sum(1 for unit in units if unit["status"] in {"healthy", "degraded", "unhealthy"})
+        overall_status = "idle"
+        if unhealthy_unit_count > 0:
+            overall_status = "unhealthy"
+        elif degraded_unit_count > 0:
+            overall_status = "degraded"
+        elif healthy_unit_count > 0:
+            overall_status = "healthy"
+        elif task_status in terminal_statuses:
+            overall_status = "terminal"
+        elif any(unit["status"] == "unknown" for unit in units):
+            overall_status = "unknown"
+        elif any(unit["status"] == "idle" for unit in units):
+            overall_status = "idle"
+        units.sort(key=lambda unit: (_runtime_health_status_rank(unit["status"]), unit["unit_label"]), reverse=True)
+        return {
+            "summary": {
+                "overall_status": overall_status,
+                "active_unit_count": active_unit_count,
+                "healthy_unit_count": healthy_unit_count,
+                "degraded_unit_count": degraded_unit_count,
+                "unhealthy_unit_count": unhealthy_unit_count,
+                "last_updated_at": _now(),
+                "message": self._runtime_health_summary_message(overall_status),
+            },
+            "units": units,
+        }
 
     def _archive_job_responses(
         self,
@@ -5323,6 +5903,7 @@ class TaskManager:
                         continue
                     if mapped_status not in ARCHIVE_SUCCESS_MAPPED_STATUSES:
                         error_message = observed_error_message
+                        recovered_after_errors = self._stage_item_sync_consecutive_error_count(item) > 0
                         should_apply = observed_apply_state and (mapped_status != before_status or force)
                         if should_apply:
                             if not self._apply_child_state_with_savepoint(
@@ -5391,6 +5972,16 @@ class TaskManager:
                                 failed_count += 1
                                 continue
                             skipped_count += 1
+                        if recovered_after_errors:
+                            self._record_event(
+                                db,
+                                task,
+                                "downstream_poll_recovered_after_errors",
+                                "下游状态同步已从异常中恢复",
+                                stage_name=item.stage_name,
+                                item=item,
+                                payload={"downstream_status": downstream_status},
+                            )
                         if force or mapped_status != before_status or record_noop_events or not apply_state:
                             self._record_event(
                                 db,
@@ -5789,41 +6380,64 @@ class TaskManager:
                     )
                     if repair_applied:
                         touched_stages.add(item.stage_name)
-                if not self._persist_child_sync_observation(
+                if repair_applied:
+                    state = DownstreamSyncSupervisorState(
+                        consecutive_error_count=0,
+                        budget_exhausted=False,
+                        next_retry_at=None,
+                        last_result="success",
+                    )
+                    if not self._persist_child_sync_observation(
+                        db,
+                        task=task,
+                        item=item,
+                        change_source="transport_error",
+                        sync_status="synced",
+                        error_message=str(exc),
+                        http_status=self._extract_http_status_from_exception(exc),
+                        error_type=self._classify_downstream_sync_error(exc),
+                        state_applied=True,
+                        extra_payload={"operation": "downstream_sync"},
+                        consecutive_error_count=state.consecutive_error_count,
+                        budget_exhausted=state.budget_exhausted,
+                        next_retry_at=state.next_retry_at,
+                        last_sync_result=state.last_result,
+                    ):
+                        failed_count += 1
+                        continue
+                elif not self._persist_downstream_sync_failure(
                     db,
                     task=task,
                     item=item,
+                    error=exc,
                     change_source="transport_error",
-                    sync_status="synced" if repair_applied else "transport_error",
-                    error_message=str(exc),
-                    http_status=self._extract_http_status_from_exception(exc),
-                    error_type=self._classify_downstream_sync_error(exc),
-                    state_applied=repair_applied,
-                    extra_payload={"operation": "downstream_sync"},
+                    operation="downstream_sync",
+                    before_status=before_status,
                 ):
                     failed_count += 1
                     continue
-                self._log_child_status_event(
-                    db,
-                    task=task,
-                    item=item,
-                    event_type="child_transport_failed",
-                    change_source="transport_error",
-                    before_status=before_status,
-                    after_status=str(item.status or "").strip().lower() or before_status,
-                    sync_status="synced" if repair_applied else "transport_error",
-                    downstream_status_raw=None,
-                    downstream_status_mapped=None,
-                    downstream_status=None,
-                    state_applied=repair_applied,
-                    error_message=str(exc),
-                    error_type=self._classify_downstream_sync_error(exc),
-                    http_status=self._extract_http_status_from_exception(exc),
-                    extra_payload={
-                        "operation": "downstream_sync",
-                        "repair_applied": repair_applied,
-                    },
-                )
+                if repair_applied:
+                    self._log_child_status_event(
+                        db,
+                        task=task,
+                        item=item,
+                        event_type="child_transport_failed",
+                        change_source="transport_error",
+                        before_status=before_status,
+                        after_status=str(item.status or "").strip().lower() or before_status,
+                        sync_status="synced",
+                        downstream_status_raw=None,
+                        downstream_status_mapped=None,
+                        downstream_status=None,
+                        state_applied=True,
+                        error_message=str(exc),
+                        error_type=self._classify_downstream_sync_error(exc),
+                        http_status=self._extract_http_status_from_exception(exc),
+                        extra_payload={
+                            "operation": "downstream_sync",
+                            "repair_applied": True,
+                        },
+                    )
         for current_stage in touched_stages:
             if current_stage == "system_analysis":
                 self._refresh_system_analysis_stage_from_synced_items(db, task)
@@ -5841,6 +6455,60 @@ class TaskManager:
             skipped_downstream_count=skipped_count,
             failed_downstream_count=failed_count,
         )
+
+    def _persist_downstream_sync_failure(
+        self,
+        db: Session,
+        *,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        error: Exception,
+        change_source: str,
+        operation: str,
+        before_status: str | None = None,
+    ) -> bool:
+        error_type = self._classify_downstream_sync_error(error)
+        observed_at = _now()
+        state = self._build_next_downstream_sync_failure_state(item, observed_at=observed_at)
+        persisted = self._persist_child_sync_observation(
+            db,
+            task=task,
+            item=item,
+            change_source=change_source,
+            sync_status="transport_error",
+            synced_at=observed_at,
+            error_message=str(error),
+            http_status=self._extract_http_status_from_exception(error),
+            error_type=error_type,
+            state_applied=False,
+            extra_payload={"operation": operation, **self._downstream_sync_failure_payload(item, error_type=error_type, error_message=str(error), state=state)},
+            consecutive_error_count=state.consecutive_error_count,
+            budget_exhausted=state.budget_exhausted,
+            next_retry_at=state.next_retry_at,
+            last_sync_result="error",
+        )
+        if not persisted:
+            return False
+        event_type = "downstream_sync_error_budget_exhausted" if state.budget_exhausted else "downstream_poll_retry_scheduled"
+        self._log_child_status_event(
+            db,
+            task=task,
+            item=item,
+            event_type=event_type,
+            change_source=change_source,
+            before_status=before_status or (str(item.status or "").strip().lower() or None),
+            after_status=str(item.status or "").strip().lower() or before_status,
+            sync_status="transport_error",
+            downstream_status_raw=None,
+            downstream_status_mapped=None,
+            downstream_status=None,
+            state_applied=False,
+            error_message=str(error),
+            error_type=error_type,
+            http_status=self._extract_http_status_from_exception(error),
+            extra_payload={"operation": operation, **self._downstream_sync_failure_payload(item, error_type=error_type, error_message=str(error), state=state)},
+        )
+        return True
 
     def _clear_archive_jobs_for_stage_items(self, db: Session, task_id: str, stage_name: str, item_ids: list[str]) -> int:
         normalized_item_ids = [str(item_id or "").strip() for item_id in item_ids if str(item_id or "").strip()]
@@ -8250,6 +8918,8 @@ class TaskManager:
                 continue
             if not self._is_streaming_tail_stage(task, item.stage_name):
                 continue
+            if self._stage_item_orchestration_in_retry_backoff(item):
+                continue
             try:
                 active_count = int(
                     db.query(func.count(BinarySecurityStageItem.id))
@@ -8378,9 +9048,23 @@ class TaskManager:
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == item.task_id).first() if item is not None else None
             if item is not None and str(item.status or "").strip().lower() == "dispatching":
                 retryable_transport = self._is_retryable_downstream_transport_error(exc)
-                item.status = "queued" if retryable_transport else "pending"
+                recoverable = retryable_transport or self._is_recoverable_orchestration_error(exc)
+                item.status = "queued" if recoverable else "pending"
                 item.error_message = str(exc)
                 item.finished_at = None
+                if recoverable:
+                    state = self._build_next_stage_item_orchestration_failure_state(item)
+                    self._mark_stage_item_orchestration_observation(
+                        item,
+                        source="streaming_stage_worker",
+                        observed_at=_now(),
+                        error_message=str(exc),
+                        error_type=self._classify_orchestration_error(exc),
+                        last_result="error",
+                        consecutive_error_count=state.consecutive_error_count,
+                        budget_exhausted=state.budget_exhausted,
+                        next_retry_at=state.next_retry_at,
+                    )
                 db.commit()
                 if task is not None:
                     self._record_event(
@@ -8394,6 +9078,10 @@ class TaskManager:
                         payload={
                             "error": str(exc),
                             "retryable_transport": retryable_transport,
+                            "recoverable_orchestration": recoverable,
+                            "error_type": self._classify_orchestration_error(exc),
+                            "next_retry_at": _isoformat_or_none(self._stage_item_next_orchestration_retry_at_value(item)),
+                            "budget_exhausted": self._stage_item_orchestration_error_budget_exhausted(item),
                             "requeued_status": item.status,
                         },
                     )
@@ -8517,7 +9205,8 @@ class TaskManager:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                pass
+                logger.exception("binary-security archive dispatch loop crashed and recovered")
+                await asyncio.sleep(1)
             await asyncio.sleep(max(1, self.cfg.scheduler.poll_interval_seconds))
 
     async def _schedule_archive_workers(self) -> None:
@@ -9376,6 +10065,10 @@ class TaskManager:
         mapped_status: str | None = None,
         downstream_status: str | None = None,
         state_applied: bool | None = None,
+        consecutive_error_count: int | None = None,
+        budget_exhausted: bool | None = None,
+        next_retry_at: datetime | None = None,
+        last_sync_result: str | None = None,
     ) -> None:
         self._apply_child_task_sync_observation(
             item,
@@ -9388,6 +10081,10 @@ class TaskManager:
             downstream_status_mapped=mapped_status,
             downstream_status=downstream_status,
             state_applied=state_applied,
+            consecutive_error_count=consecutive_error_count,
+            budget_exhausted=budget_exhausted,
+            next_retry_at=next_retry_at,
+            last_sync_result=last_sync_result,
         )
 
     def _refresh_polled_child_sync_snapshot(
@@ -9429,6 +10126,64 @@ class TaskManager:
                 mapped_status=mapped_status,
                 downstream_status=self._string_or_none(payload.get("status")),
                 state_applied=should_apply,
+            )
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def _record_polled_child_sync_failure(
+        self,
+        *,
+        task_id: str,
+        item_id: str,
+        error_message: str,
+        error_type: str,
+        http_status: int | None = None,
+    ) -> None:
+        session = get_session_factory()()
+        try:
+            task = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
+            item = session.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == item_id).first()
+            if task is None or item is None:
+                return
+            state = self._build_next_downstream_sync_failure_state(item)
+            self._persist_child_sync_observation(
+                session,
+                task=task,
+                item=item,
+                change_source="poll_supervisor",
+                sync_status="transport_error",
+                synced_at=_now(),
+                error_message=error_message,
+                http_status=http_status,
+                error_type=error_type,
+                state_applied=False,
+                extra_payload={
+                    "operation": "poll_until_terminal",
+                    **self._downstream_sync_failure_payload(item, error_type=error_type, error_message=error_message, state=state),
+                },
+                consecutive_error_count=state.consecutive_error_count,
+                budget_exhausted=state.budget_exhausted,
+                next_retry_at=state.next_retry_at,
+                last_sync_result="error",
+            )
+            self._record_event(
+                session,
+                task,
+                "downstream_poll_attempt_failed",
+                f"下游轮询失败，将在退避后重试: {error_message}",
+                level="warning",
+                stage_name=item.stage_name,
+                item=item,
+                payload={
+                    "error_type": error_type,
+                    "error_message": error_message,
+                    "http_status": http_status,
+                    **self._downstream_sync_failure_payload(item, error_type=error_type, error_message=error_message, state=state),
+                },
             )
             session.commit()
         except Exception:
@@ -10031,6 +10786,185 @@ class TaskManager:
                 project_id=ref["project_id"],
                 task_id=ref["task_id"],
                 force=False,
+                token=token,
+                record_request_event=False,
+                record_noop_events=False,
+                apply_state=True,
+            )
+        finally:
+            db.close()
+
+    async def _stage_item_sync_reconcile_loop(self) -> None:
+        interval_seconds = self._stage_item_sync_reconcile_interval_seconds()
+        while self._running:
+            db = get_session_factory()()
+            try:
+                with observe_scheduler_loop("stage_item_sync_reconcile"):
+                    self._mark_loop_heartbeat("stage_item_sync_reconcile")
+                    refs = await asyncio.to_thread(self._list_tasks_with_stale_stage_item_syncs, db)
+                    token = self._service_token()
+                    results = await self._run_with_limits(
+                        refs,
+                        lambda ref: self._reconcile_stale_stage_item_sync_ref(ref, token),
+                        concurrency=max(1, min(int(self.cfg.scheduler.downstream_sync_concurrency or 1), 8)),
+                        timeout_seconds=self.cfg.scheduler.downstream_request_timeout_seconds,
+                    )
+                    for ref, _, exc in results:
+                        if exc is None:
+                            continue
+                        with suppress(Exception):
+                            task = self._task_or_404(db, ref["project_id"], ref["task_id"])
+                            self._record_event(
+                                db,
+                                task,
+                                "downstream_sync_reconcile_failed",
+                                f"后台 stale sync 收敛失败: {exc}",
+                                level="warning",
+                                stage_name=ref.get("stage_name"),
+                                payload={
+                                    "task_id": ref["task_id"],
+                                    "project_id": ref["project_id"],
+                                    "stage_name": ref.get("stage_name"),
+                                    "item_ids": list(ref.get("item_ids") or []),
+                                    "error": str(exc),
+                                    "error_type": exc.__class__.__name__,
+                                },
+                            )
+                            db.commit()
+                    self._mark_loop_heartbeat("stage_item_sync_reconcile")
+            finally:
+                db.close()
+            await asyncio.sleep(interval_seconds)
+
+    async def _archive_runtime_reconcile_loop(self) -> None:
+        interval_seconds = self._archive_runtime_reconcile_interval_seconds()
+        while self._running:
+            try:
+                self._mark_loop_heartbeat("archive_runtime_reconcile")
+                await asyncio.to_thread(self._reclaim_stale_archive_jobs)
+                self._mark_loop_heartbeat("archive_runtime_reconcile")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("binary-security archive runtime reconcile loop crashed and recovered")
+                await asyncio.sleep(1)
+            await asyncio.sleep(interval_seconds)
+
+    async def _state_repair_reconcile_loop(self) -> None:
+        interval_seconds = self._state_repair_reconcile_interval_seconds()
+        while self._running:
+            db = get_session_factory()()
+            try:
+                self._mark_loop_heartbeat("state_repair_reconcile")
+                await asyncio.to_thread(self._repair_retryable_state_events, db)
+                self._mark_loop_heartbeat("state_repair_reconcile")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("binary-security state repair reconcile loop crashed and recovered")
+                await asyncio.sleep(1)
+            finally:
+                db.close()
+            await asyncio.sleep(interval_seconds)
+
+    def _repair_retryable_state_events(self, db: Session) -> int:
+        batch_size = self._state_repair_reconcile_batch_size()
+        events = (
+            db.query(BinarySecurityStateEvent)
+            .filter(BinarySecurityStateEvent.status.in_(["retryable", "dead_letter"]))
+            .order_by(BinarySecurityStateEvent.updated_at.asc(), BinarySecurityStateEvent.id.asc())
+            .limit(batch_size)
+            .all()
+        )
+        repaired = 0
+        for event in events:
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == event.task_id).first()
+            if task is None:
+                continue
+            event.status = "pending"
+            event.available_at = _now()
+            event.leased_by = None
+            event.lease_expires_at = None
+            event.processing_result = "requeued_for_repair"
+            event.updated_at = _now()
+            self._record_event(
+                db,
+                task,
+                "task_state_repair_reconcile_triggered",
+                "检测到 retryable/dead-letter reducer 事件，已重新排队修复",
+                stage_name=event.stage_name,
+                payload={
+                    "state_event_id": event.id,
+                    "event_type": event.event_type,
+                    "resolution_reason": "retryable_or_dead_letter_state_event",
+                },
+            )
+            repaired += 1
+        if repaired:
+            db.commit()
+        else:
+            db.rollback()
+        return repaired
+
+    def _list_tasks_with_stale_stage_item_syncs(self, db: Session) -> list[dict[str, Any]]:
+        batch_size = self._stage_item_sync_reconcile_batch_size()
+        rows = (
+            db.query(BinarySecurityStageItem)
+            .join(BinarySecurityTask, BinarySecurityTask.id == BinarySecurityStageItem.task_id)
+            .filter(
+                BinarySecurityTask.status.in_(["pending", "dispatching", "running", "failed"]),
+                BinarySecurityStageItem.downstream_service.isnot(None),
+                BinarySecurityStageItem.downstream_task_id.isnot(None),
+                BinarySecurityStageItem.status.in_(["pending", "queued", "dispatching", "running"]),
+            )
+            .order_by(BinarySecurityStageItem.updated_at.asc(), BinarySecurityStageItem.created_at.asc(), BinarySecurityStageItem.id.asc())
+            .limit(batch_size * 4)
+            .all()
+        )
+        grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for item in rows:
+            if not self._item_downstream_sync_stale(item):
+                continue
+            key = (str(item.project_id or ""), str(item.task_id or ""), str(item.stage_name or ""))
+            entry = grouped.setdefault(
+                key,
+                {
+                    "project_id": str(item.project_id or ""),
+                    "task_id": str(item.task_id or ""),
+                    "stage_name": str(item.stage_name or ""),
+                    "item_ids": [],
+                },
+            )
+            entry["item_ids"].append(str(item.id or ""))
+            if sum(len(current["item_ids"]) for current in grouped.values()) >= batch_size:
+                break
+        return list(grouped.values())
+
+    async def _reconcile_stale_stage_item_sync_ref(self, ref: dict[str, Any], token: str | None) -> None:
+        db = get_session_factory()()
+        try:
+            task = self._task_or_404(db, ref["project_id"], ref["task_id"])
+            self._record_event(
+                db,
+                task,
+                "downstream_sync_reconcile_triggered",
+                "检测到阶段下游同步陈旧，触发安全重同步",
+                stage_name=ref.get("stage_name"),
+                payload={
+                    "task_id": ref["task_id"],
+                    "stage_name": ref.get("stage_name"),
+                    "item_ids": list(ref.get("item_ids") or []),
+                    "resolution_reason": "stale_sync_attempt",
+                },
+            )
+            db.commit()
+            await self.sync_downstream_status(
+                db,
+                project_id=ref["project_id"],
+                task_id=ref["task_id"],
+                stage_name=ref.get("stage_name"),
+                item_ids=list(ref.get("item_ids") or []),
+                force=True,
                 token=token,
                 record_request_event=False,
                 record_noop_events=False,
@@ -10942,6 +11876,9 @@ class TaskManager:
             "archive_dispatch": self._loop_runtime_detail("archive_dispatch", self._archive_loop_task),
             "stage_item_dispatch": self._loop_runtime_detail("stage_item_dispatch", self._stage_item_loop_task),
             "downstream_reconcile": self._loop_runtime_detail("downstream_reconcile", self._downstream_reconcile_task),
+            "stage_item_sync_reconcile": self._loop_runtime_detail("stage_item_sync_reconcile", self._stage_item_sync_reconcile_task),
+            "archive_runtime_reconcile": self._loop_runtime_detail("archive_runtime_reconcile", self._archive_runtime_reconcile_task),
+            "state_repair_reconcile": self._loop_runtime_detail("state_repair_reconcile", self._state_repair_reconcile_task),
             "readless_reconcile": self._loop_runtime_detail("readless_reconcile", self._readless_reconcile_task),
             "state_reducer": self._loop_runtime_detail("state_reducer", self._state_reducer_loop_task),
             "reducer_metrics_snapshot": self._loop_runtime_detail("reducer_metrics_snapshot", self._reducer_metrics_snapshot_loop_task),
@@ -11138,9 +12075,11 @@ class TaskManager:
             sync_status = self._stage_item_sync_status_value(item)
             if sync_status in {None, "", "pending", "transport_error"}:
                 return True
+            if self._stage_item_sync_in_retry_backoff(item):
+                continue
             if self._item_missing_recorded_downstream_status(item):
                 return True
-            parsed = self._stage_item_last_synced_at_value(item)
+            parsed = self._stage_item_sync_attempt_at_value(item)
             if parsed is None:
                 return True
             if latest_synced_at is None or parsed > latest_synced_at:
@@ -11179,6 +12118,227 @@ class TaskManager:
         value = str(sync_status or "").strip().lower()
         return value or None
 
+    def _stage_item_sync_observation(self, item: BinarySecurityStageItem) -> dict[str, Any]:
+        result = dict(item.result or {})
+        observation = result.get("sync_observation") or {}
+        return dict(observation) if isinstance(observation, dict) else {}
+
+    def _stage_item_sync_attempt_at_value(self, item: BinarySecurityStageItem) -> datetime | None:
+        result = dict(item.result or {})
+        sync_observation = self._stage_item_sync_observation(item)
+        raw = (
+            sync_observation.get("last_attempt_at")
+            or result.get("last_sync_attempt_at")
+            or sync_observation.get("last_synced_at")
+            or result.get("downstream_status_synced_at")
+        )
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    def _stage_item_sync_error_at_value(self, item: BinarySecurityStageItem) -> datetime | None:
+        result = dict(item.result or {})
+        sync_observation = self._stage_item_sync_observation(item)
+        raw = sync_observation.get("last_error_at") or result.get("last_sync_error_at")
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    def _stage_item_sync_consecutive_error_count(self, item: BinarySecurityStageItem) -> int:
+        result = dict(item.result or {})
+        sync_observation = self._stage_item_sync_observation(item)
+        raw = sync_observation.get("consecutive_error_count")
+        if raw is None:
+            raw = result.get("consecutive_sync_error_count")
+        try:
+            return max(0, int(raw or 0))
+        except Exception:
+            return 0
+
+    def _stage_item_sync_error_budget_exhausted(self, item: BinarySecurityStageItem) -> bool:
+        result = dict(item.result or {})
+        sync_observation = self._stage_item_sync_observation(item)
+        raw = sync_observation.get("budget_exhausted")
+        if raw is None:
+            raw = result.get("sync_error_budget_exhausted")
+        return bool(raw)
+
+    def _stage_item_next_sync_retry_at_value(self, item: BinarySecurityStageItem) -> datetime | None:
+        result = dict(item.result or {})
+        sync_observation = self._stage_item_sync_observation(item)
+        raw = sync_observation.get("next_retry_at") or result.get("next_sync_retry_at")
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    def _stage_item_sync_in_retry_backoff(self, item: BinarySecurityStageItem, now_value: datetime | None = None) -> bool:
+        next_retry_at = self._stage_item_next_sync_retry_at_value(item)
+        if next_retry_at is None:
+            return False
+        return next_retry_at > (now_value or _now())
+
+    def _stage_item_orchestration_observation(self, item: BinarySecurityStageItem) -> dict[str, Any]:
+        result = dict(item.result or {})
+        observation = result.get("orchestration_observation") or {}
+        return dict(observation) if isinstance(observation, dict) else {}
+
+    def _stage_item_orchestration_attempt_at_value(self, item: BinarySecurityStageItem) -> datetime | None:
+        result = dict(item.result or {})
+        observation = self._stage_item_orchestration_observation(item)
+        raw = observation.get("last_attempt_at") or result.get("last_orchestration_attempt_at")
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    def _stage_item_next_orchestration_retry_at_value(self, item: BinarySecurityStageItem) -> datetime | None:
+        result = dict(item.result or {})
+        observation = self._stage_item_orchestration_observation(item)
+        raw = observation.get("next_retry_at") or result.get("next_orchestration_retry_at")
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    def _stage_item_orchestration_in_retry_backoff(self, item: BinarySecurityStageItem, now_value: datetime | None = None) -> bool:
+        next_retry_at = self._stage_item_next_orchestration_retry_at_value(item)
+        if next_retry_at is None:
+            return False
+        return next_retry_at > (now_value or _now())
+
+    def _stage_item_orchestration_error_budget_exhausted(self, item: BinarySecurityStageItem) -> bool:
+        result = dict(item.result or {})
+        observation = self._stage_item_orchestration_observation(item)
+        raw = observation.get("budget_exhausted")
+        if raw is None:
+            raw = result.get("orchestration_error_budget_exhausted")
+        return bool(raw)
+
+    def _stage_item_orchestration_consecutive_error_count(self, item: BinarySecurityStageItem) -> int:
+        result = dict(item.result or {})
+        observation = self._stage_item_orchestration_observation(item)
+        raw = observation.get("consecutive_error_count")
+        if raw is None:
+            raw = result.get("consecutive_orchestration_error_count")
+        try:
+            return max(0, int(raw or 0))
+        except Exception:
+            return 0
+
+    def _next_stage_orchestration_retry_backoff_seconds(self, consecutive_error_count: int) -> int:
+        exponent = max(0, int(consecutive_error_count) - 1)
+        backoff = self._stage_orchestration_backoff_base_seconds() * (2 ** exponent)
+        return min(self._stage_orchestration_backoff_max_seconds(), max(1, int(backoff)))
+
+    def _read_stage_item_orchestration_state(self, item: BinarySecurityStageItem) -> OrchestrationSupervisorState:
+        result = dict(item.result or {})
+        observation = self._stage_item_orchestration_observation(item)
+        consecutive = observation.get("consecutive_error_count")
+        if consecutive is None:
+            consecutive = result.get("consecutive_orchestration_error_count")
+        exhausted = observation.get("budget_exhausted")
+        if exhausted is None:
+            exhausted = result.get("orchestration_error_budget_exhausted")
+        last_result = self._string_or_none(observation.get("last_result")) or self._string_or_none(result.get("last_orchestration_result"))
+        return OrchestrationSupervisorState(
+            consecutive_error_count=max(0, int(consecutive or 0)),
+            budget_exhausted=bool(exhausted),
+            next_retry_at=self._stage_item_next_orchestration_retry_at_value(item),
+            last_result=last_result,
+        )
+
+    def _build_next_stage_item_orchestration_failure_state(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        observed_at: datetime | None = None,
+    ) -> OrchestrationSupervisorState:
+        previous = self._read_stage_item_orchestration_state(item)
+        consecutive = previous.consecutive_error_count + 1
+        budget_exhausted = consecutive >= self._stage_orchestration_max_consecutive_errors()
+        retry_at = (observed_at or _now()) + timedelta(seconds=self._next_stage_orchestration_retry_backoff_seconds(consecutive))
+        return OrchestrationSupervisorState(
+            consecutive_error_count=consecutive,
+            budget_exhausted=budget_exhausted,
+            next_retry_at=retry_at,
+            last_result="error",
+        )
+
+    def _mark_stage_item_orchestration_observation(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        source: str,
+        observed_at: datetime | None = None,
+        error_message: str | None = None,
+        error_type: str | None = None,
+        last_result: str | None = None,
+        consecutive_error_count: int | None = None,
+        budget_exhausted: bool | None = None,
+        next_retry_at: datetime | None = None,
+    ) -> None:
+        result = dict(item.result or {})
+        observation = dict(result.get("orchestration_observation") or {})
+        now_value = observed_at or _now()
+        observed_at_iso = now_value.isoformat()
+        if last_result is None:
+            last_result = "error" if error_message or error_type else "success"
+        observation.update(
+            {
+                "source": source,
+                "last_attempt_at": observed_at_iso,
+                "last_result": last_result,
+                "error_message": error_message,
+                "error_type": error_type,
+            }
+        )
+        if consecutive_error_count is not None:
+            observation["consecutive_error_count"] = max(0, int(consecutive_error_count))
+        if budget_exhausted is not None:
+            observation["budget_exhausted"] = bool(budget_exhausted)
+        if next_retry_at is not None:
+            observation["next_retry_at"] = next_retry_at.isoformat()
+        elif last_result == "success":
+            observation["next_retry_at"] = None
+        if last_result == "success":
+            observation["last_success_at"] = observed_at_iso
+            observation["last_error_at"] = None
+            observation["error_message"] = None
+            observation["error_type"] = None
+            observation["consecutive_error_count"] = 0
+            observation["budget_exhausted"] = False
+            observation["next_retry_at"] = None
+        else:
+            observation["last_error_at"] = observed_at_iso
+        result.update(
+            {
+                "orchestration_observation": observation,
+                "last_orchestration_attempt_at": observed_at_iso,
+                "last_orchestration_success_at": observation.get("last_success_at"),
+                "last_orchestration_error_at": observation.get("last_error_at"),
+                "last_orchestration_error_type": observation.get("error_type"),
+                "last_orchestration_error_message": observation.get("error_message"),
+                "consecutive_orchestration_error_count": observation.get("consecutive_error_count"),
+                "orchestration_error_budget_exhausted": observation.get("budget_exhausted"),
+                "next_orchestration_retry_at": observation.get("next_retry_at"),
+                "last_orchestration_result": observation.get("last_result"),
+            }
+        )
+        item.result = result
+
     def _stage_item_last_synced_at_value(self, item: BinarySecurityStageItem) -> datetime | None:
         result = dict(item.result or {})
         raw = result.get("downstream_status_synced_at")
@@ -11195,21 +12355,17 @@ class TaskManager:
         item_status = str(item.status or "").strip().lower()
         if item_status not in {"pending", "queued", "running", "dispatching"}:
             return False
-        last_synced_at = self._stage_item_last_synced_at_value(item)
-        if last_synced_at is None:
-            return True
         current_now = now_value or _now()
-        interval_seconds = max(
-            5,
-            int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30) or 30),
-        )
-        return (current_now - last_synced_at).total_seconds() >= interval_seconds
+        last_attempt_at = self._stage_item_sync_attempt_at_value(item)
+        if last_attempt_at is None:
+            return True
+        return (current_now - last_attempt_at).total_seconds() >= self._stage_item_sync_stale_seconds()
 
     def _item_needs_initial_downstream_sync(self, item: BinarySecurityStageItem) -> bool:
         sync_status = self._stage_item_sync_status_value(item)
         if sync_status in {None, "", "pending", "transport_error"}:
             return True
-        return self._stage_item_last_synced_at_value(item) is None
+        return self._stage_item_sync_attempt_at_value(item) is None
 
     def _item_needs_downstream_sync(
         self,
@@ -11219,6 +12375,8 @@ class TaskManager:
         now_value: datetime | None = None,
     ) -> bool:
         if not str(item.downstream_service or "").strip() or not str(item.downstream_task_id or "").strip():
+            return False
+        if self._stage_item_sync_in_retry_backoff(item, now_value):
             return False
         item_status = str(item.status or "").strip().lower()
         if item_status in {"pending", "queued", "running", "dispatching"}:
@@ -11480,6 +12638,15 @@ class TaskManager:
         return None
 
     def _classify_downstream_sync_error(self, exc: Exception) -> str:
+        if isinstance(exc, SATimeoutError):
+            return "db_connection_lost"
+        if isinstance(exc, OperationalError):
+            lowered_operational = str(exc or "").strip().lower()
+            if "connection refused" in lowered_operational or "[errno 111]" in lowered_operational:
+                return "db_connection_refused"
+            if any(token in lowered_operational for token in {"lost connection", "server has gone away", "closed the connection"}):
+                return "db_connection_lost"
+            return "db_session_invalid"
         http_status = self._extract_http_status_from_exception(exc)
         lowered = str(exc or "").strip().lower()
         detail = str(getattr(exc, "error_type_detail", "") or getattr(exc, "transport_error_kind", "")).strip().lower()
@@ -11496,8 +12663,54 @@ class TaskManager:
         if any(token in lowered for token in {"auth", "unauthorized", "forbidden", "认证"}):
             return "auth_error"
         if isinstance(exc, (TypeError, ValueError, KeyError, AssertionError)):
-            return "unexpected_response"
+            return "downstream_payload_invalid"
         return exc.__class__.__name__
+
+    def _classify_orchestration_error(self, exc: Exception) -> str:
+        sync_error = self._classify_downstream_sync_error(exc)
+        if sync_error in {
+            "db_connection_refused",
+            "db_connection_lost",
+            "db_session_invalid",
+            "downstream_http_timeout",
+            "downstream_http_error",
+            "downstream_payload_invalid",
+        }:
+            return sync_error
+        lowered = str(exc or "").strip().lower()
+        if isinstance(exc, FileNotFoundError):
+            return "workspace_transient_missing"
+        if isinstance(exc, OSError):
+            return "archive_copy_io_error"
+        if any(token in lowered for token in {"metadata", "task-metadata.json"}):
+            return "task_metadata_write_failed"
+        if any(token in lowered for token in {"state event", "state reducer"}):
+            return "state_event_persist_failed"
+        if self._is_retryable_lock_error(exc):
+            return "retryable_lock_conflict"
+        return sync_error
+
+    def _is_recoverable_orchestration_error(self, exc: Exception) -> bool:
+        if isinstance(exc, (OperationalError, SATimeoutError, UpstreamError, httpx.RequestError, FileNotFoundError, OSError)):
+            return True
+        return self._classify_orchestration_error(exc) in {
+            "db_connection_refused",
+            "db_connection_lost",
+            "db_session_invalid",
+            "retryable_lock_conflict",
+            "downstream_http_timeout",
+            "downstream_http_error",
+            "downstream_payload_invalid",
+            "task_metadata_write_failed",
+            "state_event_persist_failed",
+            "archive_copy_io_error",
+            "archive_apply_io_error",
+            "workspace_transient_missing",
+            "fileserver_transient_error",
+            "connection_error",
+            "timeout",
+            "http_5xx",
+        }
 
     def _is_retryable_downstream_transport_error(self, exc: Exception) -> bool:
         if isinstance(exc, UpstreamError):
@@ -13051,6 +14264,64 @@ class TaskManager:
         retries = 3 if max_retries is None else int(max_retries)
         return max(1, retries)
 
+    def _next_stage_sync_retry_backoff_seconds(self, consecutive_error_count: int) -> int:
+        exponent = max(0, int(consecutive_error_count) - 1)
+        backoff = self._stage_downstream_sync_backoff_base_seconds() * (2 ** exponent)
+        return min(self._stage_downstream_sync_backoff_max_seconds(), max(1, int(backoff)))
+
+    def _read_stage_item_sync_supervisor_state(self, item: BinarySecurityStageItem) -> DownstreamSyncSupervisorState:
+        result = dict(item.result or {})
+        sync_observation = self._stage_item_sync_observation(item)
+        consecutive = sync_observation.get("consecutive_error_count")
+        if consecutive is None:
+            consecutive = result.get("consecutive_sync_error_count")
+        exhausted = sync_observation.get("budget_exhausted")
+        if exhausted is None:
+            exhausted = result.get("sync_error_budget_exhausted")
+        last_result = self._string_or_none(sync_observation.get("last_result")) or self._string_or_none(result.get("last_sync_result"))
+        return DownstreamSyncSupervisorState(
+            consecutive_error_count=max(0, int(consecutive or 0)),
+            budget_exhausted=bool(exhausted),
+            next_retry_at=self._stage_item_next_sync_retry_at_value(item),
+            last_result=last_result,
+        )
+
+    def _downstream_sync_failure_payload(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        error_type: str,
+        error_message: str,
+        state: DownstreamSyncSupervisorState,
+    ) -> dict[str, Any]:
+        return {
+            "item_id": str(item.id or ""),
+            "stage_name": str(item.stage_name or ""),
+            "downstream_task_id": str(item.downstream_task_id or ""),
+            "consecutive_sync_error_count": state.consecutive_error_count,
+            "last_sync_error_type": error_type,
+            "last_sync_error_message": error_message,
+            "next_sync_retry_at": _isoformat_or_none(state.next_retry_at),
+            "sync_error_budget_exhausted": state.budget_exhausted,
+        }
+
+    def _build_next_downstream_sync_failure_state(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        observed_at: datetime | None = None,
+    ) -> DownstreamSyncSupervisorState:
+        previous = self._read_stage_item_sync_supervisor_state(item)
+        consecutive = previous.consecutive_error_count + 1
+        budget_exhausted = consecutive >= self._stage_downstream_sync_max_consecutive_errors()
+        retry_at = (observed_at or _now()) + timedelta(seconds=self._next_stage_sync_retry_backoff_seconds(consecutive))
+        return DownstreamSyncSupervisorState(
+            consecutive_error_count=consecutive,
+            budget_exhausted=budget_exhausted,
+            next_retry_at=retry_at,
+            last_result="error",
+        )
+
     def _sleep_after_retryable_lock_error(self, attempt: int) -> None:
         attempt_no = max(1, int(attempt))
         backoff_seconds = {1: 1.0, 2: 3.0, 3: 5.0}.get(attempt_no, 5.0)
@@ -13429,6 +14700,16 @@ class TaskManager:
             "archive_copy_stats",
             "archive_root",
             "artifact_root",
+            "orchestration_observation",
+            "last_orchestration_attempt_at",
+            "last_orchestration_success_at",
+            "last_orchestration_error_at",
+            "last_orchestration_error_type",
+            "last_orchestration_error_message",
+            "consecutive_orchestration_error_count",
+            "orchestration_error_budget_exhausted",
+            "next_orchestration_retry_at",
+            "last_orchestration_result",
         )
 
     def _downstream_binding_snapshot(self, item: BinarySecurityStageItem) -> dict[str, Any]:
@@ -13717,6 +14998,10 @@ class TaskManager:
         downstream_payload: dict[str, Any] | None = None,
         archive_root: str | None = None,
         archive_copy_stats: dict[str, Any] | None = None,
+        consecutive_error_count: int | None = None,
+        budget_exhausted: bool | None = None,
+        next_retry_at: datetime | None = None,
+        last_sync_result: str | None = None,
     ) -> list[str]:
         current_result = dict(item.result or {})
         preserved_keys = [key for key in self._preserved_child_result_keys() if key in current_result]
@@ -13724,6 +15009,8 @@ class TaskManager:
         observed_at = synced_at or _now()
         observed_at_iso = observed_at.isoformat()
         sync_observation["last_attempt_at"] = observed_at_iso
+        if last_sync_result is None:
+            last_sync_result = "error" if error_message or error_type else "success"
         sync_observation.update(
             {
                 "sync_status": sync_status,
@@ -13734,8 +15021,19 @@ class TaskManager:
                 "mapped_status": downstream_status_mapped,
                 "downstream_status": downstream_status,
                 "state_applied": state_applied,
+                "last_result": last_sync_result,
             }
         )
+        if consecutive_error_count is not None:
+            sync_observation["consecutive_error_count"] = max(0, int(consecutive_error_count))
+        if budget_exhausted is not None:
+            sync_observation["budget_exhausted"] = bool(budget_exhausted)
+        if next_retry_at is not None:
+            sync_observation["next_retry_at"] = next_retry_at.isoformat()
+        elif error_message or error_type:
+            sync_observation["next_retry_at"] = sync_observation.get("next_retry_at")
+        else:
+            sync_observation["next_retry_at"] = None
         if error_message or error_type:
             sync_observation["last_error_at"] = observed_at_iso
         elif state_applied or downstream_status or downstream_status_mapped or downstream_status_raw:
@@ -13745,6 +15043,9 @@ class TaskManager:
             sync_observation["error_message"] = None
             sync_observation["error_type"] = None
             sync_observation["http_status"] = None
+            sync_observation["consecutive_error_count"] = 0
+            sync_observation["budget_exhausted"] = False
+            sync_observation["next_retry_at"] = None
         merged_result = {
             **current_result,
             "sync_status": sync_status,
@@ -13754,6 +15055,10 @@ class TaskManager:
             "last_sync_error_at": sync_observation.get("last_error_at"),
             "last_sync_error_message": sync_observation.get("error_message"),
             "last_sync_error_type": sync_observation.get("error_type"),
+            "last_sync_result": sync_observation.get("last_result"),
+            "consecutive_sync_error_count": sync_observation.get("consecutive_error_count"),
+            "sync_error_budget_exhausted": sync_observation.get("budget_exhausted"),
+            "next_sync_retry_at": sync_observation.get("next_retry_at"),
             "downstream_status": downstream_status or current_result.get("downstream_status"),
             "sync_observation": sync_observation,
         }
@@ -13906,6 +15211,10 @@ class TaskManager:
         downstream_status: str | None = None,
         state_applied: bool | None = None,
         extra_payload: dict[str, Any] | None = None,
+        consecutive_error_count: int | None = None,
+        budget_exhausted: bool | None = None,
+        next_retry_at: datetime | None = None,
+        last_sync_result: str | None = None,
     ) -> bool:
         before_status = str(item.status or "").strip().lower() or None
         after_status = str(item.status or "").strip().lower() or None
@@ -13937,6 +15246,10 @@ class TaskManager:
                         mapped_status=mapped_status,
                         downstream_status=downstream_status,
                         state_applied=state_applied,
+                        consecutive_error_count=consecutive_error_count,
+                        budget_exhausted=budget_exhausted,
+                        next_retry_at=next_retry_at,
+                        last_sync_result=last_sync_result,
                     )
                     db.flush()
                 return True
@@ -17294,6 +18607,28 @@ class TaskManager:
     ) -> bool:
         return self._stage_has_active_items(items)
 
+    def _stage_has_sync_degraded_items(self, items: list[BinarySecurityStageItem]) -> bool:
+        for item in items:
+            if not str(item.downstream_task_id or "").strip():
+                continue
+            if self._stage_item_sync_error_budget_exhausted(item):
+                return True
+            if self._stage_item_sync_in_retry_backoff(item):
+                return True
+            if self._item_downstream_sync_stale(item):
+                return True
+            if self._stage_item_sync_consecutive_error_count(item) > 0:
+                return True
+        return False
+
+    def _stage_has_orchestration_degraded_items(self, items: list[BinarySecurityStageItem]) -> bool:
+        for item in items:
+            if self._stage_item_orchestration_error_budget_exhausted(item):
+                return True
+            if self._stage_item_orchestration_in_retry_backoff(item):
+                return True
+        return False
+
     def _stage_has_real_runnable_work(
         self,
         db: Session,
@@ -17405,6 +18740,10 @@ class TaskManager:
         items = deduped_items
         if items:
             status = self._aggregate_item_statuses([item.status for item in items])
+            if status in {"success", "partial_success"} and self._stage_has_sync_degraded_items(items):
+                status = "running" if any(str(item.status or "").strip() in {"running", "dispatching"} for item in items) else "pending"
+            if status in {"success", "partial_success"} and self._stage_has_orchestration_degraded_items(items):
+                status = "running" if any(str(item.status or "").strip() in {"running", "dispatching"} for item in items) else "pending"
         else:
             status = self._empty_streaming_stage_run_status(task, stage_run)
         stage_run.status = status
@@ -18738,6 +20077,20 @@ class TaskManager:
                 "deferred_mode": deferred_mode,
             },
         )
+        state = self._build_next_downstream_sync_failure_state(item)
+        self._mark_stage_item_sync_observation(
+            item,
+            sync_status="transport_error",
+            synced_at=_now(),
+            error_message=str(exc),
+            http_status=self._extract_http_status_from_exception(exc),
+            error_type=self._classify_downstream_sync_error(exc),
+            state_applied=False,
+            consecutive_error_count=state.consecutive_error_count,
+            budget_exhausted=state.budget_exhausted,
+            next_retry_at=state.next_retry_at,
+            last_sync_result="error",
+        )
         if replacement_state["replacement_in_progress"]:
             self._mark_replacement_in_progress(
                 item,
@@ -18769,6 +20122,9 @@ class TaskManager:
                 "state_applied": False,
                 "deferred_mode": deferred_mode,
                 "item_status": item.status,
+                "consecutive_sync_error_count": state.consecutive_error_count,
+                "next_sync_retry_at": _isoformat_or_none(state.next_retry_at),
+                "sync_error_budget_exhausted": state.budget_exhausted,
                 "binding_state": self._downstream_binding_state(item),
                 "binding_attempts": self._downstream_binding_attempts(item),
                 "binding_next_retry_at": _isoformat_or_none(self._downstream_binding_time(item, "next_retry_at")),
@@ -18780,6 +20136,66 @@ class TaskManager:
             "error": str(exc),
             "item": response_item,
             "deferred_mode": deferred_mode,
+            "sync_degraded": True,
+        }
+
+    def _defer_item_after_orchestration_error(
+        self,
+        session: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        operation: str,
+        exc: Exception,
+        response_item: dict[str, Any],
+        has_downstream_ref: bool | None = None,
+    ) -> dict[str, Any]:
+        if has_downstream_ref is None:
+            has_downstream_ref = bool(str(item.downstream_task_id or "").strip())
+        state = self._build_next_stage_item_orchestration_failure_state(item)
+        deferred_mode = "reconcile" if has_downstream_ref else "redispatch"
+        deferred_status = "running" if has_downstream_ref else "queued"
+        item.status = deferred_status
+        item.error_message = str(exc)
+        item.finished_at = None
+        self._mark_stage_item_orchestration_observation(
+            item,
+            source=operation,
+            observed_at=_now(),
+            error_message=str(exc),
+            error_type=self._classify_orchestration_error(exc),
+            last_result="error",
+            consecutive_error_count=state.consecutive_error_count,
+            budget_exhausted=state.budget_exhausted,
+            next_retry_at=state.next_retry_at,
+        )
+        self._record_event(
+            session,
+            task,
+            "stage_item_orchestration_error_budget_exhausted" if state.budget_exhausted else "stage_item_orchestration_retry_scheduled",
+            "阶段子任务推进异常，已进入延迟恢复" if not state.budget_exhausted else "阶段子任务推进异常预算耗尽，等待后台恢复",
+            level="warning",
+            stage_name=item.stage_name,
+            item=item,
+            payload={
+                "operation": operation,
+                "error_type": self._classify_orchestration_error(exc),
+                "error_message": str(exc),
+                "consecutive_error_count": state.consecutive_error_count,
+                "next_retry_at": _isoformat_or_none(state.next_retry_at),
+                "budget_exhausted": state.budget_exhausted,
+                "resolution_reason": "recoverable_orchestration_error",
+                "deferred_mode": deferred_mode,
+            },
+        )
+        session.commit()
+        return {
+            "status": "running" if has_downstream_ref else "pending",
+            "error": str(exc),
+            "item": response_item,
+            "deferred_mode": deferred_mode,
+            "sync_degraded": True,
+            "orchestration_degraded": True,
         }
 
     def _status_from_downstream_payload(self, payload: dict[str, Any], *, success_statuses: set[str]) -> str:
@@ -20899,35 +22315,51 @@ class TaskManager:
 
     async def _poll_until_terminal(self, fetcher, *, success_statuses: set[str], failure_statuses: set[str], task: BinarySecurityTask, item: BinarySecurityStageItem | None = None):
         while True:
-            await self._ensure_task_execution_current_async(task)
-            await self._touch_task_heartbeat_async(task.id)
             try:
+                await self._ensure_task_execution_current_async(task)
+                await self._touch_task_heartbeat_async(task.id)
                 payload = await fetcher()
+                await self._ensure_task_execution_current_async(task)
+                status = str(payload.get("status") or "").lower()
+                if status in success_statuses:
+                    return "success", payload
+                if status in failure_statuses:
+                    mapped_status = self._map_downstream_status(status)
+                    if mapped_status == "cancelled":
+                        return "cancelled", payload
+                    if mapped_status == "downstream_missing":
+                        return "downstream_missing", payload
+                    return "failed", payload
+                if item is not None:
+                    await asyncio.to_thread(
+                        self._refresh_polled_child_sync_snapshot,
+                        task_id=task.id,
+                        item_id=item.id,
+                        payload=dict(payload),
+                    )
+                if await self._is_task_cancelled_async(task.id):
+                    if item and item.downstream_task_id:
+                        await self._cancel_downstream(item, self._service_token())
+                    return "cancelled", payload
+                await asyncio.sleep(self.cfg.scheduler.stage_poll_interval_seconds)
             except NotFoundError:
                 return "downstream_missing", {"status": "downstream_missing", "error": "下游子任务不存在"}
-            await self._ensure_task_execution_current_async(task)
-            status = str(payload.get("status") or "").lower()
-            if status in success_statuses:
-                return "success", payload
-            if status in failure_statuses:
-                mapped_status = self._map_downstream_status(status)
-                if mapped_status == "cancelled":
-                    return "cancelled", payload
-                if mapped_status == "downstream_missing":
-                    return "downstream_missing", payload
-                return "failed", payload
-            if item is not None:
-                await asyncio.to_thread(
-                    self._refresh_polled_child_sync_snapshot,
-                    task_id=task.id,
-                    item_id=item.id,
-                    payload=dict(payload),
+            except Exception as exc:
+                if item is not None:
+                    await asyncio.to_thread(
+                        self._record_polled_child_sync_failure,
+                        task_id=task.id,
+                        item_id=item.id,
+                        error_message=str(exc),
+                        error_type=self._classify_downstream_sync_error(exc),
+                        http_status=self._extract_http_status_from_exception(exc),
+                    )
+                await asyncio.sleep(
+                    min(
+                        self._stage_downstream_sync_backoff_max_seconds(),
+                        self._stage_downstream_sync_backoff_base_seconds(),
+                    )
                 )
-            if await self._is_task_cancelled_async(task.id):
-                if item and item.downstream_task_id:
-                    await self._cancel_downstream(item, self._service_token())
-                return "cancelled", payload
-            await asyncio.sleep(self.cfg.scheduler.stage_poll_interval_seconds)
 
     def _touch_task_heartbeat(self, task_id: str) -> None:
         now = _now()
@@ -21249,6 +22681,16 @@ class TaskManager:
             if "item" in locals() and self._is_retryable_downstream_transport_error(exc):
                 session.rollback()
                 return self._defer_item_after_downstream_transport_error(
+                    session,
+                    task,
+                    item,
+                    operation="firmware_unpack",
+                    exc=exc,
+                    response_item=input_file,
+                )
+            if "item" in locals() and self._is_recoverable_orchestration_error(exc):
+                session.rollback()
+                return self._defer_item_after_orchestration_error(
                     session,
                     task,
                     item,
@@ -21731,6 +23173,16 @@ class TaskManager:
             if "item" in locals() and self._is_retryable_downstream_transport_error(exc):
                 session.rollback()
                 return self._defer_item_after_downstream_transport_error(
+                    session,
+                    task,
+                    item,
+                    operation="system_analysis",
+                    exc=exc,
+                    response_item=firmware,
+                )
+            if "item" in locals() and self._is_recoverable_orchestration_error(exc):
+                session.rollback()
+                return self._defer_item_after_orchestration_error(
                     session,
                     task,
                     item,
@@ -23354,6 +24806,16 @@ class TaskManager:
                     exc=exc,
                     response_item=entry_input if "entry_input" in locals() else module,
                 )
+            if "item" in locals() and self._is_recoverable_orchestration_error(exc):
+                session.rollback()
+                return self._defer_item_after_orchestration_error(
+                    session,
+                    task,
+                    item,
+                    operation="entry_analysis",
+                    exc=exc,
+                    response_item=entry_input if "entry_input" in locals() else module,
+                )
             session.rollback()
             if "item" in locals():
                 item.status = "failed"
@@ -24237,6 +25699,16 @@ class TaskManager:
                     exc=exc,
                     response_item=entry,
                 )
+            if "item" in locals() and self._is_recoverable_orchestration_error(exc):
+                session.rollback()
+                return self._defer_item_after_orchestration_error(
+                    session,
+                    task,
+                    item,
+                    operation="dataflow_analysis",
+                    exc=exc,
+                    response_item=entry,
+                )
             if "item" in locals():
                 session.rollback()
                 item.status = "failed"
@@ -24629,6 +26101,16 @@ class TaskManager:
                     exc=exc,
                     response_item=dataflow_result,
                 )
+            if "item" in locals() and self._is_recoverable_orchestration_error(exc):
+                session.rollback()
+                return self._defer_item_after_orchestration_error(
+                    session,
+                    task,
+                    item,
+                    operation="vuln_scan",
+                    exc=exc,
+                    response_item=dataflow_result,
+                )
             if "item" in locals():
                 session.rollback()
                 item.status = "failed"
@@ -24652,6 +26134,8 @@ class TaskManager:
         success = [result["item"] for result in results if result.get("status") == "success"]
         compact_success = self._compact_stage_success_items(summary_key, success)
         db_success = self._compact_stage_success_items_for_db(summary_key, compact_success)
+        has_sync_degraded = any(bool(result.get("sync_degraded")) for result in results)
+        has_orchestration_degraded = any(bool(result.get("orchestration_degraded")) for result in results)
         active_results = [
             result
             for result in results
@@ -24700,7 +26184,9 @@ class TaskManager:
             for result in active_results
             if result.get("status") in {"pending", "queued"} or result.get("deferred_mode") == "redispatch"
         ]
-        if reconcile_waiting:
+        if has_sync_degraded or has_orchestration_degraded:
+            status = "running" if running_active or reconcile_waiting else "pending"
+        elif reconcile_waiting:
             status = "running"
         elif running_active:
             status = "running"

@@ -456,6 +456,41 @@ class BinarySecurityOverviewNode(BaseModel):
     detail: BinarySecurityOverviewBusinessDetail | BinarySecurityOverviewArchiveDetail
 
 
+class BinarySecurityRuntimeHealthEvidence(BaseModel):
+    label: str
+    value: Optional[str] = None
+
+
+class BinarySecurityRuntimeHealthUnit(BaseModel):
+    unit_key: str
+    unit_label: str
+    unit_kind: str
+    status: str
+    task_scoped: bool = True
+    owner_instance_id: Optional[str] = None
+    started_at: Optional[datetime] = None
+    last_heartbeat_at: Optional[datetime] = None
+    age_seconds: Optional[float] = None
+    detail: Optional[str] = None
+    reason: Optional[str] = None
+    evidence: list[BinarySecurityRuntimeHealthEvidence] = Field(default_factory=list)
+
+
+class BinarySecurityRuntimeHealthSummary(BaseModel):
+    overall_status: str = "unknown"
+    active_unit_count: int = 0
+    healthy_unit_count: int = 0
+    degraded_unit_count: int = 0
+    unhealthy_unit_count: int = 0
+    last_updated_at: Optional[datetime] = None
+    message: Optional[str] = None
+
+
+class BinarySecurityRuntimeHealthResponse(BaseModel):
+    summary: BinarySecurityRuntimeHealthSummary = Field(default_factory=BinarySecurityRuntimeHealthSummary)
+    units: list[BinarySecurityRuntimeHealthUnit] = Field(default_factory=list)
+
+
 class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
     description: Optional[str] = None
     output_root: str
@@ -472,6 +507,7 @@ class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
     overview_nodes: list[BinarySecurityOverviewNode] = Field(default_factory=list)
     orchestration_observability: dict[str, Any] = Field(default_factory=dict)
     cleanup_snapshot: dict[str, Any] = Field(default_factory=dict)
+    runtime_health: BinarySecurityRuntimeHealthResponse = Field(default_factory=BinarySecurityRuntimeHealthResponse)
     abnormal_reason_history: list[BinarySecurityAbnormalReasonEventSummary] = Field(default_factory=list)
 
 
