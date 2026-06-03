@@ -3305,6 +3305,50 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("t1", response.task_id)
         self.assertTrue(any(node.node_id == "business:firmware_unpack" for node in response.nodes))
 
+    def test_get_task_overview_uses_stage_summary_snapshot_for_idle_stages(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/in",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="running",
+            current_stage="system_analysis",
+        )
+        task.stage_summary = {
+            "firmware_unpack": {"sequence_no": 1, "status": "success", "counts": {"total_items": 1, "success_items": 1}},
+            "system_analysis": {"sequence_no": 2, "status": "running", "counts": {"total_items": 1, "running_items": 1}},
+            "binary_to_source": {"sequence_no": 3, "status": "pending", "counts": {"total_items": 0}},
+        }
+        run = BinarySecurityStageRun(
+            id="sr-system",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="i1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-system",
+            stage_name="system_analysis",
+            item_key="fw1",
+            status="running",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], archive_jobs=[], events=[])
+
+        response = self.manager.get_task_overview(db, project_id="p1", task_id="t1")
+
+        by_node = {node.node_id: node for node in response.nodes}
+        self.assertIn("business:firmware_unpack", by_node)
+        self.assertIn("business:system_analysis", by_node)
+        self.assertIn(by_node["business:system_analysis"].status, {"pending", "running"})
+
     def test_list_tasks_keeps_read_path_side_effect_free_when_stage_is_running(self):
         task = BinarySecurityTask(
             id="t1",

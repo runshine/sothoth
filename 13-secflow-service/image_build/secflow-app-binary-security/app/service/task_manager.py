@@ -2359,6 +2359,22 @@ class TaskManager:
             .order_by(BinarySecurityStageRun.sequence_no.asc())
             .all()
         )
+        stage_sequence = self._stage_sequence_for_task(task)
+        stage_summaries = self._build_stage_summaries_from_snapshot(task, stage_sequence)
+        summary_by_stage = {summary.stage_name: summary for summary in stage_summaries}
+        stage_names_needing_items = {
+            stage_name
+            for stage_name, summary in summary_by_stage.items()
+            if (
+                summary.total_items > 0
+                or summary.running_items > 0
+                or summary.failed_items > 0
+                or summary.downstream_missing_items > 0
+                or summary.cancelled_items > 0
+                or summary.status in {"running", "failed", "partial_success", "downstream_missing", "cancelled"}
+                or stage_name == task.current_stage
+            )
+        }
         stage_items = (
             db.query(BinarySecurityStageItem)
             .options(
@@ -2383,7 +2399,10 @@ class TaskManager:
                     BinarySecurityStageItem.updated_at,
                 )
             )
-            .filter(BinarySecurityStageItem.task_id == task.id)
+            .filter(
+                BinarySecurityStageItem.task_id == task.id,
+                BinarySecurityStageItem.stage_name.in_(list(stage_names_needing_items or stage_sequence)),
+            )
             .order_by(BinarySecurityStageItem.created_at.asc(), BinarySecurityStageItem.id.asc())
             .all()
         )
@@ -2415,8 +2434,10 @@ class TaskManager:
             .order_by(BinarySecurityArchiveJob.created_at.asc(), BinarySecurityArchiveJob.id.asc())
             .all()
         )
-        stage_sequence = self._stage_sequence_for_task(task)
-        stage_summaries = self._build_stage_summaries(db, task, stage_sequence, stage_runs, stage_items)
+        if stage_items:
+            refreshed_summaries = self._build_stage_summaries(db, task, stage_sequence, stage_runs, stage_items, include_retry_support=False)
+            refreshed_by_stage = {summary.stage_name: summary for summary in refreshed_summaries}
+            stage_summaries = [refreshed_by_stage.get(stage_name, summary_by_stage.get(stage_name) or BinarySecurityStageSummary(stage_name=stage_name, sequence_no=index, status="pending")) for index, stage_name in enumerate(stage_sequence, start=1)]
         abnormal_reason = None
         if isinstance(task.latest_abnormal_reason, dict):
             try:
@@ -15288,6 +15309,7 @@ class TaskManager:
         summaries: list[BinarySecurityStageSummary] = []
         for index, stage_name in enumerate(stage_sequence, start=1):
             payload = snapshot.get(stage_name) if isinstance(snapshot.get(stage_name), dict) else {}
+            counts = payload.get("counts") if isinstance(payload.get("counts"), dict) else {}
             summary = BinarySecurityStageSummary(
                 stage_name=stage_name,
                 sequence_no=int(payload.get("sequence_no") or index),
@@ -15299,14 +15321,14 @@ class TaskManager:
                 retry_failed_reason=None,
                 retry_full_supported=False,
                 retry_full_reason=None,
-                total_items=int(payload.get("total_items") or 0),
-                success_items=int(payload.get("success_items") or 0),
-                failed_items=int(payload.get("failed_items") or 0),
-                orchestration_failed_items=int(payload.get("orchestration_failed_items") or payload.get("failed_items") or 0),
-                downstream_missing_items=int(payload.get("downstream_missing_items") or 0),
-                skipped_items=int(payload.get("skipped_items") or 0),
-                running_items=int(payload.get("running_items") or 0),
-                cancelled_items=int(payload.get("cancelled_items") or 0),
+                total_items=int(payload.get("total_items") or counts.get("total_items") or 0),
+                success_items=int(payload.get("success_items") or counts.get("success_items") or 0),
+                failed_items=int(payload.get("failed_items") or counts.get("failed_items") or 0),
+                orchestration_failed_items=int(payload.get("orchestration_failed_items") or counts.get("orchestration_failed_items") or payload.get("failed_items") or counts.get("failed_items") or 0),
+                downstream_missing_items=int(payload.get("downstream_missing_items") or counts.get("downstream_missing_items") or 0),
+                skipped_items=int(payload.get("skipped_items") or counts.get("skipped_items") or 0),
+                running_items=int(payload.get("running_items") or counts.get("running_items") or 0),
+                cancelled_items=int(payload.get("cancelled_items") or counts.get("cancelled_items") or 0),
                 downstream_status_counts=dict(payload.get("downstream_status_counts") or {}),
                 started_at=payload.get("started_at"),
                 finished_at=payload.get("finished_at"),
