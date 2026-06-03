@@ -4,8 +4,8 @@ database:
   username: "secflow"
   password: "Huawei12#$"
   name: "secflow"
-  pool_size: 10
-  max_overflow: 20
+  pool_size: 5
+  max_overflow: 10
 
 auth_service:
   host: "secflow-platform-auth"
