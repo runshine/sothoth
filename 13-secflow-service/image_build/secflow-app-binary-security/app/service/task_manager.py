@@ -13419,6 +13419,7 @@ class TaskManager:
     @staticmethod
     def _preserved_child_result_keys() -> tuple[str, ...]:
         return (
+            "first_started_at",
             "sync_status",
             "downstream_status_synced_at",
             "downstream_status",
@@ -13544,6 +13545,28 @@ class TaskManager:
         if reset_finished_at:
             item.finished_at = None
         return preserved_keys
+
+    @staticmethod
+    def _stage_item_first_started_at(item: BinarySecurityStageItem) -> datetime | None:
+        result_payload = dict(item.result or {})
+        raw_value = result_payload.get("first_started_at")
+        if isinstance(raw_value, datetime):
+            return raw_value
+        if isinstance(raw_value, str) and raw_value.strip():
+            try:
+                return datetime.fromisoformat(raw_value)
+            except ValueError:
+                return None
+        return item.started_at
+
+    def _ensure_stage_item_first_started_at(self, item: BinarySecurityStageItem) -> None:
+        if item.started_at is None:
+            return
+        result_payload = dict(item.result or {})
+        current = self._stage_item_first_started_at(item)
+        if current is None:
+            result_payload["first_started_at"] = item.started_at.isoformat()
+            item.result = result_payload
 
     def _build_child_status_event_payload(
         self,
@@ -16222,6 +16245,9 @@ class TaskManager:
                 parsed_last_error_at = datetime.fromisoformat(last_error_at)
             except ValueError:
                 parsed_last_error_at = None
+        first_started_at = self._stage_item_first_started_at(item)
+        latest_started_at = item.started_at
+        total_retry_count = int(item.retry_count or 0) + int(item.rerun_count or 0)
         binding = self._downstream_binding_snapshot(item)
         binding_state = self._downstream_binding_state(item)
         freshness_state = self._stage_item_sync_freshness_state(
@@ -16240,6 +16266,7 @@ class TaskManager:
             retry_count=int(item.retry_count or 0),
             rerun_count=int(item.rerun_count or 0),
             auto_retry_count=int(item.retry_count or 0),
+            total_retry_count=total_retry_count,
             downstream_service=item.downstream_service,
             downstream_task_id=item.downstream_task_id,
             downstream_status=downstream_status,
@@ -16272,6 +16299,8 @@ class TaskManager:
             sync_observation_error_message=self._string_or_none(sync_observation.get("error_message")),
             sync_observation_error_type=self._string_or_none(sync_observation.get("error_type")),
             sync_observation_http_status=self._int_or_none(sync_observation.get("http_status")),
+            first_started_at=first_started_at,
+            latest_started_at=latest_started_at,
             started_at=item.started_at,
             finished_at=item.finished_at,
         )
@@ -17911,6 +17940,7 @@ class TaskManager:
                 downstream_service=downstream_service,
                 started_at=self._stage_item_started_at(running_status),
             )
+            self._ensure_stage_item_first_started_at(item)
             item.retry_count = int(item.retry_count or 0)
             item.rerun_count = int(item.rerun_count or 0)
             if retrying:
@@ -17934,6 +17964,7 @@ class TaskManager:
             )
             if not keep_existing_active:
                 item.started_at = self._stage_item_started_at(running_status)
+                self._ensure_stage_item_first_started_at(item)
             if retrying:
                 item.rerun_count = int(item.rerun_count or 0) + 1
             if auto_retrying:
@@ -17974,6 +18005,7 @@ class TaskManager:
                 )
                 if not keep_existing_active:
                     existing.started_at = self._stage_item_started_at(running_status)
+                    self._ensure_stage_item_first_started_at(existing)
                 existing.input_ref = input_ref
                 if output_ref is not None:
                     existing.output_ref = output_ref

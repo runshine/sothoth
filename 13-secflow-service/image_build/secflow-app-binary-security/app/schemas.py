@@ -343,6 +343,7 @@ class BinarySecurityStageItemResponse(BaseModel):
     retry_count: int = 0
     rerun_count: int = 0
     auto_retry_count: int = 0
+    total_retry_count: int = 0
     downstream_service: Optional[str] = None
     downstream_task_id: Optional[str] = None
     downstream_status: Optional[str] = None
@@ -375,6 +376,8 @@ class BinarySecurityStageItemResponse(BaseModel):
     sync_observation_error_message: Optional[str] = None
     sync_observation_error_type: Optional[str] = None
     sync_observation_http_status: Optional[int] = None
+    first_started_at: Optional[datetime] = None
+    latest_started_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
 
