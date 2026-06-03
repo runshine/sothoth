@@ -47,9 +47,9 @@ spec:
           - name: DFA_ENABLE_REGISTRY
             value: "false"
           - name: DFA_LEASE_TTL_SECONDS
-            value: "90"
+            value: "300"
           - name: DFA_HEARTBEAT_INTERVAL_SECONDS
-            value: "15"
+            value: "60"
           - name: DFA_MAX_LOCAL_RUNNING_TASKS
             value: "4"
           - name: DFA_CLUSTER_EXPECTED_WORKERS
