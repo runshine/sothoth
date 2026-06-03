@@ -91,6 +91,7 @@ RECURSIVE_ARCHIVE_FORMATS = {
 }
 REDUNDANT_ZLIB_BASENAME_RE = re.compile(r"^[0-9A-Fa-f]{6,}\.zlib$")
 REDUNDANT_ZLIB_MIN_BYTES = 1024 * 1024
+REDUNDANT_ARTIFACT_SOURCE_RE = re.compile(r"^[0-9A-Fa-f]{6,}\.(gz|7z|lzma|zlib)$")
 
 
 def _safe_relpath(path: Path, root: Path) -> str:
@@ -136,7 +137,7 @@ def _count_tree_entries(path: Path) -> int:
     return total
 
 
-def _cleanup_redundant_zlib_blobs(output_path: str) -> dict[str, Any]:
+def _cleanup_known_artifact_sources(output_path: str) -> dict[str, Any]:
     output_root = Path(output_path)
     deleted_files: list[str] = []
     deleted_bytes = 0
@@ -148,17 +149,17 @@ def _cleanup_redundant_zlib_blobs(output_path: str) -> dict[str, Any]:
             "deleted_files": deleted_files,
             "failed_files": failed_files,
         }
-    for path in output_root.rglob("*.zlib"):
+    for path in output_root.rglob("*"):
         if not path.is_file():
             continue
-        if not REDUNDANT_ZLIB_BASENAME_RE.match(path.name):
+        if not REDUNDANT_ARTIFACT_SOURCE_RE.match(path.name):
             continue
         try:
             size_bytes = int(path.stat().st_size)
         except Exception as exc:
             failed_files.append({"path": str(path), "error": str(exc)})
             continue
-        if size_bytes < REDUNDANT_ZLIB_MIN_BYTES:
+        if path.suffix.lower() == ".zlib" and size_bytes < REDUNDANT_ZLIB_MIN_BYTES:
             continue
         try:
             path.unlink()
@@ -292,13 +293,25 @@ def _run_recursive_expand(
     failed_items_count = 0
     skipped_blacklist_items = 0
     total_new_paths = 0
+    pre_cleanup_result = _cleanup_known_artifact_sources(output_path)
+    _append_stage_log(
+        round_dir,
+        "recursive_expand.log",
+        "recursive expand pre-cleanup completed",
+        deleted_count=pre_cleanup_result.get("deleted_count", 0),
+        deleted_bytes=pre_cleanup_result.get("deleted_bytes", 0),
+        failed_count=len(pre_cleanup_result.get("failed_files", [])),
+    )
     if event_callback:
         event_callback(
             "recursive_expand_started",
             "开始递归展开确定性可识别文件",
             stage_key="recursive_expand",
             status="running",
-            detail={"max_rounds": max_rounds},
+            detail={
+                "max_rounds": max_rounds,
+                "pre_cleanup_deleted_count": pre_cleanup_result.get("deleted_count", 0),
+            },
         )
     for round_index in range(1, max_rounds + 1):
         if cancel_check and cancel_check():
@@ -423,6 +436,7 @@ def _run_recursive_expand(
             "deleted_source_items": deleted_source_items,
             "total_new_paths": total_new_paths,
         },
+        "pre_cleanup": pre_cleanup_result,
         "failed_blacklist": sorted(failed_blacklist),
         "failed_items": failed_items,
     }
@@ -1348,11 +1362,11 @@ def _run_cleaner(
         "starting cleanup",
         output_path=output_path,
     )
-    redundant_zlib_cleanup = _cleanup_redundant_zlib_blobs(output_path)
+    redundant_zlib_cleanup = _cleanup_known_artifact_sources(output_path)
     _append_stage_log(
         log_dir,
         "cleaner.log",
-        "pre-cleaned redundant zlib blobs",
+        "pre-cleaned known artifact sources",
         deleted_count=redundant_zlib_cleanup.get("deleted_count"),
         deleted_bytes=redundant_zlib_cleanup.get("deleted_bytes"),
         failed_count=len(list(redundant_zlib_cleanup.get("failed_files") or [])),
