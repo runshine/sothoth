@@ -5,6 +5,7 @@ import dataclasses
 import hashlib
 import logging
 from collections import deque
+from collections import defaultdict
 import threading
 import time
 from datetime import timedelta
@@ -94,6 +95,15 @@ class SchedulerService:
         self._dispatch_capacity_conflict_total = 0
         self._dispatch_backoff_scheduled_total = 0
         self._dispatch_skipped_due_to_backoff_total = 0
+        self._heartbeat_metrics_lock = threading.Lock()
+        self._heartbeat_success_total = 0
+        self._heartbeat_failure_total = 0
+        self._heartbeat_failure_reasons: dict[str, int] = defaultdict(int)
+        self._heartbeat_loop_alive = 0
+        self._last_heartbeat_success_at = None
+        self._last_heartbeat_failure_at = None
+        self._last_heartbeat_failure_reason = ""
+        self._last_heartbeat_log_at_by_reason: dict[str, float] = {}
 
     @property
     def role(self) -> str:
@@ -237,8 +247,12 @@ class SchedulerService:
         self._worker_status = "active"
         self._tasks = []
         if self.runs_worker:
-            await asyncio.to_thread(self._heartbeat_once)
             self._tasks.append(asyncio.create_task(self._heartbeat_loop(), name="scheduler-heartbeat"))
+            try:
+                await asyncio.to_thread(self._heartbeat_once)
+            except Exception:
+                self._record_heartbeat_failure("startup_initial_heartbeat")
+                logger.exception("initial worker heartbeat publish failed during scheduler start: pod=%s", self.pod_id)
         if self.runs_worker and self.role == "standalone":
             self._tasks.extend(
                 [
@@ -286,6 +300,7 @@ class SchedulerService:
                 db.close()
 
     def health_payload(self) -> Dict[str, str]:
+        heartbeat_metrics = self.heartbeat_metrics()
         return {
             "status": "ok",
             "pod_id": self.pod_id,
@@ -293,6 +308,8 @@ class SchedulerService:
             "scheduler": "running" if self._started else "stopped",
             "scheduler_role": self.role,
             "worker_enabled": "true" if self.runs_worker else "false",
+            "heartbeat_loop_alive": "true" if heartbeat_metrics.get("loop_alive") else "false",
+            "heartbeat_last_failure_reason": str(heartbeat_metrics.get("last_failure_reason") or ""),
         }
 
     def advertise_url(self) -> str:
@@ -765,6 +782,26 @@ class SchedulerService:
                 "active_worker_cooldowns": len(self._worker_cooldown_until_by_pod),
             }
 
+    def heartbeat_metrics(self) -> dict[str, Any]:
+        with self._heartbeat_metrics_lock:
+            success_age_seconds = None
+            failure_age_seconds = None
+            if self._last_heartbeat_success_at is not None:
+                success_age_seconds = max((now_local() - self._last_heartbeat_success_at).total_seconds(), 0.0)
+            if self._last_heartbeat_failure_at is not None:
+                failure_age_seconds = max((now_local() - self._last_heartbeat_failure_at).total_seconds(), 0.0)
+            return {
+                "success_total": self._heartbeat_success_total,
+                "failure_total": self._heartbeat_failure_total,
+                "failure_reasons": dict(self._heartbeat_failure_reasons),
+                "loop_alive": self._heartbeat_loop_alive,
+                "last_success_at": self._last_heartbeat_success_at,
+                "last_failure_at": self._last_heartbeat_failure_at,
+                "last_failure_reason": self._last_heartbeat_failure_reason,
+                "last_success_age_seconds": success_age_seconds,
+                "last_failure_age_seconds": failure_age_seconds,
+            }
+
     def _set_cluster_capacity_summary_snapshot(
         self,
         snapshot: WorkerClusterCapacitySummaryResponse,
@@ -885,9 +922,19 @@ class SchedulerService:
 
     async def _heartbeat_loop(self) -> None:
         interval = get_config().scheduler.heartbeat_interval_seconds
+        with self._heartbeat_metrics_lock:
+            self._heartbeat_loop_alive = 1
         while True:
             await asyncio.sleep(interval)
-            await asyncio.to_thread(self._heartbeat_once)
+            try:
+                await asyncio.to_thread(self._heartbeat_once)
+            except asyncio.CancelledError:
+                with self._heartbeat_metrics_lock:
+                    self._heartbeat_loop_alive = 0
+                raise
+            except Exception as exc:
+                self._record_heartbeat_failure(type(exc).__name__)
+                self._log_heartbeat_failure(exc)
 
     def _heartbeat_once(self) -> None:
         if not self.runs_worker:
@@ -932,8 +979,48 @@ class SchedulerService:
             db.add(worker)
             db.commit()
             self._heartbeat_published = True
+            self._record_heartbeat_success(now)
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                logger.exception("failed to rollback worker heartbeat session: pod=%s", self.pod_id)
+            raise
         finally:
             db.close()
+
+    def _record_heartbeat_success(self, heartbeat_at) -> None:
+        with self._heartbeat_metrics_lock:
+            self._heartbeat_success_total += 1
+            self._last_heartbeat_success_at = heartbeat_at
+            self._last_heartbeat_failure_reason = ""
+
+    def _record_heartbeat_failure(self, reason: str) -> None:
+        reason_key = str(reason or "unknown").strip().lower() or "unknown"
+        with self._heartbeat_metrics_lock:
+            self._heartbeat_failure_total += 1
+            self._heartbeat_failure_reasons[reason_key] += 1
+            self._last_heartbeat_failure_at = now_local()
+            self._last_heartbeat_failure_reason = reason_key
+
+    def _log_heartbeat_failure(self, exc: Exception) -> None:
+        reason_key = type(exc).__name__.lower() or "unknown"
+        now_monotonic = self._now_monotonic()
+        should_log = False
+        with self._heartbeat_metrics_lock:
+            last_logged_at = self._last_heartbeat_log_at_by_reason.get(reason_key, 0.0)
+            if now_monotonic - last_logged_at >= 30:
+                self._last_heartbeat_log_at_by_reason[reason_key] = now_monotonic
+                should_log = True
+        if should_log:
+            logger.exception("worker heartbeat publish failed; continuing retry loop: pod=%s", self.pod_id)
+        else:
+            logger.warning(
+                "worker heartbeat publish failed; continuing retry loop: pod=%s reason=%s error=%s",
+                self.pod_id,
+                reason_key,
+                exc,
+            )
 
     async def _dispatch_loop(self) -> None:
         interval = get_config().scheduler.poll_interval_seconds
@@ -1696,6 +1783,14 @@ class SchedulerService:
 
             trigger = db.get(TriggerTask, execution.trigger_task_id)
             message = f"worker job start failed before process launch, requeued: {error}"
+            lowered_error = str(error or "").lower()
+            projection_write_involved = "task_list_projection" in lowered_error or "projection" in lowered_error
+            if projection_write_involved or "pendingrollbackerror" in lowered_error or "duplicate entry" in lowered_error:
+                root_cause_category = "startup_metadata_write_conflict"
+            elif "startup grace" in lowered_error or "without process registration" in lowered_error:
+                root_cause_category = "startup_grace_exceeded_without_process_registration"
+            else:
+                root_cause_category = "process_launch_precondition_failed"
             worker_url = execution.worker_url
             owner_pod_id = execution.owner_pod_id
             worker_job_id = execution.worker_job_id
@@ -1737,6 +1832,10 @@ class SchedulerService:
                     "owner_pod_id": owner_pod_id,
                     "worker_job_id": worker_job_id,
                     "process_pid": None,
+                    "exception_class": type(error).__name__,
+                    "root_cause_category": root_cause_category,
+                    "projection_write_involved": projection_write_involved,
+                    "session_rollback_applied": True,
                 },
             )
             get_execution_service().record_event(
@@ -1745,7 +1844,15 @@ class SchedulerService:
                 event_type="worker_job_requeued_before_process_start",
                 message=message,
                 level="warning",
-                payload_json={"reason": "process_not_started", "error": error, "worker_pod_id": self.pod_id},
+                payload_json={
+                    "reason": "process_not_started",
+                    "error": error,
+                    "worker_pod_id": self.pod_id,
+                    "exception_class": type(error).__name__,
+                    "root_cause_category": root_cause_category,
+                    "projection_write_involved": projection_write_involved,
+                    "session_rollback_applied": True,
+                },
             )
             self._record_execution_health_sample(
                 "requeued_before_process_start",

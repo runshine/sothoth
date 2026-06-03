@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import pytest
 
 from app.config import get_config
 from app.main import create_app
@@ -699,8 +701,8 @@ def test_worker_jobs_api_claims_and_starts_assigned_execution(
     assert response.status_code == 200
     payload = response.json()
     assert payload["id"] == execution_id
-    assert payload["status"] == "dispatching"
-    assert payload["phase"] == "queued"
+    assert payload["status"] == "starting"
+    assert payload["phase"] == "starting"
     assert started == [execution_id]
 
     list_response = client.get("/api/v1/jobs")
@@ -715,12 +717,12 @@ def test_worker_jobs_api_claims_and_starts_assigned_execution(
         trigger = db.get(TriggerTask, "tt-sched-worker-api")
         assert execution is not None
         assert trigger is not None
-        assert execution.status == "dispatching"
+        assert execution.status == "starting"
         assert trigger.status == "dispatching"
         assert execution.owner_pod_id == "worker-pod"
         assert execution.worker_url == "http://worker-pod"
         assert execution.worker_job_id == execution_id
-        assert execution.dispatch_status == "queued"
+        assert execution.dispatch_status == "starting"
     finally:
         db.close()
 
@@ -1169,3 +1171,76 @@ def test_cluster_capacity_summary_ignores_stale_worker_running_count(
         assert target.available_slots == 2
     finally:
         db.close()
+
+
+def test_worker_heartbeat_loop_retries_after_failure(service_config_path: Path, monkeypatch):
+    config = get_config()
+    config.scheduler.enabled = True
+    config.scheduler.role = "worker"
+    config.scheduler.pod_id = "worker-heartbeat-loop"
+    config.scheduler.host_name = "worker-heartbeat-loop"
+    config.scheduler.heartbeat_interval_seconds = 0
+
+    scheduler = SchedulerService()
+    calls: list[str] = []
+
+    def fake_heartbeat_once():
+        calls.append("heartbeat")
+        if len(calls) == 1:
+            raise RuntimeError("db down")
+        raise asyncio.CancelledError()
+
+    async def fake_sleep(_interval):
+        return None
+
+    monkeypatch.setattr(scheduler, "_heartbeat_once", fake_heartbeat_once)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(scheduler._heartbeat_loop())
+
+    metrics = scheduler.heartbeat_metrics()
+    assert len(calls) == 2
+    assert metrics["failure_total"] == 1
+    assert metrics["failure_reasons"]["runtimeerror"] == 1
+    assert metrics["loop_alive"] == 0
+
+
+def test_scheduler_start_survives_initial_heartbeat_failure(service_config_path: Path, monkeypatch):
+    config = get_config()
+    config.scheduler.enabled = True
+    config.scheduler.role = "worker"
+    config.scheduler.pod_id = "worker-heartbeat-start"
+    config.scheduler.host_name = "worker-heartbeat-start"
+
+    scheduler = SchedulerService()
+    created_tasks: list[str] = []
+
+    def fake_heartbeat_once():
+        raise RuntimeError("mysql unavailable")
+
+    async def fake_start_assigned_jobs():
+        return None
+
+    def fake_create_task(coro, name=None):
+        coro.close()
+
+        class DummyTask:
+            def cancel(self):
+                return None
+
+        created_tasks.append(str(name or "unnamed"))
+        return DummyTask()
+
+    monkeypatch.setattr(scheduler, "_heartbeat_once", fake_heartbeat_once)
+    monkeypatch.setattr(scheduler, "_start_assigned_jobs", lambda: None)
+    monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+
+    asyncio.run(scheduler.start())
+
+    metrics = scheduler.heartbeat_metrics()
+    assert scheduler._started is True
+    assert "scheduler-heartbeat" in created_tasks
+    assert "scheduler-assigned-dispatch" in created_tasks
+    assert metrics["failure_total"] == 1
+    assert metrics["failure_reasons"]["startup_initial_heartbeat"] == 1

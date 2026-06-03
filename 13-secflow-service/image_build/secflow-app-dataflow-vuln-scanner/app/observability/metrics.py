@@ -451,6 +451,10 @@ def _collect_scheduler_metrics(db: Session, builder: MetricsBuilder) -> None:
     builder.metric("secflow_dataflow_dispatch_skipped_due_to_backoff_total", "counter", "Dispatch attempts skipped because execution backoff was active.")
     builder.metric("secflow_dataflow_worker_cooldown_active_count", "gauge", "Workers currently in local dispatch cooldown.")
     builder.metric("secflow_dataflow_execution_backoff_active_count", "gauge", "Executions currently in local dispatch backoff.")
+    builder.metric("dfvs_scheduler_heartbeat_success_total", "counter", "Worker heartbeat publish successes observed by this process.")
+    builder.metric("dfvs_scheduler_heartbeat_failure_total", "counter", "Worker heartbeat publish failures observed by this process.")
+    builder.metric("dfvs_scheduler_heartbeat_loop_alive", "gauge", "Whether the local worker heartbeat loop is alive.")
+    builder.metric("dfvs_scheduler_worker_heartbeat_age_seconds", "gauge", "Age of the last local worker heartbeat observation.")
 
     workers = db.query(SchedulerWorker).all()
     db_capacity = sum(int(worker.capacity or 0) for worker in workers)
@@ -490,6 +494,41 @@ def _collect_scheduler_metrics(db: Session, builder: MetricsBuilder) -> None:
     builder.sample("secflow_dataflow_dispatch_skipped_due_to_backoff_total", backoff_metrics.get("skipped_due_to_backoff_total", 0))
     builder.sample("secflow_dataflow_worker_cooldown_active_count", backoff_metrics.get("active_worker_cooldowns", 0))
     builder.sample("secflow_dataflow_execution_backoff_active_count", backoff_metrics.get("active_execution_backoffs", 0))
+    heartbeat_metrics = scheduler.heartbeat_metrics()
+    builder.sample(
+        "dfvs_scheduler_heartbeat_success_total",
+        heartbeat_metrics.get("success_total", 0),
+        {"role": scheduler.role, "pod_id": scheduler.pod_id},
+    )
+    for reason, count in sorted((heartbeat_metrics.get("failure_reasons") or {}).items()):
+        builder.sample(
+            "dfvs_scheduler_heartbeat_failure_total",
+            count,
+            {"role": scheduler.role, "pod_id": scheduler.pod_id, "reason": str(reason or "unknown")},
+        )
+    if not (heartbeat_metrics.get("failure_reasons") or {}):
+        builder.sample(
+            "dfvs_scheduler_heartbeat_failure_total",
+            0,
+            {"role": scheduler.role, "pod_id": scheduler.pod_id, "reason": "none"},
+        )
+    builder.sample(
+        "dfvs_scheduler_heartbeat_loop_alive",
+        int(bool(heartbeat_metrics.get("loop_alive"))),
+        {"role": scheduler.role, "pod_id": scheduler.pod_id},
+    )
+    if heartbeat_metrics.get("last_success_age_seconds") is not None:
+        builder.sample(
+            "dfvs_scheduler_worker_heartbeat_age_seconds",
+            heartbeat_metrics.get("last_success_age_seconds", 0),
+            {"role": scheduler.role, "pod_id": scheduler.pod_id, "kind": "success"},
+        )
+    if heartbeat_metrics.get("last_failure_age_seconds") is not None:
+        builder.sample(
+            "dfvs_scheduler_worker_heartbeat_age_seconds",
+            heartbeat_metrics.get("last_failure_age_seconds", 0),
+            {"role": scheduler.role, "pod_id": scheduler.pod_id, "kind": "failure"},
+        )
 
 
 def _collect_scheduler_snapshot_metrics(builder: MetricsBuilder) -> None:
