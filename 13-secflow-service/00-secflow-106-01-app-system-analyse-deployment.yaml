@@ -30,11 +30,11 @@ spec:
           - name: SECFLOW_SYSTEM_ANALYSE_DB_AUTO_MIGRATE
             value: "true"
           - name: SECFLOW_SYSTEM_ANALYSE_DB_POOL_SIZE_API
-            value: "5"
+            value: "20"
           - name: SECFLOW_SYSTEM_ANALYSE_DB_MAX_OVERFLOW_API
-            value: "5"
+            value: "20"
           - name: SECFLOW_SYSTEM_ANALYSE_DB_POOL_TIMEOUT_API
-            value: "10"
+            value: "5"
           - name: SECFLOW_SYSTEM_ANALYSE_DB_POOL_RECYCLE_API
             value: "1800"
         ports:
