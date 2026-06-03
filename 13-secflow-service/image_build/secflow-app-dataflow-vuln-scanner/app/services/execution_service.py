@@ -1737,6 +1737,7 @@ class ExecutionService:
         model: str | None = None,
         mode: str | None = None,
         parent_task_id: str | None = None,
+        parent_stage_item_id: str | None = None,
         sort_by: str | None = None,
         sort_order: str | None = None,
     ):
@@ -1785,6 +1786,9 @@ class ExecutionService:
         normalized_parent_task_id = str(parent_task_id or "").strip()
         if normalized_parent_task_id:
             query = query.filter(DfvsTaskListProjection.parent_task_id == normalized_parent_task_id)
+        normalized_parent_stage_item_id = str(parent_stage_item_id or "").strip()
+        if normalized_parent_stage_item_id:
+            query = query.filter(DfvsTaskListProjection.parent_stage_item_id == normalized_parent_stage_item_id)
         normalized_sort_by = str(sort_by or "created_at").strip()
         sort_column = _TASK_LIST_SORT_COLUMNS.get(normalized_sort_by)
         if sort_column is None:
