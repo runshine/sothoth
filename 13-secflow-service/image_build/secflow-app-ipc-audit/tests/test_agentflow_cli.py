@@ -124,7 +124,7 @@ class AgentFlowCliModeTest(unittest.TestCase):
             [item["path"] for item in audit_sessions],
             [
                 "runtime/audit/prompt.txt",
-                "runtime/audit/events.jsonl",
+                "runtime/agentflow-runs/run_fake/artifacts/audit/trace.jsonl",
                 "runtime/audit/last-message.md",
             ],
         )
@@ -132,18 +132,18 @@ class AgentFlowCliModeTest(unittest.TestCase):
             [item["path"] for item in poc_sessions],
             [
                 "runtime/poc/prompt.txt",
-                "runtime/poc/events.jsonl",
+                "runtime/agentflow-runs/run_fake/artifacts/poc/trace.jsonl",
                 "runtime/poc/last-message.md",
             ],
         )
 
-        audit_events = get_task_service().get_stage_session_file(
+        audit_trace = get_task_service().get_stage_session_file(
             task.task_id,
             str(detail.latest_attempt_id),
             "audit",
-            "runtime/audit/events.jsonl",
+            "runtime/agentflow-runs/run_fake/artifacts/audit/trace.jsonl",
         )["content"]
-        self.assertIn('"type": "assistant_message"', audit_events)
+        self.assertIn('"kind": "assistant_message"', audit_trace)
 
         poc_last_message = get_task_service().get_stage_session_file(
             task.task_id,
@@ -154,10 +154,6 @@ class AgentFlowCliModeTest(unittest.TestCase):
         self.assertIn("# Fake AgentFlow Message", poc_last_message)
 
         event_page = get_task_service().list_events(task.task_id, attempt_id=str(detail.latest_attempt_id), cursor=None, limit=200)
-        stdout_event = next(item for item in event_page.items if item.event_type == "stage.stdout.appended" and item.stage_name == "audit")
-        self.assertEqual(stdout_event.payload["session_file_path"], "runtime/audit/events.jsonl")
-        self.assertEqual(stdout_event.payload["event_types"]["assistant_message"], 1)
-
         agent_event = next(item for item in event_page.items if item.event_type == "stage.agent.message" and item.stage_name == "poc")
         self.assertIn("# Fake AgentFlow Message", agent_event.payload["preview"])
 
@@ -530,7 +526,7 @@ class AgentFlowCliModeTest(unittest.TestCase):
         self.assertIn("exports/audited-result.json", artifact_by_path)
         self.assertEqual(artifact_by_path["exports/audited-result.json"].artifact_kind, "audited_result_json")
 
-    def test_custom_graph_stage_sessions_fallback_to_agentflow_trace_while_runtime_files_missing(self) -> None:
+    def test_custom_graph_stage_sessions_use_agentflow_trace_as_session_source(self) -> None:
         task = get_task_service().create_task(
             TaskCreateRequest(
                 title="dynamic-graph-session-fallback",
@@ -594,32 +590,37 @@ class AgentFlowCliModeTest(unittest.TestCase):
 
         stage_sessions = get_task_service().list_stage_sessions(task.task_id, attempt_id, "stage1")
         session_paths = [item["path"] for item in stage_sessions]
-        self.assertIn("runtime/stage1/events.jsonl", session_paths)
-        self.assertIn("runtime/stage1/last-message.md", session_paths)
+        self.assertIn("runtime/graph/agentflow-runs/run_fake/artifacts/stage1/trace.jsonl", session_paths)
+        self.assertNotIn("runtime/stage1/events.jsonl", session_paths)
+        self.assertNotIn("runtime/stage1/last-message.md", session_paths)
         runtime_events_path = attempt_root / "runtime" / "stage1" / "events.jsonl"
-        runtime_events_before = runtime_events_path.read_text(encoding="utf-8") if runtime_events_path.exists() else None
 
-        events_file = get_task_service().get_stage_session_file(
+        trace_file = get_task_service().get_stage_session_file(
             task.task_id,
             attempt_id,
             "stage1",
-            "runtime/stage1/events.jsonl",
+            "runtime/graph/agentflow-runs/run_fake/artifacts/stage1/trace.jsonl",
         )
-        if runtime_events_before is None:
-            self.assertFalse(runtime_events_path.exists())
-        else:
-            self.assertEqual(runtime_events_path.read_text(encoding="utf-8"), runtime_events_before)
-        self.assertIn('"type": "assistant_message"', events_file["content"])
-        self.assertIn("# Runtime Trace", events_file["content"])
-        self.assertGreater(events_file["next_cursor"], 0)
+        self.assertIn('"kind": "assistant_message"', trace_file["content"])
+        self.assertIn("# Runtime Trace", trace_file["content"])
+        self.assertGreater(trace_file["next_cursor"], 0)
 
-        last_message_file = get_task_service().get_stage_session_file(
-            task.task_id,
-            attempt_id,
-            "stage1",
-            "runtime/stage1/last-message.md",
-        )
-        self.assertIn("# Runtime Trace", last_message_file["content"])
+        with self.assertRaises(HTTPException):
+            get_task_service().get_stage_session_file(
+                task.task_id,
+                attempt_id,
+                "stage1",
+                "runtime/stage1/events.jsonl",
+            )
+        self.assertFalse(runtime_events_path.exists())
+
+        with self.assertRaises(HTTPException):
+            get_task_service().get_stage_session_file(
+                task.task_id,
+                attempt_id,
+                "stage1",
+                "runtime/stage1/last-message.md",
+            )
 
     def test_custom_graph_inline_json_supports_bracketed_report_output_access(self) -> None:
         task = get_task_service().create_task(

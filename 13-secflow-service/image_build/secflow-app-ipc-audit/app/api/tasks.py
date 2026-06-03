@@ -22,9 +22,7 @@ from app.schemas import (
     TaskSummaryResponse,
 )
 from app.services.task_service import (
-    extract_complete_jsonl_byte_chunks,
     get_task_service,
-    normalize_agentflow_trace_jsonl_line,
 )
 
 router = APIRouter()
@@ -153,11 +151,7 @@ async def stream_stage_session_file(
                     position += len(chunk)
                     if normalized.name.endswith(".jsonl"):
                         pending += chunk
-                        if source.mode == "agentflow_trace":
-                            raw_lines, pending = extract_complete_jsonl_byte_chunks(pending)
-                            lines = [line for raw in raw_lines if (line := normalize_agentflow_trace_jsonl_line(raw))]
-                        else:
-                            lines, pending = _extract_complete_lines(pending)
+                        lines, pending = _extract_complete_lines(pending)
                         if lines:
                             yield _sse(
                                 "delta",

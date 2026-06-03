@@ -510,39 +510,7 @@ def write_last_message_from_jsonl(events_path: Path, output_path: Path) -> Path 
     return write_text_file(output_path, last_message.rstrip() + "\n")
 
 
-def write_agentflow_events_from_trace(trace_path: Path, output_path: Path) -> Path | None:
-    if not trace_path.exists():
-        return None
-    normalized_lines: list[str] = []
-    for raw_line in trace_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        stripped = raw_line.strip()
-        if not stripped:
-            continue
-        try:
-            item = json.loads(stripped)
-        except json.JSONDecodeError:
-            normalized_lines.append(stripped)
-            continue
-        normalized = {
-            "type": item.get("kind") or "event",
-            "title": item.get("title"),
-            "content": item.get("content"),
-            "timestamp": item.get("timestamp"),
-            "agent": item.get("agent"),
-            "attempt": item.get("attempt"),
-            "source": item.get("source"),
-            "raw": item.get("raw"),
-        }
-        normalized_lines.append(json.dumps(normalized, ensure_ascii=False))
-    return write_text_file(output_path, "\n".join(normalized_lines) + ("\n" if normalized_lines else ""))
-
-
-def write_last_message_from_agentflow_result(
-    result_path: Path,
-    output_path: Path,
-    *,
-    trace_path: Path | None = None,
-) -> Path | None:
+def write_last_message_from_agentflow_result(result_path: Path, output_path: Path) -> Path | None:
     final_message: str | None = None
     if result_path.exists():
         try:
@@ -551,18 +519,6 @@ def write_last_message_from_agentflow_result(
             payload = None
         if isinstance(payload, dict):
             final_message = str(payload.get("final_response") or payload.get("output") or "").strip() or None
-    if not final_message and trace_path is not None and trace_path.exists():
-        for raw_line in trace_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            stripped = raw_line.strip()
-            if not stripped:
-                continue
-            try:
-                item = json.loads(stripped)
-            except json.JSONDecodeError:
-                continue
-            message = str(item.get("content") or "").strip()
-            if message and str(item.get("kind") or "").strip() in {"assistant_message", "completed", "result"}:
-                final_message = message
     if not final_message:
         return None
     return write_text_file(output_path, final_message.rstrip() + "\n")

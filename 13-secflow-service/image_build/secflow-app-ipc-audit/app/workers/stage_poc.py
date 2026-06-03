@@ -30,7 +30,6 @@ from app.workers.runner import (
     resolve_stage_executor_model,
     resolve_stage_work_dir,
     run_logged_command,
-    write_agentflow_events_from_trace,
     write_json_file,
     write_last_message_from_agentflow_result,
     write_last_message_from_jsonl,
@@ -196,7 +195,6 @@ def _run_mock_stage(
             ]
         ),
     )
-    write_text_file(events_path, "")
     write_text_file(
         final_report_path,
         "\n".join(
@@ -242,7 +240,7 @@ def _run_mock_stage(
             StageArtifact("poc_report", final_report_path, display_name=final_report_path.name),
             StageArtifact("audited_result_json", final_json_path, display_name=final_json_path.name),
         ],
-        session_files=[prompt_path, events_path, last_message_path],
+        session_files=[prompt_path, last_message_path],
         output_path=final_report_path,
         metadata={"executor_mode": "mock", "poc_skill": poc_skill},
     )
@@ -527,13 +525,11 @@ def _run_agentflow_single_node_stage(
     if stderr_path and stderr_path.exists() and stderr_path.stat().st_size > 0:
         append_file_to_log(log_path, stderr_path, "=== agentflow node stderr ===")
     if trace_path and trace_path.exists():
-        write_agentflow_events_from_trace(trace_path, events_path)
-    else:
-        write_text_file(events_path, "")
+        session_files.append(trace_path)
     if events_path.exists():
         session_files.append(events_path)
     if result_path and result_path.exists():
-        write_last_message_from_agentflow_result(result_path, last_message_path, trace_path=trace_path)
+        write_last_message_from_agentflow_result(result_path, last_message_path)
     if last_message_path.exists():
         session_files.append(last_message_path)
     metadata = {

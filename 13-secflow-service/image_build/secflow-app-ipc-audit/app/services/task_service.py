@@ -41,14 +41,11 @@ from app.services.workspace_service import get_workspace_service
 from app.workers.poc_runtime import build_in_container_qemu_runtime, build_poc_qemu_instance_name
 from app.workers.runner import (
     StageContext,
-    discover_single_run_dir,
     build_agentflow_process_env_and_summary,
     normalize_attempt_relative_path,
     read_json_file,
     resolve_attempt_relative_path,
     resolve_stage_work_dir,
-    write_agentflow_events_from_trace,
-    write_last_message_from_agentflow_result,
 )
 
 ACTIVE_TASK_STATUSES = {"queued", "running", "cancel_requested"}
@@ -60,39 +57,6 @@ TERMINAL_TASK_STATUSES = {"succeeded", "partial_success", "failed", "cancelled",
 class ResolvedStageSessionSource:
     normalized_path: PurePosixPath
     source_path: Path
-    mode: str = "direct"
-
-
-def extract_complete_jsonl_byte_chunks(buffer: bytes) -> tuple[list[bytes], bytes]:
-    if not buffer:
-        return [], b""
-    parts = buffer.splitlines(keepends=True)
-    if parts and not parts[-1].endswith((b"\n", b"\r")):
-        pending = parts.pop()
-    else:
-        pending = b""
-    return [part for part in parts if part.strip()], pending
-
-
-def normalize_agentflow_trace_jsonl_line(raw_line: bytes | str) -> str | None:
-    stripped = raw_line.decode("utf-8", errors="replace").strip() if isinstance(raw_line, bytes) else str(raw_line).strip()
-    if not stripped:
-        return None
-    try:
-        item = json.loads(stripped)
-    except json.JSONDecodeError:
-        return stripped
-    normalized = {
-        "type": item.get("kind") or "event",
-        "title": item.get("title"),
-        "content": item.get("content"),
-        "timestamp": item.get("timestamp"),
-        "agent": item.get("agent"),
-        "attempt": item.get("attempt"),
-        "source": item.get("source"),
-        "raw": item.get("raw"),
-    }
-    return json.dumps(normalized, ensure_ascii=False)
 
 
 class TaskService:
@@ -725,12 +689,6 @@ class TaskService:
 
     def list_stage_sessions(self, task_id: str, attempt_id: str, stage_name: str) -> list[dict]:
         attempt_root = get_artifact_service().attempt_root(task_id, attempt_id).resolve()
-        self._materialize_stage_session_fallback_files(
-            task_id,
-            attempt_id,
-            stage_name,
-            attempt_root=attempt_root,
-        )
         with get_database().connect() as conn:
             attempt_row = self._get_attempt_row(conn, attempt_id)
             if attempt_row["task_id"] != task_id:
@@ -766,6 +724,21 @@ class TaskService:
             for row in rows
         ]
         known_paths = {item["path"] for item in items}
+        for trace_path in self._discover_stage_trace_files(attempt_root, stage_name):
+            relative_path = trace_path.resolve().relative_to(attempt_root).as_posix()
+            if relative_path in known_paths:
+                continue
+            stat = trace_path.stat()
+            items.append(
+                {
+                    "path": relative_path,
+                    "display_name": "trace.jsonl",
+                    "content_type": "application/x-ndjson",
+                    "size": stat.st_size,
+                    "created_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                }
+            )
+            known_paths.add(relative_path)
         for filename in ("prompt.txt", "events.jsonl", "last-message.md"):
             path = attempt_root / "runtime" / stage_name / filename
             if not path.exists() or not path.is_file():
@@ -788,8 +761,6 @@ class TaskService:
 
     def get_stage_session_file(self, task_id: str, attempt_id: str, stage_name: str, path: str) -> dict:
         source = self.resolve_stage_session_source(task_id, attempt_id, stage_name, path)
-        if source.mode == "agentflow_trace":
-            return self._read_agentflow_trace_session_file(source.normalized_path, source.source_path, max_bytes=1024 * 1024)
         if not source.source_path.exists() or not source.source_path.is_file():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"session file not found: {path}")
         data = source.source_path.read_bytes()
@@ -809,11 +780,6 @@ class TaskService:
         path: str,
     ) -> ResolvedStageSessionSource:
         normalized, candidate = self.resolve_stage_session_file_path(task_id, attempt_id, stage_name, path)
-        if normalized.name == "events.jsonl":
-            trace_path = self._resolve_agentflow_stage_trace_path(task_id, attempt_id, stage_name)
-            if trace_path is not None:
-                return ResolvedStageSessionSource(normalized, trace_path, mode="agentflow_trace")
-        self._materialize_stage_session_fallback_file(task_id, attempt_id, stage_name, normalized)
         return ResolvedStageSessionSource(normalized, candidate)
 
     def resolve_stage_session_file_path(self, task_id: str, attempt_id: str, stage_name: str, path: str) -> tuple[PurePosixPath, Path]:
@@ -843,118 +809,22 @@ class TaskService:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="session file escapes attempt root") from exc
         return normalized, candidate
 
-    def _materialize_stage_session_fallback_files(
-        self,
-        task_id: str,
-        attempt_id: str,
-        stage_name: str,
-        *,
-        attempt_root: Path | None = None,
-    ) -> None:
-        for filename in ("events.jsonl", "last-message.md"):
-            self._materialize_stage_session_fallback_file(
-                task_id,
-                attempt_id,
-                stage_name,
-                PurePosixPath(f"runtime/{stage_name}/{filename}"),
-                attempt_root=attempt_root,
-            )
-
-    def _materialize_stage_session_fallback_file(
-        self,
-        task_id: str,
-        attempt_id: str,
-        stage_name: str,
-        normalized: PurePosixPath,
-        *,
-        attempt_root: Path | None = None,
-    ) -> Path | None:
-        expected_runtime_paths = {
-            PurePosixPath(f"runtime/{stage_name}/events.jsonl"),
-            PurePosixPath(f"runtime/{stage_name}/last-message.md"),
-        }
-        if normalized not in expected_runtime_paths:
-            return None
-
-        resolved_attempt_root = (attempt_root or get_artifact_service().attempt_root(task_id, attempt_id)).resolve()
-        target_path = (resolved_attempt_root / normalized.as_posix()).resolve()
-        run_root_candidates = [
-            resolved_attempt_root / "runtime" / stage_name / "agentflow-runs",
-            resolved_attempt_root / "runtime" / "agentflow-runs",
-            resolved_attempt_root / "runtime" / "graph" / "agentflow-runs",
-        ]
-        for runs_dir in run_root_candidates:
-            run_dir = discover_single_run_dir(runs_dir)
-            if run_dir is None:
-                continue
-            stage_artifact_dir = run_dir / "artifacts" / stage_name
-            trace_path = stage_artifact_dir / "trace.jsonl"
-            result_path = stage_artifact_dir / "result.json"
-            if normalized.name == "events.jsonl":
-                if trace_path.exists():
-                    return write_agentflow_events_from_trace(trace_path, target_path)
-                continue
-            if normalized.name == "last-message.md":
-                if result_path.exists() or trace_path.exists():
-                    return write_last_message_from_agentflow_result(result_path, target_path, trace_path=trace_path)
-        return None
-
-    def _resolve_agentflow_stage_trace_path(
-        self,
-        task_id: str,
-        attempt_id: str,
-        stage_name: str,
-        *,
-        attempt_root: Path | None = None,
-    ) -> Path | None:
-        resolved_attempt_root = (attempt_root or get_artifact_service().attempt_root(task_id, attempt_id)).resolve()
-        run_root_candidates = [
-            resolved_attempt_root / "runtime" / stage_name / "agentflow-runs",
-            resolved_attempt_root / "runtime" / "agentflow-runs",
-            resolved_attempt_root / "runtime" / "graph" / "agentflow-runs",
-        ]
-        for runs_dir in run_root_candidates:
-            run_dir = discover_single_run_dir(runs_dir)
-            if run_dir is None:
-                continue
-            trace_path = run_dir / "artifacts" / stage_name / "trace.jsonl"
-            return trace_path
-        return None
-
     @staticmethod
-    def _read_agentflow_trace_session_file(normalized: PurePosixPath, trace_path: Path, *, max_bytes: int) -> dict:
-        if not trace_path.exists() or not trace_path.is_file():
-            return {
-                "path": normalized.as_posix(),
-                "content": "",
-                "truncated": False,
-                "next_cursor": 0,
-            }
-        data = trace_path.read_bytes()
-        raw_lines, _pending = extract_complete_jsonl_byte_chunks(data)
-        content_lines: list[str] = []
-        cursor = 0
-        written_bytes = 0
-        preview_truncated = False
-        for raw_line in raw_lines:
-            normalized_line = normalize_agentflow_trace_jsonl_line(raw_line)
-            next_cursor = cursor + len(raw_line)
-            cursor = next_cursor
-            if normalized_line is None:
+    def _discover_stage_trace_files(attempt_root: Path, stage_name: str) -> list[Path]:
+        candidates: list[Path] = []
+        run_roots = [
+            attempt_root / "runtime" / stage_name / "agentflow-runs",
+            attempt_root / "runtime" / "agentflow-runs",
+            attempt_root / "runtime" / "graph" / "agentflow-runs",
+        ]
+        for runs_dir in run_roots:
+            if not runs_dir.exists() or not runs_dir.is_dir():
                 continue
-            encoded = (normalized_line + "\n").encode("utf-8")
-            if written_bytes + len(encoded) > max_bytes:
-                preview_truncated = True
-                cursor -= len(raw_line)
-                break
-            content_lines.append(normalized_line)
-            written_bytes += len(encoded)
-        return {
-            "path": normalized.as_posix(),
-            "content": "\n".join(content_lines) + ("\n" if content_lines else ""),
-            "truncated": preview_truncated,
-            "next_cursor": cursor,
-        }
+            for run_dir in sorted(path for path in runs_dir.iterdir() if path.is_dir()):
+                trace_path = run_dir / "artifacts" / stage_name / "trace.jsonl"
+                if trace_path.exists() and trace_path.is_file():
+                    candidates.append(trace_path)
+        return candidates
 
     def list_artifacts(self, task_id: str, attempt_id: str) -> ArtifactListResponse:
         with get_database().connect() as conn:

@@ -28,7 +28,6 @@ from app.workers.runner import (
     resolve_report_outputs_for_attempt,
     resolve_stage_work_dir,
     run_logged_command,
-    write_agentflow_events_from_trace,
     write_json_file,
     write_last_message_from_agentflow_result,
     write_text_file,
@@ -567,7 +566,7 @@ def _read_live_agentflow_node_status(
         result_status = str(result_payload.get("status") or "").strip().lower()
         if result_status:
             return result_status
-    if any((artifact_dir / filename).exists() for filename in ("launch.json", "trace.jsonl", "stdout.log", "stderr.log")):
+    if any((artifact_dir / filename).exists() for filename in ("launch.json", "stdout.log", "stderr.log")):
         return "running"
     return _read_agentflow_node_status(run_record, stage_name) or "pending"
 
@@ -622,12 +621,8 @@ def _materialize_graph_stage_result(
     stdout_path = stage_artifact_dir / "stdout.log" if stage_artifact_dir else None
     stderr_path = stage_artifact_dir / "stderr.log" if stage_artifact_dir else None
     run_record = _read_agentflow_run_record(run_dir)
-    if trace_path and trace_path.exists():
-        write_agentflow_events_from_trace(trace_path, events_path)
-    else:
-        write_text_file(events_path, "")
     if result_path and result_path.exists():
-        write_last_message_from_agentflow_result(result_path, last_message_path, trace_path=trace_path)
+        write_last_message_from_agentflow_result(result_path, last_message_path)
     result_payload = read_json_file(result_path) if result_path else None
     node_status = str(result_payload.get("status") or "").strip().lower() if isinstance(result_payload, dict) else ""
     if not node_status:
@@ -688,6 +683,8 @@ def _materialize_graph_stage_result(
     if stderr_path and stderr_path.exists() and stderr_path.stat().st_size > 0:
         append_file_to_log(stage_log_path, stderr_path, "=== agentflow node stderr ===")
     session_files = [prompt_path]
+    if trace_path and trace_path.exists():
+        session_files.append(trace_path)
     if events_path.exists():
         session_files.append(events_path)
     if last_message_path.exists():

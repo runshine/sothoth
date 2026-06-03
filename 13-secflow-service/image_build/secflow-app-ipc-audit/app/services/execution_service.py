@@ -1050,7 +1050,7 @@ class ExecutionService:
             if not path.exists():
                 continue
             relative_path = self._relative_path_in_attempt(task_id, attempt_id, path)
-            if path.name == "events.jsonl":
+            if path.name in {"events.jsonl", "trace.jsonl"}:
                 payload = self._summarize_jsonl_session(path, relative_path=relative_path)
                 if payload["line_count"] > 0:
                     get_event_service().append_event(
@@ -1096,7 +1096,7 @@ class ExecutionService:
                     preview_parts.append(stripped[:240])
                 continue
             parsed_count += 1
-            event_type = str(item.get("type") or item.get("event") or "unknown")
+            event_type = str(item.get("type") or item.get("kind") or item.get("event") or "unknown")
             type_counter[event_type] += 1
             preview = ExecutionService._extract_event_preview(item)
             if preview and len(preview_parts) < 3:

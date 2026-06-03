@@ -29,7 +29,6 @@ from app.workers.runner import (
     resolve_stage_executor_model,
     resolve_stage_work_dir,
     run_logged_command,
-    write_agentflow_events_from_trace,
     write_json_file,
     write_last_message_from_agentflow_result,
     write_last_message_from_jsonl,
@@ -172,7 +171,6 @@ def _run_mock_stage(
             ]
         ),
     )
-    write_text_file(events_path, "")
     write_text_file(last_message_path, report_body)
     write_text_file(final_report_path, report_body)
     return StageExecutionResult(
@@ -182,7 +180,7 @@ def _run_mock_stage(
         return_code=0,
         log_path=log_path,
         artifacts=[StageArtifact("audit_report", final_report_path, display_name=final_report_path.name)],
-        session_files=[prompt_path, events_path, last_message_path],
+        session_files=[prompt_path, last_message_path],
         output_path=final_report_path,
         metadata={"executor_mode": "mock", "audit_skill": audit_skill},
     )
@@ -469,13 +467,11 @@ def _run_agentflow_single_node_stage(
     if stderr_path and stderr_path.exists() and stderr_path.stat().st_size > 0:
         append_file_to_log(log_path, stderr_path, "=== agentflow node stderr ===")
     if trace_path and trace_path.exists():
-        write_agentflow_events_from_trace(trace_path, events_path)
-    else:
-        write_text_file(events_path, "")
+        session_files.append(trace_path)
     if events_path.exists():
         session_files.append(events_path)
     if result_path and result_path.exists():
-        write_last_message_from_agentflow_result(result_path, last_message_path, trace_path=trace_path)
+        write_last_message_from_agentflow_result(result_path, last_message_path)
     if last_message_path.exists():
         session_files.append(last_message_path)
     metadata = {
@@ -763,6 +759,9 @@ def _run_agentflow_combined_pipeline(
         **provider_metadata,
     }
     audit_session_files = [prompt_path]
+    audit_trace_path = Path(str(audit_stage_data.get("trace_path") or ""))
+    if str(audit_stage_data.get("trace_path") or "") and audit_trace_path.exists():
+        audit_session_files.append(audit_trace_path)
     if events_path.exists():
         audit_session_files.append(events_path)
     if last_message_path.exists():
@@ -814,12 +813,8 @@ def _materialize_agentflow_combined_stage(
     result_path = stage_artifact_dir / "result.json" if stage_artifact_dir else None
     stdout_path = stage_artifact_dir / "stdout.log" if stage_artifact_dir else None
     stderr_path = stage_artifact_dir / "stderr.log" if stage_artifact_dir else None
-    if trace_path and trace_path.exists():
-        write_agentflow_events_from_trace(trace_path, events_path)
-    else:
-        write_text_file(events_path, "")
     if result_path and result_path.exists():
-        write_last_message_from_agentflow_result(result_path, last_message_path, trace_path=trace_path)
+        write_last_message_from_agentflow_result(result_path, last_message_path)
     stage_result_payload = read_json_file(result_path) if result_path else None
     node_status = str(stage_result_payload.get("status") or "").strip().lower() if isinstance(stage_result_payload, dict) else ""
     return_code = (
