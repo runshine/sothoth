@@ -102,6 +102,7 @@ class SchedulerConfig(BaseModel):
     task_concurrency: int = 2
     stage_poll_interval_seconds: int = 5
     downstream_reconcile_interval_seconds: int = 30
+    stage_item_sync_reconcile_interval_seconds: int = 30
     readless_reconcile_interval_seconds: int = 300
     heartbeat_update_interval_seconds: int = 15
     operation_lease_ttl_seconds: int = 60
@@ -120,6 +121,18 @@ class SchedulerConfig(BaseModel):
     downstream_sync_batch_size: int = 50
     downstream_action_concurrency: int = 8
     downstream_request_timeout_seconds: int = 120
+    stage_downstream_sync_max_consecutive_errors: int = 10
+    stage_downstream_sync_backoff_base_seconds: int = 2
+    stage_downstream_sync_backoff_max_seconds: int = 60
+    stage_item_sync_stale_seconds: int = 300
+    stage_item_sync_reconcile_batch_size: int = 100
+    stage_orchestration_max_consecutive_errors: int = 10
+    stage_orchestration_backoff_base_seconds: int = 2
+    stage_orchestration_backoff_max_seconds: int = 60
+    archive_runtime_reconcile_interval_seconds: int = 30
+    archive_runtime_stale_seconds: int = 300
+    state_repair_reconcile_interval_seconds: int = 30
+    state_repair_reconcile_batch_size: int = 100
 
 
 class QueueConfig(BaseModel):

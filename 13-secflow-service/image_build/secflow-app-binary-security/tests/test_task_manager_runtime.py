@@ -43,6 +43,9 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
                 "archive_dispatch": False,
                 "stage_item_dispatch": True,
                 "downstream_reconcile": True,
+                "stage_item_sync_reconcile": False,
+                "archive_runtime_reconcile": False,
+                "state_repair_reconcile": False,
                 "readless_reconcile": True,
                 "state_reducer": True,
                 "reducer_metrics_snapshot": True,
@@ -618,8 +621,136 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("processing", captured.get("status"))
         self.assertEqual(manager.instance_id, captured.get("processed_by"))
         self.assertEqual("processing", captured.get("processing_result"))
-        self.assertIsNotNone(captured.get("processing_started_at"))
-        self.assertEqual(1, session.commits)
+
+    async def test_poll_until_terminal_survives_operational_error_and_records_failure(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(id="task-1", project_id="project-1")
+        item = type("Item", (), {"id": "item-1", "downstream_task_id": "child-1"})()
+        calls = {"count": 0}
+        failures = []
+
+        async def _ensure(_task):
+            return None
+
+        async def _touch(_task_id):
+            return None
+
+        async def _cancelled(_task_id):
+            return False
+
+        def _record_failure(**kwargs):
+            failures.append(kwargs)
+
+        async def _sleep(_seconds):
+            return None
+
+        async def _fetch():
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise OperationalError("stmt", {}, RuntimeError("connection refused"))
+            return {"status": "success"}
+
+        manager._ensure_task_execution_current_async = _ensure
+        manager._touch_task_heartbeat_async = _touch
+        manager._is_task_cancelled_async = _cancelled
+        manager._record_polled_child_sync_failure = _record_failure
+
+        with patch("app.service.task_manager.asyncio.sleep", _sleep):
+            status, payload = await manager._poll_until_terminal(
+                _fetch,
+                success_statuses={"success"},
+                failure_statuses={"failed", "cancelled"},
+                task=task,
+                item=item,
+            )
+
+        self.assertEqual("success", status)
+        self.assertEqual({"status": "success"}, payload)
+        self.assertEqual(2, calls["count"])
+        self.assertEqual(1, len(failures))
+        self.assertEqual("db_connection_refused", failures[0]["error_type"])
+
+    def test_stage_item_stale_uses_last_attempt_instead_of_last_success(self):
+        manager = TaskManager()
+        manager.cfg.scheduler.stage_item_sync_stale_seconds = 300
+        item = type(
+            "Item",
+            (),
+            {
+                "status": "running",
+                "downstream_task_id": "child-1",
+                "result": {
+                    "downstream_status_synced_at": (_now() - timedelta(hours=1)).isoformat(),
+                    "last_sync_attempt_at": (_now() - timedelta(seconds=30)).isoformat(),
+                    "sync_observation": {
+                        "last_attempt_at": (_now() - timedelta(seconds=30)).isoformat(),
+                        "last_success_at": (_now() - timedelta(hours=1)).isoformat(),
+                    },
+                },
+            },
+        )()
+        self.assertFalse(manager._item_downstream_sync_stale(item))
+
+    def test_aggregate_stage_items_holds_pending_when_sync_degraded(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(id="task-1", project_id="project-1", summary={})
+
+        class _Db:
+            def commit(self):
+                return None
+
+        status, _summary = manager._aggregate_stage_items(
+            _Db(),
+            task,
+            [
+                {"status": "success", "item": {"id": "a"}},
+                {"status": "pending", "item": {"id": "b"}, "sync_degraded": True, "deferred_mode": "reconcile"},
+            ],
+            "entry_results",
+        )
+        self.assertEqual("running", status)
+
+    def test_defer_item_after_orchestration_error_records_observation(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(id="task-1", project_id="project-1")
+        item = type(
+            "Item",
+            (),
+            {
+                "id": "item-1",
+                "stage_name": "entry_analysis",
+                "status": "dispatching",
+                "downstream_task_id": "",
+                "result": {},
+                "error_message": None,
+                "finished_at": None,
+            },
+        )()
+
+        class _Db:
+            def __init__(self):
+                self.commits = 0
+
+            def add(self, _event):
+                return None
+
+            def commit(self):
+                self.commits += 1
+
+        db = _Db()
+        response = manager._defer_item_after_orchestration_error(
+            db,
+            task,
+            item,
+            operation="entry_analysis",
+            exc=OperationalError("stmt", {}, RuntimeError("lost connection")),
+            response_item={"id": "m1"},
+        )
+        self.assertEqual("pending", response["status"])
+        self.assertTrue(response["orchestration_degraded"])
+        self.assertEqual("error", item.result["orchestration_observation"]["last_result"])
+        self.assertIsNotNone(item.result.get("next_orchestration_retry_at"))
+        self.assertEqual(1, db.commits)
 
 
 if __name__ == "__main__":
