@@ -10393,6 +10393,21 @@ class TaskManager:
                 f"任务由实例 {self.instance_id} 启动执行",
                 payload={"dispatcher_instance_id": self.instance_id},
             )
+            active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
+            if active_item_count > 0:
+                self._record_event(
+                    db,
+                    task,
+                    "downstream_reconcile_resumed_after_takeover",
+                    "新的 worker 已接管流式尾段父任务，继续执行下游状态对账与阶段收口",
+                    stage_name=active_stage_name or task.current_stage,
+                    payload={
+                        "dispatcher_instance_id": self.instance_id,
+                        "active_stage_name": active_stage_name or task.current_stage,
+                        "active_item_count": active_item_count,
+                        "has_downstream_refs": has_downstream_refs,
+                    },
+                )
             db.commit()
             await self._execute_task(task_id)
         except StaleTaskExecution:
@@ -11284,12 +11299,15 @@ class TaskManager:
             if self._has_local_task_execution_owner(task.id) or self._task_has_active_streaming_stage_workers(task.id):
                 continue
             stage_name = task.current_stage or self._stage_sequence_for_task(task)[0]
-            if self._recover_streaming_parent_running_state_locked(
+            if self._release_streaming_parent_for_takeover_locked(
                 db,
                 task,
-                reason="stale_running_reconcile",
+                runtime_lease_owner=runtime_lease_owner,
+                runtime_lease_expires_at=runtime_lease_expires_at,
+                reason="expired_runtime_lease_with_active_tail",
             ):
                 observe_runtime_lease_owner_mismatch("expired_runtime_lease_with_active_tail")
+                reclaimed = True
                 continue
             stage_run = db.query(BinarySecurityStageRun).filter(
                 BinarySecurityStageRun.task_id == task.id,
@@ -11425,12 +11443,18 @@ class TaskManager:
                 continue
             if self._has_local_task_execution_owner(task.id) or self._task_has_active_streaming_stage_workers(task.id):
                 continue
-            if self._recover_streaming_parent_running_state_locked(
+            lease = self._runtime_lease_for_task(db, task.id)
+            runtime_lease_owner = str(lease.owner_instance_id or "").strip() or None if lease is not None else None
+            runtime_lease_expires_at = lease.lease_expires_at if lease is not None else None
+            if self._release_streaming_parent_for_takeover_locked(
                 db,
                 task,
-                reason="released_running_reconcile",
+                runtime_lease_owner=runtime_lease_owner,
+                runtime_lease_expires_at=runtime_lease_expires_at,
+                reason="released_running_without_owner_with_active_tail",
             ):
                 observe_runtime_lease_owner_mismatch("released_running_with_active_tail")
+                requeued = True
                 continue
             stage_name = task.current_stage or self._stage_sequence_for_task(task)[0]
             active_items = db.query(BinarySecurityStageItem).filter(
@@ -12350,6 +12374,47 @@ class TaskManager:
                 stage=str(task.current_stage or "unknown"),
                 from_status=previous_status or "unknown",
             )
+        return True
+
+    def _release_streaming_parent_for_takeover_locked(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        runtime_lease_owner: str | None,
+        runtime_lease_expires_at: datetime | None,
+        reason: str,
+    ) -> bool:
+        active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
+        if active_item_count <= 0:
+            return False
+        previous_dispatcher = str(task.dispatcher_instance_id or "").strip() or None
+        task.status = "pending"
+        task.current_stage = active_stage_name or task.current_stage
+        task.dispatcher_instance_id = None
+        task.dispatch_started_at = None
+        task.lease_expires_at = None
+        task.finished_at = None
+        task.last_error = None
+        self._clear_runtime_lease(db, task.id)
+        self._clear_task_abnormal_reason_snapshot(db, task)
+        self._record_event(
+            db,
+            task,
+            "running_execution_released_for_takeover",
+            "运行实例租约已失效，父任务已释放并重新排队，等待新的 worker 继续对账与收口",
+            level="warning",
+            stage_name=task.current_stage,
+            payload={
+                "stage_name": task.current_stage,
+                "previous_dispatcher_instance_id": previous_dispatcher,
+                "runtime_lease_owner": runtime_lease_owner,
+                "runtime_lease_expires_at": _isoformat_or_none(runtime_lease_expires_at),
+                "active_item_count": active_item_count,
+                "has_downstream_refs": has_downstream_refs,
+                "requeue_reason": reason,
+            },
+        )
         return True
 
     def _task_operation_token(self) -> str:

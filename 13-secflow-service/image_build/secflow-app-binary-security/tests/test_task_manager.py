@@ -22672,7 +22672,7 @@ def _test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent(s
     self.assertTrue(any(event.event_type == "streaming_parent_state_recovered" for event in db.events))
 
 
-def _test_requeue_released_running_locked_skips_streaming_tail_with_active_items(self):
+def _test_requeue_released_running_locked_requeues_streaming_tail_with_active_items(self):
     manager = TaskManager()
     task = BinarySecurityTask(
         id="task-tail-active",
@@ -22703,9 +22703,124 @@ def _test_requeue_released_running_locked_skips_streaming_tail_with_active_items
 
     changed = manager._requeue_released_running_locked(db)
 
-    self.assertFalse(changed)
-    self.assertEqual("running", task.status)
-    self.assertFalse(any(event.event_type == "running_execution_requeued" for event in db.events))
+    self.assertTrue(changed)
+    self.assertEqual("pending", task.status)
+    self.assertEqual("entry_analysis", task.current_stage)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+    self.assertTrue(any(event.event_type == "running_execution_released_for_takeover" for event in db.events))
+
+
+def _test_reclaim_stale_running_streaming_tail_requeues_for_takeover(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-stale-tail",
+        project_id="p1",
+        name="source",
+        status="running",
+        current_stage="entry_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="dead-worker",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    task.dispatch_started_at = _now() - timedelta(seconds=600)
+    task.updated_at = _now() - timedelta(seconds=600)
+    item = BinarySecurityStageItem(
+        id="si-stale-tail",
+        task_id=task.id,
+        project_id="p1",
+        stage_run_id="sr-entry",
+        stage_name="entry_analysis",
+        item_key="module-a",
+        item_name="module-a",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+
+    class _ReclaimDb(_FakeDb):
+        def query(self, model, *args, **kwargs):
+            model_name = getattr(model, "__name__", "")
+            if model_name == "BinarySecurityTask":
+                return _FakeQuery([task])
+            if model_name == "BinarySecurityStageRun":
+                return _FakeQuery([])
+            if model_name == "BinarySecurityStageItem":
+                return _FakeQuery([item])
+            if model_name == "BinarySecurityTaskRuntimeLease":
+                return _FakeQuery([])
+            return _FakeQuery([])
+
+        def flush(self):
+            pass
+
+    original_loader = self.manager._load_service_config
+    self.manager._load_service_config = lambda db: SimpleNamespace(dispatch_timeout_seconds=60)
+    try:
+        reclaimed = self.manager._reclaim_stale_running_locked(_ReclaimDb())
+    finally:
+        self.manager._load_service_config = original_loader
+
+    self.assertTrue(reclaimed)
+    self.assertEqual("pending", task.status)
+    self.assertEqual("entry_analysis", task.current_stage)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+
+
+def _test_run_task_records_takeover_resume_event_for_streaming_tail(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-a"
+    task = BinarySecurityTask(
+        id="task-run-tail",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        current_stage="entry_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-a",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    task.dispatch_started_at = _now()
+    task.lease_expires_at = _now() + timedelta(seconds=120)
+    item = BinarySecurityStageItem(
+        id="si-run-tail",
+        task_id=task.id,
+        project_id="p1",
+        stage_run_id="sr-entry",
+        stage_name="entry_analysis",
+        item_key="module-a",
+        item_name="module-a",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+    async def _noop_execute(_task_id):
+        return None
+
+    original_factory = task_manager_module.get_session_factory
+    original_execute = manager._execute_task
+    try:
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+        manager._execute_task = _noop_execute
+        asyncio.run(manager._run_task(task.id))
+    finally:
+        task_manager_module.get_session_factory = original_factory
+        manager._execute_task = original_execute
+
+    self.assertTrue(any(event.event_type == "downstream_reconcile_resumed_after_takeover" for event in db.events))
 
 
 TaskManagerTests.test_stage_item_response_falls_back_to_downstream_payload_status = _test_stage_item_response_falls_back_to_downstream_payload_status
@@ -22736,7 +22851,9 @@ TaskManagerTests.test_sync_downstream_status_rewinds_running_entry_item_to_pendi
 TaskManagerTests.test_sync_downstream_status_keeps_dispatching_pending_for_entry_item = _test_sync_downstream_status_keeps_dispatching_pending_for_entry_item
 TaskManagerTests.test_task_list_response_exposes_runtime_lease_and_sync_view = _test_task_list_response_exposes_runtime_lease_and_sync_view
 TaskManagerTests.test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent = _test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent
-TaskManagerTests.test_requeue_released_running_locked_skips_streaming_tail_with_active_items = _test_requeue_released_running_locked_skips_streaming_tail_with_active_items
+TaskManagerTests.test_requeue_released_running_locked_requeues_streaming_tail_with_active_items = _test_requeue_released_running_locked_requeues_streaming_tail_with_active_items
+TaskManagerTests.test_reclaim_stale_running_streaming_tail_requeues_for_takeover = _test_reclaim_stale_running_streaming_tail_requeues_for_takeover
+TaskManagerTests.test_run_task_records_takeover_resume_event_for_streaming_tail = _test_run_task_records_takeover_resume_event_for_streaming_tail
 
 
 if __name__ == "__main__":
