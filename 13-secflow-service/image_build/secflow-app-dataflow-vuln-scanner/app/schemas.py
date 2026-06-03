@@ -297,8 +297,8 @@ class ScanTaskListResponse(BaseModel):
     items: List[ScanTaskListItemResponse] = Field(default_factory=list)
     total: int = 0
     page: int = 1
-    per_page: int = 100
-    page_size: int = 100
+    per_page: int = 50
+    page_size: int = 50
     projection_backfill_pending: bool = False
     projection_backfill_enqueued: bool = False
     projection_total_missing: int = 0

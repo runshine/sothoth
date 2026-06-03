@@ -2134,7 +2134,7 @@ class TaskManager:
         task_id: str,
         stage_name: str,
         page: int = 1,
-        per_page: int = 100,
+        per_page: int = 50,
     ) -> BinarySecurityStageItemPageResponse:
         task = self._task_or_404(db, project_id, task_id)
         normalized_stage_name = str(stage_name or "").strip()
@@ -2184,7 +2184,7 @@ class TaskManager:
         task_id: str,
         stage_name: str | None = None,
         page: int = 1,
-        per_page: int = 100,
+        per_page: int = 50,
     ) -> BinarySecurityArchiveJobPageResponse:
         task = self._task_or_404(db, project_id, task_id)
         query = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id)
@@ -2313,7 +2313,13 @@ class TaskManager:
                 entry[normalized_status] += int(count or 0)
         sync_items = (
             db.query(BinarySecurityStageItem)
-            .options(load_only(BinarySecurityStageItem.id, BinarySecurityStageItem.result, BinarySecurityStageItem.status))
+            .options(
+                load_only(
+                    BinarySecurityStageItem.id,
+                    BinarySecurityStageItem.result_json,
+                    BinarySecurityStageItem.status,
+                )
+            )
             .filter(BinarySecurityStageItem.task_id == task.id)
             .all()
         )

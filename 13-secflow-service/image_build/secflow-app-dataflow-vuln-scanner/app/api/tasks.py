@@ -121,10 +121,10 @@ async def list_tasks(
     slot_binding_state: Optional[str] = Query(None),
     report_status: Optional[str] = Query(None),
     model: Optional[str] = Query(None),
-    limit: int = Query(100, ge=1, le=500),
+    limit: int = Query(50, ge=10, le=1000),
     offset: int = Query(0, ge=0),
     page: Optional[int] = Query(None, ge=1),
-    per_page: Optional[int] = Query(None, ge=1, le=500),
+    per_page: Optional[int] = Query(None, ge=10, le=1000),
     mode: Optional[str] = Query(None),
     parent_task_id: Optional[str] = Query(None),
     sort_by: Optional[str] = Query(None),
@@ -137,13 +137,13 @@ async def list_tasks(
         await ensure_project_access(project_id, token)
     if page is None and per_page is None:
         if limit is not None:
-            safe_limit = max(1, min(int(limit), 500))
+            safe_limit = max(10, min(int(limit), 1000))
             safe_offset = max(0, int(offset or 0))
             per_page = safe_limit
             page = (safe_offset // safe_limit) + 1
         else:
             page = 1
-            per_page = 100
+            per_page = 50
     return get_execution_service().list_scan_tasks(
         db,
         principal,

@@ -2778,7 +2778,7 @@ async def list_project_tasks(
     owner_id: Optional[str] = Query(default=None),
     origin_mode: Optional[str] = Query(default=None),
     search: Optional[str] = Query(default=None),
-    limit: int = Query(default=20, ge=1, le=200),
+    limit: int = Query(default=50, ge=10, le=1000),
     offset: int = Query(default=0, ge=0),
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
@@ -2975,7 +2975,7 @@ async def list_project_evolution_jobs(
     project_id: str,
     status: Optional[str] = Query(default=None),
     search: Optional[str] = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=500),
+    limit: int = Query(default=50, ge=10, le=1000),
     offset: int = Query(default=0, ge=0),
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
@@ -3012,7 +3012,7 @@ async def list_evolution_jobs_legacy(
     project_id: Optional[str] = Query(default=None),
     status: Optional[str] = Query(default=None),
     search: Optional[str] = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=500),
+    limit: int = Query(default=50, ge=10, le=1000),
     offset: int = Query(default=0, ge=0),
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
@@ -3198,7 +3198,7 @@ async def list_tasks_legacy(
     owner_id: Optional[str] = Query(default=None),
     origin_mode: Optional[str] = Query(default=None),
     search: Optional[str] = Query(default=None),
-    limit: int = Query(default=20, ge=1, le=200),
+    limit: int = Query(default=50, ge=10, le=1000),
     offset: int = Query(default=0, ge=0),
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):

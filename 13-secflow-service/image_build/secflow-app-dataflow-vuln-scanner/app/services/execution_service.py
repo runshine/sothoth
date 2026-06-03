@@ -5786,7 +5786,7 @@ class ExecutionService:
             sort_order=sort_order,
         )
         safe_page = max(1, int(page or 1))
-        safe_per_page = max(1, min(int(per_page or 100), 500))
+        safe_per_page = max(10, min(int(per_page or 50), 1000))
         total = query.order_by(None).count()
         rows = query.offset((safe_page - 1) * safe_per_page).limit(safe_per_page).all()
         items = [self._projection_to_task_list_item(row) for row in rows]

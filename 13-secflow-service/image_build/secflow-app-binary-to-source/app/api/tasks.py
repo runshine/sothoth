@@ -218,7 +218,7 @@ async def save_b2s_config(
 @router.get("/projects/{project_id}/cache", response_model=B2SCacheListResponse)
 def list_b2s_cache(
     project_id: str,
-    limit: int = Query(100, ge=1, le=500),
+    limit: int = Query(50, ge=10, le=1000),
     offset: int = Query(0, ge=0),
     include_all_projects: bool = Query(False),
     mode: Optional[str] = Query(None),
@@ -311,7 +311,7 @@ def list_tasks(
     input_filename: Optional[str] = Query(None),
     sort_by: str = Query("created_at"),
     sort_order: str = Query("desc"),
-    limit: int = Query(100, ge=1, le=500),
+    limit: int = Query(50, ge=10, le=1000),
     offset: int = Query(0, ge=0),
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),

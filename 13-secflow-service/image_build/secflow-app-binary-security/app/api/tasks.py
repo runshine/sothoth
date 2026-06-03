@@ -94,7 +94,7 @@ def list_tasks(
     sort_by: str = Query("created_at"),
     sort_order: str = Query("desc"),
     page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=200),
+    page_size: int = Query(50, ge=10, le=1000),
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
@@ -114,7 +114,7 @@ def list_tasks(
 @router.get("/reducer/events", response_model=BinarySecurityReducerEventPageResponse)
 def list_reducer_events(
     page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=200),
+    page_size: int = Query(50, ge=10, le=1000),
     sort_by: str = Query("processed_at"),
     sort_order: str = Query("desc"),
     status: Optional[list[str]] = Query(default=None),
@@ -217,7 +217,7 @@ def get_task_stage_items(
     task_id: str,
     stage_name: str = Query(..., min_length=1),
     page: int = Query(1, ge=1),
-    per_page: int = Query(100, ge=1, le=1000),
+    per_page: int = Query(50, ge=10, le=1000),
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
@@ -257,7 +257,7 @@ def get_task_archive_jobs(
     task_id: str,
     stage_name: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
-    per_page: int = Query(100, ge=1, le=1000),
+    per_page: int = Query(50, ge=10, le=1000),
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
