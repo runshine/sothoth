@@ -3,6 +3,7 @@ from datetime import timedelta
 from unittest.mock import patch
 
 from redis.exceptions import TimeoutError as RedisTimeoutError
+from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 
 from app.model import BinarySecurityTask, TASK_TYPE_BINARY
 from app.service import task_manager as task_manager_module
@@ -67,6 +68,24 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
         self.assertTrue(status["loops"]["operation_dispatch"])
         self.assertTrue(status["loop_details"]["operation_dispatch"]["stale"])
 
+    def test_runtime_status_uses_recent_heartbeat_when_task_handle_is_done(self):
+        self.manager._running = True
+
+        class _Task:
+            def done(self):
+                return True
+
+        self.manager._operation_loop_task = _Task()
+        self.manager.cfg.scheduler.worker_ready_loop_stale_seconds = 30
+        self.manager._loop_heartbeats["operation_dispatch"] = _now()
+
+        status = self.manager.runtime_status()
+
+        self.assertTrue(status["loops"]["operation_dispatch"])
+        self.assertFalse(status["loop_details"]["operation_dispatch"]["stale"])
+        self.assertFalse(status["loop_details"]["operation_dispatch"]["task_running"])
+        self.assertTrue(status["loop_details"]["operation_dispatch"]["heartbeat_alive"])
+
     def test_operation_lease_uses_short_configured_ttl(self):
         self.manager.cfg.scheduler.operation_lease_ttl_seconds = 60
         now_value = _now()
@@ -75,6 +94,31 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
 
 
 class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
+    def test_recover_loop_db_error_disposes_engine_for_operational_and_timeout_errors(self):
+        manager = TaskManager()
+
+        class _Db:
+            def __init__(self):
+                self.rolled_back = False
+                self.closed = False
+
+            def rollback(self):
+                self.rolled_back = True
+
+            def close(self):
+                self.closed = True
+
+        operational = OperationalError("stmt", {}, RuntimeError("lost connection"))
+        pool_timeout = SATimeoutError("pool timeout")
+
+        for exc in (operational, pool_timeout):
+            db = _Db()
+            with patch("app.service.task_manager.get_engine") as mock_get_engine:
+                manager._recover_loop_db_error("operation_dispatch", db, exc)
+            self.assertTrue(db.rolled_back)
+            self.assertTrue(db.closed)
+            mock_get_engine.return_value.dispose.assert_called_once()
+
     async def test_dispatch_loop_reconciles_queues_even_when_task_queue_is_busy(self):
         manager = TaskManager()
         manager._running = True

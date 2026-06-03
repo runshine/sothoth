@@ -1,6 +1,7 @@
 import asyncio
 import unittest
 
+from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from app.service.task_queue import TaskQueue
@@ -65,6 +66,20 @@ class _FakeRedisTimeout(_FakeRedis):
         return None
 
 
+class _FakeRedisConnectionError(_FakeRedis):
+    def __init__(self):
+        super().__init__()
+        self.closed = False
+
+    async def blpop(self, key, timeout=0):
+        del key, timeout
+        raise RedisConnectionError("Connection closed by server")
+
+    async def aclose(self):
+        self.closed = True
+        return None
+
+
 class TaskQueueTests(unittest.TestCase):
     def test_push_task_dedupes_same_task_id(self):
         queue = TaskQueue()
@@ -94,6 +109,17 @@ class TaskQueueTests(unittest.TestCase):
         queue._client = fake
 
         popped = asyncio.run(queue.pop_task(timeout_seconds=1))
+
+        self.assertIsNone(popped)
+        self.assertTrue(fake.closed)
+        self.assertIsNone(queue._client)
+
+    def test_pop_operation_resets_client_after_connection_error(self):
+        queue = TaskQueue()
+        fake = _FakeRedisConnectionError()
+        queue._client = fake
+
+        popped = asyncio.run(queue.pop_operation(timeout_seconds=1))
 
         self.assertIsNone(popped)
         self.assertTrue(fake.closed)

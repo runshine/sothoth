@@ -8,6 +8,7 @@ import time
 from typing import Optional
 
 from redis.asyncio import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from app.config import get_config
@@ -53,6 +54,9 @@ class TaskQueue:
         except RedisTimeoutError:
             await self._reset_client_after_timeout("task")
             return None
+        except (RedisConnectionError, OSError):
+            await self._reset_client_after_error("task")
+            return None
         return await self._consume_result(client, self.config.task_queue_key, result)
 
     async def pop_operation(self, timeout_seconds: int | None = None) -> Optional[str]:
@@ -66,6 +70,9 @@ class TaskQueue:
         except RedisTimeoutError:
             await self._reset_client_after_timeout("operation")
             return None
+        except (RedisConnectionError, OSError):
+            await self._reset_client_after_error("operation")
+            return None
         return await self._consume_result(client, queue_key, result)
 
     async def _reset_client_after_timeout(self, queue_name: str) -> None:
@@ -78,6 +85,17 @@ class TaskQueue:
             except Exception:
                 logger.debug("failed closing redis client after %s queue timeout", queue_name, exc_info=True)
         logger.debug("reset redis client after %s queue blocking pop timeout", queue_name)
+
+    async def _reset_client_after_error(self, queue_name: str) -> None:
+        async with self._lock:
+            client = self._client
+            self._client = None
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                logger.debug("failed closing redis client after %s queue error", queue_name, exc_info=True)
+        logger.warning("reset redis client after %s queue connection error", queue_name)
 
     async def _push_unique(self, client: Redis, queue_key: str, task_id: str) -> None:
         value = str(task_id or "").strip()

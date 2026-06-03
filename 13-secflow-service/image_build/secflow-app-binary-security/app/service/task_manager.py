@@ -25,7 +25,7 @@ from typing import Any, Optional
 from dataclasses import dataclass, field
 
 from sqlalchemy import Integer, case, cast, func, or_, text
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.orm import Session, load_only
 
 from app.config import get_config
@@ -164,6 +164,12 @@ class _TaskDetailContext:
     archive_jobs: list[BinarySecurityArchiveJob] = field(default_factory=list)
     stage_summaries: list[BinarySecurityStageSummary] = field(default_factory=list)
     abnormal_reason: BinarySecurityAbnormalReason | None = None
+    stage_items_total: int = 0
+    item_stats: dict[str, dict[str, int]] = field(default_factory=dict)
+    last_successful_sync_at: datetime | None = None
+    last_sync_attempt_at: datetime | None = None
+    last_sync_error_type: str | None = None
+    last_sync_error_message: str | None = None
 DB_ENTRY_PREVIEW_LIMIT = 50
 DB_ARTIFACT_PREVIEW_LIMIT = 50
 DB_EVENT_PAYLOAD_LIMIT_BYTES = 32768
@@ -960,14 +966,33 @@ class TaskManager:
     def _mark_loop_heartbeat(self, loop_name: str, *, now_value: datetime | None = None) -> None:
         self._loop_heartbeats[str(loop_name)] = now_value or _now()
 
+    def _recover_loop_db_error(self, loop_name: str, db: Session | None, exc: Exception) -> None:
+        if db is not None:
+            with suppress(Exception):
+                db.rollback()
+            with suppress(Exception):
+                db.close()
+        if isinstance(exc, (OperationalError, SATimeoutError)):
+            with suppress(Exception):
+                get_engine().dispose()
+            logger.warning("binary-security %s loop reset database engine after db error: %s", loop_name, exc)
+
     def _loop_runtime_detail(self, loop_name: str, task: asyncio.Task | None) -> dict[str, Any]:
-        alive = bool(task and not task.done())
+        task_running = bool(task and not task.done())
         heartbeat_at = self._loop_heartbeats.get(loop_name)
         heartbeat_age_seconds = _elapsed_seconds_since(heartbeat_at)
         stale_after_seconds = self._loop_stale_threshold_seconds(loop_name)
+        heartbeat_alive = bool(
+            heartbeat_at
+            and heartbeat_age_seconds is not None
+            and heartbeat_age_seconds <= stale_after_seconds
+        )
+        alive = bool(task_running or heartbeat_alive)
         stale = bool(alive and heartbeat_at and heartbeat_age_seconds is not None and heartbeat_age_seconds > stale_after_seconds)
         return {
             "alive": alive,
+            "task_running": task_running,
+            "heartbeat_alive": heartbeat_alive,
             "heartbeat_at": _isoformat_or_none(heartbeat_at),
             "heartbeat_age_seconds": None if heartbeat_age_seconds is None else round(float(heartbeat_age_seconds), 3),
             "stale_after_seconds": stale_after_seconds,
@@ -2072,7 +2097,7 @@ class TaskManager:
             )
 
     def get_task_detail(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskDetailResponse:
-        ctx = self._build_task_detail_context(db, project_id=project_id, task_id=task_id)
+        ctx = self._build_light_task_detail_context(db, project_id=project_id, task_id=task_id)
         base = self._task_response(db, ctx.task, queue_info=ctx.queue_info, detail_ctx=ctx).model_dump()
         base.pop("execution_epoch", None)
         archive_jobs_by_item = self._archive_jobs_by_item_id(ctx.archive_jobs)
@@ -2080,7 +2105,6 @@ class TaskManager:
             self._stage_item_response(item, archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []))
             for item in ctx.stage_items[:DETAIL_STAGE_ITEMS_LIMIT]
         ]
-        archive_job_responses = self._archive_job_responses(db, ctx.task, ctx.archive_jobs)
         return BinarySecurityTaskDetailResponse(
             **base,
             execution_epoch=int(getattr(ctx.task, "execution_epoch", 0) or 0),
@@ -2091,20 +2115,14 @@ class TaskManager:
             policy=ctx.task.policy,
             summary=ctx.task.summary,
             metrics=ctx.task.metrics,
-            item_stats=self._item_stats(ctx.stage_items),
-            stage_items_total=len(ctx.stage_items),
-            stage_items_truncated=len(ctx.stage_items) > DETAIL_STAGE_ITEMS_LIMIT,
+            item_stats=ctx.item_stats,
+            stage_items_total=ctx.stage_items_total,
+            stage_items_truncated=ctx.stage_items_total > DETAIL_STAGE_ITEMS_LIMIT,
             stage_items=stage_item_responses,
-            archive_jobs=archive_job_responses,
+            archive_jobs=[],
             abnormal_reason_history=[],
-            overview_nodes=self._build_stage_overview_nodes(
-                db,
-                ctx.task,
-                ctx.stage_summaries,
-                archive_job_responses,
-                ctx.stage_items,
-            ),
-            orchestration_observability=self._build_orchestration_observability(db, ctx.task),
+            overview_nodes=[],
+            orchestration_observability={},
             cleanup_snapshot=dict(ctx.task.cleanup_snapshot or {}),
         )
 
@@ -2231,6 +2249,7 @@ class TaskManager:
                 abnormal_reason = None
         if abnormal_reason is None:
             abnormal_reason = self._task_abnormal_reason(task, stage_summaries, stage_items, archive_jobs)
+        last_successful_sync_at, last_sync_attempt_at, last_sync_error_type, last_sync_error_message = self._task_sync_status_view(stage_items)
         return _TaskDetailContext(
             task=task,
             queue_info=self._build_queue_info(db, project_id=project_id),
@@ -2240,6 +2259,89 @@ class TaskManager:
             archive_jobs=archive_jobs,
             stage_summaries=stage_summaries,
             abnormal_reason=abnormal_reason,
+            stage_items_total=len(stage_items),
+            item_stats=self._item_stats(stage_items),
+            last_successful_sync_at=last_successful_sync_at,
+            last_sync_attempt_at=last_sync_attempt_at,
+            last_sync_error_type=last_sync_error_type,
+            last_sync_error_message=last_sync_error_message,
+        )
+
+    def _build_light_task_detail_context(self, db: Session, *, project_id: str, task_id: str) -> _TaskDetailContext:
+        task = self._task_or_404(db, project_id, task_id)
+        stage_runs = (
+            db.query(BinarySecurityStageRun)
+            .filter(BinarySecurityStageRun.task_id == task.id)
+            .order_by(BinarySecurityStageRun.sequence_no.asc())
+            .all()
+        )
+        stage_items_total = (
+            db.query(func.count(BinarySecurityStageItem.id))
+            .filter(BinarySecurityStageItem.task_id == task.id)
+            .scalar()
+            or 0
+        )
+        stage_items = (
+            db.query(BinarySecurityStageItem)
+            .filter(BinarySecurityStageItem.task_id == task.id)
+            .order_by(BinarySecurityStageItem.created_at.asc(), BinarySecurityStageItem.id.asc())
+            .limit(DETAIL_STAGE_ITEMS_LIMIT)
+            .all()
+        )
+        item_stats_rows = (
+            db.query(
+                BinarySecurityStageItem.stage_name,
+                BinarySecurityStageItem.status,
+                func.count(BinarySecurityStageItem.id),
+            )
+            .filter(BinarySecurityStageItem.task_id == task.id)
+            .group_by(BinarySecurityStageItem.stage_name, BinarySecurityStageItem.status)
+            .all()
+        )
+        item_stats: dict[str, dict[str, int]] = {}
+        for stage_name, status, count in item_stats_rows:
+            stage_key = str(stage_name or "").strip()
+            if not stage_key:
+                continue
+            entry = item_stats.setdefault(
+                stage_key,
+                {"total": 0, "success": 0, "failed": 0, "skipped": 0, "running": 0, "cancelled": 0},
+            )
+            normalized_status = self._normalize_downstream_status(status) or str(status or "").strip()
+            entry["total"] += int(count or 0)
+            if normalized_status in entry:
+                entry[normalized_status] += int(count or 0)
+        sync_items = (
+            db.query(BinarySecurityStageItem)
+            .options(load_only(BinarySecurityStageItem.id, BinarySecurityStageItem.result, BinarySecurityStageItem.status))
+            .filter(BinarySecurityStageItem.task_id == task.id)
+            .all()
+        )
+        sync_times = self._task_sync_status_view(sync_items)
+        archive_jobs: list[BinarySecurityArchiveJob] = []
+        stage_sequence = self._stage_sequence_for_task(task)
+        stage_summaries = self._build_stage_summaries_from_snapshot(task, stage_sequence)
+        abnormal_reason = None
+        if isinstance(task.latest_abnormal_reason, dict):
+            try:
+                abnormal_reason = BinarySecurityAbnormalReason(**task.latest_abnormal_reason)
+            except Exception:
+                abnormal_reason = None
+        return _TaskDetailContext(
+            task=task,
+            queue_info=self._build_queue_info(db, project_id=project_id),
+            stage_sequence=stage_sequence,
+            stage_runs=stage_runs,
+            stage_items=stage_items,
+            archive_jobs=archive_jobs,
+            stage_summaries=stage_summaries,
+            abnormal_reason=abnormal_reason,
+            stage_items_total=int(stage_items_total),
+            item_stats=item_stats,
+            last_successful_sync_at=sync_times[0],
+            last_sync_attempt_at=sync_times[1],
+            last_sync_error_type=sync_times[2],
+            last_sync_error_message=sync_times[3],
         )
 
     def _archive_job_responses(
@@ -6848,11 +6950,13 @@ class TaskManager:
                     self._mark_loop_heartbeat("operation_dispatch")
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                self._recover_loop_db_error("operation_dispatch", db, exc)
                 logger.exception("binary-security operation dispatch loop crashed and recovered")
                 await asyncio.sleep(1)
             finally:
-                db.close()
+                with suppress(Exception):
+                    db.close()
 
     async def _run_task_operation(self, operation_id: str) -> None:
         session_factory = get_session_factory()
@@ -8014,11 +8118,13 @@ class TaskManager:
                     self._mark_loop_heartbeat("task_dispatch")
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                self._recover_loop_db_error("task_dispatch", db, exc)
                 logger.exception("binary-security task dispatch loop crashed and recovered")
                 await asyncio.sleep(1)
             finally:
-                db.close()
+                with suppress(Exception):
+                    db.close()
 
     async def _stage_item_dispatch_loop(self) -> None:
         session_factory = get_session_factory()
@@ -8042,11 +8148,13 @@ class TaskManager:
                     self._mark_loop_heartbeat("stage_item_dispatch")
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                self._recover_loop_db_error("stage_item_dispatch", db, exc)
                 logger.exception("binary-security stage item dispatch loop crashed and recovered")
                 await asyncio.sleep(1)
             finally:
-                db.close()
+                with suppress(Exception):
+                    db.close()
             await asyncio.sleep(max(1, int(self.cfg.scheduler.stage_poll_interval_seconds or 5)))
 
     def _claim_streaming_stage_items(self, db: Session) -> list[str]:
@@ -15320,8 +15428,14 @@ class TaskManager:
         task_continue_supported, task_continue_reason, _ = self._task_continue_support(db, task)
         task_retry_failed_supported, task_retry_failed_reason, _, _ = self._task_retry_failed_items_support(db, task)
         lease_owner, lease_expires_at, lease_source = self._task_runtime_lease_view(db, task)
-        stage_items_for_sync = detail_ctx.stage_items if detail_ctx is not None else self._stage_items(db, task.id)
-        last_successful_sync_at, last_sync_attempt_at, last_sync_error_type, last_sync_error_message = self._task_sync_status_view(stage_items_for_sync)
+        if detail_ctx is not None:
+            last_successful_sync_at = detail_ctx.last_successful_sync_at
+            last_sync_attempt_at = detail_ctx.last_sync_attempt_at
+            last_sync_error_type = detail_ctx.last_sync_error_type
+            last_sync_error_message = detail_ctx.last_sync_error_message
+        else:
+            stage_items_for_sync = self._stage_items(db, task.id)
+            last_successful_sync_at, last_sync_attempt_at, last_sync_error_type, last_sync_error_message = self._task_sync_status_view(stage_items_for_sync)
         manual_operation_state = self._build_manual_operation_state(
             db,
             task,
