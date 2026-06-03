@@ -7,6 +7,7 @@ import signal
 import shutil
 import subprocess
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
@@ -135,6 +136,21 @@ def normalize_project(project_path: str) -> str:
 
 def project_label(project_path: str) -> str:
     return normalize_project(project_path).replace("/", ".")
+
+
+def resolve_stage_work_dir(context: StageContext) -> Path:
+    repo_root = context.repo_root.resolve()
+    project_path = normalize_project(context.project_path or "")
+    if not project_path:
+        return repo_root
+    candidate = (repo_root / project_path).resolve()
+    try:
+        candidate.relative_to(repo_root)
+    except ValueError:
+        return repo_root
+    if not candidate.is_dir():
+        return repo_root
+    return candidate
 
 
 def resolve_executor_mode(effective_config: dict[str, Any]) -> str:
@@ -302,6 +318,7 @@ def build_agentflow_node(
     node_id: str,
     prompt: str,
     repo_root: Path,
+    work_dir: Path | None = None,
     attempt_root: Path,
     model: str | None = None,
     sandbox_mode: str | None = None,
@@ -328,7 +345,7 @@ def build_agentflow_node(
         "tools": "read_write",
         "target": {
             "kind": "local",
-            "cwd": str(repo_root),
+            "cwd": str(work_dir or repo_root),
         },
         "timeout_seconds": int(cfg.task_timeout_seconds),
         "executable": executable,
@@ -630,6 +647,7 @@ def run_logged_command(
 
     cancelled = False
     timed_out = False
+    termination_requested = False
     started = time.monotonic()
     last_heartbeat = 0.0
     last_progress_tick = 0.0
@@ -649,10 +667,12 @@ def run_logged_command(
                     last_progress_tick = now
                 if hooks.is_cancel_requested():
                     cancelled = True
+                    termination_requested = True
                     _terminate_process(process)
                     break
                 if timeout_seconds > 0 and now - started >= timeout_seconds:
                     timed_out = True
+                    termination_requested = True
                     _terminate_process(process)
                     break
 
@@ -670,14 +690,19 @@ def run_logged_command(
 
                 if process.poll() is not None and not events:
                     break
+        except Exception:
+            termination_requested = True
+            _terminate_process(process)
+            raise
         finally:
-            _drain_process_output(process, handle, mirror_handles)
+            _drain_process_output(process, handle, mirror_handles, nonblocking=termination_requested)
             _close_selector(selector)
             for mirror in mirror_handles:
                 mirror.close()
 
+    return_code = process.poll() if termination_requested else process.wait()
     return LoggedCommandResult(
-        return_code=process.wait(),
+        return_code=return_code,
         cancelled=cancelled,
         timed_out=timed_out,
         duration_seconds=round(time.monotonic() - started, 3),
@@ -692,38 +717,128 @@ def _read_chunk(fd: int) -> bytes:
 
 
 def _terminate_process(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
+    process_ids = _collect_process_tree_ids(process.pid)
+    if not process_ids and process.poll() is not None:
         return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
+    group_ids = _collect_process_group_ids(process_ids)
+    _signal_process_groups(group_ids, signal.SIGTERM)
+    _signal_processes(process_ids, signal.SIGTERM)
+    if process.poll() is not None:
         return
     grace_seconds = max(float(get_config().execution.process_terminate_grace_seconds), 0.5)
     try:
         process.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
+        process_ids = _collect_process_tree_ids(process.pid) | process_ids
+        group_ids = _collect_process_group_ids(process_ids) | group_ids
+        _signal_process_groups(group_ids, signal.SIGKILL)
+        _signal_processes(process_ids, signal.SIGKILL)
+        with suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=0.2)
+
+
+def _collect_process_tree_ids(root_pid: int) -> set[int]:
+    process_ids: set[int] = set()
+    pending = [root_pid]
+    while pending:
+        current_pid = pending.pop()
+        if current_pid in process_ids:
+            continue
+        if not Path(f"/proc/{current_pid}").exists():
+            continue
+        process_ids.add(current_pid)
+        for child_pid in _child_process_ids(current_pid):
+            if child_pid not in process_ids:
+                pending.append(child_pid)
+    return process_ids
+
+
+def _child_process_ids(parent_pid: int) -> list[int]:
+    task_children = Path(f"/proc/{parent_pid}/task/{parent_pid}/children")
+    try:
+        return [int(value) for value in task_children.read_text(encoding="utf-8").split() if value.strip()]
+    except (OSError, ValueError):
+        pass
+    children: list[int] = []
+    for proc_dir in Path("/proc").iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+        status_path = proc_dir / "status"
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            for line in status_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.startswith("PPid:") and int(line.split()[1]) == parent_pid:
+                    children.append(int(proc_dir.name))
+                    break
+        except (OSError, ValueError, IndexError):
+            continue
+    return children
+
+
+def _collect_process_group_ids(process_ids: set[int]) -> set[int]:
+    group_ids: set[int] = set()
+    for pid in process_ids:
+        try:
+            group_ids.add(os.getpgid(pid))
         except ProcessLookupError:
-            pass
-        process.wait()
+            continue
+    return group_ids
 
 
-def _drain_process_output(process: subprocess.Popen[bytes], handle, mirror_handles: list) -> None:
+def _signal_process_groups(group_ids: set[int], sig: signal.Signals) -> None:
+    for group_id in sorted(group_ids):
+        try:
+            os.killpg(group_id, sig)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+
+
+def _signal_processes(process_ids: set[int], sig: signal.Signals) -> None:
+    for pid in sorted(process_ids, reverse=True):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+
+
+def _drain_process_output(
+    process: subprocess.Popen[bytes],
+    handle,
+    mirror_handles: list,
+    *,
+    nonblocking: bool = False,
+) -> None:
     stdout = process.stdout
     if stdout is None:
         return
-    while True:
-        chunk = _read_chunk(stdout.fileno())
-        if not chunk:
-            break
-        handle.write(chunk)
-        for mirror in mirror_handles:
-            mirror.write(chunk)
+    fd = stdout.fileno()
+    if nonblocking:
+        os.set_blocking(fd, False)
+    max_chunks = 256 if nonblocking else None
+    chunks_read = 0
+    try:
+        while True:
+            if max_chunks is not None and chunks_read >= max_chunks:
+                break
+            chunk = _read_chunk(fd)
+            if not chunk:
+                break
+            chunks_read += 1
+            handle.write(chunk)
+            for mirror in mirror_handles:
+                mirror.write(chunk)
+    finally:
+        if nonblocking:
+            with suppress(OSError):
+                os.set_blocking(fd, True)
     handle.flush()
     for mirror in mirror_handles:
         mirror.flush()
-    stdout.close()
+    with suppress(OSError):
+        stdout.close()
 
 
 def _safe_unregister(selector: selectors.BaseSelector, fileobj: object) -> None:

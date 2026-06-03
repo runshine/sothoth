@@ -46,6 +46,7 @@ from app.workers.runner import (
     normalize_attempt_relative_path,
     read_json_file,
     resolve_attempt_relative_path,
+    resolve_stage_work_dir,
     write_agentflow_events_from_trace,
     write_last_message_from_agentflow_result,
 )
@@ -491,6 +492,8 @@ class TaskService:
             report_output_map[payload["output_id"]] = payload
             report_output_list.append(payload)
         poc_runtime = build_in_container_qemu_runtime(build_poc_qemu_instance_name(context.task_id))
+        work_dir = resolve_stage_work_dir(context)
+        project_absolute_path = str(work_dir) if context.project_path else None
         task_context = {
             "task_id": context.task_id,
             "attempt_id": context.attempt_id,
@@ -501,9 +504,12 @@ class TaskService:
                 "project_path": context.project_path,
                 "report_path": context.report_path,
             },
-            "project_path": context.project_path,
+            "project_path": project_absolute_path,
+            "project_relative_path": context.project_path,
+            "project_absolute_path": project_absolute_path,
             "report_path": context.report_path,
             "repo_root": str(context.repo_root),
+            "work_dir": str(work_dir),
             "attempt_root": str(context.attempt_root),
             "runtime_root": str(context.runtime_root),
             "stage_names": list(context.effective_config.get("stage_names") or []),
@@ -961,7 +967,46 @@ class TaskService:
             row = self._get_task_row(conn, task_id)
             if row["status"] not in ACTIVE_TASK_STATUSES:
                 return self._task_row_to_summary(row)
+            attempt_row = self._get_attempt_row(conn, row["latest_attempt_id"]) if row["latest_attempt_id"] else None
             conn.execute("BEGIN IMMEDIATE")
+            if attempt_row is not None and attempt_row["status"] == "queued":
+                cursor = conn.execute(
+                    """
+                    update ipc_audit_task_attempts
+                    set status = 'cancelled', finished_at = ?, updated_at = ?, failure_reason = 'task cancelled'
+                    where attempt_id = ? and status = 'queued'
+                    """,
+                    (now, now, row["latest_attempt_id"]),
+                )
+                if cursor.rowcount == 1:
+                    conn.execute(
+                        """
+                        update ipc_audit_stage_runs
+                        set status = 'cancelled', finished_at = coalesce(finished_at, ?), updated_at = ?, message = 'task cancelled'
+                        where attempt_id = ? and status in ('pending', 'queued', 'running')
+                        """,
+                        (now, now, row["latest_attempt_id"]),
+                    )
+                    conn.execute(
+                        """
+                        update ipc_audit_tasks
+                        set status = 'cancelled', current_stage = null, finished_at = ?, updated_at = ?, message = 'task cancelled'
+                        where task_id = ?
+                        """,
+                        (now, now, task_id),
+                    )
+                    get_event_service().append_event(
+                        conn,
+                        task_id=task_id,
+                        attempt_id=row["latest_attempt_id"],
+                        stage_name=None,
+                        event_type="task.cancelled",
+                        level="warning",
+                        message="task cancelled",
+                        payload={"reason": "cancelled_before_claim"},
+                    )
+                    conn.commit()
+                    return self.get_task_summary(task_id)
             conn.execute(
                 """
                 update ipc_audit_tasks

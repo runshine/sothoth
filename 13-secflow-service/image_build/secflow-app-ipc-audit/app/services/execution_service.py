@@ -126,13 +126,22 @@ class ExecutionService:
                 self._cancel_attempt(str(context["task_id"]), attempt_id, str(exc))
             except TimedOutError as exc:
                 logger.warning("attempt %s timed out: %s", attempt_id, exc)
-                self._timeout_attempt(str(context["task_id"]), attempt_id, str(exc))
+                if self._is_cancel_requested_safe(str(context["task_id"]), attempt_id):
+                    self._cancel_attempt(str(context["task_id"]), attempt_id, "task cancelled")
+                else:
+                    self._timeout_attempt(str(context["task_id"]), attempt_id, str(exc))
             except StageFailedError as exc:
                 logger.warning("attempt %s stage %s failed: %s", attempt_id, exc.stage_name, exc.message)
-                self._fail_attempt(str(context["task_id"]), attempt_id, exc.message)
+                if self._is_cancel_requested_safe(str(context["task_id"]), attempt_id):
+                    self._cancel_attempt(str(context["task_id"]), attempt_id, "task cancelled")
+                else:
+                    self._fail_attempt(str(context["task_id"]), attempt_id, exc.message)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("attempt %s failed: %s", attempt_id, exc)
-                self._fail_attempt(str(context["task_id"]), attempt_id, str(exc))
+                if self._is_cancel_requested_safe(str(context["task_id"]), attempt_id):
+                    self._cancel_attempt(str(context["task_id"]), attempt_id, "task cancelled")
+                else:
+                    self._fail_attempt(str(context["task_id"]), attempt_id, str(exc))
             finally:
                 try:
                     self._write_runtime_manifest(context)
@@ -896,6 +905,13 @@ class ExecutionService:
         return row is not None and (
             row["task_status"] == "cancel_requested" or row["attempt_status"] == "cancel_requested"
         )
+
+    def _is_cancel_requested_safe(self, task_id: str, attempt_id: str) -> bool:
+        try:
+            return self._is_cancel_requested(task_id, attempt_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("failed to check cancellation for %s: %s", attempt_id, exc)
+            return False
 
     def _write_runtime_manifest(self, context: dict[str, object]) -> None:
         task_id = str(context["task_id"])

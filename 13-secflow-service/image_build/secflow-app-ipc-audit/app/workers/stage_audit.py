@@ -27,6 +27,7 @@ from app.workers.runner import (
     resolve_executor_mode,
     resolve_stage_primary_report_output_path,
     resolve_stage_executor_model,
+    resolve_stage_work_dir,
     run_logged_command,
     write_agentflow_events_from_trace,
     write_json_file,
@@ -50,10 +51,12 @@ def run_audit_stage(context: StageContext, hooks: StageHooks) -> StageExecutionR
         default_path=context.stage_artifact_path("audit-report.md"),
     )
     log_path = context.stage_log_path()
+    work_dir = resolve_stage_work_dir(context)
+    prompt_project_path = str(work_dir) if context.project_path else ""
     prompt = _build_prompt(
         audit_skill=audit_skill,
         repo_root=context.repo_root,
-        project_path=context.project_path or "",
+        project_path=prompt_project_path,
         output_report_path=_attempt_output_path(context),
     )
     write_text_file(prompt_path, prompt)
@@ -398,14 +401,16 @@ def _run_agentflow_single_node_stage(
     pipeline_path = context.stage_session_dir() / "agentflow-pipeline.json"
     runs_dir = context.stage_session_dir() / "agentflow-runs"
     agent_name = cfg.agentflow_agent
+    work_dir = resolve_stage_work_dir(context)
     pipeline_payload: dict[str, object] = {
         "name": f"secflow-ipc-audit-{context.stage_name}",
-        "working_dir": str(context.repo_root),
+        "working_dir": str(work_dir),
         "nodes": [
             build_agentflow_node(
                 node_id=context.stage_name,
                 prompt=prompt,
                 repo_root=context.repo_root,
+                work_dir=work_dir,
                 attempt_root=context.attempt_root,
                 model=executor_model,
                 sandbox_mode=sandbox_mode,
@@ -429,6 +434,7 @@ def _run_agentflow_single_node_stage(
             f"Generated at (UTC): {utc_now_z()}",
             f"Repo root: {context.repo_root}",
             f"Subproject: {context.project_path}",
+            f"AgentFlow work dir: {work_dir}",
             f"Executor mode: agentflow_cli",
             f"AgentFlow agent: {agent_name}",
             f"Model: {executor_model or '(default)'}",
@@ -445,7 +451,7 @@ def _run_agentflow_single_node_stage(
     )
     result = run_logged_command(
         cmd,
-        cwd=context.repo_root,
+        cwd=work_dir,
         log_path=log_path,
         log_header=log_header,
         hooks=hooks,
@@ -578,6 +584,7 @@ def _run_agentflow_combined_pipeline(
     runs_dir = context.runtime_root / "agentflow-runs"
     combined_cli_log_path = context.stage_session_dir() / "agentflow-cli.log"
     agent_name = cfg.agentflow_agent
+    work_dir = resolve_stage_work_dir(context)
     stage_specs = [
         {
             "stage_name": "audit",
@@ -591,6 +598,7 @@ def _run_agentflow_combined_pipeline(
                 node_id="audit",
                 prompt=prompt,
                 repo_root=context.repo_root,
+                work_dir=work_dir,
                 attempt_root=context.attempt_root,
                 model=executor_model,
                 sandbox_mode=str(context.effective_config.get("audit_sandbox_mode") or cfg.audit_sandbox_mode),
@@ -607,6 +615,7 @@ def _run_agentflow_combined_pipeline(
                 f"Generated at (UTC): {utc_now_z()}",
                 f"Repo root: {context.repo_root}",
                 f"Subproject: {context.project_path}",
+                f"AgentFlow work dir: {work_dir}",
                 "Executor mode: agentflow_cli",
                 f"AgentFlow agent: {agent_name}",
                 f"Model: {executor_model or '(default)'}",
@@ -627,6 +636,7 @@ def _run_agentflow_combined_pipeline(
                 node_id="poc",
                 prompt=poc_prompt,
                 repo_root=context.repo_root,
+                work_dir=work_dir,
                 attempt_root=context.attempt_root,
                 model=executor_model,
                 sandbox_mode=str(context.effective_config.get("poc_sandbox_mode") or cfg.poc_sandbox_mode),
@@ -651,6 +661,7 @@ def _run_agentflow_combined_pipeline(
                 f"=== {str(context.effective_config.get('poc_skill') or cfg.default_poc_skill)} ===",
                 f"Generated at (UTC): {utc_now_z()}",
                 f"Repo root: {context.repo_root}",
+                f"AgentFlow work dir: {work_dir}",
                 f"Source report: {audit_output_path}",
                 "Executor mode: agentflow_cli",
                 f"AgentFlow agent: {agent_name}",
@@ -664,7 +675,7 @@ def _run_agentflow_combined_pipeline(
     ]
     pipeline_payload: dict[str, object] = {
         "name": "secflow-ipc-audit-stage-pipeline",
-        "working_dir": str(context.repo_root),
+        "working_dir": str(work_dir),
         "nodes": [stage_spec["node"] for stage_spec in stage_specs],
     }
     write_json_file(pipeline_path, pipeline_payload)
@@ -677,6 +688,7 @@ def _run_agentflow_combined_pipeline(
             f"Generated at (UTC): {utc_now_z()}",
             f"Repo root: {context.repo_root}",
             f"Subproject: {context.project_path}",
+            f"AgentFlow work dir: {work_dir}",
             "Executor mode: agentflow_cli",
             f"AgentFlow agent: {agent_name}",
             f"Model: {executor_model or '(default)'}",
@@ -697,7 +709,7 @@ def _run_agentflow_combined_pipeline(
     )
     result = run_logged_command(
         cmd,
-        cwd=context.repo_root,
+        cwd=work_dir,
         log_path=combined_cli_log_path,
         log_header=log_header,
         hooks=hooks,
@@ -932,7 +944,7 @@ def _run_opencode_stage(
         previous_return_code = result.return_code
         retry_prompt = _build_missing_audit_output_retry_prompt(
             repo_root=context.repo_root,
-            project_path=context.project_path or "",
+            project_path=str(resolve_stage_work_dir(context)) if context.project_path else "",
             output_report_path=output_path,
             retry_count=retry_count,
             max_retries=max_retries,
@@ -1091,6 +1103,7 @@ def _build_missing_audit_output_retry_prompt(
             reason_text,
             "Do not restart the task or ask for clarification. Continue from the existing session context.",
             "Inspect more files only if needed, then create parent directories and write the final Markdown report exactly to the required output report path.",
+            "Keep any additional search scoped to the Subproject path. Do not run broad rg/find searches from Repo root.",
             "Before your final response, verify that the report file exists and is non-empty.",
             "If no issue is found, the report must still be written and must explicitly say no concrete IPC-reachable OOB issue was found.",
         ]
@@ -1124,17 +1137,21 @@ This prompt is self-contained. Do not invoke, require, or assume any external Co
 
 Goal:
 - Audit only the specified OpenHarmony subproject for IPC-reachable out-of-bounds memory reads/writes.
-- Stay scoped to the subproject for candidate surfaces, but follow call chains to real implementations anywhere under Repo root when needed.
+- Stay scoped to the subproject source for candidate surfaces and broad searches.
+- Do not use rg/find from Repo root to discover candidates. If readtags or a direct code reference points to a file outside the subproject, read that exact file directly as dependency context only.
 - Write the final Markdown report exactly to Output report path. Create parent directories if needed.
 
 Workflow:
 1. Find IPC-reachable attack surfaces first.
 - Search under the subproject for server-side IPC handlers and parcel consumers: OnRemoteRequest, OnRemoteRequestInner, IRemoteStub, RemoteStub, IPCObjectStub, transaction dispatch switches/tables, and helpers that read MessageParcel/data.
 - Prefer rg under the subproject first. Exclude tests, fuzzers, demos, and sample code unless they reveal the production path.
+- The process cwd is intended to be the Subproject path. Do not cd to Repo root or run bare rg/find there.
+- Do not run broad rg searches from Repo root. Repo-root access is only for reading exact files resolved by readtags or already referenced from the subproject code.
 
 2. Resolve real implementations; never guess.
 - When a relevant function or class is declared, generated, virtual, or referenced indirectly, resolve its real implementation before judging safety.
 - Prefer readtags against the Repo root tags file when available: readtags -e -t <Repo root>/tags <symbol> | grep -v test.
+- If readtags returns definitions in another project, open those returned files directly. Do not use repo-wide rg to rediscover or expand the search.
 - If an implementation cannot be found, record it in an Unresolved section and do not claim a vulnerability based on assumptions.
 
 3. Build the full serialization/deserialization object graph.
@@ -1155,6 +1172,7 @@ Workflow:
 - Cite exact attacker-controlled parcel fields and exact later OOB sinks.
 - Include file paths and line numbers wherever possible.
 - If safety depends on an assumption you cannot prove from code, mark the path unresolved instead of reporting it.
+- Keep external files resolved by readtags clearly marked as dependency context, not as new audit scope.
 
 Report requirements:
 - Include Scope: Repo root, Subproject, audited IPC entrypoints, and transaction codes if known.

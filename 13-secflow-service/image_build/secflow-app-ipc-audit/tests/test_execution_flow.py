@@ -151,6 +151,58 @@ class ExecutionFlowTest(unittest.TestCase):
                 self.subject,
             )
 
+    def test_cancel_queued_task_finishes_immediately(self) -> None:
+        task = get_task_service().create_task(
+            TaskCreateRequest(
+                title="queued-cancel",
+                workspace_id="oh61-main",
+                pipeline_mode="audit_then_poc",
+                input_ref=InputRef(kind="custom_project", project_path="foundation/demo/service"),
+            ),
+            self.subject,
+        )
+
+        cancelled = get_task_service().cancel_task(task.task_id)
+        detail = get_task_service().get_task(task.task_id)
+        attempt = get_task_service().get_attempt(task.task_id, str(detail.latest_attempt_id))
+
+        self.assertEqual(cancelled.status, "cancelled")
+        self.assertEqual(detail.status, "cancelled")
+        self.assertEqual(attempt.status, "cancelled")
+        self.assertEqual({item.stage_name: item.status for item in attempt.stage_runs}, {"audit": "cancelled", "poc": "cancelled"})
+        self.assertIsNone(get_task_service().claim_next_attempt("tester-worker"))
+
+    def test_cancel_requested_attempt_stays_cancelled_when_stage_raises(self) -> None:
+        task = get_task_service().create_task(
+            TaskCreateRequest(
+                title="cancel-wins-over-stage-error",
+                workspace_id="oh61-main",
+                pipeline_mode="audit_only",
+                input_ref=InputRef(kind="custom_project", project_path="foundation/demo/service"),
+            ),
+            self.subject,
+        )
+        attempt_id = get_task_service().claim_next_attempt("tester-worker")
+        self.assertIsNotNone(attempt_id)
+
+        execution_service = get_execution_service()
+        original_run_stage = execution_service._run_stage
+
+        def failing_run_stage(*args, **kwargs):
+            get_task_service().cancel_task(task.task_id)
+            raise RuntimeError("stage failed after cancel")
+
+        execution_service._run_stage = failing_run_stage
+        try:
+            execution_service.run_attempt(str(attempt_id))
+        finally:
+            execution_service._run_stage = original_run_stage
+
+        detail = get_task_service().get_task(task.task_id)
+        attempt = get_task_service().get_attempt(task.task_id, str(detail.latest_attempt_id))
+        self.assertEqual(detail.status, "cancelled")
+        self.assertEqual(attempt.status, "cancelled")
+
     def test_slow_provider_resolution_does_not_expire_worker_lease(self) -> None:
         task = get_task_service().create_task(
             TaskCreateRequest(

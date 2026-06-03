@@ -173,7 +173,10 @@ class AgentFlowCliModeTest(unittest.TestCase):
 
         attempt_root = self._attempt_root(task.task_id, str(detail.latest_attempt_id))
         pipeline_payload = json.loads((attempt_root / "runtime" / "agentflow-stage-pipeline.json").read_text(encoding="utf-8"))
+        project_work_dir = str(self.repo_root / "foundation" / "demo" / "service")
+        self.assertEqual(pipeline_payload["working_dir"], project_work_dir)
         self.assertEqual([node["id"] for node in pipeline_payload["nodes"]], ["audit", "poc"])
+        self.assertEqual([node["target"]["cwd"] for node in pipeline_payload["nodes"]], [project_work_dir, project_work_dir])
         self.assertEqual(pipeline_payload["nodes"][1]["depends_on"], ["audit"])
 
         manifest = json.loads((attempt_root / "runtime" / "agentflow-stage-pipeline-manifest.json").read_text(encoding="utf-8"))
@@ -185,6 +188,9 @@ class AgentFlowCliModeTest(unittest.TestCase):
         invocations = [json.loads(line) for line in invocations_path.read_text(encoding="utf-8").splitlines() if line.strip()]
         self.assertEqual(len(invocations), 1)
         self.assertEqual(invocations[0]["node_ids"], ["audit", "poc"])
+        self.assertEqual(invocations[0]["cwd"], project_work_dir)
+        self.assertEqual(invocations[0]["working_dir"], project_work_dir)
+        self.assertEqual(invocations[0]["node_cwds"], [project_work_dir, project_work_dir])
 
     def test_agentflow_root_resolves_nested_directory_for_k8s_style_mount(self) -> None:
         from app.core.config import load_config, resolve_agentflow_root
@@ -396,9 +402,15 @@ class AgentFlowCliModeTest(unittest.TestCase):
         self.assertTrue(all(item.exists for item in attempt.report_outputs))
         self.assertEqual([item.path for item in attempt.report_outputs], ["exports/stage1-report.md", "exports/stage2-report.md"])
         self.assertEqual(attempt.effective_config["materialized_graph_source"]["type"], "inline_json")
+        project_work_dir = str(self.repo_root / "foundation" / "demo" / "service")
+        self.assertEqual(attempt.effective_config["materialized_graph_source"]["content"]["working_dir"], project_work_dir)
         self.assertEqual(
             [item["id"] for item in attempt.effective_config["materialized_graph_source"]["content"]["nodes"]],
             ["stage1", "stage2"],
+        )
+        self.assertEqual(
+            [item["target"]["cwd"] for item in attempt.effective_config["materialized_graph_source"]["content"]["nodes"]],
+            [project_work_dir, project_work_dir],
         )
         self.assertEqual(
             attempt.effective_config["materialized_graph_source"]["content"]["nodes"][1]["depends_on"],
@@ -426,8 +438,15 @@ class AgentFlowCliModeTest(unittest.TestCase):
         manifest_payload = json.loads(manifest_content)
         self.assertIn("stage1_report", manifest_content)
         self.assertIn("stage2_report", manifest_content)
+        self.assertEqual(manifest_payload["pipeline"]["working_dir"], project_work_dir)
         self.assertEqual([item["id"] for item in manifest_payload["pipeline"]["nodes"]], ["stage1", "stage2"])
         self.assertEqual(manifest_payload["pipeline"]["nodes"][1]["depends_on"], ["stage1"])
+
+        invocations_path = self.agentflow_root / "invocations.jsonl"
+        invocations = [json.loads(line) for line in invocations_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(invocations[-1]["cwd"], project_work_dir)
+        self.assertEqual(invocations[-1]["working_dir"], project_work_dir)
+        self.assertEqual(invocations[-1]["node_cwds"], [project_work_dir, project_work_dir])
 
     def test_custom_graph_reconciles_extra_success_criteria_outputs_into_artifacts_and_attempt_outputs(self) -> None:
         task = get_task_service().create_task(
@@ -876,7 +895,15 @@ class AgentFlowCliModeTest(unittest.TestCase):
         detail = get_task_service().get_task(task.task_id)
         attempt_id = str(detail.latest_attempt_id)
         attempt_root = self._attempt_root(task.task_id, attempt_id)
+        project_work_dir = str(self.repo_root / "foundation" / "demo" / "service")
+        graph_context = json.loads((attempt_root / "runtime" / "graph" / "graph-context.json").read_text(encoding="utf-8"))
+        self.assertEqual(graph_context["task"]["project_path"], project_work_dir)
+        self.assertEqual(graph_context["task"]["project_absolute_path"], project_work_dir)
+        self.assertEqual(graph_context["task"]["project_relative_path"], "foundation/demo/service")
+        self.assertEqual(graph_context["task"]["work_dir"], project_work_dir)
         pipeline_payload = json.loads((attempt_root / "runtime" / "graph" / "agentflow-pipeline.json").read_text(encoding="utf-8"))
+        self.assertEqual(pipeline_payload["working_dir"], project_work_dir)
+        self.assertEqual([node["target"]["cwd"] for node in pipeline_payload["nodes"]], [project_work_dir, project_work_dir])
         self.assertEqual(
             pipeline_payload["nodes"][0]["success_criteria"][0]["path"],
             str(attempt_root / "exports" / "builder1-report.md"),
@@ -1018,7 +1045,13 @@ class AgentFlowCliModeTest(unittest.TestCase):
                     "    payload = json.loads(pipeline_path.read_text(encoding='utf-8'))",
                     "    nodes = payload['nodes']",
                     "    fail_node = os.environ.get('FAKE_AGENTFLOW_FAIL_NODE', '').strip()",
-                    "    invocation = {'pipeline_path': str(pipeline_path), 'node_ids': [node.get('id') for node in nodes]}",
+                    "    invocation = {",
+                    "        'pipeline_path': str(pipeline_path),",
+                    "        'cwd': os.getcwd(),",
+                    "        'working_dir': payload.get('working_dir'),",
+                    "        'node_ids': [node.get('id') for node in nodes],",
+                    "        'node_cwds': [(node.get('target') or {}).get('cwd') for node in nodes],",
+                    "    }",
                     "    with (capture_root / 'invocations.jsonl').open('a', encoding='utf-8') as handle:",
                     "        handle.write(json.dumps(invocation, ensure_ascii=False) + '\\n')",
                     "    (capture_root / 'last_pipeline.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\\n', encoding='utf-8')",

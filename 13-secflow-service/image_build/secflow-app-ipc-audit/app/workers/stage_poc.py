@@ -28,6 +28,7 @@ from app.workers.runner import (
     resolve_executor_mode,
     resolve_stage_primary_report_output_path,
     resolve_stage_executor_model,
+    resolve_stage_work_dir,
     run_logged_command,
     write_agentflow_events_from_trace,
     write_json_file,
@@ -449,14 +450,16 @@ def _run_agentflow_single_node_stage(
     pipeline_path = context.stage_session_dir() / "agentflow-pipeline.json"
     runs_dir = context.stage_session_dir() / "agentflow-runs"
     agent_name = cfg.agentflow_agent
+    work_dir = resolve_stage_work_dir(context)
     pipeline_payload: dict[str, object] = {
         "name": f"secflow-ipc-audit-{context.stage_name}",
-        "working_dir": str(context.repo_root),
+        "working_dir": str(work_dir),
         "nodes": [
             build_agentflow_node(
                 node_id=context.stage_name,
                 prompt=prompt,
                 repo_root=context.repo_root,
+                work_dir=work_dir,
                 attempt_root=context.attempt_root,
                 model=executor_model,
                 sandbox_mode=sandbox_mode,
@@ -487,6 +490,7 @@ def _run_agentflow_single_node_stage(
             f"=== {poc_skill} ===",
             f"Generated at (UTC): {utc_now_z()}",
             f"Repo root: {context.repo_root}",
+            f"AgentFlow work dir: {work_dir}",
             f"Source report: {source_report_path}",
             f"Executor mode: agentflow_cli",
             f"AgentFlow agent: {agent_name}",
@@ -505,7 +509,7 @@ def _run_agentflow_single_node_stage(
     )
     result = run_logged_command(
         cmd,
-        cwd=context.repo_root,
+        cwd=work_dir,
         log_path=log_path,
         log_header=log_header,
         hooks=hooks,
@@ -1041,11 +1045,14 @@ _POC_WORKFLOW_PROMPT = """\
 This prompt is self-contained. Do not invoke, require, or assume any external Codex/OpenCode skill.
 
 Goal:
-- Validate the issues in Project report against the code under Repo root.
+- Validate the issues in Project report against the reported subproject code and exact referenced dependency files only.
 - Always write a PoC report exactly to Output PoC report path. Create parent directories if needed.
 - Always write a JSON stats file exactly to Output audited result json path. Create parent directories if needed.
 
 Scope rules:
+- Keep code validation scoped to the reported subproject and exact files already cited by the report, direct code references, or readtags.
+- The process cwd is intended to be the Subproject path. Do not cd to Repo root or run bare rg/find there.
+- Do not run broad rg/find searches from Repo root. If readtags resolves helper classes or implementations in another project, read those exact files directly as dependency context.
 - If a reported sink cannot be triggered from OnRemoteRequest or an equivalent IPC stub dispatch into the service-side implementation, classify it as NOT_APPLICABLE and do not generate a PoC for it.
 - For Lite system reports, issues based on Lite IPC IpcIo rather than MessageParcel-based IPC are NOT_APPLICABLE in this workflow.
 - Do not patch the target service implementation to force a crash.

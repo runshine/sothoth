@@ -26,6 +26,7 @@ from app.workers.runner import (
     read_json_file,
     resolve_attempt_relative_path,
     resolve_report_outputs_for_attempt,
+    resolve_stage_work_dir,
     run_logged_command,
     write_agentflow_events_from_trace,
     write_json_file,
@@ -72,6 +73,7 @@ def run_graph(context: StageContext, hooks: StageHooks) -> GraphExecutionResult:
     cli_log_path = graph_runtime_dir / "agentflow-cli.log"
     graph_manifest_path = graph_runtime_dir / "graph-manifest.json"
     runs_dir = graph_runtime_dir / "agentflow-runs"
+    work_dir = resolve_stage_work_dir(context)
 
     report_outputs = resolve_report_outputs_for_attempt(context.attempt_root, context.effective_config)
     template_context = _build_template_context(context, report_outputs)
@@ -127,6 +129,7 @@ def run_graph(context: StageContext, hooks: StageHooks) -> GraphExecutionResult:
             "=== custom_graph ===",
             f"Generated at (UTC): {utc_now_z()}",
             f"Repo root: {context.repo_root}",
+            f"AgentFlow work dir: {work_dir}",
             f"Task ID: {context.task_id}",
             f"Attempt ID: {context.attempt_id}",
             "Executor mode: agentflow_cli",
@@ -142,7 +145,7 @@ def run_graph(context: StageContext, hooks: StageHooks) -> GraphExecutionResult:
     )
     process_result = run_logged_command(
         cmd,
-        cwd=context.repo_root,
+        cwd=work_dir,
         log_path=cli_log_path,
         log_header=log_header,
         hooks=hooks,
@@ -218,6 +221,8 @@ def _build_template_context(context: StageContext, report_outputs: list[dict[str
         report_output_map[payload["output_id"]] = payload
         report_output_list.append(payload)
     poc_runtime = build_in_container_qemu_runtime(build_poc_qemu_instance_name(context.task_id))
+    work_dir = resolve_stage_work_dir(context)
+    project_absolute_path = str(work_dir) if context.project_path else None
     task_context = {
         "task_id": context.task_id,
         "attempt_id": context.attempt_id,
@@ -228,9 +233,12 @@ def _build_template_context(context: StageContext, report_outputs: list[dict[str
             "project_path": context.project_path,
             "report_path": context.report_path,
         },
-        "project_path": context.project_path,
+        "project_path": project_absolute_path,
+        "project_relative_path": context.project_path,
+        "project_absolute_path": project_absolute_path,
         "report_path": context.report_path,
         "repo_root": str(context.repo_root),
+        "work_dir": str(work_dir),
         "attempt_root": str(context.attempt_root),
         "runtime_root": str(context.runtime_root),
         "stage_names": _declared_stage_names(context),
@@ -296,6 +304,7 @@ def _materialize_pipeline(
             "=== graph builder ===",
             f"Generated at (UTC): {utc_now_z()}",
             f"Repo root: {context.repo_root}",
+            f"AgentFlow work dir: {resolve_stage_work_dir(context)}",
             "=== provider runtime ===",
             provider_summary,
             "=== command ===",
@@ -413,6 +422,7 @@ def _normalize_pipeline_payload(context: StageContext, payload: dict[str, Any]) 
         raise ValueError("pipeline.nodes must be a non-empty array")
     normalized_nodes: list[dict[str, Any]] = []
     default_timeout_seconds = int(get_config().execution.task_timeout_seconds)
+    work_dir = resolve_stage_work_dir(context)
     seen_ids: set[str] = set()
     for node in nodes_value:
         if not isinstance(node, dict):
@@ -427,12 +437,21 @@ def _normalize_pipeline_payload(context: StageContext, payload: dict[str, Any]) 
         seen_ids.add(node_id)
         normalized_node = dict(node)
         normalized_node.setdefault("agent", "opencode")
-        normalized_node.setdefault("target", {"kind": "local", "cwd": str(context.repo_root)})
+        target = normalized_node.get("target")
+        if not isinstance(target, dict):
+            normalized_node["target"] = {"kind": "local", "cwd": str(work_dir)}
+        else:
+            normalized_target = dict(target)
+            target_kind = str(normalized_target.get("kind") or "local").strip() or "local"
+            normalized_target["kind"] = target_kind
+            if target_kind == "local":
+                normalized_target.setdefault("cwd", str(work_dir))
+            normalized_node["target"] = normalized_target
         normalized_node.setdefault("tools", "read_write")
         normalized_node.setdefault("timeout_seconds", default_timeout_seconds)
         normalized_nodes.append(normalized_node)
     normalized_payload = dict(payload)
-    normalized_payload.setdefault("working_dir", str(context.repo_root))
+    normalized_payload.setdefault("working_dir", str(work_dir))
     normalized_payload["nodes"] = normalized_nodes
     return normalized_payload
 
