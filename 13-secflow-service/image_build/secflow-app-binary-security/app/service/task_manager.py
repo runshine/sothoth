@@ -2313,7 +2313,13 @@ class TaskManager:
                 entry[normalized_status] += int(count or 0)
         sync_items = (
             db.query(BinarySecurityStageItem)
-            .options(load_only(BinarySecurityStageItem.id, BinarySecurityStageItem.result, BinarySecurityStageItem.status))
+            .options(
+                load_only(
+                    BinarySecurityStageItem.id,
+                    BinarySecurityStageItem.result_json,
+                    BinarySecurityStageItem.status,
+                )
+            )
             .filter(BinarySecurityStageItem.task_id == task.id)
             .all()
         )

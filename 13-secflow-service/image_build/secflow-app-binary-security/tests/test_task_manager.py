@@ -3219,6 +3219,45 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("dispatching", task.status)
         self.assertEqual("running", next(summary.status for summary in detail.stage_summaries if summary.stage_name == "system_analysis"))
 
+    def test_get_task_detail_light_context_does_not_use_result_property_in_loader(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=1,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="i1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-a",
+            item_name="module-a",
+            status="running",
+        )
+        item.result = {"last_sync_attempt_at": "2026-06-03T13:00:00Z"}
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], archive_jobs=[], events=[])
+
+        detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
+
+        self.assertIsInstance(detail.stage_items_total, int)
+        self.assertIsInstance(detail.stage_items, list)
+
     def test_list_tasks_keeps_read_path_side_effect_free_when_stage_is_running(self):
         task = BinarySecurityTask(
             id="t1",
