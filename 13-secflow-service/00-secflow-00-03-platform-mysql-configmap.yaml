@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: secflow-platform-mysql-config
+  namespace: secflow-ns
+data:
+  90-binlog-retention.cnf: |
+    [mysqld]
+    binlog_expire_logs_seconds=604800

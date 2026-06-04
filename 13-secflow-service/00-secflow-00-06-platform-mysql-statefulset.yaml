@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: secflow-platform-mysql
+  namespace: secflow-ns
+spec:
+  serviceName: secflow-platform-mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      name: secflow-platform-mysql
+  minReadySeconds: 1
+  template:
+    metadata:
+      labels:
+        name: secflow-platform-mysql
+        app: secflow-platform-mysql
+        tier: mysql
+    spec:
+      containers:
+        - name: mysql
+          image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/mysql:9.5.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              value: Huawei12#$
+            - name: MYSQL_ROOT_HOST
+              value: "%"
+          ports:
+            - containerPort: 3306
+              name: mysql
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "4096Mi"
+            limits:
+              cpu: "8000m"
+              memory: "8192Mi"
+          volumeMounts:
+            - name: mysql-data
+              mountPath: /var/lib/mysql
+            - name: mysql-config
+              mountPath: /etc/mysql/conf.d/90-binlog-retention.cnf
+              subPath: 90-binlog-retention.cnf
+            - name: mysql-custom-config
+              mountPath: /etc/mysql/conf.d/custom.cnf
+              subPath: custom.cnf
+          livenessProbe:
+            exec:
+              command:
+                - mysqladmin
+                - ping
+                - -uroot
+                - -pHuawei12#$
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+                - mysqladmin
+                - ping
+                - -uroot
+                - -pHuawei12#$
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+      volumes:
+        - name: mysql-data
+          persistentVolumeClaim:
+            claimName: secflow-platform-mysql-data-pvc
+        - name: mysql-config
+          configMap:
+            name: secflow-platform-mysql-config
+        - name: mysql-custom-config
+          configMap:
+            name: secflow-platform-mysql-custom-config
