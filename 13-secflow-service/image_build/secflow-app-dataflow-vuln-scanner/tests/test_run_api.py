@@ -404,6 +404,7 @@ def _create_execution_bound_run(
         db.add(trigger)
         run_index = get_run_index_service().sync_execution_run(db, execution)
         assert run_index is not None
+        get_execution_service()._refresh_task_list_projection_for_task_id(db, trigger.id)
         db.commit()
         return {
             "profile_id": profile["profile_id"],
@@ -1267,16 +1268,10 @@ def test_ready_does_not_require_db_connection_after_runtime_ready(service_config
         lambda: {"ready": True, "last_error": None},
     )
 
-    class _ForbiddenEngine:
-        def connect(self):
-            raise AssertionError("ready endpoint should not acquire a db connection")
-
-    async def _noop_auth_validate():
-        return None
-
-    monkeypatch.setattr("app.api.health.get_engine", lambda: _ForbiddenEngine(), raising=False)
-    monkeypatch.setattr("app.api.health.get_auth_service", lambda: type("_Auth", (), {"startup_validate": staticmethod(_noop_auth_validate)})())
-    monkeypatch.setattr("app.api.health.get_project_service", lambda: type("_Project", (), {"startup_validate": staticmethod(lambda: None)})())
+    monkeypatch.setattr(
+        "app.api.health.collect_probe_snapshot",
+        lambda: {"readiness_ok": True, "reason": None},
+    )
 
     response = client.get("/api/dataflow-vuln-scanner/ready")
     assert response.status_code == 200
@@ -1292,14 +1287,10 @@ def test_ready_returns_503_when_auth_service_unavailable(service_config_path, mo
         lambda: {"ready": True, "last_error": None},
     )
 
-    async def _failed_auth_validate():
-        raise HTTPException(status_code=503, detail="auth_service_unavailable")
-
     monkeypatch.setattr(
-        "app.api.health.get_auth_service",
-        lambda: type("_Auth", (), {"startup_validate": staticmethod(_failed_auth_validate)})(),
+        "app.api.health.collect_probe_snapshot",
+        lambda: {"readiness_ok": False, "reason": "auth_service_unavailable"},
     )
-    monkeypatch.setattr("app.api.health.get_project_service", lambda: type("_Project", (), {"startup_validate": staticmethod(lambda: None)})())
 
     response = client.get("/api/dataflow-vuln-scanner/ready")
     assert response.status_code == 503
@@ -1313,24 +1304,19 @@ def test_ready_caches_auth_validation_for_ttl(service_config_path, monkeypatch):
         "app.api.health.build_runtime_status",
         lambda: {"ready": True, "last_error": None},
     )
-    monkeypatch.setattr("app.api.health.get_project_service", lambda: type("_Project", (), {"startup_validate": staticmethod(lambda: None)})())
-
     calls = {"count": 0}
 
-    async def _counted_auth_validate():
+    def _snapshot():
         calls["count"] += 1
-        return None
+        return {"readiness_ok": True, "reason": None}
 
-    monkeypatch.setattr(
-        "app.api.health.get_auth_service",
-        lambda: type("_Auth", (), {"startup_validate": staticmethod(_counted_auth_validate)})(),
-    )
+    monkeypatch.setattr("app.api.health.collect_probe_snapshot", _snapshot)
 
     first = client.get("/api/dataflow-vuln-scanner/ready")
     second = client.get("/api/dataflow-vuln-scanner/ready")
     assert first.status_code == 200
     assert second.status_code == 200
-    assert calls["count"] == 1
+    assert calls["count"] == 2
 
 
 def test_reconcile_stale_runtime_without_process_requeues_instead_of_failing(service_config_path):

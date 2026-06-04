@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -42,6 +43,7 @@ from app.models.database import (
     RunIndexSession,
     SchedulerWorker,
     SchedulerWorkerSlotReservation,
+    TaskTimelineEvent,
     TriggerTask,
     VulnReportSubmission,
     WorkflowDefinition,
@@ -114,6 +116,62 @@ _NORMALIZED_TIMELINE_MESSAGES = {
     "stale_runtime_kept_running": "runtime binding incomplete; preserved by run evidence",
     "runtime_binding_repaired": "runtime binding repaired from run/process evidence",
     "runtime_binding_repair_requested": "runtime binding repair requested from run/process evidence",
+}
+_TASK_TIMELINE_DEDUPE_WINDOW_SECONDS = 60
+_TASK_TIMELINE_EVENT_GROUPS = {
+    "task_created": "task",
+    "task_retry_requested": "operation",
+    "task_retry_created": "operation",
+    "task_resume_requested": "operation",
+    "task_cancel_requested": "operation",
+    "task_cancel_reconciled": "operation",
+    "task_deleted": "operation",
+    "task_priority_updated": "operation",
+    "task_projection_rebuilt": "operation",
+    "task_dispatch_queued": "dispatch",
+    "task_dispatch_assigned": "dispatch",
+    "task_dispatch_started": "dispatch",
+    "task_dispatch_failed": "dispatch",
+    "task_dispatch_requeued": "dispatch",
+    "task_dispatch_backoff_scheduled": "dispatch",
+    "task_dispatch_backoff_released": "dispatch",
+    "task_worker_starting": "dispatch",
+    "task_process_started": "dispatch",
+    "task_process_start_failed": "dispatch",
+    "task_requeued_before_process_start": "recovery",
+    "task_recovery_pending": "recovery",
+    "task_recovery_requeued": "recovery",
+    "task_runtime_preserved": "recovery",
+    "task_succeeded": "terminal",
+    "task_failed": "terminal",
+    "task_cancelled": "terminal",
+    "task_interrupted": "terminal",
+}
+_RAW_EVENT_TASK_TIMELINE_MIRRORS = {
+    "execution_queued": "task_dispatch_queued",
+    "worker_dispatch_succeeded": "task_dispatch_assigned",
+    "worker_job_queued": "task_dispatch_queued",
+    "worker_job_starting": "task_worker_starting",
+    "run_vuln_scan_process_started": "task_process_started",
+    "worker_dispatch_requeued": "task_dispatch_requeued",
+    "dispatch_backoff_scheduled": "task_dispatch_backoff_scheduled",
+    "dispatch_backoff_released": "task_dispatch_backoff_released",
+    "worker_job_start_failed": "task_process_start_failed",
+    "worker_job_requeued_before_process_start": "task_requeued_before_process_start",
+    "startup_registration_timeout_requeued": "task_recovery_requeued",
+    "runtime_lost_requeued": "task_recovery_requeued",
+    "unbound_active_execution_requeued": "task_dispatch_requeued",
+    "startup_grace_protected": "task_recovery_pending",
+    "stale_runtime_kept_running": "task_runtime_preserved",
+    "legacy_dispatch_failure_reconciled": "task_dispatch_failed",
+    "stale_dispatching_reconciled": "task_dispatch_failed",
+    "execution_finished": "task_succeeded",
+    "execution_failed": "task_failed",
+    "execution_cancelled": "task_cancelled",
+    "task_retry_queued": "task_retry_created",
+    "run_resume_queued": "task_resume_requested",
+    "task_cancel_reconciled": "task_cancel_reconciled",
+    "task_delete_reconciled": "task_deleted",
 }
 
 
@@ -1609,6 +1667,119 @@ class ExecutionService:
             resolved_execution = self._latest_execution_for_trigger(db, resolved_trigger.id)
         return resolved_trigger, resolved_execution
 
+    def _task_timeline_dedupe_key(
+        self,
+        *,
+        event_type: str,
+        task_id: str,
+        execution_id: str | None,
+        payload_json: dict[str, Any] | None,
+    ) -> str:
+        payload = payload_json if isinstance(payload_json, dict) else {}
+        dedupe_payload = {
+            "event_type": event_type,
+            "task_id": task_id,
+            "execution_id": execution_id,
+            "attempt_no": payload.get("attempt_no"),
+            "reason": payload.get("reason") or payload.get("resolution_reason"),
+            "worker_job_id": payload.get("worker_job_id"),
+            "dispatch_status_before": payload.get("dispatch_status_before"),
+            "dispatch_status_after": payload.get("dispatch_status_after"),
+            "task_status_before": payload.get("task_status_before"),
+            "task_status_after": payload.get("task_status_after"),
+            "status_before": payload.get("status_before"),
+            "status_after": payload.get("status_after"),
+        }
+        encoded = json.dumps(dedupe_payload, ensure_ascii=True, sort_keys=True, default=str)
+        return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+
+    def record_task_timeline_event(
+        self,
+        db: Session,
+        *,
+        task_id: str,
+        project_id: str,
+        event_type: str,
+        message: str,
+        execution_id: str | None = None,
+        attempt_no: int | None = None,
+        event_group: str | None = None,
+        source: str = "task",
+        level: str = "info",
+        payload_json: dict[str, Any] | None = None,
+        dedupe_key: str | None = None,
+    ) -> TaskTimelineEvent:
+        normalized_message, normalized_payload = self._normalized_timeline_message(event_type, message, payload_json)
+        safe_payload = jsonable_encoder(normalized_payload or {})
+        normalized_group = str(event_group or _TASK_TIMELINE_EVENT_GROUPS.get(event_type) or "task").strip() or "task"
+        effective_dedupe_key = str(dedupe_key or "").strip() or self._task_timeline_dedupe_key(
+            event_type=event_type,
+            task_id=task_id,
+            execution_id=execution_id,
+            payload_json=safe_payload,
+        )
+        threshold = now_local() - timedelta(seconds=_TASK_TIMELINE_DEDUPE_WINDOW_SECONDS)
+        existing = (
+            db.query(TaskTimelineEvent)
+            .filter(
+                TaskTimelineEvent.task_id == task_id,
+                TaskTimelineEvent.dedupe_key == effective_dedupe_key,
+                TaskTimelineEvent.created_at >= threshold,
+            )
+            .order_by(TaskTimelineEvent.created_at.desc(), TaskTimelineEvent.id.desc())
+            .first()
+        )
+        if existing is not None:
+            return existing
+        event = TaskTimelineEvent(
+            id=_new_id("tte"),
+            task_id=task_id,
+            project_id=project_id,
+            execution_id=execution_id,
+            attempt_no=attempt_no,
+            event_type=event_type,
+            event_group=normalized_group,
+            source=str(source or "task").strip() or "task",
+            level=level,
+            message=normalized_message,
+            payload_json=safe_payload,
+            dedupe_key=effective_dedupe_key,
+        )
+        db.add(event)
+        db.commit()
+        db.refresh(event)
+        return event
+
+    def _mirror_raw_event_to_task_timeline(
+        self,
+        db: Session,
+        *,
+        execution: WorkflowExecution,
+        event_type: str,
+        message: str,
+        level: str,
+        payload_json: dict[str, Any] | None,
+    ) -> TaskTimelineEvent | None:
+        mirrored_event_type = _RAW_EVENT_TASK_TIMELINE_MIRRORS.get(event_type)
+        if not mirrored_event_type:
+            return None
+        trigger = db.get(TriggerTask, execution.trigger_task_id) if execution.trigger_task_id else None
+        if trigger is None:
+            return None
+        return self.record_task_timeline_event(
+            db,
+            task_id=trigger.id,
+            project_id=trigger.project_id,
+            execution_id=execution.id,
+            attempt_no=execution.attempt_no,
+            event_type=mirrored_event_type,
+            event_group=_TASK_TIMELINE_EVENT_GROUPS.get(mirrored_event_type),
+            source="raw_mirror",
+            level=level,
+            message=message,
+            payload_json=payload_json,
+        )
+
     def _record_task_mutation_event(
         self,
         db: Session,
@@ -1638,6 +1809,26 @@ class ExecutionService:
                 message,
             )
             return None
+        effective_payload = dict(payload_json or {})
+        if resolved_trigger is not None:
+            effective_payload.setdefault("task_id", resolved_trigger.id)
+            effective_payload.setdefault("project_id", resolved_trigger.project_id)
+        if resolved_execution is not None:
+            effective_payload.setdefault("execution_id", resolved_execution.id)
+            effective_payload.setdefault("attempt_no", resolved_execution.attempt_no)
+        self.record_task_timeline_event(
+            db,
+            task_id=resolved_trigger.id if resolved_trigger is not None else str(task_id or ""),
+            project_id=resolved_trigger.project_id if resolved_trigger is not None else str(effective_payload.get("project_id") or ""),
+            execution_id=resolved_execution.id,
+            attempt_no=resolved_execution.attempt_no,
+            event_type=event_type,
+            event_group=_TASK_TIMELINE_EVENT_GROUPS.get(event_type),
+            source="task",
+            level=level,
+            message=message,
+            payload_json=effective_payload,
+        )
         return self.record_event(
             db,
             execution_id=resolved_execution.id,
@@ -1646,7 +1837,8 @@ class ExecutionService:
             stage_id=stage_id,
             round_no=round_no,
             level=level,
-            payload_json=payload_json,
+            payload_json=effective_payload,
+            suppress_task_timeline_mirror=True,
         )
 
     def _log_task_mutation(
@@ -2211,6 +2403,14 @@ class ExecutionService:
     ) -> RunIndex | None:
         existing_run_index = self._find_run_index_for_execution(db, execution)
         if existing_run_index is not None:
+            run_root = str(existing_run_index.run_root_path or "").strip()
+            if run_root and not Path(run_root).is_dir():
+                return self._refresh_run_index_for_execution(
+                    db,
+                    execution,
+                    trigger,
+                    include_runtime_assets=include_runtime_assets,
+                )
             return existing_run_index
         return self._refresh_run_index_for_execution(
             db,
@@ -2302,7 +2502,22 @@ class ExecutionService:
                             execution=latest_execution,
                         ),
                     })
-        if run_summary and "process_state" not in run_summary:
+        if run_locator["run_name"] and run_locator["runs_root"]:
+            run_summary = {
+                "name": run_locator["run_name"],
+                "root_path": run_locator["runs_root"],
+                "path": run_locator["run_path"],
+                "linked_task_id": trigger.id,
+                "linked_execution_id": latest_execution.id if latest_execution else None,
+                **run_summary,
+            }
+        current_process_state = run_summary.get("process_state")
+        if (
+            "process_state" not in run_summary
+            or not isinstance(current_process_state, dict)
+            or not current_process_state
+            or not str(current_process_state.get("source") or "").strip()
+        ):
             run_index_for_state = None
             run_index_id = str(run_summary.get("run_id") or "").strip()
             if run_index_id:
@@ -2327,15 +2542,6 @@ class ExecutionService:
                     trigger=trigger,
                     execution=latest_execution,
                 )
-        if run_locator["run_name"] and run_locator["runs_root"]:
-            run_summary = {
-                "name": run_locator["run_name"],
-                "root_path": run_locator["runs_root"],
-                "path": run_locator["run_path"],
-                "linked_task_id": trigger.id,
-                "linked_execution_id": latest_execution.id if latest_execution else None,
-                **run_summary,
-            }
         run_index_for_unbound = None
         run_index_id = str(run_summary.get("run_id") or "").strip()
         if run_index_id:
@@ -5958,8 +6164,48 @@ class ExecutionService:
         return payload
 
     def get_scan_task_timeline(self, db: Session, task_id: str, principal: dict) -> DataflowTaskTimelineResponse:
+        return self.get_scan_task_timeline_view(db, task_id, principal, view="task")
+
+    def get_scan_task_timeline_view(
+        self,
+        db: Session,
+        task_id: str,
+        principal: dict,
+        *,
+        view: str = "task",
+    ) -> DataflowTaskTimelineResponse:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
+        normalized_view = str(view or "task").strip().lower() or "task"
+        if normalized_view not in {"task", "raw"}:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="unsupported timeline view")
+        if normalized_view == "task":
+            events = (
+                db.query(TaskTimelineEvent)
+                .filter(TaskTimelineEvent.task_id == trigger.id)
+                .order_by(TaskTimelineEvent.created_at.asc(), TaskTimelineEvent.id.asc())
+                .all()
+            )
+            items = [
+                DataflowTaskTimelineEvent(
+                    id=event.id,
+                    task_id=event.task_id,
+                    project_id=event.project_id,
+                    execution_id=event.execution_id,
+                    attempt_no=event.attempt_no,
+                    stage_key=None,
+                    stage_name=None,
+                    event_type=event.event_type,
+                    event_group=str(event.event_group or "").strip() or None,
+                    source=str(event.source or "").strip() or None,
+                    level=str(event.level or "info").strip() or "info",
+                    message=event.message,
+                    payload=event.payload_json if isinstance(event.payload_json, dict) else {},
+                    created_at=event.created_at,
+                )
+                for event in events
+            ]
+            return DataflowTaskTimelineResponse(task_id=trigger.id, items=items)
         executions = (
             db.query(WorkflowExecution)
             .filter(WorkflowExecution.trigger_task_id == trigger.id)
@@ -5986,6 +6232,8 @@ class ExecutionService:
                 stage_key=str(event.stage_id or "").strip() or None,
                 stage_name=_normalize_timeline_stage_name(event.stage_id, event.payload_json if isinstance(event.payload_json, dict) else None),
                 event_type=event.event_type,
+                event_group=None,
+                source="raw",
                 level=str(event.level or "info").strip() or "info",
                 message=event.message,
                 payload=event.payload_json if isinstance(event.payload_json, dict) else {},
@@ -5996,44 +6244,93 @@ class ExecutionService:
         return DataflowTaskTimelineResponse(task_id=trigger.id, items=items)
 
     def clear_scan_task_timeline(self, db: Session, task_id: str, principal: dict) -> DataflowTaskTimelineActionResponse:
+        return self.clear_scan_task_timeline_view(db, task_id, principal, view="task")
+
+    def clear_scan_task_timeline_view(
+        self,
+        db: Session,
+        task_id: str,
+        principal: dict,
+        *,
+        view: str = "task",
+    ) -> DataflowTaskTimelineActionResponse:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
-        execution_ids = [
-            row[0]
-            for row in db.query(WorkflowExecution.id).filter(WorkflowExecution.trigger_task_id == trigger.id).all()
-        ]
         deleted = 0
-        if execution_ids:
+        normalized_view = str(view or "task").strip().lower() or "task"
+        if normalized_view not in {"task", "raw"}:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="unsupported timeline view")
+        if normalized_view == "task":
             deleted = (
-                db.query(WorkflowExecutionEvent)
-                .filter(WorkflowExecutionEvent.execution_id.in_(execution_ids))
+                db.query(TaskTimelineEvent)
+                .filter(TaskTimelineEvent.task_id == trigger.id)
                 .delete(synchronize_session=False)
             ) or 0
             db.commit()
-        self._log_task_mutation(
-            action="timeline_cleared",
-            principal=principal,
-            task_id=trigger.id,
-            deleted_event_count=int(deleted or 0),
-        )
+        else:
+            execution_ids = [
+                row[0]
+                for row in db.query(WorkflowExecution.id).filter(WorkflowExecution.trigger_task_id == trigger.id).all()
+            ]
+            if execution_ids:
+                deleted = (
+                    db.query(WorkflowExecutionEvent)
+                    .filter(WorkflowExecutionEvent.execution_id.in_(execution_ids))
+                    .delete(synchronize_session=False)
+                ) or 0
+                db.commit()
+        if deleted:
+            self._log_task_mutation(
+                action="timeline_cleared",
+                principal=principal,
+                task_id=trigger.id,
+                view=normalized_view,
+                deleted_event_count=int(deleted or 0),
+            )
+        else:
+            db.commit()
         return DataflowTaskTimelineActionResponse(
             task_id=trigger.id,
-            message="task timeline cleared",
+            message=f"{normalized_view} timeline cleared",
             deleted_event_count=int(deleted or 0),
         )
 
     def delete_scan_task_timeline_event(self, db: Session, task_id: str, event_id: str, principal: dict) -> DataflowTaskTimelineActionResponse:
+        return self.delete_scan_task_timeline_event_view(db, task_id, event_id, principal, view="task")
+
+    def delete_scan_task_timeline_event_view(
+        self,
+        db: Session,
+        task_id: str,
+        event_id: str,
+        principal: dict,
+        *,
+        view: str = "task",
+    ) -> DataflowTaskTimelineActionResponse:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
-        event = (
-            db.query(WorkflowExecutionEvent)
-            .join(WorkflowExecution, WorkflowExecution.id == WorkflowExecutionEvent.execution_id)
-            .filter(
-                WorkflowExecutionEvent.id == event_id,
-                WorkflowExecution.trigger_task_id == trigger.id,
+        normalized_view = str(view or "task").strip().lower() or "task"
+        if normalized_view not in {"task", "raw"}:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="unsupported timeline view")
+        if normalized_view == "task":
+            event = (
+                db.query(TaskTimelineEvent)
+                .filter(
+                    TaskTimelineEvent.id == event_id,
+                    TaskTimelineEvent.task_id == trigger.id,
+                )
+                .first()
             )
-            .first()
-        )
+        else:
+            event = (
+                db.query(WorkflowExecutionEvent)
+                .join(WorkflowExecution, WorkflowExecution.id == WorkflowExecutionEvent.execution_id)
+                .filter(
+                    WorkflowExecutionEvent.id == event_id,
+                    WorkflowExecution.trigger_task_id == trigger.id,
+                )
+                .first()
+            )
         if event is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="timeline event not found")
         db.delete(event)
@@ -6043,10 +6340,11 @@ class ExecutionService:
             principal=principal,
             task_id=trigger.id,
             event_id=event_id,
+            view=normalized_view,
         )
         return DataflowTaskTimelineActionResponse(
             task_id=trigger.id,
-            message="task timeline event deleted",
+            message=f"{normalized_view} timeline event deleted",
             deleted_event_count=1,
         )
 
@@ -8235,6 +8533,7 @@ class ExecutionService:
         round_no: int | None = None,
         level: str = "info",
         payload_json: dict[str, Any] | None = None,
+        suppress_task_timeline_mirror: bool = False,
     ) -> WorkflowExecutionEvent:
         normalized_message, normalized_payload = self._normalized_timeline_message(event_type, message, payload_json)
         safe_payload = jsonable_encoder(normalized_payload or {})
@@ -8251,6 +8550,17 @@ class ExecutionService:
         db.add(event)
         db.commit()
         db.refresh(event)
+        if not suppress_task_timeline_mirror:
+            execution = db.get(WorkflowExecution, execution_id)
+            if execution is not None:
+                self._mirror_raw_event_to_task_timeline(
+                    db,
+                    execution=execution,
+                    event_type=event_type,
+                    message=normalized_message,
+                    level=level,
+                    payload_json=safe_payload,
+                )
         return event
 
     def _invoke_run_vuln_scan_cli(
