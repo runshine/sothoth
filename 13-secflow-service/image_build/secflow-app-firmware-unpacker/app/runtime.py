@@ -10,7 +10,9 @@ from app.config import get_runtime_roles, runtime_has_role
 from app.model import init_database
 from app.services.registry import get_registry_service
 from app.services.task_manager import start as start_task_dispatcher
+from app.services.task_manager import start_scheduler as start_task_scheduler
 from app.services.task_manager import stop as stop_task_dispatcher
+from app.services.task_manager import stop_scheduler as stop_task_scheduler
 from app.services.worker import (
     deregister_worker,
     register_worker,
@@ -19,6 +21,7 @@ from app.services.worker import (
     start_evolution_loop,
     start_worker_heartbeat,
     stop_all_loops,
+    update_worker_runtime_state,
 )
 
 
@@ -33,6 +36,7 @@ _runtime_state = {
     "cleanup_loop": False,
     "evolution_loop": False,
     "dispatcher": False,
+    "scheduler": False,
     "registry": False,
     "startup_error": None,
     "started_at": 0.0,
@@ -60,19 +64,25 @@ async def start_runtime() -> None:
             _verify_auth_service_or_exit()
             init_database()
             roles = get_runtime_roles()
+            if "worker" in roles and "dispatcher" in roles:
+                logger.warning("deprecated runtime role dispatcher,worker detected; treating as dispatcher")
             logger.info("firmware unpacker runtime roles: %s", ",".join(sorted(roles)))
-            if any(runtime_has_role(role) for role in ("dispatcher", "worker", "cleanup-worker")):
+            if any(runtime_has_role(role) for role in ("dispatcher", "scheduler", "worker", "cleanup-worker")):
                 register_worker()
                 _runtime_state["worker_registered"] = True
-            if any(runtime_has_role(role) for role in ("dispatcher", "worker", "cleanup-worker")):
+            if any(runtime_has_role(role) for role in ("dispatcher", "scheduler", "worker", "cleanup-worker")):
                 start_worker_heartbeat()
                 _runtime_state["worker_heartbeat"] = True
-            if runtime_has_role("dispatcher") or runtime_has_role("cleanup-worker"):
+            if runtime_has_role("scheduler") or runtime_has_role("cleanup-worker"):
                 start_cluster_maintenance()
                 _runtime_state["cluster_maintenance"] = True
+            if runtime_has_role("scheduler"):
+                start_task_scheduler()
+                _runtime_state["scheduler"] = True
             if runtime_has_role("dispatcher"):
                 start_task_dispatcher()
                 _runtime_state["dispatcher"] = True
+                update_worker_runtime_state(state="idle")
             if runtime_has_role("cleanup-worker"):
                 start_cleanup_loop()
                 _runtime_state["cleanup_loop"] = True
@@ -110,6 +120,9 @@ async def stop_runtime() -> None:
         _runtime_state["shutting_down"] = True
 
     try:
+        if _runtime_state["scheduler"]:
+            stop_task_scheduler()
+            _runtime_state["scheduler"] = False
         if _runtime_state["dispatcher"]:
             stop_task_dispatcher()
             _runtime_state["dispatcher"] = False
@@ -143,6 +156,7 @@ def runtime_snapshot() -> dict[str, object]:
             "cleanup_loop": bool(_runtime_state.get("cleanup_loop")),
             "evolution_loop": bool(_runtime_state.get("evolution_loop")),
             "dispatcher": bool(_runtime_state.get("dispatcher")),
+            "scheduler": bool(_runtime_state.get("scheduler")),
             "registry": bool(_runtime_state.get("registry")),
             "roles": sorted(get_runtime_roles()),
         }
