@@ -20192,6 +20192,181 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("taint_details", first)
         self.assertNotIn("entry_file", first)
 
+    def test_persist_stage_item_result_externalizes_large_entry_payload(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="binary",
+                workspace_root=temp_dir,
+                output_root=f"{temp_dir}/out",
+                firmware_source="project_filesystem",
+                firmware_path="/tmp/fw",
+            )
+            item = BinarySecurityStageItem(
+                id="si1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                item_key="module-1",
+                item_name="mod",
+                parent_key="fw-1",
+                downstream_service="entry_analyse",
+                status="success",
+            )
+            result = {
+                "module_key": "module-1",
+                "module_name": "mod",
+                "artifact_root": "/tmp/out",
+                "entries": [{"entry_key": f"e-{idx}", "function_name": f"fn_{idx}"} for idx in range(8)],
+                "downstream": {"status": "success", "task_id": "ea-1"},
+            }
+
+            stored = self.manager._persist_stage_item_result(
+                task,
+                item,
+                stage_name="entry_analysis",
+                result=result,
+            )
+
+            self.assertIn("result_path", stored)
+            self.assertTrue(Path(stored["result_path"]).is_file())
+            loaded = json.loads(Path(stored["result_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(8, len(loaded["entries"]))
+            self.assertEqual(8, stored["entry_count"])
+            self.assertIn("entries_preview", stored)
+            self.assertNotIn("entries", stored)
+
+    def test_load_stage_item_result_payload_reads_externalized_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_path = Path(temp_dir) / "result.json"
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "entries": [{"entry_key": "e1", "function_name": "fn"}],
+                        "module_key": "module-1",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            item = BinarySecurityStageItem(
+                id="si1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                item_key="module-1",
+                status="success",
+            )
+            item.result = {
+                "result_path": str(result_path),
+                "entry_count": 1,
+                "entries_preview": [{"entry_key": "e1"}],
+            }
+
+            loaded = self.manager._load_stage_item_result_payload(item)
+
+            self.assertEqual("module-1", loaded["module_key"])
+            self.assertEqual(1, len(loaded["entries"]))
+            self.assertEqual(str(result_path), loaded["result_path"])
+
+    def test_merge_stage_item_result_fields_preserves_externalized_payload(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="binary",
+                workspace_root=temp_dir,
+                output_root=f"{temp_dir}/out",
+                firmware_source="project_filesystem",
+                firmware_path="/tmp/fw",
+            )
+            item = BinarySecurityStageItem(
+                id="si1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                item_key="module-1",
+                item_name="mod",
+                status="success",
+            )
+            original = {
+                "module_key": "module-1",
+                "entries": [{"entry_key": f"e-{idx}", "function_name": f"fn_{idx}"} for idx in range(12)],
+            }
+            stored = self.manager._persist_stage_item_result(
+                task,
+                item,
+                stage_name="entry_analysis",
+                result=original,
+            )
+
+            merged = self.manager._merge_stage_item_result_fields(
+                task,
+                item,
+                stage_name="entry_analysis",
+                updates={"project_id": "p1"},
+            )
+
+            self.assertEqual(stored["result_path"], merged["result_path"])
+            loaded = self.manager._load_stage_item_result_payload(item)
+            self.assertEqual("p1", loaded["project_id"])
+            self.assertEqual(12, len(loaded["entries"]))
+
+    def test_schedule_archive_job_missing_source_retry_keeps_payload_compact(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_key="fw1",
+            status="running",
+        )
+        job = BinarySecurityArchiveJob(
+            id="aj1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_id="si1",
+            item_key="fw1",
+            downstream_service="system_analyse",
+            downstream_task_id="sat1",
+            archive_status="running",
+        )
+        job.payload = {"downstream_payload": {"task_id": "sat1"}}
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[job], events=[])
+
+        candidates = [f"/tmp/missing-{idx}" for idx in range(50)]
+        scheduled, retry_delay_seconds, next_retry_at = self.manager._schedule_archive_job_missing_source_retry(
+            db,
+            task,
+            item,
+            job,
+            source_candidates=candidates,
+        )
+
+        self.assertTrue(scheduled)
+        self.assertIsNotNone(retry_delay_seconds)
+        self.assertIsNotNone(next_retry_at)
+        self.assertEqual(50, job.payload["last_source_candidate_count"])
+        self.assertLessEqual(len(job.payload["last_source_candidates_preview"]), DB_ARTIFACT_PREVIEW_LIMIT)
+        self.assertNotIn("last_source_candidates", job.payload)
+        event = db.events[-1]
+        self.assertEqual(50, event.payload["source_candidate_count"])
+        self.assertLessEqual(len(event.payload["source_candidates_preview"]), DB_ARTIFACT_PREVIEW_LIMIT)
+        self.assertNotIn("source_candidates", event.payload)
+
     def test_run_entry_item_rolls_back_before_marking_failure(self):
         task = BinarySecurityTask(
             id="t1",

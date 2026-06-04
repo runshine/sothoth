@@ -16,6 +16,7 @@ import shutil
 import tarfile
 import threading
 import time
+import tempfile
 import uuid
 import zipfile
 from contextlib import contextmanager, suppress
@@ -625,6 +626,10 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
             pass
 
 
+def _read_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def _is_within_path(base: Path, candidate: Path) -> bool:
     try:
         candidate.resolve().relative_to(base.resolve())
@@ -1124,6 +1129,7 @@ class TaskManager:
             payload=merged_payload,
             resume_cursor=resume_cursor if resume_cursor is not None else dict(operation.resume_cursor or {}),
             increment_attempt=False,
+            workspace_root=task.workspace_root,
         )
         now_value = _now()
         operation.heartbeat_at = now_value
@@ -4008,7 +4014,7 @@ class TaskManager:
             # after observing the old terminal state, but binding removal now
             # belongs to the retry operation cleanup step rather than prepare.
             for item in retry_items:
-                result = dict(item.result or {})
+                result = self._load_stage_item_result_payload(item)
                 sync_observation = dict(result.get("sync_observation") or {})
                 item.status = "pending"
                 item.finished_at = None
@@ -4254,10 +4260,11 @@ class TaskManager:
             "downstream_refs": [dict(ref) for ref in downstream_refs],
             "downstream_ref_count": len(downstream_refs),
         }
-        operation.result_payload = {
-            **dict(operation.result_payload or {}),
-            "cleanup_plan": plan,
-        }
+        self._update_operation_result_payload(
+            operation,
+            {"cleanup_plan": plan},
+            workspace_root=task.workspace_root,
+        )
         return plan
 
     async def _operation_execute_retry_stage_full_cleanup(
@@ -4266,7 +4273,7 @@ class TaskManager:
         task: BinarySecurityTask,
         operation: BinarySecurityTaskOperation,
     ) -> dict[str, Any]:
-        plan = dict(dict(operation.result_payload or {}).get("cleanup_plan") or {})
+        plan = dict(self._operation_result_data(operation).get("cleanup_plan") or {})
         target_stage = str(plan.get("target_stage") or operation.target_stage or "").strip()
         affected_stages = [str(stage).strip() for stage in (plan.get("affected_stages") or []) if str(stage).strip()]
         if not affected_stages:
@@ -4355,16 +4362,19 @@ class TaskManager:
             },
             operation_id=operation.id,
         )
-        operation.result_payload = {
-            **dict(operation.result_payload or {}),
-            "cleanup_plan": {
-                **plan,
-                "target_stage": target_stage,
-                "affected_stages": list(affected_stages),
-                "downstream_refs": downstream_refs,
+        self._update_operation_result_payload(
+            operation,
+            {
+                "cleanup_plan": {
+                    **plan,
+                    "target_stage": target_stage,
+                    "affected_stages": list(affected_stages),
+                    "downstream_refs": downstream_refs,
+                },
+                "cleanup_result": cleanup_summary,
             },
-            "cleanup_result": cleanup_summary,
-        }
+            workspace_root=task.workspace_root,
+        )
         return cleanup_summary
 
     def retry_stage(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
@@ -4714,6 +4724,9 @@ class TaskManager:
         )
 
     def _operation_response(self, operation: BinarySecurityTaskOperation) -> BinarySecurityTaskOperationResponse:
+        request_payload = self._load_operation_request_payload(operation)
+        result_payload = self._load_operation_result_payload(operation)
+        step_payload = self._load_operation_step_payload(operation)
         return BinarySecurityTaskOperationResponse(
             id=operation.id,
             task_id=operation.task_id,
@@ -4727,13 +4740,13 @@ class TaskManager:
             owner_instance_id=operation.owner_instance_id,
             claim_lease_expires_at=operation.claim_lease_expires_at,
             heartbeat_at=operation.heartbeat_at,
-            request_payload=dict(operation.request_payload or {}),
-            result_payload=dict(operation.result_payload or {}),
+            request_payload=request_payload,
+            result_payload=result_payload,
             error_code=operation.error_code,
             error_message=operation.error_message,
             current_step=operation.current_step,
             step_attempts=dict(operation.step_attempts or {}),
-            step_payload=dict(operation.step_payload or {}),
+            step_payload=step_payload,
             resume_cursor=dict(operation.resume_cursor or {}),
             superseded_by_operation_id=operation.superseded_by_operation_id,
             created_at=operation.created_at,
@@ -4749,6 +4762,274 @@ class TaskManager:
             .order_by(BinarySecurityTaskOperation.created_at.desc(), BinarySecurityTaskOperation.id.desc())
             .all()
         )
+
+    def _operation_payload_root(
+        self,
+        operation: BinarySecurityTaskOperation,
+        *,
+        workspace_root: str | None = None,
+    ) -> Path | None:
+        task_root_value = str(workspace_root or "").strip()
+        task_root = Path(task_root_value) if task_root_value else None
+        if task_root is None:
+            return None
+        return task_root / "run" / "task-operations" / str(operation.id or "").strip()
+
+    def _operation_result_payload_path(
+        self,
+        operation: BinarySecurityTaskOperation,
+        *,
+        workspace_root: str | None = None,
+    ) -> Path | None:
+        root = self._operation_payload_root(operation, workspace_root=workspace_root)
+        if root is None:
+            return None
+        return root / "result.json"
+
+    def _operation_request_payload_path(
+        self,
+        operation: BinarySecurityTaskOperation,
+        *,
+        workspace_root: str | None = None,
+    ) -> Path | None:
+        root = self._operation_payload_root(operation, workspace_root=workspace_root)
+        if root is None:
+            return None
+        return root / "request.json"
+
+    def _operation_step_payload_path(
+        self,
+        operation: BinarySecurityTaskOperation,
+        *,
+        step_name: str,
+        workspace_root: str | None = None,
+    ) -> Path | None:
+        root = self._operation_payload_root(operation, workspace_root=workspace_root)
+        if root is None:
+            return None
+        safe_step_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(step_name or "").strip()) or "unknown"
+        return root / "steps" / f"{safe_step_name}.json"
+
+    def _operation_result_payload_path_value(self, operation: BinarySecurityTaskOperation) -> str | None:
+        payload = dict(operation.result_payload or {})
+        path_value = str(payload.get("result_payload_path") or "").strip()
+        return path_value or None
+
+    def _operation_request_payload_path_value(self, operation: BinarySecurityTaskOperation) -> str | None:
+        payload = dict(operation.request_payload or {})
+        path_value = str(payload.get("request_payload_path") or "").strip()
+        return path_value or None
+
+    def _load_externalized_payload(
+        self,
+        path_value: str | None,
+        *,
+        path_key: str,
+        missing_key: str,
+    ) -> dict[str, Any]:
+        normalized_path = str(path_value or "").strip()
+        if not normalized_path:
+            return {}
+        try:
+            loaded = _read_json(Path(normalized_path))
+        except Exception:
+            return {path_key: normalized_path, missing_key: True}
+        if isinstance(loaded, dict):
+            return loaded
+        return {path_key: normalized_path, "externalized_payload_invalid": True}
+
+    def _load_operation_result_payload(self, operation: BinarySecurityTaskOperation) -> dict[str, Any]:
+        payload = dict(operation.result_payload or {})
+        path_value = str(payload.get("result_payload_path") or "").strip()
+        if not path_value:
+            return payload
+        return self._load_externalized_payload(
+            path_value,
+            path_key="result_payload_path",
+            missing_key="missing_externalized_payload",
+        )
+
+    def _load_operation_request_payload(self, operation: BinarySecurityTaskOperation) -> dict[str, Any]:
+        payload = dict(operation.request_payload or {})
+        path_value = str(payload.get("request_payload_path") or "").strip()
+        if not path_value:
+            return payload
+        return self._load_externalized_payload(
+            path_value,
+            path_key="request_payload_path",
+            missing_key="missing_externalized_request_payload",
+        )
+
+    def _load_operation_step_payload(self, operation: BinarySecurityTaskOperation) -> dict[str, Any]:
+        step_payload = dict(operation.step_payload or {})
+        resolved: dict[str, Any] = {}
+        for step_name, raw_state in step_payload.items():
+            state = dict(raw_state or {})
+            payload_path = str(state.get("payload_path") or "").strip()
+            if payload_path:
+                loaded = self._load_externalized_payload(
+                    payload_path,
+                    path_key="payload_path",
+                    missing_key="missing_externalized_step_payload",
+                )
+                if "payload_path" not in loaded:
+                    loaded["payload_path"] = payload_path
+                state["payload"] = loaded
+            resolved[str(step_name)] = state
+        return resolved
+
+    def _persist_externalized_payload(
+        self,
+        *,
+        operation: BinarySecurityTaskOperation,
+        payload: dict[str, Any] | None,
+        path: Path | None,
+        fallback_name: str,
+        path_key: str,
+        assign: Any,
+    ) -> None:
+        payload_data = dict(payload or {})
+        if path is None:
+            assign(payload_data)
+            return
+        try:
+            _write_json(path, payload_data)
+            assign({path_key: str(path)})
+            return
+        except OSError:
+            fallback_root = (
+                Path(tempfile.gettempdir())
+                / "secflow-binary-security"
+                / "task-operations"
+                / str(operation.task_id or "unknown")
+                / str(operation.id or "unknown")
+            )
+            fallback_path = fallback_root / fallback_name
+            _write_json(fallback_path, payload_data)
+            assign({path_key: str(fallback_path)})
+
+    def _persist_operation_result_payload(
+        self,
+        operation: BinarySecurityTaskOperation,
+        payload: dict[str, Any] | None,
+        *,
+        workspace_root: str | None = None,
+    ) -> None:
+        self._persist_externalized_payload(
+            operation=operation,
+            payload=payload,
+            path=self._operation_result_payload_path(operation, workspace_root=workspace_root),
+            fallback_name="result.json",
+            path_key="result_payload_path",
+            assign=lambda value: setattr(operation, "result_payload", value),
+        )
+
+    def _persist_operation_request_payload(
+        self,
+        operation: BinarySecurityTaskOperation,
+        payload: dict[str, Any] | None,
+        *,
+        workspace_root: str | None = None,
+    ) -> None:
+        self._persist_externalized_payload(
+            operation=operation,
+            payload=payload,
+            path=self._operation_request_payload_path(operation, workspace_root=workspace_root),
+            fallback_name="request.json",
+            path_key="request_payload_path",
+            assign=lambda value: setattr(operation, "request_payload", value),
+        )
+
+    def _persist_operation_step_payload(
+        self,
+        operation: BinarySecurityTaskOperation,
+        *,
+        step_name: str,
+        payload: dict[str, Any] | None,
+        workspace_root: str | None = None,
+    ) -> str | None:
+        if payload is None:
+            return None
+        captured_path: str | None = None
+
+        def _assign(value: dict[str, Any]) -> None:
+            nonlocal captured_path
+            captured_path = str(value.get("payload_path") or "").strip() or None
+
+        safe_step_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(step_name or "").strip()) or "unknown"
+        self._persist_externalized_payload(
+            operation=operation,
+            payload=payload,
+            path=self._operation_step_payload_path(operation, step_name=step_name, workspace_root=workspace_root),
+            fallback_name=f"steps/{safe_step_name}.json",
+            path_key="payload_path",
+            assign=_assign,
+        )
+        return captured_path
+
+    def _operation_result_data(self, operation: BinarySecurityTaskOperation) -> dict[str, Any]:
+        return self._load_operation_result_payload(operation)
+
+    def _update_operation_result_payload(
+        self,
+        operation: BinarySecurityTaskOperation,
+        payload_updates: dict[str, Any] | None,
+        *,
+        workspace_root: str | None = None,
+    ) -> dict[str, Any]:
+        merged = {
+            **self._operation_result_data(operation),
+            **dict(payload_updates or {}),
+        }
+        self._persist_operation_result_payload(
+            operation,
+            merged,
+            workspace_root=workspace_root,
+        )
+        return merged
+
+    def _sync_retry_operation_result_payload(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+        *,
+        target_stage: str | None = None,
+        phase: str = "prepare",
+        extra_updates: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        resolved_target_stage = str(target_stage or operation.target_stage or "").strip()
+        payload_updates: dict[str, Any] = {
+            "target_stage": resolved_target_stage,
+            "retry_item_keys": [
+                str(item_key).strip()
+                for item_key in list(self._retry_plan(task).get("retry_item_keys") or [])
+                if str(item_key).strip()
+            ],
+            "item_actions": self._retry_item_actions(task),
+        }
+        if resolved_target_stage:
+            payload_updates.update(
+                self._build_retry_prepare_result(
+                    db,
+                    task,
+                    target_stage=resolved_target_stage,
+                    phase=phase,
+                )
+            )
+        payload_updates.update(dict(extra_updates or {}))
+        return self._update_operation_result_payload(
+            operation,
+            payload_updates,
+            workspace_root=task.workspace_root,
+        )
+
+    def _commit_or_rollback(self, db: Session) -> None:
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
 
     def _record_operation_event(
         self,
@@ -4789,20 +5070,31 @@ class TaskManager:
         payload: dict[str, Any] | None = None,
         resume_cursor: dict[str, Any] | None = None,
         increment_attempt: bool = False,
+        workspace_root: str | None = None,
     ) -> None:
         attempts = dict(operation.step_attempts or {})
         step_payload = dict(operation.step_payload or {})
         next_resume_cursor = dict(operation.resume_cursor or {})
         if increment_attempt:
             attempts[step_name] = int(attempts.get(step_name) or 0) + 1
+        payload_path = self._persist_operation_step_payload(
+            operation,
+            step_name=step_name,
+            payload=payload,
+            workspace_root=workspace_root,
+        )
         step_payload[step_name] = {
             **dict(step_payload.get(step_name) or {}),
             "status": status,
             "updated_at": _isoformat_or_none(_now()),
-            **({"payload": dict(payload or {})} if payload is not None else {}),
+            **({"payload_path": payload_path} if payload_path else {}),
         }
         if resume_cursor is not None:
-            next_resume_cursor = dict(resume_cursor)
+            next_resume_cursor = {
+                key: value
+                for key, value in dict(resume_cursor).items()
+                if key == "current_step" or isinstance(value, (str, int, float, bool)) or value is None or isinstance(value, dict)
+            }
         operation.current_step = step_name
         operation.step_attempts = attempts
         operation.step_payload = step_payload
@@ -4827,6 +5119,7 @@ class TaskManager:
             payload=payload,
             resume_cursor={"current_step": step_name},
             increment_attempt=True,
+            workspace_root=task.workspace_root,
         )
         self._record_operation_event(
             db,
@@ -4856,6 +5149,7 @@ class TaskManager:
             status="succeeded",
             payload=payload,
             resume_cursor={"current_step": next_step or step_name},
+            workspace_root=task.workspace_root,
         )
         self._record_operation_event(
             db,
@@ -4885,6 +5179,7 @@ class TaskManager:
             status="failed",
             payload={"error": error_message, **dict(payload or {})},
             resume_cursor={"current_step": step_name},
+            workspace_root=task.workspace_root,
         )
         self._record_operation_event(
             db,
@@ -4962,9 +5257,10 @@ class TaskManager:
     ) -> dict[str, Any]:
         if not self._cancel_state_operation_visible(task, operation):
             return {}
+        result_payload = self._operation_result_data(operation)
         targets = [
             dict(target)
-            for target in list((operation.result_payload or {}).get("cancel_targets") or [])
+            for target in list(result_payload.get("cancel_targets") or [])
             if isinstance(target, dict)
         ]
         blocking_targets = [
@@ -4990,7 +5286,7 @@ class TaskManager:
             "blocking_targets_preview_count": len(blocking_preview),
             "blocking_targets_truncated": len(blocking_targets) > len(blocking_preview),
             "last_progress_at": (
-                (operation.result_payload or {}).get("last_progress_at")
+                result_payload.get("last_progress_at")
                 or _isoformat_or_none(operation.updated_at)
             ),
         }
@@ -5113,24 +5409,27 @@ class TaskManager:
         operation: BinarySecurityTaskOperation,
         targets: list[dict[str, Any]],
         *,
+        workspace_root: str | None = None,
         last_progress_at: datetime | None = None,
     ) -> None:
-        operation.result_payload = {
-            **dict(operation.result_payload or {}),
+        self._persist_operation_result_payload(operation, {
+            **self._operation_result_data(operation),
             "cancel_targets": self._normalize_cancel_targets(targets),
             "last_progress_at": _isoformat_or_none(last_progress_at or _now()),
-        }
+        }, workspace_root=workspace_root)
 
     def _update_cancel_target(
         self,
         operation: BinarySecurityTaskOperation,
         target: dict[str, Any],
+        *,
+        workspace_root: str | None = None,
     ) -> None:
         targets = self._normalize_cancel_targets(
-            [dict(item) for item in list((operation.result_payload or {}).get("cancel_targets") or []) if isinstance(item, dict)]
+            [dict(item) for item in list(self._operation_result_data(operation).get("cancel_targets") or []) if isinstance(item, dict)]
             + [target]
         )
-        self._store_cancel_targets(operation, targets)
+        self._store_cancel_targets(operation, targets, workspace_root=workspace_root)
 
     def _is_operation_requeue_state_applied(
         self,
@@ -5174,7 +5473,11 @@ class TaskManager:
             created_at=_now(),
             updated_at=_now(),
         )
-        operation.request_payload = dict(request_payload or {})
+        self._persist_operation_request_payload(
+            operation,
+            dict(request_payload or {}),
+            workspace_root=task.workspace_root,
+        )
         db.add(operation)
         task.current_operation_id = operation.id
         self._record_operation_event(
@@ -6368,8 +6671,9 @@ class TaskManager:
                 failed_count += 1
                 repair_applied = False
                 current_item_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower() or None
+                item_result = self._load_stage_item_result_payload(item)
                 current_observed = self._normalize_downstream_status(
-                    self._string_or_none(dict(item.result or {}).get("sync_observation", {}).get("downstream_status"))
+                    self._string_or_none(dict(item_result.get("sync_observation") or {}).get("downstream_status"))
                 )
                 if current_item_status in {"success", "partial_success", "failed", "cancelled", "downstream_missing"} and current_observed in {"pending", "dispatching", "running"}:
                     repair_applied = self._repair_stage_item_terminal_downstream_observation(
@@ -7035,7 +7339,7 @@ class TaskManager:
                 stage_name=operation.target_stage,
                 payload={"operation_type": operation.operation_type},
             )
-            db.commit()
+            self._commit_or_rollback(db)
             try:
                 result = await fn()
             except Exception as exc:
@@ -7047,7 +7351,7 @@ class TaskManager:
                     error=exc,
                     stage_name=operation.target_stage,
                 )
-                db.commit()
+                self._commit_or_rollback(db)
                 raise
             payload = result if isinstance(result, dict) else None
             self._record_operation_step_finished(
@@ -7061,7 +7365,7 @@ class TaskManager:
                 next_step=next_step,
             )
             current_step = next_step or step_name
-            db.commit()
+            self._commit_or_rollback(db)
             return result
 
         async def _mark_task_cancelling() -> dict[str, Any]:
@@ -7081,7 +7385,7 @@ class TaskManager:
 
         async def _collect_targets() -> dict[str, Any]:
             targets = self._collect_cancel_targets(db, task)
-            self._store_cancel_targets(operation, targets)
+            self._store_cancel_targets(operation, targets, workspace_root=task.workspace_root)
             for target in targets:
                 self._record_operation_event(
                     db,
@@ -7096,22 +7400,22 @@ class TaskManager:
 
         async def _cancel_local() -> dict[str, Any]:
             cancelled_stages = await self._prepare_cancel_task(db, task)
-            targets = [dict(target) for target in list((operation.result_payload or {}).get("cancel_targets") or []) if isinstance(target, dict)]
+            targets = [dict(target) for target in list(self._operation_result_data(operation).get("cancel_targets") or []) if isinstance(target, dict)]
             for target in targets:
                 if str(target.get("target_type") or "") == "local_worker":
                     target["cancel_request_status"] = "requested"
                     target["terminal_observation_status"] = "cancelled"
                     target["last_observed_at"] = _isoformat_or_none(_now())
-            self._store_cancel_targets(operation, targets)
+            self._store_cancel_targets(operation, targets, workspace_root=task.workspace_root)
             return {"cancelled_stage_names": cancelled_stages}
 
         async def _cancel_downstream_targets() -> dict[str, Any]:
-            targets = [dict(target) for target in list((operation.result_payload or {}).get("cancel_targets") or []) if isinstance(target, dict)]
+            targets = [dict(target) for target in list(self._operation_result_data(operation).get("cancel_targets") or []) if isinstance(target, dict)]
             for target in targets:
                 if str(target.get("target_type") or "") == "downstream_task":
                     target["cancel_request_status"] = "requested"
                     target["last_observed_at"] = _isoformat_or_none(_now())
-            self._store_cancel_targets(operation, targets)
+            self._store_cancel_targets(operation, targets, workspace_root=task.workspace_root)
             return {
                 "downstream_target_count": sum(
                     1 for target in targets if str(target.get("target_type") or "") == "downstream_task"
@@ -7128,7 +7432,7 @@ class TaskManager:
                 blocking_targets: list[dict[str, Any]] = []
                 stored_targets = [
                     dict(target)
-                    for target in list((operation.result_payload or {}).get("cancel_targets") or [])
+                    for target in list(self._operation_result_data(operation).get("cancel_targets") or [])
                     if isinstance(target, dict)
                 ]
                 task_items = {
@@ -7184,8 +7488,8 @@ class TaskManager:
                             stage_name=str(target.get("stage_name") or operation.target_stage or "").strip() or None,
                             payload=dict(target),
                         )
-                self._store_cancel_targets(operation, refreshed_targets)
-                db.commit()
+                self._store_cancel_targets(operation, refreshed_targets, workspace_root=task.workspace_root)
+                self._commit_or_rollback(db)
                 if not blocking_targets:
                     return {
                         "targets_total": len(refreshed_targets),
@@ -7203,7 +7507,7 @@ class TaskManager:
                         stage_name=operation.target_stage,
                         payload={"blocking_targets": blocking_targets},
                     )
-                    db.commit()
+                    self._commit_or_rollback(db)
                     last_blocking_snapshot = blocking_snapshot
                 if _now() >= deadline:
                     raise ValidationError(
@@ -7220,6 +7524,7 @@ class TaskManager:
                     task.updated_at = task_refreshed.updated_at
                 if operation_refreshed is not None:
                     operation.result_payload = dict(operation_refreshed.result_payload or {})
+                    operation.request_payload = dict(operation_refreshed.request_payload or {})
                     operation.step_payload = dict(operation_refreshed.step_payload or {})
                     operation.step_attempts = dict(operation_refreshed.step_attempts or {})
                     operation.resume_cursor = dict(operation_refreshed.resume_cursor or {})
@@ -7857,10 +8162,11 @@ class TaskManager:
                         task,
                         target_stage=str(operation.target_stage or "").strip(),
                     )
-                    operation.result_payload = {
-                        **dict(operation.result_payload or {}),
-                        **prepare_result,
-                    }
+                    self._update_operation_result_payload(
+                        operation,
+                        prepare_result,
+                        workspace_root=task.workspace_root,
+                    )
                     validation = dict(prepare_result.get("validation") or {})
                     if not bool(validation.get("validated")):
                         self._record_operation_event(
@@ -7893,7 +8199,7 @@ class TaskManager:
                     step_name=prepare_step,
                     message=f"后台操作准备步骤已完成: {operation.operation_type}",
                     stage_name=operation.target_stage,
-                    payload=dict(operation.result_payload or {}) if operation.operation_type in {TASK_ACTION_RETRY_FAILED_ITEMS, TASK_ACTION_RETRY_STAGE_FAILED_ITEMS} else None,
+                    payload=self._operation_result_data(operation) if operation.operation_type in {TASK_ACTION_RETRY_FAILED_ITEMS, TASK_ACTION_RETRY_STAGE_FAILED_ITEMS} else None,
                     next_step=next_step,
                 )
                 if not requeue_required:
@@ -7932,14 +8238,17 @@ class TaskManager:
         task.finished_at = None
         self._invalidate_task_execution(task)
         self._enqueue_task(task.id)
-        operation.result_payload = {
-            **dict(operation.result_payload or {}),
-            "requeue": {
-                "task_status_before": "requeue_pending",
-                "task_status_after": task.status,
-                "requeue_requested": True,
+        self._update_operation_result_payload(
+            operation,
+            {
+                "requeue": {
+                    "task_status_before": "requeue_pending",
+                    "task_status_after": task.status,
+                    "requeue_requested": True,
+                },
             },
-        }
+            workspace_root=task.workspace_root,
+        )
         self._record_operation_event(
             db,
             task,
@@ -8086,14 +8395,17 @@ class TaskManager:
         task.finished_at = None
         self._invalidate_task_execution(task)
         self._enqueue_task(task.id)
-        operation.result_payload = {
-            **dict(operation.result_payload or {}),
-            "requeue": {
-                "requested": True,
-                "task_status_before": "retry_operation_succeeded",
-                "task_status_after": task.status,
+        self._update_operation_result_payload(
+            operation,
+            {
+                "requeue": {
+                    "requested": True,
+                    "task_status_before": "retry_operation_succeeded",
+                    "task_status_after": task.status,
+                },
             },
-        }
+            workspace_root=task.workspace_root,
+        )
         self._record_operation_event(
             db,
             task,
@@ -8183,14 +8495,14 @@ class TaskManager:
         operation: BinarySecurityTaskOperation,
     ) -> dict[str, Any]:
         target_stage = str(operation.target_stage or "").strip()
-        actions = await self._collect_retry_item_actions(db, task, target_stage=target_stage, token=self._service_token())
-        payload = {
-            "target_stage": target_stage,
-            "retry_item_keys": [str(item_key).strip() for item_key in list(self._retry_plan(task).get("retry_item_keys") or []) if str(item_key).strip()],
-            "item_actions": actions,
-        }
-        operation.result_payload = {**dict(operation.result_payload or {}), **payload}
-        return payload
+        await self._collect_retry_item_actions(db, task, target_stage=target_stage, token=self._service_token())
+        return self._sync_retry_operation_result_payload(
+            db,
+            task,
+            operation,
+            target_stage=target_stage,
+            phase="prepare",
+        )
 
     async def _operation_sync_retry_target_stage_state(
         self,
@@ -8246,7 +8558,11 @@ class TaskManager:
                 },
             )
         payload = {"target_stage": target_stage, "synced": True, "synced_items": synced_count, "total_items": len(item_ids)}
-        operation.result_payload = {**dict(operation.result_payload or {}), "sync_target_stage_state": payload}
+        self._update_operation_result_payload(
+            operation,
+            {"sync_target_stage_state": payload},
+            workspace_root=task.workspace_root,
+        )
         return payload
 
     async def _operation_prepare_retry_items(
@@ -8259,7 +8575,14 @@ class TaskManager:
         affected_stages = await self._prepare_retry_failed_items(db, task, target_stage)
         prepare_result = self._build_retry_prepare_result(db, task, target_stage=target_stage)
         prepare_result["affected_stages"] = affected_stages
-        operation.result_payload = {**dict(operation.result_payload or {}), **prepare_result}
+        self._sync_retry_operation_result_payload(
+            db,
+            task,
+            operation,
+            target_stage=target_stage,
+            phase="prepare",
+            extra_updates=prepare_result,
+        )
         validation = dict(prepare_result.get("validation") or {})
         if not bool(validation.get("validated")):
             self._record_operation_event(
@@ -8380,7 +8703,14 @@ class TaskManager:
                     step_name=TASK_OPERATION_STEP_CLEANUP_ABNORMAL_CHILDREN,
                     payload={"processed_count": cleaned},
                 )
-        operation.result_payload = {**dict(operation.result_payload or {}), "cleanup": {"cleaned_items": cleaned}}
+        self._sync_retry_operation_result_payload(
+            db,
+            task,
+            operation,
+            target_stage=str(operation.target_stage or "").strip(),
+            phase="prepare",
+            extra_updates={"cleanup": {"cleaned_items": cleaned}},
+        )
         return {"cleaned_items": cleaned}
 
     async def _operation_create_retry_children(
@@ -8530,7 +8860,14 @@ class TaskManager:
                     step_name=TASK_OPERATION_STEP_CREATE_REPLACEMENT_CHILDREN,
                     payload={"processed_count": created_count},
                 )
-        operation.result_payload = {**dict(operation.result_payload or {}), "create": {"created_items": created_count}}
+        self._sync_retry_operation_result_payload(
+            db,
+            task,
+            operation,
+            target_stage=str(operation.target_stage or "").strip(),
+            phase="prepare",
+            extra_updates={"create": {"created_items": created_count}},
+        )
         return {"created_items": created_count}
 
     async def _operation_verify_retry_bindings(
@@ -8539,6 +8876,7 @@ class TaskManager:
         task: BinarySecurityTask,
         operation: BinarySecurityTaskOperation,
     ) -> dict[str, Any]:
+        target_stage = str(operation.target_stage or "").strip()
         await self._operation_reconcile_retry_non_abnormal_children(db, task, operation)
         if any(
             str(action.get("strategy") or "").strip() == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL
@@ -8547,13 +8885,17 @@ class TaskManager:
         ):
             cleanup_payload = await self._operation_cleanup_retry_abnormal_children(db, task, operation)
             create_payload = await self._operation_create_retry_children(db, task, operation)
-            operation.result_payload = {
-                **dict(operation.result_payload or {}),
-                "cleanup": dict(cleanup_payload or {}),
-                "create": dict(create_payload or {}),
-                "item_actions": self._retry_item_actions(task),
-            }
-        target_stage = str(operation.target_stage or "").strip()
+            self._sync_retry_operation_result_payload(
+                db,
+                task,
+                operation,
+                target_stage=target_stage,
+                phase="verify",
+                extra_updates={
+                    "cleanup": dict(cleanup_payload or {}),
+                    "create": dict(create_payload or {}),
+                },
+            )
         processed_count = 0
         batch_size = self._operation_step_batch_size()
         for action in self._retry_item_actions(task):
@@ -8663,11 +9005,17 @@ class TaskManager:
                 payload=result,
             )
             raise ValidationError("失败项重试绑定校验失败")
-        operation.result_payload = {
-            **dict(operation.result_payload or {}),
-            **result,
-            "item_actions": refreshed_actions,
-        }
+        self._sync_retry_operation_result_payload(
+            db,
+            task,
+            operation,
+            target_stage=target_stage,
+            phase="verify",
+            extra_updates={
+                **result,
+                "item_actions": refreshed_actions,
+            },
+        )
         return result
 
     async def _find_retry_created_child_payload(
@@ -8801,11 +9149,16 @@ class TaskManager:
                 },
             )
             adopted += 1
-        operation.result_payload = {
-            **dict(operation.result_payload or {}),
-            "non_abnormal": {"reused_items": reused, "adopted_items": adopted},
-            "item_actions": self._retry_item_actions(task),
-        }
+        self._sync_retry_operation_result_payload(
+            db,
+            task,
+            operation,
+            target_stage=str(operation.target_stage or "").strip(),
+            phase="prepare",
+            extra_updates={
+                "non_abnormal": {"reused_items": reused, "adopted_items": adopted},
+            },
+        )
         return {"reused_items": reused, "adopted_items": adopted}
 
     async def _operation_finalize_retry_failed_items(
@@ -8815,7 +9168,14 @@ class TaskManager:
         operation: BinarySecurityTaskOperation,
     ) -> dict[str, Any]:
         payload = {"finalized": True, "target_stage": operation.target_stage}
-        operation.result_payload = {**dict(operation.result_payload or {}), "finalize": payload}
+        self._sync_retry_operation_result_payload(
+            db,
+            task,
+            operation,
+            target_stage=str(operation.target_stage or "").strip(),
+            phase="verify",
+            extra_updates={"finalize": payload},
+        )
         self._record_operation_event(
             db,
             task,
@@ -9296,6 +9656,8 @@ class TaskManager:
             "copy_retry_schedule_seconds",
             "last_missing_source_observed_at",
             "last_source_candidates",
+            "last_source_candidate_count",
+            "last_source_candidates_preview",
         ):
             payload.pop(key, None)
         return payload
@@ -9323,7 +9685,8 @@ class TaskManager:
                 "copy_retry_next_at": next_retry_at.isoformat(),
                 "copy_retry_schedule_seconds": schedule,
                 "last_missing_source_observed_at": _now().isoformat(),
-                "last_source_candidates": list(source_candidates),
+                "last_source_candidate_count": len(source_candidates),
+                "last_source_candidates_preview": list(source_candidates[:DB_ARTIFACT_PREVIEW_LIMIT]),
             }
         )
         job.payload = payload
@@ -9347,7 +9710,8 @@ class TaskManager:
                 "retry_attempt": retry_attempt + 1,
                 "retry_delay_seconds": retry_delay_seconds,
                 "next_retry_at": next_retry_at.isoformat(),
-                "source_candidates": list(source_candidates),
+                "source_candidate_count": len(source_candidates),
+                "source_candidates_preview": list(source_candidates[:DB_ARTIFACT_PREVIEW_LIMIT]),
                 "downstream_task_id": job.downstream_task_id,
                 "resolution_reason": ARCHIVE_COPY_MISSING_SOURCE_RETRY_REASON,
             },
@@ -11197,7 +11561,8 @@ class TaskManager:
                     "copy_retry_attempt": exhausted_attempt,
                     "copy_retry_schedule_seconds": self._archive_copy_missing_source_retry_schedule_seconds(),
                     "last_missing_source_observed_at": _now().isoformat(),
-                    "last_source_candidates": list(archive_result.source_candidates),
+                    "last_source_candidate_count": len(archive_result.source_candidates),
+                    "last_source_candidates_preview": list(archive_result.source_candidates[:DB_ARTIFACT_PREVIEW_LIMIT]),
                 }
                 self._record_event(
                     db,
@@ -11212,7 +11577,8 @@ class TaskManager:
                         "retry_attempt": exhausted_attempt,
                         "retry_delay_seconds": retry_delay_seconds,
                         "next_retry_at": next_retry_at.isoformat() if next_retry_at else None,
-                        "source_candidates": list(archive_result.source_candidates),
+                        "source_candidate_count": len(archive_result.source_candidates),
+                        "source_candidates_preview": list(archive_result.source_candidates[:DB_ARTIFACT_PREVIEW_LIMIT]),
                         "downstream_task_id": job.downstream_task_id,
                         "resolution_reason": "archive_source_retry_exhausted",
                     },
@@ -12011,7 +12377,7 @@ class TaskManager:
         ).all()
 
     def _item_missing_recorded_downstream_status(self, item: BinarySecurityStageItem) -> bool:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         if self._string_or_none(result.get("downstream_status")):
             return False
         downstream_payload = dict(result.get("downstream") or {})
@@ -12111,7 +12477,7 @@ class TaskManager:
         return priority, last_synced_at, str(item.id or "")
 
     def _stage_item_sync_status_value(self, item: BinarySecurityStageItem) -> str | None:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         sync_status = result.get("sync_status")
         if sync_status is None:
             sync_status = dict(result.get("sync_observation") or {}).get("sync_status")
@@ -12119,12 +12485,12 @@ class TaskManager:
         return value or None
 
     def _stage_item_sync_observation(self, item: BinarySecurityStageItem) -> dict[str, Any]:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         observation = result.get("sync_observation") or {}
         return dict(observation) if isinstance(observation, dict) else {}
 
     def _stage_item_sync_attempt_at_value(self, item: BinarySecurityStageItem) -> datetime | None:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         sync_observation = self._stage_item_sync_observation(item)
         raw = (
             sync_observation.get("last_attempt_at")
@@ -12140,7 +12506,7 @@ class TaskManager:
             return None
 
     def _stage_item_sync_error_at_value(self, item: BinarySecurityStageItem) -> datetime | None:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         sync_observation = self._stage_item_sync_observation(item)
         raw = sync_observation.get("last_error_at") or result.get("last_sync_error_at")
         if not isinstance(raw, str) or not raw.strip():
@@ -12151,7 +12517,7 @@ class TaskManager:
             return None
 
     def _stage_item_sync_consecutive_error_count(self, item: BinarySecurityStageItem) -> int:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         sync_observation = self._stage_item_sync_observation(item)
         raw = sync_observation.get("consecutive_error_count")
         if raw is None:
@@ -12162,7 +12528,7 @@ class TaskManager:
             return 0
 
     def _stage_item_sync_error_budget_exhausted(self, item: BinarySecurityStageItem) -> bool:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         sync_observation = self._stage_item_sync_observation(item)
         raw = sync_observation.get("budget_exhausted")
         if raw is None:
@@ -12170,7 +12536,7 @@ class TaskManager:
         return bool(raw)
 
     def _stage_item_next_sync_retry_at_value(self, item: BinarySecurityStageItem) -> datetime | None:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         sync_observation = self._stage_item_sync_observation(item)
         raw = sync_observation.get("next_retry_at") or result.get("next_sync_retry_at")
         if not isinstance(raw, str) or not raw.strip():
@@ -12187,12 +12553,12 @@ class TaskManager:
         return next_retry_at > (now_value or _now())
 
     def _stage_item_orchestration_observation(self, item: BinarySecurityStageItem) -> dict[str, Any]:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         observation = result.get("orchestration_observation") or {}
         return dict(observation) if isinstance(observation, dict) else {}
 
     def _stage_item_orchestration_attempt_at_value(self, item: BinarySecurityStageItem) -> datetime | None:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         observation = self._stage_item_orchestration_observation(item)
         raw = observation.get("last_attempt_at") or result.get("last_orchestration_attempt_at")
         if not isinstance(raw, str) or not raw.strip():
@@ -12203,7 +12569,7 @@ class TaskManager:
             return None
 
     def _stage_item_next_orchestration_retry_at_value(self, item: BinarySecurityStageItem) -> datetime | None:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         observation = self._stage_item_orchestration_observation(item)
         raw = observation.get("next_retry_at") or result.get("next_orchestration_retry_at")
         if not isinstance(raw, str) or not raw.strip():
@@ -12220,7 +12586,7 @@ class TaskManager:
         return next_retry_at > (now_value or _now())
 
     def _stage_item_orchestration_error_budget_exhausted(self, item: BinarySecurityStageItem) -> bool:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         observation = self._stage_item_orchestration_observation(item)
         raw = observation.get("budget_exhausted")
         if raw is None:
@@ -12228,7 +12594,7 @@ class TaskManager:
         return bool(raw)
 
     def _stage_item_orchestration_consecutive_error_count(self, item: BinarySecurityStageItem) -> int:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         observation = self._stage_item_orchestration_observation(item)
         raw = observation.get("consecutive_error_count")
         if raw is None:
@@ -12244,7 +12610,7 @@ class TaskManager:
         return min(self._stage_orchestration_backoff_max_seconds(), max(1, int(backoff)))
 
     def _read_stage_item_orchestration_state(self, item: BinarySecurityStageItem) -> OrchestrationSupervisorState:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         observation = self._stage_item_orchestration_observation(item)
         consecutive = observation.get("consecutive_error_count")
         if consecutive is None:
@@ -12290,6 +12656,9 @@ class TaskManager:
         budget_exhausted: bool | None = None,
         next_retry_at: datetime | None = None,
     ) -> None:
+        # Keep runtime observation updates lightweight in DB. If the stage item
+        # already externalized its full result, preserve only the compact row
+        # envelope plus result_path instead of writing the full payload back.
         result = dict(item.result or {})
         observation = dict(result.get("orchestration_observation") or {})
         now_value = observed_at or _now()
@@ -12340,7 +12709,7 @@ class TaskManager:
         item.result = result
 
     def _stage_item_last_synced_at_value(self, item: BinarySecurityStageItem) -> datetime | None:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         raw = result.get("downstream_status_synced_at")
         if not isinstance(raw, str) or not raw.strip():
             raw = dict(result.get("sync_observation") or {}).get("last_synced_at")
@@ -12883,11 +13252,19 @@ class TaskManager:
             item.status = "pending"
             item.error_message = None
             item.finished_at = None
-            item.result = {
-                **(item.result or {}),
-                "dispatch_reclaimed_at": _now().isoformat(),
-            }
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == item.task_id).first()
+            if task is not None:
+                self._merge_stage_item_result_fields(
+                    task,
+                    item,
+                    stage_name=str(item.stage_name or "").strip(),
+                    updates={"dispatch_reclaimed_at": _now().isoformat()},
+                )
+            else:
+                item.result = {
+                    **(item.result or {}),
+                    "dispatch_reclaimed_at": _now().isoformat(),
+                }
             if task is not None:
                 self._record_event(
                     db,
@@ -14270,7 +14647,7 @@ class TaskManager:
         return min(self._stage_downstream_sync_backoff_max_seconds(), max(1, int(backoff)))
 
     def _read_stage_item_sync_supervisor_state(self, item: BinarySecurityStageItem) -> DownstreamSyncSupervisorState:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         sync_observation = self._stage_item_sync_observation(item)
         consecutive = sync_observation.get("consecutive_error_count")
         if consecutive is None:
@@ -14757,7 +15134,8 @@ class TaskManager:
     def _downstream_binding_state(self, item: BinarySecurityStageItem) -> str:
         binding = self._downstream_binding_snapshot(item)
         task_id = str(item.downstream_task_id or "").strip()
-        downstream_status = self._string_or_none(binding.get("downstream_status")) or self._string_or_none(dict(item.result or {}).get("downstream_status"))
+        item_result = self._load_stage_item_result_payload(item)
+        downstream_status = self._string_or_none(binding.get("downstream_status")) or self._string_or_none(item_result.get("downstream_status"))
         explicit = self._string_or_none(binding.get("state"))
         if task_id:
             return "bound" if downstream_status else "created_pending_sync"
@@ -16128,7 +16506,7 @@ class TaskManager:
             stage_items = items_by_stage.get(stage_name, [])
             downstream_status_counts: dict[str, int] = {}
             for item in stage_items:
-                item_result = dict(item.result or {})
+                item_result = self._load_stage_item_result_payload(item)
                 sync_observation = dict(item_result.get("sync_observation") or {})
                 downstream_status = (
                     self._string_or_none(sync_observation.get("downstream_status"))
@@ -16231,7 +16609,7 @@ class TaskManager:
         archive_jobs: list[BinarySecurityArchiveJob] | None = None,
     ) -> dict[str, Any]:
         current_output_ref = dict(item.output_ref or {})
-        current_result = dict(item.result or {})
+        current_result = self._load_stage_item_result_payload(item)
         resolved: dict[str, Any] = {}
         for key in ("artifact_root", "archive_root", "archive_copy_stats"):
             current_value = current_output_ref.get(key)
@@ -16278,7 +16656,7 @@ class TaskManager:
             resolved.get("archive_root")
             or resolved.get("artifact_root")
             or dict(item.output_ref or {}).get("unpacked_root")
-            or dict(item.result or {}).get("unpacked_root")
+            or self._load_stage_item_result_payload(item).get("unpacked_root")
             or ""
         ).strip()
 
@@ -16346,7 +16724,7 @@ class TaskManager:
             current_stage_items = items_by_stage.get(stage_name, [])
             downstream_status_counts: dict[str, int] = {}
             for item in current_stage_items:
-                item_result = dict(item.result or {})
+                item_result = self._load_stage_item_result_payload(item)
                 sync_observation = dict(item_result.get("sync_observation") or {})
                 raw_downstream_status = (
                     self._string_or_none(sync_observation.get("downstream_status"))
@@ -16834,7 +17212,7 @@ class TaskManager:
             last_synced_at = self._stage_item_last_synced_at_value(item)
             if last_synced_at is not None and (latest_success is None or last_synced_at > latest_success):
                 latest_success = last_synced_at
-            result = dict(item.result or {})
+            result = self._load_stage_item_result_payload(item)
             sync_observation = dict(result.get("sync_observation") or {})
             raw_attempt = (
                 sync_observation.get("last_attempt_at")
@@ -17266,7 +17644,11 @@ class TaskManager:
             never_synced_item_count = detail_ctx.never_synced_item_count
             stale_synced_item_count = detail_ctx.stale_synced_item_count
         else:
-            stage_items_for_sync = self._stage_items(db, task.id)
+            stage_items_for_sync = [
+                item
+                for stage_name in stage_sequence
+                for item in self._stage_items(db, task.id, stage_name)
+            ]
             (
                 last_successful_sync_at,
                 last_sync_attempt_at,
@@ -17506,7 +17888,7 @@ class TaskManager:
         *,
         archive_jobs: list[BinarySecurityArchiveJob] | None = None,
     ) -> BinarySecurityStageItemResponse:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         output_ref = dict(item.output_ref or {})
         resolved_archive_refs = self._resolved_stage_item_archive_refs(item, archive_jobs=archive_jobs)
         for key in ("artifact_root", "archive_root", "archive_copy_stats", "archive_job_id", "archive_status"):
@@ -18470,14 +18852,19 @@ class TaskManager:
             item.downstream_task_id,
         )
         modules = self._parse_system_analysis_modules(artifact_root, firmware, result_payload)
-        item.result = {
-            **self._lightweight_system_analysis_input(firmware),
-            "modules": self._lightweight_modules_for_storage(modules),
-            "module_count": len(modules),
-            "downstream": self._lightweight_downstream_payload(payload),
-            "system_analysis_result": self._lightweight_system_analysis_result(result_payload),
-            "downstream_status_synced_at": _now().isoformat(),
-        }
+        self._persist_stage_item_result(
+            task,
+            item,
+            stage_name=item.stage_name,
+            result={
+                **self._lightweight_system_analysis_input(firmware),
+                "modules": self._lightweight_modules_for_storage(modules),
+                "module_count": len(modules),
+                "downstream": self._lightweight_downstream_payload(payload),
+                "system_analysis_result": self._lightweight_system_analysis_result(result_payload),
+                "downstream_status_synced_at": _now().isoformat(),
+            },
+        )
         item.output_ref = {
             **(item.output_ref or {}),
             "artifact_root": str(artifact_root),
@@ -18493,7 +18880,7 @@ class TaskManager:
         downstream_payload: dict[str, Any] | None = None,
     ) -> None:
         input_ref = dict(item.input_ref or {})
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         firmware_key = str(item.item_key or input_ref.get("firmware_key") or result.get("firmware_key") or "")
         filename = str(input_ref.get("filename") or item.item_name or result.get("filename") or firmware_key)
         metadata_sources = self._resolve_downstream_output_sources(
@@ -18507,18 +18894,23 @@ class TaskManager:
             self._stage_item_archive_root(item)
             or str(result.get("unpacked_root") or runtime_output_path)
         )
-        item.result = {
-            **result,
-            "firmware_key": firmware_key,
-            "firmware_name": str(result.get("firmware_name") or Path(filename).stem or firmware_key),
-            "filename": filename,
-            "input_path": str(input_ref.get("path") or result.get("input_path") or ""),
-            "unpacked_root": unpacked_root,
-            "source_root": str(result.get("source_root") or unpacked_root),
-            "task_type": result.get("task_type", TASK_TYPE_BINARY),
-            "downstream": self._lightweight_downstream_payload(downstream_payload or result.get("downstream") or {}),
-            "downstream_status_synced_at": _now().isoformat(),
-        }
+        self._persist_stage_item_result(
+            task,
+            item,
+            stage_name=item.stage_name,
+            result={
+                **result,
+                "firmware_key": firmware_key,
+                "firmware_name": str(result.get("firmware_name") or Path(filename).stem or firmware_key),
+                "filename": filename,
+                "input_path": str(input_ref.get("path") or result.get("input_path") or ""),
+                "unpacked_root": unpacked_root,
+                "source_root": str(result.get("source_root") or unpacked_root),
+                "task_type": result.get("task_type", TASK_TYPE_BINARY),
+                "downstream": self._lightweight_downstream_payload(downstream_payload or result.get("downstream") or {}),
+                "downstream_status_synced_at": _now().isoformat(),
+            },
+        )
         item.output_ref = {
             **(item.output_ref or {}),
             "runtime_output_path": runtime_output_path,
@@ -18799,7 +19191,7 @@ class TaskManager:
         else:
             stage_run.finished_at = stage_run.finished_at or _now()
         if stage_name == "firmware_unpack":
-            success_items = [dict(item.result or {}) for item in items if item.status == "success"]
+            success_items = [self._load_stage_item_result_payload(item) for item in items if item.status == "success"]
             compact_success = self._compact_stage_success_items("firmware_unpack_results", success_items)
             task.summary = {**(task.summary or {}), "firmware_unpack_results": compact_success}
             task.metrics = {
@@ -18829,7 +19221,7 @@ class TaskManager:
         ]
         rebuilt: list[dict[str, Any]] = []
         for item in items:
-            result = dict(item.result or {})
+            result = self._load_stage_item_result_payload(item)
             input_ref = dict(item.input_ref or {})
             output_ref = dict(item.output_ref or {})
             module = {
@@ -18868,7 +19260,15 @@ class TaskManager:
             stage_summary = {
                 "items": self._compact_stage_success_items_for_db("entry_results", rebuilt),
                 "failed_items": [
-                    self._lightweight_stage_failure({"item": dict(item.input_ref or item.result or {}), "error": item.error_message})
+                    self._lightweight_stage_failure(
+                        {
+                            "item": {
+                                **dict(item.input_ref or {}),
+                                **self._load_stage_item_result_payload(item),
+                            },
+                            "error": item.error_message,
+                        }
+                    )
                     for item in self._stage_items(db, task.id, "entry_analysis")
                     if item.status in {"failed", "cancelled", "downstream_missing"}
                 ],
@@ -18902,7 +19302,7 @@ class TaskManager:
         for item in items:
             if item.status != "success":
                 continue
-            result = dict(item.result or {})
+            result = self._load_stage_item_result_payload(item)
             item_modules = self._system_analysis_modules_from_item(
                 task,
                 item,
@@ -19435,7 +19835,7 @@ class TaskManager:
         ]
         for item in entry_items:
             input_ref = dict(item.input_ref or {})
-            result = dict(item.result or {})
+            result = self._load_stage_item_result_payload(item)
             output_ref = dict(item.output_ref or {})
             module = {
                 **input_ref,
@@ -20249,7 +20649,7 @@ class TaskManager:
         return any(token in joined for token in self_healing_tokens)
 
     def _latest_observed_downstream_status(self, item: BinarySecurityStageItem) -> str | None:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         observed, _sync_observation, _repaired = self._effective_stage_item_downstream_status(item, result=result)
         mapped = self._map_downstream_status(str(observed or ""))
         return mapped or (str(observed or "").strip().lower() or None)
@@ -21720,7 +22120,7 @@ class TaskManager:
                 {
                     **dict(item.input_ref or {}),
                     **dict(item.output_ref or {}),
-                    **dict(item.result or {}),
+                    **self._load_stage_item_result_payload(item),
                 }
                 for item in items
             ],
@@ -21736,12 +22136,28 @@ class TaskManager:
         ).first()
         if stage_run is not None:
             failed_items = [
-                self._lightweight_stage_failure({"item": dict(item.input_ref or item.result or {}), "error": item.error_message})
+                self._lightweight_stage_failure(
+                    {
+                        "item": {
+                            **dict(item.input_ref or {}),
+                            **self._load_stage_item_result_payload(item),
+                        },
+                        "error": item.error_message,
+                    }
+                )
                 for item in self._stage_items(db, task.id, stage_name)
                 if item.status in {"failed", "downstream_missing"}
             ]
             cancelled_items = [
-                self._lightweight_stage_failure({"item": dict(item.input_ref or item.result or {}), "error": item.error_message})
+                self._lightweight_stage_failure(
+                    {
+                        "item": {
+                            **dict(item.input_ref or {}),
+                            **self._load_stage_item_result_payload(item),
+                        },
+                        "error": item.error_message,
+                    }
+                )
                 for item in self._stage_items(db, task.id, stage_name)
                 if item.status == "cancelled"
             ]
@@ -22494,7 +22910,12 @@ class TaskManager:
                 item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "running"
                 item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
                 item.started_at = item.started_at or _now()
-                item.result = {"project_id": task.project_id}
+                self._merge_stage_item_result_fields(
+                    task,
+                    item,
+                    stage_name=stage_run.stage_name,
+                    updates={"project_id": task.project_id},
+                )
                 session.commit()
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, token or ""),
@@ -22517,7 +22938,12 @@ class TaskManager:
                         token,
                         keep_task_ids={str(item.downstream_task_id or "").strip()},
                     )
-                    item.result = {"project_id": task.project_id}
+                    self._merge_stage_item_result_fields(
+                        task,
+                        item,
+                        stage_name=stage_run.stage_name,
+                        updates={"project_id": task.project_id},
+                    )
                     if mapped_reusable_status in {"queued", "running"}:
                         item.status = mapped_reusable_status
                         item.started_at = item.started_at or _now()
@@ -22550,7 +22976,12 @@ class TaskManager:
                         item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
                         item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
                         item.started_at = item.started_at or _now()
-                        item.result = {"project_id": task.project_id}
+                        self._merge_stage_item_result_fields(
+                            task,
+                            item,
+                            stage_name=stage_run.stage_name,
+                            updates={"project_id": task.project_id},
+                        )
                         session.commit()
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, token or ""),
@@ -22563,7 +22994,12 @@ class TaskManager:
                     elif outcome == "already_terminal":
                         payload = dict(control.get("payload") or {})
                         item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
-                        item.result = {"project_id": task.project_id}
+                        self._merge_stage_item_result_fields(
+                            task,
+                            item,
+                            stage_name=stage_run.stage_name,
+                            updates={"project_id": task.project_id},
+                        )
                         session.commit()
                         status = self._status_from_downstream_payload(payload, success_statuses={"success"})
                         created = None
@@ -22600,7 +23036,12 @@ class TaskManager:
                 item.status = "running"
                 item.downstream_task_id = created.get("task_id") or item.downstream_task_id
                 item.started_at = _now()
-                item.result = {"project_id": task.project_id}
+                self._merge_stage_item_result_fields(
+                    task,
+                    item,
+                    stage_name=stage_run.stage_name,
+                    updates={"project_id": task.project_id},
+                )
                 self._record_downstream_item_disposition(
                     session,
                     task,
@@ -22654,7 +23095,12 @@ class TaskManager:
                 "unpacked_root": str(archive_root),
                 "downstream": self._lightweight_downstream_payload(payload),
             }
-            item.result = {**(item.result or {}), **result}
+            self._persist_stage_item_result(
+                task,
+                item,
+                stage_name=stage_run.stage_name,
+                result={**self._load_stage_item_result_payload(item), **result},
+            )
             item.output_ref = {
                 **(item.output_ref or {}),
                 "archive_root": str(archive_root),
@@ -22873,7 +23319,7 @@ class TaskManager:
             if self._normalize_item_status(item.status) != "success":
                 continue
             input_ref = dict(item.input_ref or {})
-            result = dict(item.result or {})
+            result = self._load_stage_item_result_payload(item)
             archive_root = self._stage_item_archive_root(
                 item,
                 archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []),
@@ -23150,7 +23596,12 @@ class TaskManager:
                 "downstream": self._lightweight_downstream_payload(payload),
                 "system_analysis_result": self._lightweight_system_analysis_result(result_payload),
             }
-            item.result = self._compact_result_for_storage(stage_run.stage_name, result)
+            self._persist_stage_item_result(
+                task,
+                item,
+                stage_name=stage_run.stage_name,
+                result=result,
+            )
             item.output_ref = {**(item.output_ref or {}), "artifact_root": str(archive_root), "archive_root": str(archive_root)}
             session.commit()
             return {"status": item.status, "item": {**result, "modules": modules}, "error": payload.get("error") or payload.get("error_message")}
@@ -23196,11 +23647,16 @@ class TaskManager:
                 item.status = "failed"
                 item.error_message = str(exc)
                 item.finished_at = _now()
-                item.result = {
-                    **self._lightweight_system_analysis_input(firmware),
-                    "error": str(exc),
-                    "downstream_task_id": item.downstream_task_id,
-                }
+                self._persist_stage_item_result(
+                    task,
+                    item,
+                    stage_name=stage_run.stage_name,
+                    result={
+                        **self._lightweight_system_analysis_input(firmware),
+                        "error": str(exc),
+                        "downstream_task_id": item.downstream_task_id,
+                    },
+                )
                 session.commit()
             return {"status": "failed", "error": str(exc), "item": firmware}
         finally:
@@ -23318,6 +23774,110 @@ class TaskManager:
             if value not in (None, "")
         }
 
+    def _stage_item_result_path(
+        self,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+    ) -> Path | None:
+        workspace_root = str(getattr(task, "workspace_root", "") or "").strip()
+        item_id = str(getattr(item, "id", "") or "").strip()
+        if not workspace_root or not item_id:
+            return None
+        return Path(workspace_root) / "run" / "stage-items" / item_id / "result.json"
+
+    def _result_payload_needs_externalization(
+        self,
+        stage_name: str,
+        result: dict[str, Any],
+    ) -> bool:
+        normalized_stage = str(stage_name or "").strip()
+        if normalized_stage in {"system_analysis", "entry_analysis", "dataflow_analysis", "vuln_scan", "binary_to_source"}:
+            if any(key in result for key in ("entries", "modules", "artifact_files", "system_analysis_result")):
+                return True
+        try:
+            payload_size = len(json.dumps(result, ensure_ascii=False))
+        except Exception:
+            return False
+        return payload_size >= 16 * 1024
+
+    def _load_stage_item_result_payload(self, item: BinarySecurityStageItem) -> dict[str, Any]:
+        result = dict(item.result or {})
+        result_path = str(result.get("result_path") or "").strip()
+        if not result_path:
+            return result
+        try:
+            loaded = _read_json(Path(result_path))
+        except Exception:
+            return {
+                **result,
+                "missing_externalized_result": True,
+            }
+        if not isinstance(loaded, dict):
+            return result
+        merged = dict(loaded)
+        for key, value in result.items():
+            merged.setdefault(key, value)
+        return merged
+
+    def _merge_stage_item_result_fields(
+        self,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        stage_name: str,
+        updates: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        merged = {
+            **self._load_stage_item_result_payload(item),
+            **dict(updates or {}),
+        }
+        return self._persist_stage_item_result(
+            task,
+            item,
+            stage_name=stage_name,
+            result=merged,
+        )
+
+    def _persist_stage_item_result(
+        self,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        stage_name: str,
+        result: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        full_result = dict(result or {})
+        compact = self._compact_result_for_storage(stage_name, full_result)
+        if not self._result_payload_needs_externalization(stage_name, full_result):
+            item.result = compact
+            return compact
+        path = self._stage_item_result_path(task, item)
+        if path is None:
+            item.result = compact
+            return compact
+        try:
+            _write_json(path, full_result)
+            item.result = {
+                **compact,
+                "result_path": str(path),
+            }
+            return dict(item.result or {})
+        except OSError:
+            fallback_root = (
+                Path(tempfile.gettempdir())
+                / "secflow-binary-security"
+                / "stage-items"
+                / str(task.id or "unknown")
+                / str(item.id or "unknown")
+            )
+            fallback_path = fallback_root / "result.json"
+            _write_json(fallback_path, full_result)
+            item.result = {
+                **compact,
+                "result_path": str(fallback_path),
+            }
+            return dict(item.result or {})
+
     def _compact_result_for_storage(self, stage_name: str, item: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(item, dict):
             return {}
@@ -23392,7 +23952,7 @@ class TaskManager:
         *,
         archive_jobs: list[BinarySecurityArchiveJob] | None = None,
     ) -> list[dict[str, Any]]:
-        result = dict(item.result or {})
+        result = self._load_stage_item_result_payload(item)
         artifact_root = Path(self._stage_item_artifact_root(item, archive_jobs=archive_jobs))
         modules_file = artifact_root / "system_analysis_modules.json"
         if modules_file.is_file():
@@ -24134,7 +24694,12 @@ class TaskManager:
                         },
                     )
                     item.downstream_task_id = created.get("id") or item.downstream_task_id
-                    item.result = {"project_id": task.project_id}
+                    self._merge_stage_item_result_fields(
+                        task,
+                        item,
+                        stage_name=stage_run.stage_name,
+                        updates={"project_id": task.project_id},
+                    )
                     item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
                     item.started_at = item.started_at or _now()
                     item.error_message = None
@@ -24162,7 +24727,12 @@ class TaskManager:
                         task=task,
                         item=item,
                     )
-            item.result = {"project_id": task.project_id, **(item.result or {})}
+            self._merge_stage_item_result_fields(
+                task,
+                item,
+                stage_name=stage_run.stage_name,
+                updates={"project_id": task.project_id},
+            )
             session.commit()
             extra_paths: list[str] = []
             for child in payload.get("items", []):
@@ -24226,7 +24796,12 @@ class TaskManager:
                 "result_summary_version": b2s_result_summary_version or 1,
                 **prepared_entry,
             }
-            item.result = self._compact_result_for_storage(stage_run.stage_name, result)
+            self._persist_stage_item_result(
+                task,
+                item,
+                stage_name=stage_run.stage_name,
+                result=result,
+            )
             item.output_ref = {
                 **(item.output_ref or {}),
                 "archive_root": str(archived_dir),
@@ -24774,7 +25349,12 @@ class TaskManager:
                 "source_dir": entry_input["source_dir"],
                 "downstream": payload,
             }
-            item.result = self._compact_result_for_storage(stage_run.stage_name, result)
+            self._persist_stage_item_result(
+                task,
+                item,
+                stage_name=stage_run.stage_name,
+                result=result,
+            )
             item.output_ref = {**(item.output_ref or {}), "artifact_root": str(archived_dir), "archive_root": str(archived_dir)}
             if self._streaming_mode_enabled(task):
                 self._trigger_dataflow_items_from_entry_result(session, task, result, upstream_item=item)
@@ -25382,9 +25962,11 @@ class TaskManager:
                 item.status = "failed"
                 item.finished_at = _now()
                 item.error_message = "未找到函数定义，无法执行数据流分析"
-                item.result = self._compact_result_for_storage(
-                    stage_run.stage_name,
-                    {
+                self._persist_stage_item_result(
+                    task,
+                    item,
+                    stage_name=stage_run.stage_name,
+                    result={
                         **entry,
                         "failed": True,
                         "failure_reason": item.error_message,
@@ -25396,9 +25978,11 @@ class TaskManager:
                 item.status = "failed"
                 item.finished_at = _now()
                 item.error_message = "入口仅定位到声明，无法执行数据流分析"
-                item.result = self._compact_result_for_storage(
-                    stage_run.stage_name,
-                    {
+                self._persist_stage_item_result(
+                    task,
+                    item,
+                    stage_name=stage_run.stage_name,
+                    result={
                         **entry,
                         "failed": True,
                         "failure_reason": item.error_message,
@@ -25411,9 +25995,11 @@ class TaskManager:
                 item.status = "failed"
                 item.finished_at = _now()
                 item.error_message = "未识别到明确污点参数，无法执行数据流分析"
-                item.result = self._compact_result_for_storage(
-                    stage_run.stage_name,
-                    {
+                self._persist_stage_item_result(
+                    task,
+                    item,
+                    stage_name=stage_run.stage_name,
+                    result={
                         **entry,
                         "failed": True,
                         "failure_reason": item.error_message,
@@ -25425,9 +26011,11 @@ class TaskManager:
                 item.status = "failed"
                 item.finished_at = _now()
                 item.error_message = "未找到可用于数据流分析的模块输入目录"
-                item.result = self._compact_result_for_storage(
-                    stage_run.stage_name,
-                    {
+                self._persist_stage_item_result(
+                    task,
+                    item,
+                    stage_name=stage_run.stage_name,
+                    result={
                         **entry,
                         "failed": True,
                         "failure_reason": item.error_message,
@@ -25439,9 +26027,11 @@ class TaskManager:
                 item.status = "failed"
                 item.finished_at = _now()
                 item.error_message = "未找到可用于数据流分析的源码根目录"
-                item.result = self._compact_result_for_storage(
-                    stage_run.stage_name,
-                    {
+                self._persist_stage_item_result(
+                    task,
+                    item,
+                    stage_name=stage_run.stage_name,
+                    result={
                         **entry,
                         "failed": True,
                         "failure_reason": item.error_message,
@@ -25657,7 +26247,12 @@ class TaskManager:
                 dataflow_dir=str(archived_dir),
             )
             result["downstream"] = self._lightweight_downstream_payload(payload)
-            item.result = self._compact_result_for_storage(stage_run.stage_name, result)
+            self._persist_stage_item_result(
+                task,
+                item,
+                stage_name=stage_run.stage_name,
+                result=result,
+            )
             item.output_ref = {
                 **(item.output_ref or {}),
                 "artifact_root": str(archived_dir),
@@ -25854,7 +26449,12 @@ class TaskManager:
                             "downstream": self._lightweight_downstream_payload(payload),
                             "artifacts": artifacts,
                         }
-                        item.result = self._compact_result_for_storage(stage_run.stage_name, result)
+                        self._persist_stage_item_result(
+                            task,
+                            item,
+                            stage_name=stage_run.stage_name,
+                            result=result,
+                        )
                         item.output_ref = {
                             **(item.output_ref or {}),
                             "workspace_root": artifacts.get("workspace_root"),
@@ -26067,7 +26667,12 @@ class TaskManager:
                 "downstream": self._lightweight_downstream_payload(payload),
                 "artifacts": artifacts,
             }
-            item.result = self._compact_result_for_storage(stage_run.stage_name, result)
+            self._persist_stage_item_result(
+                task,
+                item,
+                stage_name=stage_run.stage_name,
+                result=result,
+            )
             item.output_ref = {
                 **(item.output_ref or {}),
                 "workspace_root": artifacts.get("workspace_root"),

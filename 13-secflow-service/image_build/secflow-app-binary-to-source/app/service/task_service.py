@@ -90,6 +90,17 @@ from app.service.security import app_task_item_root, app_task_root, ensure_path_
 from app.time_utils import ensure_local, isoformat_local, now_local
 
 TERMINAL = {"success", "failed", "cancelled"}
+TIMELINE_CLASS_OPERATION = "operation"
+TIMELINE_CLASS_DISPATCH = "dispatch"
+TIMELINE_CLASS_LIFECYCLE = "lifecycle"
+TIMELINE_CLASS_ABNORMAL = "abnormal"
+TIMELINE_CLASS_INTERNAL = "internal"
+DEFAULT_TIMELINE_CLASSES = {
+    TIMELINE_CLASS_OPERATION,
+    TIMELINE_CLASS_DISPATCH,
+    TIMELINE_CLASS_LIFECYCLE,
+    TIMELINE_CLASS_ABNORMAL,
+}
 PI_STATUS_MAP = {
     "queued": "queued",
     "running": "running",
@@ -264,6 +275,194 @@ def _task_context_payload(task: B2STask) -> dict[str, Any]:
     }
 
 
+def _task_execution_epoch(task: B2STask | None) -> int | None:
+    metadata = task.extra_metadata if task is not None and isinstance(task.extra_metadata, dict) else {}
+    value = metadata.get("task_execution_epoch")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _timeline_payload(
+    *,
+    task: B2STask,
+    timeline_class: str,
+    timeline_visible: bool | None = None,
+    operation_name: str | None = None,
+    operation_run_id: str | None = None,
+    dispatch_cycle: int | None = None,
+    related_event_ids: list[str] | None = None,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    merged = dict(payload or {})
+    merged["timeline_class"] = timeline_class
+    merged["timeline_visible"] = timeline_class != TIMELINE_CLASS_INTERNAL if timeline_visible is None else bool(timeline_visible)
+    if operation_name:
+        merged["operation_name"] = operation_name
+    if operation_run_id:
+        merged["operation_run_id"] = operation_run_id
+    epoch = _task_execution_epoch(task)
+    if epoch is not None:
+        merged["task_execution_epoch"] = epoch
+    if dispatch_cycle is not None:
+        merged["dispatch_cycle"] = dispatch_cycle
+    if related_event_ids:
+        merged["related_event_ids"] = related_event_ids
+    return merged
+
+
+def _event_timeline_class(event: B2STaskEventModel) -> str:
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    explicit = str(payload.get("timeline_class") or "").strip()
+    if explicit:
+        return explicit
+    event_type = str(event.event_type or "").strip()
+    if event_type in {
+        "task_created",
+        "task_sync_requested",
+        "task_terminate_requested",
+        "task_cancel_requested",
+        "task_retry_requested",
+        "task_rerun_requested",
+        "task_deleted",
+        "task_delete_requested",
+    }:
+        return TIMELINE_CLASS_OPERATION
+    if event_type in {
+        "dispatch_requested",
+        "item_dispatched",
+        "dispatch_failed",
+        "dispatch_conflicted",
+        "missing_job_requeued",
+        "task_dispatch_enqueued",
+        "task_dispatch_started",
+        "task_dispatch_succeeded",
+        "task_dispatch_failed",
+        "task_rescheduled",
+        "task_worker_takeover",
+    }:
+        return TIMELINE_CLASS_DISPATCH
+    if event_type == "item_requeued":
+        reason = str(payload.get("reason") or "").strip()
+        if reason in {"retry", "rerun", "missing_job_requeue", "manual_requeue", "reschedule"}:
+            return TIMELINE_CLASS_DISPATCH
+        return TIMELINE_CLASS_INTERNAL
+    if event_type in {
+        "task_started",
+        "task_completed",
+        "task_failed",
+        "task_cancelled",
+        "task_status_changed",
+    }:
+        return TIMELINE_CLASS_LIFECYCLE
+    if event_type in {"abnormal_reason_recorded"}:
+        return TIMELINE_CLASS_ABNORMAL
+    return TIMELINE_CLASS_INTERNAL
+
+
+def _event_timeline_visible(event: B2STaskEventModel) -> bool:
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    visible = payload.get("timeline_visible")
+    if visible is not None:
+        return bool(visible)
+    return _event_timeline_class(event) in DEFAULT_TIMELINE_CLASSES
+
+
+def _is_default_timeline_event(event: B2STaskEventModel) -> bool:
+    return _event_timeline_visible(event) and _event_timeline_class(event) in DEFAULT_TIMELINE_CLASSES
+
+
+def _task_execution_epoch(task: B2STask) -> int:
+    metadata = task.extra_metadata or {}
+    return max(0, int(metadata.get("task_execution_epoch") or 0))
+
+
+def _timeline_payload(
+    *,
+    timeline_class: str,
+    timeline_visible: bool = True,
+    operation_name: str | None = None,
+    operation_run_id: str | None = None,
+    task_execution_epoch: int | None = None,
+    dispatch_cycle: int | None = None,
+    related_event_ids: list[str] | None = None,
+    extra_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = dict(extra_payload or {})
+    payload["timeline_class"] = timeline_class
+    payload["timeline_visible"] = bool(timeline_visible)
+    if operation_name:
+        payload["operation_name"] = operation_name
+    if operation_run_id:
+        payload["operation_run_id"] = operation_run_id
+    if task_execution_epoch is not None:
+        payload["task_execution_epoch"] = int(task_execution_epoch)
+    if dispatch_cycle is not None:
+        payload["dispatch_cycle"] = int(dispatch_cycle)
+    if related_event_ids:
+        payload["related_event_ids"] = list(related_event_ids)
+    return payload
+
+
+def _event_timeline_class(event: B2STaskEventModel) -> str:
+    payload = event.payload or {}
+    payload_class = str(payload.get("timeline_class") or "").strip()
+    if payload_class:
+        return payload_class
+    if event.event_type == "abnormal_reason_recorded":
+        return TIMELINE_CLASS_ABNORMAL
+    if event.event_type in {
+        "task_created",
+        "task_sync_requested",
+        "task_terminate_requested",
+        "task_retry_requested",
+        "task_rerun_requested",
+        "task_delete_requested",
+        "task_deleted",
+    }:
+        return TIMELINE_CLASS_OPERATION
+    if event.event_type in {
+        "task_started",
+        "task_completed",
+        "task_failed",
+        "task_cancelled",
+        "task_status_changed",
+    }:
+        return TIMELINE_CLASS_LIFECYCLE
+    if event.event_type in {
+        "dispatch_requested",
+        "item_dispatched",
+        "dispatch_failed",
+        "dispatch_conflicted",
+        "missing_job_requeued",
+        "item_requeued",
+        "task_dispatch_enqueued",
+        "task_dispatch_started",
+        "task_dispatch_succeeded",
+        "task_dispatch_failed",
+        "task_rescheduled",
+        "task_worker_takeover",
+    }:
+        if event.event_type == "item_requeued":
+            reason = str(payload.get("reason") or "").strip().lower()
+            if reason not in {"retry", "rerun", "missing_job_requeue", "manual_requeue", "reschedule"}:
+                return TIMELINE_CLASS_INTERNAL
+        return TIMELINE_CLASS_DISPATCH
+    return TIMELINE_CLASS_INTERNAL
+
+
+def _event_timeline_visible(event: B2STaskEventModel) -> bool:
+    payload = event.payload or {}
+    if "timeline_visible" in payload:
+        return bool(payload.get("timeline_visible"))
+    return _event_timeline_class(event) in DEFAULT_TIMELINE_CLASSES
+
+
+def _is_default_timeline_event(event: B2STaskEventModel) -> bool:
+    return _event_timeline_visible(event) and _event_timeline_class(event) in DEFAULT_TIMELINE_CLASSES
+
+
 def _record_task_operation_event(
     db: Session,
     *,
@@ -277,13 +476,19 @@ def _record_task_operation_event(
     status: str | None = None,
     dedupe_parts: tuple[object, ...] = (),
 ) -> None:
-    payload = {
+    payload = _timeline_payload(
+        task=task,
+        timeline_class=TIMELINE_CLASS_OPERATION,
+        operation_name=operation,
+        operation_run_id=uuid4().hex[:16],
+        payload={
         "operation": operation,
         "trigger": "api",
         "operator": _normalize_operator(operator),
         "request": request_payload or {},
         "task_context": _task_context_payload(task),
-    }
+        },
+    )
     _safe_create_task_event(
         db,
         task_id=task.id,
@@ -500,37 +705,33 @@ def _sync_task_abnormal_reason(db: Session, task: B2STask, items: list[B2STaskIt
         source=TASK_EVENT_SOURCE_B2S,
         level="warning" if reason.status in {"partial", "cancelled"} else "error",
         status=reason.status,
-        payload={"reason": next_payload},
+        payload=_timeline_payload(
+            task=task,
+            timeline_class=TIMELINE_CLASS_ABNORMAL,
+            payload={"reason": next_payload},
+        ),
         dedupe_key=_event_dedupe_key(task.id, "", "abnormal_reason_recorded", reason.code, reason.status, reason.message),
     )
 
 
 def _build_task_event_summary(db: Session, task_id: str) -> B2STaskEventSummary:
-    events = db.query(B2STaskEventModel).filter(B2STaskEventModel.task_id == task_id).order_by(B2STaskEventModel.created_at.desc()).all()
+    events = [
+        event
+        for event in db.query(B2STaskEventModel).filter(B2STaskEventModel.task_id == task_id).order_by(B2STaskEventModel.created_at.desc()).all()
+        if _is_default_timeline_event(event)
+    ]
     summary = B2STaskEventSummary(total_events=len(events))
     if not events:
         return summary
     latest = events[0]
     summary.latest_event_type = latest.event_type
     summary.latest_event_at = latest.created_at
-    for event in events:
-        if summary.last_batch_id is None and event.batch_id is not None:
-            summary.last_batch_id = int(event.batch_id)
-        if not summary.current_function and event.function_name:
-            summary.current_function = str(event.function_name)
-        if summary.current_attempt is None and event.attempt is not None:
-            summary.current_attempt = int(event.attempt)
-        if (
-            summary.last_batch_id is not None
-            and summary.current_function
-            and summary.current_attempt is not None
-        ):
-            break
     return summary
 
 
-def get_task_timeline(db: Session, task: B2STask) -> B2STaskTimelineResponse:
+def get_task_timeline(db: Session, task: B2STask, *, include_internal: bool = False) -> B2STaskTimelineResponse:
     events = db.query(B2STaskEventModel).filter(B2STaskEventModel.task_id == task.id).order_by(B2STaskEventModel.created_at.desc()).all()
+    filtered_events = events if include_internal else [event for event in events if _is_default_timeline_event(event)]
     return B2STaskTimelineResponse(
         task_id=task.id,
         events=[
@@ -553,7 +754,7 @@ def get_task_timeline(db: Session, task: B2STask) -> B2STaskTimelineResponse:
                 payload=event.payload,
                 created_at=event.created_at,
             )
-            for event in events
+            for event in filtered_events
         ],
     )
 
@@ -1405,16 +1606,29 @@ def _record_task_status_event(db: Session, task: B2STask, previous_status: str |
     prev_status = str(previous_status or "").strip() or None
     if not current_status or current_status == prev_status:
         return
+    event_type = "task_status_changed"
+    if prev_status in {None, "", "pending", "queued"} and current_status == "running":
+        event_type = "task_started"
+    elif current_status == "success":
+        event_type = "task_completed"
+    elif current_status == "failed":
+        event_type = "task_failed"
+    elif current_status == "cancelled":
+        event_type = "task_cancelled"
     _safe_create_task_event(
         db,
         task_id=task.id,
         project_id=task.project_id,
         source=TASK_EVENT_SOURCE_B2S,
-        event_type="task_status_changed",
+        event_type=event_type,
         status=current_status,
         message=f"任务状态切换为 {current_status}",
-        payload={"previous_status": prev_status, "current_status": current_status},
-        dedupe_key=_event_dedupe_key(task.id, "task_status_changed", prev_status, current_status, task.updated_at),
+        payload=_timeline_payload(
+            task=task,
+            timeline_class=TIMELINE_CLASS_LIFECYCLE,
+            payload={"previous_status": prev_status, "current_status": current_status},
+        ),
+        dedupe_key=_event_dedupe_key(task.id, event_type, prev_status, current_status, task.updated_at),
     )
 
 
@@ -1930,7 +2144,12 @@ async def dispatch_item_to_pi(db: Session, item: B2STaskItem, *, owner_id: str) 
             phase=item.phase,
             status=item.status,
             message=f"任务项 #{item.sequence_no} 已请求派发到 pi-re-agent",
-            payload={"worker_url": worker_url, "dispatch_attempts": item.dispatch_attempts},
+            payload=_timeline_payload(
+                task=task,
+                timeline_class=TIMELINE_CLASS_DISPATCH,
+                dispatch_cycle=int(item.dispatch_attempts or 0),
+                payload={"worker_url": worker_url, "dispatch_attempts": item.dispatch_attempts},
+            ),
             dedupe_key=_event_dedupe_key(task.id, item.id, "dispatch_requested", item.dispatch_attempts, worker_url),
         )
 
@@ -1971,7 +2190,12 @@ async def dispatch_item_to_pi(db: Session, item: B2STaskItem, *, owner_id: str) 
                 phase=item.phase,
                 status=item.status,
                 message=f"任务项 #{item.sequence_no} 已派发到 pi job {item.pi_job_id}",
-                payload={"worker_url": worker_url, "dispatch_attempts": item.dispatch_attempts},
+                payload=_timeline_payload(
+                    task=task,
+                    timeline_class=TIMELINE_CLASS_DISPATCH,
+                    dispatch_cycle=int(item.dispatch_attempts or 0),
+                    payload={"worker_url": worker_url, "dispatch_attempts": item.dispatch_attempts},
+                ),
                 dedupe_key=_event_dedupe_key(task.id, item.id, "item_dispatched", item.pi_job_id, item.dispatch_attempts),
             )
         if item.status == "success":
@@ -2015,7 +2239,12 @@ async def dispatch_item_to_pi(db: Session, item: B2STaskItem, *, owner_id: str) 
                 status=item.status,
                 level="warning" if item.status == "pending" else "error",
                 message=f"任务项 #{item.sequence_no} 派发失败: {exc}",
-                payload={"worker_url": worker_url, "dispatch_attempts": item.dispatch_attempts, "error": str(exc)},
+                payload=_timeline_payload(
+                    task=task,
+                    timeline_class=TIMELINE_CLASS_DISPATCH,
+                    dispatch_cycle=int(item.dispatch_attempts or 0),
+                    payload={"worker_url": worker_url, "dispatch_attempts": item.dispatch_attempts, "error": str(exc)},
+                ),
                 dedupe_key=_event_dedupe_key(task.id, item.id, "dispatch_failed", item.dispatch_attempts, str(exc)),
             )
         return False
@@ -2315,7 +2544,13 @@ async def sync_task(db: Session, task: B2STask) -> None:
                 phase=item.phase,
                 status=item.status,
                 message=f"任务项 #{item.sequence_no} 丢失 pi job id，已重新回到派发队列",
-                payload={"previous_pi_job_id": observed_pi_job_id},
+                payload=_timeline_payload(
+                    task=task,
+                    timeline_class=TIMELINE_CLASS_DISPATCH,
+                    dispatch_cycle=int(item.dispatch_attempts or 0),
+                    operation_name="reschedule",
+                    payload={"previous_pi_job_id": observed_pi_job_id, "reason": "missing_job_requeue"},
+                ),
                 dedupe_key=_event_dedupe_key(task.id, item.id, "missing_job_requeued", observed_pi_job_id, item.dispatch_attempts),
             )
             _record_item_snapshot_events(db, task=task, item=item, previous=previous, source=TASK_EVENT_SOURCE_B2S)
@@ -2729,7 +2964,13 @@ async def rerun_task(
             phase=item.phase,
             status=item.status,
             message=f"任务项 #{item.sequence_no} 已重新排队等待重跑",
-            payload={"reason": "rerun"},
+            payload=_timeline_payload(
+                task=task,
+                timeline_class=TIMELINE_CLASS_DISPATCH,
+                dispatch_cycle=int(item.dispatch_attempts or 0),
+                operation_name="rerun",
+                payload={"reason": "rerun"},
+            ),
             dedupe_key=_event_dedupe_key(task.id, item.id, "item_requeued", "rerun", item.extra_metadata.get("pi_idempotency_key")),
         )
         _record_item_snapshot_events(db, task=task, item=item, previous=previous, source=TASK_EVENT_SOURCE_B2S, payload={"reason": "rerun"})
@@ -2792,7 +3033,13 @@ async def retry_task(
             phase=item.phase,
             status=item.status,
             message=f"任务项 #{item.sequence_no} 已重新排队等待重试",
-            payload={"reason": "retry"},
+            payload=_timeline_payload(
+                task=task,
+                timeline_class=TIMELINE_CLASS_DISPATCH,
+                dispatch_cycle=int(item.dispatch_attempts or 0),
+                operation_name="retry",
+                payload={"reason": "retry"},
+            ),
             dedupe_key=_event_dedupe_key(task.id, item.id, "item_requeued", "retry", item.extra_metadata.get("pi_idempotency_key")),
         )
         _record_item_snapshot_events(db, task=task, item=item, previous=previous, source=TASK_EVENT_SOURCE_B2S, payload={"reason": "retry"})

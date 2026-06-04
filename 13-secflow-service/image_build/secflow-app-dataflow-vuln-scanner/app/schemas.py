@@ -393,11 +393,13 @@ class DataflowTaskTimelineEvent(BaseModel):
     id: str
     task_id: str
     project_id: str
-    execution_id: str
+    execution_id: Optional[str] = None
     attempt_no: Optional[int] = None
     stage_name: Optional[str] = None
     stage_key: Optional[str] = None
     event_type: str
+    event_group: Optional[str] = None
+    source: Optional[str] = None
     level: str = "info"
     message: str
     payload: Dict[str, Any] = Field(default_factory=dict)

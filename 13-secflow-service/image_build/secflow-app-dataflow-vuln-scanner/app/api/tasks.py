@@ -263,26 +263,37 @@ async def reconcile_active_tasks(
 
 
 @router.get("/tasks/{task_id}/timeline", response_model=DataflowTaskTimelineResponse)
-async def get_task_timeline(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
+async def get_task_timeline(
+    task_id: str,
+    view: str = Query("task"),
+    subject=Depends(get_current_or_machine_subject),
+    db: Session = Depends(get_db),
+):
     principal, _ = subject
-    return get_execution_service().get_scan_task_timeline(db, task_id, principal)
+    return get_execution_service().get_scan_task_timeline_view(db, task_id, principal, view=view)
 
 
 @router.delete("/tasks/{task_id}/timeline", response_model=DataflowTaskTimelineActionResponse)
-async def clear_task_timeline(task_id: str, subject=Depends(get_current_or_machine_subject), db: Session = Depends(get_db)):
+async def clear_task_timeline(
+    task_id: str,
+    view: str = Query("task"),
+    subject=Depends(get_current_or_machine_subject),
+    db: Session = Depends(get_db),
+):
     principal, _ = subject
-    return get_execution_service().clear_scan_task_timeline(db, task_id, principal)
+    return get_execution_service().clear_scan_task_timeline_view(db, task_id, principal, view=view)
 
 
 @router.delete("/tasks/{task_id}/timeline/{event_id}", response_model=DataflowTaskTimelineActionResponse)
 async def delete_task_timeline_event(
     task_id: str,
     event_id: str,
+    view: str = Query("task"),
     subject=Depends(get_current_or_machine_subject),
     db: Session = Depends(get_db),
 ):
     principal, _ = subject
-    return get_execution_service().delete_scan_task_timeline_event(db, task_id, event_id, principal)
+    return get_execution_service().delete_scan_task_timeline_event_view(db, task_id, event_id, principal, view=view)
 
 
 @router.get("/tasks/{task_id}/replay-ready", response_model=ReplayReadyResponse)
