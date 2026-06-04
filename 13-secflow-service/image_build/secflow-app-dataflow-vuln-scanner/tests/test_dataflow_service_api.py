@@ -1889,6 +1889,14 @@ def test_service_runtime_config_roundtrip(service_config_path):
         "dispatch_retry_interval_seconds",
         "dispatch_max_retries",
     }
+    assert set(payload["config"]["service"].keys()) == {
+        "agent_cleanup_enabled",
+        "agent_cleanup_before_task_start",
+        "agent_cleanup_after_task_finish",
+        "agent_cleanup_force_kill_timeout_seconds",
+        "agent_cleanup_escalation_timeout_seconds",
+        "agent_cleanup_process_match_patterns",
+    }
 
     save_response = client.put(
         "/api/dataflow-vuln-scanner/service/config",
@@ -1902,6 +1910,9 @@ def test_service_runtime_config_roundtrip(service_config_path):
                     "advertise_url_template": "http://{pod_id}.{headless_service_name}.{pod_namespace}.svc.cluster.local:8080",
                     "dispatch_retry_interval_seconds": 4,
                 },
+                "service": {
+                    "agent_cleanup_force_kill_timeout_seconds": 9,
+                },
             }
         },
     )
@@ -1909,6 +1920,7 @@ def test_service_runtime_config_roundtrip(service_config_path):
     saved = save_response.json()
     assert saved["config"]["scheduler"]["worker_capacity"] == 3
     assert saved["config"]["dataflow_worker"]["advertise_url_template"] == "http://{pod_id}.{headless_service_name}.{pod_namespace}.svc.cluster.local:8080"
+    assert saved["config"]["service"]["agent_cleanup_force_kill_timeout_seconds"] == 9
 
 
 def test_service_runtime_config_drops_legacy_registry_incompatible_fields(service_config_path):

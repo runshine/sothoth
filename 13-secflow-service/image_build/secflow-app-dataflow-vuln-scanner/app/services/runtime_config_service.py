@@ -55,6 +55,14 @@ def _default_payload() -> dict[str, Any]:
             "dispatch_retry_interval_seconds": config.dataflow_worker.dispatch_retry_interval_seconds,
             "dispatch_max_retries": config.dataflow_worker.dispatch_max_retries,
         },
+        "service": {
+            "agent_cleanup_enabled": config.service.agent_cleanup_enabled,
+            "agent_cleanup_before_task_start": config.service.agent_cleanup_before_task_start,
+            "agent_cleanup_after_task_finish": config.service.agent_cleanup_after_task_finish,
+            "agent_cleanup_force_kill_timeout_seconds": config.service.agent_cleanup_force_kill_timeout_seconds,
+            "agent_cleanup_escalation_timeout_seconds": config.service.agent_cleanup_escalation_timeout_seconds,
+            "agent_cleanup_process_match_patterns": list(config.service.agent_cleanup_process_match_patterns),
+        },
     }
 
 

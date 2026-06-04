@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import hashlib
 import json
@@ -85,6 +86,7 @@ from app.services.run_index_service import (
     _load_externalized_mapping_payload,
     get_run_index_service,
 )
+from app.services.runtime_config_service import get_runtime_config_service
 from app.services.run_state import is_run_active, is_run_queued, is_run_terminal
 from app.services.task_state import (
     derive_task_control_state,
@@ -151,6 +153,9 @@ _TASK_TIMELINE_EVENT_GROUPS = {
     "task_failed": "terminal",
     "task_cancelled": "terminal",
     "task_interrupted": "terminal",
+    "task_agent_cleanup_before_start": "operation",
+    "task_agent_cleanup_after_finish": "operation",
+    "task_agent_residual_force_killed": "operation",
 }
 _RAW_EVENT_TASK_TIMELINE_MIRRORS = {
     "task_retry_queued": ("task_retry_created", "operation", "raw_execution"),
@@ -3470,6 +3475,397 @@ class ExecutionService:
         if process is not None:
             self._forget_cli_process(execution_id, process)
         return None
+
+    def _service_runtime_config(self, db: Session) -> dict[str, Any]:
+        try:
+            runtime_config = get_runtime_config_service().get_config(db)
+        except Exception:
+            logger.warning("failed to load runtime config for agent cleanup", exc_info=True)
+            return {}
+        return dict(runtime_config.get("service") or {})
+
+    def _agent_cleanup_enabled(self, db: Session, *, phase: str) -> bool:
+        service_cfg = self._service_runtime_config(db)
+        if not bool(service_cfg.get("agent_cleanup_enabled", get_config().service.agent_cleanup_enabled)):
+            return False
+        if phase == "pre_task_start":
+            return bool(service_cfg.get("agent_cleanup_before_task_start", get_config().service.agent_cleanup_before_task_start))
+        return bool(service_cfg.get("agent_cleanup_after_task_finish", get_config().service.agent_cleanup_after_task_finish))
+
+    def _agent_cleanup_patterns(self, db: Session) -> list[str]:
+        service_cfg = self._service_runtime_config(db)
+        raw = service_cfg.get("agent_cleanup_process_match_patterns", get_config().service.agent_cleanup_process_match_patterns)
+        if not isinstance(raw, list):
+            raw = get_config().service.agent_cleanup_process_match_patterns
+        return [str(item).strip().lower() for item in raw if str(item).strip()]
+
+    @staticmethod
+    def _process_group_exists(pgid: int | None) -> bool:
+        if not pgid or pgid <= 0:
+            return False
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+        return True
+
+    @staticmethod
+    def _process_exists(pid: int | None) -> bool:
+        if not pid or pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+        return True
+
+    def _scan_residual_agent_processes(
+        self,
+        db: Session,
+        *,
+        execution: WorkflowExecution | None,
+        trigger: TriggerTask | None,
+    ) -> list[dict[str, Any]]:
+        patterns = self._agent_cleanup_patterns(db)
+        current_pid = os.getpid()
+        current_ppid = os.getppid()
+        current_pgid = None
+        with contextlib.suppress(Exception):
+            current_pgid = os.getpgid(current_pid)
+        workspace_root = str(execution.workspace_root or "").strip() if execution is not None else ""
+        matched: list[dict[str, Any]] = []
+        proc = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,pgid=,command="],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        for raw_line in proc.stdout.splitlines():
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+            parts = line.split(None, 3)
+            if len(parts) < 4:
+                continue
+            try:
+                pid = int(parts[0])
+                ppid = int(parts[1])
+                pgid = int(parts[2])
+            except ValueError:
+                continue
+            command = str(parts[3] or "").strip()
+            command_lc = command.lower()
+            if pid in {current_pid, current_ppid}:
+                continue
+            if pid <= 1 or not command:
+                continue
+            pattern_matches = [pattern for pattern in patterns if pattern in command_lc]
+            workspace_match = bool(workspace_root and workspace_root in command)
+            if not pattern_matches and not workspace_match:
+                continue
+            classified_type = "unknown_child"
+            if "pi_agent" in command_lc or "pi-agent" in command_lc:
+                classified_type = "pi_agent"
+            elif "codex" in command_lc or "opencode" in command_lc or "claude" in command_lc:
+                classified_type = "rpc_process"
+            elif "run_vuln_scan.py" in command:
+                classified_type = "run_vuln_scan"
+            matched.append(
+                {
+                    "pid": pid,
+                    "ppid": ppid,
+                    "pgid": pgid,
+                    "cmdline": command,
+                    "classified_type": classified_type,
+                    "workspace_match": workspace_match,
+                    "pattern_matches": pattern_matches,
+                    "same_process_group_as_worker": bool(current_pgid is not None and pgid == current_pgid),
+                    "task_id": trigger.id if trigger is not None else None,
+                    "execution_id": execution.id if execution is not None else None,
+                }
+            )
+        return matched
+
+    def _kill_residual_agent_processes(
+        self,
+        db: Session,
+        *,
+        processes: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+        service_cfg = self._service_runtime_config(db)
+        escalation_timeout = float(
+            service_cfg.get(
+                "agent_cleanup_escalation_timeout_seconds",
+                get_config().service.agent_cleanup_escalation_timeout_seconds,
+            )
+        )
+        force_timeout = float(
+            service_cfg.get(
+                "agent_cleanup_force_kill_timeout_seconds",
+                get_config().service.agent_cleanup_force_kill_timeout_seconds,
+            )
+        )
+        processed_keys: set[tuple[str, int]] = set()
+        survivors: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        force_kill_used = False
+        for process_info in processes:
+            pid = int(process_info.get("pid") or 0)
+            pgid = int(process_info.get("pgid") or 0)
+            same_worker_group = bool(process_info.get("same_process_group_as_worker"))
+            key = ("pid", pid) if same_worker_group or pgid <= 0 else ("pgid", pgid)
+            if key in processed_keys:
+                process_info["kill_result"] = "deduped"
+                continue
+            processed_keys.add(key)
+            try:
+                if same_worker_group or pgid <= 0:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(pid, signal.SIGTERM)
+                    deadline = time.monotonic() + max(escalation_timeout, 0.1)
+                    while time.monotonic() < deadline and self._process_exists(pid):
+                        time.sleep(0.1)
+                    if self._process_exists(pid):
+                        force_kill_used = True
+                        with contextlib.suppress(ProcessLookupError):
+                            os.kill(pid, signal.SIGKILL)
+                        force_deadline = time.monotonic() + max(force_timeout, 0.1)
+                        while time.monotonic() < force_deadline and self._process_exists(pid):
+                            time.sleep(0.1)
+                    alive = self._process_exists(pid)
+                else:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(pgid, signal.SIGTERM)
+                    deadline = time.monotonic() + max(escalation_timeout, 0.1)
+                    while time.monotonic() < deadline and self._process_group_exists(pgid):
+                        time.sleep(0.1)
+                    if self._process_group_exists(pgid):
+                        force_kill_used = True
+                        with contextlib.suppress(ProcessLookupError):
+                            os.killpg(pgid, signal.SIGKILL)
+                        force_deadline = time.monotonic() + max(force_timeout, 0.1)
+                        while time.monotonic() < force_deadline and self._process_group_exists(pgid):
+                            time.sleep(0.1)
+                    alive = self._process_group_exists(pgid)
+                process_info["kill_result"] = "survived" if alive else "killed"
+                if alive:
+                    survivors.append(process_info)
+            except Exception as exc:
+                process_info["kill_result"] = "error"
+                process_info["kill_error"] = str(exc)
+                survivors.append(process_info)
+                errors.append(
+                    {
+                        "pid": pid,
+                        "pgid": pgid,
+                        "error": str(exc),
+                    }
+                )
+        return processes, survivors, force_kill_used
+
+    def _record_agent_cleanup_events(
+        self,
+        db: Session,
+        *,
+        trigger: TriggerTask,
+        execution: WorkflowExecution,
+        report: dict[str, Any],
+    ) -> None:
+        phase = str(report.get("phase") or "")
+        matched = int(report.get("matched_process_count") or 0)
+        killed = int(report.get("killed_process_count") or 0)
+        survivors = int(report.get("survivor_process_count") or 0)
+        clean_result = str(report.get("clean_result") or "clean")
+        summary_event_type = "task_agent_cleanup_before_start" if phase == "pre_task_start" else "task_agent_cleanup_after_finish"
+        summary_message = (
+            f"agent cleanup {phase or 'unknown'} finished: matched={matched}, "
+            f"killed={killed}, survivors={survivors}, result={clean_result}"
+        )
+        self._record_task_mutation_event(
+            db,
+            event_type=summary_event_type,
+            message=summary_message,
+            payload_json={
+                "phase": phase,
+                "matched_process_count": matched,
+                "killed_process_count": killed,
+                "survivor_process_count": survivors,
+                "clean_result": clean_result,
+                "owner_pod_id": report.get("owner_pod_id"),
+            },
+            level="warning" if matched > 0 else "info",
+            trigger=trigger,
+            execution=execution,
+            source="agent_cleanup",
+        )
+        if matched > 0:
+            self._record_task_mutation_event(
+                db,
+                event_type="task_agent_residual_force_killed",
+                message=(
+                    f"residual agents detected during {phase}: matched={matched}, "
+                    f"killed={killed}, survivors={survivors}"
+                ),
+                payload_json={
+                    "phase": phase,
+                    "matched_process_count": matched,
+                    "killed_process_count": killed,
+                    "survivor_process_count": survivors,
+                    "clean_result": clean_result,
+                    "owner_pod_id": report.get("owner_pod_id"),
+                },
+                level="error",
+                trigger=trigger,
+                execution=execution,
+                source="agent_cleanup",
+            )
+
+    def _cleanup_residual_agents_for_task(
+        self,
+        db: Session,
+        *,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+        phase: str,
+        cleanup_reason: str,
+        strict: bool,
+    ) -> dict[str, Any] | None:
+        if trigger is None or execution is None:
+            return None
+        if not self._agent_cleanup_enabled(db, phase=phase):
+            return None
+        started_at = now_local()
+        report: dict[str, Any] = {
+            "phase": phase,
+            "cleanup_reason": cleanup_reason,
+            "task_id": trigger.id,
+            "execution_id": execution.id,
+            "owner_pod_id": execution.owner_pod_id,
+            "scan_started_at": isoformat_local(started_at),
+        }
+        try:
+            processes = self._scan_residual_agent_processes(db, execution=execution, trigger=trigger)
+            processes, survivors, force_kill_used = self._kill_residual_agent_processes(db, processes=processes)
+            matched_count = len(processes)
+            survivor_count = len(survivors)
+            killed_count = max(matched_count - survivor_count, 0)
+            clean_result = "clean"
+            if matched_count > 0 and survivor_count == 0:
+                clean_result = "residual_killed"
+            elif matched_count > 0:
+                clean_result = "residual_kill_partial_failed"
+            report.update(
+                {
+                    "scan_finished_at": isoformat_local(now_local()),
+                    "matched_process_count": matched_count,
+                    "killed_process_count": killed_count,
+                    "survivor_process_count": survivor_count,
+                    "processes": processes,
+                    "errors": [item for item in survivors if str(item.get("kill_result")) == "error"],
+                    "force_kill_used": force_kill_used,
+                    "clean_result": clean_result,
+                }
+            )
+            self.record_event(
+                db,
+                execution_id=execution.id,
+                event_type=f"agent_cleanup_{'pre' if phase == 'pre_task_start' else 'post'}_task_finished",
+                message=f"agent cleanup {phase} finished",
+                level="warning" if matched_count > 0 else "info",
+                payload_json=report,
+                suppress_task_timeline_mirror=True,
+            )
+            if matched_count > 0:
+                self.record_event(
+                    db,
+                    execution_id=execution.id,
+                    event_type="agent_residual_detected",
+                    message=f"residual agents detected during {phase}",
+                    level="warning",
+                    payload_json=report,
+                    suppress_task_timeline_mirror=True,
+                )
+            if clean_result == "residual_kill_partial_failed":
+                self.record_event(
+                    db,
+                    execution_id=execution.id,
+                    event_type="agent_residual_kill_partial_failed",
+                    message=f"residual agent cleanup partially failed during {phase}",
+                    level="error",
+                    payload_json=report,
+                    suppress_task_timeline_mirror=True,
+                )
+            elif matched_count > 0:
+                self.record_event(
+                    db,
+                    execution_id=execution.id,
+                    event_type="agent_residual_killed",
+                    message=f"residual agents killed during {phase}",
+                    level="warning",
+                    payload_json=report,
+                    suppress_task_timeline_mirror=True,
+                )
+            self._record_agent_cleanup_events(db, trigger=trigger, execution=execution, report=report)
+            db.commit()
+            if strict and survivor_count > 0:
+                raise RuntimeError(f"agent cleanup {phase} left {survivor_count} survivor processes")
+            return report
+        except Exception as exc:
+            db.rollback()
+            report.update(
+                {
+                    "scan_finished_at": isoformat_local(now_local()),
+                    "matched_process_count": int(report.get("matched_process_count") or 0),
+                    "killed_process_count": int(report.get("killed_process_count") or 0),
+                    "survivor_process_count": int(report.get("survivor_process_count") or 0),
+                    "processes": report.get("processes") or [],
+                    "errors": [*list(report.get("errors") or []), {"error": str(exc)}],
+                    "force_kill_used": bool(report.get("force_kill_used")),
+                    "clean_result": "residual_kill_partial_failed",
+                }
+            )
+            try:
+                self.record_event(
+                    db,
+                    execution_id=execution.id,
+                    event_type=f"agent_cleanup_{'pre' if phase == 'pre_task_start' else 'post'}_task_failed",
+                    message=f"agent cleanup {phase} failed",
+                    level="error",
+                    payload_json=report,
+                    suppress_task_timeline_mirror=True,
+                )
+                self._record_task_mutation_event(
+                    db,
+                    event_type="task_agent_residual_force_killed",
+                    message=f"agent cleanup {phase} failed: {exc}",
+                    payload_json={
+                        "phase": phase,
+                        "matched_process_count": int(report.get("matched_process_count") or 0),
+                        "killed_process_count": int(report.get("killed_process_count") or 0),
+                        "survivor_process_count": int(report.get("survivor_process_count") or 0),
+                        "clean_result": "residual_kill_partial_failed",
+                        "owner_pod_id": execution.owner_pod_id,
+                    },
+                    level="error",
+                    trigger=trigger,
+                    execution=execution,
+                    source="agent_cleanup",
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.warning("failed to persist agent cleanup failure report task_id=%s execution_id=%s", trigger.id, execution.id, exc_info=True)
+            if strict:
+                raise RuntimeError(f"agent cleanup {phase} failed: {exc}") from exc
+            return report
 
     def _process_heartbeat_stale_after_seconds(self) -> int:
         cfg = get_config()
@@ -8961,6 +9357,14 @@ class ExecutionService:
         temp_config_path: str | None = None
         argv: list[str] = []
         try:
+            self._cleanup_residual_agents_for_task(
+                db,
+                trigger=trigger,
+                execution=execution,
+                phase="pre_task_start",
+                cleanup_reason="task_start_guard",
+                strict=True,
+            )
             argv, temp_config_path = self._build_dataflow_cli_argv(
                 plan=plan,
                 config_payload=config_payload,
@@ -9084,6 +9488,29 @@ class ExecutionService:
                 },
             )
         finally:
+            if execution is not None and trigger is not None:
+                try:
+                    db.refresh(execution)
+                    db.refresh(trigger)
+                except Exception:
+                    db.rollback()
+                if _canonical_task_status(execution.status) in {"succeeded", "failed", "cancelled"}:
+                    try:
+                        self._cleanup_residual_agents_for_task(
+                            db,
+                            trigger=trigger,
+                            execution=execution,
+                            phase="post_task_finish",
+                            cleanup_reason="task_terminal_guard",
+                            strict=False,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "post task agent cleanup failed task_id=%s execution_id=%s",
+                            trigger.id,
+                            execution.id,
+                            exc_info=True,
+                        )
             if temp_config_path:
                 try:
                     Path(temp_config_path).unlink(missing_ok=True)
@@ -9183,6 +9610,14 @@ class ExecutionService:
             get_run_index_service().sync_execution_run(db, execution)
             self._refresh_task_list_projection_for_execution(db, execution)
             db.commit()
+            self._cleanup_residual_agents_for_task(
+                db,
+                trigger=trigger,
+                execution=execution,
+                phase="pre_task_start",
+                cleanup_reason="task_start_guard",
+                strict=True,
+            )
             log_path = attach_log_file(abs_path(runtime_root / "run.log"))
             self.record_event(
                 db,
@@ -9321,6 +9756,29 @@ class ExecutionService:
             )
             raise
         finally:
+            if execution is not None and trigger is not None:
+                try:
+                    db.refresh(execution)
+                    db.refresh(trigger)
+                except Exception:
+                    db.rollback()
+                if _canonical_task_status(execution.status) in {"succeeded", "failed", "cancelled"}:
+                    try:
+                        self._cleanup_residual_agents_for_task(
+                            db,
+                            trigger=trigger,
+                            execution=execution,
+                            phase="post_task_finish",
+                            cleanup_reason="task_terminal_guard",
+                            strict=False,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "post task agent cleanup failed task_id=%s execution_id=%s",
+                            trigger.id if trigger is not None else "",
+                            execution.id if execution is not None else "",
+                            exc_info=True,
+                        )
             db.close()
 
 
