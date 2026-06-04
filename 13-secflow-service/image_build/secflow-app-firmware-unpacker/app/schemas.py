@@ -74,13 +74,17 @@ class TaskResponse(BaseModel):
     output_path: str
     status: str
     owner_id: Optional[str] = None
+    assigned_worker_id: Optional[str] = None
+    assigned_pod_name: Optional[str] = None
     dispatch_token: Optional[str] = None
     dispatch_owner_id: Optional[str] = None
     dispatch_claimed_at: Optional[str] = None
     dispatch_lease_expires_at: Optional[str] = None
+    assignment_generation: Optional[int] = None
     heartbeat_at: Optional[str] = None
     current_stage: Optional[str] = None
     lease_expires_at: Optional[str] = None
+    run_lease_expires_at: Optional[str] = None
     cancel_requested_at: Optional[str] = None
     last_progress_at: Optional[str] = None
     runner_pid: Optional[int] = None
@@ -115,6 +119,10 @@ class TaskResponse(BaseModel):
     latest_evolution_started_at: Optional[str] = None
     latest_evolution_completed_at: Optional[str] = None
     latest_evolution_final_skill_path: Optional[str] = None
+    takeover_count: Optional[int] = None
+    pre_cleanup_scan_id: Optional[str] = None
+    post_cleanup_scan_id: Optional[str] = None
+    last_cleanup_residual_count: Optional[int] = None
     created_at: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
@@ -449,12 +457,24 @@ class EvolutionSessionIndexResponse(BaseModel):
 
 class WorkerInstanceResponse(BaseModel):
     owner_id: str
+    worker_id: str
     hostname: Optional[str] = None
+    pod_name: Optional[str] = None
     pod_ip: Optional[str] = None
+    role: Optional[str] = None
+    advertised_capacity: int = 0
     started_at: Optional[str] = None
     last_heartbeat: Optional[str] = None
     is_alive: bool
     active_tasks: int
+    active_task_count: int = 0
+    running_task_id: Optional[str] = None
+    state: Optional[str] = None
+    drain_requested: bool = False
+    drain_reason: Optional[str] = None
+    startup_epoch: Optional[str] = None
+    last_cleanup_scan_at: Optional[str] = None
+    last_cleanup_summary_json: Optional[str] = None
 
 
 class ConcurrencyInfoResponse(BaseModel):
@@ -478,12 +498,31 @@ class ConcurrencyInfoResponse(BaseModel):
 
 class ClusterInfoResponse(BaseModel):
     this_owner: str
+    this_worker: Optional[WorkerInstanceResponse] = None
     total_workers: int
     alive_workers: int
+    total_capacity: int = 0
+    available_capacity: int = 0
+    queued_tasks: int = 0
     workers: List[WorkerInstanceResponse]
     task_counts: dict[str, int]
     total_tasks: int
     concurrency: ConcurrencyInfoResponse
+
+
+class CleanupScanResponse(BaseModel):
+    id: str
+    task_id: Optional[str] = None
+    worker_id: str
+    phase: str
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    suspected_process_count: int = 0
+    terminated_count: int = 0
+    killed_count: int = 0
+    remaining_count: int = 0
+    processes_json: Optional[str] = None
+    errors_json: Optional[str] = None
 
 
 class ConfigEntryResponse(BaseModel):

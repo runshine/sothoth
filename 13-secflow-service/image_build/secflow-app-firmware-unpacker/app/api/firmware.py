@@ -18,12 +18,13 @@ from sqlalchemy.orm import load_only
 from app.api.dependencies import ensure_project_access, get_current_subject
 from app.build_info import build_service_meta
 from app.exception import ForbiddenError, InternalError, NotFoundError, ValidationError
-from app.model import FirmwareEvolutionJob, FirmwareEvolutionRound, ServiceConfig, TaskStatus, UnpackTask, UnpackTaskEvent, get_db_session
+from app.model import FirmwareEvolutionJob, FirmwareEvolutionRound, ServiceConfig, TaskCleanupScan, TaskStatus, UnpackTask, UnpackTaskEvent, get_db_session
 from app.runtime import runtime_snapshot
 from app.schemas import (
     ActionResponse,
     BatchDeleteRequest,
     ClusterInfoResponse,
+    CleanupScanResponse,
     ConfigBatchUpdateItem,
     ConfigEntryResponse,
     ConfigListResponse,
@@ -73,6 +74,7 @@ from app.services.task_manager import (
     submit_unpack_task,
 )
 from app.services.worker import get_cluster_snapshot, get_worker_id
+from app.services.worker import request_worker_drain
 from app.tool_store import list_python_tools
 from app.tool_dispatcher import parse_tool_version, read_family_manifest, resolve_active_tool_target
 from app.time_utils import ensure_local, now_local
@@ -2636,6 +2638,91 @@ async def get_cluster_info(
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
     return get_cluster_snapshot()
+
+
+@router.get("/api/app/firmware-unpacker/workers/cluster-capacity", response_model=ClusterInfoResponse)
+@router.get("/api/app/firmware-unpacker/workers/cluster-capacity/summary", response_model=ClusterInfoResponse)
+@router.get("/api/app/firmware-unpacker/workers/slot-cluster", response_model=ClusterInfoResponse)
+async def get_worker_cluster_info(
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    return get_cluster_snapshot()
+
+
+@router.post("/api/app/firmware-unpacker/workers/{worker_id}/drain", response_model=ActionResponse)
+async def drain_worker(
+    worker_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    success = request_worker_drain(worker_id, reason="api_request")
+    if not success:
+        raise NotFoundError("worker", worker_id)
+    return {"message": "worker drain requested"}
+
+
+@router.post("/api/app/firmware-unpacker/workers/reconcile", response_model=ActionResponse)
+async def reconcile_workers(
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    snapshot = get_cluster_snapshot()
+    return {"message": f"reconciled {snapshot.get('total_workers', 0)} workers"}
+
+
+@router.get("/api/app/firmware-unpacker/tasks/{task_id}/worker-runtime")
+async def get_task_worker_runtime(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    task = _get_task_or_404(task_id)
+    cluster = get_cluster_snapshot()
+    worker_id = str(task.get("assigned_worker_id") or task.get("owner_id") or "").strip()
+    worker = next((item for item in cluster.get("workers", []) if str(item.get("worker_id") or "") == worker_id), None)
+    return {
+        "task_id": task_id,
+        "assigned_worker_id": worker_id or None,
+        "assigned_pod_name": task.get("assigned_pod_name"),
+        "dispatch_lease_expires_at": task.get("dispatch_lease_expires_at"),
+        "run_lease_expires_at": task.get("run_lease_expires_at"),
+        "worker": worker,
+    }
+
+
+@router.get("/api/app/firmware-unpacker/tasks/{task_id}/cleanup-scans", response_model=list[CleanupScanResponse])
+async def list_task_cleanup_scans(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    db = get_db_session()
+    try:
+        rows = (
+            db.query(TaskCleanupScan)
+            .filter(TaskCleanupScan.task_id == task_id)
+            .order_by(TaskCleanupScan.started_at.asc(), TaskCleanupScan.id.asc())
+            .all()
+        )
+        return [row.to_dict() for row in rows]
+    finally:
+        db.close()
+
+
+@router.get("/api/app/firmware-unpacker/tasks/{task_id}/cleanup-scans/{scan_id}", response_model=CleanupScanResponse)
+async def get_task_cleanup_scan(
+    task_id: str,
+    scan_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    db = get_db_session()
+    try:
+        row = (
+            db.query(TaskCleanupScan)
+            .filter(TaskCleanupScan.id == scan_id, TaskCleanupScan.task_id == task_id)
+            .first()
+        )
+        if row is None:
+            raise NotFoundError("cleanup scan", scan_id)
+        return row.to_dict()
+    finally:
+        db.close()
 
 
 @router.get("/api/app/firmware-unpacker/config", response_model=ConfigListResponse)

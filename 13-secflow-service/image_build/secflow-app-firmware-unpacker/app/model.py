@@ -21,7 +21,9 @@ Base = declarative_base()
 
 class TaskStatus(str, enum.Enum):
     PENDING = "pending"
+    ASSIGNED = "assigned"
     CLAIMED = "claimed"
+    AWAITING_TAKEOVER = "awaiting_takeover"
     RETRY_PREPARING = "retry_preparing"
     ARCHIVE_PENDING = "archive_pending"
     ARCHIVING = "archiving"
@@ -66,11 +68,15 @@ class UnpackTask(Base):
     owner_id = Column(String(96), nullable=True, index=True)
     dispatch_token = Column(String(64), nullable=True, index=True)
     dispatch_owner_id = Column(String(96), nullable=True, index=True)
+    assigned_worker_id = Column(String(96), nullable=True, index=True)
+    assigned_pod_name = Column(String(128), nullable=True, index=True)
     dispatch_claimed_at = Column(DateTime, nullable=True, index=True)
     dispatch_lease_expires_at = Column(DateTime, nullable=True, index=True)
+    assignment_generation = Column(Integer, nullable=False, default=0)
     heartbeat_at = Column(DateTime, nullable=True, index=True)
     current_stage = Column(String(64), nullable=True)
     lease_expires_at = Column(DateTime, nullable=True, index=True)
+    run_lease_expires_at = Column(DateTime, nullable=True, index=True)
     cancel_requested_at = Column(DateTime, nullable=True)
     last_progress_at = Column(DateTime, nullable=True)
     runner_pid = Column(Integer, nullable=True, index=True)
@@ -107,6 +113,10 @@ class UnpackTask(Base):
     latest_evolution_completed_at = Column(DateTime, nullable=True)
     latest_evolution_final_skill_path = Column(String(512), nullable=True)
     llm_binding_snapshot = Column(Text, nullable=True)
+    takeover_count = Column(Integer, nullable=False, default=0)
+    pre_cleanup_scan_id = Column(String(32), nullable=True, index=True)
+    post_cleanup_scan_id = Column(String(32), nullable=True, index=True)
+    last_cleanup_residual_count = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=now_local)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
@@ -136,11 +146,15 @@ class UnpackTask(Base):
             "owner_id": self.owner_id,
             "dispatch_token": self.dispatch_token,
             "dispatch_owner_id": self.dispatch_owner_id,
+            "assigned_worker_id": self.assigned_worker_id,
+            "assigned_pod_name": self.assigned_pod_name,
             "dispatch_claimed_at": isoformat_local(self.dispatch_claimed_at),
             "dispatch_lease_expires_at": isoformat_local(self.dispatch_lease_expires_at),
+            "assignment_generation": self.assignment_generation,
             "heartbeat_at": isoformat_local(self.heartbeat_at),
             "current_stage": self.current_stage,
             "lease_expires_at": isoformat_local(self.lease_expires_at),
+            "run_lease_expires_at": isoformat_local(self.run_lease_expires_at),
             "cancel_requested_at": isoformat_local(self.cancel_requested_at),
             "last_progress_at": isoformat_local(self.last_progress_at),
             "runner_pid": self.runner_pid,
@@ -175,6 +189,10 @@ class UnpackTask(Base):
             "latest_evolution_started_at": isoformat_local(self.latest_evolution_started_at),
             "latest_evolution_completed_at": isoformat_local(self.latest_evolution_completed_at),
             "latest_evolution_final_skill_path": self.latest_evolution_final_skill_path,
+            "takeover_count": self.takeover_count,
+            "pre_cleanup_scan_id": self.pre_cleanup_scan_id,
+            "post_cleanup_scan_id": self.post_cleanup_scan_id,
+            "last_cleanup_residual_count": self.last_cleanup_residual_count,
             "created_at": isoformat_local(self.created_at),
             "started_at": isoformat_local(self.started_at),
             "completed_at": isoformat_local(self.completed_at),
@@ -186,21 +204,76 @@ class WorkerInstance(Base):
 
     worker_id = Column(String(96), primary_key=True)
     hostname = Column(String(128), nullable=True)
+    pod_name = Column(String(128), nullable=True, index=True)
     pod_ip = Column(String(64), nullable=True)
+    role = Column(String(32), nullable=True, index=True)
+    advertised_capacity = Column(Integer, default=1)
     started_at = Column(DateTime, default=now_local)
     last_heartbeat = Column(DateTime, default=now_local)
     is_alive = Column(Boolean, default=True)
     active_tasks = Column(Integer, default=0)
+    running_task_id = Column(String(32), nullable=True, index=True)
+    state = Column(String(32), nullable=False, default="starting", index=True)
+    drain_requested = Column(Boolean, nullable=False, default=False)
+    drain_reason = Column(String(255), nullable=True)
+    startup_epoch = Column(String(64), nullable=True, index=True)
+    last_cleanup_scan_at = Column(DateTime, nullable=True)
+    last_cleanup_summary_json = Column(Text, nullable=True)
 
     def to_dict(self) -> dict:
         return {
             "owner_id": self.worker_id,
+            "worker_id": self.worker_id,
             "hostname": self.hostname,
+            "pod_name": self.pod_name,
             "pod_ip": self.pod_ip,
+            "role": self.role,
+            "advertised_capacity": self.advertised_capacity,
             "started_at": isoformat_local(self.started_at),
             "last_heartbeat": isoformat_local(self.last_heartbeat),
             "is_alive": self.is_alive,
             "active_tasks": self.active_tasks,
+            "active_task_count": self.active_tasks,
+            "running_task_id": self.running_task_id,
+            "state": self.state,
+            "drain_requested": bool(self.drain_requested),
+            "drain_reason": self.drain_reason,
+            "startup_epoch": self.startup_epoch,
+            "last_cleanup_scan_at": isoformat_local(self.last_cleanup_scan_at),
+            "last_cleanup_summary_json": self.last_cleanup_summary_json,
+        }
+
+
+class TaskCleanupScan(Base):
+    __tablename__ = "secflow_app_firmware_unpacker_task_cleanup_scans"
+
+    id = Column(String(32), primary_key=True)
+    task_id = Column(String(32), nullable=True, index=True)
+    worker_id = Column(String(96), nullable=False, index=True)
+    phase = Column(String(32), nullable=False, index=True)
+    started_at = Column(DateTime, default=now_local, nullable=False, index=True)
+    completed_at = Column(DateTime, nullable=True)
+    suspected_process_count = Column(Integer, nullable=False, default=0)
+    terminated_count = Column(Integer, nullable=False, default=0)
+    killed_count = Column(Integer, nullable=False, default=0)
+    remaining_count = Column(Integer, nullable=False, default=0)
+    processes_json = Column(Text, nullable=True)
+    errors_json = Column(Text, nullable=True)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "worker_id": self.worker_id,
+            "phase": self.phase,
+            "started_at": isoformat_local(self.started_at),
+            "completed_at": isoformat_local(self.completed_at),
+            "suspected_process_count": self.suspected_process_count,
+            "terminated_count": self.terminated_count,
+            "killed_count": self.killed_count,
+            "remaining_count": self.remaining_count,
+            "processes_json": self.processes_json,
+            "errors_json": self.errors_json,
         }
 
 
@@ -543,6 +616,7 @@ def apply_table_prefix_if_needed() -> None:
     SkillGenerationJob.__table__.name = f"{prefix}skill_generation_jobs"
     FirmwareEvolutionJob.__table__.name = f"{prefix}evolution_jobs"
     FirmwareEvolutionRound.__table__.name = f"{prefix}evolution_rounds"
+    TaskCleanupScan.__table__.name = f"{prefix}task_cleanup_scans"
 
 
 def init_database() -> None:
@@ -550,6 +624,7 @@ def init_database() -> None:
     Base.metadata.create_all(bind=get_engine())
     _ensure_unpack_task_columns()
     _ensure_evolution_job_columns()
+    _ensure_worker_instance_columns()
     _seed_default_configs()
 
 
@@ -572,11 +647,15 @@ def _ensure_unpack_task_columns() -> None:
         "owner_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN owner_id VARCHAR(96)",
         "dispatch_token": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN dispatch_token VARCHAR(64)",
         "dispatch_owner_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN dispatch_owner_id VARCHAR(96)",
+        "assigned_worker_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN assigned_worker_id VARCHAR(96)",
+        "assigned_pod_name": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN assigned_pod_name VARCHAR(128)",
         "dispatch_claimed_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN dispatch_claimed_at DATETIME",
         "dispatch_lease_expires_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN dispatch_lease_expires_at DATETIME",
+        "assignment_generation": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN assignment_generation INTEGER DEFAULT 0",
         "heartbeat_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN heartbeat_at DATETIME",
         "current_stage": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN current_stage VARCHAR(64)",
         "lease_expires_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN lease_expires_at DATETIME",
+        "run_lease_expires_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN run_lease_expires_at DATETIME",
         "cancel_requested_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN cancel_requested_at DATETIME",
         "last_progress_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN last_progress_at DATETIME",
         "runner_pid": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN runner_pid INTEGER",
@@ -609,6 +688,10 @@ def _ensure_unpack_task_columns() -> None:
         "latest_evolution_completed_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN latest_evolution_completed_at DATETIME",
         "latest_evolution_final_skill_path": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN latest_evolution_final_skill_path VARCHAR(512)",
         "llm_binding_snapshot": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN llm_binding_snapshot TEXT",
+        "takeover_count": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN takeover_count INTEGER DEFAULT 0",
+        "pre_cleanup_scan_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN pre_cleanup_scan_id VARCHAR(32)",
+        "post_cleanup_scan_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN post_cleanup_scan_id VARCHAR(32)",
+        "last_cleanup_residual_count": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN last_cleanup_residual_count INTEGER DEFAULT 0",
     }
 
     with engine.begin() as conn:
@@ -642,8 +725,39 @@ def _ensure_unpack_task_columns() -> None:
         index_statements.append(
             f"CREATE INDEX ix_fu_tasks_dispatch_status_created_id ON {UnpackTask.__table__.name} (status, dispatch_claimed_at, id)"
         )
+    if "ix_fu_tasks_assigned_worker_status_id" not in indexes:
+        index_statements.append(
+            f"CREATE INDEX ix_fu_tasks_assigned_worker_status_id ON {UnpackTask.__table__.name} (assigned_worker_id, status, id)"
+        )
     with engine.begin() as conn:
         for statement in index_statements:
+            conn.execute(text(statement))
+
+
+def _ensure_worker_instance_columns() -> None:
+    engine = get_engine()
+    inspector = inspect(engine)
+    try:
+        columns = {column["name"] for column in inspector.get_columns(WorkerInstance.__table__.name)}
+    except Exception:
+        return
+
+    statements = {
+        "pod_name": f"ALTER TABLE {WorkerInstance.__table__.name} ADD COLUMN pod_name VARCHAR(128)",
+        "role": f"ALTER TABLE {WorkerInstance.__table__.name} ADD COLUMN role VARCHAR(32)",
+        "advertised_capacity": f"ALTER TABLE {WorkerInstance.__table__.name} ADD COLUMN advertised_capacity INTEGER DEFAULT 1",
+        "running_task_id": f"ALTER TABLE {WorkerInstance.__table__.name} ADD COLUMN running_task_id VARCHAR(32)",
+        "state": f"ALTER TABLE {WorkerInstance.__table__.name} ADD COLUMN state VARCHAR(32) DEFAULT 'starting'",
+        "drain_requested": f"ALTER TABLE {WorkerInstance.__table__.name} ADD COLUMN drain_requested BOOLEAN DEFAULT 0",
+        "drain_reason": f"ALTER TABLE {WorkerInstance.__table__.name} ADD COLUMN drain_reason VARCHAR(255)",
+        "startup_epoch": f"ALTER TABLE {WorkerInstance.__table__.name} ADD COLUMN startup_epoch VARCHAR(64)",
+        "last_cleanup_scan_at": f"ALTER TABLE {WorkerInstance.__table__.name} ADD COLUMN last_cleanup_scan_at DATETIME",
+        "last_cleanup_summary_json": f"ALTER TABLE {WorkerInstance.__table__.name} ADD COLUMN last_cleanup_summary_json TEXT",
+    }
+    with engine.begin() as conn:
+        for column_name, statement in statements.items():
+            if column_name in columns:
+                continue
             conn.execute(text(statement))
 
 

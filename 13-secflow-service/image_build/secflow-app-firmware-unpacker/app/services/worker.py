@@ -7,12 +7,13 @@ import os
 import socket
 import threading
 import time
+import json
 from datetime import timedelta
 from typing import Optional
 
 from sqlalchemy import func, or_
 
-from app.config import get_config
+from app.config import get_config, get_runtime_roles
 from app.services.observability import record_maintenance_operation, refresh_cluster_state_metrics
 from app.time_utils import now_local
 
@@ -31,6 +32,62 @@ _active_lock = threading.Lock()
 _background_loop_interval: Optional[int] = None
 _cleanup_loop_heartbeat_at: float = 0.0
 _evolution_loop_heartbeat_at: float = 0.0
+
+
+def _runtime_role() -> str:
+    roles = get_runtime_roles()
+    if "dispatcher" in roles:
+        return "dispatcher"
+    if "scheduler" in roles:
+        return "scheduler"
+    if "cleanup-worker" in roles:
+        return "cleanup-worker"
+    if "api" in roles:
+        return "api"
+    return "all"
+
+
+def _pod_name() -> str:
+    return (os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or socket.gethostname()).strip()
+
+
+def _startup_epoch() -> str:
+    return str(int(time.time()))
+
+
+def update_worker_runtime_state(
+    *,
+    state: Optional[str] = None,
+    running_task_id: Optional[str] = None,
+    drain_requested: Optional[bool] = None,
+    drain_reason: Optional[str] = None,
+    cleanup_summary: Optional[dict] = None,
+) -> None:
+    from app.model import WorkerInstance, get_db_session
+
+    owner_id = get_worker_id()
+    db = get_db_session()
+    try:
+        row = db.query(WorkerInstance).filter(WorkerInstance.worker_id == owner_id).first()
+        if row is None:
+            return
+        row.last_heartbeat = now_local()
+        row.is_alive = True
+        if state is not None:
+            row.state = state
+        if running_task_id is not None:
+            row.running_task_id = running_task_id or None
+            row.active_tasks = 1 if running_task_id else 0
+        if drain_requested is not None:
+            row.drain_requested = bool(drain_requested)
+        if drain_reason is not None:
+            row.drain_reason = drain_reason or None
+        if cleanup_summary is not None:
+            row.last_cleanup_scan_at = now_local()
+            row.last_cleanup_summary_json = json.dumps(cleanup_summary, ensure_ascii=False)
+        db.commit()
+    finally:
+        db.close()
 
 
 def get_worker_id() -> str:
@@ -115,6 +172,8 @@ def register_worker() -> None:
     from app.model import WorkerInstance, get_db_session
 
     owner_id = get_worker_id()
+    role = _runtime_role()
+    pod_name = _pod_name()
     db = get_db_session()
     try:
         row = db.query(WorkerInstance).filter(WorkerInstance.worker_id == owner_id).first()
@@ -122,19 +181,34 @@ def register_worker() -> None:
             row = WorkerInstance(
                 worker_id=owner_id,
                 hostname=socket.gethostname(),
+                pod_name=pod_name,
                 pod_ip=os.environ.get("POD_IP", ""),
+                role=role,
+                advertised_capacity=1 if role == "dispatcher" else 0,
                 started_at=now_local(),
                 last_heartbeat=now_local(),
                 is_alive=True,
                 active_tasks=0,
+                running_task_id=None,
+                state="starting" if role == "dispatcher" else "idle",
+                drain_requested=False,
+                startup_epoch=_startup_epoch(),
             )
             db.add(row)
         else:
             row.hostname = socket.gethostname()
+            row.pod_name = pod_name
             row.pod_ip = os.environ.get("POD_IP", "")
+            row.role = role
+            row.advertised_capacity = 1 if role == "dispatcher" else 0
             row.is_alive = True
             row.last_heartbeat = now_local()
             row.active_tasks = 0
+            row.running_task_id = None
+            row.state = "starting" if role == "dispatcher" else "idle"
+            row.drain_requested = False
+            row.drain_reason = None
+            row.startup_epoch = _startup_epoch()
         db.commit()
         logger.info("worker registered: %s", owner_id)
     finally:
@@ -143,14 +217,25 @@ def register_worker() -> None:
 
 def heartbeat() -> None:
     from app.model import WorkerInstance, get_db_session
+    from app.services.task_manager import get_local_active_task_count, get_local_running_task_id
 
     owner_id = get_worker_id()
+    active = max(0, int(get_local_active_task_count()))
+    running_task_id = get_local_running_task_id()
     db = get_db_session()
     try:
         row = db.query(WorkerInstance).filter(WorkerInstance.worker_id == owner_id).first()
         if row is not None:
             row.last_heartbeat = now_local()
             row.is_alive = True
+            row.active_tasks = active
+            row.running_task_id = running_task_id
+            if row.drain_requested:
+                row.state = "draining"
+            elif active > 0:
+                row.state = "busy"
+            elif row.state in {"starting", "busy", "draining"}:
+                row.state = "idle"
             db.commit()
     finally:
         db.close()
@@ -185,6 +270,8 @@ def deregister_worker() -> None:
         if row is not None:
             row.is_alive = False
             row.active_tasks = 0
+            row.running_task_id = None
+            row.state = "dead"
             row.last_heartbeat = now_local()
             db.commit()
         logger.info("worker deregistered: %s", owner_id)
@@ -438,7 +525,9 @@ def get_cluster_snapshot() -> dict:
         all_tasks = db.query(UnpackTask).all()
         task_counts = {
             TaskStatus.PENDING.value: 0,
+            TaskStatus.ASSIGNED.value: 0,
             TaskStatus.CLAIMED.value: 0,
+            TaskStatus.AWAITING_TAKEOVER.value: 0,
             TaskStatus.RETRY_PREPARING.value: 0,
             TaskStatus.ARCHIVE_PENDING.value: 0,
             TaskStatus.ARCHIVING.value: 0,
@@ -450,11 +539,30 @@ def get_cluster_snapshot() -> dict:
         }
         for task in all_tasks:
             task_counts[task.status] = int(task_counts.get(task.status, 0)) + 1
+        alive_workers = [worker for worker in workers if worker.is_alive and worker.state != "dead"]
+        total_capacity = sum(max(0, int(worker.advertised_capacity or 0)) for worker in alive_workers)
+        available_capacity = sum(
+            1
+            for worker in alive_workers
+            if str(worker.role or "") == "dispatcher"
+            and not bool(worker.drain_requested)
+            and int(worker.active_tasks or 0) <= 0
+            and str(worker.state or "") in {"idle", "starting"}
+        )
 
         return {
             "this_owner": get_worker_id(),
+            "this_worker": next((worker.to_dict() for worker in workers if worker.worker_id == get_worker_id()), None),
             "total_workers": len(workers),
-            "alive_workers": sum(1 for worker in workers if worker.is_alive),
+            "alive_workers": len(alive_workers),
+            "total_capacity": total_capacity,
+            "available_capacity": available_capacity,
+            "queued_tasks": int(
+                task_counts.get(TaskStatus.PENDING.value, 0)
+                + task_counts.get(TaskStatus.ASSIGNED.value, 0)
+                + task_counts.get(TaskStatus.AWAITING_TAKEOVER.value, 0)
+                + task_counts.get(TaskStatus.RETRY_PREPARING.value, 0)
+            ),
             "workers": [worker.to_dict() for worker in workers],
             "task_counts": task_counts,
             "total_tasks": len(all_tasks),
@@ -757,3 +865,21 @@ def stop_all_loops() -> None:
         stop_cleanup_loop()
     if _evolution_thread and _evolution_thread.is_alive():
         stop_evolution_loop()
+
+
+def request_worker_drain(worker_id: str, reason: Optional[str] = None) -> bool:
+    from app.model import WorkerInstance, get_db_session
+
+    db = get_db_session()
+    try:
+        row = db.query(WorkerInstance).filter(WorkerInstance.worker_id == worker_id).first()
+        if row is None:
+            return False
+        row.drain_requested = True
+        row.drain_reason = str(reason or "manual_drain")
+        row.state = "draining"
+        row.last_heartbeat = now_local()
+        db.commit()
+        return True
+    finally:
+        db.close()

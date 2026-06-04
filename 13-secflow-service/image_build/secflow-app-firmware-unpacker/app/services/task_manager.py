@@ -22,6 +22,7 @@ from typing import Any, Callable, Dict, Optional
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import get_config
+from app.services.agent_sanitizer import run_agent_cleanup
 from app.services.observability import (
     record_claim_result,
     record_cleanup_job,
@@ -48,6 +49,8 @@ _executor: Optional[ThreadPoolExecutor] = None
 _executor_lock = threading.Lock()
 _dispatcher_thread: Optional[threading.Thread] = None
 _dispatcher_stop = threading.Event()
+_scheduler_thread: Optional[threading.Thread] = None
+_scheduler_stop = threading.Event()
 _futures: Dict[str, Future] = {}
 _futures_lock = threading.Lock()
 _active_cancel_hooks: Dict[str, object] = {}
@@ -216,23 +219,15 @@ def get_concurrency_snapshot() -> dict[str, int | str | bool | None]:
 
 
 def _runtime_max_concurrent() -> int:
-    snapshot = get_concurrency_snapshot()
-    return int(snapshot["effective_max_concurrent"])
+    return 1
 
 
 def _runtime_max_concurrent_for_logs() -> str:
-    snapshot = get_concurrency_snapshot()
-    source = "resource" if snapshot["resource_based"] else "fallback"
-    return (
-        f"mode={snapshot['mode']} "
-        f"effective={snapshot['effective_max_concurrent']} "
-        f"executor={snapshot['executor_capacity']} "
-        f"source={source}"
-    )
+    return "mode=single-slot effective=1 executor=1 source=dispatcher"
 
 
 def _dispatch_interval_seconds() -> int:
-    return max(1, int(get_config().worker.claim_interval_seconds))
+    return max(1, int(get_config().worker.dispatcher_poll_seconds or get_config().worker.claim_interval_seconds))
 
 
 def _claim_batch_size() -> int:
@@ -310,7 +305,7 @@ def _run_db_retry(
 
 def _task_lease_seconds() -> int:
     return max(
-        15,
+        30,
         _runtime_config_int(
             "task_lease_seconds",
             default=int(get_config().worker.task_lease_seconds),
@@ -719,6 +714,27 @@ def _trigger_cancel_hook(task_id: str) -> None:
 def get_local_active_task_count() -> int:
     # Keep manual evolution within the same worker capacity budget as unpack tasks.
     return _active_runner_count() + _local_running_evolution_job_count()
+
+
+def get_local_running_task_id() -> str | None:
+    from app.model import TaskStatus, UnpackTask, get_db_session
+    from app.services.worker import get_worker_id
+
+    owner_id = get_worker_id()
+    db = get_db_session()
+    try:
+        row = (
+            db.query(UnpackTask.id)
+            .filter(
+                UnpackTask.assigned_worker_id == owner_id,
+                UnpackTask.status.in_([TaskStatus.ASSIGNED.value, TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value]),
+            )
+            .order_by(UnpackTask.created_at.asc(), UnpackTask.id.asc())
+            .first()
+        )
+        return str(row.id) if row else None
+    finally:
+        db.close()
 
 
 def recover_stale_owned_tasks() -> None:
@@ -1340,6 +1356,8 @@ def _update_task_progress_for_owner(
         previous_stage = str(task.current_stage or "").strip() or None
         task.runner_heartbeat_at = now_local()
         task.heartbeat_at = task.runner_heartbeat_at
+        task.dispatch_lease_expires_at = task.runner_heartbeat_at + timedelta(seconds=_task_lease_seconds())
+        task.run_lease_expires_at = task.runner_heartbeat_at + timedelta(seconds=_task_lease_seconds())
         task.last_progress_at = now_local()
         if stage:
             task.current_stage = stage
@@ -1369,11 +1387,12 @@ def _finalize_orphaned_task(task_id: str, reason: str, *, owner_lost: bool = Fal
         task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
         if task is None or task.status not in (
             TaskStatus.CLAIMED.value,
+            TaskStatus.ASSIGNED.value,
             TaskStatus.RUNNING.value,
             TaskStatus.CANCELLING.value,
         ):
             return
-        if task.status == TaskStatus.CLAIMED.value:
+        if task.status in (TaskStatus.CLAIMED.value, TaskStatus.ASSIGNED.value):
             task.status = TaskStatus.PENDING.value
             task.current_stage = "pending"
             task.result_status = None
@@ -1398,9 +1417,12 @@ def _finalize_orphaned_task(task_id: str, reason: str, *, owner_lost: bool = Fal
         task.owner_id = None
         task.dispatch_owner_id = None
         task.dispatch_token = None
+        task.assigned_worker_id = None
+        task.assigned_pod_name = None
         task.dispatch_claimed_at = None
         task.dispatch_lease_expires_at = None
         task.lease_expires_at = None
+        task.run_lease_expires_at = None
         task.runner_pid = None
         task.runner_started_at = None
         task.runner_heartbeat_at = None
@@ -2728,10 +2750,14 @@ def _reset_claim(task_id: str) -> None:
                     UnpackTask.owner_id: None,
                     UnpackTask.dispatch_owner_id: None,
                     UnpackTask.dispatch_token: None,
+                    UnpackTask.assigned_worker_id: None,
+                    UnpackTask.assigned_pod_name: None,
                     UnpackTask.dispatch_claimed_at: None,
                     UnpackTask.dispatch_lease_expires_at: None,
+                    UnpackTask.assignment_generation: 0,
                     UnpackTask.current_stage: "pending",
                     UnpackTask.lease_expires_at: None,
+                    UnpackTask.run_lease_expires_at: None,
                     UnpackTask.cancel_requested_at: None,
                     UnpackTask.heartbeat_at: None,
                     UnpackTask.runner_pid: None,
@@ -2751,9 +2777,110 @@ def _reset_claim(task_id: str) -> None:
         db.close()
 
 
+def _assign_task_to_worker(task_id: str, worker_id: str, pod_name: str) -> bool:
+    from app.model import TaskStatus, UnpackTask, get_db_session
+
+    db = get_db_session()
+    try:
+        now = now_local()
+        updated = (
+            db.query(UnpackTask)
+            .filter(
+                UnpackTask.id == task_id,
+                UnpackTask.status.in_(
+                    [
+                        TaskStatus.PENDING.value,
+                        TaskStatus.AWAITING_TAKEOVER.value,
+                        TaskStatus.RETRY_PREPARING.value,
+                    ]
+                ),
+            )
+            .update(
+                {
+                    UnpackTask.status: TaskStatus.ASSIGNED.value,
+                    UnpackTask.owner_id: worker_id,
+                    UnpackTask.dispatch_owner_id: worker_id,
+                    UnpackTask.assigned_worker_id: worker_id,
+                    UnpackTask.assigned_pod_name: pod_name,
+                    UnpackTask.dispatch_token: uuid.uuid4().hex,
+                    UnpackTask.dispatch_claimed_at: now,
+                    UnpackTask.dispatch_lease_expires_at: now + timedelta(seconds=_task_lease_seconds()),
+                    UnpackTask.assignment_generation: UnpackTask.assignment_generation + 1,
+                    UnpackTask.current_stage: "queued",
+                    UnpackTask.heartbeat_at: now,
+                    UnpackTask.last_progress_at: now,
+                    UnpackTask.runner_pid: None,
+                    UnpackTask.runner_started_at: None,
+                    UnpackTask.runner_heartbeat_at: None,
+                    UnpackTask.run_token: None,
+                    UnpackTask.run_lease_expires_at: None,
+                    UnpackTask.cancel_grace_deadline: None,
+                    UnpackTask.cancel_force_deadline: None,
+                    UnpackTask.completed_at: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return bool(updated)
+    finally:
+        db.close()
+
+
+def _assign_pending_tasks(limit: int) -> list[str]:
+    from app.model import TaskStatus, UnpackTask, WorkerInstance, get_db_session
+
+    db = get_db_session()
+    assigned_ids: list[str] = []
+    try:
+        workers = (
+            db.query(WorkerInstance)
+            .filter(
+                WorkerInstance.role == "dispatcher",
+                WorkerInstance.is_alive.is_(True),
+                WorkerInstance.drain_requested.is_(False),
+                WorkerInstance.active_tasks <= 0,
+            )
+            .order_by(WorkerInstance.last_heartbeat.asc(), WorkerInstance.started_at.asc())
+            .all()
+        )
+        if not workers:
+            return []
+        tasks = (
+            db.query(UnpackTask)
+            .filter(
+                UnpackTask.status.in_(
+                    [
+                        TaskStatus.AWAITING_TAKEOVER.value,
+                        TaskStatus.RETRY_PREPARING.value,
+                        TaskStatus.PENDING.value,
+                    ]
+                )
+            )
+            .order_by(UnpackTask.created_at.asc(), UnpackTask.id.asc())
+            .limit(max(1, limit))
+            .all()
+        )
+        worker_index = 0
+        for task in tasks:
+            if worker_index >= len(workers):
+                break
+            worker = workers[worker_index]
+            if _assign_task_to_worker(str(task.id), str(worker.worker_id), str(worker.pod_name or worker.hostname or worker.worker_id)):
+                assigned_ids.append(str(task.id))
+                worker.active_tasks = 1
+                worker.running_task_id = str(task.id)
+                worker.state = "busy"
+                worker_index += 1
+        db.commit()
+    finally:
+        db.close()
+    return assigned_ids
+
+
 def _launch_task_runner(task_id: str) -> None:
     from app.model import TaskStatus, UnpackTask, get_db_session
-    from app.services.worker import get_worker_id, refresh_worker_active_tasks
+    from app.services.worker import get_worker_id, refresh_worker_active_tasks, update_worker_runtime_state
 
     owner_id = get_worker_id()
     db = get_db_session()
@@ -2762,8 +2889,8 @@ def _launch_task_runner(task_id: str) -> None:
             db.query(UnpackTask)
             .filter(
                 UnpackTask.id == task_id,
-                UnpackTask.owner_id == owner_id,
-                UnpackTask.status == TaskStatus.CLAIMED.value,
+                UnpackTask.assigned_worker_id == owner_id,
+                UnpackTask.status.in_([TaskStatus.ASSIGNED.value, TaskStatus.CLAIMED.value]),
             )
             .first()
         )
@@ -2771,6 +2898,22 @@ def _launch_task_runner(task_id: str) -> None:
             raise RuntimeError(f"任务未被当前 owner 正确认领: {task_id}")
         dispatch_token = task.dispatch_token
         run_token = uuid.uuid4().hex
+        if get_config().worker.agent_pre_cleanup_enabled:
+            cleanup_summary = run_agent_cleanup(worker_id=owner_id, phase="pre-run", task_id=task_id)
+            update_worker_runtime_state(cleanup_summary=cleanup_summary)
+            if int(cleanup_summary.get("errors") and len(cleanup_summary["errors"]) or 0) > 0:
+                _reset_claim(task_id)
+                _record_task_event_from_row(
+                    task,
+                    event_type="agent_cleanup_failed",
+                    summary="任务启动前智能体清理失败，任务重新排队",
+                    stage_key="cleanup",
+                    status=TaskStatus.RETRY_PREPARING.value,
+                    detail=cleanup_summary,
+                    owner_id=owner_id,
+                    created_by="task_manager",
+                )
+                raise RuntimeError("pre-run cleanup failed")
     finally:
         db.close()
 
@@ -2802,19 +2945,20 @@ def _launch_task_runner(task_id: str) -> None:
             db.query(UnpackTask)
             .filter(
                 UnpackTask.id == task_id,
-                UnpackTask.owner_id == owner_id,
+                UnpackTask.assigned_worker_id == owner_id,
                 UnpackTask.dispatch_token == dispatch_token,
-                UnpackTask.status == TaskStatus.CLAIMED.value,
+                UnpackTask.status.in_([TaskStatus.ASSIGNED.value, TaskStatus.CLAIMED.value]),
             )
             .update(
                 {
                     UnpackTask.status: TaskStatus.RUNNING.value,
-                    UnpackTask.dispatch_lease_expires_at: None,
+                    UnpackTask.dispatch_lease_expires_at: now + timedelta(seconds=_task_lease_seconds()),
                     UnpackTask.runner_pid: proc.pid,
                     UnpackTask.runner_started_at: now,
                     UnpackTask.runner_heartbeat_at: now,
                     UnpackTask.heartbeat_at: now,
                     UnpackTask.lease_expires_at: None,
+                    UnpackTask.run_lease_expires_at: now + timedelta(seconds=_task_lease_seconds()),
                     UnpackTask.last_progress_at: now,
                     UnpackTask.run_token: run_token,
                     UnpackTask.started_at: now,
@@ -2847,6 +2991,7 @@ def _launch_task_runner(task_id: str) -> None:
             )
     finally:
         db.close()
+    update_worker_runtime_state(state="busy", running_task_id=task_id)
     refresh_worker_active_tasks()
 
 
@@ -3012,6 +3157,39 @@ def _schedule_pending_tasks() -> None:
         except Exception:
             _reset_claim(task_id)
             raise
+
+
+def _scheduler_assign_tasks() -> None:
+    available_slots = max(0, _claim_batch_size())
+    if available_slots <= 0:
+        return
+    _assign_pending_tasks(available_slots)
+
+
+def _dispatcher_start_assigned_task() -> None:
+    from app.model import TaskStatus, UnpackTask, get_db_session
+    from app.services.worker import get_worker_id
+
+    if get_local_active_task_count() > 0:
+        return
+    owner_id = get_worker_id()
+    db = get_db_session()
+    try:
+        task = (
+            db.query(UnpackTask)
+            .filter(
+                UnpackTask.assigned_worker_id == owner_id,
+                UnpackTask.status == TaskStatus.ASSIGNED.value,
+            )
+            .order_by(UnpackTask.dispatch_claimed_at.asc(), UnpackTask.created_at.asc())
+            .first()
+        )
+        task_id = str(task.id) if task is not None else ""
+    finally:
+        db.close()
+    if not task_id:
+        return
+    _launch_task_runner(task_id)
 
 
 def _fail_retry_preparing_task(task_id: str, error_message: str) -> None:
@@ -4832,15 +5010,7 @@ def _update_task_error(task_id: str, error: str, *, run_token: Optional[str] = N
 def _dispatch_loop() -> None:
     while not _dispatcher_stop.wait(timeout=_dispatch_interval_seconds()):
         try:
-            recovered_retry_preparing = _recover_stuck_retry_preparing_tasks()
-            if recovered_retry_preparing:
-                logger.warning(
-                    "recovered stuck retry_preparing tasks: count=%s timeout_seconds=%s",
-                    recovered_retry_preparing,
-                    RETRY_PREPARING_TIMEOUT_SECONDS,
-                )
-            recover_orphaned_tasks()
-            _schedule_pending_tasks()
+            _dispatcher_start_assigned_task()
             processed_evolution_jobs = process_evolution_jobs(max(1, _claim_batch_size()))
             if processed_evolution_jobs:
                 logger.info(
@@ -4851,6 +5021,22 @@ def _dispatch_loop() -> None:
                 )
         except Exception as exc:
             logger.warning("task dispatch warning: %s", exc)
+
+
+def _scheduler_loop() -> None:
+    while not _scheduler_stop.wait(timeout=_dispatch_interval_seconds()):
+        try:
+            recovered_retry_preparing = _recover_stuck_retry_preparing_tasks()
+            if recovered_retry_preparing:
+                logger.warning(
+                    "recovered stuck retry_preparing tasks: count=%s timeout_seconds=%s",
+                    recovered_retry_preparing,
+                    RETRY_PREPARING_TIMEOUT_SECONDS,
+                )
+            recover_orphaned_tasks()
+            _scheduler_assign_tasks()
+        except Exception as exc:
+            logger.warning("task scheduler warning: %s", exc)
 
 
 def start() -> None:
@@ -4873,6 +5059,25 @@ def start() -> None:
     logger.info("task dispatcher started")
 
 
+def start_scheduler() -> None:
+    global _scheduler_thread
+
+    if _scheduler_thread and _scheduler_thread.is_alive():
+        return
+
+    get_executor()
+    recover_stale_owned_tasks()
+    recover_orphaned_tasks()
+    _scheduler_stop.clear()
+    _scheduler_thread = threading.Thread(
+        target=_scheduler_loop,
+        name="fw-task-scheduler",
+        daemon=True,
+    )
+    _scheduler_thread.start()
+    logger.info("task scheduler started")
+
+
 def stop() -> None:
     global _dispatcher_thread
 
@@ -4882,6 +5087,16 @@ def stop() -> None:
     _dispatcher_thread = None
     shutdown()
     logger.info("task dispatcher stopped")
+
+
+def stop_scheduler() -> None:
+    global _scheduler_thread
+
+    _scheduler_stop.set()
+    if _scheduler_thread and _scheduler_thread.is_alive():
+        _scheduler_thread.join(timeout=5)
+    _scheduler_thread = None
+    logger.info("task scheduler stopped")
 
 
 def shutdown() -> None:

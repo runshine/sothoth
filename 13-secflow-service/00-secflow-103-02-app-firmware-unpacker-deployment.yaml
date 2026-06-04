@@ -141,7 +141,11 @@ metadata:
   name: secflow-app-firmware-unpacker-dispatcher
   namespace: secflow-ns
 spec:
-  replicas: 1
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
   selector:
     matchLabels:
       name: secflow-app-firmware-unpacker
@@ -152,6 +156,7 @@ spec:
         name: secflow-app-firmware-unpacker
         component: dispatcher
     spec:
+      terminationGracePeriodSeconds: 60
       serviceAccountName: secflow-app-firmware-unpacker-serviceaccount
       dnsPolicy: ClusterFirstWithHostNet
       topologySpreadConstraints:
@@ -186,7 +191,25 @@ spec:
             - name: SECFLOW_FIRMWARE_UNPACKER_PROBE_PORT
               value: "18080"
             - name: FIRMWARE_UNPACKER_RUNTIME_ROLE
-              value: dispatcher,worker
+              value: dispatcher
+            - name: FW_TASK_LEASE_SECONDS
+              value: "300"
+            - name: FW_TASK_LEASE_RENEW_INTERVAL_SECONDS
+              value: "30"
+            - name: FW_DISPATCHER_POLL_SECONDS
+              value: "5"
+            - name: FW_DISPATCHER_CAPACITY
+              value: "1"
+            - name: FW_DRAIN_GRACE_SECONDS
+              value: "45"
+            - name: FW_AGENT_PRE_CLEANUP_ENABLED
+              value: "true"
+            - name: FW_AGENT_POST_CLEANUP_ENABLED
+              value: "true"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: UNPACKER_AGENT_DIR
               value: /app/app/agent
             - name: WORKER_ID
@@ -261,6 +284,93 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 2
             failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -lc
+                  - sleep 45
+      volumes:
+        - name: secflow-app-firmware-unpacker-config
+          configMap:
+            name: secflow-app-firmware-unpacker-config
+            items:
+              - key: config.yaml
+                path: config.yaml
+        - name: secflow-platform-fileserver-data-nfs-pvc
+          persistentVolumeClaim:
+            claimName: secflow-platform-fileserver-data-nfs-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-app-firmware-unpacker-scheduler
+  namespace: secflow-ns
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      name: secflow-app-firmware-unpacker
+      component: scheduler
+  template:
+    metadata:
+      labels:
+        name: secflow-app-firmware-unpacker
+        component: scheduler
+    spec:
+      serviceAccountName: secflow-app-firmware-unpacker-serviceaccount
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: secflow-app-firmware-unpacker
+          image: ghcr.io/runshine/secflow-app-firmware-unpacker:latest
+          imagePullPolicy: Always
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: CONFIG_PATH
+              value: /app/config.yaml
+            - name: FIRMWARE_UNPACKER_CONFIG
+              value: /app/config.yaml
+            - name: SECFLOW_FIRMWARE_UNPACKER_PROBE_PORT
+              value: "18080"
+            - name: FIRMWARE_UNPACKER_RUNTIME_ROLE
+              value: scheduler
+            - name: FW_TASK_LEASE_SECONDS
+              value: "300"
+            - name: FW_TASK_LEASE_RENEW_INTERVAL_SECONDS
+              value: "30"
+            - name: FW_DISPATCHER_POLL_SECONDS
+              value: "5"
+            - name: FW_DISPATCHER_CAPACITY
+              value: "1"
+            - name: FW_DRAIN_GRACE_SECONDS
+              value: "45"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - containerPort: 8080
+            - containerPort: 18080
+              name: probe
+          volumeMounts:
+            - name: secflow-app-firmware-unpacker-config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+            - name: secflow-platform-fileserver-data-nfs-pvc
+              mountPath: /data
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2"
       volumes:
         - name: secflow-app-firmware-unpacker-config
           configMap:

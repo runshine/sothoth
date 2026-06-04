@@ -93,11 +93,11 @@ RUN python3 -m venv "${VIRTUAL_ENV}"
 
 COPY requirements.txt /app/
 RUN pip3 install --no-cache-dir --default-timeout=300 \
-    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    -i https://pypi.org/simple \
     -r /app/requirements.txt
 
 RUN pip3 install --no-cache-dir --default-timeout=300 \
-    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    -i https://pypi.org/simple \
     jefferson \
     ubi_reader
 

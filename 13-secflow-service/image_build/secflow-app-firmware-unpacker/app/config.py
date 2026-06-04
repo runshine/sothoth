@@ -106,12 +106,16 @@ class WorkerConfig(BaseModel):
     claim_batch_size: int = 8
     transient_db_retry_attempts: int = 3
     transient_db_retry_backoff_ms: int = 200
-    # Deprecated for task execution; retained for config compatibility.
-    task_lease_seconds: int = 45
-    task_lease_renew_interval_seconds: int = 10
     cancel_timeout_seconds: int = 120
     cancel_grace_seconds: int = 10
     cancel_force_seconds: int = 30
+    dispatcher_poll_seconds: int = 5
+    dispatcher_capacity: int = 1
+    task_lease_seconds: int = 300
+    task_lease_renew_interval_seconds: int = 30
+    drain_grace_seconds: int = 45
+    agent_pre_cleanup_enabled: bool = True
+    agent_post_cleanup_enabled: bool = True
 
 
 class RegistryMenuLevelConfig(BaseModel):
@@ -239,6 +243,8 @@ def get_runtime_roles() -> set[str]:
         if item.strip()
     ]
     roles = set(tokens or ["all"])
+    if "dispatcher" in roles and "worker" in roles:
+        roles.discard("worker")
     if "all" in roles:
         return {"all"}
     return roles
@@ -256,6 +262,20 @@ def get_config() -> Config:
     global _config
     if _config is None:
         _config = load_config()
+        worker = _config.worker
+        worker.task_lease_seconds = int(os.environ.get("FW_TASK_LEASE_SECONDS", worker.task_lease_seconds))
+        worker.task_lease_renew_interval_seconds = int(
+            os.environ.get("FW_TASK_LEASE_RENEW_INTERVAL_SECONDS", worker.task_lease_renew_interval_seconds)
+        )
+        worker.dispatcher_poll_seconds = int(os.environ.get("FW_DISPATCHER_POLL_SECONDS", worker.dispatcher_poll_seconds))
+        worker.dispatcher_capacity = int(os.environ.get("FW_DISPATCHER_CAPACITY", worker.dispatcher_capacity))
+        worker.drain_grace_seconds = int(os.environ.get("FW_DRAIN_GRACE_SECONDS", worker.drain_grace_seconds))
+        worker.agent_pre_cleanup_enabled = str(
+            os.environ.get("FW_AGENT_PRE_CLEANUP_ENABLED", str(worker.agent_pre_cleanup_enabled))
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        worker.agent_post_cleanup_enabled = str(
+            os.environ.get("FW_AGENT_POST_CLEANUP_ENABLED", str(worker.agent_post_cleanup_enabled))
+        ).strip().lower() in {"1", "true", "yes", "on"}
     return _config
 
 
