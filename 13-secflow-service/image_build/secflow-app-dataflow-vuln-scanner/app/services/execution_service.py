@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -120,6 +121,7 @@ _NORMALIZED_TIMELINE_MESSAGES = {
     "runtime_binding_repaired": "runtime binding repaired from run/process evidence",
     "runtime_binding_repair_requested": "runtime binding repair requested from run/process evidence",
 }
+_TASK_TIMELINE_DEDUPE_WINDOW_SECONDS = 60
 _TASK_TIMELINE_EVENT_GROUPS = {
     "task_created": "task",
     "task_retry_requested": "operation",
@@ -2516,6 +2518,14 @@ class ExecutionService:
     ) -> RunIndex | None:
         existing_run_index = self._find_run_index_for_execution(db, execution)
         if existing_run_index is not None:
+            run_root = str(existing_run_index.run_root_path or "").strip()
+            if run_root and not Path(run_root).is_dir():
+                return self._refresh_run_index_for_execution(
+                    db,
+                    execution,
+                    trigger,
+                    include_runtime_assets=include_runtime_assets,
+                )
             return existing_run_index
         return self._refresh_run_index_for_execution(
             db,
@@ -2607,7 +2617,22 @@ class ExecutionService:
                             execution=latest_execution,
                         ),
                     })
-        if run_summary and "process_state" not in run_summary:
+        if run_locator["run_name"] and run_locator["runs_root"]:
+            run_summary = {
+                "name": run_locator["run_name"],
+                "root_path": run_locator["runs_root"],
+                "path": run_locator["run_path"],
+                "linked_task_id": trigger.id,
+                "linked_execution_id": latest_execution.id if latest_execution else None,
+                **run_summary,
+            }
+        current_process_state = run_summary.get("process_state")
+        if (
+            "process_state" not in run_summary
+            or not isinstance(current_process_state, dict)
+            or not current_process_state
+            or not str(current_process_state.get("source") or "").strip()
+        ):
             run_index_for_state = None
             run_index_id = str(run_summary.get("run_id") or "").strip()
             if run_index_id:
@@ -2632,15 +2657,6 @@ class ExecutionService:
                     trigger=trigger,
                     execution=latest_execution,
                 )
-        if run_locator["run_name"] and run_locator["runs_root"]:
-            run_summary = {
-                "name": run_locator["run_name"],
-                "root_path": run_locator["runs_root"],
-                "path": run_locator["run_path"],
-                "linked_task_id": trigger.id,
-                "linked_execution_id": latest_execution.id if latest_execution else None,
-                **run_summary,
-            }
         run_index_for_unbound = None
         run_index_id = str(run_summary.get("run_id") or "").strip()
         if run_index_id:
@@ -6293,7 +6309,9 @@ class ExecutionService:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
         normalized_view = str(view or "task").strip().lower() or "task"
-        if normalized_view != "raw":
+        if normalized_view not in {"task", "raw"}:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="unsupported timeline view")
+        if normalized_view == "task":
             events = (
                 db.query(TaskTimelineEvent)
                 .filter(TaskTimelineEvent.task_id == trigger.id)
@@ -6303,7 +6321,7 @@ class ExecutionService:
             items = [
                 DataflowTaskTimelineEvent(
                     id=event.id,
-                    task_id=trigger.id,
+                    task_id=event.task_id,
                     project_id=event.project_id,
                     execution_id=event.execution_id,
                     attempt_no=event.attempt_no,
@@ -6346,6 +6364,8 @@ class ExecutionService:
                 stage_key=str(event.stage_id or "").strip() or None,
                 stage_name=_normalize_timeline_stage_name(event.stage_id, event.payload_json if isinstance(event.payload_json, dict) else None),
                 event_type=event.event_type,
+                event_group=None,
+                source="raw",
                 level=str(event.level or "info").strip() or "info",
                 message=event.message,
                 payload=event.payload_json if isinstance(event.payload_json, dict) else {},
@@ -6368,47 +6388,42 @@ class ExecutionService:
     ) -> DataflowTaskTimelineActionResponse:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
+        deleted = 0
         normalized_view = str(view or "task").strip().lower() or "task"
-        if normalized_view != "raw":
+        if normalized_view not in {"task", "raw"}:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="unsupported timeline view")
+        if normalized_view == "task":
             deleted = (
                 db.query(TaskTimelineEvent)
                 .filter(TaskTimelineEvent.task_id == trigger.id)
                 .delete(synchronize_session=False)
             ) or 0
             db.commit()
+        else:
+            execution_ids = [
+                row[0]
+                for row in db.query(WorkflowExecution.id).filter(WorkflowExecution.trigger_task_id == trigger.id).all()
+            ]
+            if execution_ids:
+                deleted = (
+                    db.query(WorkflowExecutionEvent)
+                    .filter(WorkflowExecutionEvent.execution_id.in_(execution_ids))
+                    .delete(synchronize_session=False)
+                ) or 0
+                db.commit()
+        if deleted:
             self._log_task_mutation(
-                action="task_timeline_cleared",
+                action="timeline_cleared",
                 principal=principal,
                 task_id=trigger.id,
-                deleted_event_count=int(deleted or 0),
-                timeline_view=normalized_view,
-            )
-            return DataflowTaskTimelineActionResponse(
-                task_id=trigger.id,
-                message="task timeline cleared",
+                view=normalized_view,
                 deleted_event_count=int(deleted or 0),
             )
-        execution_ids = [
-            row[0]
-            for row in db.query(WorkflowExecution.id).filter(WorkflowExecution.trigger_task_id == trigger.id).all()
-        ]
-        deleted = 0
-        if execution_ids:
-            deleted = (
-                db.query(WorkflowExecutionEvent)
-                .filter(WorkflowExecutionEvent.execution_id.in_(execution_ids))
-                .delete(synchronize_session=False)
-            ) or 0
+        else:
             db.commit()
-        self._log_task_mutation(
-            action="timeline_cleared",
-            principal=principal,
-            task_id=trigger.id,
-            deleted_event_count=int(deleted or 0),
-        )
         return DataflowTaskTimelineActionResponse(
             task_id=trigger.id,
-            message="task timeline cleared",
+            message=f"{normalized_view} timeline cleared",
             deleted_event_count=int(deleted or 0),
         )
 
@@ -6427,7 +6442,9 @@ class ExecutionService:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
         normalized_view = str(view or "task").strip().lower() or "task"
-        if normalized_view != "raw":
+        if normalized_view not in {"task", "raw"}:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="unsupported timeline view")
+        if normalized_view == "task":
             event = (
                 db.query(TaskTimelineEvent)
                 .filter(
@@ -6436,31 +6453,16 @@ class ExecutionService:
                 )
                 .first()
             )
-            if event is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="timeline event not found")
-            db.delete(event)
-            db.commit()
-            self._log_task_mutation(
-                action="task_timeline_event_deleted",
-                principal=principal,
-                task_id=trigger.id,
-                event_id=event_id,
-                timeline_view=normalized_view,
+        else:
+            event = (
+                db.query(WorkflowExecutionEvent)
+                .join(WorkflowExecution, WorkflowExecution.id == WorkflowExecutionEvent.execution_id)
+                .filter(
+                    WorkflowExecutionEvent.id == event_id,
+                    WorkflowExecution.trigger_task_id == trigger.id,
+                )
+                .first()
             )
-            return DataflowTaskTimelineActionResponse(
-                task_id=trigger.id,
-                message="task timeline event deleted",
-                deleted_event_count=1,
-            )
-        event = (
-            db.query(WorkflowExecutionEvent)
-            .join(WorkflowExecution, WorkflowExecution.id == WorkflowExecutionEvent.execution_id)
-            .filter(
-                WorkflowExecutionEvent.id == event_id,
-                WorkflowExecution.trigger_task_id == trigger.id,
-            )
-            .first()
-        )
         if event is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="timeline event not found")
         db.delete(event)
@@ -6470,10 +6472,11 @@ class ExecutionService:
             principal=principal,
             task_id=trigger.id,
             event_id=event_id,
+            view=normalized_view,
         )
         return DataflowTaskTimelineActionResponse(
             task_id=trigger.id,
-            message="task timeline event deleted",
+            message=f"{normalized_view} timeline event deleted",
             deleted_event_count=1,
         )
 
