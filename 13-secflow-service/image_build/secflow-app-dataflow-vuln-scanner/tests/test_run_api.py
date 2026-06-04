@@ -1420,17 +1420,67 @@ def test_reconcile_unbound_running_without_runtime_evidence_requeues_to_pending(
         db.commit()
         db.refresh(execution)
         db.refresh(trigger)
-        assert execution.status == "pending"
-        assert execution.public_status == "pending"
-        assert execution.dispatch_status is None
+        assert execution.status == "queued"
+        assert execution.public_status == "dispatching"
+        assert execution.dispatch_status == "queued"
         assert execution.owner_pod_id is None
         assert execution.process_pid is None
-        assert trigger.status == "pending"
+        assert trigger.status == "queued"
+        assert trigger.public_status == "dispatching"
         event = (
             db.query(WorkflowExecutionEvent)
             .filter(
                 WorkflowExecutionEvent.execution_id == execution.id,
-                WorkflowExecutionEvent.event_type == "unbound_active_execution_requeued",
+                WorkflowExecutionEvent.event_type == "runtime_lost_requeued",
+            )
+            .first()
+        )
+        assert event is not None
+
+
+def test_reconcile_runtime_lost_within_startup_protection_is_preserved(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_runtime_lost_startup_protected_20260604_010203"
+    bound = _create_execution_bound_run(client, run_root)
+
+    with get_db_session() as db:
+        run_index = db.get(RunIndex, bound["run_id"])
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        trigger = db.get(TriggerTask, bound["task_id"])
+        assert run_index is not None and execution is not None and trigger is not None
+        recent_started_at = now_local() - timedelta(seconds=60)
+        run_index.status = "running"
+        run_index.started_at = recent_started_at
+        execution.status = "running"
+        execution.public_status = "running"
+        execution.dispatch_status = "running"
+        execution.started_at = None
+        execution.process_pid = None
+        execution.process_started_at = None
+        execution.process_status = None
+        execution.owner_pod_id = None
+        execution.worker_job_id = None
+        trigger.status = "running"
+        trigger.public_status = "running"
+        trigger.started_at = None
+        db.add_all([run_index, execution, trigger])
+        db.commit()
+
+        service = get_execution_service()
+        response = service.reconcile_active_tasks(db, limit=10)
+        db.commit()
+        db.refresh(execution)
+        db.refresh(trigger)
+        assert response.requeued_count == 0
+        assert execution.status == "running"
+        assert execution.dispatch_status == "running"
+        assert trigger.status == "running"
+        event = (
+            db.query(WorkflowExecutionEvent)
+            .filter(
+                WorkflowExecutionEvent.execution_id == execution.id,
+                WorkflowExecutionEvent.event_type == "startup_grace_protected",
             )
             .first()
         )

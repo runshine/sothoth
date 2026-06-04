@@ -50,6 +50,11 @@ _RUNTIME_RECONCILED_FAILURE_MESSAGES = {
     "stale active runtime assumed failed",
     "runtime heartbeat lost; assumed failed",
 }
+_RUNTIME_REDISPATCH_MESSAGES = {
+    "runtime lost; requeued for redispatch",
+    "startup registration timeout; requeued for redispatch",
+    "stale runtime requeued for redispatch",
+}
 
 
 @dataclass(frozen=True)
@@ -171,6 +176,8 @@ def resolve_public_task_state(
     execution_runtime_reconciled_failure = (
         execution_public == "failed" and _is_runtime_reconciled_failure_message(execution_message)
     )
+    trigger_runtime_redispatch = str(trigger_message or "").strip().lower() in _RUNTIME_REDISPATCH_MESSAGES
+    execution_runtime_redispatch = str(execution_message or "").strip().lower() in _RUNTIME_REDISPATCH_MESSAGES
     if run_public == "success" and (trigger_runtime_reconciled_failure or execution_runtime_reconciled_failure):
         return ResolvedPublicTaskState(
             status="success",
@@ -178,6 +185,15 @@ def resolve_public_task_state(
             started_at=run_started_at or effective_started_at,
             finished_at=run_finished_at or execution_finished_at or trigger_finished_at,
             source="run_reconciled_success",
+        )
+
+    if dispatch_public == "dispatching" and (trigger_runtime_redispatch or execution_runtime_redispatch):
+        return ResolvedPublicTaskState(
+            status="dispatching",
+            message=execution_message or trigger_message,
+            started_at=effective_started_at,
+            finished_at=None,
+            source="dispatch",
         )
 
     for source, status, message, started_at, finished_at in (
