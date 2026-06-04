@@ -515,8 +515,8 @@ def test_active_reconcile_refreshes_stale_running_projection(service_config_path
         assert response.reconciled_count >= 1
         projection = db.get(DfvsTaskListProjection, "tt-active-reconcile-stale-projection")
         assert projection is not None
-        assert projection.public_status == "failed"
-        assert projection.dispatch_status == "failed"
+        assert projection.public_status == "dispatching"
+        assert projection.dispatch_status == "queued"
     finally:
         db.close()
 

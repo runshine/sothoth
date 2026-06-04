@@ -124,6 +124,26 @@ def test_resolve_public_task_state_prefers_terminal_trigger_over_stale_running_m
     assert resolved.source == "trigger"
 
 
+def test_resolve_public_task_state_keeps_dispatching_for_runtime_redispatch_message() -> None:
+    started_at = datetime(2026, 1, 1, 0, 0, 0)
+    resolved = resolve_public_task_state(
+        trigger_status="queued",
+        trigger_message="runtime lost; requeued for redispatch",
+        trigger_started_at=started_at,
+        trigger_finished_at=None,
+        execution_status="queued",
+        execution_message="runtime lost; requeued for redispatch",
+        execution_started_at=started_at,
+        execution_finished_at=None,
+        dispatch_status="queued",
+        preferred_error_message=None,
+        run_status="",
+        run_message=None,
+    )
+    assert resolved.status == "dispatching"
+    assert resolved.source == "dispatch"
+
+
 def test_public_task_status_matches_filter_uses_public_status() -> None:
     assert public_task_status_matches_filter("review_error", "failed")
     assert public_task_status_matches_filter("queued", "dispatching")

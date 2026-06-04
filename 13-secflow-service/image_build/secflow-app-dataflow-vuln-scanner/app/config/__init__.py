@@ -142,6 +142,7 @@ class ServiceConfig(BaseModel):
     # window so transient network/storage jitter does not incorrectly invite
     # users to resume an already-running scan.
     process_heartbeat_stale_after_seconds: int = 300
+    process_startup_protection_seconds: int = 180
     trigger_retry_limit: int = 0
     public_api_prefix: str = "/api/dataflow-vuln-scanner"
     admin_proxy_prefix: str = "/api/dataflow-vuln-scanner-admin-proxy"
