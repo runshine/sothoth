@@ -121,11 +121,11 @@ spec:
                 name: secflow-platform-vuln
                 port:
                   number: 80
-          - path: /api/system-analysis
+          - path: /api/app/system-analyse
             pathType: Prefix
             backend:
               service:
-                name: secflow-platform-system-analysis
+                name: secflow-app-system-analyse
                 port:
                   number: 80
           - path: /api/dataflow-vuln-scanner
