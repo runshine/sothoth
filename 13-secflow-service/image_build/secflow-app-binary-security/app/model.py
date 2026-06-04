@@ -76,6 +76,20 @@ class JsonMixin:
     def _dump_json(self, value: Any) -> str:
         return json.dumps(value, ensure_ascii=False)
 
+    def _load_externalized_json(self, value: Any, *, path_key: str) -> Any:
+        if not isinstance(value, dict):
+            return value
+        path_value = str(value.get(path_key) or "").strip()
+        if not path_value:
+            return value
+        try:
+            loaded = json.loads(Path(path_value).read_text(encoding="utf-8"))
+        except Exception:
+            fallback = dict(value)
+            fallback[f"missing_externalized_{path_key}"] = True
+            return fallback
+        return loaded if isinstance(loaded, dict) else value
+
 
 class BinarySecurityTask(Base, JsonMixin):
     __tablename__ = "secflow_binary_security_task"
@@ -410,7 +424,8 @@ class BinarySecurityTaskOperation(Base, JsonMixin):
 
     @property
     def request_payload(self) -> dict[str, Any]:
-        return self._load_json(self.request_payload_json, {})
+        value = self._load_json(self.request_payload_json, {})
+        return self._load_externalized_json(value, path_key="request_payload_path")
 
     @request_payload.setter
     def request_payload(self, value: dict[str, Any] | None) -> None:
@@ -418,7 +433,8 @@ class BinarySecurityTaskOperation(Base, JsonMixin):
 
     @property
     def result_payload(self) -> dict[str, Any]:
-        return self._load_json(self.result_payload_json, {})
+        value = self._load_json(self.result_payload_json, {})
+        return self._load_externalized_json(value, path_key="result_payload_path")
 
     @result_payload.setter
     def result_payload(self, value: dict[str, Any] | None) -> None:
