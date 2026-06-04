@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: secflow-app-dataflow-vuln-scan-config
+  namespace: secflow-ns
+data:
+  service.yaml: |
+    database:
+      host: "mysql.sothothv2-ns.svc.cluster.local"
+      port: 3306
+      username: "secflow"
+      password: "Huawei12#$"
+      name: "secflow"
+      table_prefix: "app_dvs_"
+      pool_size: 10
+      max_overflow: 20
+
+    auth_service:
+      host: "secflow-platform-auth"
+      port: 80
+      validate_token_path: "/api/auth/validate-token"
+      service_machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
+      timeout: 10
+      token_cache_enabled: true
+      token_cache_ttl_minutes: 15
+
+    registry:
+      enabled: true
+      menu_service_url: "http://secflow-platform-menu:80"
+      service_id: "secflow-app-dataflow-vuln-scan"
+      service_name: "数据流漏洞挖掘服务"
+      host: "secflow-app-dataflow-vuln-scan"
+      port: 80
+      maturity: "已上线"
+      description: "基于数据流与污点传播路径挖掘潜在漏洞风险"
+      api_prefix: "/api/app/dataflow-vuln-scan"
+      unregister_on_shutdown: false
+      heartbeat_interval_seconds: 30
+      menu:
+        id: "app-dataflow-vuln-scan"
+        path: "/app/dataflow-vuln-scan"
+        icon: "git-branch"
+        order: 114
+        level1:
+          name: "应用工具"
+          name_en: "App Tools"
+        level2:
+          name: "数据流漏洞挖掘"
+          name_en: "Dataflow Vulnerability Mining"
+        level3:
+          name: "数据流漏洞追踪"
+          name_en: "Dataflow Tracking"
+
+    app:
+      host: "0.0.0.0"
+      port: 8080
+      debug: false
+
+    configcenter_service:
+      base_url: "http://secflow-platform-configcenter/api/configcenter"
+      timeout: 30
+
+    logging:
+      level: "INFO"
+      format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

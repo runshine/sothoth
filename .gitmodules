@@ -20,3 +20,6 @@
 [submodule "13-secflow-service/image_build/secflow-app-dataflow-analyse"]
 	path = 13-secflow-service/image_build/secflow-app-dataflow-analyse
 	url = https://github.com/ict-bin/data_flow_analyse.git
+[submodule "13-secflow-service/image_build/secflow-app-dataflow-vuln-scan"]
+	path = 13-secflow-service/image_build/secflow-app-dataflow-vuln-scan
+	url = https://github.com/ict-bin/dataflow_vuln_scan.git

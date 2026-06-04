@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-app-dataflow-vuln-scan-worker
+  namespace: secflow-ns
+spec:
+  replicas: 6
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      name: secflow-app-dataflow-vuln-scan
+      role: worker
+  template:
+    metadata:
+      labels:
+        name: secflow-app-dataflow-vuln-scan
+        role: worker
+    spec:
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: secflow-app-dataflow-vuln-scan
+        image: ghcr.io/runshine/secflow-app-dataflow-vuln-scan:latest
+        imagePullPolicy: Always
+        env:
+          - name: TZ
+            value: Asia/Shanghai
+          - name: PORT
+            value: "8080"
+          - name: SERVICE_YAML
+            value: /app/service.yaml
+          - name: FILESERVER_ROOT
+            value: /data/files
+          - name: DVS_AGENT_TIMEOUT_SECONDS
+            value: "900"
+          - name: DVS_ROLE
+            value: worker
+          - name: DVS_ENABLE_PUBLIC_API
+            value: "false"
+          - name: DVS_ENABLE_DISPATCHER
+            value: "true"
+          - name: DVS_ENABLE_EXECUTOR
+            value: "true"
+          - name: DVS_ENABLE_REGISTRY
+            value: "false"
+          - name: DVS_LEASE_TTL_SECONDS
+            value: "300"
+          - name: DVS_HEARTBEAT_INTERVAL_SECONDS
+            value: "60"
+          - name: DVS_MAX_LOCAL_RUNNING_TASKS
+            value: "4"
+          - name: DVS_CLUSTER_EXPECTED_WORKERS
+            value: "6"
+          - name: DVS_CLUSTER_EXPECTED_WORKER_CAPACITY
+            value: "4"
+          - name: DVS_DISPATCH_POLL_INTERVAL_SECONDS
+            value: "3"
+          - name: DVS_DB_RETRY_MAX_ATTEMPTS
+            value: "5"
+          - name: DVS_DB_RETRY_BASE_DELAY_SECONDS
+            value: "1"
+        ports:
+        - containerPort: 8080
+        - containerPort: 18080
+          name: probe
+        volumeMounts:
+        - name: secflow-app-dataflow-vuln-scan-config
+          mountPath: /app/service.yaml
+          subPath: service.yaml
+        - name: secflow-platform-fileserver-data-nfs-pvc
+          mountPath: /data
+        resources:
+          requests:
+            memory: "12Gi"
+            cpu: "6"
+          limits:
+            memory: "16Gi"
+            cpu: "8"
+        startupProbe:
+          httpGet:
+            path: /api/app/dataflow-vuln-scan/health
+            port: 18080
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 18
+        livenessProbe:
+          httpGet:
+            path: /api/app/dataflow-vuln-scan/health
+            port: 18080
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 6
+        readinessProbe:
+          httpGet:
+            path: /api/app/dataflow-vuln-scan/ready
+            port: 18080
+          initialDelaySeconds: 20
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 3
+      volumes:
+      - name: secflow-app-dataflow-vuln-scan-config
+        configMap:
+          name: secflow-app-dataflow-vuln-scan-config
+          items:
+            - key: service.yaml
+              path: service.yaml
+      - name: secflow-platform-fileserver-data-nfs-pvc
+        persistentVolumeClaim:
+          claimName: secflow-platform-fileserver-data-nfs-pvc
