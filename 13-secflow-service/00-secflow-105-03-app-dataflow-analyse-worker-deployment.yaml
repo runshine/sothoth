@@ -51,11 +51,11 @@ spec:
           - name: DFA_HEARTBEAT_INTERVAL_SECONDS
             value: "60"
           - name: DFA_MAX_LOCAL_RUNNING_TASKS
-            value: "4"
+            value: "1"
           - name: DFA_CLUSTER_EXPECTED_WORKERS
             value: "6"
           - name: DFA_CLUSTER_EXPECTED_WORKER_CAPACITY
-            value: "4"
+            value: "1"
           - name: DFA_DISPATCH_POLL_INTERVAL_SECONDS
             value: "3"
           - name: DFA_DB_RETRY_MAX_ATTEMPTS
