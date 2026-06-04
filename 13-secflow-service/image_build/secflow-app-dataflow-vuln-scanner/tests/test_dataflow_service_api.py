@@ -1435,13 +1435,21 @@ def test_task_mutation_timeline_records_create_cancel_priority_and_projection(se
     assert timeline.status_code == 200
     items = timeline.json()["items"]
     task_created = next((item for item in items if item["event_type"] == "task_created"), None)
-    execution_queued = next((item for item in items if item["event_type"] == "execution_queued"), None)
+    dispatch_queued = next((item for item in items if item["event_type"] == "task_dispatch_queued"), None)
     assert task_created is not None
-    assert execution_queued is not None
+    assert dispatch_queued is not None
+    assert task_created["event_group"] == "task"
+    assert dispatch_queued["event_group"] == "dispatch"
     assert task_created["payload"]["task_id"] == task_id
     assert task_created["payload"]["project_id"] == "default"
     assert task_created["payload"]["task_purpose"] == "normal"
     assert task_created["payload"]["dataflow_cli_task"] is True
+
+    raw_timeline = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/timeline?view=raw")
+    assert raw_timeline.status_code == 200
+    raw_items = raw_timeline.json()["items"]
+    execution_queued = next((item for item in raw_items if item["event_type"] == "execution_queued"), None)
+    assert execution_queued is not None
 
     priority_response = client.post(
         f"/api/dataflow-vuln-scanner/tasks/{task_id}/priority",
@@ -1494,6 +1502,18 @@ def test_timeline_clear_and_delete_do_not_create_extra_events(service_config_pat
     assert delete_one.status_code == 200
     after_delete = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/timeline")
     assert after_delete.status_code == 200
+    raw_timeline = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/timeline?view=raw")
+    assert raw_timeline.status_code == 200
+    assert len(raw_timeline.json()["items"]) >= 1
+
+    clear_task_timeline = client.delete(f"/api/dataflow-vuln-scanner/tasks/{task_id}/timeline")
+    assert clear_task_timeline.status_code == 200
+    after_clear = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/timeline")
+    assert after_clear.status_code == 200
+    assert after_clear.json()["items"] == []
+    raw_after_clear = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/timeline?view=raw")
+    assert raw_after_clear.status_code == 200
+    assert len(raw_after_clear.json()["items"]) >= 1
 
 
 def test_cancel_orphaned_requeued_task_converges_to_cancelled(service_config_path, patch_mock_agent_runtime):

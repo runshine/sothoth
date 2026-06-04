@@ -166,6 +166,24 @@ class WorkflowExecutionEvent(Base):
     created_at = Column(DateTime, default=now_utc)
 
 
+class TaskTimelineEvent(Base):
+    __tablename__ = _prefix("task_timeline_event")
+
+    id = Column(String(64), primary_key=True)
+    task_id = Column(String(64), nullable=False)
+    project_id = Column(String(64), nullable=False)
+    execution_id = Column(String(64))
+    attempt_no = Column(Integer)
+    event_type = Column(String(64), nullable=False)
+    event_group = Column(String(32), nullable=False, default="task")
+    source = Column(String(32), nullable=False, default="task")
+    level = Column(String(16), nullable=False, default="info")
+    message = Column(Text, nullable=False)
+    payload_json = Column(JSON)
+    dedupe_key = Column(String(255))
+    created_at = Column(DateTime, default=now_utc)
+
+
 class RunIndex(Base):
     __tablename__ = _prefix("run_index")
 
@@ -486,6 +504,7 @@ MODEL_CLASSES = [
     TriggerTask,
     WorkflowExecution,
     WorkflowExecutionEvent,
+    TaskTimelineEvent,
     RunIndex,
     RunIndexCycle,
     RunIndexGlobalReview,
@@ -538,6 +557,9 @@ INDEX_DEFINITIONS = [
     (WorkflowExecutionEvent.__tablename__, "ix_dfvs_event_exec", "CREATE INDEX ix_dfvs_event_exec ON {table} (execution_id)"),
     (WorkflowExecutionEvent.__tablename__, "ix_dfvs_event_type", "CREATE INDEX ix_dfvs_event_type ON {table} (event_type)"),
     (WorkflowExecutionEvent.__tablename__, "ix_dfvs_event_created", "CREATE INDEX ix_dfvs_event_created ON {table} (created_at)"),
+    (TaskTimelineEvent.__tablename__, "ix_dfvs_tte_task_created", "CREATE INDEX ix_dfvs_tte_task_created ON {table} (task_id, created_at)"),
+    (TaskTimelineEvent.__tablename__, "ix_dfvs_tte_task_type", "CREATE INDEX ix_dfvs_tte_task_type ON {table} (task_id, event_type)"),
+    (TaskTimelineEvent.__tablename__, "ix_dfvs_tte_task_dedupe", "CREATE INDEX ix_dfvs_tte_task_dedupe ON {table} (task_id, dedupe_key)"),
     (RunIndex.__tablename__, "ix_dfvs_ri_project", "CREATE INDEX ix_dfvs_ri_project ON {table} (project_id)"),
     (RunIndex.__tablename__, "ix_dfvs_ri_status", "CREATE INDEX ix_dfvs_ri_status ON {table} (status)"),
     (RunIndex.__tablename__, "ux_dfvs_ri_source_hash", "CREATE UNIQUE INDEX ux_dfvs_ri_source_hash ON {table} (source_type, source_hash)"),
