@@ -4,7 +4,7 @@ metadata:
   name: secflow-app-dataflow-vuln-scan-worker
   namespace: secflow-ns
 spec:
-  replicas: 6
+  replicas: 1
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -51,11 +51,11 @@ spec:
           - name: DVS_HEARTBEAT_INTERVAL_SECONDS
             value: "60"
           - name: DVS_MAX_LOCAL_RUNNING_TASKS
-            value: "4"
+            value: "2"
           - name: DVS_CLUSTER_EXPECTED_WORKERS
-            value: "6"
+            value: "1"
           - name: DVS_CLUSTER_EXPECTED_WORKER_CAPACITY
-            value: "4"
+            value: "2"
           - name: DVS_DISPATCH_POLL_INTERVAL_SECONDS
             value: "3"
           - name: DVS_DB_RETRY_MAX_ATTEMPTS
@@ -74,11 +74,11 @@ spec:
           mountPath: /data
         resources:
           requests:
-            memory: "12Gi"
-            cpu: "6"
+            memory: "4Gi"
+            cpu: "2"
           limits:
-            memory: "16Gi"
-            cpu: "8"
+            memory: "8Gi"
+            cpu: "4"
         startupProbe:
           httpGet:
             path: /api/app/dataflow-vuln-scan/health

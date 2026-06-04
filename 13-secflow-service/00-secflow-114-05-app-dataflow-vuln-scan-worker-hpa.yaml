@@ -8,8 +8,8 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: secflow-app-dataflow-vuln-scan-worker
-  minReplicas: 6
-  maxReplicas: 6
+  minReplicas: 1
+  maxReplicas: 1
   metrics:
   - type: Resource
     resource:
