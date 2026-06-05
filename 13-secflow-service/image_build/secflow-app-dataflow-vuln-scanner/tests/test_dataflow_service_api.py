@@ -136,7 +136,7 @@ def test_profiles_tasks_and_effective_config(service_config_path, patch_mock_age
     assert task.status_code == 201
     task_payload = task.json()
     task_id = task_payload["task_id"]
-    assert task_payload["status"] in {"running", "succeeded"}
+    assert task_payload["status"] in {"dispatching", "running", "succeeded"}
 
     detail_payload = _wait_for_task_status(client, task_id)
     assert detail_payload["status"] == "succeeded"
@@ -424,7 +424,8 @@ def test_task_list_marks_stale_running_process_as_runtime_lost(service_config_pa
 
     detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}")
     assert detail.status_code == 200
-    process_state = detail.json()["latest_run"]["process_state"]
+    detail_payload = detail.json()
+    process_state = detail_payload["latest_run"].get("process_state") or detail_payload["run"].get("process_state") or {}
     assert process_state["display_status"] == "runtime_lost"
     assert process_state["display_label"] == "运行失联"
     assert process_state["source"] == "stale_process_heartbeat"
@@ -607,7 +608,7 @@ def test_create_task_bootstraps_default_profile_when_missing(service_config_path
     )
     assert task.status_code == 201
     task_payload = task.json()
-    assert task_payload["status"] in {"running", "succeeded"}
+    assert task_payload["status"] in {"dispatching", "running", "succeeded"}
     assert task_payload["profile_id"]
     _wait_for_task_status(client, task_payload["task_id"])
 
@@ -1888,6 +1889,14 @@ def test_service_runtime_config_roundtrip(service_config_path):
         "dispatch_retry_interval_seconds",
         "dispatch_max_retries",
     }
+    assert set(payload["config"]["service"].keys()) == {
+        "agent_cleanup_enabled",
+        "agent_cleanup_before_task_start",
+        "agent_cleanup_after_task_finish",
+        "agent_cleanup_force_kill_timeout_seconds",
+        "agent_cleanup_escalation_timeout_seconds",
+        "agent_cleanup_process_match_patterns",
+    }
 
     save_response = client.put(
         "/api/dataflow-vuln-scanner/service/config",
@@ -1901,6 +1910,9 @@ def test_service_runtime_config_roundtrip(service_config_path):
                     "advertise_url_template": "http://{pod_id}.{headless_service_name}.{pod_namespace}.svc.cluster.local:8080",
                     "dispatch_retry_interval_seconds": 4,
                 },
+                "service": {
+                    "agent_cleanup_force_kill_timeout_seconds": 9,
+                },
             }
         },
     )
@@ -1908,6 +1920,7 @@ def test_service_runtime_config_roundtrip(service_config_path):
     saved = save_response.json()
     assert saved["config"]["scheduler"]["worker_capacity"] == 3
     assert saved["config"]["dataflow_worker"]["advertise_url_template"] == "http://{pod_id}.{headless_service_name}.{pod_namespace}.svc.cluster.local:8080"
+    assert saved["config"]["service"]["agent_cleanup_force_kill_timeout_seconds"] == 9
 
 
 def test_service_runtime_config_drops_legacy_registry_incompatible_fields(service_config_path):

@@ -10,7 +10,6 @@ from unittest import mock
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.api import tasks as tasks_api
 from app.model import Base, B2STask, B2STaskEvent, B2STaskItem
 from app.schemas import B2SAgentSessionRuntimeSummary, ElfTaskInput, TaskBatchDeleteRequest, TaskCreate, TokenUser
 from app.service import task_service
@@ -72,7 +71,29 @@ class TimelineServiceTests(unittest.TestCase):
         timeline = task_service.get_task_timeline(self.db, self.task)
 
         self.assertEqual(self.task.id, timeline.task_id)
+        self.assertEqual(["task_created"], [event.event_type for event in timeline.events])
+
+    def test_get_task_timeline_include_internal_returns_raw_events(self) -> None:
+        self.db.add(self._event("evt-1", "task_created", 0))
+        self.db.add(self._event("evt-2", "phase_changed", 1))
+        self.db.commit()
+
+        timeline = task_service.get_task_timeline(self.db, self.task, include_internal=True)
+
         self.assertEqual(["phase_changed", "task_created"], [event.event_type for event in timeline.events])
+
+    def test_build_task_event_summary_uses_default_timeline_events_only(self) -> None:
+        self.db.add(self._event("evt-1", "task_created", 0))
+        self.db.add(self._event("evt-2", "phase_changed", 1))
+        self.db.commit()
+
+        summary = task_service._build_task_event_summary(self.db, self.task.id)
+
+        self.assertEqual(1, summary.total_events)
+        self.assertEqual("task_created", summary.latest_event_type)
+        self.assertIsNone(summary.last_batch_id)
+        self.assertIsNone(summary.current_function)
+        self.assertIsNone(summary.current_attempt)
 
     def test_clear_and_delete_timeline_event(self) -> None:
         self.db.add(self._event("evt-1", "task_created"))
@@ -321,6 +342,43 @@ class TimelineServiceTests(unittest.TestCase):
         self.assertEqual(["item-1"], task_event.payload["request"]["item_ids"])
         self.assertEqual("tester", task_event.payload["operator"]["username"])
         self.assertEqual("retry", item_event.payload["reason"])
+
+    def test_retry_and_rerun_append_timeline_without_clearing_history(self) -> None:
+        self.db.add(self._event("evt-1", "task_created", 0))
+        self.db.commit()
+
+        self.item.status = "failed"
+        self.item.phase = "failed"
+        self.item.extra_metadata = {}
+        self.item.output_dir = str(Path(tempfile.gettempdir()) / "timeline-rerun-history-out")
+
+        with (
+            mock.patch.object(task_service, "query_items", return_value=[self.item]),
+            mock.patch.object(task_service, "_restart_llm_provider_key", return_value=None),
+            mock.patch.object(task_service, "materialize_llm_provider", return_value=None),
+            mock.patch.object(task_service, "get_config", return_value=mock.Mock(configcenter_service=mock.Mock(enabled=False))),
+            mock.patch.object(task_service, "clean_item_output_dir", return_value=Path(self.item.output_dir)),
+        ):
+            asyncio.run(task_service.rerun_task(self.db, self.task, _token(), clean_output=True, cancel_running=True))
+
+        self.item.status = "failed"
+        self.item.phase = "failed"
+        self.item.extra_metadata = self.item.extra_metadata or {}
+
+        with (
+            mock.patch.object(task_service, "query_items", return_value=[self.item]),
+            mock.patch.object(task_service, "_restart_llm_provider_key", return_value=None),
+            mock.patch.object(task_service, "materialize_llm_provider", return_value=None),
+            mock.patch.object(task_service, "get_config", return_value=mock.Mock(configcenter_service=mock.Mock(enabled=False))),
+        ):
+            asyncio.run(task_service.retry_task(self.db, self.task, _token(), ["item-1"]))
+
+        timeline = task_service.get_task_timeline(self.db, self.task)
+        event_types = [event.event_type for event in timeline.events]
+        self.assertIn("task_created", event_types)
+        self.assertIn("task_rerun_requested", event_types)
+        self.assertIn("task_retry_requested", event_types)
+        self.assertIn("item_requeued", event_types)
 
     def test_delete_task_returns_deleted_event_count(self) -> None:
         self.db.add(self._event("evt-1", "task_created"))

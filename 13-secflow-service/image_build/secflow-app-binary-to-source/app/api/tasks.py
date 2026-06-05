@@ -616,11 +616,12 @@ def get_b2s_task(
 def get_b2s_task_timeline(
     project_id: str,
     task_id: str,
+    include_internal: bool = Query(False),
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
     task = get_task_or_404(db, project_id, task_id)
-    return get_task_timeline(db, task)
+    return get_task_timeline(db, task, include_internal=include_internal)
 
 
 @router.delete("/projects/{project_id}/tasks/{task_id}/timeline", response_model=ActionResponse)

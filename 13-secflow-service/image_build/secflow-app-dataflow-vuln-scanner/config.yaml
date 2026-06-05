@@ -76,6 +76,20 @@ service:
   default_execution_timeout_seconds: 0
   execution_cancel_check_interval_seconds: 1
   process_heartbeat_stale_after_seconds: 300
+  agent_cleanup_enabled: true
+  agent_cleanup_before_task_start: true
+  agent_cleanup_after_task_finish: true
+  agent_cleanup_force_kill_timeout_seconds: 5
+  agent_cleanup_escalation_timeout_seconds: 2
+  agent_cleanup_process_match_patterns:
+    - codex
+    - opencode
+    - claude
+    - pi_agent
+    - pi-agent
+    - .pi/agent
+    - PI_CODING_AGENT_DIR
+    - run_vuln_scan.py
   trigger_retry_limit: 0
   public_api_prefix: /api/dataflow-vuln-scanner
   admin_proxy_prefix: /api/dataflow-vuln-scanner-admin-proxy
@@ -91,7 +105,7 @@ scheduler:
   worker_headless_service_name: secflow-app-dataflow-vuln-scanner-worker-headless
   manager_service_name: secflow-app-dataflow-vuln-scanner-manager
   manager_service_port: 80
-  worker_capacity: 5
+  worker_capacity: 1
   poll_interval_seconds: 1
   heartbeat_interval_seconds: 2
   worker_timeout_seconds: 300

@@ -150,6 +150,23 @@ class ServiceConfig(BaseModel):
     default_artifact_subdir: str = "assets"
     default_profile_template_kind: str = "vuln_scan_default"
     allow_absolute_input_refs: bool = False
+    agent_cleanup_enabled: bool = True
+    agent_cleanup_before_task_start: bool = True
+    agent_cleanup_after_task_finish: bool = True
+    agent_cleanup_force_kill_timeout_seconds: float = 5.0
+    agent_cleanup_escalation_timeout_seconds: float = 2.0
+    agent_cleanup_process_match_patterns: list[str] = Field(
+        default_factory=lambda: [
+            "codex",
+            "opencode",
+            "claude",
+            "pi_agent",
+            "pi-agent",
+            ".pi/agent",
+            "PI_CODING_AGENT_DIR",
+            "run_vuln_scan.py",
+        ]
+    )
 
 
 class SchedulerConfig(BaseModel):
@@ -166,7 +183,7 @@ class SchedulerConfig(BaseModel):
     manager_service_name: str = "secflow-app-dataflow-vuln-scanner-manager"
     manager_service_port: int = 80
     # worker_capacity <= 0 means no scheduler-side concurrency limit.
-    worker_capacity: int = 5
+    worker_capacity: int = 1
     poll_interval_seconds: int = 2
     heartbeat_interval_seconds: int = 5
     worker_timeout_seconds: int = 300

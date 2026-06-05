@@ -82,7 +82,7 @@ def service_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
             "enabled": False,
             "pod_id": "test-pod",
             "host_name": "test-host",
-            "worker_capacity": 5,
+            "worker_capacity": 1,
             "poll_interval_seconds": 1,
             "heartbeat_interval_seconds": 1,
             "worker_timeout_seconds": 2,

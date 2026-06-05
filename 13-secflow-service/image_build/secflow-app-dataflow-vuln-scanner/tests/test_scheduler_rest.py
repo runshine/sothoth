@@ -13,6 +13,7 @@ from app.models.database import (
     RunIndex,
     SchedulerWorker,
     SchedulerWorkerSlotReservation,
+    TaskTimelineEvent,
     TriggerTask,
     WorkflowDefinition,
     WorkflowExecution,
@@ -20,6 +21,7 @@ from app.models.database import (
     get_db_session,
 )
 from app.services.dataflow_worker_client import DataflowWorkerError
+from app.services.execution_service import get_execution_service
 from app.services.runtime_config_service import get_runtime_config_service
 from app.services.scheduler import SchedulerService
 from app.time_utils import now_local
@@ -238,9 +240,9 @@ def test_worker_role_registers_single_capacity_worker(service_config_path: Path)
         db.close()
 
 
-def test_worker_capacity_default_is_five(service_config_path: Path):
+def test_worker_capacity_default_is_one(service_config_path: Path):
     config = get_config()
-    assert config.scheduler.worker_capacity == 5
+    assert config.scheduler.worker_capacity == 1
 
     db = get_db_session()
     try:
@@ -248,7 +250,7 @@ def test_worker_capacity_default_is_five(service_config_path: Path):
     finally:
         db.close()
 
-    assert runtime_config["scheduler"]["worker_capacity"] == 5
+    assert runtime_config["scheduler"]["worker_capacity"] == 1
 
 
 def test_database_pool_size_default_is_forty(service_config_path: Path):
@@ -256,6 +258,77 @@ def test_database_pool_size_default_is_forty(service_config_path: Path):
     assert config.database.pool_size == 40
     assert config.database.max_overflow == 20
     assert config.database.pool_timeout == 30
+
+
+def test_agent_cleanup_records_error_timeline_when_residuals_found(
+    service_config_path: Path,
+    framework_config_payload: dict,
+    monkeypatch,
+):
+    execution_id: str
+    db = get_db_session()
+    try:
+        execution_id = _create_pending_execution(db, framework_config_payload, suffix="cleanup-event")
+    finally:
+        db.close()
+
+    db = get_db_session()
+    try:
+        execution = db.get(WorkflowExecution, execution_id)
+        assert execution is not None
+        trigger = db.get(TriggerTask, execution.trigger_task_id)
+        assert trigger is not None
+        execution.owner_pod_id = "worker-pod-cleanup"
+        execution.workspace_root = "/tmp/cleanup-event"
+        db.add(execution)
+        db.commit()
+
+        service = SchedulerService()
+        exec_service = get_execution_service()
+
+        monkeypatch.setattr(
+            exec_service,
+            "_scan_residual_agent_processes",
+            lambda _db, **_kwargs: [
+                {
+                    "pid": 4321,
+                    "ppid": 1,
+                    "pgid": 4321,
+                    "cmdline": "python /tmp/.pi/agent/codex residual",
+                    "classified_type": "pi_agent",
+                    "workspace_match": False,
+                    "pattern_matches": ["codex"],
+                }
+            ],
+        )
+        monkeypatch.setattr(
+            exec_service,
+            "_kill_residual_agent_processes",
+            lambda _db, **_kwargs: (_kwargs["processes"], [], True),
+        )
+
+        report = exec_service._cleanup_residual_agents_for_task(
+            db,
+            trigger=trigger,
+            execution=execution,
+            phase="pre_task_start",
+            cleanup_reason="task_start_guard",
+            strict=True,
+        )
+        assert report is not None
+        assert report["matched_process_count"] == 1
+        assert report["killed_process_count"] == 1
+
+        timeline_events = (
+            db.query(TaskTimelineEvent)
+            .filter(TaskTimelineEvent.task_id == trigger.id)
+            .order_by(TaskTimelineEvent.created_at.asc(), TaskTimelineEvent.id.asc())
+            .all()
+        )
+        assert any(event.event_type == "task_agent_residual_force_killed" and event.level == "error" for event in timeline_events)
+        assert any(event.event_type == "task_agent_cleanup_before_start" for event in timeline_events)
+    finally:
+        db.close()
 
 
 def test_start_execution_now_allows_unlimited_worker_capacity(
