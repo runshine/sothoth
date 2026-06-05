@@ -51,11 +51,11 @@ spec:
           - name: DVS_HEARTBEAT_INTERVAL_SECONDS
             value: "60"
           - name: DVS_MAX_LOCAL_RUNNING_TASKS
-            value: "2"
+            value: "1"
           - name: DVS_CLUSTER_EXPECTED_WORKERS
             value: "1"
           - name: DVS_CLUSTER_EXPECTED_WORKER_CAPACITY
-            value: "2"
+            value: "1"
           - name: DVS_DISPATCH_POLL_INTERVAL_SECONDS
             value: "3"
           - name: DVS_DB_RETRY_MAX_ATTEMPTS
