@@ -648,3 +648,6 @@ binary-to-source → entry-analyse → dataflow-analyse → dataflow-vuln-scan
 ```
 
 通过 `parent_project_id`、`parent_task_id`、`parent_stage_name`、`parent_stage_item_id` 等字段，binary-security 可精确追踪每个子任务与总任务的父子关系，支持 barrier 和 mixed_streaming 两种编排模式。
+
+---
+> 文档版本：`v2.1` @ `5e4b6467` · 代码 `5cd660a9`（2026-06-05）

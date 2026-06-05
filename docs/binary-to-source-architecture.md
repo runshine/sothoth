@@ -501,3 +501,6 @@ Kubernetes
 | **静态验证** | Python regex/grep + gcc -fsyntax-only |
 | **数据库** | MySQL / SQLite (双端各独立) |
 | **并发** | asyncio (适配层) + ThreadPoolExecutor (引擎层) |
+
+---
+> 文档版本：`v2.1` @ `5e4b6467` · 代码 `e7b262be`（2026-06-05）

@@ -648,3 +648,6 @@ agent-helper 容器启动
 | **运行时安全** | Cilium Tetragon (eBPF) |
 | **通信协议** | REST (HTTP/1.1), WebSocket, SSE, A2A (Agent-to-Agent) |
 | **MCP** | Model Context Protocol (SSH 工具) |
+
+---
+> 文档版本：`v2.1` @ `5e4b6467`（2026-06-05）

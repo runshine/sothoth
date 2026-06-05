@@ -615,3 +615,6 @@ entry-analyse → dataflow-analyse → dataflow-vuln-scan
 | **总计** | | | **~6 h** |
 
 > S3 优化前耗时 ~13 h（平均 42.6 tool calls/模块）。预注入优化将每模块 LLM 调用从 42.6 次降至 1 次，耗时从 ~3.8 min/模块降至 ~0.9 min/模块。
+
+---
+> 文档版本：`v2.1` @ `5e4b6467` · 子模块 `d338e4a`（2026-06-05）

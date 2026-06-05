@@ -581,3 +581,6 @@ dataflow-analyse 与 dataflow-vuln-scan 是 SecFlow 流水线中的上下游服�
 | 大型复杂模块 | 15-40 | 3-4 | 3-10 min | 1-3 h |
 
 > 每函数耗时取决于代码行数（100-500 行）和 LLM Provider 并发能力。预注入函数体 + 零 tool call 优化将单函数分析时间压缩了 40-60%（相比传统"read+grep+分析"的多次 tool call 模式）。
+
+---
+> 文档版本：`v2.1` @ `5e4b6467` · 子模块 `740abbd`（2026-06-05）
