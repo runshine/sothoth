@@ -58,6 +58,8 @@ spec:
             value: "1"
           - name: DVS_DISPATCH_POLL_INTERVAL_SECONDS
             value: "3"
+          - name: DVS_EXECUTION_NO_PROGRESS_SECONDS
+            value: "0"
           - name: DVS_DB_RETRY_MAX_ATTEMPTS
             value: "5"
           - name: DVS_DB_RETRY_BASE_DELAY_SECONDS
