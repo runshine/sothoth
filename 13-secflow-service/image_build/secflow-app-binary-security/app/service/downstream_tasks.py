@@ -259,8 +259,8 @@ class DownstreamTaskGateway:
             )
         if stage_name == "entry_analysis" and normalized == "entry_analyse":
             return await self._entry_analyse_client().restart_task(task_id, token or "")
-        if stage_name == "dataflow_analysis" and normalized == "dataflow_analyse":
-            return await self._dataflow_analyse_client().restart_task(task_id)
+        if stage_name == "dataflow_analysis" and normalized == "dataflow_vuln_scanner":
+            return await self._dataflow_vuln_scanner_client().retry_task(task_id, token or "")
         if stage_name == "vuln_scan" and normalized == "dataflow_vuln_scanner":
             return await self._dataflow_vuln_scanner_client().retry_task(task_id, token or "")
         raise ValidationError(f"阶段 {stage_name} 未配置安全重试接口")

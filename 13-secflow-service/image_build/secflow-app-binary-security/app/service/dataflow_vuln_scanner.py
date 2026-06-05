@@ -33,21 +33,47 @@ class DataflowVulnScannerClient(JsonHttpClient):
             "filename": candidate.name or None,
         }
 
-    async def create_task(self, project_id: str, title: str, token: str, data_flow_path: str, source_dir: str, origin: dict[str, Any] | None = None) -> dict:
-        # DFVS now owns its standard run/output layout under
-        # /data/files/<project>/app/secflow-app-dataflow-vuln-scanner.  Do not
-        # pass absolute workspace/output refs; send project-scoped input refs so
-        # allow_absolute_input_refs can remain disabled.
-        origin_payload = dict(origin or {})
+    async def create_task(
+        self,
+        project_id: str,
+        task_name: str,
+        module_input_path: str,
+        source_root_path: str,
+        prompt_content: str,
+        origin: dict[str, Any] | None = None,
+        *,
+        source_file: str | None = None,
+        function_name: str | None = None,
+        line_hint: str | None = None,
+        definition_kind: str | None = None,
+        taint_params: list[str] | None = None,
+        function_description: str | None = None,
+        entry_reason: str | None = None,
+        taint_details: list[dict[str, Any]] | None = None,
+        function_description_source: str | None = None,
+        entry_reason_source: str | None = None,
+    ) -> dict:
         return await self.post(
             f"{self.API_PREFIX}/tasks",
-            token=token,
             json_body={
                 "project_id": project_id,
-                "title": title,
-                "data_flow": self._project_filesystem_ref(project_id, data_flow_path),
-                "source_dir": self._project_filesystem_ref(project_id, source_dir),
-                **origin_payload,
+                "task_name": task_name,
+                "input_path": module_input_path,
+                "module_input_path": module_input_path,
+                "source_root_path": source_root_path,
+                "task_description": "由 binary security 编排器触发的漏洞扫描任务",
+                "prompt_content": prompt_content,
+                "source_file": source_file,
+                "function_name": function_name,
+                "line_hint": line_hint,
+                "definition_kind": definition_kind,
+                "taint_params": taint_params or [],
+                "function_description": function_description or "",
+                "function_description_source": function_description_source or "",
+                "entry_reason": entry_reason or "",
+                "entry_reason_source": entry_reason_source or "",
+                "taint_details": taint_details or [],
+                **(origin or {}),
             },
         )
 

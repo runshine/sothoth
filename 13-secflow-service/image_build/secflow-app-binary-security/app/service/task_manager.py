@@ -867,8 +867,7 @@ STAGE_RETRY_ENDPOINTS = {
     "system_analysis": ("system_analyse", "restart"),
     "binary_to_source": ("binary_to_source", "retry"),
     "entry_analysis": ("entry_analyse", "restart"),
-    "dataflow_analysis": ("dataflow_analyse", "restart"),
-    "vuln_scan": ("dataflow_vuln_scanner", "retry"),
+    "dataflow_analysis": ("dataflow_vuln_scanner", "retry"),
 }
 SERVICE_STAGE_NAMES = {service: stage_name for stage_name, (service, _action) in STAGE_RETRY_ENDPOINTS.items()}
 SOURCE_TASK_INPUT_KEY = "source_project"
@@ -885,8 +884,7 @@ STAGE_OUTPUT_SERVICES = {
     "system_analysis": ["system_analyse"],
     "binary_to_source": ["binary_to_source"],
     "entry_analysis": ["entry_analyse"],
-    "dataflow_analysis": ["dataflow_analyse"],
-    "vuln_scan": ["dataflow_vuln_scanner"],
+    "dataflow_analysis": ["dataflow_vuln_scanner"],
 }
 DOWNSTREAM_APP_ROOTS = {
     "firmware_unpacker": "secflow-app-firmware-unpacker",
@@ -19994,7 +19992,7 @@ class TaskManager:
                 item_key=entry_key,
                 item_name=str(entry.get("function_name") or "").strip() or None,
                 parent_key=str(entry.get("module_key") or "").strip() or None,
-                downstream_service="dataflow_analyse",
+                downstream_service="dataflow_vuln_scanner",
                 input_ref=normalized_entry,
                 output_ref={},
                 retrying=False,
@@ -21419,7 +21417,7 @@ class TaskManager:
             return None
         try:
             listed = await self._downstream_list_tasks(
-                service="dataflow_analyse",
+                service="dataflow_vuln_scanner",
                 project_id=task.project_id,
                 token=None,
                 parent_task_id=task.id,
@@ -24450,7 +24448,7 @@ class TaskManager:
             task=task,
             stage_run=stage_run,
             inputs=entries,
-            downstream_service="dataflow_analyse",
+            downstream_service="dataflow_vuln_scanner",
             identity=lambda entry: (
                 entry["entry_key"],
                 entry["function_name"],
@@ -25923,7 +25921,7 @@ class TaskManager:
                 item_key=entry["entry_key"],
                 item_name=entry["function_name"],
                 parent_key=entry["module_key"],
-                downstream_service="dataflow_analyse",
+                downstream_service="dataflow_vuln_scanner",
                 input_ref=entry,
                 retrying=retrying,
                 auto_retrying=auto_retrying,
@@ -26166,10 +26164,10 @@ class TaskManager:
                         session,
                         task,
                         item,
-                        service="dataflow_analyse",
+                        service="dataflow_vuln_scanner",
                         token=None,
                         payload={
-                            "task_name": f"{task.name}-{entry['function_name']}-dfa",
+                            "task_name": f"{task.name}-{entry['function_name']}-scan",
                             "module_input_path": module_input_path,
                             "source_root_path": source_root_path,
                             "prompt_content": prompt,
