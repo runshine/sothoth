@@ -457,7 +457,9 @@ runs/{run_name}/workspace/vuln_scan_{task_id}/
 |:---|:---|:---|:---|
 | **api** | `secflow-app-dataflow-vuln-scanner-api` | 2 | REST API + 任务 CRUD + 服务注册 |
 | **manager** | `secflow-app-dataflow-vuln-scanner-manager` | 2 | 任务调度 + 状态流转 + LLM Provider 同步 + 配置下发 |
-| **worker** | `secflow-app-dataflow-vuln-scanner-worker` (StatefulSet) | 2 | 任务消费 + 子进程执行 + Agent 调用 + 进度上报 |
+| **worker** | `secflow-app-dataflow-vuln-scanner-worker` (StatefulSet) | 2 | 任务消费 + 子进程执行 + Agent 调用 + 进度上报。**单槽执行**（同时最多 1 个任务），每个任务启动前执行 Agent 进程清理 |
+
+> **架构演进**：worker 角色已改为单槽模式——通过 `execution_service.py` 强制执行单任务约束，每个 worker Pod 同时只运行一个 `run_vuln_scan.py` 子进程。任务启动前自动清理残留的 pi Agent 进程，防止僵尸进程累积。多任务并发通过水平扩展 worker Pod 数量实现。
 
 **三角色职责边界**：
 
