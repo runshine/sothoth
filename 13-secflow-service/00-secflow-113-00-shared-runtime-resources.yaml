@@ -1,12 +1,14 @@
-apiVersion: v1
-kind: Secret
-metadata:
-  name: secflow-app-dataflow-vuln-scanner-secret
-  namespace: secflow-ns
-type: Opaque
-data:
-  db-password: SHVhd2VpMTIjJA==
-  service-machine-token: azdhZGk1SWFnS0FaNTRhTnhTNzdOc0RaU3BXdmV5UG42aWF4bXJ3bC1HNExYbkVUR1dNYkVhU3NYMUtWdXFoOA==
+# [DISABLED] secflow-app-dataflow-vuln-scanner-secret - 方便后续复用
+# ---
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: secflow-app-dataflow-vuln-scanner-secret
+#   namespace: secflow-ns
+# type: Opaque
+# data:
+#   db-password: SHVhd2VpMTIjJA==
+#   service-machine-token: azdhZGk1SWFnS0FaNTRhTnhTNzdOc0RaU3BXdmV5UG42aWF4bXJ3bC1HNExYbkVUR1dNYkVhU3NYMUtWdXFoOA==
 ---
 apiVersion: v1
 kind: Secret

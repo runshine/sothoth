@@ -149,13 +149,14 @@ spec:
                 name: secflow-app-dataflow-vuln-scan
                 port:
                   number: 80
-          - path: /api/dataflow-vuln-scanner
-            pathType: Prefix
-            backend:
-              service:
-                name: secflow-app-dataflow-vuln-scanner
-                port:
-                  number: 80
+          # [DISABLED] secflow-app-dataflow-vuln-scanner - 方便后续复用
+          # - path: /api/dataflow-vuln-scanner
+          #   pathType: Prefix
+          #   backend:
+          #     service:
+          #       name: secflow-app-dataflow-vuln-scanner
+          #       port:
+          #         number: 80
           - path: /api/app/firmware-unpacker
             pathType: Prefix
             backend:

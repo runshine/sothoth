@@ -750,6 +750,43 @@ def test_manager_dispatch_requires_registry_worker(
         db.close()
 
 
+@pytest.mark.asyncio
+async def test_manager_dispatch_loop_continues_after_iteration_error(
+    service_config_path: Path,
+    monkeypatch,
+):
+    config = get_config()
+    config.scheduler.enabled = True
+    config.scheduler.role = "manager"
+    config.scheduler.poll_interval_seconds = 1
+
+    sleep_calls = 0
+    original_sleep = asyncio.sleep
+
+    async def fake_sleep(_interval):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls > 2:
+            raise asyncio.CancelledError
+        await original_sleep(0)
+
+    dispatch_calls = 0
+
+    def fake_dispatch_once(self):
+        nonlocal dispatch_calls
+        dispatch_calls += 1
+        if dispatch_calls == 1:
+            raise RuntimeError("transient dispatch failure")
+
+    monkeypatch.setattr("app.services.scheduler.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(SchedulerService, "_dispatch_pending_to_workers_once", fake_dispatch_once)
+
+    with pytest.raises(asyncio.CancelledError):
+        await SchedulerService()._manager_dispatch_loop()
+
+    assert dispatch_calls == 2
+
+
 def test_worker_jobs_api_claims_and_starts_assigned_execution(
     service_config_path: Path,
     framework_config_payload: dict,

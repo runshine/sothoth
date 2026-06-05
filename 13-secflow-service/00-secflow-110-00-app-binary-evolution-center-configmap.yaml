@@ -63,10 +63,11 @@ data:
         level2_name: "二进制安全"
         level3_name: "进化中心"
 
-    dataflow_vuln_service:
-      base_url: "http://secflow-app-dataflow-vuln-scanner"
-      api_prefix: "/api/dataflow-vuln-scanner"
-      timeout: 60
+    # [DISABLED] secflow-app-dataflow-vuln-scanner - 方便后续复用
+    # dataflow_vuln_service:
+    #   base_url: "http://secflow-app-dataflow-vuln-scanner"
+    #   api_prefix: "/api/dataflow-vuln-scanner"
+    #   timeout: 60
 
     vuln_service:
       base_url: "http://secflow-platform-vuln"

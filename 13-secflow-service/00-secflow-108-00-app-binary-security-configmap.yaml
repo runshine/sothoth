@@ -83,9 +83,10 @@ data:
       dataflow_analyse:
         base_url: "http://secflow-app-dataflow-analyse"
         timeout: 60
-      dataflow_vuln_scanner:
-        base_url: "http://secflow-app-dataflow-vuln-scanner"
-        timeout: 120
+      # [DISABLED] secflow-app-dataflow-vuln-scanner - 方便后续复用
+      # dataflow_vuln_scanner:
+      #   base_url: "http://secflow-app-dataflow-vuln-scanner"
+      #   timeout: 120
       fileserver:
         base_url: "http://secflow-platform-fileserver/api/fileserver"
         timeout: 30

@@ -1,0 +1,27 @@
+[
+  {
+    "source_task_id": "tt-7e8e2fecae3148b0a6be",
+    "derived_task_id": "tt-ff1925fc55534259a836",
+    "status": "failed",
+    "run_id": "exec-0f741829a4534b6fa694",
+    "duration_seconds": 11.687393530039117,
+    "results_summary": {
+      "task_id": "tt-ff1925fc55534259a836",
+      "status": "failed",
+      "title": "Evolution round 1 / tt-7e8e2fecae3148b0a6be",
+      "latest_execution_id": "exec-0f741829a4534b6fa694",
+      "latest_run_id": null,
+      "result_count": 0,
+      "vuln_report_status": {
+        "enabled": true,
+        "status": "not_started",
+        "total": 0,
+        "reported": 0,
+        "failed": 0,
+        "pending": 0,
+        "items": []
+      }
+    },
+    "error": null
+  }
+]

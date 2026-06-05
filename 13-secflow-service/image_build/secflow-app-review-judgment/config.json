@@ -1,0 +1,19 @@
+{
+  "_description": "评审研判 CLI 默认配置",
+  "reviewer": {
+    "model": "icsl/zai-org/GLM-5",
+    "thinking": "high",
+    "tools": "read,bash,edit,write",
+    "timeout_seconds": 3600,
+    "max_retries": 3,
+    "retry_interval_seconds": 30
+  },
+  "worker": {
+    "model": "icsl/zai-org/GLM-5",
+    "thinking": "high",
+    "tools": "read,bash,edit,write",
+    "timeout_seconds": 3600,
+    "max_retries": 3,
+    "retry_interval_seconds": 30
+  }
+}
