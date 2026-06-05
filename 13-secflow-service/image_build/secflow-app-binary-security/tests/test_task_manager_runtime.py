@@ -330,6 +330,67 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         observe_health.assert_called_once()
         self.assertEqual(0, observe_health.call_args.kwargs["consecutive_crash_count"])
 
+    async def test_downstream_reconcile_loop_recovers_from_runtime_metrics_failure(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.cfg.scheduler.downstream_reconcile_interval_seconds = 5
+        sleep_calls = []
+        observed_candidates = []
+
+        async def _sleep(seconds):
+            sleep_calls.append(seconds)
+            if seconds == 1:
+                manager._running = False
+
+        async def _observe_runtime_metrics(_db, reconcile_candidates=0):
+            observed_candidates.append(reconcile_candidates)
+            raise RuntimeError("boom")
+
+        async def _run_with_limits(refs, func, concurrency, timeout_seconds):
+            del refs, func, concurrency, timeout_seconds
+            return []
+
+        manager._list_tasks_needing_downstream_sync = lambda _db: []
+        manager._run_with_limits = _run_with_limits
+        manager._observe_runtime_metrics = _observe_runtime_metrics
+
+        with (
+            patch("app.service.task_manager.asyncio.sleep", new=_sleep),
+            patch("app.service.task_manager.logger.exception") as logger_exception,
+        ):
+            await manager._downstream_reconcile_loop()
+
+        self.assertEqual([0], observed_candidates)
+        self.assertIn(1, sleep_calls)
+        logger_exception.assert_called_once()
+
+    async def test_stage_item_sync_reconcile_loop_recovers_from_runtime_failure(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.cfg.scheduler.stage_item_sync_reconcile_interval_seconds = 5
+        sleep_calls = []
+
+        async def _sleep(seconds):
+            sleep_calls.append(seconds)
+            if seconds == 1:
+                manager._running = False
+
+        async def _run_with_limits(refs, func, concurrency, timeout_seconds):
+            del refs, func, concurrency, timeout_seconds
+            return []
+
+        manager._list_tasks_with_stale_stage_item_syncs = lambda _db: (_ for _ in ()).throw(RuntimeError("boom"))
+        manager._run_with_limits = _run_with_limits
+
+        with (
+            patch("app.service.task_manager.asyncio.sleep", new=_sleep),
+            patch("app.service.task_manager.logger.exception") as logger_exception,
+        ):
+            await manager._stage_item_sync_reconcile_loop()
+
+        self.assertIn(1, sleep_calls)
+        logger_exception.assert_called_once()
+
     async def test_readless_reconcile_loop_commits_per_task_and_stops_after_sleep(self):
         manager = TaskManager()
         manager._running = True

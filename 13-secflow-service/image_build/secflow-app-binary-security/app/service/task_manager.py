@@ -11138,6 +11138,12 @@ class TaskManager:
                             db.rollback()
                     await self._observe_runtime_metrics(db, reconcile_candidates=len(task_refs))
                     self._mark_loop_heartbeat("downstream_reconcile")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._recover_loop_db_error("downstream_reconcile", db, exc)
+                logger.exception("binary-security downstream reconcile loop crashed and recovered")
+                await asyncio.sleep(1)
             finally:
                 db.close()
             await asyncio.sleep(interval_seconds)
@@ -11196,6 +11202,12 @@ class TaskManager:
                             )
                             db.commit()
                     self._mark_loop_heartbeat("stage_item_sync_reconcile")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._recover_loop_db_error("stage_item_sync_reconcile", db, exc)
+                logger.exception("binary-security stage item sync reconcile loop crashed and recovered")
+                await asyncio.sleep(1)
             finally:
                 db.close()
             await asyncio.sleep(interval_seconds)
