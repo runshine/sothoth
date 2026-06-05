@@ -64,6 +64,15 @@ Entry Analyse 不做抽样、不依赖启发式规则。它抓住的核心突破
 
 ### 5.1 六阶段流水线
 
+系统提供两套流水线引擎：
+
+| 引擎 | 文件 | 适用场景 |
+|:---|:---|:---|
+| **完整模式** | `engine.py` | 默认，所有函数经过完整 R3 Agent 分析 |
+| **Lean 模式** | `lean_engine.py` | `api_filter_entry_judge=True` 时启用，在 R2 与 R3 之间插入 API_Filter 预筛 |
+
+两套引擎的阶段定义一致，Lean 模式仅增加 API_Filter 预筛阶段。
+
 每个阶段由 **Worker（执行分析）+ Judge（验证结论）** 双角色构成。Worker 负责分析并产出结论，Judge 以独立上下文验证结论的正确性。Judge 不通过时，Worker 带反馈重试，形成闭环修正。
 
 ```
@@ -120,6 +129,10 @@ Judge 验证：taints 非空（有参函数）、tag 合法、has_external_input
 R3 与 CC 完全并行——R3 不需要调用链信息即可独立判断该函数是否有外部输入。
 
 可选：`api_filter_entry_judge = True` 时，在 R2 与 R3 之间插入轻量 API_Filter（直接调用 LLM API，无 pi 子进程）。AF 判定非入口 → 直接跳过完整 R3 分析，减少 30-50% 的计算。
+
+API_Filter 采用独立超时控制（每函数 `EA_API_FILTER_TIMEOUT_SECONDS`，默认 45s），超时函数保守保留（不漏报）。每次 Filter 调用的 LLM 对话历史写入独立 JSONL session 文件，支持审计回溯。
+
+当启用 API_Filter 时，流水线引擎切换为 **LeanPipelineEngine**（`lean_engine.py`）——这是 `engine.py` 的并行变体，在 R2 与 R3 之间插入 API_Filter 阶段，其余阶段与完整模式一致。
 
 #### CC — 静态调用链建图（模块级，无 LLM）
 
@@ -251,16 +264,19 @@ Skills 是注入 LLM Agent 上下文的轻量级指令模块。Worker/Judge 启�
 
 ### 6.1 运行时角色
 
-Entry Analyse 在 SecFlow 平台中以微服务形式运行（`secflow-app-entry-analyse`），支持两种模式：
+Entry Analyse 在 SecFlow 平台中以微服务形式运行（`secflow-app-entry-analyse`），支持三种运行时角色：
 
-| 模式 | 入口 | 说明 |
+| 角色 | 入口 | 说明 |
 |------|------|------|
-| REST API | `main.py` → FastAPI Server | 接收任务、SSE 实时事件流、结果查询 |
-| CLI | `cli.py` | 单次分析，Docker 容器内运行 |
+| `api` | `main.py` → FastAPI Server | 接收任务、SSE 实时事件流、结果查询 |
+| `worker` | WorkerService 后台循环 | 消费任务队列，执行流水线分析。启动前校验 `RUNTIME_ROLE_WORKER`，非 worker Pod 拒绝执行 |
+| CLI | `cli.py` | 单次分析，Docker 容器内运行（`runtime_role=standalone`） |
 
 ### 6.2 智能体进程管理
 
 Worker Pod 内智能体进程并发由 `AgentProcessSlotManager` 统一管理。单任务可吃满所在 Pod 的全部智能体槽位；多任务共享 FIFO 槽位队列。上限由 `EA_AGENT_PROCESS_LIMIT` 环境变量和配置页热生效。
+
+Worker 心跳上报包含 `runtime_role` 标识，集群调度基于角色进行任务分配，确保分析任务只被路由到 worker Pod。
 
 ### 6.3 外部依赖
 
