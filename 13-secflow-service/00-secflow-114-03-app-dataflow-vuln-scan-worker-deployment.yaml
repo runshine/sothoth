@@ -4,7 +4,7 @@ metadata:
   name: secflow-app-dataflow-vuln-scan-worker
   namespace: secflow-ns
 spec:
-  replicas: 1
+  replicas: 2
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -53,7 +53,7 @@ spec:
           - name: DVS_MAX_LOCAL_RUNNING_TASKS
             value: "1"
           - name: DVS_CLUSTER_EXPECTED_WORKERS
-            value: "1"
+            value: "2"
           - name: DVS_CLUSTER_EXPECTED_WORKER_CAPACITY
             value: "1"
           - name: DVS_DISPATCH_POLL_INTERVAL_SECONDS
