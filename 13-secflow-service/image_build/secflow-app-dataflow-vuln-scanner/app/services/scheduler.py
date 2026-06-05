@@ -1037,27 +1037,36 @@ class SchedulerService:
         interval = get_config().scheduler.poll_interval_seconds
         while True:
             await asyncio.sleep(interval)
-            if not self.runs_worker:
-                continue
-            if self._worker_status != "active":
-                continue
-            while self.has_available_capacity():
-                execution_id = await asyncio.to_thread(self._claim_next_execution)
-                if not execution_id:
-                    break
-                self._schedule_execution(execution_id)
+            try:
+                if not self.runs_worker:
+                    continue
+                if self._worker_status != "active":
+                    continue
+                while self.has_available_capacity():
+                    execution_id = await asyncio.to_thread(self._claim_next_execution)
+                    if not execution_id:
+                        break
+                    self._schedule_execution(execution_id)
+            except Exception:
+                logger.exception("scheduler dispatch loop iteration failed")
 
     async def _assigned_dispatch_loop(self) -> None:
         interval = get_config().scheduler.poll_interval_seconds
         while True:
             await asyncio.sleep(interval)
-            await asyncio.to_thread(self._start_assigned_jobs)
+            try:
+                await asyncio.to_thread(self._start_assigned_jobs)
+            except Exception:
+                logger.exception("scheduler assigned dispatch loop iteration failed")
 
     async def _manager_dispatch_loop(self) -> None:
         interval = get_config().scheduler.poll_interval_seconds
         while True:
             await asyncio.sleep(interval)
-            await asyncio.to_thread(self._dispatch_pending_to_workers_once)
+            try:
+                await asyncio.to_thread(self._dispatch_pending_to_workers_once)
+            except Exception:
+                logger.exception("scheduler manager dispatch loop iteration failed")
 
     def _dispatch_pending_to_workers_once(self) -> None:
         if not self.is_manager_role:
@@ -2169,7 +2178,10 @@ class SchedulerService:
         interval = get_config().scheduler.cleanup_interval_seconds
         while True:
             await asyncio.sleep(interval)
-            await asyncio.to_thread(self._cleanup_once)
+            try:
+                await asyncio.to_thread(self._cleanup_once)
+            except Exception:
+                logger.exception("scheduler cleanup loop iteration failed")
 
     async def _active_reconcile_loop(self) -> None:
         interval = max(1, int(get_config().scheduler.active_reconcile_interval_seconds or 30))

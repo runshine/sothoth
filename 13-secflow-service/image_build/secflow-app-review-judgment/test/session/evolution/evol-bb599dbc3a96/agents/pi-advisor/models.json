@@ -1,0 +1,73 @@
+{
+  "providers": {
+    "local_minimax": {
+      "baseUrl": "http://172.31.29.10/v1",
+      "api": "openai-completions",
+      "apiKey": "sk-vpb2kN107QRwuEoAKLi_tA",
+      "models": [
+        {
+          "id": "MiniMax/MiniMax-M2.5",
+          "reasoning": false,
+          "name": "MiniMax/MiniMax-M2.5",
+          "input": [
+            "text"
+          ],
+          "contextWindow": 160000,
+          "maxTokens": 8192,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        }
+      ]
+    },
+    "gaiasec": {
+      "baseUrl": "http://gaiasec-api-gateway/v1",
+      "api": "openai-completions",
+      "apiKey": "1111",
+      "models": [
+        {
+          "id": "auto",
+          "reasoning": false,
+          "name": "auto",
+          "input": [
+            "text"
+          ],
+          "contextWindow": 128000,
+          "maxTokens": 8192,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        }
+      ]
+    },
+    "local_codex": {
+      "baseUrl": "http://172.31.29.10/v1",
+      "api": "openai-completions",
+      "apiKey": "sk-kRfP4uOZi3JTrnt859pbtw",
+      "models": [
+        {
+          "id": "zai-org/GLM-5",
+          "reasoning": false,
+          "name": "zai-org/GLM-5",
+          "input": [
+            "text"
+          ],
+          "contextWindow": 128000,
+          "maxTokens": 8192,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        }
+      ]
+    }
+  }
+}

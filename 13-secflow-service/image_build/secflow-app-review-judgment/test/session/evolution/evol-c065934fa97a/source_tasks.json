@@ -1,0 +1,3624 @@
+[
+  {
+    "task_id": "tt-7e8e2fecae3148b0a6be",
+    "execution_id": "exec-517565ce7c754256aa54",
+    "title": "Resume 5.26_audit_2",
+    "case_ids": [
+      "case-20260526-112436-387583495a",
+      "case-20260526-112436-0eb49e2534",
+      "case-20260526-112436-6efa9cd0a5",
+      "case-20260526-112437-7db5549934",
+      "case-20260526-112437-908a39611e",
+      "case-20260526-112436-e36ede15d6",
+      "case-20260526-112436-d989f92245",
+      "case-20260526-112435-a4cb0fa13d",
+      "case-20260526-112435-8d04d70b51",
+      "case-20260526-112435-07bcfd129a",
+      "case-20260526-112435-450780712f",
+      "case-20260526-112434-f1f0be0569",
+      "case-20260526-112434-48c0c11df7"
+    ],
+    "agent_state_dirs": {
+      "pi-worker": {
+        "agent_id": "pi-worker",
+        "root_dir": "/data/files/44f9029d00650a10/DATAFLOW_VULN_SCANNER/agent-state/shared/pi-worker",
+        "skills_dir": "/data/files/44f9029d00650a10/DATAFLOW_VULN_SCANNER/agent-state/shared/pi-worker/skills",
+        "memory_dir": "/data/files/44f9029d00650a10/DATAFLOW_VULN_SCANNER/agent-state/shared/pi-worker/memory",
+        "source": "shared_default"
+      },
+      "pi-advisor": {
+        "agent_id": "pi-advisor",
+        "root_dir": "/data/files/44f9029d00650a10/DATAFLOW_VULN_SCANNER/agent-state/shared/pi-advisor",
+        "skills_dir": "/data/files/44f9029d00650a10/DATAFLOW_VULN_SCANNER/agent-state/shared/pi-advisor/skills",
+        "memory_dir": "/data/files/44f9029d00650a10/DATAFLOW_VULN_SCANNER/agent-state/shared/pi-advisor/memory",
+        "source": "shared_default"
+      }
+    },
+    "task_detail": {
+      "task_id": "tt-7e8e2fecae3148b0a6be",
+      "project_id": "44f9029d00650a10",
+      "task_purpose": "normal",
+      "agent_state_dirs": {
+        "pi-worker": {
+          "agent_id": "pi-worker",
+          "root_dir": "/data/files/44f9029d00650a10/DATAFLOW_VULN_SCANNER/agent-state/shared/pi-worker",
+          "skills_dir": "/data/files/44f9029d00650a10/DATAFLOW_VULN_SCANNER/agent-state/shared/pi-worker/skills",
+          "memory_dir": "/data/files/44f9029d00650a10/DATAFLOW_VULN_SCANNER/agent-state/shared/pi-worker/memory",
+          "source": "shared_default"
+        },
+        "pi-advisor": {
+          "agent_id": "pi-advisor",
+          "root_dir": "/data/files/44f9029d00650a10/DATAFLOW_VULN_SCANNER/agent-state/shared/pi-advisor",
+          "skills_dir": "/data/files/44f9029d00650a10/DATAFLOW_VULN_SCANNER/agent-state/shared/pi-advisor/skills",
+          "memory_dir": "/data/files/44f9029d00650a10/DATAFLOW_VULN_SCANNER/agent-state/shared/pi-advisor/memory",
+          "source": "shared_default"
+        }
+      },
+      "derived_from_task_id": null,
+      "derived_from_execution_id": null,
+      "derived_from_run_id": null,
+      "derivation_kind": null,
+      "task_origin_type": "manual",
+      "parent_project_id": null,
+      "parent_task_id": null,
+      "parent_task_type": null,
+      "parent_stage_name": null,
+      "parent_stage_item_id": null,
+      "parent_stage_item_key": null,
+      "origin_label": "手动任务",
+      "parent_task_display": null,
+      "profile_id": "wfd-4f30eb62c60f40698fdc",
+      "profile_version": 7,
+      "title": "Resume 5.26_audit_2",
+      "status": "succeeded",
+      "control_state": "none",
+      "latest_attempt_no": 2,
+      "retry_count": 0,
+      "max_retry_count": 3,
+      "priority": 100,
+      "created_by": "system",
+      "created_at": "2026-05-26T15:38:24",
+      "started_at": "2026-05-26T17:50:58",
+      "finished_at": "2026-05-26T19:23:57",
+      "message": "run index reconciled to success",
+      "latest_execution_id": "exec-517565ce7c754256aa54",
+      "owner_pod_id": "secflow-app-dataflow-vuln-scanner-worker-0",
+      "dispatch_status": "succeeded",
+      "slot_binding_state": "released",
+      "slot_binding_reason": null,
+      "run_name": "5.26_audit_2",
+      "runs_root": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner",
+      "run_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+      "run": {
+        "name": "5.26_audit_2",
+        "root_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner",
+        "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+        "linked_task_id": "tt-7e8e2fecae3148b0a6be",
+        "linked_execution_id": "exec-517565ce7c754256aa54",
+        "run_id": "ri-f96c1de3090c478f8df7",
+        "project_id": "44f9029d00650a10",
+        "source_type": "execution_workspace",
+        "source_key": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+        "profile_id": "wfd-4f30eb62c60f40698fdc",
+        "status": "completed",
+        "start_time": "",
+        "start_epoch": 1779809905,
+        "duration_seconds": 13531,
+        "last_activity": "2026-05-26T19:23:57+08:00",
+        "model": "local_minimax/MiniMax/MiniMax-M2.5",
+        "provider": "",
+        "thinking": "",
+        "review_profile": "audit",
+        "max_cycles": 10,
+        "cycles_used": 4,
+        "result_count": 13,
+        "passed_count": 13,
+        "failed_count": 0,
+        "workflow_mode": "discovery",
+        "updated_at": "2026-05-26T19:24:30+08:00",
+        "process_state": {
+          "checked_at": "2026-06-01T18:15:25.133523+08:00",
+          "stale_after_seconds": 300,
+          "run_status": "completed",
+          "trigger_task_id": "tt-7e8e2fecae3148b0a6be",
+          "trigger_status": "succeeded",
+          "execution_id": "exec-517565ce7c754256aa54",
+          "execution_status": "succeeded",
+          "process_status": "exited",
+          "can_retry": true,
+          "is_running": false,
+          "is_queued": false,
+          "reason": "任务已进入终态，无活跃 run_vuln_scan.py 进程",
+          "source": "terminal_linked_status"
+        }
+      },
+      "latest_run": {
+        "name": "5.26_audit_2",
+        "root_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner",
+        "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+        "linked_task_id": "tt-7e8e2fecae3148b0a6be",
+        "linked_execution_id": "exec-517565ce7c754256aa54",
+        "run_id": "ri-f96c1de3090c478f8df7",
+        "project_id": "44f9029d00650a10",
+        "source_type": "execution_workspace",
+        "source_key": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+        "profile_id": "wfd-4f30eb62c60f40698fdc",
+        "status": "completed",
+        "start_time": "",
+        "start_epoch": 1779809905,
+        "duration_seconds": 13531,
+        "last_activity": "2026-05-26T19:23:57+08:00",
+        "model": "local_minimax/MiniMax/MiniMax-M2.5",
+        "provider": "",
+        "thinking": "",
+        "review_profile": "audit",
+        "max_cycles": 10,
+        "cycles_used": 4,
+        "result_count": 13,
+        "passed_count": 13,
+        "failed_count": 0,
+        "workflow_mode": "discovery",
+        "updated_at": "2026-05-26T19:24:30+08:00",
+        "process_state": {
+          "checked_at": "2026-06-01T18:15:25.133523+08:00",
+          "stale_after_seconds": 300,
+          "run_status": "completed",
+          "trigger_task_id": "tt-7e8e2fecae3148b0a6be",
+          "trigger_status": "succeeded",
+          "execution_id": "exec-517565ce7c754256aa54",
+          "execution_status": "succeeded",
+          "process_status": "exited",
+          "can_retry": true,
+          "is_running": false,
+          "is_queued": false,
+          "reason": "任务已进入终态，无活跃 run_vuln_scan.py 进程",
+          "source": "terminal_linked_status"
+        }
+      },
+      "auto_report_vulnerabilities": true,
+      "vuln_report_status": {
+        "enabled": true,
+        "status": "reported",
+        "total": 13,
+        "reported": 13,
+        "failed": 0,
+        "pending": 0,
+        "items": [
+          {
+            "result_file": "result_001.md",
+            "status": "reported",
+            "case_id": "case-20260526-112434-f1f0be0569",
+            "attempt_count": 1,
+            "last_error": null,
+            "reported_at": "2026-05-26T19:24:35"
+          },
+          {
+            "result_file": "result_002.md",
+            "status": "reported",
+            "case_id": "case-20260526-112434-48c0c11df7",
+            "attempt_count": 1,
+            "last_error": null,
+            "reported_at": "2026-05-26T19:24:35"
+          },
+          {
+            "result_file": "result_003.md",
+            "status": "reported",
+            "case_id": "case-20260526-112435-450780712f",
+            "attempt_count": 1,
+            "last_error": null,
+            "reported_at": "2026-05-26T19:24:35"
+          },
+          {
+            "result_file": "result_004.md",
+            "status": "reported",
+            "case_id": "case-20260526-112435-a4cb0fa13d",
+            "attempt_count": 1,
+            "last_error": null,
+            "reported_at": "2026-05-26T19:24:36"
+          },
+          {
+            "result_file": "result_005.md",
+            "status": "reported",
+            "case_id": "case-20260526-112435-8d04d70b51",
+            "attempt_count": 1,
+            "last_error": null,
+            "reported_at": "2026-05-26T19:24:36"
+          },
+          {
+            "result_file": "result_006.md",
+            "status": "reported",
+            "case_id": "case-20260526-112435-07bcfd129a",
+            "attempt_count": 1,
+            "last_error": null,
+            "reported_at": "2026-05-26T19:24:36"
+          },
+          {
+            "result_file": "result_007.md",
+            "status": "reported",
+            "case_id": "case-20260526-112436-e36ede15d6",
+            "attempt_count": 1,
+            "last_error": null,
+            "reported_at": "2026-05-26T19:24:36"
+          },
+          {
+            "result_file": "result_008.md",
+            "status": "reported",
+            "case_id": "case-20260526-112436-d989f92245",
+            "attempt_count": 1,
+            "last_error": null,
+            "reported_at": "2026-05-26T19:24:36"
+          },
+          {
+            "result_file": "result_009.md",
+            "status": "reported",
+            "case_id": "case-20260526-112436-6efa9cd0a5",
+            "attempt_count": 1,
+            "last_error": null,
+            "reported_at": "2026-05-26T19:24:37"
+          },
+          {
+            "result_file": "result_010.md",
+            "status": "reported",
+            "case_id": "case-20260526-112436-387583495a",
+            "attempt_count": 1,
+            "last_error": null,
+            "reported_at": "2026-05-26T19:24:37"
+          },
+          {
+            "result_file": "result_011.md",
+            "status": "reported",
+            "case_id": "case-20260526-112436-0eb49e2534",
+            "attempt_count": 1,
+            "last_error": null,
+            "reported_at": "2026-05-26T19:24:37"
+          },
+          {
+            "result_file": "result_012.md",
+            "status": "reported",
+            "case_id": "case-20260526-112437-908a39611e",
+            "attempt_count": 1,
+            "last_error": null,
+            "reported_at": "2026-05-26T19:24:37"
+          },
+          {
+            "result_file": "result_013.md",
+            "status": "reported",
+            "case_id": "case-20260526-112437-7db5549934",
+            "attempt_count": 1,
+            "last_error": null,
+            "reported_at": "2026-05-26T19:24:37"
+          }
+        ]
+      },
+      "abnormal_reason_title": null,
+      "abnormal_reason_code": null,
+      "abnormal_reason_category": null,
+      "abnormal_reason": null,
+      "task_markdown": "# 漏洞挖掘任务\n\n## 任务目标\n基于数据流污点分析结果，对入口函数 `IPSEC_SOCKI_PipeMsg` 及调用链中共 61 个跟踪函数进行漏洞挖掘。重点验证污点从入口参数、派生对象、网络或管道数据进入后，在源码中的传播、边界检查、清洗、外部调用和危险内存操作是否形成可利用问题。\n\n## 输入目录\n\n### 数据流污点分析结果目录\n`/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/input/dataflows`\n\n- `/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/input/dataflows/final_report.md`：从入口函数开始的整体污点分析报告，包含根函数、调用链函数列表、污点源、传播路径、DIRECT_SINK/USED/EXPORT/CLEANED 终点和安全备注。\n- `/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/input/dataflows/dataflow`：子函数级污点分析结果，共 61 个 `.md` 文件。每个文件对应一个被跟入函数，记录该函数接收的污点、内部传播、导入对象、终点和高危操作。\n\n数据流标记含义：\n- `DIRECT_SINK`：污点在当前函数内直接进入高危操作（最高优先级核查点。比如污点控制 memcpy/strcpy/sprintf 的大小或指针、整数截断、污点下标、污点偏移、污点控制循环边界等。它表示“这里可能直接形成漏洞”，但仍需源码验证。）\n- `USED`：污点被当前函数最终消费（表示数据流到这里结束或被用于某个操作，但不一定是危险操作。常见如返回值、比较、日志、统计计数、格式化参数、普通状态处理等。需要看具体用途判断是否有安全影响。）\n- `EXPORT`：污点被传出当前分析边界（通常是传给找不到定义的函数、外部库函数、标准 C/C++ 库函数等。后端会把 EXPORT/extern/未找到定义 过滤掉，不再递归跟入。它不是“安全”或“危险”的结论，而是“污点流出去了，当前系统无法继续展开”。）\n- `CLEANED`：污点被清洗或验证，需要确认清洗逻（表示分析认为污点已被切断或变成安全值。例如长度被上限约束、偏移被边界校验、输出被常量赋值。这个标记也需要验证：检查是否真的支配后续使用、检查条件是否充分。）\n\n分析概览：\n- 数据流分析已识别 5 个外部输入\n- 有 303 处 DIRECT_SINK 标记\n- 有 74 个 USED 标记\n- 有 31 个 EXPORT 标记\n- 有 32 个 CLEANED 标记\n\n### 源码目录\n`/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/input/source`\n\n该目录包含反编译源码和辅助文件：\n- `libipsec.c`：反编译 C 代码，主要用于验证函数实现、条件判断、污点传播和危险操作。\n- `libipsec.h`：头文件，主要用于查看结构体、类型、宏和函数声明。\n- `libipsec.asm`：汇编/反汇编结果，主要用于在反编译代码不明确时核对指令和地址。\n\n源码用于验证数据流报告中的函数签名、行号、条件判断、内存访问、拷贝长度、指针偏移、外部调用和清洗逻辑。\n\n## 分析要求\n1. 先阅读 `final_report.md`，建立入口函数、调用链和高危传播路径的整体视图。\n2. 再按需要阅读 `dataflow/` 中对应的子函数报告，补齐跨函数传播、导入污点对象和终点语义。\n3. 对照源码目录中的反编译源码按数据流污点传播路径进行漏洞挖掘和报告生成。\n4. 输出漏洞时必须给出从污点源到危险操作的证据链，并引用数据流报告文件和源码位置。\n",
+      "artifact_refs": [],
+      "runtime_overrides": {},
+      "task_metadata": {
+        "run_retry": {
+          "run_id": "ri-f96c1de3090c478f8df7",
+          "source_type": "execution_workspace",
+          "extra_cycles": 9,
+          "requested_at": "2026-05-26T17:50:57.840666+08:00"
+        },
+        "task_title": "Resume 5.26_audit_2",
+        "dataflow_cli": {
+          "argv": [
+            "--resume-run-dir",
+            "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+            "--extra-cycles",
+            "9"
+          ],
+          "mode": "resume",
+          "command": [
+            "/usr/local/bin/python",
+            "/app/run_vuln_scan.py",
+            "--resume-run-dir",
+            "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+            "--extra-cycles",
+            "9"
+          ],
+          "run_dir": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+          "launcher": "run_vuln_scan.py",
+          "run_name": "5.26_audit_2",
+          "runs_root": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner",
+          "source_dir": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/input/source",
+          "launch_mode": "run_vuln_scan_cli",
+          "extra_cycles": 9,
+          "task_md_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/run/input/task.md",
+          "data_flow_dir": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/input/dataflows",
+          "resume_run_dir": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+          "command_display": "/usr/local/bin/python /app/run_vuln_scan.py --resume-run-dir /data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2 --extra-cycles 9",
+          "agent_state_dirs": {
+            "pi-worker": {
+              "source": "shared_default",
+              "agent_id": "pi-worker",
+              "root_dir": "/data/files/44f9029d00650a10/DATAFLOW_VULN_SCANNER/agent-state/shared/pi-worker",
+              "memory_dir": "/data/files/44f9029d00650a10/DATAFLOW_VULN_SCANNER/agent-state/shared/pi-worker/memory",
+              "skills_dir": "/data/files/44f9029d00650a10/DATAFLOW_VULN_SCANNER/agent-state/shared/pi-worker/skills"
+            },
+            "pi-advisor": {
+              "source": "shared_default",
+              "agent_id": "pi-advisor",
+              "root_dir": "/data/files/44f9029d00650a10/DATAFLOW_VULN_SCANNER/agent-state/shared/pi-advisor",
+              "memory_dir": "/data/files/44f9029d00650a10/DATAFLOW_VULN_SCANNER/agent-state/shared/pi-advisor/memory",
+              "skills_dir": "/data/files/44f9029d00650a10/DATAFLOW_VULN_SCANNER/agent-state/shared/pi-advisor/skills"
+            }
+          }
+        },
+        "task_purpose": "normal",
+        "artifact_refs": [],
+        "parent_task_id": null,
+        "parent_task_type": null,
+        "task_origin_type": "manual",
+        "agent_state_roots": {},
+        "parent_project_id": null,
+        "parent_stage_name": null,
+        "runtime_overrides": {},
+        "task_input_uploads": [],
+        "parent_stage_item_id": null,
+        "dataflow_scan_request": {
+          "model": null,
+          "options": {
+            "resume": true,
+            "run_id": "ri-f96c1de3090c478f8df7"
+          },
+          "launcher": "run_vuln_scan.py",
+          "provider": null,
+          "data_flow": {
+            "path": "/app/secflow-app-dataflow-vuln-scanner/input/dataflows",
+            "source": "project_filesystem",
+            "filename": "dataflows",
+            "metadata": {},
+            "storage_key": null,
+            "relative_path": null
+          },
+          "project_id": "44f9029d00650a10",
+          "source_dir": {
+            "path": "/app/secflow-app-dataflow-vuln-scanner/input/source",
+            "source": "project_filesystem",
+            "filename": "source",
+            "metadata": {},
+            "storage_key": null,
+            "relative_path": null
+          },
+          "data_flow_dir": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/input/dataflows",
+          "workspace_dir": {
+            "path": "/app/secflow-app-dataflow-vuln-scanner",
+            "source": "project_filesystem",
+            "filename": "secflow-app-dataflow-vuln-scanner",
+            "metadata": {},
+            "storage_key": null,
+            "relative_path": null
+          },
+          "resume_run_dir": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+          "clean_workspace": false,
+          "resume_extra_cycles": 9
+        },
+        "parent_stage_item_key": null,
+        "auto_report_vulnerabilities": true
+      },
+      "input_summary": {
+        "workspace_dir": {
+          "path": "/app/secflow-app-dataflow-vuln-scanner",
+          "source": "project_filesystem",
+          "filename": "secflow-app-dataflow-vuln-scanner",
+          "metadata": {},
+          "storage_key": null,
+          "relative_path": null
+        },
+        "data_flow": {
+          "path": "/app/secflow-app-dataflow-vuln-scanner/input/dataflows",
+          "source": "project_filesystem",
+          "filename": "dataflows",
+          "metadata": {},
+          "storage_key": null,
+          "relative_path": null
+        },
+        "source_dir": {
+          "path": "/app/secflow-app-dataflow-vuln-scanner/input/source",
+          "source": "project_filesystem",
+          "filename": "source",
+          "metadata": {},
+          "storage_key": null,
+          "relative_path": null
+        },
+        "output_dir": null,
+        "task_markdown_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/run/input/task.md",
+        "data_flow_dir": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/input/dataflows",
+        "data_flow_files": []
+      },
+      "output_summary": {
+        "run_root": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/run",
+        "workspace_root": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+        "output_root": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/output",
+        "atomic_work_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/run/workspace/pipeline_5.26_audit_2_run_001/stage_01_vuln_scan/vuln_scan_initial_001",
+        "run_name": "5.26_audit_2"
+      },
+      "effective_config_summary": {
+        "profile_id": "wfd-4f30eb62c60f40698fdc",
+        "profile_version": 7,
+        "runtime_overrides": {},
+        "review_profile": null,
+        "compiled_profile": {}
+      },
+      "task_root": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+      "run_root": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/run",
+      "workspace_root": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+      "attempts": [
+        {
+          "execution_id": "exec-6482e60fa7874d62ab99",
+          "task_id": "tt-7e8e2fecae3148b0a6be",
+          "attempt_no": 1,
+          "status": "failed",
+          "run_id": "ri-f96c1de3090c478f8df7",
+          "owner_pod_id": "secflow-app-dataflow-vuln-scanner-worker-0",
+          "worker_url": "http://secflow-app-dataflow-vuln-scanner-worker-0.secflow-app-dataflow-vuln-scanner-worker-headless.secflow-ns.svc.cluster.local:8080",
+          "worker_job_id": "exec-6482e60fa7874d62ab99",
+          "dispatch_status": "failed",
+          "slot_binding_state": "released",
+          "slot_binding_reason": null,
+          "dispatch_error": "run_vuln_scan.py failed with exit code 1",
+          "process_pid": 16,
+          "process_host": "secflow-app-dataflow-vuln-scanner-worker-0",
+          "process_status": "exited",
+          "process_started_at": "2026-05-26T15:38:25",
+          "process_finished_at": "2026-05-26T16:25:24",
+          "started_at": "2026-05-26T15:38:24",
+          "finished_at": "2026-05-26T16:25:24",
+          "recovery_reason": null,
+          "message": "stale active runtime assumed failed",
+          "workspace_root": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+          "output_manifest_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/output/execution_summary.json",
+          "output_task_count": 8,
+          "created_at": "2026-05-26T15:38:24",
+          "updated_at": "2026-05-26T16:25:24"
+        },
+        {
+          "execution_id": "exec-517565ce7c754256aa54",
+          "task_id": "tt-7e8e2fecae3148b0a6be",
+          "attempt_no": 2,
+          "status": "succeeded",
+          "run_id": "ri-f96c1de3090c478f8df7",
+          "owner_pod_id": "secflow-app-dataflow-vuln-scanner-worker-0",
+          "worker_url": "http://secflow-app-dataflow-vuln-scanner-worker-0.secflow-app-dataflow-vuln-scanner-worker-headless.secflow-ns.svc.cluster.local:8080",
+          "worker_job_id": "exec-517565ce7c754256aa54",
+          "dispatch_status": "succeeded",
+          "slot_binding_state": "released",
+          "slot_binding_reason": null,
+          "dispatch_error": null,
+          "process_pid": 22,
+          "process_host": "secflow-app-dataflow-vuln-scanner-worker-0",
+          "process_status": "exited",
+          "process_started_at": "2026-05-26T17:51:00",
+          "process_finished_at": "2026-05-26T19:24:20",
+          "started_at": "2026-05-26T17:50:58",
+          "finished_at": "2026-05-26T19:23:57",
+          "recovery_reason": "manual run resume requested",
+          "message": "run index reconciled to success",
+          "workspace_root": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+          "output_manifest_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/output/execution_summary.json",
+          "output_task_count": 13,
+          "created_at": "2026-05-26T17:50:58",
+          "updated_at": "2026-05-27T23:36:34"
+        }
+      ],
+      "abnormal_reason_history": [
+        {
+          "event_id": "evt-f7adb83a5b324aeba8a6",
+          "created_at": "2026-05-26T19:24:20",
+          "reason": {
+            "code": "unknown_abnormal",
+            "title": "任务异常结束",
+            "status": "failed",
+            "message": "stale active runtime assumed failed",
+            "service": "dataflow-vuln-scanner",
+            "category": "orchestration",
+            "evidence": [
+              {
+                "key": "task_status",
+                "label": "任务状态",
+                "value": "failed"
+              },
+              {
+                "key": "dispatch_status",
+                "label": "调度状态",
+                "value": "running"
+              },
+              {
+                "key": "process_status",
+                "label": "进程状态",
+                "value": "exited"
+              },
+              {
+                "key": "error",
+                "label": "原始错误",
+                "value": "stale active runtime assumed failed"
+              }
+            ],
+            "item_key": null,
+            "terminal": true,
+            "stage_name": "None",
+            "is_abnormal": true,
+            "last_seen_at": "2026-05-26T19:24:19.861089+08:00",
+            "source_layer": "task",
+            "first_seen_at": "2026-05-26T17:50:58+08:00",
+            "related_event_ids": [],
+            "downstream_service": "workflow_execution",
+            "downstream_task_id": "exec-517565ce7c754256aa54",
+            "recommended_action": "查看最近一次 execution、run summary 和 dispatch_error，确认是调度失败、运行时中断还是扫描执行本身失败。"
+          }
+        },
+        {
+          "event_id": "evt-013a9e3b7d894aa8a8f7",
+          "created_at": "2026-05-26T19:24:11",
+          "reason": {
+            "code": "unknown_abnormal",
+            "title": "任务异常结束",
+            "status": "failed",
+            "message": "stale active runtime assumed failed",
+            "service": "dataflow-vuln-scanner",
+            "category": "orchestration",
+            "evidence": [
+              {
+                "key": "task_status",
+                "label": "任务状态",
+                "value": "failed"
+              },
+              {
+                "key": "dispatch_status",
+                "label": "调度状态",
+                "value": "running"
+              },
+              {
+                "key": "process_status",
+                "label": "进程状态",
+                "value": "exited"
+              },
+              {
+                "key": "error",
+                "label": "原始错误",
+                "value": "stale active runtime assumed failed"
+              }
+            ],
+            "item_key": null,
+            "terminal": true,
+            "stage_name": "None",
+            "is_abnormal": true,
+            "last_seen_at": "2026-05-26T19:24:11.235373+08:00",
+            "source_layer": "task",
+            "first_seen_at": "2026-05-26T17:50:58+08:00",
+            "related_event_ids": [],
+            "downstream_service": "workflow_execution",
+            "downstream_task_id": "exec-517565ce7c754256aa54",
+            "recommended_action": "查看最近一次 execution、run summary 和 dispatch_error，确认是调度失败、运行时中断还是扫描执行本身失败。"
+          }
+        },
+        {
+          "event_id": "evt-050b2a4e652e48498fed",
+          "created_at": "2026-05-26T19:23:58",
+          "reason": {
+            "code": "unknown_abnormal",
+            "title": "任务异常结束",
+            "status": "failed",
+            "message": "stale active runtime assumed failed",
+            "service": "dataflow-vuln-scanner",
+            "category": "orchestration",
+            "evidence": [
+              {
+                "key": "task_status",
+                "label": "任务状态",
+                "value": "failed"
+              },
+              {
+                "key": "dispatch_status",
+                "label": "调度状态",
+                "value": "running"
+              },
+              {
+                "key": "process_status",
+                "label": "进程状态",
+                "value": "exited"
+              },
+              {
+                "key": "error",
+                "label": "原始错误",
+                "value": "stale active runtime assumed failed"
+              }
+            ],
+            "item_key": null,
+            "terminal": true,
+            "stage_name": "None",
+            "is_abnormal": true,
+            "last_seen_at": "2026-05-26T19:23:58.313270+08:00",
+            "source_layer": "task",
+            "first_seen_at": "2026-05-26T17:50:58+08:00",
+            "related_event_ids": [],
+            "downstream_service": "workflow_execution",
+            "downstream_task_id": "exec-517565ce7c754256aa54",
+            "recommended_action": "查看最近一次 execution、run summary 和 dispatch_error，确认是调度失败、运行时中断还是扫描执行本身失败。"
+          }
+        },
+        {
+          "event_id": "evt-c481d937175249a4b1d8",
+          "created_at": "2026-05-26T16:25:24",
+          "reason": {
+            "code": "unknown_abnormal",
+            "title": "任务异常结束",
+            "status": "failed",
+            "message": "stale active runtime assumed failed",
+            "service": "dataflow-vuln-scanner",
+            "category": "orchestration",
+            "evidence": [
+              {
+                "key": "task_status",
+                "label": "任务状态",
+                "value": "failed"
+              },
+              {
+                "key": "dispatch_status",
+                "label": "调度状态",
+                "value": "running"
+              },
+              {
+                "key": "process_status",
+                "label": "进程状态",
+                "value": "exited"
+              },
+              {
+                "key": "error",
+                "label": "原始错误",
+                "value": "stale active runtime assumed failed"
+              }
+            ],
+            "item_key": null,
+            "terminal": true,
+            "stage_name": "None",
+            "is_abnormal": true,
+            "last_seen_at": "2026-05-26T16:25:23.660022+08:00",
+            "source_layer": "task",
+            "first_seen_at": "2026-05-26T15:38:24+08:00",
+            "related_event_ids": [],
+            "downstream_service": "workflow_execution",
+            "downstream_task_id": "exec-6482e60fa7874d62ab99",
+            "recommended_action": "查看最近一次 execution、run summary 和 dispatch_error，确认是调度失败、运行时中断还是扫描执行本身失败。"
+          }
+        },
+        {
+          "event_id": "evt-8f2ee99257c1455d80a9",
+          "created_at": "2026-05-26T16:25:21",
+          "reason": {
+            "code": "unknown_abnormal",
+            "title": "任务异常结束",
+            "status": "failed",
+            "message": "stale active runtime assumed failed",
+            "service": "dataflow-vuln-scanner",
+            "category": "orchestration",
+            "evidence": [
+              {
+                "key": "task_status",
+                "label": "任务状态",
+                "value": "failed"
+              },
+              {
+                "key": "dispatch_status",
+                "label": "调度状态",
+                "value": "running"
+              },
+              {
+                "key": "process_status",
+                "label": "进程状态",
+                "value": "exited"
+              },
+              {
+                "key": "error",
+                "label": "原始错误",
+                "value": "stale active runtime assumed failed"
+              }
+            ],
+            "item_key": null,
+            "terminal": true,
+            "stage_name": "None",
+            "is_abnormal": true,
+            "last_seen_at": "2026-05-26T16:25:21.331468+08:00",
+            "source_layer": "task",
+            "first_seen_at": "2026-05-26T15:38:24+08:00",
+            "related_event_ids": [],
+            "downstream_service": "workflow_execution",
+            "downstream_task_id": "exec-6482e60fa7874d62ab99",
+            "recommended_action": "查看最近一次 execution、run summary 和 dispatch_error，确认是调度失败、运行时中断还是扫描执行本身失败。"
+          }
+        },
+        {
+          "event_id": "evt-62e73e6d9de3426e867b",
+          "created_at": "2026-05-26T16:25:20",
+          "reason": {
+            "code": "unknown_abnormal",
+            "title": "任务异常结束",
+            "status": "failed",
+            "message": "stale active runtime assumed failed",
+            "service": "dataflow-vuln-scanner",
+            "category": "orchestration",
+            "evidence": [
+              {
+                "key": "task_status",
+                "label": "任务状态",
+                "value": "failed"
+              },
+              {
+                "key": "dispatch_status",
+                "label": "调度状态",
+                "value": "running"
+              },
+              {
+                "key": "process_status",
+                "label": "进程状态",
+                "value": "exited"
+              },
+              {
+                "key": "error",
+                "label": "原始错误",
+                "value": "stale active runtime assumed failed"
+              }
+            ],
+            "item_key": null,
+            "terminal": true,
+            "stage_name": "None",
+            "is_abnormal": true,
+            "last_seen_at": "2026-05-26T16:25:19.817085+08:00",
+            "source_layer": "task",
+            "first_seen_at": "2026-05-26T15:38:24+08:00",
+            "related_event_ids": [],
+            "downstream_service": "workflow_execution",
+            "downstream_task_id": "exec-6482e60fa7874d62ab99",
+            "recommended_action": "查看最近一次 execution、run summary 和 dispatch_error，确认是调度失败、运行时中断还是扫描执行本身失败。"
+          }
+        },
+        {
+          "event_id": "evt-5053190a7edf48c19e7d",
+          "created_at": "2026-05-26T16:25:18",
+          "reason": {
+            "code": "unknown_abnormal",
+            "title": "任务异常结束",
+            "status": "failed",
+            "message": "stale active runtime assumed failed",
+            "service": "dataflow-vuln-scanner",
+            "category": "orchestration",
+            "evidence": [
+              {
+                "key": "task_status",
+                "label": "任务状态",
+                "value": "failed"
+              },
+              {
+                "key": "dispatch_status",
+                "label": "调度状态",
+                "value": "running"
+              },
+              {
+                "key": "process_status",
+                "label": "进程状态",
+                "value": "exited"
+              },
+              {
+                "key": "error",
+                "label": "原始错误",
+                "value": "stale active runtime assumed failed"
+              }
+            ],
+            "item_key": null,
+            "terminal": true,
+            "stage_name": "None",
+            "is_abnormal": true,
+            "last_seen_at": "2026-05-26T16:25:18.196798+08:00",
+            "source_layer": "task",
+            "first_seen_at": "2026-05-26T15:38:24+08:00",
+            "related_event_ids": [],
+            "downstream_service": "workflow_execution",
+            "downstream_task_id": "exec-6482e60fa7874d62ab99",
+            "recommended_action": "查看最近一次 execution、run summary 和 dispatch_error，确认是调度失败、运行时中断还是扫描执行本身失败。"
+          }
+        },
+        {
+          "event_id": "evt-beee3bc2b839418d9300",
+          "created_at": "2026-05-26T16:25:17",
+          "reason": {
+            "code": "unknown_abnormal",
+            "title": "任务异常结束",
+            "status": "failed",
+            "message": "stale active runtime assumed failed",
+            "service": "dataflow-vuln-scanner",
+            "category": "orchestration",
+            "evidence": [
+              {
+                "key": "task_status",
+                "label": "任务状态",
+                "value": "failed"
+              },
+              {
+                "key": "dispatch_status",
+                "label": "调度状态",
+                "value": "running"
+              },
+              {
+                "key": "process_status",
+                "label": "进程状态",
+                "value": "exited"
+              },
+              {
+                "key": "error",
+                "label": "原始错误",
+                "value": "stale active runtime assumed failed"
+              }
+            ],
+            "item_key": null,
+            "terminal": true,
+            "stage_name": "None",
+            "is_abnormal": true,
+            "last_seen_at": "2026-05-26T16:25:16.521918+08:00",
+            "source_layer": "task",
+            "first_seen_at": "2026-05-26T15:38:24+08:00",
+            "related_event_ids": [],
+            "downstream_service": "workflow_execution",
+            "downstream_task_id": "exec-6482e60fa7874d62ab99",
+            "recommended_action": "查看最近一次 execution、run summary 和 dispatch_error，确认是调度失败、运行时中断还是扫描执行本身失败。"
+          }
+        },
+        {
+          "event_id": "evt-771380124a9946fc9447",
+          "created_at": "2026-05-26T16:25:16",
+          "reason": {
+            "code": "dispatch_failed",
+            "title": "调度失败",
+            "status": "failed",
+            "message": "run_vuln_scan.py failed with exit code 1",
+            "service": "dataflow-vuln-scanner",
+            "category": "runtime",
+            "evidence": [
+              {
+                "key": "task_status",
+                "label": "任务状态",
+                "value": "failed"
+              },
+              {
+                "key": "dispatch_status",
+                "label": "调度状态",
+                "value": "failed"
+              },
+              {
+                "key": "process_status",
+                "label": "进程状态",
+                "value": "exited"
+              },
+              {
+                "key": "error",
+                "label": "原始错误",
+                "value": "run_vuln_scan.py failed with exit code 1"
+              }
+            ],
+            "item_key": null,
+            "terminal": true,
+            "stage_name": "None",
+            "is_abnormal": true,
+            "last_seen_at": "2026-05-26T16:25:16.230771+08:00",
+            "source_layer": "task",
+            "first_seen_at": "2026-05-26T15:38:24+08:00",
+            "related_event_ids": [],
+            "downstream_service": "workflow_execution",
+            "downstream_task_id": "exec-6482e60fa7874d62ab99",
+            "recommended_action": "查看最近一次 execution、run summary 和 dispatch_error，确认是调度失败、运行时中断还是扫描执行本身失败。"
+          }
+        }
+      ]
+    },
+    "case_details": [
+      {
+        "id": "case-20260526-112436-387583495a",
+        "global_vuln_id": "vuln-20260526-112436-f48097da31",
+        "project_id": "44f9029d00650a10",
+        "title": "Tainted Header Length Used as Unbounded Heap Allocation Size in ESP Output Paths",
+        "summary": null,
+        "severity": "medium",
+        "cvss_score": 0.0,
+        "confidence": 93,
+        "finding_id": "DFVS-20260526-153825-010-9BDC56",
+        "report_id": "DFVS-20260526-153825-010-9BDC56",
+        "state": "suspected",
+        "category": "dataflow",
+        "rule_id": null,
+        "rule_name": null,
+        "fingerprint": "f2a34c32ac9a272047f9fb7ca3407a5cff4538ff72a1ab404972eeb99bac48fd",
+        "reported_at": null,
+        "source_refs": [
+          {
+            "reporter_name": "secflow-app-dataflow-vuln-scanner",
+            "reporter_type": "service",
+            "reporter_vendor": null,
+            "report_id": "DFVS-20260526-153825-010-9BDC56",
+            "reported_at": null,
+            "first_seen_at": "2026-05-26T11:24:36.751752",
+            "last_seen_at": "2026-05-26T11:24:36.751752"
+          }
+        ],
+        "source_report_ids": [
+          "DFVS-20260526-153825-010-9BDC56"
+        ],
+        "reporter": {
+          "name": "secflow-app-dataflow-vuln-scanner",
+          "version": "1.0.0",
+          "type": "service",
+          "vendor": null,
+          "endpoint": null,
+          "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+        },
+        "subject": {
+          "type": "dataflow_vulnerability",
+          "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_010.md",
+          "name": "Tainted Header Length Used as Unbounded Heap Allocation Size in ESP Output Paths",
+          "version": null
+        },
+        "evidence": {
+          "summary": "Tainted Header Length Used as Unbounded Heap Allocation Size in ESP Output Paths",
+          "reproduction_hint": "",
+          "references": [
+            {
+              "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_010.md",
+              "kind": "report"
+            }
+          ]
+        },
+        "artifacts": [
+          {
+            "artifact_id": null,
+            "kind": "report",
+            "name": "result_010.md",
+            "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_010.md",
+            "media_type": null,
+            "sha256": null,
+            "size": 11183,
+            "encoding": null,
+            "content": null,
+            "content_ref": null,
+            "children": [],
+            "metadata": {
+              "run_id": "ri-f96c1de3090c478f8df7",
+              "result_file": "result_010.md"
+            }
+          }
+        ],
+        "metadata": {
+          "source": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "run_root_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+            "result_file": "result_010.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_010.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium",
+            "finding_id": "DFVS-20260526-153825-010-9BDC56",
+            "anonymous_submission": false
+          },
+          "pool_type": "normal",
+          "dataflow_vuln_scanner": {
+            "run_status": "completed",
+            "review_verdict": "CONFIRMED",
+            "review_cycle": 2,
+            "lifecycle_status": "candidate",
+            "finding_id": "DFVS-20260526-153825-010-9BDC56",
+            "linked_task_purpose": "normal"
+          }
+        },
+        "source_task": {
+          "service_name": "secflow-app-dataflow-vuln-scanner",
+          "service_id": "secflow-app-dataflow-vuln-scanner",
+          "task_id": "tt-7e8e2fecae3148b0a6be",
+          "execution_id": "exec-517565ce7c754256aa54",
+          "run_id": "ri-f96c1de3090c478f8df7",
+          "run_name": "5.26_audit_2",
+          "finding_id": "DFVS-20260526-153825-010-9BDC56",
+          "result_file": "result_010.md",
+          "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_010.md",
+          "project_id": "44f9029d00650a10",
+          "parent_task_id": null,
+          "parent_stage_name": null,
+          "parent_stage_item_id": null,
+          "task_purpose": "normal",
+          "evolution_task_id": null,
+          "evolution_round": null,
+          "evolution_source_task_id": null,
+          "evolution_source_execution_id": null,
+          "reported_severity": "medium"
+        },
+        "files_root_path": "/__vuln_cases__/case-20260526-112436-387583495a",
+        "fileserver_root": {
+          "root_path": "/__vuln_cases__/case-20260526-112436-387583495a",
+          "root_name": "case-20260526-112436-387583495a",
+          "special_subproject_name": "__vuln_cases__",
+          "special_subproject_id": null
+        },
+        "current_stage": "receive",
+        "current_status": "intake_created",
+        "decision_status": "observe",
+        "triage_decision": "observe",
+        "triage_gate": "pending",
+        "triage_round": 1,
+        "triage_history": [],
+        "validation_result": "inconclusive",
+        "finished_reason": null,
+        "created_by_type": "service",
+        "created_by": "secflow-app-dataflow-vuln-scanner",
+        "created_at": "2026-05-26T11:24:37",
+        "updated_at": "2026-05-26T11:24:37",
+        "report_summary": null,
+        "display_summary": {
+          "title": "Tainted Header Length Used as Unbounded Heap Allocation Size in ESP Output Paths",
+          "subtitle": "dataflow",
+          "severity": "medium",
+          "confidence": 93,
+          "current_stage": "receive",
+          "decision_status": "observe",
+          "validation_result": "inconclusive",
+          "finished_reason": null,
+          "reporter": {
+            "name": "secflow-app-dataflow-vuln-scanner",
+            "version": "1.0.0",
+            "type": "service",
+            "vendor": null,
+            "endpoint": null,
+            "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+          },
+          "subject": {
+            "type": "dataflow_vulnerability",
+            "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_010.md",
+            "name": "Tainted Header Length Used as Unbounded Heap Allocation Size in ESP Output Paths",
+            "version": null
+          },
+          "source_task": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "finding_id": "DFVS-20260526-153825-010-9BDC56",
+            "result_file": "result_010.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_010.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium"
+          },
+          "source_report_ids": [
+            "DFVS-20260526-153825-010-9BDC56"
+          ],
+          "reported_at": null,
+          "key_points": [
+            "当前阶段：receive",
+            "当前结论：observe",
+            "验证结果：inconclusive"
+          ],
+          "current_report_id": null,
+          "current_report_title": null,
+          "current_report_updated_at": null
+        }
+      },
+      {
+        "id": "case-20260526-112436-0eb49e2534",
+        "global_vuln_id": "vuln-20260526-112436-439d655d7f",
+        "project_id": "44f9029d00650a10",
+        "title": "Unsigned Underflow in IPv6 AH Inbound MBUF Read Length in IPSEC_AH_HandleInputPkt",
+        "summary": null,
+        "severity": "medium",
+        "cvss_score": 0.0,
+        "confidence": 91,
+        "finding_id": "DFVS-20260526-153825-011-14DCEE",
+        "report_id": "DFVS-20260526-153825-011-14DCEE",
+        "state": "suspected",
+        "category": "dataflow",
+        "rule_id": null,
+        "rule_name": null,
+        "fingerprint": "46144f5a12bd88a41f7f87e003baf19dd592cedeb661a97c89c41b1ec62bc35c",
+        "reported_at": null,
+        "source_refs": [
+          {
+            "reporter_name": "secflow-app-dataflow-vuln-scanner",
+            "reporter_type": "service",
+            "reporter_vendor": null,
+            "report_id": "DFVS-20260526-153825-011-14DCEE",
+            "reported_at": null,
+            "first_seen_at": "2026-05-26T11:24:36.947751",
+            "last_seen_at": "2026-05-26T11:24:36.947751"
+          }
+        ],
+        "source_report_ids": [
+          "DFVS-20260526-153825-011-14DCEE"
+        ],
+        "reporter": {
+          "name": "secflow-app-dataflow-vuln-scanner",
+          "version": "1.0.0",
+          "type": "service",
+          "vendor": null,
+          "endpoint": null,
+          "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+        },
+        "subject": {
+          "type": "dataflow_vulnerability",
+          "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_011.md",
+          "name": "Unsigned Underflow in IPv6 AH Inbound MBUF Read Length in IPSEC_AH_HandleInputPkt",
+          "version": null
+        },
+        "evidence": {
+          "summary": "Unsigned Underflow in IPv6 AH Inbound MBUF Read Length in IPSEC_AH_HandleInputPkt",
+          "reproduction_hint": "",
+          "references": [
+            {
+              "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_011.md",
+              "kind": "report"
+            }
+          ]
+        },
+        "artifacts": [
+          {
+            "artifact_id": null,
+            "kind": "report",
+            "name": "result_011.md",
+            "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_011.md",
+            "media_type": null,
+            "sha256": null,
+            "size": 10260,
+            "encoding": null,
+            "content": null,
+            "content_ref": null,
+            "children": [],
+            "metadata": {
+              "run_id": "ri-f96c1de3090c478f8df7",
+              "result_file": "result_011.md"
+            }
+          }
+        ],
+        "metadata": {
+          "source": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "run_root_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+            "result_file": "result_011.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_011.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium",
+            "finding_id": "DFVS-20260526-153825-011-14DCEE",
+            "anonymous_submission": false
+          },
+          "pool_type": "normal",
+          "dataflow_vuln_scanner": {
+            "run_status": "completed",
+            "review_verdict": "CONFIRMED",
+            "review_cycle": 3,
+            "lifecycle_status": "candidate",
+            "finding_id": "DFVS-20260526-153825-011-14DCEE",
+            "linked_task_purpose": "normal"
+          }
+        },
+        "source_task": {
+          "service_name": "secflow-app-dataflow-vuln-scanner",
+          "service_id": "secflow-app-dataflow-vuln-scanner",
+          "task_id": "tt-7e8e2fecae3148b0a6be",
+          "execution_id": "exec-517565ce7c754256aa54",
+          "run_id": "ri-f96c1de3090c478f8df7",
+          "run_name": "5.26_audit_2",
+          "finding_id": "DFVS-20260526-153825-011-14DCEE",
+          "result_file": "result_011.md",
+          "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_011.md",
+          "project_id": "44f9029d00650a10",
+          "parent_task_id": null,
+          "parent_stage_name": null,
+          "parent_stage_item_id": null,
+          "task_purpose": "normal",
+          "evolution_task_id": null,
+          "evolution_round": null,
+          "evolution_source_task_id": null,
+          "evolution_source_execution_id": null,
+          "reported_severity": "medium"
+        },
+        "files_root_path": "/__vuln_cases__/case-20260526-112436-0eb49e2534",
+        "fileserver_root": {
+          "root_path": "/__vuln_cases__/case-20260526-112436-0eb49e2534",
+          "root_name": "case-20260526-112436-0eb49e2534",
+          "special_subproject_name": "__vuln_cases__",
+          "special_subproject_id": null
+        },
+        "current_stage": "receive",
+        "current_status": "intake_created",
+        "decision_status": "observe",
+        "triage_decision": "observe",
+        "triage_gate": "pending",
+        "triage_round": 1,
+        "triage_history": [],
+        "validation_result": "inconclusive",
+        "finished_reason": null,
+        "created_by_type": "service",
+        "created_by": "secflow-app-dataflow-vuln-scanner",
+        "created_at": "2026-05-26T11:24:37",
+        "updated_at": "2026-05-26T11:24:37",
+        "report_summary": null,
+        "display_summary": {
+          "title": "Unsigned Underflow in IPv6 AH Inbound MBUF Read Length in IPSEC_AH_HandleInputPkt",
+          "subtitle": "dataflow",
+          "severity": "medium",
+          "confidence": 91,
+          "current_stage": "receive",
+          "decision_status": "observe",
+          "validation_result": "inconclusive",
+          "finished_reason": null,
+          "reporter": {
+            "name": "secflow-app-dataflow-vuln-scanner",
+            "version": "1.0.0",
+            "type": "service",
+            "vendor": null,
+            "endpoint": null,
+            "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+          },
+          "subject": {
+            "type": "dataflow_vulnerability",
+            "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_011.md",
+            "name": "Unsigned Underflow in IPv6 AH Inbound MBUF Read Length in IPSEC_AH_HandleInputPkt",
+            "version": null
+          },
+          "source_task": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "finding_id": "DFVS-20260526-153825-011-14DCEE",
+            "result_file": "result_011.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_011.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium"
+          },
+          "source_report_ids": [
+            "DFVS-20260526-153825-011-14DCEE"
+          ],
+          "reported_at": null,
+          "key_points": [
+            "当前阶段：receive",
+            "当前结论：observe",
+            "验证结果：inconclusive"
+          ],
+          "current_report_id": null,
+          "current_report_title": null,
+          "current_report_updated_at": null
+        }
+      },
+      {
+        "id": "case-20260526-112436-6efa9cd0a5",
+        "global_vuln_id": "vuln-20260526-112436-8e11f43cb6",
+        "project_id": "44f9029d00650a10",
+        "title": "IP Options Parsing Out-of-Bounds Read in IPSEC_AH_HandleOutputPktV4",
+        "summary": null,
+        "severity": "medium",
+        "cvss_score": 0.0,
+        "confidence": 93,
+        "finding_id": "DFVS-20260526-153825-009-1B5EDC",
+        "report_id": "DFVS-20260526-153825-009-1B5EDC",
+        "state": "suspected",
+        "category": "dataflow",
+        "rule_id": null,
+        "rule_name": null,
+        "fingerprint": "474b72b60267c9b387d576278ae360f524a66ca3ef91e148719c362ad38abe2a",
+        "reported_at": null,
+        "source_refs": [
+          {
+            "reporter_name": "secflow-app-dataflow-vuln-scanner",
+            "reporter_type": "service",
+            "reporter_vendor": null,
+            "report_id": "DFVS-20260526-153825-009-1B5EDC",
+            "reported_at": null,
+            "first_seen_at": "2026-05-26T11:24:36.519628",
+            "last_seen_at": "2026-05-26T11:24:36.519628"
+          }
+        ],
+        "source_report_ids": [
+          "DFVS-20260526-153825-009-1B5EDC"
+        ],
+        "reporter": {
+          "name": "secflow-app-dataflow-vuln-scanner",
+          "version": "1.0.0",
+          "type": "service",
+          "vendor": null,
+          "endpoint": null,
+          "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+        },
+        "subject": {
+          "type": "dataflow_vulnerability",
+          "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_009.md",
+          "name": "IP Options Parsing Out-of-Bounds Read in IPSEC_AH_HandleOutputPktV4",
+          "version": null
+        },
+        "evidence": {
+          "summary": "IP Options Parsing Out-of-Bounds Read in IPSEC_AH_HandleOutputPktV4",
+          "reproduction_hint": "",
+          "references": [
+            {
+              "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_009.md",
+              "kind": "report"
+            }
+          ]
+        },
+        "artifacts": [
+          {
+            "artifact_id": null,
+            "kind": "report",
+            "name": "result_009.md",
+            "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_009.md",
+            "media_type": null,
+            "sha256": null,
+            "size": 9404,
+            "encoding": null,
+            "content": null,
+            "content_ref": null,
+            "children": [],
+            "metadata": {
+              "run_id": "ri-f96c1de3090c478f8df7",
+              "result_file": "result_009.md"
+            }
+          }
+        ],
+        "metadata": {
+          "source": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "run_root_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+            "result_file": "result_009.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_009.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium",
+            "finding_id": "DFVS-20260526-153825-009-1B5EDC",
+            "anonymous_submission": false
+          },
+          "pool_type": "normal",
+          "dataflow_vuln_scanner": {
+            "run_status": "completed",
+            "review_verdict": "CONFIRMED",
+            "review_cycle": 2,
+            "lifecycle_status": "candidate",
+            "finding_id": "DFVS-20260526-153825-009-1B5EDC",
+            "linked_task_purpose": "normal"
+          }
+        },
+        "source_task": {
+          "service_name": "secflow-app-dataflow-vuln-scanner",
+          "service_id": "secflow-app-dataflow-vuln-scanner",
+          "task_id": "tt-7e8e2fecae3148b0a6be",
+          "execution_id": "exec-517565ce7c754256aa54",
+          "run_id": "ri-f96c1de3090c478f8df7",
+          "run_name": "5.26_audit_2",
+          "finding_id": "DFVS-20260526-153825-009-1B5EDC",
+          "result_file": "result_009.md",
+          "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_009.md",
+          "project_id": "44f9029d00650a10",
+          "parent_task_id": null,
+          "parent_stage_name": null,
+          "parent_stage_item_id": null,
+          "task_purpose": "normal",
+          "evolution_task_id": null,
+          "evolution_round": null,
+          "evolution_source_task_id": null,
+          "evolution_source_execution_id": null,
+          "reported_severity": "medium"
+        },
+        "files_root_path": "/__vuln_cases__/case-20260526-112436-6efa9cd0a5",
+        "fileserver_root": {
+          "root_path": "/__vuln_cases__/case-20260526-112436-6efa9cd0a5",
+          "root_name": "case-20260526-112436-6efa9cd0a5",
+          "special_subproject_name": "__vuln_cases__",
+          "special_subproject_id": null
+        },
+        "current_stage": "receive",
+        "current_status": "intake_created",
+        "decision_status": "observe",
+        "triage_decision": "observe",
+        "triage_gate": "pending",
+        "triage_round": 1,
+        "triage_history": [],
+        "validation_result": "inconclusive",
+        "finished_reason": null,
+        "created_by_type": "service",
+        "created_by": "secflow-app-dataflow-vuln-scanner",
+        "created_at": "2026-05-26T11:24:37",
+        "updated_at": "2026-05-26T11:24:37",
+        "report_summary": null,
+        "display_summary": {
+          "title": "IP Options Parsing Out-of-Bounds Read in IPSEC_AH_HandleOutputPktV4",
+          "subtitle": "dataflow",
+          "severity": "medium",
+          "confidence": 93,
+          "current_stage": "receive",
+          "decision_status": "observe",
+          "validation_result": "inconclusive",
+          "finished_reason": null,
+          "reporter": {
+            "name": "secflow-app-dataflow-vuln-scanner",
+            "version": "1.0.0",
+            "type": "service",
+            "vendor": null,
+            "endpoint": null,
+            "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+          },
+          "subject": {
+            "type": "dataflow_vulnerability",
+            "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_009.md",
+            "name": "IP Options Parsing Out-of-Bounds Read in IPSEC_AH_HandleOutputPktV4",
+            "version": null
+          },
+          "source_task": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "finding_id": "DFVS-20260526-153825-009-1B5EDC",
+            "result_file": "result_009.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_009.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium"
+          },
+          "source_report_ids": [
+            "DFVS-20260526-153825-009-1B5EDC"
+          ],
+          "reported_at": null,
+          "key_points": [
+            "当前阶段：receive",
+            "当前结论：observe",
+            "验证结果：inconclusive"
+          ],
+          "current_report_id": null,
+          "current_report_title": null,
+          "current_report_updated_at": null
+        }
+      },
+      {
+        "id": "case-20260526-112437-7db5549934",
+        "global_vuln_id": "vuln-20260526-112437-1afe516ab3",
+        "project_id": "44f9029d00650a10",
+        "title": "Unsigned Underflow in IPv4 Parser Layer MBUF Read Length in IPSEC_PKT_ParseAndVerifyHdrV4",
+        "summary": null,
+        "severity": "medium",
+        "cvss_score": 0.0,
+        "confidence": 88,
+        "finding_id": "DFVS-20260526-153825-013-315CC2",
+        "report_id": "DFVS-20260526-153825-013-315CC2",
+        "state": "suspected",
+        "category": "dataflow",
+        "rule_id": null,
+        "rule_name": null,
+        "fingerprint": "025786945d5cf91f217788692a4f1009ba72550a0a2c23c3c2256713ecec6101",
+        "reported_at": null,
+        "source_refs": [
+          {
+            "reporter_name": "secflow-app-dataflow-vuln-scanner",
+            "reporter_type": "service",
+            "reporter_vendor": null,
+            "report_id": "DFVS-20260526-153825-013-315CC2",
+            "reported_at": null,
+            "first_seen_at": "2026-05-26T11:24:37.350218",
+            "last_seen_at": "2026-05-26T11:24:37.350218"
+          }
+        ],
+        "source_report_ids": [
+          "DFVS-20260526-153825-013-315CC2"
+        ],
+        "reporter": {
+          "name": "secflow-app-dataflow-vuln-scanner",
+          "version": "1.0.0",
+          "type": "service",
+          "vendor": null,
+          "endpoint": null,
+          "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+        },
+        "subject": {
+          "type": "dataflow_vulnerability",
+          "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_013.md",
+          "name": "Unsigned Underflow in IPv4 Parser Layer MBUF Read Length in IPSEC_PKT_ParseAndVerifyHdrV4",
+          "version": null
+        },
+        "evidence": {
+          "summary": "Unsigned Underflow in IPv4 Parser Layer MBUF Read Length in IPSEC_PKT_ParseAndVerifyHdrV4",
+          "reproduction_hint": "",
+          "references": [
+            {
+              "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_013.md",
+              "kind": "report"
+            }
+          ]
+        },
+        "artifacts": [
+          {
+            "artifact_id": null,
+            "kind": "report",
+            "name": "result_013.md",
+            "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_013.md",
+            "media_type": null,
+            "sha256": null,
+            "size": 10627,
+            "encoding": null,
+            "content": null,
+            "content_ref": null,
+            "children": [],
+            "metadata": {
+              "run_id": "ri-f96c1de3090c478f8df7",
+              "result_file": "result_013.md"
+            }
+          }
+        ],
+        "metadata": {
+          "source": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "run_root_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+            "result_file": "result_013.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_013.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium",
+            "finding_id": "DFVS-20260526-153825-013-315CC2",
+            "anonymous_submission": false
+          },
+          "pool_type": "normal",
+          "dataflow_vuln_scanner": {
+            "run_status": "completed",
+            "review_verdict": "CONFIRMED",
+            "review_cycle": 4,
+            "lifecycle_status": "candidate",
+            "finding_id": "DFVS-20260526-153825-013-315CC2",
+            "linked_task_purpose": "normal"
+          }
+        },
+        "source_task": {
+          "service_name": "secflow-app-dataflow-vuln-scanner",
+          "service_id": "secflow-app-dataflow-vuln-scanner",
+          "task_id": "tt-7e8e2fecae3148b0a6be",
+          "execution_id": "exec-517565ce7c754256aa54",
+          "run_id": "ri-f96c1de3090c478f8df7",
+          "run_name": "5.26_audit_2",
+          "finding_id": "DFVS-20260526-153825-013-315CC2",
+          "result_file": "result_013.md",
+          "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_013.md",
+          "project_id": "44f9029d00650a10",
+          "parent_task_id": null,
+          "parent_stage_name": null,
+          "parent_stage_item_id": null,
+          "task_purpose": "normal",
+          "evolution_task_id": null,
+          "evolution_round": null,
+          "evolution_source_task_id": null,
+          "evolution_source_execution_id": null,
+          "reported_severity": "medium"
+        },
+        "files_root_path": "/__vuln_cases__/case-20260526-112437-7db5549934",
+        "fileserver_root": {
+          "root_path": "/__vuln_cases__/case-20260526-112437-7db5549934",
+          "root_name": "case-20260526-112437-7db5549934",
+          "special_subproject_name": "__vuln_cases__",
+          "special_subproject_id": null
+        },
+        "current_stage": "receive",
+        "current_status": "intake_created",
+        "decision_status": "observe",
+        "triage_decision": "observe",
+        "triage_gate": "pending",
+        "triage_round": 1,
+        "triage_history": [],
+        "validation_result": "inconclusive",
+        "finished_reason": null,
+        "created_by_type": "service",
+        "created_by": "secflow-app-dataflow-vuln-scanner",
+        "created_at": "2026-05-26T11:24:37",
+        "updated_at": "2026-05-26T11:24:37",
+        "report_summary": null,
+        "display_summary": {
+          "title": "Unsigned Underflow in IPv4 Parser Layer MBUF Read Length in IPSEC_PKT_ParseAndVerifyHdrV4",
+          "subtitle": "dataflow",
+          "severity": "medium",
+          "confidence": 88,
+          "current_stage": "receive",
+          "decision_status": "observe",
+          "validation_result": "inconclusive",
+          "finished_reason": null,
+          "reporter": {
+            "name": "secflow-app-dataflow-vuln-scanner",
+            "version": "1.0.0",
+            "type": "service",
+            "vendor": null,
+            "endpoint": null,
+            "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+          },
+          "subject": {
+            "type": "dataflow_vulnerability",
+            "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_013.md",
+            "name": "Unsigned Underflow in IPv4 Parser Layer MBUF Read Length in IPSEC_PKT_ParseAndVerifyHdrV4",
+            "version": null
+          },
+          "source_task": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "finding_id": "DFVS-20260526-153825-013-315CC2",
+            "result_file": "result_013.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_013.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium"
+          },
+          "source_report_ids": [
+            "DFVS-20260526-153825-013-315CC2"
+          ],
+          "reported_at": null,
+          "key_points": [
+            "当前阶段：receive",
+            "当前结论：observe",
+            "验证结果：inconclusive"
+          ],
+          "current_report_id": null,
+          "current_report_title": null,
+          "current_report_updated_at": null
+        }
+      },
+      {
+        "id": "case-20260526-112437-908a39611e",
+        "global_vuln_id": "vuln-20260526-112437-bbf4baf207",
+        "project_id": "44f9029d00650a10",
+        "title": "Unsigned Underflow Leading to Heap Overflow in IPv6 AH Inbound Payload Copy in IPSEC_AH_HandleInputPkt",
+        "summary": null,
+        "severity": "medium",
+        "cvss_score": 0.0,
+        "confidence": 92,
+        "finding_id": "DFVS-20260526-153825-012-BC5EB8",
+        "report_id": "DFVS-20260526-153825-012-BC5EB8",
+        "state": "suspected",
+        "category": "dataflow",
+        "rule_id": null,
+        "rule_name": null,
+        "fingerprint": "25fadbdd55e856423f6920e5893d760a6b07b2676ee6147ec09c87b7ad23d27d",
+        "reported_at": null,
+        "source_refs": [
+          {
+            "reporter_name": "secflow-app-dataflow-vuln-scanner",
+            "reporter_type": "service",
+            "reporter_vendor": null,
+            "report_id": "DFVS-20260526-153825-012-BC5EB8",
+            "reported_at": null,
+            "first_seen_at": "2026-05-26T11:24:37.161034",
+            "last_seen_at": "2026-05-26T11:24:37.161034"
+          }
+        ],
+        "source_report_ids": [
+          "DFVS-20260526-153825-012-BC5EB8"
+        ],
+        "reporter": {
+          "name": "secflow-app-dataflow-vuln-scanner",
+          "version": "1.0.0",
+          "type": "service",
+          "vendor": null,
+          "endpoint": null,
+          "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+        },
+        "subject": {
+          "type": "dataflow_vulnerability",
+          "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_012.md",
+          "name": "Unsigned Underflow Leading to Heap Overflow in IPv6 AH Inbound Payload Copy in IPSEC_AH_HandleInputPkt",
+          "version": null
+        },
+        "evidence": {
+          "summary": "Unsigned Underflow Leading to Heap Overflow in IPv6 AH Inbound Payload Copy in IPSEC_AH_HandleInputPkt",
+          "reproduction_hint": "",
+          "references": [
+            {
+              "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_012.md",
+              "kind": "report"
+            }
+          ]
+        },
+        "artifacts": [
+          {
+            "artifact_id": null,
+            "kind": "report",
+            "name": "result_012.md",
+            "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_012.md",
+            "media_type": null,
+            "sha256": null,
+            "size": 10691,
+            "encoding": null,
+            "content": null,
+            "content_ref": null,
+            "children": [],
+            "metadata": {
+              "run_id": "ri-f96c1de3090c478f8df7",
+              "result_file": "result_012.md"
+            }
+          }
+        ],
+        "metadata": {
+          "source": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "run_root_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+            "result_file": "result_012.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_012.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium",
+            "finding_id": "DFVS-20260526-153825-012-BC5EB8",
+            "anonymous_submission": false
+          },
+          "pool_type": "normal",
+          "dataflow_vuln_scanner": {
+            "run_status": "completed",
+            "review_verdict": "CONFIRMED",
+            "review_cycle": 3,
+            "lifecycle_status": "candidate",
+            "finding_id": "DFVS-20260526-153825-012-BC5EB8",
+            "linked_task_purpose": "normal"
+          }
+        },
+        "source_task": {
+          "service_name": "secflow-app-dataflow-vuln-scanner",
+          "service_id": "secflow-app-dataflow-vuln-scanner",
+          "task_id": "tt-7e8e2fecae3148b0a6be",
+          "execution_id": "exec-517565ce7c754256aa54",
+          "run_id": "ri-f96c1de3090c478f8df7",
+          "run_name": "5.26_audit_2",
+          "finding_id": "DFVS-20260526-153825-012-BC5EB8",
+          "result_file": "result_012.md",
+          "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_012.md",
+          "project_id": "44f9029d00650a10",
+          "parent_task_id": null,
+          "parent_stage_name": null,
+          "parent_stage_item_id": null,
+          "task_purpose": "normal",
+          "evolution_task_id": null,
+          "evolution_round": null,
+          "evolution_source_task_id": null,
+          "evolution_source_execution_id": null,
+          "reported_severity": "medium"
+        },
+        "files_root_path": "/__vuln_cases__/case-20260526-112437-908a39611e",
+        "fileserver_root": {
+          "root_path": "/__vuln_cases__/case-20260526-112437-908a39611e",
+          "root_name": "case-20260526-112437-908a39611e",
+          "special_subproject_name": "__vuln_cases__",
+          "special_subproject_id": null
+        },
+        "current_stage": "receive",
+        "current_status": "intake_created",
+        "decision_status": "observe",
+        "triage_decision": "observe",
+        "triage_gate": "pending",
+        "triage_round": 1,
+        "triage_history": [],
+        "validation_result": "inconclusive",
+        "finished_reason": null,
+        "created_by_type": "service",
+        "created_by": "secflow-app-dataflow-vuln-scanner",
+        "created_at": "2026-05-26T11:24:37",
+        "updated_at": "2026-05-26T11:24:37",
+        "report_summary": null,
+        "display_summary": {
+          "title": "Unsigned Underflow Leading to Heap Overflow in IPv6 AH Inbound Payload Copy in IPSEC_AH_HandleInputPkt",
+          "subtitle": "dataflow",
+          "severity": "medium",
+          "confidence": 92,
+          "current_stage": "receive",
+          "decision_status": "observe",
+          "validation_result": "inconclusive",
+          "finished_reason": null,
+          "reporter": {
+            "name": "secflow-app-dataflow-vuln-scanner",
+            "version": "1.0.0",
+            "type": "service",
+            "vendor": null,
+            "endpoint": null,
+            "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+          },
+          "subject": {
+            "type": "dataflow_vulnerability",
+            "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_012.md",
+            "name": "Unsigned Underflow Leading to Heap Overflow in IPv6 AH Inbound Payload Copy in IPSEC_AH_HandleInputPkt",
+            "version": null
+          },
+          "source_task": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "finding_id": "DFVS-20260526-153825-012-BC5EB8",
+            "result_file": "result_012.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_012.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium"
+          },
+          "source_report_ids": [
+            "DFVS-20260526-153825-012-BC5EB8"
+          ],
+          "reported_at": null,
+          "key_points": [
+            "当前阶段：receive",
+            "当前结论：observe",
+            "验证结果：inconclusive"
+          ],
+          "current_report_id": null,
+          "current_report_title": null,
+          "current_report_updated_at": null
+        }
+      },
+      {
+        "id": "case-20260526-112436-e36ede15d6",
+        "global_vuln_id": "vuln-20260526-112436-0bc4d7f583",
+        "project_id": "44f9029d00650a10",
+        "title": "Missing Block Size Validation Leading to Out-of-Bounds Read in IPSEC_ESP_HandleInputPktV4 and IPSEC_ESP_HandleInputPkt",
+        "summary": null,
+        "severity": "medium",
+        "cvss_score": 0.0,
+        "confidence": 92,
+        "finding_id": "DFVS-20260526-153825-007-ECC42E",
+        "report_id": "DFVS-20260526-153825-007-ECC42E",
+        "state": "suspected",
+        "category": "dataflow",
+        "rule_id": null,
+        "rule_name": null,
+        "fingerprint": "1d856016612de59861b458b635c85121c39edb5b4cf5b650982e239eb5e2ead4",
+        "reported_at": null,
+        "source_refs": [
+          {
+            "reporter_name": "secflow-app-dataflow-vuln-scanner",
+            "reporter_type": "service",
+            "reporter_vendor": null,
+            "report_id": "DFVS-20260526-153825-007-ECC42E",
+            "reported_at": null,
+            "first_seen_at": "2026-05-26T11:24:36.171746",
+            "last_seen_at": "2026-05-26T11:24:36.171746"
+          }
+        ],
+        "source_report_ids": [
+          "DFVS-20260526-153825-007-ECC42E"
+        ],
+        "reporter": {
+          "name": "secflow-app-dataflow-vuln-scanner",
+          "version": "1.0.0",
+          "type": "service",
+          "vendor": null,
+          "endpoint": null,
+          "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+        },
+        "subject": {
+          "type": "dataflow_vulnerability",
+          "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_007.md",
+          "name": "Missing Block Size Validation Leading to Out-of-Bounds Read in IPSEC_ESP_HandleInputPktV4 and IPSEC_ESP_HandleInputPkt",
+          "version": null
+        },
+        "evidence": {
+          "summary": "Missing Block Size Validation Leading to Out-of-Bounds Read in IPSEC_ESP_HandleInputPktV4 and IPSEC_ESP_HandleInputPkt",
+          "reproduction_hint": "",
+          "references": [
+            {
+              "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_007.md",
+              "kind": "report"
+            }
+          ]
+        },
+        "artifacts": [
+          {
+            "artifact_id": null,
+            "kind": "report",
+            "name": "result_007.md",
+            "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_007.md",
+            "media_type": null,
+            "sha256": null,
+            "size": 11090,
+            "encoding": null,
+            "content": null,
+            "content_ref": null,
+            "children": [],
+            "metadata": {
+              "run_id": "ri-f96c1de3090c478f8df7",
+              "result_file": "result_007.md"
+            }
+          }
+        ],
+        "metadata": {
+          "source": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "run_root_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+            "result_file": "result_007.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_007.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium",
+            "finding_id": "DFVS-20260526-153825-007-ECC42E",
+            "anonymous_submission": false
+          },
+          "pool_type": "normal",
+          "dataflow_vuln_scanner": {
+            "run_status": "completed",
+            "review_verdict": "CONFIRMED",
+            "review_cycle": 1,
+            "lifecycle_status": "candidate",
+            "finding_id": "DFVS-20260526-153825-007-ECC42E",
+            "linked_task_purpose": "normal"
+          }
+        },
+        "source_task": {
+          "service_name": "secflow-app-dataflow-vuln-scanner",
+          "service_id": "secflow-app-dataflow-vuln-scanner",
+          "task_id": "tt-7e8e2fecae3148b0a6be",
+          "execution_id": "exec-517565ce7c754256aa54",
+          "run_id": "ri-f96c1de3090c478f8df7",
+          "run_name": "5.26_audit_2",
+          "finding_id": "DFVS-20260526-153825-007-ECC42E",
+          "result_file": "result_007.md",
+          "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_007.md",
+          "project_id": "44f9029d00650a10",
+          "parent_task_id": null,
+          "parent_stage_name": null,
+          "parent_stage_item_id": null,
+          "task_purpose": "normal",
+          "evolution_task_id": null,
+          "evolution_round": null,
+          "evolution_source_task_id": null,
+          "evolution_source_execution_id": null,
+          "reported_severity": "medium"
+        },
+        "files_root_path": "/__vuln_cases__/case-20260526-112436-e36ede15d6",
+        "fileserver_root": {
+          "root_path": "/__vuln_cases__/case-20260526-112436-e36ede15d6",
+          "root_name": "case-20260526-112436-e36ede15d6",
+          "special_subproject_name": "__vuln_cases__",
+          "special_subproject_id": null
+        },
+        "current_stage": "receive",
+        "current_status": "intake_created",
+        "decision_status": "observe",
+        "triage_decision": "observe",
+        "triage_gate": "pending",
+        "triage_round": 1,
+        "triage_history": [],
+        "validation_result": "inconclusive",
+        "finished_reason": null,
+        "created_by_type": "service",
+        "created_by": "secflow-app-dataflow-vuln-scanner",
+        "created_at": "2026-05-26T11:24:36",
+        "updated_at": "2026-05-26T11:24:36",
+        "report_summary": null,
+        "display_summary": {
+          "title": "Missing Block Size Validation Leading to Out-of-Bounds Read in IPSEC_ESP_HandleInputPktV4 and IPSEC_ESP_HandleInputPkt",
+          "subtitle": "dataflow",
+          "severity": "medium",
+          "confidence": 92,
+          "current_stage": "receive",
+          "decision_status": "observe",
+          "validation_result": "inconclusive",
+          "finished_reason": null,
+          "reporter": {
+            "name": "secflow-app-dataflow-vuln-scanner",
+            "version": "1.0.0",
+            "type": "service",
+            "vendor": null,
+            "endpoint": null,
+            "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+          },
+          "subject": {
+            "type": "dataflow_vulnerability",
+            "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_007.md",
+            "name": "Missing Block Size Validation Leading to Out-of-Bounds Read in IPSEC_ESP_HandleInputPktV4 and IPSEC_ESP_HandleInputPkt",
+            "version": null
+          },
+          "source_task": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "finding_id": "DFVS-20260526-153825-007-ECC42E",
+            "result_file": "result_007.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_007.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium"
+          },
+          "source_report_ids": [
+            "DFVS-20260526-153825-007-ECC42E"
+          ],
+          "reported_at": null,
+          "key_points": [
+            "当前阶段：receive",
+            "当前结论：observe",
+            "验证结果：inconclusive"
+          ],
+          "current_report_id": null,
+          "current_report_title": null,
+          "current_report_updated_at": null
+        }
+      },
+      {
+        "id": "case-20260526-112436-d989f92245",
+        "global_vuln_id": "vuln-20260526-112436-9c12f87bbb",
+        "project_id": "44f9029d00650a10",
+        "title": "Multiple Integer Safety Issues in IPSEC_AH_HandleInputPktV4: Unsigned Underflow OOB Read, Tainted Malloc Size, and IP Options OOB Read",
+        "summary": null,
+        "severity": "medium",
+        "cvss_score": 0.0,
+        "confidence": 90,
+        "finding_id": "DFVS-20260526-153825-008-F6DCB9",
+        "report_id": "DFVS-20260526-153825-008-F6DCB9",
+        "state": "suspected",
+        "category": "dataflow",
+        "rule_id": null,
+        "rule_name": null,
+        "fingerprint": "3c0ef79c18d95a267895bc714da657f687716a98b03a48e91ca3641370a35955",
+        "reported_at": null,
+        "source_refs": [
+          {
+            "reporter_name": "secflow-app-dataflow-vuln-scanner",
+            "reporter_type": "service",
+            "reporter_vendor": null,
+            "report_id": "DFVS-20260526-153825-008-F6DCB9",
+            "reported_at": null,
+            "first_seen_at": "2026-05-26T11:24:36.317638",
+            "last_seen_at": "2026-05-26T11:24:36.317638"
+          }
+        ],
+        "source_report_ids": [
+          "DFVS-20260526-153825-008-F6DCB9"
+        ],
+        "reporter": {
+          "name": "secflow-app-dataflow-vuln-scanner",
+          "version": "1.0.0",
+          "type": "service",
+          "vendor": null,
+          "endpoint": null,
+          "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+        },
+        "subject": {
+          "type": "dataflow_vulnerability",
+          "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_008.md",
+          "name": "Multiple Integer Safety Issues in IPSEC_AH_HandleInputPktV4: Unsigned Underflow OOB Read, Tainted Malloc Size, and IP Options OOB Read",
+          "version": null
+        },
+        "evidence": {
+          "summary": "Multiple Integer Safety Issues in IPSEC_AH_HandleInputPktV4: Unsigned Underflow OOB Read, Tainted Malloc Size, and IP Options OOB Read",
+          "reproduction_hint": "",
+          "references": [
+            {
+              "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_008.md",
+              "kind": "report"
+            }
+          ]
+        },
+        "artifacts": [
+          {
+            "artifact_id": null,
+            "kind": "report",
+            "name": "result_008.md",
+            "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_008.md",
+            "media_type": null,
+            "sha256": null,
+            "size": 11910,
+            "encoding": null,
+            "content": null,
+            "content_ref": null,
+            "children": [],
+            "metadata": {
+              "run_id": "ri-f96c1de3090c478f8df7",
+              "result_file": "result_008.md"
+            }
+          }
+        ],
+        "metadata": {
+          "source": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "run_root_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+            "result_file": "result_008.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_008.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium",
+            "finding_id": "DFVS-20260526-153825-008-F6DCB9",
+            "anonymous_submission": false
+          },
+          "pool_type": "normal",
+          "dataflow_vuln_scanner": {
+            "run_status": "completed",
+            "review_verdict": "CONFIRMED",
+            "review_cycle": 1,
+            "lifecycle_status": "candidate",
+            "finding_id": "DFVS-20260526-153825-008-F6DCB9",
+            "linked_task_purpose": "normal"
+          }
+        },
+        "source_task": {
+          "service_name": "secflow-app-dataflow-vuln-scanner",
+          "service_id": "secflow-app-dataflow-vuln-scanner",
+          "task_id": "tt-7e8e2fecae3148b0a6be",
+          "execution_id": "exec-517565ce7c754256aa54",
+          "run_id": "ri-f96c1de3090c478f8df7",
+          "run_name": "5.26_audit_2",
+          "finding_id": "DFVS-20260526-153825-008-F6DCB9",
+          "result_file": "result_008.md",
+          "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_008.md",
+          "project_id": "44f9029d00650a10",
+          "parent_task_id": null,
+          "parent_stage_name": null,
+          "parent_stage_item_id": null,
+          "task_purpose": "normal",
+          "evolution_task_id": null,
+          "evolution_round": null,
+          "evolution_source_task_id": null,
+          "evolution_source_execution_id": null,
+          "reported_severity": "medium"
+        },
+        "files_root_path": "/__vuln_cases__/case-20260526-112436-d989f92245",
+        "fileserver_root": {
+          "root_path": "/__vuln_cases__/case-20260526-112436-d989f92245",
+          "root_name": "case-20260526-112436-d989f92245",
+          "special_subproject_name": "__vuln_cases__",
+          "special_subproject_id": null
+        },
+        "current_stage": "receive",
+        "current_status": "intake_created",
+        "decision_status": "observe",
+        "triage_decision": "observe",
+        "triage_gate": "pending",
+        "triage_round": 1,
+        "triage_history": [],
+        "validation_result": "inconclusive",
+        "finished_reason": null,
+        "created_by_type": "service",
+        "created_by": "secflow-app-dataflow-vuln-scanner",
+        "created_at": "2026-05-26T11:24:36",
+        "updated_at": "2026-05-26T11:24:36",
+        "report_summary": null,
+        "display_summary": {
+          "title": "Multiple Integer Safety Issues in IPSEC_AH_HandleInputPktV4: Unsigned Underflow OOB Read, Tainted Malloc Size, and IP Options OOB Read",
+          "subtitle": "dataflow",
+          "severity": "medium",
+          "confidence": 90,
+          "current_stage": "receive",
+          "decision_status": "observe",
+          "validation_result": "inconclusive",
+          "finished_reason": null,
+          "reporter": {
+            "name": "secflow-app-dataflow-vuln-scanner",
+            "version": "1.0.0",
+            "type": "service",
+            "vendor": null,
+            "endpoint": null,
+            "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+          },
+          "subject": {
+            "type": "dataflow_vulnerability",
+            "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_008.md",
+            "name": "Multiple Integer Safety Issues in IPSEC_AH_HandleInputPktV4: Unsigned Underflow OOB Read, Tainted Malloc Size, and IP Options OOB Read",
+            "version": null
+          },
+          "source_task": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "finding_id": "DFVS-20260526-153825-008-F6DCB9",
+            "result_file": "result_008.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_008.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium"
+          },
+          "source_report_ids": [
+            "DFVS-20260526-153825-008-F6DCB9"
+          ],
+          "reported_at": null,
+          "key_points": [
+            "当前阶段：receive",
+            "当前结论：observe",
+            "验证结果：inconclusive"
+          ],
+          "current_report_id": null,
+          "current_report_title": null,
+          "current_report_updated_at": null
+        }
+      },
+      {
+        "id": "case-20260526-112435-a4cb0fa13d",
+        "global_vuln_id": "vuln-20260526-112435-da93afc0e1",
+        "project_id": "44f9029d00650a10",
+        "title": "Tainted Pointer Offset Write via Network-Controlled packet_info[1] in AH/ESP Header Processing",
+        "summary": null,
+        "severity": "medium",
+        "cvss_score": 0.0,
+        "confidence": 93,
+        "finding_id": "DFVS-20260526-153825-004-9B5862",
+        "report_id": "DFVS-20260526-153825-004-9B5862",
+        "state": "suspected",
+        "category": "dataflow",
+        "rule_id": null,
+        "rule_name": null,
+        "fingerprint": "134fceb2d5a1fa7102069fb8c8a6664444f3d6e26c93a08f57b2ff13096897c1",
+        "reported_at": null,
+        "source_refs": [
+          {
+            "reporter_name": "secflow-app-dataflow-vuln-scanner",
+            "reporter_type": "service",
+            "reporter_vendor": null,
+            "report_id": "DFVS-20260526-153825-004-9B5862",
+            "reported_at": null,
+            "first_seen_at": "2026-05-26T11:24:35.497795",
+            "last_seen_at": "2026-05-26T11:24:35.497795"
+          }
+        ],
+        "source_report_ids": [
+          "DFVS-20260526-153825-004-9B5862"
+        ],
+        "reporter": {
+          "name": "secflow-app-dataflow-vuln-scanner",
+          "version": "1.0.0",
+          "type": "service",
+          "vendor": null,
+          "endpoint": null,
+          "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+        },
+        "subject": {
+          "type": "dataflow_vulnerability",
+          "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_004.md",
+          "name": "Tainted Pointer Offset Write via Network-Controlled packet_info[1] in AH/ESP Header Processing",
+          "version": null
+        },
+        "evidence": {
+          "summary": "Tainted Pointer Offset Write via Network-Controlled packet_info[1] in AH/ESP Header Processing",
+          "reproduction_hint": "",
+          "references": [
+            {
+              "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_004.md",
+              "kind": "report"
+            }
+          ]
+        },
+        "artifacts": [
+          {
+            "artifact_id": null,
+            "kind": "report",
+            "name": "result_004.md",
+            "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_004.md",
+            "media_type": null,
+            "sha256": null,
+            "size": 9735,
+            "encoding": null,
+            "content": null,
+            "content_ref": null,
+            "children": [],
+            "metadata": {
+              "run_id": "ri-f96c1de3090c478f8df7",
+              "result_file": "result_004.md"
+            }
+          }
+        ],
+        "metadata": {
+          "source": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "run_root_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+            "result_file": "result_004.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_004.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium",
+            "finding_id": "DFVS-20260526-153825-004-9B5862",
+            "anonymous_submission": false
+          },
+          "pool_type": "normal",
+          "dataflow_vuln_scanner": {
+            "run_status": "completed",
+            "review_verdict": "CONFIRMED",
+            "review_cycle": 1,
+            "lifecycle_status": "candidate",
+            "finding_id": "DFVS-20260526-153825-004-9B5862",
+            "linked_task_purpose": "normal"
+          }
+        },
+        "source_task": {
+          "service_name": "secflow-app-dataflow-vuln-scanner",
+          "service_id": "secflow-app-dataflow-vuln-scanner",
+          "task_id": "tt-7e8e2fecae3148b0a6be",
+          "execution_id": "exec-517565ce7c754256aa54",
+          "run_id": "ri-f96c1de3090c478f8df7",
+          "run_name": "5.26_audit_2",
+          "finding_id": "DFVS-20260526-153825-004-9B5862",
+          "result_file": "result_004.md",
+          "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_004.md",
+          "project_id": "44f9029d00650a10",
+          "parent_task_id": null,
+          "parent_stage_name": null,
+          "parent_stage_item_id": null,
+          "task_purpose": "normal",
+          "evolution_task_id": null,
+          "evolution_round": null,
+          "evolution_source_task_id": null,
+          "evolution_source_execution_id": null,
+          "reported_severity": "medium"
+        },
+        "files_root_path": "/__vuln_cases__/case-20260526-112435-a4cb0fa13d",
+        "fileserver_root": {
+          "root_path": "/__vuln_cases__/case-20260526-112435-a4cb0fa13d",
+          "root_name": "case-20260526-112435-a4cb0fa13d",
+          "special_subproject_name": "__vuln_cases__",
+          "special_subproject_id": null
+        },
+        "current_stage": "receive",
+        "current_status": "intake_created",
+        "decision_status": "observe",
+        "triage_decision": "observe",
+        "triage_gate": "pending",
+        "triage_round": 1,
+        "triage_history": [],
+        "validation_result": "inconclusive",
+        "finished_reason": null,
+        "created_by_type": "service",
+        "created_by": "secflow-app-dataflow-vuln-scanner",
+        "created_at": "2026-05-26T11:24:36",
+        "updated_at": "2026-05-26T11:24:36",
+        "report_summary": null,
+        "display_summary": {
+          "title": "Tainted Pointer Offset Write via Network-Controlled packet_info[1] in AH/ESP Header Processing",
+          "subtitle": "dataflow",
+          "severity": "medium",
+          "confidence": 93,
+          "current_stage": "receive",
+          "decision_status": "observe",
+          "validation_result": "inconclusive",
+          "finished_reason": null,
+          "reporter": {
+            "name": "secflow-app-dataflow-vuln-scanner",
+            "version": "1.0.0",
+            "type": "service",
+            "vendor": null,
+            "endpoint": null,
+            "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+          },
+          "subject": {
+            "type": "dataflow_vulnerability",
+            "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_004.md",
+            "name": "Tainted Pointer Offset Write via Network-Controlled packet_info[1] in AH/ESP Header Processing",
+            "version": null
+          },
+          "source_task": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "finding_id": "DFVS-20260526-153825-004-9B5862",
+            "result_file": "result_004.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_004.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium"
+          },
+          "source_report_ids": [
+            "DFVS-20260526-153825-004-9B5862"
+          ],
+          "reported_at": null,
+          "key_points": [
+            "当前阶段：receive",
+            "当前结论：observe",
+            "验证结果：inconclusive"
+          ],
+          "current_report_id": null,
+          "current_report_title": null,
+          "current_report_updated_at": null
+        }
+      },
+      {
+        "id": "case-20260526-112435-8d04d70b51",
+        "global_vuln_id": "vuln-20260526-112435-6e49ef432a",
+        "project_id": "44f9029d00650a10",
+        "title": "Tainted Timer Handle Deletion via Network-Controlled Pipe ID in IPSEC_SOCKI_CloseLDMPipe and IPSEC_MGTI_TimerDelete",
+        "summary": null,
+        "severity": "medium",
+        "cvss_score": 0.0,
+        "confidence": 85,
+        "finding_id": "DFVS-20260526-153825-005-04E1DB",
+        "report_id": "DFVS-20260526-153825-005-04E1DB",
+        "state": "suspected",
+        "category": "dataflow",
+        "rule_id": null,
+        "rule_name": null,
+        "fingerprint": "932dff30c8ad650a94447ebeafb7fd67aee7b07f131de474d57db72f7d0cf713",
+        "reported_at": null,
+        "source_refs": [
+          {
+            "reporter_name": "secflow-app-dataflow-vuln-scanner",
+            "reporter_type": "service",
+            "reporter_vendor": null,
+            "report_id": "DFVS-20260526-153825-005-04E1DB",
+            "reported_at": null,
+            "first_seen_at": "2026-05-26T11:24:35.720018",
+            "last_seen_at": "2026-05-26T11:24:35.720018"
+          }
+        ],
+        "source_report_ids": [
+          "DFVS-20260526-153825-005-04E1DB"
+        ],
+        "reporter": {
+          "name": "secflow-app-dataflow-vuln-scanner",
+          "version": "1.0.0",
+          "type": "service",
+          "vendor": null,
+          "endpoint": null,
+          "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+        },
+        "subject": {
+          "type": "dataflow_vulnerability",
+          "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_005.md",
+          "name": "Tainted Timer Handle Deletion via Network-Controlled Pipe ID in IPSEC_SOCKI_CloseLDMPipe and IPSEC_MGTI_TimerDelete",
+          "version": null
+        },
+        "evidence": {
+          "summary": "Tainted Timer Handle Deletion via Network-Controlled Pipe ID in IPSEC_SOCKI_CloseLDMPipe and IPSEC_MGTI_TimerDelete",
+          "reproduction_hint": "",
+          "references": [
+            {
+              "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_005.md",
+              "kind": "report"
+            }
+          ]
+        },
+        "artifacts": [
+          {
+            "artifact_id": null,
+            "kind": "report",
+            "name": "result_005.md",
+            "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_005.md",
+            "media_type": null,
+            "sha256": null,
+            "size": 10209,
+            "encoding": null,
+            "content": null,
+            "content_ref": null,
+            "children": [],
+            "metadata": {
+              "run_id": "ri-f96c1de3090c478f8df7",
+              "result_file": "result_005.md"
+            }
+          }
+        ],
+        "metadata": {
+          "source": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "run_root_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+            "result_file": "result_005.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_005.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium",
+            "finding_id": "DFVS-20260526-153825-005-04E1DB",
+            "anonymous_submission": false
+          },
+          "pool_type": "normal",
+          "dataflow_vuln_scanner": {
+            "run_status": "completed",
+            "review_verdict": "CONFIRMED",
+            "review_cycle": 1,
+            "lifecycle_status": "candidate",
+            "finding_id": "DFVS-20260526-153825-005-04E1DB",
+            "linked_task_purpose": "normal"
+          }
+        },
+        "source_task": {
+          "service_name": "secflow-app-dataflow-vuln-scanner",
+          "service_id": "secflow-app-dataflow-vuln-scanner",
+          "task_id": "tt-7e8e2fecae3148b0a6be",
+          "execution_id": "exec-517565ce7c754256aa54",
+          "run_id": "ri-f96c1de3090c478f8df7",
+          "run_name": "5.26_audit_2",
+          "finding_id": "DFVS-20260526-153825-005-04E1DB",
+          "result_file": "result_005.md",
+          "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_005.md",
+          "project_id": "44f9029d00650a10",
+          "parent_task_id": null,
+          "parent_stage_name": null,
+          "parent_stage_item_id": null,
+          "task_purpose": "normal",
+          "evolution_task_id": null,
+          "evolution_round": null,
+          "evolution_source_task_id": null,
+          "evolution_source_execution_id": null,
+          "reported_severity": "medium"
+        },
+        "files_root_path": "/__vuln_cases__/case-20260526-112435-8d04d70b51",
+        "fileserver_root": {
+          "root_path": "/__vuln_cases__/case-20260526-112435-8d04d70b51",
+          "root_name": "case-20260526-112435-8d04d70b51",
+          "special_subproject_name": "__vuln_cases__",
+          "special_subproject_id": null
+        },
+        "current_stage": "receive",
+        "current_status": "intake_created",
+        "decision_status": "observe",
+        "triage_decision": "observe",
+        "triage_gate": "pending",
+        "triage_round": 1,
+        "triage_history": [],
+        "validation_result": "inconclusive",
+        "finished_reason": null,
+        "created_by_type": "service",
+        "created_by": "secflow-app-dataflow-vuln-scanner",
+        "created_at": "2026-05-26T11:24:36",
+        "updated_at": "2026-05-26T11:24:36",
+        "report_summary": null,
+        "display_summary": {
+          "title": "Tainted Timer Handle Deletion via Network-Controlled Pipe ID in IPSEC_SOCKI_CloseLDMPipe and IPSEC_MGTI_TimerDelete",
+          "subtitle": "dataflow",
+          "severity": "medium",
+          "confidence": 85,
+          "current_stage": "receive",
+          "decision_status": "observe",
+          "validation_result": "inconclusive",
+          "finished_reason": null,
+          "reporter": {
+            "name": "secflow-app-dataflow-vuln-scanner",
+            "version": "1.0.0",
+            "type": "service",
+            "vendor": null,
+            "endpoint": null,
+            "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+          },
+          "subject": {
+            "type": "dataflow_vulnerability",
+            "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_005.md",
+            "name": "Tainted Timer Handle Deletion via Network-Controlled Pipe ID in IPSEC_SOCKI_CloseLDMPipe and IPSEC_MGTI_TimerDelete",
+            "version": null
+          },
+          "source_task": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "finding_id": "DFVS-20260526-153825-005-04E1DB",
+            "result_file": "result_005.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_005.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium"
+          },
+          "source_report_ids": [
+            "DFVS-20260526-153825-005-04E1DB"
+          ],
+          "reported_at": null,
+          "key_points": [
+            "当前阶段：receive",
+            "当前结论：observe",
+            "验证结果：inconclusive"
+          ],
+          "current_report_id": null,
+          "current_report_title": null,
+          "current_report_updated_at": null
+        }
+      },
+      {
+        "id": "case-20260526-112435-07bcfd129a",
+        "global_vuln_id": "vuln-20260526-112435-5452fb5075",
+        "project_id": "44f9029d00650a10",
+        "title": "Network-Controlled SPI Injection into SADB Lookup Key in IPSEC_LIBI_GetManualSa and IPSEC_ESP_HandleOutputPktV4",
+        "summary": null,
+        "severity": "medium",
+        "cvss_score": 0.0,
+        "confidence": 91,
+        "finding_id": "DFVS-20260526-153825-006-7AF4C3",
+        "report_id": "DFVS-20260526-153825-006-7AF4C3",
+        "state": "suspected",
+        "category": "dataflow",
+        "rule_id": null,
+        "rule_name": null,
+        "fingerprint": "68669c46dd90402a9987a70795723abfef77c4c18a1f4d09eedf0f17ae8e74c3",
+        "reported_at": null,
+        "source_refs": [
+          {
+            "reporter_name": "secflow-app-dataflow-vuln-scanner",
+            "reporter_type": "service",
+            "reporter_vendor": null,
+            "report_id": "DFVS-20260526-153825-006-7AF4C3",
+            "reported_at": null,
+            "first_seen_at": "2026-05-26T11:24:35.925214",
+            "last_seen_at": "2026-05-26T11:24:35.925214"
+          }
+        ],
+        "source_report_ids": [
+          "DFVS-20260526-153825-006-7AF4C3"
+        ],
+        "reporter": {
+          "name": "secflow-app-dataflow-vuln-scanner",
+          "version": "1.0.0",
+          "type": "service",
+          "vendor": null,
+          "endpoint": null,
+          "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+        },
+        "subject": {
+          "type": "dataflow_vulnerability",
+          "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_006.md",
+          "name": "Network-Controlled SPI Injection into SADB Lookup Key in IPSEC_LIBI_GetManualSa and IPSEC_ESP_HandleOutputPktV4",
+          "version": null
+        },
+        "evidence": {
+          "summary": "Network-Controlled SPI Injection into SADB Lookup Key in IPSEC_LIBI_GetManualSa and IPSEC_ESP_HandleOutputPktV4",
+          "reproduction_hint": "",
+          "references": [
+            {
+              "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_006.md",
+              "kind": "report"
+            }
+          ]
+        },
+        "artifacts": [
+          {
+            "artifact_id": null,
+            "kind": "report",
+            "name": "result_006.md",
+            "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_006.md",
+            "media_type": null,
+            "sha256": null,
+            "size": 9621,
+            "encoding": null,
+            "content": null,
+            "content_ref": null,
+            "children": [],
+            "metadata": {
+              "run_id": "ri-f96c1de3090c478f8df7",
+              "result_file": "result_006.md"
+            }
+          }
+        ],
+        "metadata": {
+          "source": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "run_root_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+            "result_file": "result_006.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_006.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium",
+            "finding_id": "DFVS-20260526-153825-006-7AF4C3",
+            "anonymous_submission": false
+          },
+          "pool_type": "normal",
+          "dataflow_vuln_scanner": {
+            "run_status": "completed",
+            "review_verdict": "CONFIRMED",
+            "review_cycle": 1,
+            "lifecycle_status": "candidate",
+            "finding_id": "DFVS-20260526-153825-006-7AF4C3",
+            "linked_task_purpose": "normal"
+          }
+        },
+        "source_task": {
+          "service_name": "secflow-app-dataflow-vuln-scanner",
+          "service_id": "secflow-app-dataflow-vuln-scanner",
+          "task_id": "tt-7e8e2fecae3148b0a6be",
+          "execution_id": "exec-517565ce7c754256aa54",
+          "run_id": "ri-f96c1de3090c478f8df7",
+          "run_name": "5.26_audit_2",
+          "finding_id": "DFVS-20260526-153825-006-7AF4C3",
+          "result_file": "result_006.md",
+          "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_006.md",
+          "project_id": "44f9029d00650a10",
+          "parent_task_id": null,
+          "parent_stage_name": null,
+          "parent_stage_item_id": null,
+          "task_purpose": "normal",
+          "evolution_task_id": null,
+          "evolution_round": null,
+          "evolution_source_task_id": null,
+          "evolution_source_execution_id": null,
+          "reported_severity": "medium"
+        },
+        "files_root_path": "/__vuln_cases__/case-20260526-112435-07bcfd129a",
+        "fileserver_root": {
+          "root_path": "/__vuln_cases__/case-20260526-112435-07bcfd129a",
+          "root_name": "case-20260526-112435-07bcfd129a",
+          "special_subproject_name": "__vuln_cases__",
+          "special_subproject_id": null
+        },
+        "current_stage": "receive",
+        "current_status": "intake_created",
+        "decision_status": "observe",
+        "triage_decision": "observe",
+        "triage_gate": "pending",
+        "triage_round": 1,
+        "triage_history": [],
+        "validation_result": "inconclusive",
+        "finished_reason": null,
+        "created_by_type": "service",
+        "created_by": "secflow-app-dataflow-vuln-scanner",
+        "created_at": "2026-05-26T11:24:36",
+        "updated_at": "2026-05-26T11:24:36",
+        "report_summary": null,
+        "display_summary": {
+          "title": "Network-Controlled SPI Injection into SADB Lookup Key in IPSEC_LIBI_GetManualSa and IPSEC_ESP_HandleOutputPktV4",
+          "subtitle": "dataflow",
+          "severity": "medium",
+          "confidence": 91,
+          "current_stage": "receive",
+          "decision_status": "observe",
+          "validation_result": "inconclusive",
+          "finished_reason": null,
+          "reporter": {
+            "name": "secflow-app-dataflow-vuln-scanner",
+            "version": "1.0.0",
+            "type": "service",
+            "vendor": null,
+            "endpoint": null,
+            "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+          },
+          "subject": {
+            "type": "dataflow_vulnerability",
+            "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_006.md",
+            "name": "Network-Controlled SPI Injection into SADB Lookup Key in IPSEC_LIBI_GetManualSa and IPSEC_ESP_HandleOutputPktV4",
+            "version": null
+          },
+          "source_task": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "finding_id": "DFVS-20260526-153825-006-7AF4C3",
+            "result_file": "result_006.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_006.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium"
+          },
+          "source_report_ids": [
+            "DFVS-20260526-153825-006-7AF4C3"
+          ],
+          "reported_at": null,
+          "key_points": [
+            "当前阶段：receive",
+            "当前结论：observe",
+            "验证结果：inconclusive"
+          ],
+          "current_report_id": null,
+          "current_report_title": null,
+          "current_report_updated_at": null
+        }
+      },
+      {
+        "id": "case-20260526-112435-450780712f",
+        "global_vuln_id": "vuln-20260526-112435-306130a0cc",
+        "project_id": "44f9029d00650a10",
+        "title": "IPv6 Extension Header Parsing Offset Overflow / Out-of-Bounds Read in IPSEC_PKT_ParseAndVerifyHdr",
+        "summary": null,
+        "severity": "medium",
+        "cvss_score": 0.0,
+        "confidence": 89,
+        "finding_id": "DFVS-20260526-153825-003-C0A10A",
+        "report_id": "DFVS-20260526-153825-003-C0A10A",
+        "state": "suspected",
+        "category": "dataflow",
+        "rule_id": null,
+        "rule_name": null,
+        "fingerprint": "07ddc6be74e1622b29e45b57d49750ba9b95e432580a689c58fbe88a73f87267",
+        "reported_at": null,
+        "source_refs": [
+          {
+            "reporter_name": "secflow-app-dataflow-vuln-scanner",
+            "reporter_type": "service",
+            "reporter_vendor": null,
+            "report_id": "DFVS-20260526-153825-003-C0A10A",
+            "reported_at": null,
+            "first_seen_at": "2026-05-26T11:24:35.230298",
+            "last_seen_at": "2026-05-26T11:24:35.230298"
+          }
+        ],
+        "source_report_ids": [
+          "DFVS-20260526-153825-003-C0A10A"
+        ],
+        "reporter": {
+          "name": "secflow-app-dataflow-vuln-scanner",
+          "version": "1.0.0",
+          "type": "service",
+          "vendor": null,
+          "endpoint": null,
+          "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+        },
+        "subject": {
+          "type": "dataflow_vulnerability",
+          "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_003.md",
+          "name": "IPv6 Extension Header Parsing Offset Overflow / Out-of-Bounds Read in IPSEC_PKT_ParseAndVerifyHdr",
+          "version": null
+        },
+        "evidence": {
+          "summary": "IPv6 Extension Header Parsing Offset Overflow / Out-of-Bounds Read in IPSEC_PKT_ParseAndVerifyHdr",
+          "reproduction_hint": "",
+          "references": [
+            {
+              "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_003.md",
+              "kind": "report"
+            }
+          ]
+        },
+        "artifacts": [
+          {
+            "artifact_id": null,
+            "kind": "report",
+            "name": "result_003.md",
+            "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_003.md",
+            "media_type": null,
+            "sha256": null,
+            "size": 9812,
+            "encoding": null,
+            "content": null,
+            "content_ref": null,
+            "children": [],
+            "metadata": {
+              "run_id": "ri-f96c1de3090c478f8df7",
+              "result_file": "result_003.md"
+            }
+          }
+        ],
+        "metadata": {
+          "source": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "run_root_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+            "result_file": "result_003.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_003.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium",
+            "finding_id": "DFVS-20260526-153825-003-C0A10A",
+            "anonymous_submission": false
+          },
+          "pool_type": "normal",
+          "dataflow_vuln_scanner": {
+            "run_status": "completed",
+            "review_verdict": "CONFIRMED",
+            "review_cycle": 1,
+            "lifecycle_status": "candidate",
+            "finding_id": "DFVS-20260526-153825-003-C0A10A",
+            "linked_task_purpose": "normal"
+          }
+        },
+        "source_task": {
+          "service_name": "secflow-app-dataflow-vuln-scanner",
+          "service_id": "secflow-app-dataflow-vuln-scanner",
+          "task_id": "tt-7e8e2fecae3148b0a6be",
+          "execution_id": "exec-517565ce7c754256aa54",
+          "run_id": "ri-f96c1de3090c478f8df7",
+          "run_name": "5.26_audit_2",
+          "finding_id": "DFVS-20260526-153825-003-C0A10A",
+          "result_file": "result_003.md",
+          "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_003.md",
+          "project_id": "44f9029d00650a10",
+          "parent_task_id": null,
+          "parent_stage_name": null,
+          "parent_stage_item_id": null,
+          "task_purpose": "normal",
+          "evolution_task_id": null,
+          "evolution_round": null,
+          "evolution_source_task_id": null,
+          "evolution_source_execution_id": null,
+          "reported_severity": "medium"
+        },
+        "files_root_path": "/__vuln_cases__/case-20260526-112435-450780712f",
+        "fileserver_root": {
+          "root_path": "/__vuln_cases__/case-20260526-112435-450780712f",
+          "root_name": "case-20260526-112435-450780712f",
+          "special_subproject_name": "__vuln_cases__",
+          "special_subproject_id": null
+        },
+        "current_stage": "receive",
+        "current_status": "intake_created",
+        "decision_status": "observe",
+        "triage_decision": "observe",
+        "triage_gate": "pending",
+        "triage_round": 1,
+        "triage_history": [],
+        "validation_result": "inconclusive",
+        "finished_reason": null,
+        "created_by_type": "service",
+        "created_by": "secflow-app-dataflow-vuln-scanner",
+        "created_at": "2026-05-26T11:24:35",
+        "updated_at": "2026-05-26T11:24:35",
+        "report_summary": null,
+        "display_summary": {
+          "title": "IPv6 Extension Header Parsing Offset Overflow / Out-of-Bounds Read in IPSEC_PKT_ParseAndVerifyHdr",
+          "subtitle": "dataflow",
+          "severity": "medium",
+          "confidence": 89,
+          "current_stage": "receive",
+          "decision_status": "observe",
+          "validation_result": "inconclusive",
+          "finished_reason": null,
+          "reporter": {
+            "name": "secflow-app-dataflow-vuln-scanner",
+            "version": "1.0.0",
+            "type": "service",
+            "vendor": null,
+            "endpoint": null,
+            "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+          },
+          "subject": {
+            "type": "dataflow_vulnerability",
+            "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_003.md",
+            "name": "IPv6 Extension Header Parsing Offset Overflow / Out-of-Bounds Read in IPSEC_PKT_ParseAndVerifyHdr",
+            "version": null
+          },
+          "source_task": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "finding_id": "DFVS-20260526-153825-003-C0A10A",
+            "result_file": "result_003.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_003.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium"
+          },
+          "source_report_ids": [
+            "DFVS-20260526-153825-003-C0A10A"
+          ],
+          "reported_at": null,
+          "key_points": [
+            "当前阶段：receive",
+            "当前结论：observe",
+            "验证结果：inconclusive"
+          ],
+          "current_report_id": null,
+          "current_report_title": null,
+          "current_report_updated_at": null
+        }
+      },
+      {
+        "id": "case-20260526-112434-f1f0be0569",
+        "global_vuln_id": "vuln-20260526-112434-ac641073fb",
+        "project_id": "44f9029d00650a10",
+        "title": "Integer Truncation Leading to Pipe ID Collision in IPSEC_SOCKI_HandlePipeData",
+        "summary": null,
+        "severity": "medium",
+        "cvss_score": 0.0,
+        "confidence": 94,
+        "finding_id": "DFVS-20260526-153825-001-53C2E3",
+        "report_id": "DFVS-20260526-153825-001-53C2E3",
+        "state": "suspected",
+        "category": "dataflow",
+        "rule_id": null,
+        "rule_name": null,
+        "fingerprint": "c0b783879c3670b7cde32872133eb36f86c89e088b16a2fbd05fa085ad045aab",
+        "reported_at": null,
+        "source_refs": [
+          {
+            "reporter_name": "secflow-app-dataflow-vuln-scanner",
+            "reporter_type": "service",
+            "reporter_vendor": null,
+            "report_id": "DFVS-20260526-153825-001-53C2E3",
+            "reported_at": null,
+            "first_seen_at": "2026-05-26T11:24:34.651000",
+            "last_seen_at": "2026-05-26T11:24:34.651000"
+          }
+        ],
+        "source_report_ids": [
+          "DFVS-20260526-153825-001-53C2E3"
+        ],
+        "reporter": {
+          "name": "secflow-app-dataflow-vuln-scanner",
+          "version": "1.0.0",
+          "type": "service",
+          "vendor": null,
+          "endpoint": null,
+          "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+        },
+        "subject": {
+          "type": "dataflow_vulnerability",
+          "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_001.md",
+          "name": "Integer Truncation Leading to Pipe ID Collision in IPSEC_SOCKI_HandlePipeData",
+          "version": null
+        },
+        "evidence": {
+          "summary": "Integer Truncation Leading to Pipe ID Collision in IPSEC_SOCKI_HandlePipeData",
+          "reproduction_hint": "",
+          "references": [
+            {
+              "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_001.md",
+              "kind": "report"
+            }
+          ]
+        },
+        "artifacts": [
+          {
+            "artifact_id": null,
+            "kind": "report",
+            "name": "result_001.md",
+            "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_001.md",
+            "media_type": null,
+            "sha256": null,
+            "size": 6973,
+            "encoding": null,
+            "content": null,
+            "content_ref": null,
+            "children": [],
+            "metadata": {
+              "run_id": "ri-f96c1de3090c478f8df7",
+              "result_file": "result_001.md"
+            }
+          }
+        ],
+        "metadata": {
+          "source": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "run_root_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+            "result_file": "result_001.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_001.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium",
+            "finding_id": "DFVS-20260526-153825-001-53C2E3",
+            "anonymous_submission": false
+          },
+          "pool_type": "normal",
+          "dataflow_vuln_scanner": {
+            "run_status": "completed",
+            "review_verdict": "CONFIRMED",
+            "review_cycle": 1,
+            "lifecycle_status": "candidate",
+            "finding_id": "DFVS-20260526-153825-001-53C2E3",
+            "linked_task_purpose": "normal"
+          }
+        },
+        "source_task": {
+          "service_name": "secflow-app-dataflow-vuln-scanner",
+          "service_id": "secflow-app-dataflow-vuln-scanner",
+          "task_id": "tt-7e8e2fecae3148b0a6be",
+          "execution_id": "exec-517565ce7c754256aa54",
+          "run_id": "ri-f96c1de3090c478f8df7",
+          "run_name": "5.26_audit_2",
+          "finding_id": "DFVS-20260526-153825-001-53C2E3",
+          "result_file": "result_001.md",
+          "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_001.md",
+          "project_id": "44f9029d00650a10",
+          "parent_task_id": null,
+          "parent_stage_name": null,
+          "parent_stage_item_id": null,
+          "task_purpose": "normal",
+          "evolution_task_id": null,
+          "evolution_round": null,
+          "evolution_source_task_id": null,
+          "evolution_source_execution_id": null,
+          "reported_severity": "medium"
+        },
+        "files_root_path": "/__vuln_cases__/case-20260526-112434-f1f0be0569",
+        "fileserver_root": {
+          "root_path": "/__vuln_cases__/case-20260526-112434-f1f0be0569",
+          "root_name": "case-20260526-112434-f1f0be0569",
+          "special_subproject_name": "__vuln_cases__",
+          "special_subproject_id": null
+        },
+        "current_stage": "receive",
+        "current_status": "intake_created",
+        "decision_status": "observe",
+        "triage_decision": "observe",
+        "triage_gate": "pending",
+        "triage_round": 1,
+        "triage_history": [],
+        "validation_result": "inconclusive",
+        "finished_reason": null,
+        "created_by_type": "service",
+        "created_by": "secflow-app-dataflow-vuln-scanner",
+        "created_at": "2026-05-26T11:24:35",
+        "updated_at": "2026-05-26T11:24:35",
+        "report_summary": null,
+        "display_summary": {
+          "title": "Integer Truncation Leading to Pipe ID Collision in IPSEC_SOCKI_HandlePipeData",
+          "subtitle": "dataflow",
+          "severity": "medium",
+          "confidence": 94,
+          "current_stage": "receive",
+          "decision_status": "observe",
+          "validation_result": "inconclusive",
+          "finished_reason": null,
+          "reporter": {
+            "name": "secflow-app-dataflow-vuln-scanner",
+            "version": "1.0.0",
+            "type": "service",
+            "vendor": null,
+            "endpoint": null,
+            "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+          },
+          "subject": {
+            "type": "dataflow_vulnerability",
+            "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_001.md",
+            "name": "Integer Truncation Leading to Pipe ID Collision in IPSEC_SOCKI_HandlePipeData",
+            "version": null
+          },
+          "source_task": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "finding_id": "DFVS-20260526-153825-001-53C2E3",
+            "result_file": "result_001.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_001.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium"
+          },
+          "source_report_ids": [
+            "DFVS-20260526-153825-001-53C2E3"
+          ],
+          "reported_at": null,
+          "key_points": [
+            "当前阶段：receive",
+            "当前结论：observe",
+            "验证结果：inconclusive"
+          ],
+          "current_report_id": null,
+          "current_report_title": null,
+          "current_report_updated_at": null
+        }
+      },
+      {
+        "id": "case-20260526-112434-48c0c11df7",
+        "global_vuln_id": "vuln-20260526-112434-fc75c5c7d6",
+        "project_id": "44f9029d00650a10",
+        "title": "Arbitrary Memory Allocation Address Control via Tainted Pointer in IPSEC_SOCK_Buffer_Packet",
+        "summary": null,
+        "severity": "medium",
+        "cvss_score": 0.0,
+        "confidence": 82,
+        "finding_id": "DFVS-20260526-153825-002-1586C3",
+        "report_id": "DFVS-20260526-153825-002-1586C3",
+        "state": "suspected",
+        "category": "dataflow",
+        "rule_id": null,
+        "rule_name": null,
+        "fingerprint": "b376c981d0e8e8aff3c9194a6861578f24f9cddc96ec17d9fede5a60ad8f5794",
+        "reported_at": null,
+        "source_refs": [
+          {
+            "reporter_name": "secflow-app-dataflow-vuln-scanner",
+            "reporter_type": "service",
+            "reporter_vendor": null,
+            "report_id": "DFVS-20260526-153825-002-1586C3",
+            "reported_at": null,
+            "first_seen_at": "2026-05-26T11:24:34.982872",
+            "last_seen_at": "2026-05-26T11:24:34.982872"
+          }
+        ],
+        "source_report_ids": [
+          "DFVS-20260526-153825-002-1586C3"
+        ],
+        "reporter": {
+          "name": "secflow-app-dataflow-vuln-scanner",
+          "version": "1.0.0",
+          "type": "service",
+          "vendor": null,
+          "endpoint": null,
+          "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+        },
+        "subject": {
+          "type": "dataflow_vulnerability",
+          "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_002.md",
+          "name": "Arbitrary Memory Allocation Address Control via Tainted Pointer in IPSEC_SOCK_Buffer_Packet",
+          "version": null
+        },
+        "evidence": {
+          "summary": "Arbitrary Memory Allocation Address Control via Tainted Pointer in IPSEC_SOCK_Buffer_Packet",
+          "reproduction_hint": "",
+          "references": [
+            {
+              "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_002.md",
+              "kind": "report"
+            }
+          ]
+        },
+        "artifacts": [
+          {
+            "artifact_id": null,
+            "kind": "report",
+            "name": "result_002.md",
+            "path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_002.md",
+            "media_type": null,
+            "sha256": null,
+            "size": 8909,
+            "encoding": null,
+            "content": null,
+            "content_ref": null,
+            "children": [],
+            "metadata": {
+              "run_id": "ri-f96c1de3090c478f8df7",
+              "result_file": "result_002.md"
+            }
+          }
+        ],
+        "metadata": {
+          "source": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "run_root_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2",
+            "result_file": "result_002.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_002.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium",
+            "finding_id": "DFVS-20260526-153825-002-1586C3",
+            "anonymous_submission": false
+          },
+          "pool_type": "normal",
+          "dataflow_vuln_scanner": {
+            "run_status": "completed",
+            "review_verdict": "CONFIRMED",
+            "review_cycle": 1,
+            "lifecycle_status": "candidate",
+            "finding_id": "DFVS-20260526-153825-002-1586C3",
+            "linked_task_purpose": "normal"
+          }
+        },
+        "source_task": {
+          "service_name": "secflow-app-dataflow-vuln-scanner",
+          "service_id": "secflow-app-dataflow-vuln-scanner",
+          "task_id": "tt-7e8e2fecae3148b0a6be",
+          "execution_id": "exec-517565ce7c754256aa54",
+          "run_id": "ri-f96c1de3090c478f8df7",
+          "run_name": "5.26_audit_2",
+          "finding_id": "DFVS-20260526-153825-002-1586C3",
+          "result_file": "result_002.md",
+          "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_002.md",
+          "project_id": "44f9029d00650a10",
+          "parent_task_id": null,
+          "parent_stage_name": null,
+          "parent_stage_item_id": null,
+          "task_purpose": "normal",
+          "evolution_task_id": null,
+          "evolution_round": null,
+          "evolution_source_task_id": null,
+          "evolution_source_execution_id": null,
+          "reported_severity": "medium"
+        },
+        "files_root_path": "/__vuln_cases__/case-20260526-112434-48c0c11df7",
+        "fileserver_root": {
+          "root_path": "/__vuln_cases__/case-20260526-112434-48c0c11df7",
+          "root_name": "case-20260526-112434-48c0c11df7",
+          "special_subproject_name": "__vuln_cases__",
+          "special_subproject_id": null
+        },
+        "current_stage": "receive",
+        "current_status": "intake_created",
+        "decision_status": "observe",
+        "triage_decision": "observe",
+        "triage_gate": "pending",
+        "triage_round": 1,
+        "triage_history": [],
+        "validation_result": "inconclusive",
+        "finished_reason": null,
+        "created_by_type": "service",
+        "created_by": "secflow-app-dataflow-vuln-scanner",
+        "created_at": "2026-05-26T11:24:35",
+        "updated_at": "2026-05-26T11:24:35",
+        "report_summary": null,
+        "display_summary": {
+          "title": "Arbitrary Memory Allocation Address Control via Tainted Pointer in IPSEC_SOCK_Buffer_Packet",
+          "subtitle": "dataflow",
+          "severity": "medium",
+          "confidence": 82,
+          "current_stage": "receive",
+          "decision_status": "observe",
+          "validation_result": "inconclusive",
+          "finished_reason": null,
+          "reporter": {
+            "name": "secflow-app-dataflow-vuln-scanner",
+            "version": "1.0.0",
+            "type": "service",
+            "vendor": null,
+            "endpoint": null,
+            "instance_id": "secflow-app-dataflow-vuln-scanner-worker-0"
+          },
+          "subject": {
+            "type": "dataflow_vulnerability",
+            "locator": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_002.md",
+            "name": "Arbitrary Memory Allocation Address Control via Tainted Pointer in IPSEC_SOCK_Buffer_Packet",
+            "version": null
+          },
+          "source_task": {
+            "service_name": "secflow-app-dataflow-vuln-scanner",
+            "service_id": "secflow-app-dataflow-vuln-scanner",
+            "task_id": "tt-7e8e2fecae3148b0a6be",
+            "execution_id": "exec-517565ce7c754256aa54",
+            "run_id": "ri-f96c1de3090c478f8df7",
+            "run_name": "5.26_audit_2",
+            "finding_id": "DFVS-20260526-153825-002-1586C3",
+            "result_file": "result_002.md",
+            "result_path": "/data/files/44f9029d00650a10/app/secflow-app-dataflow-vuln-scanner/5.26_audit_2/results/result_002.md",
+            "project_id": "44f9029d00650a10",
+            "parent_task_id": null,
+            "parent_stage_name": null,
+            "parent_stage_item_id": null,
+            "task_purpose": "normal",
+            "evolution_task_id": null,
+            "evolution_round": null,
+            "evolution_source_task_id": null,
+            "evolution_source_execution_id": null,
+            "reported_severity": "medium"
+          },
+          "source_report_ids": [
+            "DFVS-20260526-153825-002-1586C3"
+          ],
+          "reported_at": null,
+          "key_points": [
+            "当前阶段：receive",
+            "当前结论：observe",
+            "验证结果：inconclusive"
+          ],
+          "current_report_id": null,
+          "current_report_title": null,
+          "current_report_updated_at": null
+        }
+      }
+    ]
+  }
+]

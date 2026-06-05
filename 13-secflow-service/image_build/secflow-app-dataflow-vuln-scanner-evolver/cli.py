@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dataflow Vuln Scanner Evolver — 交互式 CLI
+Dataflow Vuln Scanner Evolver - 交互式 CLI
 
 用法:
   python cli.py --project-id <id> --case-ids <id1,id2,...>
@@ -40,7 +40,7 @@ DOC_SPECS: tuple[dict[str, str], ...] = (
         "role_name": "worker",
         "title": "漏洞挖掘执行策略",
         "purpose": "指导 worker 在本轮 replay 中怎样沿着已有任务背景和已有漏洞结果继续挖掘。",
-        "focus": "写清本轮优先追哪些数据流、哪些函数族、哪些危险操作，以及遇到什么情况应该补证据或扩路径。",
+        "focus": "写清本轮优先追哪些数据流、哪些函数族、哪些危险操作,以及遇到什么情况应该补证据或扩路径。",
     },
     {
         "key": "pi-advisor/evolution-completeness-review.md",
@@ -67,7 +67,7 @@ DOC_SPECS: tuple[dict[str, str], ...] = (
         "role_name": "result_fp_check",
         "title": "结果评审策略",
         "purpose": "指导 advisor 对新结果做误报与证据质量检查。",
-        "focus": "重点看 result 是否只是理论风险、路径是否可达、前置约束是否真实存在，以及证据不足时该如何要求补充。",
+        "focus": "重点看 result 是否只是理论风险、路径是否可达、前置约束是否真实存在,以及证据不足时该如何要求补充。",
     },
 )
 
@@ -179,11 +179,11 @@ def interactive_generate_docs(
     """
     交互式生成/修改 agent 文档。
 
-    按 4 个逻辑角色分别生成：
-      - pi-worker: 工作者（实际执行漏洞挖掘）
+    按 4 个逻辑角色分别生成:
+      - pi-worker: 工作者(实际执行漏洞挖掘)
       - pi-advisor (global_completeness): 全面性评审
       - pi-advisor (global_depth): 深入性评审
-      - pi-advisor (result_fp_check): 结果评审（误报检测）
+      - pi-advisor (result_fp_check): 结果评审(误报检测)
     """
     agent_ids = [d.name for d in workspace.agents_dir.iterdir() if d.is_dir()]
 
@@ -204,11 +204,8 @@ def interactive_generate_docs(
         adjustment_direction=adjustment_direction,
     )
 
+    # pi agent 已直接写入文件，这里只需展示确认
     for spec in DOC_SPECS:
-        skills_dir = workspace.get_agent_skills_dir(spec["agent_id"])
-        skills_dir.mkdir(parents=True, exist_ok=True)
-        path = skills_dir / spec["path"]
-        path.write_text(generated_docs[spec["key"]].rstrip() + "\n", encoding="utf-8")
         action = "已写入" if round_no == 1 else "已更新"
         print(f"  {action}: {spec['agent_id']}/skills/{spec['path']} ({spec['title']})")
 
@@ -247,7 +244,7 @@ def _generate_agent_docs_via_llm(
         previous_results=previous_results,
         adjustment_direction=adjustment_direction,
     )
-    payload = _invoke_pi_for_docs(context=context, working_dir=workspace.root)
+    payload = _invoke_pi_for_docs(context=context, working_dir=workspace.root, workspace=workspace)
     return _validate_generated_docs(payload)
 
 
@@ -414,21 +411,19 @@ def _truncate_text(text: str, limit: int) -> str:
     return normalized[: max(0, limit - 3)].rstrip() + "..."
 
 
-def _invoke_pi_for_docs(*, context: dict[str, Any], working_dir: Path) -> dict[str, Any]:
+def _invoke_pi_for_docs(*, context: dict[str, Any], working_dir: Path, workspace: Workspace) -> dict[str, Any]:
     prompt_dir = working_dir / "doc_generation"
     prompt_dir.mkdir(parents=True, exist_ok=True)
-    context_path = prompt_dir / "context.json"
     system_path = prompt_dir / "system.md"
     user_path = prompt_dir / "user.md"
-    context_path.write_text(json.dumps(context, ensure_ascii=False, indent=2), encoding="utf-8")
     system_path.write_text(_build_doc_generation_system_prompt(), encoding="utf-8")
-    user_path.write_text(_build_doc_generation_user_prompt(context), encoding="utf-8")
+    user_prompt = _build_doc_generation_user_prompt(context, workspace)
+    user_path.write_text(user_prompt, encoding="utf-8")
 
     model = _resolve_doc_generation_model()
+    # 不使用 --mode json，让 pi agent 直接使用工具读写文件
     cmd = [
         "pi",
-        "--mode",
-        "json",
         "--model",
         model,
         "--no-session",
@@ -455,7 +450,7 @@ def _invoke_pi_for_docs(*, context: dict[str, Any], working_dir: Path) -> dict[s
             check=False,
         )
     except FileNotFoundError as exc:
-        raise RuntimeError("未找到 pi CLI，无法生成 agent 文档") from exc
+        raise RuntimeError("未找到 pi CLI,无法生成 agent 文档") from exc
 
     stdout = proc.stdout or ""
     stderr = proc.stderr or ""
@@ -468,10 +463,25 @@ def _invoke_pi_for_docs(*, context: dict[str, Any], working_dir: Path) -> dict[s
         message = stderr.strip() or stdout.strip() or f"pi exit code={proc.returncode}"
         raise RuntimeError(f"大模型生成 4 个 agent 文档失败: {message[:800]}")
 
-    payload = _extract_pi_json_response(stdout)
-    if not isinstance(payload, dict):
-        raise RuntimeError("大模型输出不是合法 JSON 对象，无法生成 agent 文档")
+    payload = _read_generated_docs_from_files(workspace)
+    if not isinstance(payload, dict) or not payload:
+        raise RuntimeError("大模型未成功写入 4 个 agent 文档")
     return payload
+
+
+def _read_generated_docs_from_files(workspace: Workspace) -> dict[str, Any]:
+    """从 workspace 的 agent skills 目录中读取已生成的 4 份文档。
+    返回格式与 _validate_generated_docs 兼容: {"docs": {"key": "text", ...}}
+    """
+    docs: dict[str, str] = {}
+    for spec in DOC_SPECS:
+        skills_dir = workspace.get_agent_skills_dir(spec["agent_id"])
+        file_path = skills_dir / spec["path"]
+        if file_path.is_file():
+            docs[spec["key"]] = file_path.read_text(encoding="utf-8").strip()
+        else:
+            docs[spec["key"]] = ""
+    return {"docs": docs}
 
 
 def _resolve_doc_generation_model() -> str:
@@ -484,45 +494,63 @@ def _resolve_doc_generation_model() -> str:
     return "local_minimax/MiniMax/MiniMax-M2.5"
 
 
+_PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+
 def _build_doc_generation_system_prompt() -> str:
-    return """你要为 dataflow-vuln-scanner 的进化 replay 生成 4 份短 Markdown。
-
-核心目标：读懂原任务和已有漏洞结果，把经验注入给 4 个 agent 角色，让下一轮更容易扩到相邻漏洞、补齐证据、减少空泛检查。
-
-写法要求：
-- 中文，短，直接，人能看懂。
-- 每份 120-260 字左右。
-- 不写套话，不写流程手册，不编造源码细节。
-- worker 写“下一轮怎么挖”；三个 advisor 分别写“怎么查覆盖面 / 怎么查深度 / 怎么判误报”。
-- 只输出 JSON，不要代码块，不要解释。
-
-输出格式：
-{
-  "docs": {
-    "pi-worker/evolution-strategy.md": "...markdown...",
-    "pi-advisor/evolution-completeness-review.md": "...markdown...",
-    "pi-advisor/evolution-depth-review.md": "...markdown...",
-    "pi-advisor/evolution-result-review.md": "...markdown..."
-  }
-}
-"""
+    """从 prompts/doc_generation_system.md 加载系统提示词。"""
+    path = _PROMPTS_DIR / "doc_generation_system.md"
+    if path.is_file():
+        return path.read_text(encoding="utf-8")
+    # fallback: 内联精简版
+    return """你是 dataflow-vuln-scanner 的进化策略师。
+生成 4 份短 MD:pi-worker/evolution-strategy.md、pi-advisor/evolution-completeness-review.md、
+pi-advisor/evolution-depth-review.md、pi-advisor/evolution-result-review.md。
+中文,具体,只输出 JSON。"""
 
 
-def _build_doc_generation_user_prompt(context: dict[str, Any]) -> str:
-    compact_context = json.dumps(context, ensure_ascii=False, indent=2)
-    return f"""根据下面上下文生成 4 份 md。
+def _build_doc_generation_user_prompt(
+    context: dict[str, Any],
+    workspace: Workspace,
+) -> str:
+    """从 prompts/doc_generation_user.md 加载用户提示词模板并填充占位符。"""
+    path = _PROMPTS_DIR / "doc_generation_user.md"
+    if path.is_file():
+        template = path.read_text(encoding="utf-8")
+    else:
+        template = "## 一、原始任务信息\n\n{task_dirs}\n\n## 二、进化目标\n\n{evolution_goal}\n\n## 三、生成进化文档\n\n请写入 4 份文档到:\n- `{skills_worker_dir}/evolution-strategy.md`\n- `{skills_advisor_dir}/evolution-completeness-review.md`\n- `{skills_advisor_dir}/evolution-depth-review.md`\n- `{skills_advisor_dir}/evolution-result-review.md`\n"
 
-重点看：
-- evolution_goal: 本次进化目标
-- source_tasks: 原任务背景和已有漏洞结果
-- target_docs: 4 个文件分别注入给哪个角色
-- adjustment_direction / previous_results_summary: 如果有，体现本轮调整
+    # ── task_dirs: 为每个 source_task 构建工作目录路径 ──
+    project_id = context.get("project_id", "")
+    source_tasks = context.get("source_tasks") or []
+    task_dir_parts: list[str] = []
+    for task in source_tasks:
+        if not isinstance(task, dict):
+            continue
+        task_id = task.get("task_id", "")
+        run_name = task.get("run_name", "")
+        title = task.get("title", "")
+        if not run_name:
+            continue
+        run_dir = f"/data/files/{project_id}/DATAFLOW_VULN_SCANNER/runs/{run_name}"
+        task_dir_parts.append(f"- **{title or task_id}** (task_id: `{task_id}`)")
+        task_dir_parts.append(f"  工作目录: `{run_dir}/`")
+        task_dir_parts.append(f"  请先 `ls {run_dir}/run/workspace/` 找到 pipeline_* 子目录,")
+        task_dir_parts.append(f"  再进入 stage_01_vuln_scan/vuln_scan_*/ 读取 input/task.md、summary.md、results/")
+        task_dir_parts.append("")
+    task_dirs = "\n".join(task_dir_parts) if task_dir_parts else "(无可用任务)"
 
-上下文 JSON：
-{compact_context}
+    evolution_goal = str(context.get("evolution_goal") or "").strip()
+    skills_worker_dir = str(workspace.get_agent_skills_dir("pi-worker"))
+    skills_advisor_dir = str(workspace.get_agent_skills_dir("pi-advisor"))
 
-只输出符合 system 要求的 JSON。
-"""
+    return (
+        template
+        .replace("{task_dirs}", task_dirs)
+        .replace("{evolution_goal}", evolution_goal)
+        .replace("{skills_worker_dir}", skills_worker_dir)
+        .replace("{skills_advisor_dir}", skills_advisor_dir)
+    )
 
 
 def _extract_pi_json_response(stdout: str) -> Any:
@@ -645,7 +673,7 @@ async def run_evolution(
         confirm = input("  确认开始 replay? [Y/n]: ").strip()
         if confirm.lower() == "n":
             print("  跳过本轮 replay。")
-            direction = input("\n  输入 'done' 结束，或输入调整方向继续: ").strip()
+            direction = input("\n  输入 'done' 结束,或输入调整方向继续: ").strip()
             if direction.lower() == "done":
                 break
             continue
@@ -689,11 +717,11 @@ async def run_evolution(
         previous_results = results
 
         # 询问下一步
-        print("\n  输入 'done' 结束进化，或输入调整方向进入下一轮。")
+        print("\n  输入 'done' 结束进化,或输入调整方向进入下一轮。")
         next_input = input("  > ").strip()
         if next_input.lower() == "done":
             break
-        # 如果用户直接输入了调整方向，保存到下一轮使用
+        # 如果用户直接输入了调整方向,保存到下一轮使用
         # 下一轮循环开始时会再次询问
 
     # ─── 完成 ───
@@ -709,7 +737,7 @@ async def run_evolution_from_tasks(
     project_id: str,
     task_ids: list[str],
 ) -> None:
-    """直接从 dfvs task_ids 启动进化（跳过 vuln case 反查）。"""
+    """直接从 dfvs task_ids 启动进化(跳过 vuln case 反查)。"""
     import httpx
 
     print_header("Dataflow Vuln Scanner Evolver")
@@ -834,7 +862,7 @@ async def run_evolution_from_tasks(
         confirm = input("  确认开始 replay? [Y/n]: ").strip()
         if confirm.lower() == "n":
             print("  跳过本轮 replay。")
-            direction = input("\n  输入 'done' 结束，或输入调整方向继续: ").strip()
+            direction = input("\n  输入 'done' 结束,或输入调整方向继续: ").strip()
             if direction.lower() == "done":
                 break
             continue
@@ -872,7 +900,7 @@ async def run_evolution_from_tasks(
         print_replay_results(results, source_tasks)
         previous_results = results
 
-        print("\n  输入 'done' 结束进化，或输入调整方向进入下一轮。")
+        print("\n  输入 'done' 结束进化,或输入调整方向进入下一轮。")
         next_input = input("  > ").strip()
         if next_input.lower() == "done":
             break
@@ -993,7 +1021,7 @@ def _build_round_summary(
     results: list[ReplayResult],
     source_tasks: list[SourceTask],
 ) -> str:
-    """构建轮次摘要，写入 memory/。"""
+    """构建轮次摘要,写入 memory/。"""
     total_expected = sum(len(t.case_ids) for t in source_tasks)
     total_found = sum(r.results_summary.get("result_count", 0) for r in results)
     succeeded = len([r for r in results if r.status in ("completed", "succeeded")])
@@ -1027,17 +1055,17 @@ def _build_round_summary(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Dataflow Vuln Scanner Evolver — 交互式进化工具"
+        description="Dataflow Vuln Scanner Evolver - 交互式进化工具"
     )
     parser.add_argument("--project-id", required=True, help="项目 ID")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
         "--case-ids",
-        help="案例 ID 列表，逗号分隔（从 vuln cases 反查原始任务）",
+        help="案例 ID 列表,逗号分隔(从 vuln cases 反查原始任务)",
     )
     group.add_argument(
         "--task-ids",
-        help="直接指定 dataflow-vuln-scanner 的 scan task ID 列表，逗号分隔",
+        help="直接指定 dataflow-vuln-scanner 的 scan task ID 列表,逗号分隔",
     )
     parser.add_argument(
         "--config",
