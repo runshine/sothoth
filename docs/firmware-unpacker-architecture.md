@@ -36,18 +36,25 @@ firmware-unpacker 的解法是三层级联引擎：确定性工具做第一道�
 │                                                                    │
 │  ┌──────────────────────┐  ┌──────────────────────────────────┐   │
 │  │   API Layer          │  │   Background Runtime             │   │
-│  │   (entrypoint.py)    │  │   (background.py)                │   │
+│  │   (entrypoint.py)    │  │   (runtime.py)                   │   │
 │  │                      │  │                                  │   │
 │  │  • Task CRUD         │  │  ┌────────────┐ ┌─────────────┐ │   │
-│  │  • Auth check        │  │  │ Dispatcher │ │ Worker Pool │ │   │
-│  │  • Menu registry     │  │  │ (claim +   │ │ (executor)  │ │   │
-│  │  • Metrics/Health    │  │  │  dispatch) │ │             │ │   │
-│  └──────────┬───────────┘  │  └─────┬──────┘ └──────┬──────┘ │   │
-│             │              │        │               │         │   │
-│  ┌──────────▼───────────┐  │  ┌─────▼───────────────▼──────┐ │   │
-│  │   Shared Database    │◄─┼──│   Task Queue (MySQL/SQLite) │ │   │
-│  │   (models.py)        │  │  │   claim / dispatch / lease │ │   │
-│  └──────────────────────┘  │  └────────────────────────────┘ │   │
+│  │  • Auth check        │  │  │ Scheduler  │ │ Dispatcher  │ │   │
+│  │  • Menu registry     │  │  │ (assign    │ │ (single-    │ │   │
+│  │  • Metrics/Health    │  │  │  tasks to  │ │  slot, max  │ │   │
+│  └──────────┬───────────┘  │  │  workers)  │ │  1 task)    │ │   │
+│             │              │  └─────┬──────┘ └──────┬──────┘ │   │
+│  ┌──────────▼───────────┐  │        │               │         │   │
+│  │   Shared Database    │◄─┼────────┴───────────────┘         │   │
+│  │   (model.py)         │  │  Task Queue (MySQL)              │   │
+│  └──────────────────────┘  │  assign / dispatch / lease       │   │
+│                            │                                  │   │
+│                            │  ┌────────────────────────────┐ │   │
+│                            │  │  Agent Sanitizer           │ │   │
+│                            │  │  (agent_sanitizer.py)      │ │   │
+│                            │  │  • pre-run cleanup (/proc) │ │   │
+│                            │  │  • post-run cleanup        │ │   │
+│                            │  └────────────────────────────┘ │   │
 │                            │                                  │   │
 │                            │  ┌────────────────────────────┐ │   │
 │                            │  │  Cleanup Worker            │ │   │
@@ -92,33 +99,42 @@ firmware-unpacker 的解法是三层级联引擎：确定性工具做第一道�
 
 ## 5. 运行时模式
 
-服务支持四种运行时角色，通过 `SECFLOW_FIRMWARE_UNPACKER_ROLES` 环境变量控制：
+服务支持五种运行时角色，通过 `FIRMWARE_UNPACKER_RUNTIME_ROLE` 环境变量控制：
 
 | 角色 | 职责 | 部署形态 |
 |:---|:---|:---|
-| `api` | FastAPI HTTP 服务，提供任务 CRUD、认证、菜单注册 | 独立 Pod |
-| `dispatcher` | 从共享 DB 认领待执行任务，分派到 Worker Pool | 可合并在 api Pod |
-| `worker` | 执行解包任务的线程池 (ThreadPoolExecutor) | 可水平扩展多 Pod |
-| `cleanup-worker` | 工作目录清理 + 技能生成 + 进化循环 | 独立 Pod（建议单实例） |
+| `api` | FastAPI HTTP 服务，提供任务 CRUD、认证、菜单注册 | 独立 Pod（2 replicas） |
+| `scheduler` | 扫描 PENDING 任务，分配给空闲 dispatcher worker；回收孤儿任务 | 独立 Pod（1 replica） |
+| `dispatcher` | **单槽执行**（同时最多 1 个任务）：接收 scheduler 分配的任务，启动子进程执行 | 可水平扩展多 Pod |
+| `cleanup-worker` | 工作目录清理 + 技能生成 + 进化循环 | 独立 Pod（1 replica） |
+| `all` | 遗留兼容模式：同时承担 dispatcher + scheduler + cleanup 职责 | 单 Pod 调试用 |
+
+> **架构演进**：旧版的 `worker` 角色（线程池并发执行）已被废弃。`dispatcher` 现在是纯粹的单槽执行器——`_runtime_max_concurrent()` 固定返回 `1`，每个 dispatcher Pod 同时只运行一个解包任务。多任务并发通过水平扩展 dispatcher Pod 数量实现，而非 Pod 内线程池。
 
 ```
-                    ┌──────────────┐
-                    │   api Pod    │  HTTP 请求处理
-                    │ (dispatcher) │  任务提交 + 状态查询
-                    └──────┬───────┘
-                           │ Dispatch (shared DB)
-          ┌────────────────┼────────────────┐
-          │                │                │
-    ┌─────▼─────┐   ┌─────▼─────┐   ┌─────▼──────────┐
-    │ worker-1  │   │ worker-2  │   │ cleanup-worker │
-    │ Pool × 3  │   │ Pool × 3  │   │ skill gen +    │
-    │           │   │           │   │ evolution loop │
-    └───────────┘   └───────────┘   └────────────────┘
+                         ┌──────────────┐
+                         │   api Pod    │  HTTP 请求处理
+                         │   (×2)       │  任务提交 + 状态查询
+                         └──────────────┘
+                                │
+                         ┌──────▼──────────┐
+                         │  scheduler Pod  │  扫描 PENDING 任务
+                         │     (×1)        │  分配给空闲 dispatcher
+                         └──────┬──────────┘
+                                │ Assign (shared DB)
+           ┌────────────────────┼────────────────────┐
+           │                    │                    │
+    ┌──────▼──────┐    ┌──────▼──────┐    ┌───────▼─────────┐
+    │ dispatcher-1│    │ dispatcher-2│    │ cleanup-worker  │
+    │ single-slot │    │ single-slot │    │ skill gen +     │
+    │ max=1 task  │    │ max=1 task  │    │ evolution loop  │
+    └─────────────┘    └─────────────┘    └─────────────────┘
 ```
 
-- **Worker 并发控制**：支持 `auto`（按 Pod CPU/内存自动计算）和 `manual`（手动指定）两种模式
-- **任务分派**：基于数据库的 claim/dispatch 模式，Worker 定期轮询，通过 `dispatch_token` 防重复认领
-- **心跳机制**：Worker 周期性更新 `heartbeat_at`，超时任务（默认 300s）被 Dispatcher 回收重新分派
+- **Dispatcher 单槽执行**：`_runtime_max_concurrent()` 固定返回 `1`，确保每个 Pod 的 Agent 进程不互相干扰
+- **Scheduler 任务分配**：scheduler 独立循环 `_scheduler_loop()`，将 PENDING 任务显式分配给空闲 dispatcher（`ASSIGNED` 状态），而非 dispatcher 自行争抢
+- **Agent 进程清理**：每个 dispatcher 在启动任务前执行 `agent_sanitizer.pre-run cleanup`（扫描 `/proc` 清理残留 pi/codex/claude/opencode 进程），任务结束后执行 `post-run cleanup`
+- **心跳与状态**：Worker 实例维护完整运行时状态（`starting → idle → busy → draining → dead`），心跳同步 `active_tasks` / `running_task_id` / `state`
 
 ## 6. 解包引擎：三层级联
 
@@ -411,33 +427,84 @@ Round 1..N (max_rounds=3):
 ### 9.1 任务状态机
 
 ```
-PENDING ──► CLAIMED ──► RUNNING ──► SUCCESS
-   │           │           │
-   │           │           ├──► FAILED ──► RETRY_PREPARING ──► PENDING (重试)
-   │           │           │
-   │           │           └──► CANCELLING ──► CANCELLED
-   │           │
-   │           └── (超时未 heartbeat) ──► 回收至 PENDING
+PENDING ──► ASSIGNED ──► RUNNING ──► SUCCESS
+   │            │            │
+   │            │            ├──► FAILED ──► RETRY_PREPARING ──► PENDING (重试)
+   │            │            │
+   │            │            └──► CANCELLING ──► CANCELLED
+   │            │
+   │            └── (超时未 heartbeat) ──► 回收至 PENDING (orphan recovery)
    │
    └── 用户取消 ──► CANCELLED
+
+AWAITING_TAKEOVER ──► ASSIGNED (takeover 场景，由 scheduler 重新分配)
 ```
 
-### 9.2 Dispatcher 调度流程
+> `ASSIGNED` 是新引入的中间状态：scheduler 将任务显式分配给特定 dispatcher worker 后进入此状态，dispatcher 单槽空闲时自动启动执行。这替代了旧版的 `CLAIMED` 争抢模式。
+
+### 9.2 Scheduler + Dispatcher 分离调度
+
+旧版架构中 `dispatcher` 既负责任务分配又负责执行。新版将两者拆分为独立角色：
 
 ```
-Dispatcher Loop (每 5s):
+Scheduler Loop (每 polling-interval 秒):
 │
-├── 1. 扫描 CLAIMED 但超时的任务 → 回收至 PENDING
-├── 2. 扫描 PENDING 任务 → claim（SET dispatch_token = random）
-├── 3. 检查 Worker Pool 空闲槽位
-├── 4. 分配任务到 Worker 线程
-│   └── subprocess: python task_runner.py --task-id {id} --owner-id {id} --run-token {token}
+├── 1. 扫描 STUCK RETRY_PREPARING 任务 → 回收
+├── 2. 扫描孤儿任务 (heartbeat 超时) → 回收至 PENDING
+├── 3. _scheduler_assign_tasks():
+│   ├── 查询空闲 dispatcher (role=dispatcher, state=idle, active_tasks=0)
+│   ├── 查询 PENDING / AWAITING_TAKEOVER / RETRY_PREPARING 任务
+│   └── _assign_task_to_worker(): 任务 → ASSIGNED 状态，绑定 worker_id
 │
-├── 5. 监控运行中任务的 heartbeat
-└── 6. 处理取消请求（CANCELLING 状态的任务）
+└── 4. 处理进化任务 (evolution jobs)
+
+Dispatcher Loop (每 polling-interval 秒):
+│
+├── 1. _dispatcher_start_assigned_task():
+│   ├── 检查本地 active_tasks == 0 (单槽空闲)
+│   ├── 查询 assigned_worker_id == self 且 status == ASSIGNED 的任务
+│   └── _launch_task_runner():
+│       ├── [pre-run] agent_sanitizer.cleanup(phase="pre-run")
+│       │   └── 失败 → 任务重新排队 (RETRY_PREPARING)
+│       ├── subprocess: python task_runner.py
+│       └── [post-run] agent_sanitizer.cleanup(phase="post-run")
+│
+└── 2. 处理进化任务
 ```
 
-### 9.3 取消机制
+**关键设计**：
+- **显式分配取代争抢**：scheduler 通过 `_assign_task_to_worker()` 显式将任务绑定到特定 dispatcher，避免多 worker 同时争抢同一任务的竞态
+- **assignment_generation**：每次重新分配递增，防止过期分配被错误执行
+- **单槽确保隔离**：dispatcher 的 `_runtime_max_concurrent()` 固定返回 `1`，保证 Agent 进程不互相干扰
+
+### 9.3 Agent 进程清理器 (agent_sanitizer.py)
+
+新增模块，在任务执行前后扫描 `/proc` 文件系统，清理残留的 AI Agent 进程：
+
+```
+run_agent_cleanup(worker_id, phase, task_id)
+  │
+  ├── _collect_suspects(task):
+  │   └── 遍历 /proc/{pid}/:
+  │       • 匹配进程名包含 pi/codex/claude/opencode
+  │       • 匹配 cwd 或 cmdline 包含任务相关路径
+  │       • 匹配 ppid != 1 (非孤儿 init 进程)
+  │
+  ├── _kill_process_tree(pid):
+  │   ├── SIGTERM → 等待 3s
+  │   └── 仍存活 → SIGKILL
+  │
+  └── 结果写入 TaskCleanupScan 表
+       └── 更新 WorkerInstance.last_cleanup_* 字段
+```
+
+**两阶段清理**：
+| 阶段 | 时机 | 失败处理 |
+|:---|:---|:---|
+| `pre-run` | 任务启动前 | 任务重新排队 (RETRY_PREPARING)，不执行 |
+| `post-run` | 任务结束后 | 记录残留进程数，不影响任务结果 |
+
+### 9.4 取消机制
 
 取消是分层级的、有宽限期的：
 
@@ -465,7 +532,8 @@ DB: cancel_requested_at = now()
 |:---|:---|
 | `unpack_tasks` | 解包任务主表，包含完整生命周期字段 |
 | `task_events` | 任务事件流（SSE 事件持久化） |
-| `worker_instances` | Worker 实例注册与心跳 |
+| `worker_instances` | Worker 实例注册与心跳（含运行时状态 state / role / drain） |
+| `task_cleanup_scans` | Agent 进程清理记录（pre-run / post-run） |
 | `service_configs` | 动态配置（并发数、超时、LLM 绑定等） |
 | `workspace_cleanup_jobs` | 工作目录清理任务 |
 | `skill_generation_jobs` | 技能自动生成任务 |
@@ -485,9 +553,11 @@ DB: cancel_requested_at = now()
 │   parent_stage_item_id, parent_stage_item_key           │
 │                                                         │
 │ 调度状态:                                                │
-│   status, owner_id, dispatch_token, dispatch_owner_id   │
-│   dispatch_claimed_at, dispatch_lease_expires_at        │
-│   heartbeat_at, current_stage, lease_expires_at         │
+│   status, owner_id, assigned_worker_id, assigned_pod_name │
+│   dispatch_token, dispatch_owner_id, assignment_generation│
+│   dispatch_claimed_at, dispatch_lease_expires_at          │
+│   heartbeat_at, current_stage, lease_expires_at,          │
+│   run_lease_expires_at, takeover_count                    │
 │                                                         │
 │ 取消状态:                                                │
 │   cancel_requested_at, cancel_grace_deadline            │
@@ -513,6 +583,10 @@ DB: cancel_requested_at = now()
 │                                                         │
 │ LLM 绑定:                                               │
 │   llm_binding_snapshot (JSON)                           │
+│                                                         │
+│ Agent 进程清理:                                          │
+│   pre_cleanup_scan_id, post_cleanup_scan_id             │
+│   last_cleanup_residual_count                           │
 │                                                         │
 │ 归档:                                                    │
 │   archive_root, runtime_root, archive_status            │
@@ -550,7 +624,7 @@ DB: cancel_requested_at = now()
 | 3 | **失败可进化** — 失败的工具不是丢弃，而是进入进化引擎迭代改良 |
 | 4 | **Worker + Judge 闭环** — Executor 产出、Reviewer 独立校验，不通过则重试，每轮后确定性递归展开 |
 | 5 | **多角色 LLM 绑定** — 不同 Agent 角色可绑定不同的 LLM provider 和 model，粗活细活分开干 |
-| 6 | **共享 DB 任务队列** — Dispatcher 与 Worker 通过数据库解耦，支持水平扩展和故障恢复 |
+| 6 | **显式分配，单槽隔离** — Scheduler 显式将任务绑定到特定 dispatcher（ASSIGNED 状态），替代旧版争抢模式；dispatcher 单槽执行（max=1），杜绝 Agent 进程间干扰 |
 | 7 | **取消分层宽限** — 优雅取消 → 超时强制终止，保证产物完整性 |
 | 8 | **格式可扩展** — 新固件格式 = 新 Dispatcher 规则 + 新 Python 工具，架构无需修改 |
 | 9 | **产物契约** — 上游（binary-security）通过 `parent_*` 字段编排，下游（system-analyse）通过 output/ 产物树消费 |
