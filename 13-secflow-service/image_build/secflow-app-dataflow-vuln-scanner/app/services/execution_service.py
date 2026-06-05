@@ -1803,19 +1803,44 @@ class ExecutionService:
                 and _public_task_status(trigger.status) in {"success", "failed", "cancelled"}
                 and _public_task_status(run_index.status) in _ACTIVE_RECONCILE_RUN_INDEX_STATUSES
             )
-            if not needs_state_reconcile and not projection_drift and not run_index_drift:
+            queued_run_index_drift = (
+                run_index is not None
+                and latest_execution is not None
+                and str(process_state.get("source") or "").strip().lower() == "queued_execution"
+                and _public_task_status(trigger.status) == "pending"
+                and _public_task_status(latest_execution.status) == "pending"
+                and not str(latest_execution.dispatch_status or "").strip()
+                and not any(
+                    [
+                        bool(str(latest_execution.owner_pod_id or "").strip()),
+                        bool(str(latest_execution.worker_job_id or "").strip()),
+                        bool(latest_execution.process_pid),
+                        bool(latest_execution.process_started_at),
+                    ]
+                )
+                and _public_task_status(run_index.status) in {"running", "dispatching", "starting"}
+            )
+            if not needs_state_reconcile and not projection_drift and not run_index_drift and not queued_run_index_drift:
                 continue
             if dry_run:
                 reconciled_count += 1
                 if needs_state_reconcile:
                     terminalized_count += 1
-                if projection_drift or run_index_drift:
+                if projection_drift or run_index_drift or queued_run_index_drift:
                     projection_refreshed_count += 1
                 if len(sample_task_ids) < 20:
                     sample_task_ids.append(trigger.id)
                 continue
             changed = False
-            if self._reconcile_stale_runtime(db, run_index=run_index, trigger=trigger, execution=latest_execution):
+            if self._reconcile_unbound_queued_run_index(
+                db,
+                run_index=run_index,
+                trigger=trigger,
+                execution=latest_execution,
+                process_state=process_state,
+            ):
+                changed = True
+            elif self._reconcile_stale_runtime(db, run_index=run_index, trigger=trigger, execution=latest_execution):
                 changed = True
                 terminalized_count += 1
             elif classification in {"orphaned_cancel_requested", "orphaned_delete_requested"} and truth.get("orphaned_resolution") is not None:
@@ -1845,7 +1870,7 @@ class ExecutionService:
             ):
                 changed = True
                 run_index_drift = True
-            if changed or projection_drift or run_index_drift:
+            if changed or projection_drift or run_index_drift or queued_run_index_drift:
                 self._refresh_task_list_projection_for_task_id(db, trigger.id)
                 projection_refreshed_count += 1
                 reconciled_count += 1
@@ -1876,6 +1901,63 @@ class ExecutionService:
             dry_run=bool(dry_run),
             message="active task reconcile completed",
         )
+
+    def _reconcile_unbound_queued_run_index(
+        self,
+        db: Session,
+        *,
+        run_index: RunIndex | None,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+        process_state: dict[str, Any],
+    ) -> bool:
+        if run_index is None or trigger is None or execution is None:
+            return False
+        if str(process_state.get("source") or "").strip().lower() != "queued_execution":
+            return False
+        if bool(process_state.get("is_running")):
+            return False
+        if _canonical_task_status(trigger.status) != "pending":
+            return False
+        if _canonical_task_status(execution.status) != "pending":
+            return False
+        if str(execution.dispatch_status or "").strip():
+            return False
+        if any(
+            [
+                bool(str(execution.owner_pod_id or "").strip()),
+                bool(str(execution.worker_job_id or "").strip()),
+                bool(execution.process_pid),
+                bool(execution.process_started_at),
+            ]
+        ):
+            return False
+        run_status = _public_task_status(run_index.status)
+        if run_status not in _ACTIVE_RECONCILE_RUN_INDEX_STATUSES:
+            return False
+        now = now_local()
+        run_index.status = "queued"
+        run_index.finished_at = None
+        if run_index.started_at is None:
+            run_index.started_at = execution.created_at or trigger.created_at or now
+        run_index.last_synced_at = now
+        db.add(run_index)
+        self.record_event(
+            db,
+            execution_id=execution.id,
+            event_type="run_index_status_reconciled",
+            message="run index reconciled to queued pending execution",
+            level="warning",
+            payload_json={
+                "reason": "queued_execution_run_index_reconciled",
+                "run_index_id": run_index.id,
+                "run_status_before": run_status,
+                "run_status_after": run_index.status,
+                "task_status": str(trigger.status or ""),
+                "execution_status": str(execution.status or ""),
+            },
+        )
+        return True
 
     def _resolve_task_timeline_execution(
         self,

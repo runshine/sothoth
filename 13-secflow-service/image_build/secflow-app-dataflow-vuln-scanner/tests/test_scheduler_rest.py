@@ -1022,6 +1022,43 @@ def test_cluster_capacity_api_degrades_when_worker_probe_fails(
     assert "probe failed" in (target["error"] or "")
 
 
+def test_cluster_capacity_api_hides_historical_offline_workers(service_config_path: Path):
+    config = get_config()
+    config.scheduler.enabled = True
+    config.scheduler.role = "worker"
+    config.scheduler.pod_id = "worker-visible-pod"
+    config.scheduler.host_name = "worker-visible-host"
+    config.scheduler.worker_capacity = 2
+
+    scheduler = SchedulerService()
+    scheduler._heartbeat_once()
+
+    db = get_db_session()
+    try:
+        db.add(
+            SchedulerWorker(
+                pod_id="worker-offline-stale",
+                host_name="worker-offline-stale",
+                capacity=3,
+                running_count=0,
+                status="offline",
+                last_heartbeat_at=now_local() - timedelta(hours=12),
+                metadata_json={"advertise_url": "http://worker-offline-stale:8080"},
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    client = TestClient(create_app())
+    response = client.get("/api/dataflow-vuln-scanner/workers/cluster-capacity")
+    assert response.status_code == 200
+    payload = response.json()
+    worker_ids = {item["worker_id"] for item in payload["workers"]}
+    assert "worker-visible-pod" in worker_ids
+    assert "worker-offline-stale" not in worker_ids
+
+
 def test_pending_dispatch_skips_execution_in_backoff(service_config_path: Path, framework_config_payload: dict):
     config = get_config()
     config.scheduler.enabled = True

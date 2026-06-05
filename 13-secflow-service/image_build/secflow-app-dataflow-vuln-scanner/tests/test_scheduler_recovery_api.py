@@ -603,3 +603,81 @@ def test_active_reconcile_terminal_task_fixes_stale_running_run_index(service_co
         assert event is not None
     finally:
         db.close()
+
+
+def test_active_reconcile_queued_execution_repairs_stale_running_run_index(service_config_path):
+    db = get_db_session()
+    try:
+        execution_id = "exec-active-reconcile-queued-run-index"
+        created_at = now_local() - timedelta(minutes=10)
+        trigger = TriggerTask(
+            id="tt-active-reconcile-queued-run-index",
+            workflow_definition_id="wfd-active-reconcile-queued-run-index",
+            project_id="default",
+            trigger_type="manual",
+            input_tasks_json={"tasks": []},
+            priority=100,
+            status="pending",
+            public_status="pending",
+            message="pending start",
+            submitted_by="tester",
+            retry_count=0,
+            max_retry_count=3,
+            latest_execution_id=execution_id,
+            created_at=created_at,
+        )
+        execution = WorkflowExecution(
+            id=execution_id,
+            trigger_task_id=trigger.id,
+            workflow_definition_id=trigger.workflow_definition_id,
+            project_id="default",
+            attempt_no=1,
+            status="pending",
+            public_status="pending",
+            dispatch_status=None,
+            owner_pod_id=None,
+            worker_job_id=None,
+            worker_url=None,
+            process_status="",
+            message="pending start",
+            created_at=created_at,
+        )
+        run_index = RunIndex(
+            id="ri-active-reconcile-queued-run-index",
+            project_id="default",
+            source_type="execution_workspace",
+            source_key="/tmp/queued-run-index",
+            run_name="queued-run-index",
+            run_root_path="/tmp/queued-run-index",
+            linked_task_id=trigger.id,
+            linked_execution_id=execution.id,
+            status="running",
+            started_at=created_at,
+        )
+        db.add_all([trigger, execution, run_index])
+        db.flush()
+        get_execution_service()._rebuild_task_list_projections(db, [trigger])
+        db.commit()
+    finally:
+        db.close()
+
+    db = get_db_session()
+    try:
+        response = get_execution_service().reconcile_active_tasks(db, limit=10)
+        assert response.reconciled_count >= 1
+        run_index = db.get(RunIndex, "ri-active-reconcile-queued-run-index")
+        assert run_index is not None
+        assert run_index.status == "queued"
+        event = (
+            db.query(WorkflowExecutionEvent)
+            .filter(
+                WorkflowExecutionEvent.execution_id == execution_id,
+                WorkflowExecutionEvent.event_type == "run_index_status_reconciled",
+            )
+            .order_by(WorkflowExecutionEvent.created_at.desc())
+            .first()
+        )
+        assert event is not None
+        assert event.payload_json["reason"] == "queued_execution_run_index_reconciled"
+    finally:
+        db.close()

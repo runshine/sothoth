@@ -526,8 +526,19 @@ class SchedulerService:
         self,
         db: Session,
     ) -> tuple[list[SchedulerWorker], Any, int]:
-        workers = db.query(SchedulerWorker).order_by(SchedulerWorker.last_heartbeat_at.desc(), SchedulerWorker.pod_id.asc()).all()
         worker_timeout_at = now_local() - timedelta(seconds=get_config().scheduler.worker_timeout_seconds)
+        workers = (
+            db.query(SchedulerWorker)
+            .filter(
+                or_(
+                    SchedulerWorker.status != "offline",
+                    SchedulerWorker.last_heartbeat_at.is_(None),
+                    SchedulerWorker.last_heartbeat_at >= worker_timeout_at,
+                )
+            )
+            .order_by(SchedulerWorker.last_heartbeat_at.desc(), SchedulerWorker.pod_id.asc())
+            .all()
+        )
         queued_jobs = (
             db.query(WorkflowExecution)
             .join(TriggerTask, WorkflowExecution.trigger_task_id == TriggerTask.id)
