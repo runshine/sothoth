@@ -46,7 +46,7 @@ dataflow-vuln-scan 的解法是 **"单 Worker 全域分析 + fork session 独立
 │  │  • POST /tasks    │  │  • 状态流转       │  │  • 并发控制        │    │
 │  │  • GET /tasks     │  │  • 审核队列       │  │  • 心跳续租        │    │
 │  │  • SSE /stream    │  │  • 事件持久化     │  │  • 卡死检测        │    │
-│  │  • GET /vuln-graph│  │  • 审核轮询       │  │  • 断点续跑        │    │
+│  │  • GET /vuln-graph│  │  • 审核轮询       │  │  • 卡死检测        │    │
 │  │  • GET /findings  │  │  • 槽位管理       │  │                    │    │
 │  │  • Health/Ready   │  │                   │  │                    │    │
 │  └────────┬─────────┘  └────────┬─────────┘  └─────────┬──────────┘    │
