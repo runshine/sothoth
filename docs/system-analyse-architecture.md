@@ -70,6 +70,9 @@ system-analyse 的解法是**"确定性预处理 + LLM 语义决策 + Judge 独�
 │  │  • CheckpointManager 断点续跑         │                               │
 │  │  • EvaluationRecorder 评估记录        │                               │
 │  │  • AgentProcessHandle pi 进程管理     │                               │
+│  │  • AgentCleanupService 进程清理       │                               │
+│  │  • AgentRuntimeRegistry 运行时注册    │                               │
+│  │  • AgentObservabilityService 可观测   │                               │
 │  └──────────────────────────────────────┘                               │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -409,7 +412,42 @@ workspace/.checkpoint/
 |:---|:---|:---|
 | `api` | REST API + 任务创建/查询 | 对外暴露 HTTP 接口 |
 | `manager` | 任务编排 + 生命周期管理 | 负责任务的创建、执行调度和状态跟踪 |
-| `runner` | Worker 执行 | 消费任务队列，执行 pipelining |
+| `runner` | Worker 执行 | 消费任务队列，执行 pipelining。**单槽执行**（同时最多 1 个分析任务），每任务启动前通过 `AgentCleanupService` 清理残留 Agent 进程 |
+
+> **架构演进**：runner 角色已改为单槽模式——`_resolve_worker_task_concurrency()` 固定返回 `1`。多任务并发通过水平扩展 runner Pod 数量实现。旧版基于 `cleanup_orphan_pi_processes` 的进程清理已被 `AgentCleanupService` + `AgentRuntimeRegistry` 替代，后者通过 `/proc` 扫描 + session 文件匹配实现更精准的进程归属判断。
+
+### 9.1 Agent 进程生命周期管理
+
+系统通过三个协作组件管理 pi Agent 子进程的完整生命周期：
+
+| 组件 | 文件 | 职责 |
+|:---|:---|:---|
+| **AgentRuntimeRegistry** | `agent_runtime_registry.py` | 内存级 Agent 运行时注册表：以 session 文件路径为 key，记录 PID、启动时间、最近活动时间 |
+| **AgentObservabilityService** | `agent_observability.py` | `/proc` 扫描 + 进程快照构建：识别 pi/claude/codex/opencode 进程，匹配 session 归属，检测孤儿进程 |
+| **AgentCleanupService** | `agent_cleanup.py` | 任务级进程清理：扫描 `/proc` 中残留的 Agent 进程，SIGTERM → SIGKILL 两级终止；清理结果写入可观测快照 |
+
+```
+Agent 进程生命周期:
+  register_agent_runtime(session_file, pid)   ← pi 子进程启动时注册
+         │
+  touch_agent_runtime(session_file)           ← 每次 prompt 完成时更新活跃时间
+         │
+  AgentObservabilityService.build_snapshot()  ← 周期性扫描 /proc
+         │
+         ├── 匹配成功 → 更新活跃状态
+         └── 超过 RUNTIME_ACTIVITY_STALE_SECONDS 无活动 → 标记为 orphan
+                │
+  AgentCleanupService.cleanup(task_owner)     ← 任务启动前/异常时调用
+         │
+         ├── 收集归属当前 worker 的残留进程
+         ├── SIGTERM → 等待 → SIGKILL
+         └── 幸存进程数 > CRITICAL_SURVIVOR_THRESHOLD → 告警
+```
+
+**关键设计**：
+- **Session 归属**：通过解析 `/proc/{pid}/cmdline` 中的 `--session` 参数匹配进程到具体 session 文件，精准判断进程归属（而非粗粒度的进程名匹配）
+- **双阈值控制**：`RUNTIME_ACTIVITY_STALE_SECONDS`（默认 120s）判断进程是否失活；`ORPHAN_PROTECTION_SECONDS`（默认 120s）控制孤儿进程的保护窗口
+- **幸存告警**：清理后仍存活的进程数超过 `CRITICAL_SURVIVOR_THRESHOLD`（默认 3）时触发告警，防止僵尸 Agent 进程积累
 
 ## 10. 安全维度过滤
 
