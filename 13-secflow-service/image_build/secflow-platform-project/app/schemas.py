@@ -5,7 +5,7 @@ Pydantic模式定义模块
 from datetime import datetime
 from typing import List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ============ 项目模式 ============
@@ -17,6 +17,7 @@ class ProjectCreate(BaseModel):
     k8s_namespace: Optional[str] = Field(None, description="关联的K8S Namespace名称")
     is_public: bool = Field(default=False, description="是否公开，False为私有，True为公开")
     department_id: Optional[int] = Field(None, description="项目归属部门ID")
+    product_version_id: str = Field(..., min_length=1, max_length=32, description="产品版本ID")
 
 
 class ProjectUpdate(BaseModel):
@@ -26,6 +27,7 @@ class ProjectUpdate(BaseModel):
     k8s_namespace: Optional[str] = Field(None, description="关联的K8S Namespace名称")
     is_public: Optional[bool] = Field(None, description="是否公开，False为私有，True为公开")
     department_id: Optional[int] = Field(None, description="项目归属部门ID")
+    product_version_id: Optional[str] = Field(None, min_length=1, max_length=32, description="产品版本ID")
 
 
 class ProjectRoleBindCreate(BaseModel):
@@ -53,13 +55,17 @@ class ProjectResponse(BaseModel):
     is_public: bool = Field(default=False, description="是否公开，False为私有，True为公开")
     department_id: Optional[int] = None
     department_name: Optional[str] = None
+    product_id: Optional[str] = None
+    product_name: Optional[str] = None
+    product_path: Optional[str] = None
+    product_version_id: Optional[str] = None
+    product_version_name: Optional[str] = None
+    product_version: Optional[str] = None
     can_manage: bool = False
     created_at: datetime
     updated_at: datetime
     roles: List[ProjectRoleBindResponse] = []
-
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ProjectListResponse(BaseModel):
@@ -73,9 +79,7 @@ class ProjectAllListResponse(BaseModel):
     code: str = Field(default="200", description="状态码")
     message: str = Field(default="success", description="消息提示")
     data: List[ProjectResponse] = Field(default_factory=list, description="项目列表数据")
-
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class DeleteRoleRequest(BaseModel):
@@ -112,6 +116,69 @@ class ErrorResponse(BaseModel):
 class SuccessResponse(BaseModel):
     """成功响应"""
     message: str
+
+
+class ProductVersionCreate(BaseModel):
+    version: str = Field(..., min_length=1, max_length=128, description="产品版本号")
+    name: Optional[str] = Field(None, max_length=128, description="产品版本名称")
+    description: Optional[str] = Field(None, description="产品版本描述")
+
+
+class ProductVersionUpdate(BaseModel):
+    version: Optional[str] = Field(None, min_length=1, max_length=128, description="产品版本号")
+    name: Optional[str] = Field(None, max_length=128, description="产品版本名称")
+    description: Optional[str] = Field(None, description="产品版本描述")
+
+
+class ProductCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=128, description="产品名称")
+    code: str = Field(..., min_length=1, max_length=128, description="产品编码")
+    parent_id: Optional[str] = Field(None, max_length=32, description="父产品ID")
+    description: Optional[str] = Field(None, description="产品描述")
+    sort_order: int = Field(default=0, description="排序")
+
+
+class ProductUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=128, description="产品名称")
+    code: Optional[str] = Field(None, min_length=1, max_length=128, description="产品编码")
+    parent_id: Optional[str] = Field(None, max_length=32, description="父产品ID")
+    description: Optional[str] = Field(None, description="产品描述")
+    sort_order: Optional[int] = Field(None, description="排序")
+
+
+class ProductVersionResponse(BaseModel):
+    id: str
+    product_id: str
+    version: str
+    name: Optional[str]
+    description: Optional[str]
+    status: str
+    project_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ProductTreeNodeResponse(BaseModel):
+    id: str
+    name: str
+    code: str
+    parent_id: Optional[str]
+    description: Optional[str]
+    sort_order: int
+    status: str
+    is_leaf: bool
+    project_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+    children: List["ProductTreeNodeResponse"] = Field(default_factory=list)
+    versions: List[ProductVersionResponse] = Field(default_factory=list)
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ProductTreeResponse(BaseModel):
+    total: int
+    products: List[ProductTreeNodeResponse]
 
 
 # ============ K8S资源模式 ============

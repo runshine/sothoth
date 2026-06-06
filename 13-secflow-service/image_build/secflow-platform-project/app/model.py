@@ -71,6 +71,40 @@ class DepartmentMember(Base):
     department = relationship("Department", backref="memberships")
 
 
+class Product(Base):
+    """产品目录模型"""
+    __tablename__ = "secflow_product"
+
+    id = Column(String(32), primary_key=True)
+    name = Column(String(128), nullable=False)
+    code = Column(String(128), nullable=False, unique=True, index=True)
+    parent_id = Column(String(32), ForeignKey("secflow_product.id"), nullable=True, index=True)
+    description = Column(Text)
+    sort_order = Column(Integer, default=0)
+    status = Column(String(32), default="active", index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    parent = relationship("Product", remote_side=[id], backref="children")
+    versions = relationship("ProductVersion", back_populates="product", lazy="joined")
+
+
+class ProductVersion(Base):
+    """产品版本模型"""
+    __tablename__ = "secflow_product_version"
+
+    id = Column(String(32), primary_key=True)
+    product_id = Column(String(32), ForeignKey("secflow_product.id"), nullable=False, index=True)
+    version = Column(String(128), nullable=False)
+    name = Column(String(128), nullable=True)
+    description = Column(Text)
+    status = Column(String(32), default="active", index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    product = relationship("Product", back_populates="versions")
+
+
 class Project(Base):
     """项目模型"""
     __tablename__ = "secflow_project"
@@ -84,12 +118,14 @@ class Project(Base):
     status = Column(String(32), default="active")  # active, deleted
     is_public = Column(Boolean, default=False)  # 是否公开，False为私有，True为公开
     department_id = Column(Integer, ForeignKey("secflow_org_department.id"), nullable=True)
+    product_version_id = Column(String(32), ForeignKey("secflow_product_version.id"), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # 关系
     role_binds = relationship("ProjectRoleBind", back_populates="project", lazy="joined")
     department = relationship("Department", lazy="joined")
+    product_version = relationship("ProductVersion", lazy="joined")
 
     def to_dict(self) -> dict:
         """转换为字典"""
@@ -103,6 +139,7 @@ class Project(Base):
             "status": self.status,
             "is_public": self.is_public,
             "department_id": self.department_id,
+            "product_version_id": self.product_version_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -180,6 +217,44 @@ def run_auto_migrations():
     engine = get_engine()
     migrations = [
         {
+            "name": "create_secflow_product",
+            "check": lambda inspector: "secflow_product" in inspector.get_table_names(),
+            "sql": (
+                "CREATE TABLE secflow_product ("
+                "id VARCHAR(32) PRIMARY KEY,"
+                "name VARCHAR(128) NOT NULL,"
+                "code VARCHAR(128) NOT NULL,"
+                "parent_id VARCHAR(32) NULL,"
+                "description TEXT NULL,"
+                "sort_order INT NOT NULL DEFAULT 0,"
+                "status VARCHAR(32) NOT NULL DEFAULT 'active',"
+                "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+                "UNIQUE KEY uq_secflow_product_code (code),"
+                "KEY idx_secflow_product_parent_id (parent_id),"
+                "KEY idx_secflow_product_status (status)"
+                ")"
+            ),
+        },
+        {
+            "name": "create_secflow_product_version",
+            "check": lambda inspector: "secflow_product_version" in inspector.get_table_names(),
+            "sql": (
+                "CREATE TABLE secflow_product_version ("
+                "id VARCHAR(32) PRIMARY KEY,"
+                "product_id VARCHAR(32) NOT NULL,"
+                "version VARCHAR(128) NOT NULL,"
+                "name VARCHAR(128) NULL,"
+                "description TEXT NULL,"
+                "status VARCHAR(32) NOT NULL DEFAULT 'active',"
+                "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+                "KEY idx_secflow_product_version_product_id (product_id),"
+                "KEY idx_secflow_product_version_status (status)"
+                ")"
+            ),
+        },
+        {
             "name": "add_is_public_to_secflow_project",
             "check": lambda inspector: "is_public" in {
                 column["name"] for column in inspector.get_columns("secflow_project")
@@ -212,6 +287,28 @@ def run_auto_migrations():
                 "ON secflow_project (department_id)"
             ),
         },
+        {
+            "name": "add_product_version_id_to_secflow_project",
+            "check": lambda inspector: "product_version_id" in {
+                column["name"] for column in inspector.get_columns("secflow_project")
+            },
+            "sql": (
+                "ALTER TABLE secflow_project "
+                "ADD COLUMN product_version_id VARCHAR(32) NULL "
+                "AFTER department_id"
+            ),
+        },
+        {
+            "name": "add_product_version_id_index_to_secflow_project",
+            "check": lambda inspector: any(
+                "product_version_id" in index.get("column_names", [])
+                for index in inspector.get_indexes("secflow_project")
+            ),
+            "sql": (
+                "CREATE INDEX idx_secflow_project_product_version_id "
+                "ON secflow_project (product_version_id)"
+            ),
+        },
     ]
 
     with engine.begin() as connection:
@@ -222,6 +319,35 @@ def run_auto_migrations():
             logger.info("[Database] Applying migration: %s", migration["name"])
             connection.execute(text(migration["sql"]))
             logger.info("[Database] Migration applied: %s", migration["name"])
+
+        inspector = inspect(connection)
+        if "secflow_product" in inspector.get_table_names():
+            fk_names = {fk["name"] for fk in inspector.get_foreign_keys("secflow_product") if fk.get("name")}
+            if "fk_secflow_product_parent_id" not in fk_names:
+                connection.execute(text(
+                    "ALTER TABLE secflow_product "
+                    "ADD CONSTRAINT fk_secflow_product_parent_id "
+                    "FOREIGN KEY (parent_id) REFERENCES secflow_product(id)"
+                ))
+        inspector = inspect(connection)
+        if "secflow_product_version" in inspector.get_table_names():
+            fk_names = {fk["name"] for fk in inspector.get_foreign_keys("secflow_product_version") if fk.get("name")}
+            if "fk_secflow_product_version_product_id" not in fk_names:
+                connection.execute(text(
+                    "ALTER TABLE secflow_product_version "
+                    "ADD CONSTRAINT fk_secflow_product_version_product_id "
+                    "FOREIGN KEY (product_id) REFERENCES secflow_product(id)"
+                ))
+        inspector = inspect(connection)
+        secflow_project_columns = {column["name"] for column in inspector.get_columns("secflow_project")}
+        if "product_version_id" in secflow_project_columns:
+            fk_names = {fk["name"] for fk in inspector.get_foreign_keys("secflow_project") if fk.get("name")}
+            if "fk_secflow_project_product_version_id" not in fk_names:
+                connection.execute(text(
+                    "ALTER TABLE secflow_project "
+                    "ADD CONSTRAINT fk_secflow_project_product_version_id "
+                    "FOREIGN KEY (product_version_id) REFERENCES secflow_product_version(id)"
+                ))
 
 
 def get_db():

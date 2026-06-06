@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import asyncio
 
 import httpx
 import pytest
@@ -46,8 +47,7 @@ def test_get_project_with_permission_allows_global_machine_token():
     assert result is project
 
 
-@pytest.mark.asyncio
-async def test_get_current_user_maps_auth_transport_failure_to_dependency_error(monkeypatch):
+def test_get_current_user_maps_auth_transport_failure_to_dependency_error(monkeypatch):
     class _AuthStub:
         async def validate_token_async(self, token, project_id=None):
             del token, project_id
@@ -56,15 +56,14 @@ async def test_get_current_user_maps_auth_transport_failure_to_dependency_error(
     monkeypatch.setattr("app.api.projects.get_auth_service", lambda: _AuthStub())
 
     with pytest.raises(DependencyUnavailableError) as exc_info:
-        await get_current_user(authorization="Bearer test-token", project_id="p1")
+        asyncio.run(get_current_user(authorization="Bearer test-token", project_id="p1"))
 
     assert exc_info.value.status_code == 502
     assert exc_info.value.message == "认证服务暂时不可用"
     assert exc_info.value.details["reason"].startswith("认证服务请求失败:")
 
 
-@pytest.mark.asyncio
-async def test_auth_service_validate_token_async_retries_once_on_request_error(monkeypatch):
+def test_auth_service_validate_token_async_retries_once_on_request_error(monkeypatch):
     service = AuthService()
 
     class _Response:
@@ -97,7 +96,7 @@ async def test_auth_service_validate_token_async_retries_once_on_request_error(m
     client = _AsyncClientStub()
     monkeypatch.setattr(service, "_async_client", lambda: client)
 
-    result = await service.validate_token_async("token", project_id="p1")
+    result = asyncio.run(service.validate_token_async("token", project_id="p1"))
 
     assert result["id"] == "u1"
     assert client.calls == 2

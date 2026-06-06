@@ -6,9 +6,10 @@ import hashlib
 import logging
 import secrets
 from datetime import datetime
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.build_info import build_service_meta
@@ -25,12 +26,21 @@ from app.model import (
     get_db,
     Department,
     DepartmentMember,
+    Product,
+    ProductVersion,
     Project,
     ProjectRoleBind,
     Role,
     secflow_user_user_role,
 )
 from app.schemas import (
+    ProductCreate,
+    ProductTreeNodeResponse,
+    ProductTreeResponse,
+    ProductUpdate,
+    ProductVersionCreate,
+    ProductVersionResponse,
+    ProductVersionUpdate,
     ProjectCreate,
     ProjectUpdate,
     ProjectResponse,
@@ -86,6 +96,10 @@ def generate_project_id(name: str) -> str:
     return md5_hash[:16]
 
 
+def normalize_product_code(value: str) -> str:
+    return value.strip().lower().replace(" ", "-").replace("/", "-")
+
+
 def verify_project_permission(
     project: Project,
     user_id: str,
@@ -136,6 +150,181 @@ def get_human_user_id(current_user: dict) -> int:
     if is_machine_token_user(current_user):
         raise ForbiddenError("项目级机机Token不允许执行当前用户操作")
     return int(current_user["id"])
+
+
+def get_product_path(product: Optional[Product]) -> Optional[str]:
+    if not product:
+        return None
+    names: List[str] = []
+    current = product
+    visited: Set[str] = set()
+    while current and current.id not in visited:
+        visited.add(current.id)
+        names.append(current.name)
+        current = current.parent
+    return " / ".join(reversed(names))
+
+
+def ensure_project_admin_user(db: Session, current_user: dict) -> int:
+    user_id = get_human_user_id(current_user)
+    if is_super_admin(db, user_id) or is_ordinary_admin(db, user_id):
+        return user_id
+
+    manageable_exists = db.query(Project.id).filter(Project.status == "active").all()
+    for row in manageable_exists:
+        project = db.query(Project).options(joinedload(Project.role_binds), joinedload(Project.department)).filter(
+            Project.id == row.id,
+            Project.status == "active"
+        ).first()
+        if project and can_manage_project(db, project, user_id):
+            return user_id
+
+    raise ForbiddenError("仅项目管理员可以维护产品目录")
+
+
+def get_active_product(db: Session, product_id: str) -> Product:
+    product = db.query(Product).options(joinedload(Product.children), joinedload(Product.versions)).filter(
+        Product.id == product_id,
+        Product.status == "active",
+    ).first()
+    if not product:
+        raise NotFoundError("产品", product_id)
+    return product
+
+
+def get_active_product_version(db: Session, version_id: str) -> ProductVersion:
+    version = db.query(ProductVersion).options(
+        joinedload(ProductVersion.product).joinedload(Product.parent)
+    ).filter(
+        ProductVersion.id == version_id,
+        ProductVersion.status == "active",
+    ).first()
+    if not version:
+        raise NotFoundError("产品版本", version_id)
+    return version
+
+
+def ensure_leaf_product(db: Session, product: Product):
+    active_children = db.query(Product.id).filter(
+        Product.parent_id == product.id,
+        Product.status == "active",
+    ).first()
+    if active_children:
+        raise ValidationError("只有叶子产品可以创建版本")
+
+
+def validate_product_parent(db: Session, parent_id: Optional[str], product_id: Optional[str] = None) -> Optional[Product]:
+    if not parent_id:
+        return None
+    parent = get_active_product(db, parent_id)
+    if product_id and parent.id == product_id:
+        raise ValidationError("产品不能将自己设为父节点")
+    current = parent.parent
+    visited: Set[str] = {parent.id}
+    while current:
+        if current.id == product_id:
+            raise ValidationError("不能将产品移动到自己的子节点下")
+        if current.id in visited:
+            break
+        visited.add(current.id)
+        current = current.parent
+    return parent
+
+
+def validate_project_product_version(db: Session, product_version_id: Optional[str], required: bool = False) -> Optional[ProductVersion]:
+    if not product_version_id:
+        if required:
+            raise ValidationError("请选择产品版本")
+        return None
+    version = get_active_product_version(db, product_version_id)
+    ensure_leaf_product(db, version.product)
+    return version
+
+
+def make_product_version_response(db: Session, version: ProductVersion) -> ProductVersionResponse:
+    project_count = db.query(Project.id).filter(
+        Project.product_version_id == version.id,
+        Project.status == "active",
+    ).count()
+    return ProductVersionResponse(
+        id=version.id,
+        product_id=version.product_id,
+        version=version.version,
+        name=version.name,
+        description=version.description,
+        status=version.status,
+        project_count=project_count,
+        created_at=version.created_at,
+        updated_at=version.updated_at,
+    )
+
+
+def build_product_tree(db: Session) -> ProductTreeResponse:
+    products = db.query(Product).options(
+        joinedload(Product.children),
+        joinedload(Product.versions),
+        joinedload(Product.parent),
+    ).filter(Product.status == "active").all()
+    versions = db.query(ProductVersion).options(joinedload(ProductVersion.product)).filter(
+        ProductVersion.status == "active"
+    ).all()
+
+    versions_by_product: Dict[str, List[ProductVersion]] = {}
+    for version in versions:
+        versions_by_product.setdefault(version.product_id, []).append(version)
+    for items in versions_by_product.values():
+        items.sort(key=lambda item: (item.version, item.name or ""))
+
+    products_by_id = {product.id: product for product in products}
+    children_map: Dict[Optional[str], List[Product]] = {}
+    for product in products:
+        children_map.setdefault(product.parent_id, []).append(product)
+    for children in children_map.values():
+        children.sort(key=lambda item: (item.sort_order, item.name))
+
+    project_counts = {
+        row[0]: row[1]
+        for row in db.query(Project.product_version_id, func.count(Project.id)).filter(
+            Project.status == "active",
+            Project.product_version_id.isnot(None),
+        ).group_by(Project.product_version_id).all()
+    }
+
+    def build_node(product: Product) -> ProductTreeNodeResponse:
+        child_nodes = [build_node(child) for child in children_map.get(product.id, [])]
+        version_responses = [
+            ProductVersionResponse(
+                id=version.id,
+                product_id=version.product_id,
+                version=version.version,
+                name=version.name,
+                description=version.description,
+                status=version.status,
+                project_count=project_counts.get(version.id, 0),
+                created_at=version.created_at,
+                updated_at=version.updated_at,
+            )
+            for version in versions_by_product.get(product.id, [])
+        ]
+        project_count = sum(item.project_count for item in version_responses) + sum(child.project_count for child in child_nodes)
+        return ProductTreeNodeResponse(
+            id=product.id,
+            name=product.name,
+            code=product.code,
+            parent_id=product.parent_id,
+            description=product.description,
+            sort_order=product.sort_order,
+            status=product.status,
+            is_leaf=len(child_nodes) == 0,
+            project_count=project_count,
+            created_at=product.created_at,
+            updated_at=product.updated_at,
+            children=child_nodes,
+            versions=version_responses,
+        )
+
+    root_nodes = [build_node(product) for product in children_map.get(None, []) if product.id in products_by_id]
+    return ProductTreeResponse(total=len(products), products=root_nodes)
 
 
 def get_project_with_permission(
@@ -369,6 +558,8 @@ def make_project_response(
     can_manage: bool = False,
 ) -> ProjectResponse:
     """构建项目响应"""
+    product_version = getattr(project, "product_version", None)
+    product = product_version.product if product_version else None
     return ProjectResponse(
         id=project.id,
         name=project.name,
@@ -380,11 +571,192 @@ def make_project_response(
         is_public=project.is_public if project.is_public is not None else False,
         department_id=project.department_id,
         department_name=project.department.name if getattr(project, "department", None) else None,
+        product_id=product.id if product else None,
+        product_name=product.name if product else None,
+        product_path=get_product_path(product),
+        product_version_id=product_version.id if product_version else None,
+        product_version_name=product_version.name if product_version else None,
+        product_version=product_version.version if product_version else None,
         can_manage=can_manage,
         created_at=project.created_at,
         updated_at=project.updated_at,
         roles=roles
     )
+
+
+@router.get("/products/tree", response_model=ProductTreeResponse)
+async def get_product_tree(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    get_human_user_id(current_user)
+    return build_product_tree(db)
+
+
+@router.post("/products", response_model=ProductTreeNodeResponse, status_code=status.HTTP_201_CREATED)
+async def create_product(
+    payload: ProductCreate,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ensure_project_admin_user(db, current_user)
+    code = normalize_product_code(payload.code)
+    existing = db.query(Product).filter(Product.code == code, Product.status == "active").first()
+    if existing:
+        raise ValidationError(f"产品编码已存在: {payload.code}")
+    parent = validate_product_parent(db, payload.parent_id)
+    product = Product(
+        id=generate_project_id(f"product_{payload.name}_{payload.code}"),
+        name=payload.name.strip(),
+        code=code,
+        parent_id=parent.id if parent else None,
+        description=payload.description,
+        sort_order=payload.sort_order,
+        status="active",
+    )
+    db.add(product)
+    db.commit()
+    db.refresh(product)
+    tree = build_product_tree(db)
+    return next(node for node in _flatten_product_tree(tree.products) if node.id == product.id)
+
+
+def _flatten_product_tree(nodes: List[ProductTreeNodeResponse]) -> List[ProductTreeNodeResponse]:
+    result: List[ProductTreeNodeResponse] = []
+    for node in nodes:
+        result.append(node)
+        result.extend(_flatten_product_tree(node.children))
+    return result
+
+
+@router.put("/products/{product_id}", response_model=ProductTreeNodeResponse)
+async def update_product(
+    product_id: str,
+    payload: ProductUpdate,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ensure_project_admin_user(db, current_user)
+    product = get_active_product(db, product_id)
+    if payload.code is not None:
+        code = normalize_product_code(payload.code)
+        existing = db.query(Product).filter(
+            Product.code == code,
+            Product.id != product_id,
+            Product.status == "active",
+        ).first()
+        if existing:
+            raise ValidationError(f"产品编码已存在: {payload.code}")
+        product.code = code
+    if payload.name is not None:
+        product.name = payload.name.strip()
+    if payload.description is not None:
+        product.description = payload.description
+    if payload.sort_order is not None:
+        product.sort_order = payload.sort_order
+    if payload.parent_id is not None:
+        parent = validate_product_parent(db, payload.parent_id or None, product_id=product_id)
+        product.parent_id = parent.id if parent else None
+    db.commit()
+    tree = build_product_tree(db)
+    return next(node for node in _flatten_product_tree(tree.products) if node.id == product_id)
+
+
+@router.delete("/products/{product_id}", response_model=SuccessResponse)
+async def delete_product(
+    product_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ensure_project_admin_user(db, current_user)
+    product = get_active_product(db, product_id)
+    active_child = db.query(Product.id).filter(Product.parent_id == product_id, Product.status == "active").first()
+    if active_child:
+        raise ValidationError("存在子产品，无法删除")
+    active_version = db.query(ProductVersion.id).filter(ProductVersion.product_id == product_id, ProductVersion.status == "active").first()
+    if active_version:
+        raise ValidationError("存在产品版本，无法删除")
+    product.status = "deleted"
+    db.commit()
+    return SuccessResponse(message=f"产品 {product.name} 已删除")
+
+
+@router.post("/products/{product_id}/versions", response_model=ProductVersionResponse, status_code=status.HTTP_201_CREATED)
+async def create_product_version(
+    product_id: str,
+    payload: ProductVersionCreate,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ensure_project_admin_user(db, current_user)
+    product = get_active_product(db, product_id)
+    ensure_leaf_product(db, product)
+    existing = db.query(ProductVersion).filter(
+        ProductVersion.product_id == product_id,
+        ProductVersion.version == payload.version.strip(),
+        ProductVersion.status == "active",
+    ).first()
+    if existing:
+        raise ValidationError(f"产品版本已存在: {payload.version}")
+    version = ProductVersion(
+        id=generate_project_id(f"product_version_{product_id}_{payload.version}"),
+        product_id=product_id,
+        version=payload.version.strip(),
+        name=(payload.name or "").strip() or None,
+        description=payload.description,
+        status="active",
+    )
+    db.add(version)
+    db.commit()
+    db.refresh(version)
+    return make_product_version_response(db, version)
+
+
+@router.put("/products/versions/{version_id}", response_model=ProductVersionResponse)
+async def update_product_version(
+    version_id: str,
+    payload: ProductVersionUpdate,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ensure_project_admin_user(db, current_user)
+    version = get_active_product_version(db, version_id)
+    if payload.version is not None:
+        existing = db.query(ProductVersion).filter(
+            ProductVersion.product_id == version.product_id,
+            ProductVersion.version == payload.version.strip(),
+            ProductVersion.id != version_id,
+            ProductVersion.status == "active",
+        ).first()
+        if existing:
+            raise ValidationError(f"产品版本已存在: {payload.version}")
+        version.version = payload.version.strip()
+    if payload.name is not None:
+        version.name = payload.name.strip() or None
+    if payload.description is not None:
+        version.description = payload.description
+    db.commit()
+    db.refresh(version)
+    return make_product_version_response(db, version)
+
+
+@router.delete("/products/versions/{version_id}", response_model=SuccessResponse)
+async def delete_product_version(
+    version_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ensure_project_admin_user(db, current_user)
+    version = get_active_product_version(db, version_id)
+    project_exists = db.query(Project.id).filter(
+        Project.product_version_id == version_id,
+        Project.status == "active",
+    ).first()
+    if project_exists:
+        raise ValidationError("存在关联项目，无法删除产品版本")
+    version.status = "deleted"
+    db.commit()
+    return SuccessResponse(message=f"产品版本 {version.version} 已删除")
 
 
 # ============ 项目接口 ============
@@ -417,6 +789,7 @@ async def create_project(
 
     # 生成项目ID
     project_id = generate_project_id(project_data.name)
+    product_version = validate_project_product_version(db, project_data.product_version_id, required=True)
 
     # 生成K8S Namespace名称
     k8s_client = get_k8s_client()
@@ -434,6 +807,7 @@ async def create_project(
         status="active",
         is_public=project_data.is_public,
         department_id=department_id,
+        product_version_id=product_version.id,
     )
     db.add(project)
 
@@ -497,6 +871,9 @@ async def create_project(
 
 @router.get("", response_model=ProjectListResponse)
 async def list_projects(
+    product_id: Optional[str] = Query(None, description="按产品筛选"),
+    product_version_id: Optional[str] = Query(None, description="按产品版本筛选"),
+    unassigned_product_version: Optional[bool] = Query(None, description="筛选未绑定产品版本的项目"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -509,9 +886,18 @@ async def list_projects(
     """
     user_id = int(current_user["id"])
 
-    projects = db.query(Project).options(joinedload(Project.role_binds), joinedload(Project.department)).filter(
-        Project.status == "active"
-    ).all()
+    query = db.query(Project).options(
+        joinedload(Project.role_binds),
+        joinedload(Project.department),
+        joinedload(Project.product_version).joinedload(ProductVersion.product).joinedload(Product.parent),
+    ).filter(Project.status == "active")
+    if product_version_id:
+        query = query.filter(Project.product_version_id == product_version_id)
+    if unassigned_product_version is True:
+        query = query.filter(Project.product_version_id.is_(None))
+    if product_id:
+        query = query.join(Project.product_version, isouter=True).filter(ProductVersion.product_id == product_id)
+    projects = query.all()
 
     result = []
     for project in projects:
@@ -540,7 +926,11 @@ async def list_all_projects(
     # 查询所有项目
     user_id = int(current_user["id"])
 
-    projects = db.query(Project).options(joinedload(Project.role_binds), joinedload(Project.department)).filter(
+    projects = db.query(Project).options(
+        joinedload(Project.role_binds),
+        joinedload(Project.department),
+        joinedload(Project.product_version).joinedload(ProductVersion.product).joinedload(Product.parent),
+    ).filter(
         Project.status == "active"
     ).all()
 
@@ -646,6 +1036,10 @@ async def update_project(
         if user_id is None:
             raise ForbiddenError("项目级机机Token不允许修改项目归属部门")
         project.department_id = validate_project_department_scope(db, user_id, project_data.department_id)
+
+    if project_data.product_version_id is not None:
+        version = validate_project_product_version(db, project_data.product_version_id, required=False)
+        project.product_version_id = version.id if version else None
 
     db.commit()
     db.refresh(project)
