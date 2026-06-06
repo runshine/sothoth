@@ -9,7 +9,7 @@
 	url = https://github.com/runshine/agent-service-manager-frontend.git
 [submodule "13-secflow-service/image_build/secflow-frontend"]
 	path = 13-secflow-service/image_build/secflow-frontend
-	url = https://github.com/runshine/SecFlowFrontend.git
+	url = https://github.com/GaiaSecHW/Chimera.git
 	branch = local
 [submodule "13-secflow-service/image_build/secflow-app-system-analyse"]
 	path = 13-secflow-service/image_build/secflow-app-system-analyse
