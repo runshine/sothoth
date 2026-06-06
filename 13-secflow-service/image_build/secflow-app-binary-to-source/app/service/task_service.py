@@ -373,9 +373,17 @@ def _is_default_timeline_event(event: B2STaskEventModel) -> bool:
     return _event_timeline_visible(event) and _event_timeline_class(event) in DEFAULT_TIMELINE_CLASSES
 
 
-def _task_execution_epoch(task: B2STask) -> int:
-    metadata = task.extra_metadata or {}
-    return max(0, int(metadata.get("task_execution_epoch") or 0))
+def _task_execution_epoch(task: B2STask | None) -> int | None:
+    if task is None:
+        return None
+    metadata = getattr(task, "extra_metadata", None)
+    if not isinstance(metadata, dict):
+        metadata = {}
+    value = metadata.get("task_execution_epoch")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _timeline_payload(
