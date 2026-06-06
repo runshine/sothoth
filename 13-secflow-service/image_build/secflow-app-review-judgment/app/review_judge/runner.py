@@ -426,7 +426,7 @@ async def run_review_judgment(
     reviewer_proc = await _start_rpc_process(
         model=config.reviewer.model or model,
         thinking=config.reviewer.thinking or thinking,
-        tools="read,bash",
+        tools=config.reviewer.tools or "read,bash",
         working_dir=work_dir_abs,
         session_dir=reviewer_session,
         label="reviewer",
@@ -474,7 +474,7 @@ async def run_review_judgment(
     worker_proc = await _start_rpc_process(
         model=config.worker.model or model,
         thinking=config.worker.thinking or thinking,
-        tools="read,bash,edit,write",
+        tools=config.worker.tools or "read,bash,edit,write",
         working_dir=work_dir_abs,
         session_dir=session_dir,  # 复用原始会话！
         label="worker",

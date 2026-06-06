@@ -1,0 +1,10 @@
+{
+  "new_tainted_carriers": [
+    {
+      "variable": "g_isulad_conf.server_conf",
+      "line": 1578,
+      "source": "args",
+      "description": "外部污点指针 args 被存入全局变量，成为新的污点载体"
+    }
+  ]
+}

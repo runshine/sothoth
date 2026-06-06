@@ -1,0 +1,5 @@
+{
+  "function": "util_string_split_n",
+  "file": "src/utils/cutils/utils_string.c",
+  "newly_introduced_tainted_objects": []
+}

@@ -13,17 +13,17 @@ from pydantic import BaseModel, Field
 
 
 class ReviewerConfig(BaseModel):
-    model: str = "icsl/zai-org/GLM-5"
-    thinking: str = "high"
-    tools: str = "read,bash,edit,write"
+    model: Optional[str] = None
+    thinking: Optional[str] = None
+    tools: str = "read,bash"
     timeout_seconds: int = 3600
     max_retries: int = 3
     retry_interval_seconds: int = 30
 
 
 class WorkerConfig(BaseModel):
-    model: str = "icsl/zai-org/GLM-5"
-    thinking: str = "high"
+    model: Optional[str] = None
+    thinking: Optional[str] = None
     tools: str = "read,bash,edit,write"
     timeout_seconds: int = 3600
     max_retries: int = 3

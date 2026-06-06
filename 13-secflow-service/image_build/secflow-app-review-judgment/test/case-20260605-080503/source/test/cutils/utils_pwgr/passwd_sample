@@ -1,0 +1,16 @@
+root:x:b:0:
+root:x:99999999999999999999999999999999999999:0:root:/root:/bin/bash
+root:x:0:1a:root:/root:/bin/bash
+root:x:0:a2:root:/root:/bin/bash
+root:x:0:0:root:/root:/bin/bash
+abin:x:1:1:bin:/bin:/sbin/nologin
+bbin:x:-1:1:bin:/bin:/sbin/nologin
+uidonly:x:1::bin:/bin:/sbin/nologin
+::::1:1:bin:/bin:/sbin/nologin
+root:x:
+
+#npt:*:66:77::/etc/ntp:/sbin/nologin
+anpt:*:66:77::/etc/ntp:/sbin/nologin
+bnpt:*:66:77::/etc/ntp:/sbin/nologin:some:extra:context:added
++npt:*::::/etc/ntp:/sbin/nologin
+-npt:*::::/etc/ntp:/sbin/nologin
