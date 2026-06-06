@@ -17,7 +17,7 @@ from croniter import croniter
 from sqlalchemy.orm import Session
 
 from app.config import get_config
-from app.exception import NotFoundError, UpstreamError, ValidationError
+from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
 from app.model import ScheduleExecution, ScheduleExecutionEvent, ScheduleJob, get_db_session
 from app.service.http_client import get_shared_async_client
 from app.service.redis_runtime import get_redis_runtime
@@ -315,7 +315,7 @@ class ScheduleManager:
 
     def _working_status_query(self, db: Session):
         return db.query(ScheduleExecution).filter(
-            ScheduleExecution.status.in_(["leased", "dispatching"])
+            ScheduleExecution.status.in_(["reserved", "running"])
         )
 
     def _job_limits(self, job: ScheduleJob) -> tuple[int, int, int]:
@@ -341,6 +341,55 @@ class ScheduleManager:
             ScheduleExecution.target_bucket == target_bucket,
         ).count()
 
+    def _capacity_snapshot(self, db: Session, job: ScheduleJob, execution: ScheduleExecution) -> dict[str, int]:
+        target_bucket = execution.target_bucket or self._job_bucket_key(job)
+        return {
+            "job_limit": max(1, int(job.max_concurrency or 1)),
+            "project_limit": max(1, int(self.cfg.limits.project_default_concurrency)),
+            "target_limit": max(1, int(self.cfg.limits.target_default_concurrency)),
+            "job_working": self._working_count_for_job(db, job.id),
+            "project_working": self._working_count_for_project(db, execution.project_id),
+            "target_working": self._working_count_for_target(db, execution.project_id, target_bucket),
+        }
+
+    def _reserve_execution(self, db: Session, execution: ScheduleExecution, job: ScheduleJob, *, actor: str) -> bool:
+        if execution.status != "queued":
+            return False
+        snapshot = self._capacity_snapshot(db, job, execution)
+        if (
+            snapshot["job_working"] >= snapshot["job_limit"]
+            or snapshot["project_working"] >= snapshot["project_limit"]
+            or snapshot["target_working"] >= snapshot["target_limit"]
+        ):
+            execution.capacity_reject_count = int(execution.capacity_reject_count or 0) + 1
+            execution.capacity_reject_reason = "capacity_full"
+            execution.capacity_reject_at = utcnow()
+            self._append_event(
+                db,
+                execution.id,
+                "capacity_rejected",
+                "Execution stayed queued because working capacity is full",
+                snapshot,
+                event_source=actor,
+                attempt_no=execution.attempt_no,
+            )
+            return False
+
+        execution.status = "reserved"
+        execution.reserved_at = utcnow()
+        execution.capacity_reject_reason = None
+        execution.capacity_reject_at = None
+        self._append_event(
+            db,
+            execution.id,
+            "reserved",
+            "Execution reserved for worker dispatch",
+            snapshot,
+            event_source=actor,
+            attempt_no=execution.attempt_no,
+        )
+        return True
+
     def claim_execution_if_capacity(self, db: Session, execution_id: str) -> tuple[ScheduleExecution | None, bool]:
         execution = db.query(ScheduleExecution).filter(
             ScheduleExecution.id == execution_id
@@ -351,59 +400,15 @@ class ScheduleManager:
             return execution, False
 
         job = self.get_job_or_404(db, execution.project_id, execution.schedule_job_id)
-        target_bucket = execution.target_bucket or self._job_bucket_key(job)
-        job_limit, project_limit, target_limit = self._job_limits(job)
-        job_working = self._working_count_for_job(db, job.id)
-        project_working = self._working_count_for_project(db, execution.project_id)
-        target_working = self._working_count_for_target(db, execution.project_id, target_bucket)
-        if job_working >= job_limit or project_working >= project_limit or target_working >= target_limit:
-            self._append_event(
-                db,
-                execution.id,
-                "claim_rejected_by_concurrency_limit",
-                "Execution stayed queued because working capacity is full",
-                {
-                    "job_limit": job_limit,
-                    "project_limit": project_limit,
-                    "target_limit": target_limit,
-                    "job_working": job_working,
-                    "project_working": project_working,
-                    "target_working": target_working,
-                },
-                event_source="worker",
-                attempt_no=execution.attempt_no,
-            )
-            db.commit()
-            db.refresh(execution)
-            return execution, False
-
-        lease_token = uuid.uuid4().hex
-        execution.status = "leased"
-        execution.lease_owner = self.pod_name
-        execution.worker_pod = self.pod_name
-        execution.lease_token = lease_token
-        execution.lease_expire_at = utcnow() + timedelta(seconds=self.cfg.worker.lease_seconds)
-        execution.heartbeat_at = utcnow()
-        execution.retry_at = None
-        self._append_event(
-            db,
-            execution.id,
-            "leased",
-            "Execution lease acquired",
-            {
-                "job_limit": job_limit,
-                "project_limit": project_limit,
-                "target_limit": target_limit,
-            },
-            event_source="worker",
-            attempt_no=execution.attempt_no,
-            lease_token=lease_token,
-        )
+        reserved = self._reserve_execution(db, execution, job, actor="worker")
         db.commit()
         db.refresh(execution)
-        return execution, True
+        return execution, reserved
 
     async def enqueue_execution(self, execution_id: str) -> None:
+        await self.redis.enqueue_ready(execution_id)
+
+    async def enqueue_reserved_execution(self, execution_id: str) -> None:
         await self.redis.enqueue_ready(execution_id)
 
     async def trigger_job(self, db: Session, project_id: str, job_id: str, actor_token: str | None, trigger_source: str = "manual") -> ScheduleExecution:
@@ -467,7 +472,9 @@ class ScheduleManager:
                     execution = self.create_due_execution(db, job)
                 except ConflictError:
                     continue
-                if execution is not None:
+                reserved = self._reserve_execution(db, execution, job, actor="scheduler")
+                db.commit()
+                if execution is not None and reserved:
                     execution_ids.append(execution.id)
             db.commit()
         finally:
@@ -478,11 +485,18 @@ class ScheduleManager:
 
     async def requeue_pending_executions(self) -> int:
         db = get_db_session()
+        execution_ids: list[str] = []
         try:
             items = db.query(ScheduleExecution).filter(
-                ScheduleExecution.status == "queued"
+                ScheduleExecution.status.in_(["queued", "reserved"])
             ).order_by(ScheduleExecution.created_at.asc()).limit(self.cfg.scheduler.batch_size).all()
-            execution_ids = [item.id for item in items]
+            for execution in items:
+                if execution.status == "queued":
+                    job = self.get_job_or_404(db, execution.project_id, execution.schedule_job_id)
+                    if not self._reserve_execution(db, execution, job, actor="scheduler"):
+                        continue
+                execution_ids.append(execution.id)
+            db.commit()
         finally:
             db.close()
         for execution_id in execution_ids:
@@ -498,7 +512,7 @@ class ScheduleManager:
         reclaimed = 0
         try:
             stale = db.query(ScheduleExecution).filter(
-                ScheduleExecution.status.in_(["leased", "dispatching"]),
+                ScheduleExecution.status.in_(["reserved", "running"]),
                 ScheduleExecution.lease_expire_at.is_not(None),
                 ScheduleExecution.lease_expire_at < utcnow(),
             ).limit(self.cfg.scheduler.batch_size).all()
@@ -557,18 +571,24 @@ class ScheduleManager:
             if execution is None:
                 await self.redis.release_execution_lease(execution_id, lease_token)
                 return None
-            if execution.status not in {"queued", "retry_wait", "failed", "timeout"}:
+            if execution.status not in {"reserved", "queued", "retry_wait", "failed", "timeout"}:
                 await self.redis.release_execution_lease(execution_id, lease_token)
                 return execution
             job = self.get_job_or_404(db, execution.project_id, execution.schedule_job_id)
-            execution.status = "leased"
+            if execution.status == "queued":
+                reserved = self._reserve_execution(db, execution, job, actor="worker")
+                if not reserved:
+                    db.commit()
+                    await self.redis.release_execution_lease(execution_id, lease_token)
+                    return execution
+            execution.status = "running"
             execution.lease_owner = self.pod_name
             execution.lease_token = lease_token
             execution.worker_pod = self.pod_name
             execution.lease_expire_at = utcnow() + timedelta(seconds=self.cfg.worker.lease_seconds)
             execution.heartbeat_at = utcnow()
             execution.retry_at = None
-            self._append_event(db, execution.id, "leased", "Execution lease acquired", event_source="worker", attempt_no=execution.attempt_no, lease_token=lease_token)
+            self._append_event(db, execution.id, "running", "Execution lease acquired", event_source="worker", attempt_no=execution.attempt_no, lease_token=lease_token)
             db.commit()
 
             bucket_keys = [
@@ -627,9 +647,9 @@ class ScheduleManager:
                 "params": params,
                 "json": body,
             }
-            execution.status = "dispatching"
+            execution.status = "running"
             execution.started_at = utcnow()
-            self._append_event(db, execution.id, "dispatching", "Dispatch started", execution.request_snapshot, event_source="worker", attempt_no=execution.attempt_no, lease_token=lease_token)
+            self._append_event(db, execution.id, "running", "Dispatch started", execution.request_snapshot, event_source="worker", attempt_no=execution.attempt_no, lease_token=lease_token)
             db.commit()
 
             started = time.perf_counter()
@@ -743,7 +763,10 @@ class ScheduleManager:
         db = get_db_session()
         try:
             queue_snapshot = await self.redis.metrics_snapshot()
-            inflight = db.query(ScheduleExecution).filter(ScheduleExecution.status.in_(["queued", "leased", "dispatching", "retry_wait"])).count()
+            inflight = db.query(ScheduleExecution).filter(ScheduleExecution.status.in_(["queued", "reserved", "running", "retry_wait"])).count()
+            queued = db.query(ScheduleExecution).filter(ScheduleExecution.status == "queued").count()
+            reserved = db.query(ScheduleExecution).filter(ScheduleExecution.status == "reserved").count()
+            running = db.query(ScheduleExecution).filter(ScheduleExecution.status == "running").count()
             succeeded = db.query(ScheduleExecution).filter(ScheduleExecution.status == "succeeded").count()
             failed = db.query(ScheduleExecution).filter(ScheduleExecution.status.in_(["failed", "timeout"])).count()
             jobs_total = db.query(ScheduleJob).filter(ScheduleJob.deleted.is_(False)).count()
@@ -763,6 +786,9 @@ class ScheduleManager:
                     "local_pod": self.pod_name,
                     "concurrency": self.cfg.worker.concurrency,
                     "inflight_executions": inflight,
+                    "queued_executions": queued,
+                    "reserved_executions": reserved,
+                    "running_executions": running,
                 },
                 "stats": {
                     "jobs_total": jobs_total,
@@ -781,7 +807,7 @@ class ScheduleManager:
             ScheduleExecution.project_id == project_id,
             ScheduleExecution.schedule_job_id == job_id,
         ).order_by(ScheduleExecution.created_at.desc()).limit(20).all()
-        inflight = sum(1 for item in executions if item.status in {"queued", "leased", "dispatching", "retry_wait"})
+        inflight = sum(1 for item in executions if item.status in {"queued", "reserved", "running", "retry_wait"})
         failures = sum(1 for item in executions if item.status in {"failed", "timeout"})
         return {
             "job_id": job.id,
@@ -805,6 +831,12 @@ class ScheduleManager:
             "# HELP chirmera_schedule_inflight_executions Current inflight executions",
             "# TYPE chirmera_schedule_inflight_executions gauge",
             f"chirmera_schedule_inflight_executions {overview['workers']['inflight_executions']}",
+            "# HELP chirmera_schedule_reserved_executions Current reserved executions",
+            "# TYPE chirmera_schedule_reserved_executions gauge",
+            f"chirmera_schedule_reserved_executions {overview['workers']['reserved_executions']}",
+            "# HELP chirmera_schedule_running_executions Current running executions",
+            "# TYPE chirmera_schedule_running_executions gauge",
+            f"chirmera_schedule_running_executions {overview['workers']['running_executions']}",
         ]
         return "\n".join(lines) + "\n"
 

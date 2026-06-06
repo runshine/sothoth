@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Column, DateTime, Index, Integer, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import Boolean, Column, DateTime, Index, Integer, String, Text, UniqueConstraint, create_engine, inspect, text
 from sqlalchemy.dialects.mysql import JSON as MySQLJSON
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.types import JSON
@@ -88,9 +88,13 @@ class ScheduleExecution(Base):
     lease_token = Column(String(255), nullable=True, index=True)
     lease_expire_at = Column(DateTime, nullable=True, index=True)
     heartbeat_at = Column(DateTime, nullable=True)
+    reserved_at = Column(DateTime, nullable=True, index=True)
     worker_pod = Column(String(255), nullable=True)
     target_bucket = Column(String(128), nullable=True, index=True)
     retry_at = Column(DateTime, nullable=True, index=True)
+    capacity_reject_count = Column(Integer, nullable=False, default=0)
+    capacity_reject_reason = Column(String(128), nullable=True)
+    capacity_reject_at = Column(DateTime, nullable=True, index=True)
     result_code = Column(String(64), nullable=True)
     result_reason = Column(Text, nullable=True)
     request_snapshot = Column(JSON().with_variant(MySQLJSON, "mysql"), nullable=False, default=dict)
@@ -182,7 +186,30 @@ def get_session_factory():
 
 
 def init_database():
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(bind=engine)
+    _ensure_schedule_execution_columns(engine)
+
+
+def _ensure_schedule_execution_columns(engine) -> None:
+    inspector = inspect(engine)
+    if ScheduleExecution.__tablename__ not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns(ScheduleExecution.__tablename__)}
+    statements: list[str] = []
+    if "reserved_at" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleExecution.__tablename__} ADD COLUMN reserved_at DATETIME NULL")
+    if "capacity_reject_count" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleExecution.__tablename__} ADD COLUMN capacity_reject_count INTEGER NOT NULL DEFAULT 0")
+    if "capacity_reject_reason" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleExecution.__tablename__} ADD COLUMN capacity_reject_reason VARCHAR(128) NULL")
+    if "capacity_reject_at" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleExecution.__tablename__} ADD COLUMN capacity_reject_at DATETIME NULL")
+    if not statements:
+        return
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
 
 
 def get_db():

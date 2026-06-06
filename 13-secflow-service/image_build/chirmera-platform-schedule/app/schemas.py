@@ -128,9 +128,13 @@ class ScheduleExecutionResponse(BaseModel):
     lease_owner: Optional[str] = None
     lease_expire_at: Optional[datetime] = None
     heartbeat_at: Optional[datetime] = None
+    reserved_at: Optional[datetime] = None
     worker_pod: Optional[str] = None
     target_bucket: Optional[str] = None
     retry_at: Optional[datetime] = None
+    capacity_reject_count: int = 0
+    capacity_reject_reason: Optional[str] = None
+    capacity_reject_at: Optional[datetime] = None
     result_code: Optional[str] = None
     result_reason: Optional[str] = None
     request_snapshot: dict[str, Any]
@@ -175,7 +179,6 @@ class RuntimeOverviewResponse(BaseModel):
     workers: dict[str, Any]
     stats: dict[str, Any]
     redis_available: bool
-    redis_degraded: bool
 
 
 class JobRuntimeResponse(BaseModel):

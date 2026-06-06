@@ -12,6 +12,7 @@ FRONTEND_IMAGE_REPO="${FRONTEND_IMAGE_REPO:-ghcr.io/runshine/secflow-frontend}"
 RESOURCE_IMAGE_REPO="${RESOURCE_IMAGE_REPO:-ghcr.io/runshine/secflow-platform-resource}"
 GATEWAY_WORKER_IMAGE_REPO="${GATEWAY_WORKER_IMAGE_REPO:-ghcr.io/runshine/secflow-platform-resource-file-gateway-worker}"
 FW_UNPACKER_IMAGE_REPO="${FW_UNPACKER_IMAGE_REPO:-ghcr.io/runshine/secflow-app-firmware-unpacker}"
+CHIRMERA_SCHEDULE_IMAGE_REPO="${CHIRMERA_SCHEDULE_IMAGE_REPO:-ghcr.io/runshine/chirmera-platform-schedule}"
 ENTRY_ANALYSE_WORKER_REPLICAS="${ENTRY_ANALYSE_WORKER_REPLICAS:-4}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -38,13 +39,18 @@ SYSTEM_ANALYSE_DEPLOYMENTS=(
 )
 FRONTEND_DEPLOYMENT="secflow-platform-frontend"
 FRONTEND_CONTAINER="secflow-platform-frontend"
+CHIRMERA_SCHEDULE_DEPLOYMENTS=(
+  "chirmera-platform-schedule-api:chirmera-platform-schedule"
+  "chirmera-platform-schedule-scheduler:chirmera-platform-schedule"
+  "chirmera-platform-schedule-worker:chirmera-platform-schedule"
+)
 
 usage() {
   cat <<'HELP'
 Usage:
   ./update_k8s_image_all.sh
   ./update_k8s_image_all.sh [global_tag]
-  ./update_k8s_image_all.sh --tag <tag> [--b2s-image <image_or_tag>] [--binary-evolution-image <image_or_tag>] [--binary-security-image <image_or_tag>] [--entry-analyse-image <image_or_tag>] [--system-analyse-image <image_or_tag>] [--frontend-image <image_or_tag>] [--resource-image <image_or_tag>] [--gateway-worker-image <image_or_tag>] [--firmware-unpacker-image <image_or_tag>]
+  ./update_k8s_image_all.sh --tag <tag> [--b2s-image <image_or_tag>] [--binary-evolution-image <image_or_tag>] [--binary-security-image <image_or_tag>] [--entry-analyse-image <image_or_tag>] [--system-analyse-image <image_or_tag>] [--frontend-image <image_or_tag>] [--resource-image <image_or_tag>] [--gateway-worker-image <image_or_tag>] [--firmware-unpacker-image <image_or_tag>] [--chirmera-schedule-image <image_or_tag>]
 
 Examples:
   ./update_k8s_image_all.sh
@@ -56,6 +62,7 @@ Examples:
   ./update_k8s_image_all.sh --resource-image 20260403
   ./update_k8s_image_all.sh --gateway-worker-image ghcr.io/runshine/secflow-platform-resource-file-gateway-worker:latest
   ./update_k8s_image_all.sh --firmware-unpacker-image 20260428
+  ./update_k8s_image_all.sh --chirmera-schedule-image 20260606
 
 Behavior:
   - No args: update all secflow-* deployments in the namespace to :latest for managed repos.
@@ -73,6 +80,7 @@ Behavior:
   - resource image: override secflow-platform-resource image.
   - gateway-worker image: update file_gateway.worker_image in resource ConfigMap template vars.
   - firmware-unpacker image: override secflow-app-firmware-unpacker image.
+  - chirmera-schedule image: override chirmera-platform-schedule api/scheduler/worker image.
   - ENTRY_ANALYSE_WORKER_REPLICAS env: desired entry-analyse worker replicas, default 4.
   - Non-secflow deployments and third-party sidecars are skipped.
 HELP
@@ -176,6 +184,7 @@ FRONTEND_IMAGE_ARG=""
 RESOURCE_IMAGE_ARG=""
 GATEWAY_WORKER_IMAGE_ARG=""
 FW_UNPACKER_IMAGE_ARG=""
+CHIRMERA_SCHEDULE_IMAGE_ARG=""
 GLOBAL_TAG_ARG=""
 
 while [[ $# -gt 0 ]]; do
@@ -224,6 +233,10 @@ while [[ $# -gt 0 ]]; do
       FW_UNPACKER_IMAGE_ARG="${2:-}"
       shift 2
       ;;
+    --chirmera-schedule-image)
+      CHIRMERA_SCHEDULE_IMAGE_ARG="${2:-}"
+      shift 2
+      ;;
     *)
       if [[ -z "${GLOBAL_TAG_ARG}" ]]; then
         GLOBAL_TAG_ARG="$1"
@@ -247,10 +260,15 @@ FRONTEND_IMAGE="$(resolve_image "${FRONTEND_IMAGE_ARG}" "${FRONTEND_IMAGE_REPO}"
 RESOURCE_IMAGE="$(resolve_image "${RESOURCE_IMAGE_ARG}" "${RESOURCE_IMAGE_REPO}")"
 GATEWAY_WORKER_IMAGE="$(resolve_image "${GATEWAY_WORKER_IMAGE_ARG}" "${GATEWAY_WORKER_IMAGE_REPO}")"
 FW_UNPACKER_IMAGE="$(resolve_image "${FW_UNPACKER_IMAGE_ARG}" "${FW_UNPACKER_IMAGE_REPO}")"
+CHIRMERA_SCHEDULE_IMAGE="$(resolve_image "${CHIRMERA_SCHEDULE_IMAGE_ARG}" "${CHIRMERA_SCHEDULE_IMAGE_REPO}")"
 
 if [[ -f "${SCRIPT_DIR}/images.env" ]]; then
   # shellcheck disable=SC1091
   source "${SCRIPT_DIR}/images.env"
+fi
+
+if [[ -n "${CHIRMERA_SCHEDULE_IMAGE}" ]]; then
+  export CHIRMERA_PLATFORM_SCHEDULE_IMAGE="${CHIRMERA_SCHEDULE_IMAGE}"
 fi
 
 if [[ -n "${RESOURCE_IMAGE}" || -n "${GATEWAY_WORKER_IMAGE}" ]]; then
@@ -292,6 +310,9 @@ maybe_set_explicit_image "${BIN_EVOLUTION_WORKER_DEPLOYMENT}" "${BIN_EVOLUTION_W
 maybe_set_explicit_image "secflow-app-firmware-unpacker-api" "secflow-app-firmware-unpacker" "${FW_UNPACKER_IMAGE}"
 maybe_set_explicit_image "secflow-app-firmware-unpacker-dispatcher" "secflow-app-firmware-unpacker" "${FW_UNPACKER_IMAGE}"
 maybe_set_explicit_image "secflow-app-firmware-unpacker-cleanup" "secflow-app-firmware-unpacker" "${FW_UNPACKER_IMAGE}"
+for pair in "${CHIRMERA_SCHEDULE_DEPLOYMENTS[@]}"; do
+  maybe_set_explicit_image "${pair%%:*}" "${pair##*:}" "${CHIRMERA_SCHEDULE_IMAGE}"
+done
 
 echo "[INFO] Scanning workloads in namespace: ${NAMESPACE}"
 while IFS=$'\t' read -r workload_kind workload_name containers; do
@@ -332,6 +353,9 @@ while IFS=$'\t' read -r workload_kind workload_name containers; do
       "secflow-app-firmware-unpacker-api:secflow-app-firmware-unpacker"|"secflow-app-firmware-unpacker-dispatcher:secflow-app-firmware-unpacker"|"secflow-app-firmware-unpacker-cleanup:secflow-app-firmware-unpacker")
         [[ -n "${FW_UNPACKER_IMAGE}" ]] && requested_tag="${FW_UNPACKER_IMAGE}"
         ;;
+      "chirmera-platform-schedule-api:chirmera-platform-schedule"|"chirmera-platform-schedule-scheduler:chirmera-platform-schedule"|"chirmera-platform-schedule-worker:chirmera-platform-schedule")
+        [[ -n "${CHIRMERA_SCHEDULE_IMAGE}" ]] && requested_tag="${CHIRMERA_SCHEDULE_IMAGE}"
+        ;;
     esac
     update_workload_container "${workload_kind}" "${workload_name}" "${container}" "${current_image}" "${requested_tag}"
   done
@@ -352,7 +376,7 @@ done < <(
   {
     kubectl -n "${NAMESPACE}" get deploy -o jsonpath='{range .items[*]}{"deployment"}{"\t"}{.metadata.name}{"\n"}{end}'
     kubectl -n "${NAMESPACE}" get sts -o jsonpath='{range .items[*]}{"statefulset"}{"\t"}{.metadata.name}{"\n"}{end}'
-  } | grep $'^.*\tsecflow-'
+  } | grep -E $'^.*\t(secflow-|chirmera-platform-schedule-)'
 )
 
 echo "[INFO] Waiting for secflow workloads to finish rollout"
@@ -363,7 +387,7 @@ done < <(
   {
     kubectl -n "${NAMESPACE}" get deploy -o jsonpath='{range .items[*]}{"deployment"}{"\t"}{.metadata.name}{"\n"}{end}'
     kubectl -n "${NAMESPACE}" get sts -o jsonpath='{range .items[*]}{"statefulset"}{"\t"}{.metadata.name}{"\n"}{end}'
-  } | grep $'^.*\tsecflow-'
+  } | grep -E $'^.*\t(secflow-|chirmera-platform-schedule-)'
 )
 
 echo "[INFO] Done"
