@@ -5960,6 +5960,9 @@ class TaskManager:
             item_downstream_task_id = item.downstream_task_id
             before_status = item.status
             observed_apply_state = bool(apply_state)
+            sync_observed_at = _now()
+            if force:
+                observed_apply_state = True
             try:
                 if exc is not None:
                     raise exc
@@ -5984,6 +5987,7 @@ class TaskManager:
                             item=item,
                             change_source="downstream_sync",
                             sync_status="binding_mismatch",
+                            synced_at=sync_observed_at,
                             error_message="下游子任务仍绑定旧轮次阶段项",
                             error_type="parent_mismatch",
                             state_applied=False,
@@ -6014,6 +6018,7 @@ class TaskManager:
                         item=item,
                         change_source="downstream_sync",
                         sync_status="skipped",
+                        synced_at=sync_observed_at,
                         status_raw=downstream_status or None,
                         mapped_status=None,
                         downstream_status=downstream_status or None,
@@ -6058,7 +6063,11 @@ class TaskManager:
                     mapped_status = current_item_status
                     downstream_status = current_item_status
                 if terminal_status:
-                    observed_error_message = payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message
+                    observed_error_message = (
+                        payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message
+                        if mapped_status in {"failed", "cancelled", "downstream_missing"}
+                        else None
+                    )
                     self_healing_failure = self._is_self_healing_downstream_failure_observation(
                         mapped_status=mapped_status,
                         downstream_status=downstream_status,
@@ -6073,6 +6082,7 @@ class TaskManager:
                             item=item,
                             change_source="downstream_sync",
                             sync_status="observed",
+                            synced_at=sync_observed_at,
                             error_message=observed_error_message,
                             status_raw=downstream_status,
                             mapped_status=mapped_status,
@@ -6116,6 +6126,7 @@ class TaskManager:
                                 item=item,
                                 change_source="downstream_sync",
                                 sync_status="binding_missing_during_recreate",
+                                synced_at=sync_observed_at,
                                 error_message="旧下游绑定在重建期间已失效，本次仅记录观测",
                                 status_raw=downstream_status,
                                 mapped_status="downstream_missing",
@@ -6185,11 +6196,13 @@ class TaskManager:
                                         mapped_status=mapped_status,
                                         downstream_payload=payload,
                                         error_message="下游子任务不存在",
+                                        synced_at=sync_observed_at,
                                     ),
                                     self._reconcile_stage_and_task_state_after_item_update(db, task, item.stage_name),
                                     self._mark_stage_item_sync_observation(
                                         item,
                                         sync_status="synced",
+                                        synced_at=sync_observed_at,
                                         status_raw=downstream_status,
                                         mapped_status=mapped_status,
                                         downstream_status=downstream_status,
@@ -6208,6 +6221,7 @@ class TaskManager:
                                 item=item,
                                 change_source="downstream_sync",
                                 sync_status="skipped",
+                                synced_at=sync_observed_at,
                                 status_raw=downstream_status,
                                 mapped_status=mapped_status,
                                 downstream_status=downstream_status,
@@ -6277,11 +6291,13 @@ class TaskManager:
                                         mapped_status=mapped_status,
                                         downstream_payload=payload,
                                         error_message=error_message,
+                                        synced_at=sync_observed_at,
                                     ),
                                     self._reconcile_stage_and_task_state_after_item_update(db, task, item.stage_name),
                                     self._mark_stage_item_sync_observation(
                                         item,
                                         sync_status="synced",
+                                        synced_at=sync_observed_at,
                                         error_message=error_message,
                                         status_raw=downstream_status,
                                         mapped_status=mapped_status,
@@ -6301,6 +6317,7 @@ class TaskManager:
                                 item=item,
                                 change_source="downstream_sync",
                                 sync_status="skipped",
+                                synced_at=sync_observed_at,
                                 error_message=error_message,
                                 status_raw=downstream_status,
                                 mapped_status=mapped_status,
@@ -6370,6 +6387,7 @@ class TaskManager:
                                 item=refreshed_item,
                                 change_source="downstream_sync",
                                 sync_status="synced",
+                                synced_at=sync_observed_at,
                                 status_raw=downstream_status,
                                 mapped_status=mapped_status,
                                 downstream_status=downstream_status,
@@ -6387,6 +6405,7 @@ class TaskManager:
                             item=item,
                             change_source="downstream_sync",
                             sync_status="skipped",
+                            synced_at=sync_observed_at,
                             status_raw=downstream_status,
                             mapped_status=mapped_status,
                             downstream_status=downstream_status,
@@ -6426,6 +6445,7 @@ class TaskManager:
                             item=item,
                             change_source="downstream_sync",
                             sync_status="skipped",
+                            synced_at=sync_observed_at,
                             status_raw=downstream_status,
                             mapped_status=mapped_status,
                             downstream_status=downstream_status,
@@ -6500,11 +6520,13 @@ class TaskManager:
                                 mapped_status=mapped_status,
                                 downstream_payload=payload,
                                 error_message=apply_error_message,
+                                synced_at=sync_observed_at,
                             ),
                             self._reconcile_stage_and_task_state_after_item_update(db, task, item.stage_name),
                             self._mark_stage_item_sync_observation(
                                 item,
                                 sync_status="synced",
+                                synced_at=sync_observed_at,
                                 error_message=apply_error_message,
                                 status_raw=downstream_status,
                                 mapped_status=mapped_status,
@@ -6524,6 +6546,7 @@ class TaskManager:
                         item=item,
                         change_source="downstream_sync",
                         sync_status="skipped",
+                        synced_at=sync_observed_at,
                         status_raw=downstream_status,
                         mapped_status=mapped_status,
                         downstream_status=downstream_status,
@@ -10475,6 +10498,7 @@ class TaskManager:
         mapped_status: str,
         downstream_payload: dict[str, Any] | None,
         error_message: str | None,
+        synced_at: datetime | None = None,
     ) -> None:
         self._apply_child_task_status_change(
             None,
@@ -10489,6 +10513,7 @@ class TaskManager:
             downstream_status=self._string_or_none((downstream_payload or {}).get("status")),
             state_applied=True,
             error_message=error_message,
+            synced_at=synced_at,
         )
 
     def _should_apply_downstream_intermediate_status(
@@ -15570,7 +15595,8 @@ class TaskManager:
         downstream_status: str | None = None,
         state_applied: bool | None = None,
     ) -> bool:
-        del synced_at
+        if synced_at is not None:
+            return True
         current_result = dict(item.result or {})
         current_observation = dict(current_result.get("sync_observation") or {})
         current_sync_status = self._string_or_none(current_result.get("sync_status"))
@@ -15637,7 +15663,7 @@ class TaskManager:
             and (change_source == "transport_error" or sync_status == "transport_error")
         )
         item.error_message = error_message if keep_active_error else (
-            None if normalized_status in {"pending", "queued", "dispatching", "running", "success"} else error_message
+            None if normalized_status in {"pending", "queued", "dispatching", "running", "success", "partial_success"} else error_message
         )
         if normalized_status in {"running", "success", "failed", "cancelled", "downstream_missing", "partial_success"}:
             item.started_at = item.started_at or _now()
@@ -20841,13 +20867,19 @@ class TaskManager:
     ) -> bool:
         if not mapped_status or not current_item_status or current_item_status == mapped_status:
             return False
-        if item.stage_name != "vuln_scan":
-            return True
         replacement_state = self._replacement_in_progress_state(item)
         if replacement_state["replacement_in_progress"] or replacement_state["binding_cleared"] or replacement_state["verification_status"] == "pending":
-            return False
+            return item.stage_name != "vuln_scan"
         observed_task_id = str(payload.get("task_id") or payload.get("id") or "").strip() or None
         current_task_id = str(item.downstream_task_id or "").strip() or None
+        if item.stage_name != "vuln_scan":
+            if not observed_task_id or not current_task_id:
+                return True
+            if observed_task_id != current_task_id:
+                return True
+            if mapped_status in {"success", "partial_success"}:
+                return False
+            return True
         if observed_task_id and current_task_id and observed_task_id != current_task_id:
             return False
         return True

@@ -12854,6 +12854,107 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("running", item.result.get("sync_observation", {}).get("mapped_status"))
         self.assertFalse(bool(item.result.get("sync_observation", {}).get("state_applied")))
 
+    def test_sync_downstream_status_allows_same_child_success_to_repair_terminal_failure(self):
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            item_key="fw1",
+            parent_key="fw1",
+            status="failed",
+            downstream_service="binary_to_source",
+            downstream_task_id="b2s_1",
+        )
+
+        preserve = self.manager._should_preserve_terminal_status(
+            item,
+            mapped_status="success",
+            current_item_status="failed",
+            payload={"id": "b2s_1", "status": "completed"},
+        )
+
+        self.assertFalse(preserve)
+
+    def test_sync_downstream_status_preserves_terminal_failure_for_different_child(self):
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            item_key="fw1",
+            parent_key="fw1",
+            status="failed",
+            downstream_service="binary_to_source",
+            downstream_task_id="b2s_current",
+        )
+
+        preserve = self.manager._should_preserve_terminal_status(
+            item,
+            mapped_status="success",
+            current_item_status="failed",
+            payload={"id": "b2s_old", "status": "completed"},
+        )
+
+        self.assertTrue(preserve)
+
+    def test_sync_observation_success_refreshes_attempt_and_clears_old_error(self):
+        old_attempt = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        observed_at = old_attempt + timedelta(minutes=5)
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            item_key="fw1",
+            parent_key="fw1",
+            status="failed",
+            downstream_service="binary_to_source",
+            downstream_task_id="b2s_1",
+            error_message="old 500",
+            result={
+                "sync_status": "skipped",
+                "last_sync_attempt_at": old_attempt.isoformat(),
+                "last_sync_error_at": old_attempt.isoformat(),
+                "last_sync_error_message": "old 500",
+                "sync_observation": {
+                    "last_attempt_at": old_attempt.isoformat(),
+                    "last_error_at": old_attempt.isoformat(),
+                    "error_message": "old 500",
+                    "error_type": "http_5xx",
+                    "http_status": 500,
+                    "last_result": "error",
+                    "consecutive_error_count": 1,
+                    "budget_exhausted": True,
+                },
+            },
+        )
+
+        self.manager._apply_child_task_sync_observation(
+            item,
+            sync_status="skipped",
+            synced_at=observed_at,
+            error_message=None,
+            http_status=None,
+            error_type=None,
+            downstream_status_raw="completed",
+            downstream_status_mapped="success",
+            downstream_status="completed",
+            state_applied=False,
+        )
+
+        observation = item.result.get("sync_observation", {})
+        self.assertEqual(observed_at.isoformat(), item.result.get("last_sync_attempt_at"))
+        self.assertEqual("success", item.result.get("last_sync_result"))
+        self.assertIsNone(item.result.get("last_sync_error_at"))
+        self.assertIsNone(item.result.get("last_sync_error_message"))
+        self.assertIsNone(observation.get("last_error_at"))
+        self.assertIsNone(observation.get("error_message"))
+        self.assertIsNone(observation.get("error_type"))
+        self.assertIsNone(observation.get("http_status"))
+        self.assertEqual(0, observation.get("consecutive_error_count"))
+        self.assertFalse(observation.get("budget_exhausted"))
+
     def test_sync_downstream_status_running_revives_failed_active_stage_task(self):
         task = BinarySecurityTask(
             id="s1",

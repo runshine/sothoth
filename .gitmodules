@@ -23,3 +23,6 @@
 [submodule "13-secflow-service/image_build/secflow-app-dataflow-vuln-scan"]
 	path = 13-secflow-service/image_build/secflow-app-dataflow-vuln-scan
 	url = https://github.com/ict-bin/dataflow_vuln_scan.git
+[submodule "101-Chimera-deploy"]
+	path = 101-Chimera-deploy
+	url = https://github.com/GaiaSecHW/Chimera-deploy.git
