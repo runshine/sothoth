@@ -1,0 +1,73 @@
+database:
+  host: "secflow-platform-mysql"
+  port: 3306
+  username: "root"
+  password: ""
+  name: "secflow"
+  table_prefix: "secflow_chirmera_platform_schedule_"
+
+auth_service:
+  host: "secflow-platform-auth"
+  port: 80
+  validate_token_path: "/api/auth/validate-token"
+  service_machine_token: ""
+
+project_service:
+  base_url: "http://secflow-platform-project"
+  get_project_path: "/api/project/projects"
+
+registry:
+  enabled: true
+  service_id: "chirmera-platform-schedule"
+  service_name: "Chirmera 平台调度服务"
+  host: "chirmera-platform-schedule"
+  port: 80
+  api_prefix: "/api/chirmera-platform-schedule"
+
+scheduler:
+  enabled: true
+  poll_interval_seconds: 15
+  batch_size: 20
+  execution_timeout_seconds: 120
+  max_dispatch_workers: 4
+  leader_lease_seconds: 15
+  leader_renew_seconds: 5
+  reclaim_interval_seconds: 15
+  delay_promote_batch_size: 50
+
+redis:
+  enabled: true
+  url: "redis://ecflow-platform-redis:6379/0"
+  key_prefix: "chirmera:schedule"
+  socket_timeout_seconds: 5
+
+runtime:
+  role: "all"
+
+worker:
+  concurrency: 32
+  prefetch: 1
+  lease_seconds: 45
+  heartbeat_seconds: 10
+  drain_timeout_seconds: 60
+  idle_sleep_seconds: 0.5
+
+limits:
+  project_default_concurrency: 16
+  target_default_concurrency: 8
+  queue_requeue_delay_seconds: 10
+
+retry:
+  default_max_attempts: 3
+  default_initial_delay_seconds: 10
+  default_max_delay_seconds: 300
+
+litellm:
+  api_base: "http://litellm:4000"
+  admin_key: ""
+  create_key_path: "/key/generate"
+  list_key_path: "/key/list"
+  disable_key_path: "/key/delete"
+  get_key_path: "/key/info"
+  default_duration: "30d"
+  verify_tls: true
