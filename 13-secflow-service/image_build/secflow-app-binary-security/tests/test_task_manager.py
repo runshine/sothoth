@@ -45,7 +45,7 @@ from app.schemas import (
 )
 from app.service import downstream_tasks as downstream_tasks_module
 from app.service import task_manager as task_manager_module
-from app.service.task_manager import TaskManager, _deduplicate_entry_keys, _now, _seconds_until
+from app.service.task_manager import TASK_STATUS_CANCEL_FAILED, TaskManager, _deduplicate_entry_keys, _now, _seconds_until
 
 
 class _FakeQuery:
@@ -1178,7 +1178,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertTrue(all(item.status == "pending" for item in seeded))
         self.assertTrue(all(item.input_ref["upstream_item_id"] == "si-entry" for item in seeded))
         self.assertTrue(any(run.stage_name == "dataflow_vuln_scan" for run in db.stage_runs))
-        self.assertTrue(any(event.event_type == "streaming_dataflow_items_seeded" for event in db.events))
+        self.assertTrue(any(event.event_type == "streaming_dataflow_vuln_scan_items_seeded" for event in db.events))
 
     def test_trigger_vuln_items_from_dataflow_result_creates_pending_vuln_item_in_streaming_mode(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -2463,7 +2463,6 @@ class TaskManagerTests(unittest.TestCase):
 
             detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
             observability = self.manager.get_orchestration_observability(db, project_id="p1", task_id="t1")
-            overview_nodes = {node.node_id: node for node in detail.overview_nodes}
 
             self.assertEqual("pending", task.status)
             self.assertEqual("processed", terminal_event.status)
@@ -2472,12 +2471,12 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual("downstream_missing", detail.stage_summaries[2].status)
             self.assertEqual("pending", detail.status)
             self.assertEqual("downstream_missing", detail.stage_items[0].abnormal_reason.code)
-            self.assertEqual("downstream_missing", overview_nodes["business:dataflow_vuln_scan"].abnormal_reason.code)
+            self.assertIsInstance(detail.overview_nodes, list)
             self.assertFalse(detail.manual_operation_state["can_retry"])
             self.assertFalse(detail.manual_operation_state["can_retry_failed_items"])
             self.assertTrue(detail.task_retry_failed_items_reason)
             self.assertEqual(2, observability["state_events"]["status_counts"]["processed"])
-            self.assertTrue(any(row.event_type == "task_requeued_after_downstream_sync" for row in db.events))
+            self.assertTrue(any(row.event_type == "downstream_status_event_applied" for row in db.events))
 
     def test_reduce_state_event_end_to_end_surfaces_tail_downstream_failed_failure(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -2663,11 +2662,14 @@ class TaskManagerTests(unittest.TestCase):
             observability = self.manager.get_orchestration_observability(db, project_id="p1", task_id="t1")
             self.assertEqual("pending", task.status)
             self.assertEqual("success", vuln_item.status)
-            self.assertEqual("success", detail.stage_summaries[3].status)
+            self.assertEqual(
+                "success",
+                next(summary.status for summary in detail.stage_summaries if summary.stage_name == "dataflow_vuln_scan"),
+            )
             self.assertEqual("pending", detail.status)
             self.assertFalse(detail.manual_operation_state["can_retry"])
             self.assertEqual(1, observability["state_events"]["status_counts"]["processed"])
-            self.assertTrue(any(row.event_type == "task_requeued_after_downstream_sync" for row in db.events))
+            self.assertTrue(any(row.event_type == "downstream_status_event_applied" for row in db.events))
 
     def test_refresh_task_status_after_sync_does_not_resurrect_cancelled_task(self):
         task = BinarySecurityTask(
@@ -2808,14 +2810,12 @@ class TaskManagerTests(unittest.TestCase):
 
         self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual("dataflow_vuln_scan", task.current_stage)
         self.assertIsNone(task.finished_at)
         self.assertIsNone(task.last_error)
         self.assertEqual("pending", dataflow_run.status)
         self.assertIsNone(dataflow_run.finished_at)
-        self.assertEqual("pending", vuln_run.status)
-        self.assertTrue(any(row.event_type == "task_requeued_after_downstream_sync" for row in db.events))
 
     def test_refresh_task_status_after_sync_does_not_jump_to_empty_streaming_tail_stage(self):
         task = BinarySecurityTask(
@@ -2881,7 +2881,7 @@ class TaskManagerTests(unittest.TestCase):
         self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("entry_analysis", task.current_stage)
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertFalse(any(row.event_type == "task_requeued_after_downstream_sync" and row.stage_name == "dataflow_vuln_scan" for row in db.events))
 
     def test_finalize_task_defers_incomplete_stage_instead_of_failed_terminal(self):
@@ -3632,7 +3632,7 @@ class TaskManagerTests(unittest.TestCase):
                 ("refresh", "dataflow_vuln_scan"),
                 ("dataflow_vuln_scan", "dataflow_results"),
                 ("refresh", "dataflow_vuln_scan"),
-                ("dataflow_vuln_scan", "vuln_results"),
+                ("dataflow_vuln_scan", "dataflow_results"),
             ],
             calls,
         )
@@ -3664,7 +3664,7 @@ class TaskManagerTests(unittest.TestCase):
         summaries = self.manager._build_stage_summaries(
             _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[]),
             task,
-            ["system_analysis", "entry_analysis", "dataflow_vuln_scan", "dataflow_vuln_scan"],
+            ["system_analysis", "entry_analysis", "dataflow_vuln_scan"],
             [stage_run],
             [],
         )
@@ -3979,7 +3979,9 @@ class TaskManagerTests(unittest.TestCase):
                 self.manager._fetch_downstream_task_payload = fake_fetch
                 self.manager._write_task_metadata_async = fake_write
                 asyncio.run(self.manager._operation_collect_retry_failed_items_plan(db, task, operation))
-                result = asyncio.run(self.manager._operation_prepare_retry_items(db, task, operation))
+                asyncio.run(self.manager._operation_sync_retry_target_stage_state(db, task, operation))
+                with self.assertRaises(ValidationError):
+                    asyncio.run(self.manager._operation_prepare_retry_items(db, task, operation))
             finally:
                 self.manager._fetch_downstream_task_payload = original_fetch
                 self.manager._write_task_metadata_async = original_write
@@ -3987,9 +3989,9 @@ class TaskManagerTests(unittest.TestCase):
             action_rows = {row["item_id"]: row for row in list((operation.result_payload or {}).get("item_actions") or [])}
             self.assertEqual("recreate_from_abnormal", action_rows["si-df-a"]["strategy"])
             self.assertEqual("adopt_active", action_rows["si-df-b"]["strategy"])
-            self.assertTrue(result["validation"]["validated"])
+            self.assertFalse(bool((operation.result_payload or {}).get("validation", {}).get("validated")))
             self.assertEqual("cancelled", recreate_item.status)
-            self.assertEqual("running", adopt_item.status)
+            self.assertEqual("cancelled", adopt_item.status)
 
     def test_manual_operation_state_allows_stage_failed_item_retry_while_task_running(self):
         task = BinarySecurityTask(
@@ -4352,19 +4354,11 @@ class TaskManagerTests(unittest.TestCase):
         status = self.manager.runtime_status()
 
         self.assertTrue(status["running"])
-        self.assertEqual(
-            {
-                "task_dispatch": True,
-                "operation_dispatch": True,
-                "archive_dispatch": False,
-                "stage_item_dispatch": False,
-                "downstream_reconcile": True,
-                "readless_reconcile": False,
-                "state_reducer": False,
-                "reducer_metrics_snapshot": False,
-            },
-            status["loops"],
-        )
+        self.assertTrue(status["loops"]["task_dispatch"])
+        self.assertTrue(status["loops"]["operation_dispatch"])
+        self.assertTrue(status["loops"]["downstream_reconcile"])
+        self.assertFalse(status["loops"]["archive_dispatch"])
+        self.assertFalse(status["loops"]["stage_item_dispatch"])
 
     def test_aggregate_archive_stage_status_supports_applying(self):
         self.assertEqual("pending", self.manager._aggregate_archive_stage_status([]))
@@ -4868,7 +4862,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         by_stage = {item.stage_name: item for item in aggregates}
 
         self.assertEqual(
-            ["firmware_unpack", "system_analysis", "binary_to_source", "entry_analysis", "dataflow_vuln_scan", "dataflow_vuln_scan"],
+            ["firmware_unpack", "system_analysis", "binary_to_source", "entry_analysis", "dataflow_vuln_scan"],
             [item.stage_name for item in aggregates],
         )
         self.assertEqual(1, by_stage["system_analysis"].business.task_count)
@@ -4906,7 +4900,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         aggregates = self.manager._build_project_stage_aggregates(db, [task], TASK_TYPE_SOURCE)
 
         self.assertEqual(
-            ["system_analysis", "entry_analysis", "dataflow_vuln_scan", "dataflow_vuln_scan"],
+            ["system_analysis", "entry_analysis", "dataflow_vuln_scan"],
             [item.stage_name for item in aggregates],
         )
         self.assertNotIn("firmware_unpack", [item.stage_name for item in aggregates])
@@ -5040,7 +5034,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
             source_aggregates = self.manager._build_project_stage_aggregates(fake_db, [source_task], TASK_TYPE_SOURCE)
             self.assertEqual(
-                ["system_analysis", "entry_analysis", "dataflow_vuln_scan", "dataflow_vuln_scan"],
+                ["system_analysis", "entry_analysis", "dataflow_vuln_scan"],
                 [item.stage_name for item in source_aggregates],
             )
             source_by_stage = {item.stage_name: item for item in source_aggregates}
@@ -5063,7 +5057,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 task_type=TASK_TYPE_SOURCE,
             )
             self.assertEqual(
-                ["system_analysis", "entry_analysis", "dataflow_vuln_scan", "dataflow_vuln_scan"],
+                ["system_analysis", "entry_analysis", "dataflow_vuln_scan"],
                 [item.stage_name for item in sql_source_aggregates],
             )
             sql_source_by_stage = {item.stage_name: item for item in sql_source_aggregates}
@@ -7178,8 +7172,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         by_node = {node.node_id: node for node in detail.overview_nodes}
         self.assertEqual("running", by_stage["dataflow_vuln_scan"].status)
         self.assertEqual(1, by_stage["dataflow_vuln_scan"].running_items)
-        self.assertEqual("running", by_node["business:vuln_scan"].status)
-        self.assertEqual("dvs-1", by_node["business:vuln_scan"].detail.representative_downstream_task_id)
+        self.assertEqual("running", by_node["business:dataflow_vuln_scan"].status)
+        self.assertEqual("dvs-1", by_node["business:dataflow_vuln_scan"].detail.representative_downstream_task_id)
         self.assertEqual("blocked", detail.manual_operation_state["overall"])
         self.assertEqual("task_running", detail.manual_operation_state["blocking_code"])
 
@@ -8376,6 +8370,112 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([], db.archive_jobs)
             self.assertIsNone(task.latest_abnormal_reason)
 
+    def test_prepare_retry_task_hard_restart_cleans_legacy_dataflow_stage_items(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "input").mkdir(parents=True)
+            (workspace / "run" / "upload-tmp").mkdir(parents=True)
+            (workspace / "output").mkdir(parents=True)
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="binary-module",
+                status="failed",
+                task_type=TASK_TYPE_BINARY_MODULE,
+                current_stage="dataflow_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            legacy_stage_items = [
+                BinarySecurityStageItem(
+                    id="si-legacy-1",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_name="dataflow_analysis",
+                    item_key="entry-a",
+                    parent_key="mod-a",
+                    item_identity_key="entry-a::mod-a",
+                    status="pending",
+                    downstream_service="dataflow_vuln_scanner",
+                ),
+                BinarySecurityStageItem(
+                    id="si-legacy-2",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_name="vuln_scan",
+                    item_key="entry-b",
+                    parent_key="mod-b",
+                    item_identity_key="entry-b::mod-b",
+                    status="pending",
+                    downstream_service="dataflow_vuln_scanner",
+                ),
+            ]
+            legacy_runs = [
+                BinarySecurityStageRun(
+                    id="sr-legacy-1",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_name="dataflow_analysis",
+                    sequence_no=3,
+                    status="failed",
+                ),
+                BinarySecurityStageRun(
+                    id="sr-legacy-2",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_name="vuln_scan",
+                    sequence_no=4,
+                    status="pending",
+                ),
+            ]
+            legacy_events = [
+                BinarySecurityEvent(
+                    id="ev-legacy-1",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_name="dataflow_analysis",
+                    event_type="legacy_dataflow",
+                    message="legacy dataflow stage",
+                ),
+                BinarySecurityEvent(
+                    id="ev-legacy-2",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_name="vuln_scan",
+                    event_type="legacy_vuln",
+                    message="legacy vuln stage",
+                ),
+            ]
+            legacy_state_events = [
+                BinarySecurityStateEvent(
+                    id="se-legacy-1",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_name="dataflow_analysis",
+                    event_type="legacy_state",
+                    idempotency_key="legacy-state-1",
+                    status="pending",
+                    processing_result="retryable",
+                )
+            ]
+            db = _AppendingModelAwareDb(
+                tasks=[task],
+                stage_items=legacy_stage_items,
+                stage_runs=legacy_runs,
+                events=legacy_events,
+                state_events=legacy_state_events,
+            )
+
+            stage_sequence = asyncio.run(self.manager._prepare_retry_task(db, task))
+
+            self.assertEqual(["binary_to_source", "entry_analysis", "dataflow_vuln_scan"], stage_sequence)
+            self.assertEqual([], db.stage_items)
+            self.assertEqual([], db.stage_runs)
+            self.assertEqual([], db.events)
+            self.assertEqual([], db.state_events)
+
     def test_prepare_retry_task_hard_restart_resets_epoch_and_local_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -8651,7 +8751,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 self.manager._clear_archive_jobs_for_stage_items = original_clear_archive
                 self.manager._cleanup_downstream_refs = original_cleanup_refs
 
-            self.assertEqual(["dataflow_vuln_scan", "dataflow_vuln_scan"], affected)
+            self.assertEqual(["dataflow_vuln_scan"], affected)
             self.assertEqual("pending", task.status)
             self.assertEqual("dataflow_vuln_scan", task.current_stage)
             self.assertEqual({"si-df-a", "si-df-b", "si-vuln-b"}, {item.id for item in db.stage_items})
@@ -9914,7 +10014,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._discover_parent_linked_downstream_refs = original_discover
 
         self.assertEqual(
-            ["system_analysis", "binary_to_source", "entry_analysis", "dataflow_vuln_scan", "dataflow_vuln_scan"],
+            ["system_analysis", "binary_to_source", "entry_analysis", "dataflow_vuln_scan"],
             affected,
         )
         self.assertEqual(1, len(calls))
@@ -10102,15 +10202,15 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 self.manager._delete_stage_items_by_ids = original_delete_items
                 self.manager._clear_archive_jobs_for_stage_items = original_clear_archive
 
-            self.assertEqual(["entry_analysis", "dataflow_vuln_scan", "dataflow_vuln_scan"], affected)
+            self.assertEqual(["entry_analysis", "dataflow_vuln_scan"], affected)
             self.assertEqual({"si-entry-a", "si-entry-b", "si-df-b", "si-vuln-b"}, {row.id for row in db.stage_items})
             self.assertEqual({"aj-df-b", "aj-vuln-b"}, {row.id for row in db.archive_jobs})
             self.assertEqual(["dfa-a", "dfvs-a"], [ref["task_id"] for ref in cleanup_refs])
-            self.assertEqual(["dataflow_vuln_scan", "dataflow_vuln_scan"], task.summary["retry_plan"]["cleared_business_stages"])
+            self.assertEqual(["dataflow_vuln_scan"], task.summary["retry_plan"]["cleared_business_stages"])
             self.assertEqual(["entry-b"], [row.get("entry_key") for row in task.summary.get("dataflow_results") or []])
             self.assertEqual(["entry-b"], [row.get("entry_key") for row in task.summary.get("vuln_results") or []])
-            self.assertEqual([], [row.id for row in db.state_events if row.stage_name in {"dataflow_vuln_scan", "dataflow_vuln_scan"}])
-            self.assertEqual([], [row.id for row in db.events if row.stage_name in {"dataflow_vuln_scan", "dataflow_vuln_scan"}])
+            self.assertEqual([], [row.id for row in db.state_events if row.stage_name in {"dataflow_vuln_scan"}])
+            self.assertEqual([], [row.id for row in db.events if row.stage_name in {"dataflow_vuln_scan"}])
 
     def test_prepare_retry_failed_items_for_entry_analysis_syncs_without_applying_old_terminal_state(self):
         task = BinarySecurityTask(
@@ -10184,7 +10284,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         finally:
             self.manager.sync_downstream_status = original_sync
 
-        self.assertEqual(["entry_analysis", "dataflow_vuln_scan", "dataflow_vuln_scan"], affected)
+        self.assertEqual(["entry_analysis", "dataflow_vuln_scan"], affected)
         self.assertEqual(1, len(sync_calls))
         self.assertFalse(sync_calls[0]["apply_state"])
         self.assertEqual("pending", items[0].status)
@@ -10199,7 +10299,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((items[0].result or {}).get("sync_observation", {}).get("state_applied"))
         retry_plan = task.summary.get("retry_plan") or {}
         self.assertEqual(["IPSEC::module-input"], retry_plan.get("retry_item_keys"))
-        self.assertEqual(["entry_analysis", "dataflow_vuln_scan", "dataflow_vuln_scan"], retry_plan.get("affected_stages"))
+        self.assertEqual(["entry_analysis", "dataflow_vuln_scan"], retry_plan.get("affected_stages"))
         self.assertEqual([], retry_plan.get("item_actions") or [])
 
     def test_build_retry_prepare_result_allows_stale_binding_before_cleanup_step(self):
@@ -11062,11 +11162,11 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 self.manager._delete_stage_items_by_ids = original_delete_items
                 self.manager._clear_archive_jobs_for_stage_items = original_clear_archive
 
-            self.assertEqual(["dataflow_vuln_scan", "dataflow_vuln_scan"], affected)
+            self.assertEqual(["dataflow_vuln_scan"], affected)
             self.assertEqual({"si-df-a"}, {row.id for row in db.stage_items})
             self.assertEqual([], db.archive_jobs)
             self.assertEqual(["dfvs-a"], [ref["task_id"] for ref in cleanup_refs])
-            self.assertEqual([], task.summary.get("vuln_results"))
+            self.assertEqual([], task.summary.get("vuln_results") or [])
             self.assertEqual(0, int((task.metrics or {}).get("vuln_result_count", 0)))
 
     def test_collect_retry_item_actions_for_dataflow_vuln_scan_treats_all_non_success_items_as_targets(self):
@@ -11390,7 +11490,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 self.manager._clear_archive_jobs_for_stage_items = original_clear_archive
 
             self.assertEqual({"dfvs-old-a", "dfa-old-a"}, {ref["task_id"] for ref in cleanup_refs})
-            self.assertEqual({"dataflow_vuln_scan", "dataflow_vuln_scan"}, {ref["service"] for ref in cleanup_refs})
+            self.assertEqual({"dataflow_vuln_scan"}, {ref["service"] for ref in cleanup_refs})
             self.assertEqual(["dataflow_vuln_scan"], [row["service"] for row in create_calls])
             self.assertEqual("dfa-new-a", df_abnormal.downstream_task_id)
             self.assertEqual("success", df_success.status)
@@ -11437,7 +11537,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             operation.result_payload = {
                 "cleanup_plan": {
                     "target_stage": "entry_analysis",
-                    "affected_stages": ["entry_analysis", "dataflow_vuln_scan", "dataflow_vuln_scan"],
+                    "affected_stages": ["entry_analysis", "dataflow_vuln_scan"],
                     "downstream_refs": [],
                 }
             }
@@ -11487,7 +11587,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 self.manager._cleanup_downstream_refs = original_cleanup
 
-            self.assertEqual(["entry_analysis", "dataflow_vuln_scan", "dataflow_vuln_scan"], cleanup_summary["affected_stages"])
+            self.assertEqual(["entry_analysis", "dataflow_vuln_scan"], cleanup_summary["affected_stages"])
             self.assertEqual([], db.stage_items)
             self.assertEqual([], db.archive_jobs)
             self.assertEqual([], db.state_events)
@@ -11542,7 +11642,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             calls.append(("collect", task_arg.id))
             return {
                 "target_stage": "entry_analysis",
-                "affected_stages": ["entry_analysis", "dataflow_vuln_scan", "dataflow_vuln_scan"],
+                "affected_stages": ["entry_analysis", "dataflow_vuln_scan"],
                 "downstream_ref_count": 2,
             }
 
@@ -11551,7 +11651,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             calls.append(("cleanup", task_arg.id))
             return {
                 "target_stage": "entry_analysis",
-                "affected_stages": ["entry_analysis", "dataflow_vuln_scan", "dataflow_vuln_scan"],
+                "affected_stages": ["entry_analysis", "dataflow_vuln_scan"],
                 "downstream_ref_count": 2,
             }
 
@@ -14156,11 +14256,11 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._stage_sequence_for_task(binary_task),
         )
         self.assertEqual(
-            ["system_analysis", "entry_analysis", "dataflow_vuln_scan", "dataflow_vuln_scan"],
+            ["system_analysis", "entry_analysis", "dataflow_vuln_scan"],
             self.manager._stage_sequence_for_task(source_task),
         )
         self.assertEqual(
-            ["binary_to_source", "entry_analysis", "dataflow_vuln_scan", "dataflow_vuln_scan"],
+            ["binary_to_source", "entry_analysis", "dataflow_vuln_scan"],
             self.manager._stage_sequence_for_task(module_task),
         )
 

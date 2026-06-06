@@ -95,6 +95,21 @@ runtime_policy:
 - 状态同步：任务详情、阶段摘要、手工操作状态与尾部阶段快照一致。
 - 重试逻辑：尾部失败项按 lineage 清理后代结果，避免整阶段回滚。
 
+## 历史数据归一
+
+如果库中仍存在旧阶段名或旧下游服务名称，可执行一次性归一脚本：
+
+```bash
+python scripts/normalize_legacy_dataflow_names.py
+```
+
+脚本会把以下旧值统一到当前规范：
+
+- `dataflow_analysis` -> `dataflow_vuln_scan`
+- `vuln_scan` -> `dataflow_vuln_scan`
+- `dataflow_analyse` -> `dataflow_vuln_scan`
+- `dataflow_vuln_scanner` -> `dataflow_vuln_scan`
+
 ## 灰度与验收
 
 推荐按以下顺序灰度上线 `mixed_streaming`：

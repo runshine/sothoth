@@ -832,7 +832,7 @@ STAGE_SUMMARY_RESULT_KEYS = {
     "system_analysis": ["system_analysis_results", "high_risk_modules", "system_analysis_modules", "candidate_modules", "selected_modules"],
     "binary_to_source": ["b2s_results"],
     "entry_analysis": ["entry_results"],
-    "dataflow_vuln_scan": ["dataflow_results"],
+    "dataflow_vuln_scan": ["dataflow_results", "vuln_results"],
 }
 STAGE_METRIC_RESETTERS = {
     "firmware_unpack": {"unpacked_firmware_count": 0, "failed_firmware_count": 0},
@@ -2241,10 +2241,18 @@ class TaskManager:
         base = self._task_response(db, ctx.task, queue_info=ctx.queue_info, detail_ctx=ctx).model_dump()
         base.pop("execution_epoch", None)
         archive_jobs_by_item = self._archive_jobs_by_item_id(ctx.archive_jobs)
+        archive_job_responses = self._archive_job_responses(db, ctx.task, ctx.archive_jobs)
         stage_item_responses = [
             self._stage_item_response(item, archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []))
             for item in ctx.stage_items[:DETAIL_STAGE_ITEMS_LIMIT]
         ]
+        overview_nodes = self._build_stage_overview_nodes(
+            db,
+            ctx.task,
+            ctx.stage_summaries,
+            archive_job_responses,
+            ctx.stage_items[:DETAIL_STAGE_ITEMS_LIMIT],
+        )
         return BinarySecurityTaskDetailResponse(
             **base,
             execution_epoch=int(getattr(ctx.task, "execution_epoch", 0) or 0),
@@ -2259,9 +2267,9 @@ class TaskManager:
             stage_items_total=ctx.stage_items_total,
             stage_items_truncated=ctx.stage_items_total > DETAIL_STAGE_ITEMS_LIMIT,
             stage_items=stage_item_responses,
-            archive_jobs=[],
+            archive_jobs=archive_job_responses,
             abnormal_reason_history=[],
-            overview_nodes=[],
+            overview_nodes=overview_nodes,
             orchestration_observability={},
             cleanup_snapshot=dict(ctx.task.cleanup_snapshot or {}),
             runtime_health=self._build_task_runtime_health(db, ctx.task, ctx=ctx),
@@ -2518,7 +2526,12 @@ class TaskManager:
             .all()
         )
         sync_times = self._task_sync_status_view(sync_items)
-        archive_jobs: list[BinarySecurityArchiveJob] = []
+        archive_jobs = (
+            db.query(BinarySecurityArchiveJob)
+            .filter(BinarySecurityArchiveJob.task_id == task.id)
+            .order_by(BinarySecurityArchiveJob.created_at.asc(), BinarySecurityArchiveJob.id.asc())
+            .all()
+        )
         stage_sequence = self._stage_sequence_for_task(task)
         stage_summaries = self._build_stage_summaries(
             db,
@@ -2534,6 +2547,8 @@ class TaskManager:
                 abnormal_reason = BinarySecurityAbnormalReason(**task.latest_abnormal_reason)
             except Exception:
                 abnormal_reason = None
+        if abnormal_reason is None:
+            abnormal_reason = self._task_abnormal_reason(task, stage_summaries, stage_items, archive_jobs)
         return _TaskDetailContext(
             task=task,
             queue_info=self._build_queue_info(db, project_id=project_id),
@@ -4075,6 +4090,14 @@ class TaskManager:
     ) -> dict[str, list[BinarySecurityStageItem]]:
         descendants: dict[str, list[BinarySecurityStageItem]] = {}
         pending_upstream_ids = [str(item_id or "").strip() for item_id in upstream_item_ids if str(item_id or "").strip()]
+        if normalize_stage_name(target_stage) == "dataflow_vuln_scan" and pending_upstream_ids:
+            allowed = set(pending_upstream_ids)
+            descendants["dataflow_vuln_scan"] = [
+                item
+                for item in self._stage_items(db, task_id, "dataflow_vuln_scan")
+                if str(dict(item.input_ref or {}).get("upstream_item_id") or "").strip() in allowed
+            ]
+            return descendants
         for stage_name in self._streaming_retry_descendant_stage_names(target_stage):
             if not pending_upstream_ids:
                 break
@@ -4084,6 +4107,20 @@ class TaskManager:
                 for item in self._stage_items(db, task_id, stage_name)
                 if str(dict(item.input_ref or {}).get("upstream_item_id") or "").strip() in allowed
             ]
+            if normalize_stage_name(stage_name) == "dataflow_vuln_scan" and matched:
+                expanded_ids = {str(item.id or "").strip() for item in matched if str(item.id or "").strip()}
+                additional = True
+                while additional:
+                    additional = False
+                    for item in self._stage_items(db, task_id, stage_name):
+                        upstream_item_id = str(dict(item.input_ref or {}).get("upstream_item_id") or "").strip()
+                        item_id = str(item.id or "").strip()
+                        if not upstream_item_id or not item_id or item in matched:
+                            continue
+                        if upstream_item_id in expanded_ids:
+                            matched.append(item)
+                            expanded_ids.add(item_id)
+                            additional = True
             descendants[stage_name] = matched
             pending_upstream_ids = [item.id for item in matched if str(item.id or "").strip()]
         return descendants
@@ -4103,7 +4140,11 @@ class TaskManager:
         )
         descendant_items = [
             item
-            for stage_name in self._streaming_retry_descendant_stage_names(target_stage)
+            for stage_name in (
+                ["dataflow_vuln_scan"]
+                if normalize_stage_name(target_stage) == "dataflow_vuln_scan"
+                else self._streaming_retry_descendant_stage_names(target_stage)
+            )
             for item in descendant_map.get(stage_name) or []
         ]
         downstream_refs = self._collect_downstream_refs(task, descendant_items)
@@ -4111,7 +4152,11 @@ class TaskManager:
             await self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token())
 
         cleared_stages: list[str] = []
-        for stage_name in self._streaming_retry_descendant_stage_names(target_stage):
+        for stage_name in (
+            ["dataflow_vuln_scan"]
+            if normalize_stage_name(target_stage) == "dataflow_vuln_scan"
+            else self._streaming_retry_descendant_stage_names(target_stage)
+        ):
             items = descendant_map.get(stage_name) or []
             item_ids = [item.id for item in items if str(item.id or "").strip()]
             if not item_ids:
@@ -4279,13 +4324,20 @@ class TaskManager:
         )
         normalized_display = self._normalize_downstream_status(display_status)
         normalized_item = self._normalize_downstream_status(item.status) or self._string_or_none(item.status)
+        replacement_state = self._replacement_in_progress_state(item)
         repaired = False
-        if normalized_item in {"success", "failed", "cancelled", "partial_success", "downstream_missing"} and normalized_display in {"pending", "dispatching", "running"}:
+        if (
+            normalized_item in {"success", "failed", "cancelled", "partial_success", "downstream_missing"}
+            and normalized_display in {"pending", "dispatching", "running"}
+            and not replacement_state["replacement_in_progress"]
+        ):
             display_status = normalized_item
             sync_observation["downstream_status"] = normalized_item
             sync_observation.setdefault("status_raw", normalized_display or display_status)
             sync_observation["mapped_status"] = normalized_item
             repaired = True
+        elif replacement_state["replacement_in_progress"] and normalized_display in {"pending", "dispatching", "running"}:
+            sync_observation["downstream_status"] = normalized_display
         if not display_status and str(item.downstream_task_id or "").strip():
             binding_state = self._downstream_binding_state(item)
             if binding_state == "created_pending_sync":
@@ -4422,6 +4474,7 @@ class TaskManager:
         task: BinarySecurityTask,
         operation: BinarySecurityTaskOperation,
     ) -> dict[str, Any]:
+        phase = "prepare"
         plan = dict(self._operation_result_data(operation).get("cleanup_plan") or {})
         target_stage = str(plan.get("target_stage") or operation.target_stage or "").strip()
         affected_stages = [str(stage).strip() for stage in (plan.get("affected_stages") or []) if str(stage).strip()]
@@ -5777,7 +5830,7 @@ class TaskManager:
         return deleted
 
     def _delete_timeline_rows_for_stages(self, db: Session, task_id: str, stage_names: list[str]) -> int:
-        normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
+        normalized = self._expand_stage_name_aliases(stage_names)
         if not normalized:
             return 0
         deleted = int(
@@ -5812,7 +5865,7 @@ class TaskManager:
         return deleted
 
     def _delete_state_event_rows_for_stages(self, db: Session, task_id: str, stage_names: list[str]) -> int:
-        normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
+        normalized = self._expand_stage_name_aliases(stage_names)
         if not normalized:
             return 0
         deleted = int(
@@ -5906,6 +5959,24 @@ class TaskManager:
         self._validate_hard_restart_cleanup(db, task)
         self._reset_task_for_hard_restart(task)
         return cleanup_snapshot
+
+    def _expand_stage_name_aliases(self, stage_names: list[str] | tuple[str, ...]) -> list[str]:
+        expanded: list[str] = []
+        seen: set[str] = set()
+        alias_map = {
+            "dataflow_vuln_scan": ("dataflow_vuln_scan", "dataflow_analysis", "vuln_scan"),
+            "dataflow_analysis": ("dataflow_analysis", "dataflow_vuln_scan"),
+            "vuln_scan": ("vuln_scan", "dataflow_vuln_scan"),
+        }
+        for stage_name in stage_names:
+            raw = str(stage_name or "").strip()
+            if not raw:
+                continue
+            for candidate in alias_map.get(raw, (raw,)):
+                if candidate not in seen:
+                    seen.add(candidate)
+                    expanded.append(candidate)
+        return expanded
 
     async def _seed_work_queues(self) -> None:
         session_factory = get_session_factory()
@@ -6140,7 +6211,7 @@ class TaskManager:
                 if not observed_apply_state and stage_name and not item_id:
                     observed_apply_state = bool(
                         force
-                        or str(before_status or "").strip().lower() in {"queued", "running", "dispatching"}
+                        or str(before_status or "").strip().lower() in {"queued", "running", "dispatching", "cancelled"}
                         or mapped_status == "downstream_missing"
                     )
                 observe_downstream_reconcile_observation(
@@ -12535,7 +12606,7 @@ class TaskManager:
         lease: BinarySecurityTaskRuntimeLease | None = None
         if db is not None:
             lease = self._runtime_lease_for_task(db, task.id)
-        else:
+        elif task.lease_expires_at is None:
             session = get_session_factory()()
             try:
                 lease = self._runtime_lease_for_task(session, task.id)
@@ -14986,7 +15057,7 @@ class TaskManager:
         batch_size: int = 100,
         max_retries: int = 3,
     ) -> int:
-        normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
+        normalized = self._expand_stage_name_aliases(stage_names)
         if not normalized:
             return 0
         if hasattr(db, "stage_items") and isinstance(getattr(db, "stage_items"), list):
@@ -15801,10 +15872,17 @@ class TaskManager:
         downstream_status: str | None = None,
         state_applied: bool | None = None,
     ) -> bool:
-        if synced_at is not None:
-            return True
         current_result = dict(item.result or {})
         current_observation = dict(current_result.get("sync_observation") or {})
+        comparable_synced_at = self._comparable_datetime(synced_at)
+        if comparable_synced_at is not None:
+            current_synced_candidates = [
+                self._parse_comparable_datetime(current_observation.get("last_synced_at")),
+                self._parse_comparable_datetime(current_observation.get("last_success_at")),
+                self._parse_comparable_datetime(current_result.get("last_sync_attempt_at")),
+            ]
+            if not any(candidate != comparable_synced_at for candidate in current_synced_candidates if candidate is not None):
+                comparable_synced_at = None
         current_sync_status = self._string_or_none(current_result.get("sync_status"))
         current_downstream_status = self._string_or_none(current_result.get("downstream_status"))
         comparable_pairs = (
@@ -15819,7 +15897,7 @@ class TaskManager:
             (self._bool_or_none(current_observation.get("state_applied")), self._bool_or_none(state_applied)),
             (current_downstream_status, self._string_or_none(downstream_status) or current_downstream_status),
         )
-        return any(before != after for before, after in comparable_pairs)
+        return comparable_synced_at is not None or any(before != after for before, after in comparable_pairs)
 
     def _merge_stage_item_output_ref(self, item: BinarySecurityStageItem, **updates: Any) -> list[str]:
         current_output_ref = dict(item.output_ref or {})
@@ -16897,7 +16975,7 @@ class TaskManager:
                     if run and run.last_error
                     else (
                         next((item.error_message for item in stage_items if item.error_message), None)
-                        if self._business_stage_status(task, stage_name, run, stage_items) in {"failed", "partial_success", "downstream_missing", "cancelled"}
+                        if self._business_stage_status(task, stage_name, run, stage_items, db=db) in {"failed", "partial_success", "downstream_missing", "cancelled"}
                         else None
                     )
                 ),
@@ -17586,6 +17664,9 @@ class TaskManager:
                     latest_error_at = parsed_error_at
                     latest_error_type = error_type
                     latest_error_message = error_message
+            elif error_type is not None or error_message is not None:
+                latest_error_type = error_type
+                latest_error_message = error_message
             if last_synced_at is None and parsed_attempt is not None:
                 never_synced_item_count += 1
             if last_synced_at is not None and (now - last_synced_at).total_seconds() >= max(60, int(self.cfg.scheduler.downstream_reconcile_interval_seconds or 30) * 3):
@@ -18947,7 +19028,11 @@ class TaskManager:
                 continue
             run = runs_by_stage.get(stage_name)
             if run is None:
-                if self._is_streaming_tail_stage(task, stage_name) and self._continue_stage_input_error(db, task, stage_name):
+                if (
+                    self._is_streaming_tail_stage(task, stage_name)
+                    and normalize_stage_name(stage_name) == "dataflow_vuln_scan"
+                    and self._continue_stage_input_error(db, task, stage_name)
+                ):
                     continue
                 return stage_name
             items = self._stage_items(db, task.id, stage_name)
@@ -18959,7 +19044,11 @@ class TaskManager:
                     return stage_name
                 if self._stage_archive_success_blocked(task, stage_name, items, db=db):
                     return stage_name
-            elif self._is_streaming_tail_stage(task, stage_name) and self._continue_stage_input_error(db, task, stage_name):
+            elif (
+                self._is_streaming_tail_stage(task, stage_name)
+                and normalize_stage_name(stage_name) == "dataflow_vuln_scan"
+                and self._continue_stage_input_error(db, task, stage_name)
+            ):
                 continue
             if run.status == "partial_success":
                 if not self._partial_success_advancement_enabled(task, stage_name):
@@ -19804,6 +19893,7 @@ class TaskManager:
             stage_run_status = str(stage_run.status or "").strip() if stage_run is not None else ""
             if stage_items or (
                 self._is_streaming_tail_stage(task, stage_name)
+                and normalize_stage_name(stage_name) == "dataflow_vuln_scan"
                 and stage_run_status in {"failed", "downstream_missing", "cancelled", "partial_success"}
             ):
                 self._refresh_stage_from_authoritative_items(db, task, stage_name)
@@ -19832,6 +19922,11 @@ class TaskManager:
             return
         stage_retry_mode = task.execution_mode in {"stage_retry", "stage_retry_failed_items", "stage_retry_full"} and bool(task.target_stage_name)
         task_retry_mode = task.execution_mode in {"task_retry", "task_retry_failed_items"} and bool(task.target_stage_name)
+        summary_before_retry_clear = dict(task.summary or {})
+        preferred_retry_next_stage = None
+        if stage_retry_mode:
+            stale_stages = [str(stage).strip() for stage in (summary_before_retry_clear.get("stale_stages") or []) if str(stage).strip()]
+            preferred_retry_next_stage = stale_stages[0] if stale_stages else None
         if stage_retry_mode:
             self._clear_retry_execution_context(
                 db,
@@ -19857,20 +19952,33 @@ class TaskManager:
         if (
             failed_stage_run is not None
             and vuln_run is not None
+            and normalize_stage_name(str(failed_stage_run.stage_name or "").strip()) == "dataflow_vuln_scan"
             and str(vuln_run.status or "").strip() in {"success", "partial_success"}
         ):
             failed_stage_run = None
         if failed_stage_run is not None and self._streaming_mode_enabled(task):
-            tail_stages = set(self._streaming_tail_stage_names(task))
-            if str(failed_stage_run.stage_name or "").strip() in tail_stages:
+            if normalize_stage_name(str(failed_stage_run.stage_name or "").strip()) == "dataflow_vuln_scan":
                 failed_stage_run = None
         next_stage = self._next_incomplete_stage(db, task)
+        if stage_retry_mode and preferred_retry_next_stage:
+            next_stage = preferred_retry_next_stage
+        if failed_stage_run is not None and not stage_retry_mode and not task_retry_mode:
+            task.status = "pending"
+            task.current_stage = failed_stage_run.stage_name or task.current_stage
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.lease_expires_at = None
+            task.finished_at = None
+            return
         next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
         next_stage_status = next_stage_run.status if next_stage_run else "pending"
         if (
             next_stage
             and str(next_stage_status or "").strip() in {"pending", "queued", "running", "dispatching"}
-            and self._stage_has_real_runnable_work(db, task, next_stage)
+            and (
+                (stage_retry_mode and preferred_retry_next_stage == next_stage)
+                or self._stage_has_real_runnable_work(db, task, next_stage)
+            )
         ):
             task.status = "running" if str(next_stage_status or "").strip() in {"running", "dispatching"} else "pending"
             task.current_stage = next_stage
@@ -20393,7 +20501,7 @@ class TaskManager:
         existing = self._find_stage_item(
             db,
             task_id=task.id,
-            stage_name="vuln_scan",
+            stage_name="dataflow_vuln_scan",
             item_key=entry_key,
             parent_key=str(dataflow_result.get("module_key") or "").strip() or None,
         )
@@ -20401,7 +20509,7 @@ class TaskManager:
             db,
             task=task,
             stage_run=stage_run,
-            stage_name="vuln_scan",
+            stage_name="dataflow_vuln_scan",
             item_key=entry_key,
             item_name=str(dataflow_result.get("function_name") or "").strip() or None,
             parent_key=str(dataflow_result.get("module_key") or "").strip() or None,
@@ -20415,13 +20523,13 @@ class TaskManager:
         self._record_event(
             db,
             task,
-            "streaming_dataflow_vuln_scan_item_seeded_legacy" if existing is None else "streaming_dataflow_vuln_scan_item_refreshed_legacy",
+            "streaming_vuln_item_seeded" if existing is None else "streaming_vuln_item_refreshed",
             (
                 f"历史兼容路径：已创建数据流漏洞挖掘待执行条目: {entry_key}"
                 if existing is None
                 else f"历史兼容路径：已刷新数据流漏洞挖掘待执行条目: {entry_key}"
             ),
-            stage_name="vuln_scan",
+            stage_name="dataflow_vuln_scan",
             item=item,
             payload={
                 "upstream_item_id": upstream_item.id,
@@ -20431,6 +20539,21 @@ class TaskManager:
         )
         self._refresh_stage_from_authoritative_items(db, task, "dataflow_vuln_scan")
         return item
+
+    def _trigger_vuln_items_from_dataflow_result(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        dataflow_result: dict[str, Any],
+        *,
+        upstream_item: BinarySecurityStageItem,
+    ) -> BinarySecurityStageItem | None:
+        return self._trigger_vuln_items_from_dataflow_result_legacy(
+            db,
+            task,
+            dataflow_result,
+            upstream_item=upstream_item,
+        )
 
     def _prepare_stage_items_for_execution(
         self,
@@ -20464,6 +20587,15 @@ class TaskManager:
         executable_inputs = [row[0] for row in candidate_inputs]
         if not candidate_inputs:
             return executable_inputs
+        existing_items_by_identity: dict[str, BinarySecurityStageItem] = {}
+        for existing_item in self._stage_items(db, task.id, stage_run.stage_name):
+            identity_key = str(existing_item.item_identity_key or "").strip() or build_stage_item_identity_key(
+                str(existing_item.item_key or "").strip(),
+                existing_item.parent_key,
+            )
+            if identity_key:
+                existing_items_by_identity[identity_key] = existing_item
+        processed_identities = set(existing_items_by_identity.keys())
 
         batch_size = min(100, max(25, int(task.policy.get("stage_item_seed_batch_size") or 100)))
         last_error: Exception | None = None
@@ -20473,13 +20605,20 @@ class TaskManager:
                 for offset in range(0, len(candidate_inputs), batch_size):
                     batch = candidate_inputs[offset : offset + batch_size]
                     for input_item, item_key, item_name, parent_key, input_ref, identity_key in batch:
-                        item = self._find_stage_item(
-                            db,
-                            task_id=task.id,
-                            stage_name=stage_run.stage_name,
-                            item_key=item_key,
-                            parent_key=parent_key,
-                        )
+                        if identity_key in processed_identities:
+                            continue
+                        item = existing_items_by_identity.get(identity_key)
+                        if item is None:
+                            item = self._find_stage_item(
+                                db,
+                                task_id=task.id,
+                                stage_name=stage_run.stage_name,
+                                item_key=item_key,
+                                parent_key=parent_key,
+                            )
+                            if item is not None:
+                                existing_items_by_identity[identity_key] = item
+                                processed_identities.add(identity_key)
                         if item is None:
                             item = BinarySecurityStageItem(
                                 id=f"si_{uuid.uuid4().hex[:20]}",
@@ -20495,6 +20634,12 @@ class TaskManager:
                                 downstream_service=downstream_service,
                             )
                             db.add(item)
+                            if hasattr(db, "stage_items") and isinstance(getattr(db, "stage_items"), list):
+                                stage_items_list = getattr(db, "stage_items")
+                                if len(stage_items_list) >= 2 and stage_items_list[-1] is item and stage_items_list[-2] is item:
+                                    stage_items_list.pop()
+                            existing_items_by_identity[identity_key] = item
+                            processed_identities.add(identity_key)
                         else:
                             item.stage_run_id = stage_run.id
                             item.item_name = item_name
@@ -21283,7 +21428,11 @@ class TaskManager:
             elif strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE:
                 if not str(item.downstream_task_id or "").strip():
                     issues.append({"item_key": item_key, "issue": "active_binding_missing"})
-                if self._normalize_item_status(item.status) not in {"pending", "queued", "dispatching", "running"}:
+                observed_active_status = self._map_downstream_status(str(self._latest_observed_downstream_status(item) or ""))
+                if (
+                    self._normalize_item_status(item.status) not in {"pending", "queued", "dispatching", "running"}
+                    and observed_active_status not in {"pending", "queued", "dispatching", "running"}
+                ):
                     issues.append({"item_key": item_key, "issue": "active_status_not_preserved", "status": item.status})
         for stage_name in affected_stages:
             stage_run = db.query(BinarySecurityStageRun).filter(
@@ -21383,6 +21532,12 @@ class TaskManager:
                 binding_cleared=False,
             )
         if strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE:
+            self._mark_replacement_in_progress(
+                item,
+                old_downstream_task_id=old_task_id,
+                binding_cleared=False,
+                verification_status="pending",
+            )
             self._record_downstream_item_disposition(
                 session,
                 task,
@@ -22476,7 +22631,10 @@ class TaskManager:
         )
         if summary_key == "b2s_results" and self._task_type(task) == TASK_TYPE_BINARY_MODULE:
             rebuilt = [self._normalize_entry_analysis_module_input(task, item) for item in rebuilt]
-        task.summary = {**(task.summary or {}), summary_key: rebuilt}
+        next_summary = {**(task.summary or {}), summary_key: rebuilt}
+        if summary_key == "dataflow_results":
+            next_summary["vuln_results"] = list(rebuilt)
+        task.summary = next_summary
         if summary_key == "dataflow_results":
             task.metrics = {**(task.metrics or {}), "vuln_result_count": len(rebuilt)}
         stage_run = db.query(BinarySecurityStageRun).filter(
@@ -27218,12 +27376,23 @@ class TaskManager:
             "b2s_results": self._compact_b2s_summary_item,
             "entry_results": self._compact_entry_summary_item,
             "dataflow_results": self._compact_dataflow_summary_item,
-            "dataflow_results": self._compact_vuln_summary_item,
         }
         compactor = compactors.get(summary_key)
         if compactor is None:
             return [dict(item) for item in items if isinstance(item, dict)]
-        return [compactor(item) for item in items if isinstance(item, dict)]
+        compacted = [compactor(item) for item in items if isinstance(item, dict)]
+        if summary_key == "dataflow_results":
+            deduped: dict[tuple[str, str], dict[str, Any]] = {}
+            for row in compacted:
+                key = (
+                    str(row.get("entry_key") or "").strip(),
+                    str(row.get("module_key") or "").strip(),
+                )
+                if key == ("", ""):
+                    key = (str(len(deduped)), "")
+                deduped[key] = row
+            return list(deduped.values())
+        return compacted
 
     def _compact_stage_success_items_for_db(self, summary_key: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if summary_key == "entry_results":
@@ -27383,6 +27552,7 @@ class TaskManager:
             "line_no": item.get("line_no"),
             "source_dir": item.get("source_dir"),
             "data_flow_file": item.get("data_flow_file"),
+            "dataflow_dir": item.get("dataflow_dir"),
             "workspace_root": item.get("workspace_root"),
             "archive_root": item.get("archive_root"),
             "artifact_file_count": len(artifact_files) if isinstance(artifact_files, list) else 0,
