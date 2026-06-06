@@ -1954,6 +1954,11 @@ def _pi_job_payload(
     concurrency: int,
     clean: bool,
 ) -> dict:
+    normalized_engine = str(engine or "").strip().lower()
+    if normalized_engine == "turbo":
+        normalized_engine = "hybrid"
+    if normalized_engine not in {"agent", "hybrid"}:
+        normalized_engine = "hybrid"
     return {
         "target": item.elf_path,
         "output_dir": item.output_dir,
@@ -1966,7 +1971,7 @@ def _pi_job_payload(
         "model": job_model,
         "functions": (item.extra_metadata or {}).get("file_list") or None,
         "clean": clean,
-        "engine": engine,
+        "engine": normalized_engine,
         "concurrency": concurrency,
     }
 
