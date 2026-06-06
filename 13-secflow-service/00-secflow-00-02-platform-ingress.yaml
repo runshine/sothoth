@@ -171,6 +171,20 @@ spec:
                 name: secflow-app-binary-to-source-manager
                 port:
                   number: 80
+          - path: /api/app/binary-security
+            pathType: Prefix
+            backend:
+              service:
+                name: secflow-app-binary-security
+                port:
+                  number: 80
+          - path: /api/app/binary-evolution
+            pathType: Prefix
+            backend:
+              service:
+                name: secflow-app-binary-evolution-center
+                port:
+                  number: 80
           - path: /api/app/code-server
             pathType: Prefix
             backend:
