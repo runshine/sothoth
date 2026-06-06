@@ -15,6 +15,7 @@ from app.service.project import ProjectService
 from app.schemas import (
     BinarySecurityAbnormalReasonHistoryResponse,
     BinarySecurityArchiveJobPageResponse,
+    BinarySecurityEntrySelectionResponse,
     BinarySecurityOverviewResponse,
     BinarySecurityProjectStats,
     BinarySecurityProjectConfigPayload,
@@ -81,7 +82,7 @@ class _RouteManagerStub:
                     item_name="func_a",
                     parent_key="mod-a",
                     status="queued",
-                    downstream_service="dataflow_analyse",
+                    downstream_service="dataflow_vuln_scan",
                     downstream_task_id="dfa-1",
                     input_ref={"upstream_item_id": "i-entry-1"},
                     sync_status="pending",
@@ -164,6 +165,73 @@ class _RouteManagerStub:
         self.calls.append(("get_task_abnormal_reason_history", db, project_id, task_id))
         return BinarySecurityAbnormalReasonHistoryResponse(task_id=task_id, items=[])
 
+    def get_entry_selection(self, db, project_id, task_id):
+        self.calls.append(("get_entry_selection", db, project_id, task_id))
+        return BinarySecurityEntrySelectionResponse(
+            task_id=task_id,
+            status="pending_entry_confirmation",
+            selection_mode="manual_confirm",
+            requires_confirmation=True,
+            candidate_entries=[
+                {
+                    "entry_key": "mod-a:func_a",
+                    "module_key": "mod-a",
+                    "function_name": "func_a",
+                    "file_path": "src/a.c",
+                    "line_no": 12,
+                    "reason": "network handler",
+                },
+                {
+                    "entry_key": "mod-b:func_b",
+                    "module_key": "mod-b",
+                    "function_name": "func_b",
+                    "file_path": "src/b.c",
+                    "line_no": 34,
+                    "reason": "ioctl entry",
+                },
+            ],
+            selected_entry_keys=["mod-a:func_a"],
+            selected_entries=[
+                {
+                    "entry_key": "mod-a:func_a",
+                    "module_key": "mod-a",
+                    "function_name": "func_a",
+                }
+            ],
+            entry_results=[{"entry_key": "mod-a:func_a"}, {"entry_key": "mod-b:func_b"}],
+        )
+
+    def confirm_entry_selection(self, db, project_id, task_id, selected_entry_keys):
+        self.calls.append(("confirm_entry_selection", db, project_id, task_id, selected_entry_keys))
+        return BinarySecurityTaskDetailResponse(
+            id=task_id,
+            project_id=project_id,
+            task_type="source",
+            name="entry-confirmed-task",
+            status="pending",
+            current_stage="dataflow_analysis",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            entry_selection_mode="manual_confirm",
+            candidate_entry_count=2,
+            selected_entry_count=len(selected_entry_keys),
+            stage_summaries=[
+                BinarySecurityStageSummary(
+                    stage_name="entry_analysis",
+                    sequence_no=2,
+                    status="waiting_confirmation",
+                )
+            ],
+            manual_operation_state={
+                "overall": "allowed",
+                "can_continue": False,
+                "can_retry": False,
+                "can_retry_failed_items": False,
+            },
+            policy={"entry_selection_mode": "manual_confirm"},
+        )
+
     def get_service_config(self, db):
         self.calls.append(("get_service_config", db))
         return BinarySecurityServiceConfigResponse(
@@ -174,8 +242,19 @@ class _RouteManagerStub:
             )
         )
 
-    def list_tasks(self, db, project_id, status=None, task_type=None, page=1, page_size=50):
-        self.calls.append(("list_tasks", db, project_id, status, task_type, page, page_size))
+    def list_tasks(
+        self,
+        db,
+        project_id,
+        status=None,
+        task_type=None,
+        search=None,
+        sort_by="created_at",
+        sort_order="desc",
+        page=1,
+        page_size=50,
+    ):
+        self.calls.append(("list_tasks", db, project_id, status, task_type, search, sort_by, sort_order, page, page_size))
         return BinarySecurityTaskListResponse(
             total=1,
             page=page,
@@ -273,7 +352,7 @@ class TaskApiRouteTests(unittest.TestCase):
         self.assertEqual(20, payload["page_size"])
         self.assertEqual("task_running", payload["items"][0]["manual_operation_state"]["blocking_code"])
         self.assertEqual(
-            ("list_tasks", fake_db, "p1", "running", "source", 2, 20),
+            ("list_tasks", fake_db, "p1", "running", "source", None, "created_at", "desc", 2, 20),
             manager.calls[0],
         )
 
@@ -285,17 +364,17 @@ class TaskApiRouteTests(unittest.TestCase):
             with TestClient(app) as client:
                 response = client.get(
                     "/api/app/binary-security/projects/p1/tasks/t1/stage-items",
-                    params={"stage_name": "dataflow_analysis", "page": 2, "per_page": 5},
+                    params={"stage_name": "dataflow_analysis", "page": 2, "per_page": 10},
                     headers={"Authorization": "Bearer token"},
                 )
 
         self.assertEqual(200, response.status_code)
         payload = response.json()
         self.assertEqual(2, payload["page"])
-        self.assertEqual(5, payload["per_page"])
+        self.assertEqual(10, payload["per_page"])
         self.assertEqual("i-entry-1", payload["items"][0]["input_ref"]["upstream_item_id"])
         self.assertEqual(
-            ("get_task_stage_items_page", fake_db, "p1", "t1", "dataflow_analysis", 2, 5),
+            ("get_task_stage_items_page", fake_db, "p1", "t1", "dataflow_analysis", 2, 10),
             manager.calls[0],
         )
 
@@ -378,13 +457,13 @@ class TaskApiRouteTests(unittest.TestCase):
             with TestClient(app) as client:
                 response = client.get(
                     "/api/app/binary-security/projects/p1/tasks/t1/archive-jobs",
-                    params={"stage_name": "vuln_scan", "page": 3, "per_page": 7},
+                    params={"stage_name": "vuln_scan", "page": 3, "per_page": 10},
                     headers={"Authorization": "Bearer token"},
                 )
 
         self.assertEqual(200, response.status_code)
         self.assertEqual(
-            ("get_task_archive_jobs_page", fake_db, "p1", "t1", "vuln_scan", 3, 7),
+            ("get_task_archive_jobs_page", fake_db, "p1", "t1", "vuln_scan", 3, 10),
             manager.calls[0],
         )
 
@@ -401,6 +480,46 @@ class TaskApiRouteTests(unittest.TestCase):
 
         self.assertEqual(200, response.status_code)
         self.assertEqual(("get_task_abnormal_reason_history", fake_db, "p1", "t1"), manager.calls[0])
+
+    def test_get_entry_selection_route_returns_confirmation_snapshot(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/app/binary-security/projects/p1/tasks/t1/entry-selection",
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual("manual_confirm", payload["selection_mode"])
+        self.assertTrue(payload["requires_confirmation"])
+        self.assertEqual(2, len(payload["candidate_entries"]))
+        self.assertEqual("mod-a:func_a", payload["selected_entry_keys"][0])
+        self.assertEqual(("get_entry_selection", fake_db, "p1", "t1"), manager.calls[0])
+
+    def test_confirm_entry_selection_route_passes_selected_keys(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/app/binary-security/projects/p1/tasks/t1/entry-selection/confirm",
+                    json={"selected_entry_keys": ["mod-a:func_a", "mod-b:func_b"]},
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual("manual_confirm", payload["entry_selection_mode"])
+        self.assertEqual(2, payload["selected_entry_count"])
+        self.assertEqual(
+            ("confirm_entry_selection", fake_db, "p1", "t1", ["mod-a:func_a", "mod-b:func_b"]),
+            manager.calls[0],
+        )
 
     def test_get_service_config_route_returns_defaults(self):
         app, fake_db = self._build_client()

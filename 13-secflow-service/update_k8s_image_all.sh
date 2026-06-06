@@ -6,7 +6,6 @@ DEFAULT_IMAGE_TAG="${DEFAULT_IMAGE_TAG:-latest}"
 B2S_IMAGE_REPO="${B2S_IMAGE_REPO:-ghcr.io/runshine/secflow-app-binary-to-source}"
 BIN_SECURITY_IMAGE_REPO="${BIN_SECURITY_IMAGE_REPO:-ghcr.io/runshine/secflow-app-binary-security}"
 ENTRY_ANALYSE_IMAGE_REPO="${ENTRY_ANALYSE_IMAGE_REPO:-ghcr.io/runshine/secflow-app-entry-analyse}"
-DATAFLOW_ANALYSE_IMAGE_REPO="${DATAFLOW_ANALYSE_IMAGE_REPO:-ghcr.io/runshine/secflow-app-dataflow-analyse}"
 SYSTEM_ANALYSE_IMAGE_REPO="${SYSTEM_ANALYSE_IMAGE_REPO:-ghcr.io/runshine/secflow-app-system-analyse}"
 FRONTEND_IMAGE_REPO="${FRONTEND_IMAGE_REPO:-ghcr.io/runshine/secflow-frontend}"
 RESOURCE_IMAGE_REPO="${RESOURCE_IMAGE_REPO:-ghcr.io/runshine/secflow-platform-resource}"
@@ -27,10 +26,6 @@ ENTRY_ANALYSE_DEPLOYMENTS=(
   "secflow-app-entry-analyse-scheduler:secflow-app-entry-analyse-scheduler"
   "secflow-app-entry-analyse-worker:secflow-app-entry-analyse-worker"
 )
-DATAFLOW_ANALYSE_DEPLOYMENTS=(
-  "secflow-app-dataflow-analyse:secflow-app-dataflow-analyse"
-  "secflow-app-dataflow-analyse-worker:secflow-app-dataflow-analyse"
-)
 SYSTEM_ANALYSE_DEPLOYMENTS=(
   "secflow-app-system-analyse:secflow-app-system-analyse"
   "secflow-app-system-analyse-worker:secflow-app-system-analyse-worker"
@@ -44,7 +39,7 @@ usage() {
 Usage:
   ./update_k8s_image_all.sh
   ./update_k8s_image_all.sh [global_tag]
-  ./update_k8s_image_all.sh --tag <tag> [--b2s-image <image_or_tag>] [--binary-security-image <image_or_tag>] [--entry-analyse-image <image_or_tag>] [--dataflow-analyse-image <image_or_tag>] [--system-analyse-image <image_or_tag>] [--frontend-image <image_or_tag>] [--resource-image <image_or_tag>] [--gateway-worker-image <image_or_tag>] [--firmware-unpacker-image <image_or_tag>]
+  ./update_k8s_image_all.sh --tag <tag> [--b2s-image <image_or_tag>] [--binary-security-image <image_or_tag>] [--entry-analyse-image <image_or_tag>] [--system-analyse-image <image_or_tag>] [--frontend-image <image_or_tag>] [--resource-image <image_or_tag>] [--gateway-worker-image <image_or_tag>] [--firmware-unpacker-image <image_or_tag>]
 
 Examples:
   ./update_k8s_image_all.sh
@@ -66,7 +61,6 @@ Behavior:
   - b2s image: override binary-to-source manager/worker image.
   - binary-security image: override binary-security api/worker image.
   - entry-analyse image: override entry-analyse api/scheduler/worker image.
-  - dataflow-analyse image: override dataflow-analyse api/worker image.
   - system-analyse image: override system-analyse api/worker/runner image.
   - frontend image: override secflow platform frontend image.
   - resource image: override secflow-platform-resource image.
@@ -169,7 +163,6 @@ scale_deployment_if_exists() {
 B2S_IMAGE_ARG=""
 BIN_SECURITY_IMAGE_ARG=""
 ENTRY_ANALYSE_IMAGE_ARG=""
-DATAFLOW_ANALYSE_IMAGE_ARG=""
 SYSTEM_ANALYSE_IMAGE_ARG=""
 FRONTEND_IMAGE_ARG=""
 RESOURCE_IMAGE_ARG=""
@@ -197,10 +190,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --entry-analyse-image)
       ENTRY_ANALYSE_IMAGE_ARG="${2:-}"
-      shift 2
-      ;;
-    --dataflow-analyse-image)
-      DATAFLOW_ANALYSE_IMAGE_ARG="${2:-}"
       shift 2
       ;;
     --system-analyse-image)
@@ -240,7 +229,6 @@ GLOBAL_TAG="${GLOBAL_TAG_ARG:-${DEFAULT_IMAGE_TAG}}"
 B2S_IMAGE="$(resolve_image "${B2S_IMAGE_ARG}" "${B2S_IMAGE_REPO}")"
 BIN_SECURITY_IMAGE="$(resolve_image "${BIN_SECURITY_IMAGE_ARG}" "${BIN_SECURITY_IMAGE_REPO}")"
 ENTRY_ANALYSE_IMAGE="$(resolve_image "${ENTRY_ANALYSE_IMAGE_ARG}" "${ENTRY_ANALYSE_IMAGE_REPO}")"
-DATAFLOW_ANALYSE_IMAGE="$(resolve_image "${DATAFLOW_ANALYSE_IMAGE_ARG}" "${DATAFLOW_ANALYSE_IMAGE_REPO}")"
 SYSTEM_ANALYSE_IMAGE="$(resolve_image "${SYSTEM_ANALYSE_IMAGE_ARG}" "${SYSTEM_ANALYSE_IMAGE_REPO}")"
 FRONTEND_IMAGE="$(resolve_image "${FRONTEND_IMAGE_ARG}" "${FRONTEND_IMAGE_REPO}")"
 RESOURCE_IMAGE="$(resolve_image "${RESOURCE_IMAGE_ARG}" "${RESOURCE_IMAGE_REPO}")"
@@ -275,9 +263,6 @@ for pair in "${ENTRY_ANALYSE_DEPLOYMENTS[@]}"; do
 done
 scale_deployment_if_exists "secflow-app-entry-analyse-worker" "${ENTRY_ANALYSE_WORKER_REPLICAS}"
 
-for pair in "${DATAFLOW_ANALYSE_DEPLOYMENTS[@]}"; do
-  maybe_set_explicit_image "${pair%%:*}" "${pair##*:}" "${DATAFLOW_ANALYSE_IMAGE}"
-done
 
 for pair in "${SYSTEM_ANALYSE_DEPLOYMENTS[@]}"; do
   maybe_set_explicit_image "${pair%%:*}" "${pair##*:}" "${SYSTEM_ANALYSE_IMAGE}"
@@ -316,9 +301,6 @@ while IFS=$'\t' read -r workload_kind workload_name containers; do
         ;;
       "secflow-app-entry-analyse:secflow-app-entry-analyse"|"secflow-app-entry-analyse-scheduler:secflow-app-entry-analyse-scheduler"|"secflow-app-entry-analyse-worker:secflow-app-entry-analyse-worker")
         [[ -n "${ENTRY_ANALYSE_IMAGE}" ]] && requested_tag="${ENTRY_ANALYSE_IMAGE}"
-        ;;
-      "secflow-app-dataflow-analyse:secflow-app-dataflow-analyse"|"secflow-app-dataflow-analyse-worker:secflow-app-dataflow-analyse")
-        [[ -n "${DATAFLOW_ANALYSE_IMAGE}" ]] && requested_tag="${DATAFLOW_ANALYSE_IMAGE}"
         ;;
       "secflow-app-system-analyse:secflow-app-system-analyse"|"secflow-app-system-analyse-worker:secflow-app-system-analyse-worker"|"secflow-app-system-analyse-runner:secflow-app-system-analyse-runner")
         [[ -n "${SYSTEM_ANALYSE_IMAGE}" ]] && requested_tag="${SYSTEM_ANALYSE_IMAGE}"

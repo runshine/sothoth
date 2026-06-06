@@ -177,7 +177,7 @@ class FileserverServiceConfig(BaseModel):
 
 
 class VulnerabilityServiceConfig(BaseModel):
-    base_url: str = "http://secflow-app-dataflow-vuln-scanner"
+    base_url: str = "http://secflow-app-dataflow-vuln-scan"
     timeout: int = 60
 
 
@@ -194,10 +194,7 @@ class ServicesConfig(BaseModel):
     entry_analyse: SimpleServiceConfig = Field(
         default_factory=lambda: SimpleServiceConfig(base_url="http://secflow-app-entry-analyse")
     )
-    dataflow_analyse: SimpleServiceConfig = Field(
-        default_factory=lambda: SimpleServiceConfig(base_url="http://secflow-app-dataflow-analyse")
-    )
-    dataflow_vuln_scanner: VulnerabilityServiceConfig = Field(
+    dataflow_vuln_scan: VulnerabilityServiceConfig = Field(
         default_factory=VulnerabilityServiceConfig
     )
     fileserver: FileserverServiceConfig = Field(default_factory=FileserverServiceConfig)
@@ -227,8 +224,7 @@ def validate_downstream_service_base_urls(config: Config) -> None:
         "system_analyse": config.services.system_analyse.base_url,
         "binary_to_source": config.services.binary_to_source.base_url,
         "entry_analyse": config.services.entry_analyse.base_url,
-        "dataflow_analyse": config.services.dataflow_analyse.base_url,
-        "dataflow_vuln_scanner": config.services.dataflow_vuln_scanner.base_url,
+        "dataflow_vuln_scan": config.services.dataflow_vuln_scan.base_url,
     }
     for service_name, raw_url in services_to_validate.items():
         value = str(raw_url or "").strip()

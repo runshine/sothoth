@@ -104,6 +104,7 @@ class SchedulerConfig(BaseModel):
     leader_renew_seconds: int = 5
     reclaim_interval_seconds: int = 15
     delay_promote_batch_size: int = 50
+    ready_backfill_batch_size: int = 100
 
 
 class RedisConfig(BaseModel):
@@ -115,6 +116,7 @@ class RedisConfig(BaseModel):
 
 class RuntimeConfig(BaseModel):
     role: str = "all"
+    redis_degraded_ready: bool = True
 
 
 class WorkerConfig(BaseModel):
@@ -124,6 +126,7 @@ class WorkerConfig(BaseModel):
     heartbeat_seconds: int = 10
     drain_timeout_seconds: int = 60
     idle_sleep_seconds: float = 0.5
+    db_fallback_batch_size: int = 20
 
 
 class LimitsConfig(BaseModel):

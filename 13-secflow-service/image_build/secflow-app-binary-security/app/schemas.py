@@ -39,6 +39,7 @@ class TaskPolicyOverrides(BaseModel):
     stage_parallelism: dict[str, int] = Field(default_factory=dict)
     module_selection_mode: Optional[str] = None
     module_risk_levels: Optional[list[str]] = None
+    entry_selection_mode: Optional[str] = None
 
 
 class BinarySecurityTaskCreate(BaseModel):
@@ -173,6 +174,9 @@ class BinarySecurityTaskResponse(BaseModel):
     selected_module_count: int = 0
     selected_risk_levels: list[str] = Field(default_factory=list)
     module_selection_mode: str = "auto"
+    entry_selection_mode: str = "auto"
+    candidate_entry_count: int = 0
+    selected_entry_count: int = 0
     entry_count: int = 0
     vuln_result_count: int = 0
     firmware_item_count: int = 0
@@ -639,6 +643,22 @@ class BinarySecurityModuleSelectionConfirmPayload(BaseModel):
     selected_module_keys: list[str] = Field(default_factory=list)
 
 
+class BinarySecurityEntrySelectionResponse(BaseModel):
+    task_id: str
+    status: str
+    selection_mode: str = "auto"
+    requires_confirmation: bool = False
+    candidate_entries: list[dict[str, Any]] = Field(default_factory=list)
+    selected_entry_keys: list[str] = Field(default_factory=list)
+    selected_entries: list[dict[str, Any]] = Field(default_factory=list)
+    entry_results: list[dict[str, Any]] = Field(default_factory=list)
+    confirmed_at: Optional[datetime] = None
+
+
+class BinarySecurityEntrySelectionConfirmPayload(BaseModel):
+    selected_entry_keys: list[str] = Field(default_factory=list)
+
+
 class BinarySecurityProjectConfigPayload(BaseModel):
     pipeline_mode: str = Field(default="barrier")
     max_stage_parallelism: int = Field(default=4, ge=1, le=32)
@@ -648,7 +668,7 @@ class BinarySecurityProjectConfigPayload(BaseModel):
         default_factory=lambda: {
             "binary_to_source": False,
             "entry_analysis": False,
-            "dataflow_analysis": False,
+            "dataflow_vuln_scan": False,
         }
     )
     stage_parallelism: dict[str, int] = Field(

@@ -175,6 +175,7 @@ class RuntimeOverviewResponse(BaseModel):
     workers: dict[str, Any]
     stats: dict[str, Any]
     redis_available: bool
+    redis_degraded: bool
 
 
 class JobRuntimeResponse(BaseModel):
@@ -183,6 +184,7 @@ class JobRuntimeResponse(BaseModel):
     next_run_at: Optional[datetime] = None
     last_run_at: Optional[datetime] = None
     inflight_count: int
+    queued_count: int = 0
     last_execution_status: Optional[str] = None
     recent_error_rate: float
 

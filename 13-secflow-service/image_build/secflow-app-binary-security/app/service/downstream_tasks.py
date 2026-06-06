@@ -7,6 +7,7 @@ orchestration code must not call downstream service clients directly.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 from datetime import timedelta
@@ -21,6 +22,7 @@ from app.time_utils import now_local
 
 DOWNSTREAM_REF_ACTIVE_STATUSES = {"queued", "running", "dispatching", "pending", "cancelling", "cancel_requested"}
 DOWNSTREAM_REF_DELETED_STATUSES = {"deleted", "missing", "downstream_missing", "not_found"}
+LEGACY_UNSUPPORTED_DOWNSTREAM_SERVICES = {"dataflow_analyse", "dataflow_vuln_scanner"}
 
 
 def get_binary_to_source_client():
@@ -29,16 +31,10 @@ def get_binary_to_source_client():
     return task_manager_module.get_binary_to_source_client()
 
 
-def get_dataflow_analyse_client():
+def get_dataflow_vuln_scan_client():
     from app.service import task_manager as task_manager_module
 
-    return task_manager_module.get_dataflow_analyse_client()
-
-
-def get_dataflow_vuln_scanner_client():
-    from app.service import task_manager as task_manager_module
-
-    return task_manager_module.get_dataflow_vuln_scanner_client()
+    return task_manager_module.get_dataflow_vuln_scan_client()
 
 
 def get_entry_analyse_client():
@@ -60,14 +56,21 @@ def get_system_analyse_client():
 
 
 class DownstreamTaskGateway:
+    @staticmethod
+    async def _call_with_optional_token(method: Any, task_id: str, token: str | None) -> dict[str, Any]:
+        try:
+            signature = inspect.signature(method)
+        except (TypeError, ValueError):
+            signature = None
+        if signature is not None and "token" not in signature.parameters:
+            return await method(task_id)
+        return await method(task_id, token or "")
+
     def _binary_to_source_client(self):
         return get_binary_to_source_client()
 
-    def _dataflow_analyse_client(self):
-        return get_dataflow_analyse_client()
-
-    def _dataflow_vuln_scanner_client(self):
-        return get_dataflow_vuln_scanner_client()
+    def _dataflow_vuln_scan_client(self):
+        return get_dataflow_vuln_scan_client()
 
     def _entry_analyse_client(self):
         return get_entry_analyse_client()
@@ -84,6 +87,9 @@ class DownstreamTaskGateway:
             raise ValidationError("缺少下游服务标识")
         return value
 
+    def _reject_legacy_service(self, service: str) -> None:
+        raise ValidationError(f"历史下游服务 {service} 已移除，请使用 dataflow_vuln_scan")
+
     async def get_task(self, service: str, *, project_id: str | None, task_id: str, token: str | None) -> dict[str, Any]:
         normalized = self._normalize_service(service)
         if normalized == "firmware_unpacker":
@@ -94,10 +100,10 @@ class DownstreamTaskGateway:
             return await self._binary_to_source_client().get_task(project_id or "", task_id, token or "")
         if normalized == "entry_analyse":
             return await self._entry_analyse_client().get_task(task_id, token or "")
-        if normalized == "dataflow_analyse":
-            return await self._dataflow_analyse_client().get_task(task_id)
-        if normalized == "dataflow_vuln_scanner":
-            return await self._dataflow_vuln_scanner_client().get_task(task_id, token or "")
+        if normalized in LEGACY_UNSUPPORTED_DOWNSTREAM_SERVICES:
+            self._reject_legacy_service(normalized)
+        if normalized == "dataflow_vuln_scan":
+            return await self._call_with_optional_token(self._dataflow_vuln_scan_client().get_task, task_id, token)
         raise ValidationError(f"未知下游服务: {normalized}")
 
     async def list_tasks(self, service: str, *, project_id: str, token: str | None, **kwargs: Any) -> dict[str, Any]:
@@ -142,18 +148,10 @@ class DownstreamTaskGateway:
                 sort_order=str(kwargs.get("sort_order") or "desc"),
                 token=token,
             )
-        if normalized == "dataflow_analyse":
-            return await self._dataflow_analyse_client().list_tasks(
-                project_id,
-                parent_task_id=kwargs.get("parent_task_id"),
-                parent_stage_item_id=kwargs.get("parent_stage_item_id"),
-                page=int(kwargs.get("page", 1) or 1),
-                per_page=int(kwargs.get("per_page", 100) or 100),
-                sort_by=str(kwargs.get("sort_by") or "updated_at"),
-                sort_order=str(kwargs.get("sort_order") or "desc"),
-            )
-        if normalized == "dataflow_vuln_scanner":
-            rows = await self._dataflow_vuln_scanner_client().list_tasks(
+        if normalized in LEGACY_UNSUPPORTED_DOWNSTREAM_SERVICES:
+            self._reject_legacy_service(normalized)
+        if normalized == "dataflow_vuln_scan":
+            rows = await self._dataflow_vuln_scan_client().list_tasks(
                 project_id,
                 token or "",
                 limit=int(kwargs.get("limit", 100) or 100),
@@ -205,8 +203,10 @@ class DownstreamTaskGateway:
                 kwargs.get("source_path"),
                 kwargs.get("origin"),
             )
-        if normalized == "dataflow_analyse":
-            return await self._dataflow_analyse_client().create_task(
+        if normalized in LEGACY_UNSUPPORTED_DOWNSTREAM_SERVICES:
+            self._reject_legacy_service(normalized)
+        if normalized == "dataflow_vuln_scan" and "module_input_path" in kwargs:
+            return await self._dataflow_vuln_scan_client().create_task(
                 project_id,
                 str(kwargs["task_name"]),
                 str(kwargs["module_input_path"]),
@@ -224,13 +224,13 @@ class DownstreamTaskGateway:
                 function_description_source=kwargs.get("function_description_source"),
                 entry_reason_source=kwargs.get("entry_reason_source"),
             )
-        if normalized == "dataflow_vuln_scanner":
-            return await self._dataflow_vuln_scanner_client().create_task(
+        if normalized == "dataflow_vuln_scan":
+            return await self._dataflow_vuln_scan_client().create_task(
                 project_id,
                 str(kwargs["title"]),
-                token or "",
                 str(kwargs["data_flow_path"]),
                 str(kwargs["source_dir"]),
+                str(kwargs.get("prompt_content") or ""),
                 kwargs.get("origin"),
             )
         raise ValidationError(f"未知下游服务: {normalized}")
@@ -259,10 +259,10 @@ class DownstreamTaskGateway:
             )
         if stage_name == "entry_analysis" and normalized == "entry_analyse":
             return await self._entry_analyse_client().restart_task(task_id, token or "")
-        if stage_name == "dataflow_analysis" and normalized == "dataflow_vuln_scanner":
-            return await self._dataflow_vuln_scanner_client().retry_task(task_id, token or "")
-        if stage_name == "vuln_scan" and normalized == "dataflow_vuln_scanner":
-            return await self._dataflow_vuln_scanner_client().retry_task(task_id, token or "")
+        if stage_name == "dataflow_analysis" and normalized == "dataflow_vuln_scan":
+            return await self._dataflow_vuln_scan_client().retry_task(task_id, token or "")
+        if stage_name == "vuln_scan" and normalized == "dataflow_vuln_scan":
+            return await self._dataflow_vuln_scan_client().retry_task(task_id, token or "")
         raise ValidationError(f"阶段 {stage_name} 未配置安全重试接口")
 
     async def cancel_task(self, service: str, *, project_id: str | None, task_id: str, token: str | None) -> dict[str, Any]:
@@ -275,10 +275,10 @@ class DownstreamTaskGateway:
             return await self._binary_to_source_client().cancel_task(project_id or "", task_id, token or "")
         if normalized == "entry_analyse":
             return await self._entry_analyse_client().cancel_task(task_id, token or "")
-        if normalized == "dataflow_analyse":
-            return await self._dataflow_analyse_client().cancel_task(task_id)
-        if normalized == "dataflow_vuln_scanner":
-            return await self._dataflow_vuln_scanner_client().cancel_task(task_id, token or "")
+        if normalized in LEGACY_UNSUPPORTED_DOWNSTREAM_SERVICES:
+            self._reject_legacy_service(normalized)
+        if normalized == "dataflow_vuln_scan":
+            return await self._dataflow_vuln_scan_client().cancel_task(task_id, token or "")
         raise ValidationError(f"未知下游服务: {normalized}")
 
     async def delete_task(self, service: str, *, project_id: str | None, task_id: str, token: str | None) -> dict[str, Any]:
@@ -291,10 +291,10 @@ class DownstreamTaskGateway:
             return await self._binary_to_source_client().delete_task(project_id or "", task_id, token or "")
         if normalized == "entry_analyse":
             return await self._entry_analyse_client().delete_task(task_id, token or "")
-        if normalized == "dataflow_analyse":
-            return await self._dataflow_analyse_client().delete_task(task_id)
-        if normalized == "dataflow_vuln_scanner":
-            return await self._dataflow_vuln_scanner_client().delete_task(task_id, token or "")
+        if normalized in LEGACY_UNSUPPORTED_DOWNSTREAM_SERVICES:
+            self._reject_legacy_service(normalized)
+        if normalized == "dataflow_vuln_scan":
+            return await self._dataflow_vuln_scan_client().delete_task(task_id, token or "")
         raise ValidationError(f"未知下游服务: {normalized}")
 
     async def get_task_result(self, service: str, *, task_id: str) -> dict[str, Any]:
@@ -305,8 +305,8 @@ class DownstreamTaskGateway:
 
     async def get_artifacts(self, service: str, *, task_id: str, token: str | None) -> dict[str, Any]:
         normalized = self._normalize_service(service)
-        if normalized == "dataflow_vuln_scanner":
-            return await self._dataflow_vuln_scanner_client().get_artifacts(task_id, token or "")
+        if normalized == "dataflow_vuln_scan":
+            return await self._dataflow_vuln_scan_client().get_artifacts(task_id, token or "")
         raise ValidationError(f"下游服务 {normalized} 不支持产物读取")
 
 

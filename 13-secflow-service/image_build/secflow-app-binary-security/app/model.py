@@ -29,7 +29,7 @@ STAGE_SEQUENCE = [
     "system_analysis",
     "binary_to_source",
     "entry_analysis",
-    "dataflow_analysis",
+    "dataflow_vuln_scan",
 ]
 TASK_TYPE_BINARY = "binary"
 TASK_TYPE_SOURCE = "source"
@@ -39,14 +39,24 @@ TASK_STAGE_SEQUENCES = {
     TASK_TYPE_SOURCE: [
         "system_analysis",
         "entry_analysis",
-        "dataflow_analysis",
+        "dataflow_vuln_scan",
     ],
     TASK_TYPE_BINARY_MODULE: [
         "binary_to_source",
         "entry_analysis",
-        "dataflow_analysis",
+        "dataflow_vuln_scan",
     ],
 }
+
+LEGACY_STAGE_NAME_ALIASES = {
+    "dataflow_analysis": "dataflow_vuln_scan",
+    "vuln_scan": "dataflow_vuln_scan",
+}
+
+
+def normalize_stage_name(value: str | None) -> str:
+    normalized = str(value or "").strip()
+    return LEGACY_STAGE_NAME_ALIASES.get(normalized, normalized)
 
 
 def normalize_parent_key(value: str | None) -> str:

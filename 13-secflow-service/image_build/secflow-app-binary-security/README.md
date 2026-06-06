@@ -2,7 +2,7 @@
 
 统一的二进制软件包安全编排微服务，负责按固定阶段顺序调用：
 
-`firmware-unpacker -> system-analyse -> binary-to-source -> entry-analyse -> dataflow-analyse -> dataflow-vuln-scanner`
+`firmware-unpacker -> system-analyse -> binary-to-source -> entry-analyse -> dataflow-vuln-scan`
 
 ## 主要能力
 
@@ -25,21 +25,20 @@
 
 保持为阶段屏障模式；
 
-`entry-analyse -> dataflow-analyse -> dataflow-vuln-scanner`
+`entry-analyse -> dataflow-vuln-scan`
 
 保持阶段顺序，但以 item 为单位流式推进。
 
 ## Mixed Streaming 行为
 
 - `binary-to-source` 产出单个结果后，可立即为对应模块创建 `entry-analyse` 子任务。
-- 单个 `entry-analyse` 完成后，可立即为其派生 `dataflow-analyse` 子任务。
-- 单个 `dataflow-analyse` 完成后，可立即为其派生 `dataflow-vuln-scanner` 子任务。
+- 单个 `entry-analyse` 完成后，可立即为其派生 `dataflow-vuln-scan` 子任务。
 - 下游任务输入来自上游 item 结果及其聚合产物，不需要等待同阶段全部模块完成。
 - 并发控制仍然只服从总阶段并发上限；下层排队由下游服务自身负责。
 
 ## DFA 路径契约
 
-为了避免 `entry-analyse`、`system-analyse`、`dataflow-analyse` 之间混用“模块目录”和“源码根目录”，编排器统一遵守下面的定义：
+为了避免 `entry-analyse`、`system-analyse`、`dataflow-vuln-scan` 之间混用“模块目录”和“源码根目录”，编排器统一遵守下面的定义：
 
 - `module_input_path`
   - 含义：模块描述目录
@@ -61,20 +60,19 @@
 这意味着：
 
 - `entry-analyse` 允许 `input_path != source_path`
-- `dataflow-analyse` 不再允许只靠 `input_path` 猜源码根
+- `dataflow-vuln-scan` 不再允许只靠 `input_path` 猜源码根
 - Binary Security 在创建 DFA 子任务时，必须显式同时传 `module_input_path` 和 `source_root_path`
 
 ## 状态语义
 
-- 混合流式尾部阶段激活后，任务会在 `entry-analyse / dataflow-analyse / dataflow-vuln-scanner` 之间自动推进。
+- 混合流式尾部阶段激活后，任务会在 `entry-analyse / dataflow-vuln-scan` 之间自动推进。
 - 某个尾部阶段即使当前没有待执行 item，也会保留已有的 `failed`、`downstream_missing` 等阶段状态，而不是一律回退为 `pending`。
 - 任务详情、阶段摘要和手工操作面板会把“尾部仍在自动推进”的任务视作运行中，避免错误暴露 `continue` / `retry`。
 
 ## 重试语义
 
 - 在 `mixed_streaming` 模式下，尾部阶段失败项重试采用 lineage 定向清理，而不是整阶段清空。
-- 重试 `entry-analyse` item 时，只清理它派生出的 `dataflow-analyse` 与 `dataflow-vuln-scanner` 后代。
-- 重试 `dataflow-analyse` item 时，只清理它派生出的 `dataflow-vuln-scanner` 后代。
+- 重试 `entry-analyse` item 时，只清理它派生出的 `dataflow-vuln-scan` 后代。
 - 这样可以保留其他模块已经完成的分析结果，减少重复计算。
 
 ## 配置
@@ -93,7 +91,7 @@ runtime_policy:
 ## 验证覆盖
 
 - 生命周期：阶段完成后切换到流式尾部的 reducer 序列。
-- 调度行为：`binary-to-source -> entry-analyse -> dataflow-analyse -> dataflow-vuln-scanner` 的逐级派生。
+- 调度行为：`binary-to-source -> entry-analyse -> dataflow-vuln-scan` 的逐级派生。
 - 状态同步：任务详情、阶段摘要、手工操作状态与尾部阶段快照一致。
 - 重试逻辑：尾部失败项按 lineage 清理后代结果，避免整阶段回滚。
 
@@ -103,7 +101,7 @@ runtime_policy:
 
 1. 保持 `runtime_policy.pipeline_mode: barrier` 部署新版本，先验证服务启动、路由、worker、reducer 正常。
 2. 选择单个低风险项目，通过项目级配置切换 `pipeline_mode: mixed_streaming`，不要直接改全局默认值。
-3. 先跑一批源码任务，重点观察 `entry-analyse / dataflow-analyse / dataflow-vuln-scanner` 是否出现按 item 流式推进。
+3. 先跑一批源码任务，重点观察 `entry-analyse / dataflow-vuln-scan` 是否出现按 item 流式推进。
 4. 验证任务详情、`stage-items`、`orchestration-observability` 三个视图对尾部运行态与失败态的展示是否一致。
 5. 验证 `retry` 与 `retry_failed_items` 在尾部 `failed`、`downstream_missing`、`partial_success` 场景下行为符合预期。
 6. 灰度稳定后，再评估是否把默认值从 `barrier` 调整为 `mixed_streaming`。

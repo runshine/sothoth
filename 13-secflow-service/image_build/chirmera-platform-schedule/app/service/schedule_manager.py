@@ -17,7 +17,7 @@ from croniter import croniter
 from sqlalchemy.orm import Session
 
 from app.config import get_config
-from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
+from app.exception import NotFoundError, UpstreamError, ValidationError
 from app.model import ScheduleExecution, ScheduleExecutionEvent, ScheduleJob, get_db_session
 from app.service.http_client import get_shared_async_client
 from app.service.redis_runtime import get_redis_runtime
@@ -298,12 +298,6 @@ class ScheduleManager:
         scheduled_for: datetime,
         dedupe_key: str,
     ) -> ScheduleExecution:
-        running = db.query(ScheduleExecution).filter(
-            ScheduleExecution.schedule_job_id == job.id,
-            ScheduleExecution.status.in_(["queued", "leased", "dispatching", "retry_wait"]),
-        ).count()
-        if running >= max(1, int(job.max_concurrency or 1)):
-            raise ConflictError("当前调度任务已达到最大并发执行数")
         execution = ScheduleExecution(
             schedule_job_id=job.id,
             project_id=job.project_id,
@@ -318,6 +312,96 @@ class ScheduleManager:
         db.add(execution)
         db.flush()
         return execution
+
+    def _working_status_query(self, db: Session):
+        return db.query(ScheduleExecution).filter(
+            ScheduleExecution.status.in_(["leased", "dispatching"])
+        )
+
+    def _job_limits(self, job: ScheduleJob) -> tuple[int, int, int]:
+        return (
+            max(1, int(job.max_concurrency or 1)),
+            max(1, int(self.cfg.limits.project_default_concurrency)),
+            max(1, int(self.cfg.limits.target_default_concurrency)),
+        )
+
+    def _working_count_for_job(self, db: Session, job_id: str) -> int:
+        return self._working_status_query(db).filter(
+            ScheduleExecution.schedule_job_id == job_id
+        ).count()
+
+    def _working_count_for_project(self, db: Session, project_id: str) -> int:
+        return self._working_status_query(db).filter(
+            ScheduleExecution.project_id == project_id
+        ).count()
+
+    def _working_count_for_target(self, db: Session, project_id: str, target_bucket: str) -> int:
+        return self._working_status_query(db).filter(
+            ScheduleExecution.project_id == project_id,
+            ScheduleExecution.target_bucket == target_bucket,
+        ).count()
+
+    def claim_execution_if_capacity(self, db: Session, execution_id: str) -> tuple[ScheduleExecution | None, bool]:
+        execution = db.query(ScheduleExecution).filter(
+            ScheduleExecution.id == execution_id
+        ).first()
+        if execution is None:
+            return None, False
+        if execution.status != "queued":
+            return execution, False
+
+        job = self.get_job_or_404(db, execution.project_id, execution.schedule_job_id)
+        target_bucket = execution.target_bucket or self._job_bucket_key(job)
+        job_limit, project_limit, target_limit = self._job_limits(job)
+        job_working = self._working_count_for_job(db, job.id)
+        project_working = self._working_count_for_project(db, execution.project_id)
+        target_working = self._working_count_for_target(db, execution.project_id, target_bucket)
+        if job_working >= job_limit or project_working >= project_limit or target_working >= target_limit:
+            self._append_event(
+                db,
+                execution.id,
+                "claim_rejected_by_concurrency_limit",
+                "Execution stayed queued because working capacity is full",
+                {
+                    "job_limit": job_limit,
+                    "project_limit": project_limit,
+                    "target_limit": target_limit,
+                    "job_working": job_working,
+                    "project_working": project_working,
+                    "target_working": target_working,
+                },
+                event_source="worker",
+                attempt_no=execution.attempt_no,
+            )
+            db.commit()
+            db.refresh(execution)
+            return execution, False
+
+        lease_token = uuid.uuid4().hex
+        execution.status = "leased"
+        execution.lease_owner = self.pod_name
+        execution.worker_pod = self.pod_name
+        execution.lease_token = lease_token
+        execution.lease_expire_at = utcnow() + timedelta(seconds=self.cfg.worker.lease_seconds)
+        execution.heartbeat_at = utcnow()
+        execution.retry_at = None
+        self._append_event(
+            db,
+            execution.id,
+            "leased",
+            "Execution lease acquired",
+            {
+                "job_limit": job_limit,
+                "project_limit": project_limit,
+                "target_limit": target_limit,
+            },
+            event_source="worker",
+            attempt_no=execution.attempt_no,
+            lease_token=lease_token,
+        )
+        db.commit()
+        db.refresh(execution)
+        return execution, True
 
     async def enqueue_execution(self, execution_id: str) -> None:
         await self.redis.enqueue_ready(execution_id)

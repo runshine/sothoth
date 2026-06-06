@@ -1,4 +1,4 @@
-"""Adapter for secflow-app-dataflow-vuln-scanner."""
+"""Adapter for secflow-app-dataflow-vuln-scan."""
 
 from __future__ import annotations
 
@@ -9,12 +9,12 @@ from app.config import get_config
 from app.service.downstream_base import JsonHttpClient
 
 
-class DataflowVulnScannerClient(JsonHttpClient):
-    API_PREFIX = "/api/dataflow-vuln-scanner"
+class DataflowVulnScanClient(JsonHttpClient):
+    API_PREFIX = "/api/app/dataflow-vuln-scan"
 
     def __init__(self) -> None:
         app_cfg = get_config()
-        cfg = app_cfg.services.dataflow_vuln_scanner
+        cfg = app_cfg.services.dataflow_vuln_scan
         super().__init__(base_url=cfg.base_url.rstrip("/"), timeout=app_cfg.scheduler.downstream_request_timeout_seconds)
 
     def _project_filesystem_ref(self, project_id: str, path: str) -> dict[str, Any]:
@@ -25,7 +25,7 @@ class DataflowVulnScannerClient(JsonHttpClient):
         try:
             relative = candidate.relative_to(project_root)
         except ValueError as exc:
-            raise ValueError(f"dataflow-vuln-scanner input must be under project root {project_root}: {candidate}") from exc
+            raise ValueError(f"dataflow-vuln-scan input must be under project root {project_root}: {candidate}") from exc
         project_path = "/" + relative.as_posix().lstrip("/")
         return {
             "source": "project_filesystem",
@@ -91,10 +91,12 @@ class DataflowVulnScannerClient(JsonHttpClient):
         parent_task_id: str | None = None,
         parent_stage_item_id: str | None = None,
     ) -> list[dict]:
+        safe_limit = max(1, int(limit or 100))
+        safe_offset = max(0, int(offset or 0))
         params: dict[str, Any] = {
             "project_id": project_id,
-            "limit": limit,
-            "offset": offset,
+            "page": (safe_offset // safe_limit) + 1,
+            "per_page": safe_limit,
         }
         if status:
             params["status"] = status
@@ -111,17 +113,17 @@ class DataflowVulnScannerClient(JsonHttpClient):
         return await self.post(f"{self.API_PREFIX}/tasks/{task_id}/cancel", token=token)
 
     async def retry_task(self, task_id: str, token: str) -> dict:
-        return await self.post(f"{self.API_PREFIX}/tasks/{task_id}/retry", token=token)
+        return await self.post(f"{self.API_PREFIX}/tasks/{task_id}/restart", token=token)
 
     async def delete_task(self, task_id: str, token: str) -> dict:
         return await self.delete(f"{self.API_PREFIX}/tasks/{task_id}", token=token)
 
 
-_client: Optional[DataflowVulnScannerClient] = None
+_client: Optional[DataflowVulnScanClient] = None
 
 
-def get_dataflow_vuln_scanner_client() -> DataflowVulnScannerClient:
+def get_dataflow_vuln_scan_client() -> DataflowVulnScanClient:
     global _client
     if _client is None:
-        _client = DataflowVulnScannerClient()
+        _client = DataflowVulnScanClient()
     return _client

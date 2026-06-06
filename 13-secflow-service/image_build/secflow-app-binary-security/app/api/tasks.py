@@ -18,6 +18,8 @@ from app.schemas import (
     BinarySecurityArchiveJobPageResponse,
     BinarySecurityArtifactsResponse,
     BinarySecurityDownstreamStatusSyncPayload,
+    BinarySecurityEntrySelectionConfirmPayload,
+    BinarySecurityEntrySelectionResponse,
     BinarySecurityModuleSelectionConfirmPayload,
     BinarySecurityModuleSelectionResponse,
     BinarySecurityOverviewResponse,
@@ -590,6 +592,32 @@ def confirm_module_selection(
         project_id=project_id,
         task_id=task_id,
         selected_module_keys=payload.selected_module_keys,
+    )
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/entry-selection", response_model=BinarySecurityEntrySelectionResponse)
+def get_entry_selection(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().get_entry_selection(db, project_id=project_id, task_id=task_id)
+
+
+@router.post("/projects/{project_id}/tasks/{task_id}/entry-selection/confirm", response_model=BinarySecurityTaskDetailResponse)
+def confirm_entry_selection(
+    project_id: str,
+    task_id: str,
+    payload: BinarySecurityEntrySelectionConfirmPayload,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().confirm_entry_selection(
+        db,
+        project_id=project_id,
+        task_id=task_id,
+        selected_entry_keys=payload.selected_entry_keys,
     )
 
 

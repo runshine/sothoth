@@ -82,11 +82,8 @@ data:
       entry_analyse:
         base_url: "http://secflow-app-entry-analyse"
         timeout: 60
-      dataflow_analyse:
-        base_url: "http://secflow-app-dataflow-analyse"
-        timeout: 60
-      dataflow_vuln_scanner:
-        base_url: "http://secflow-app-dataflow-vuln-scanner"
+      dataflow_vuln_scan:
+        base_url: "http://secflow-app-dataflow-vuln-scan"
         timeout: 120
       fileserver:
         base_url: "http://secflow-platform-fileserver/api/fileserver"
@@ -103,7 +100,7 @@ data:
       host: "secflow-app-binary-security"
       port: 80
       maturity: "开发中"
-      description: "统一串联固件解包、系统分析、反编译、入口分析、数据流分析和漏洞扫描"
+      description: "统一串联固件解包、系统分析、反编译、入口分析和数据流漏洞挖掘"
       api_prefix: "/api/app/binary-security"
       menu:
         id: "secflow-app-binary-security"

@@ -96,7 +96,7 @@ def _finding_id(source_meta: dict, metadata: dict, source_task: dict) -> str | N
         source_meta.get("finding_id"),
         source_meta.get("report_id"),
         source_task.get("finding_id") if isinstance(source_task, dict) else None,
-        (metadata.get("dataflow_vuln_scanner") or {}).get("finding_id") if isinstance(metadata.get("dataflow_vuln_scanner"), dict) else None,
+        (metadata.get("dataflow_vuln_scan") or {}).get("finding_id") if isinstance(metadata.get("dataflow_vuln_scan"), dict) else None,
     ):
         value = str(candidate or "").strip()
         if value:
