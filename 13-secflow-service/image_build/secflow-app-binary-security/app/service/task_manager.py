@@ -16370,6 +16370,8 @@ class TaskManager:
         stage_name: str,
         stage_run: BinarySecurityStageRun | None,
         items: list[BinarySecurityStageItem],
+        *,
+        db: Session | None = None,
     ) -> str:
         if stage_name == "system_analysis":
             if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
@@ -16378,7 +16380,7 @@ class TaskManager:
             return "waiting_confirmation"
         statuses = [self._normalize_downstream_status(item.status) or item.status for item in items]
         aggregated_item_status = self._aggregate_item_statuses(statuses) if statuses else None
-        archive_gated = self._stage_archive_success_blocked(task, stage_name, items)
+        archive_gated = self._stage_archive_success_blocked(task, stage_name, items, db=db)
         if self._is_streaming_tail_stage(task, stage_name) and any(
             self._is_streaming_active_item_status(item.status)
             for item in items
@@ -16871,7 +16873,7 @@ class TaskManager:
             stage_summary = BinarySecurityStageSummary(
                 stage_name=stage_name,
                 sequence_no=run.sequence_no if run else index,
-                status=self._business_stage_status(task, stage_name, run, stage_items),
+                status=self._business_stage_status(task, stage_name, run, stage_items, db=db),
                 retry_count=int(run.retry_count or 0) if run else 0,
                 retry_supported=stage_retry_support.get(stage_name, (False, None))[0],
                 retry_reason=stage_retry_support.get(stage_name, (False, None))[1],
