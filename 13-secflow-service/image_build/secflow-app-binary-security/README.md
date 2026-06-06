@@ -97,10 +97,10 @@ runtime_policy:
 
 ## 历史数据归一
 
-如果库中仍存在旧阶段名或旧下游服务名称，可执行一次性归一脚本：
+如果库中仍存在旧阶段名或旧下游服务名称，可执行一次性归一脚本（镜像内路径）：
 
 ```bash
-python scripts/normalize_legacy_dataflow_names.py
+python /app/scripts/normalize_legacy_dataflow_names.py
 ```
 
 脚本会把以下旧值统一到当前规范：

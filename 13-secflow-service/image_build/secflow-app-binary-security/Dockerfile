@@ -20,6 +20,7 @@ COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app/ /app/app/
+COPY scripts/ /app/scripts/
 COPY config.yaml /app/config.yaml
 RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
