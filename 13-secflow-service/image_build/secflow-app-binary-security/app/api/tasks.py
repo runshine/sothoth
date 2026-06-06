@@ -373,10 +373,11 @@ async def cancel_task(
 async def delete_task(
     project_id: str,
     task_id: str,
+    force: bool = Query(default=False),
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    return await get_task_manager().delete_task(db, project_id=project_id, task_id=task_id)
+    return await get_task_manager().delete_task(db, project_id=project_id, task_id=task_id, force=force)
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/retry", response_model=BinarySecurityActionResponse)

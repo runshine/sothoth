@@ -373,36 +373,49 @@ def _is_default_timeline_event(event: B2STaskEventModel) -> bool:
     return _event_timeline_visible(event) and _event_timeline_class(event) in DEFAULT_TIMELINE_CLASSES
 
 
-def _task_execution_epoch(task: B2STask) -> int:
-    metadata = task.extra_metadata or {}
-    return max(0, int(metadata.get("task_execution_epoch") or 0))
+def _task_execution_epoch(task: B2STask | None) -> int | None:
+    if task is None:
+        return None
+    metadata = getattr(task, "extra_metadata", None)
+    if not isinstance(metadata, dict):
+        metadata = {}
+    value = metadata.get("task_execution_epoch")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _timeline_payload(
     *,
+    task: B2STask | None = None,
     timeline_class: str,
-    timeline_visible: bool = True,
+    timeline_visible: bool | None = None,
     operation_name: str | None = None,
     operation_run_id: str | None = None,
     task_execution_epoch: int | None = None,
     dispatch_cycle: int | None = None,
     related_event_ids: list[str] | None = None,
+    payload: dict[str, Any] | None = None,
     extra_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    payload = dict(extra_payload or {})
-    payload["timeline_class"] = timeline_class
-    payload["timeline_visible"] = bool(timeline_visible)
+    merged = dict(extra_payload or payload or {})
+    merged["timeline_class"] = timeline_class
+    merged["timeline_visible"] = timeline_class != TIMELINE_CLASS_INTERNAL if timeline_visible is None else bool(timeline_visible)
     if operation_name:
-        payload["operation_name"] = operation_name
+        merged["operation_name"] = operation_name
     if operation_run_id:
-        payload["operation_run_id"] = operation_run_id
-    if task_execution_epoch is not None:
-        payload["task_execution_epoch"] = int(task_execution_epoch)
+        merged["operation_run_id"] = operation_run_id
+    epoch = task_execution_epoch
+    if epoch is None and task is not None:
+        epoch = _task_execution_epoch(task)
+    if epoch is not None:
+        merged["task_execution_epoch"] = int(epoch)
     if dispatch_cycle is not None:
-        payload["dispatch_cycle"] = int(dispatch_cycle)
+        merged["dispatch_cycle"] = int(dispatch_cycle)
     if related_event_ids:
-        payload["related_event_ids"] = list(related_event_ids)
-    return payload
+        merged["related_event_ids"] = list(related_event_ids)
+    return merged
 
 
 def _event_timeline_class(event: B2STaskEventModel) -> str:
@@ -1941,6 +1954,11 @@ def _pi_job_payload(
     concurrency: int,
     clean: bool,
 ) -> dict:
+    normalized_engine = str(engine or "").strip().lower()
+    if normalized_engine == "turbo":
+        normalized_engine = "hybrid"
+    if normalized_engine not in {"agent", "hybrid"}:
+        normalized_engine = "hybrid"
     return {
         "target": item.elf_path,
         "output_dir": item.output_dir,
@@ -1953,7 +1971,7 @@ def _pi_job_payload(
         "model": job_model,
         "functions": (item.extra_metadata or {}).get("file_list") or None,
         "clean": clean,
-        "engine": engine,
+        "engine": normalized_engine,
         "concurrency": concurrency,
     }
 

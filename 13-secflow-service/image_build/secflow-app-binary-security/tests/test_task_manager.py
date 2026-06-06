@@ -558,6 +558,22 @@ class _AppendingModelAwareDb(_ModelAwareDb):
         elif model_name == "BinarySecurityServiceConfig":
             self.service_configs.append(obj)
 
+    def delete(self, obj):
+        for rows in (
+            self.tasks,
+            self.stage_items,
+            self.stage_runs,
+            self.archive_jobs,
+            self.events,
+            self.state_events,
+            self.runtime_leases,
+            self.operations,
+            self.project_configs,
+            self.service_configs,
+        ):
+            if obj in rows:
+                rows.remove(obj)
+
 
 class _FlakyCommitDb(_AppendingModelAwareDb):
     def __init__(self, *, fail_commits=0, fail_flushes=0, error_factory=None, **kwargs):
@@ -7974,6 +7990,38 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(operation)
         self.assertEqual("cancelling", task.status)
         self.assertEqual("op-retry", task.current_operation_id)
+
+    def test_refresh_task_status_after_sync_recovers_failed_cancel_operation(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="cancelling",
+            current_stage="entry_analysis",
+            current_operation_id="op-cancel",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        cancel_operation = BinarySecurityTaskOperation(
+            id="op-cancel",
+            task_id="t1",
+            project_id="p1",
+            operation_type="cancel",
+            status="failed",
+            current_step="collect_cancel_targets",
+            error_message="result payload too large",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[cancel_operation])
+
+        self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual(TASK_STATUS_CANCEL_FAILED, task.status)
+        self.assertEqual("op-cancel", task.current_operation_id)
+        self.assertEqual("result payload too large", task.last_error)
+        self.assertIsNotNone(task.finished_at)
 
     def test_collect_cancel_targets_excludes_historical_parent_linked_refs(self):
         task = BinarySecurityTask(
@@ -20588,6 +20636,100 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(db.tasks))
         failed_events = [row for row in db.added if isinstance(row, BinarySecurityEvent) and row.event_type == "task_delete_failed"]
         self.assertTrue(failed_events)
+
+    def test_manual_delete_force_ignores_downstream_delete_failure_and_removes_parent(self):
+        task = BinarySecurityTask(
+            id="t-force-delete",
+            project_id="p1",
+            name="force-delete-me",
+            status="cancelled",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/out",
+            workspace_root="/tmp/ws-force-delete",
+            current_stage="entry_analysis",
+            current_operation_id="op-force-delete",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op-force-delete",
+            task_id=task.id,
+            project_id="p1",
+            operation_type="delete",
+            target_stage="entry_analysis",
+            status="running",
+            request_payload={"force_delete": True},
+        )
+        db = _AppendingModelAwareDb(tasks=[task], operations=[operation], state_events=[], events=[])
+
+        async def _run():
+            with (
+                patch.object(self.manager, "_cancel_local_worker", unittest.mock.AsyncMock()),
+                patch.object(self.manager, "_cancel_downstream_refs", unittest.mock.AsyncMock()),
+                patch.object(self.manager, "_delete_downstream_refs", unittest.mock.AsyncMock(return_value=0)) as delete_mock,
+                patch.object(self.manager, "_cleanup_task_workspace", unittest.mock.AsyncMock(return_value="deleted")),
+                patch.object(self.manager, "_write_task_metadata_async", unittest.mock.AsyncMock()),
+            ):
+                await self.manager._prepare_delete_task(db, task)
+                self.assertTrue(delete_mock.await_args.kwargs.get("force_delete"))
+
+        asyncio.run(_run())
+
+        self.assertEqual([], db.tasks)
+        event_types = [row.event_type for row in db.events if isinstance(row, BinarySecurityEvent)]
+        self.assertIn("task_force_delete_requested", event_types)
+        self.assertIn("task_force_delete_completed", event_types)
+
+    def test_delete_downstream_refs_force_delete_ignores_unverified_failure(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="failed",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="IPSEC",
+            status="cancelled",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_x",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+        client = _AsyncEntryAnalyseClientStub(delete_result=UpstreamError("500 Internal Server Error"))
+
+        async def _existing_task(task_id, token):
+            del token
+            return {"task_id": task_id, "status": "cancelled"}
+
+        client.get_task = _existing_task
+
+        with patch.object(downstream_tasks_module, "get_entry_analyse_client", return_value=client):
+            deleted = asyncio.run(
+                self.manager._delete_downstream_refs(
+                    db,
+                    task,
+                    [{"service": "entry_analyse", "task_id": "eat_x", "stage_name": "entry_analysis"}],
+                    "token",
+                    force_delete=True,
+                )
+            )
+
+        self.assertEqual(1, deleted)
+        cleanup_results = list(getattr(self.manager, "_last_downstream_cleanup_results", []) or [])
+        self.assertEqual(1, len(cleanup_results))
+        self.assertTrue(cleanup_results[0]["force_delete"])
+        self.assertEqual("force_delete", cleanup_results[0]["ignored_reason"])
+        event_types = [getattr(event, "event_type", "") for event in db.added]
+        self.assertIn("child_task_delete_failed_but_ignored", event_types)
 
 
 def _test_manual_cancel_collects_dispatching_and_orphan_downstream_refs(self):

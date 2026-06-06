@@ -810,7 +810,15 @@ class DownstreamTaskController:
     async def delete_child_task(self, *, service: str, project_id: str | None, task_id: str, token: str | None) -> dict[str, Any]:
         return await self.gateway.delete_task(service, project_id=project_id, task_id=task_id, token=token)
 
-    async def delete_child_refs(self, db: Session, task: BinarySecurityTask, refs: list[dict[str, str]], token: str | None) -> int:
+    async def delete_child_refs(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        refs: list[dict[str, str]],
+        token: str | None,
+        *,
+        force_delete: bool = False,
+    ) -> int:
         cleanup_results: list[dict[str, Any]] = []
         setattr(self.manager, "_last_downstream_cleanup_results", cleanup_results)
         for ref in refs:
@@ -903,6 +911,7 @@ class DownstreamTaskController:
         for ref, result, exc in results:
             event_item = self.manager._event_item_for_downstream_ref(db, task, ref)
             cleanup_result = dict(result or {})
+            cleanup_result["force_delete"] = force_delete
             if exc is not None:
                 cleanup_result = {
                     **ref,
@@ -911,6 +920,7 @@ class DownstreamTaskController:
                     "verify_status": "not_checked",
                     "blocking": True,
                     "error": str(exc),
+                    "force_delete": force_delete,
                 }
             cleanup_results.append(cleanup_result)
             delete_status = str(cleanup_result.get("delete_status") or "").strip()
@@ -943,6 +953,19 @@ class DownstreamTaskController:
                     event_item,
                     event_type="child_task_delete_failed_but_ignored",
                     message=f"下游删除报错但已降级忽略: {ref['service']}:{ref['task_id']}",
+                    level="warning",
+                    payload=cleanup_result,
+                )
+                continue
+            if force_delete:
+                success_count += 1
+                cleanup_result["ignored_reason"] = "force_delete"
+                self._record_downstream_item_disposition(
+                    db,
+                    task,
+                    event_item,
+                    event_type="child_task_delete_failed_but_ignored",
+                    message=f"下游删除失败但已按强制删除忽略: {ref['service']}:{ref['task_id']}",
                     level="warning",
                     payload=cleanup_result,
                 )

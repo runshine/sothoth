@@ -1268,8 +1268,16 @@ class TaskManager:
         task: BinarySecurityTask,
         refs: list[dict[str, str]],
         token: str | None,
+        *,
+        force_delete: bool = False,
     ) -> int:
-        return await self._downstream_tasks().delete_child_refs(db, task, refs, token)
+        return await self._downstream_tasks().delete_child_refs(
+            db,
+            task,
+            refs,
+            token,
+            force_delete=force_delete,
+        )
 
     async def _downstream_ensure_refs_inactive(
         self,
@@ -3756,17 +3764,23 @@ class TaskManager:
             task_status_after_accept=TASK_STATUS_CANCELLING,
         )
 
-    async def delete_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityActionResponse:
+    async def delete_task(self, db: Session, *, project_id: str, task_id: str, force: bool = False) -> BinarySecurityActionResponse:
         task = self._task_or_404(db, project_id, task_id)
+        accepted_event_type = "task_delete_accepted"
+        accepted_message = (
+            "任务强制删除已受理，后台将尽力清理下游资源并删除当前任务"
+            if force
+            else "任务删除已受理，后台正在清理下游资源与工作区"
+        )
         operation = self._queue_task_operation(
             db,
             task,
             operation_type=TASK_ACTION_DELETE,
             target_stage=task.current_stage,
             requested_by=task.created_by,
-            request_payload={"current_stage": task.current_stage},
-            accepted_event_type="task_delete_accepted",
-            accepted_message="任务删除已受理，后台正在清理下游资源与工作区",
+            request_payload={"current_stage": task.current_stage, "force_delete": force},
+            accepted_event_type=accepted_event_type,
+            accepted_message=accepted_message,
         )
         return BinarySecurityActionResponse(
             task_id=task_id,
@@ -3774,7 +3788,7 @@ class TaskManager:
             accepted=True,
             action="delete",
             status="accepted",
-            message="任务删除已受理，后台正在清理下游资源与工作区",
+            message=accepted_message,
         )
 
     async def continue_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskOperation:
@@ -5401,6 +5415,29 @@ class TaskManager:
         task.current_operation_id = operation.id
         self._invalidate_task_execution(task)
         return operation
+
+    def _recover_failed_cancelled_task_state(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> bool:
+        if str(task.status or "").strip() != TASK_STATUS_CANCELLING:
+            return False
+        operation = self._latest_cancel_operation(db, task.id)
+        if operation is None:
+            return False
+        if str(operation.operation_type or "").strip() != TASK_ACTION_CANCEL:
+            return False
+        if str(operation.status or "").strip() in TASK_OPERATION_ACTIVE_STATUSES:
+            return False
+        if str(operation.status or "").strip() != "failed":
+            return False
+        task.status = TASK_STATUS_CANCEL_FAILED
+        task.finished_at = task.finished_at or _now()
+        task.last_error = str(operation.error_message or task.last_error or "cancel operation failed")
+        task.current_operation_id = operation.id
+        self._invalidate_task_execution(task)
+        return True
 
     def _store_cancel_targets(
         self,
@@ -7612,15 +7649,27 @@ class TaskManager:
         )
 
     async def _prepare_delete_task(self, db: Session, task: BinarySecurityTask) -> list[str]:
+        operation = None
+        force_delete = False
+        if getattr(task, "current_operation_id", None):
+            operation = (
+                db.query(BinarySecurityTaskOperation)
+                .filter(BinarySecurityTaskOperation.id == task.current_operation_id)
+                .first()
+            )
+        request_payload = dict(getattr(operation, "request_payload", None) or {})
+        force_delete = bool(request_payload.get("force_delete"))
         task.status = "cancelled"
         self._invalidate_task_execution(task)
         task.finished_at = task.finished_at or _now()
         self._record_event(
             db,
             task,
-            "task_delete_requested",
-            "任务删除已受理，开始清理下游与工作区",
+            "task_force_delete_requested" if force_delete else "task_delete_requested",
+            "任务强制删除已受理，开始清理下游与工作区" if force_delete else "任务删除已受理，开始清理下游与工作区",
             stage_name=task.current_stage,
+            level="warning" if force_delete else "info",
+            payload={"force_delete": force_delete},
         )
         items = db.query(BinarySecurityStageItem).options(
             load_only(
@@ -7652,7 +7701,13 @@ class TaskManager:
         await self._cancel_local_worker(task.id)
         token = self._service_token()
         await self._cancel_downstream_refs(db, task, downstream_refs, token)
-        deleted_downstream_count = await self._delete_downstream_refs(db, task, downstream_refs, token)
+        deleted_downstream_count = await self._delete_downstream_refs(
+            db,
+            task,
+            downstream_refs,
+            token,
+            force_delete=force_delete,
+        )
         cleanup_status = await self._cleanup_task_workspace(task, token)
         if cleanup_status != "deleted":
             task.status = TASK_STATUS_DELETE_FAILED
@@ -7664,12 +7719,17 @@ class TaskManager:
                 "workspace_root": task.workspace_root,
                 "downstream_ref_count": len(downstream_refs),
                 "deleted_downstream_count": int(deleted_downstream_count or 0),
+                "force_delete": force_delete,
             }
             self._record_event(
                 db,
                 task,
                 "task_delete_failed",
-                f"任务目录清理失败，任务保留为 delete_failed: {cleanup_status}",
+                (
+                    f"强制删除未完成，本地工作区清理失败，任务保留为 delete_failed: {cleanup_status}"
+                    if force_delete
+                    else f"任务目录清理失败，任务保留为 delete_failed: {cleanup_status}"
+                ),
                 stage_name=task.current_stage,
                 level="error",
                 payload={
@@ -7677,9 +7737,26 @@ class TaskManager:
                     "workspace_root": task.workspace_root,
                     "downstream_ref_count": len(downstream_refs),
                     "deleted_downstream_count": int(deleted_downstream_count or 0),
+                    "force_delete": force_delete,
+                    "failure_reason": "workspace_cleanup_failed",
                 },
             )
             raise ValidationError(f"任务目录清理失败: {cleanup_status}")
+
+        if force_delete:
+            self._record_event(
+                db,
+                task,
+                "task_force_delete_completed",
+                "已强制删除主任务；部分下游删除失败已忽略",
+                stage_name=task.current_stage,
+                level="warning",
+                payload={
+                    "force_delete": True,
+                    "downstream_ref_count": len(downstream_refs),
+                    "deleted_downstream_count": int(deleted_downstream_count or 0),
+                },
+            )
 
         db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).delete(synchronize_session=False)
         db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).delete(synchronize_session=False)
@@ -8058,7 +8135,12 @@ class TaskManager:
                 operation.finished_at = _now()
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == getattr(operation, "task_id", None)).first() if operation is not None else None
             if task is not None:
-                task.current_operation_id = None
+                if operation is not None and operation.operation_type == TASK_ACTION_DELETE:
+                    task.status = TASK_STATUS_DELETE_FAILED
+                    task.finished_at = _now()
+                    task.current_operation_id = operation.id
+                else:
+                    task.current_operation_id = None
                 task.last_error = str(exc)
                 self._record_operation_event(
                     db,
@@ -8069,6 +8151,21 @@ class TaskManager:
                     level="error",
                     stage_name=operation.target_stage,
                 )
+                if operation is not None and operation.operation_type == TASK_ACTION_DELETE:
+                    self._record_event(
+                        db,
+                        task,
+                        "task_delete_failed",
+                        "删除失败，任务已保留为 delete_failed",
+                        stage_name=operation.target_stage,
+                        level="error",
+                        payload={
+                            "failure_reason": "delete_operation_failed",
+                            "operation_id": operation.id,
+                            "operation_error": str(exc),
+                            "force_delete": bool(dict(operation.request_payload or {}).get("force_delete")),
+                        },
+                    )
             db.commit()
             observe_control_operation(operation_type, "failed")
         finally:
@@ -19425,6 +19522,8 @@ class TaskManager:
         active_cancel_operation = self._active_cancel_operation(db, task.id)
         if self._ensure_task_remains_cancelling(db, task, active_cancel_operation=active_cancel_operation) is not None:
             return
+        if self._recover_failed_cancelled_task_state(db, task):
+            return
         active_operation = self._active_operation(db, task.id)
         if task.status == "cancelled":
             self._invalidate_task_execution(task)
@@ -22720,8 +22819,16 @@ class TaskManager:
         del db, task
         await self._downstream_ensure_refs_inactive(refs, token)
 
-    async def _delete_downstream_refs(self, db: Session, task: BinarySecurityTask, refs: list[dict[str, str]], token: str | None) -> int:
-        return await self._downstream_delete_refs(db, task, refs, token)
+    async def _delete_downstream_refs(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        refs: list[dict[str, str]],
+        token: str | None,
+        *,
+        force_delete: bool = False,
+    ) -> int:
+        return await self._downstream_delete_refs(db, task, refs, token, force_delete=force_delete)
 
     async def _cleanup_task_workspace(self, task: BinarySecurityTask, token: str | None) -> str:
         workspace_root = Path(task.workspace_root)

@@ -4,7 +4,7 @@ metadata:
   name: secflow-app-binary-to-source-worker
   namespace: secflow-ns
 spec:
-  replicas: 0
+  replicas: 3
   strategy:
     type: RollingUpdate
     rollingUpdate:
