@@ -23034,6 +23034,111 @@ def _test_task_heartbeat_controller_refreshes_running_task_without_dispatcher_ow
         task_manager_module.get_session_factory = original_factory
 
 
+def _test_worker_does_not_take_tail_runtime_lease_on_refresh(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="tail-refresh-1",
+        project_id="p1",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/out",
+        workspace_root="/ws",
+        policy_json='{"pipeline_mode": "mixed_streaming"}',
+        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+    )
+    stage_run = BinarySecurityStageRun(
+        id="sr-tail-1",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        sequence_no=1,
+        status="running",
+    )
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        execution_epoch=0,
+        owner_instance_id="reducer-a",
+        heartbeat_at=_now(),
+        lease_expires_at=_now() + timedelta(seconds=120),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], runtime_leases=[lease])
+    with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False):
+        manager._refresh_task_status_after_sync(db, task)
+    self.assertEqual("reducer-a", db.runtime_leases[0].owner_instance_id)
+
+
+def _test_tail_control_plane_stale_error_does_not_pollute_sync_error(self):
+    manager = TaskManager()
+    item = BinarySecurityStageItem(
+        id="si-tail-stale",
+        task_id="t1",
+        project_id="p1",
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-1",
+        status="running",
+        downstream_task_id="dvs-1",
+    )
+    item.result = {
+        "downstream_status": "running",
+        "sync_observation": {
+            "last_success_at": (_now() - timedelta(seconds=30)).isoformat(),
+            "last_synced_at": (_now() - timedelta(seconds=30)).isoformat(),
+        },
+    }
+    manager._apply_child_task_sync_observation(
+        item,
+        sync_status="observed",
+        synced_at=_now(),
+        error_message="任务 t1 当前 tail 收敛 owner 已变更",
+        error_type="StaleTaskExecution",
+        downstream_status="running",
+        downstream_status_mapped="running",
+        downstream_status_raw="running",
+        state_applied=False,
+    )
+    result = dict(item.result or {})
+    observation = dict(result.get("sync_observation") or {})
+    self.assertEqual("synced", result.get("sync_status"))
+    self.assertIsNone(result.get("last_sync_error_at"))
+    self.assertIsNone(result.get("last_sync_error_message"))
+    self.assertIsNone(observation.get("error_message"))
+    self.assertIsNone(observation.get("error_type"))
+
+
+def _test_worker_skips_tail_tasks_in_downstream_reconcile_candidates(self):
+    manager = TaskManager()
+    tail_task = BinarySecurityTask(
+        id="tail-task-1",
+        project_id="p1",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/out",
+        workspace_root="/ws",
+        policy_json='{"pipeline_mode": "mixed_streaming"}',
+        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+    )
+    item = BinarySecurityStageItem(
+        id="si-tail-candidate",
+        task_id=tail_task.id,
+        project_id=tail_task.project_id,
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-1",
+        status="running",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-1",
+    )
+    db = _AppendingModelAwareDb(tasks=[tail_task], stage_items=[item])
+    with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False):
+        refs = manager._list_tasks_needing_downstream_sync(db)
+    self.assertEqual([], refs)
+
+
 def _test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged(self):
     manager = TaskManager()
     item = BinarySecurityStageItem(
@@ -23943,6 +24048,9 @@ TaskManagerTests.test_service_base_urls_use_service_roots = _test_service_base_u
 TaskManagerTests.test_task_heartbeat_controller_refreshes_owned_running_task = _test_task_heartbeat_controller_refreshes_owned_running_task
 TaskManagerTests.test_task_heartbeat_controller_skips_task_without_owner = _test_task_heartbeat_controller_skips_task_without_owner
 TaskManagerTests.test_task_heartbeat_controller_refreshes_running_task_without_dispatcher_ownership = _test_task_heartbeat_controller_refreshes_running_task_without_dispatcher_ownership
+TaskManagerTests.test_worker_does_not_take_tail_runtime_lease_on_refresh = _test_worker_does_not_take_tail_runtime_lease_on_refresh
+TaskManagerTests.test_tail_control_plane_stale_error_does_not_pollute_sync_error = _test_tail_control_plane_stale_error_does_not_pollute_sync_error
+TaskManagerTests.test_worker_skips_tail_tasks_in_downstream_reconcile_candidates = _test_worker_skips_tail_tasks_in_downstream_reconcile_candidates
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_locally_owned_running_task = _test_task_needs_downstream_reconcile_skips_locally_owned_running_task
 TaskManagerTests.test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items = _test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items
 TaskManagerTests.test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged = _test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged
