@@ -34,6 +34,9 @@ STAGE_SEQUENCE = [
 TASK_TYPE_BINARY = "binary"
 TASK_TYPE_SOURCE = "source"
 TASK_TYPE_BINARY_MODULE = "binary_module"
+TASK_RUNTIME_PHASE_OWNED_EXECUTION = "owned_execution"
+TASK_RUNTIME_PHASE_TAIL_RECONCILIATION = "tail_reconciliation"
+TASK_RUNTIME_PHASE_TERMINAL = "terminal"
 TASK_STAGE_SEQUENCES = {
     TASK_TYPE_BINARY: STAGE_SEQUENCE,
     TASK_TYPE_SOURCE: [
@@ -128,6 +131,7 @@ class BinarySecurityTask(Base, JsonMixin):
     cleanup_snapshot_json = Column(Text, nullable=True)
     last_error = Column(Text, nullable=True)
     latest_abnormal_reason_json = Column(Text, nullable=True)
+    runtime_phase = Column(String(32), nullable=False, default=TASK_RUNTIME_PHASE_OWNED_EXECUTION, index=True)
     operation_lock_owner = Column(String(128), nullable=True, index=True)
     operation_lock_token = Column(String(64), nullable=True, index=True)
     operation_lock_type = Column(String(32), nullable=True, index=True)
@@ -672,6 +676,10 @@ def _ensure_compat_columns(engine) -> None:
         if "cleanup_snapshot_json" not in columns:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN cleanup_snapshot_json TEXT NULL"
+            )
+        if "runtime_phase" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN runtime_phase VARCHAR(32) NOT NULL DEFAULT '{TASK_RUNTIME_PHASE_OWNED_EXECUTION}'"
             )
         if "operation_lock_owner" not in columns:
             statements.append(

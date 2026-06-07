@@ -34,6 +34,9 @@ from app.exception import ConflictError, NotFoundError, UpstreamError, Validatio
 from app.model import (
     STAGE_SEQUENCE,
     TASK_TERMINAL_STATUSES,
+    TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+    TASK_RUNTIME_PHASE_TERMINAL,
     TASK_STAGE_SEQUENCES,
     TASK_TYPE_BINARY,
     TASK_TYPE_BINARY_MODULE,
@@ -1824,6 +1827,7 @@ class TaskManager:
             output_root=str(output_root),
             workspace_root=str(workspace_root),
             execution_epoch=0,
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         )
         task.policy = policy
         task.summary = {
@@ -2658,7 +2662,8 @@ class TaskManager:
         ctx: _TaskDetailContext | None = None,
     ) -> dict[str, Any]:
         task_status = str(task.status or "").strip().lower()
-        terminal_statuses = {"success", "partial_success", "failed", "cancelled", "downstream_missing"}
+        runtime_phase = self._task_runtime_phase(task)
+        terminal_statuses = {"success", "partial_success", "failed", "cancelled", "downstream_missing", TASK_STATUS_CANCEL_FAILED}
         active_task_statuses = {"pending", "dispatching", "running"}
         heartbeat_interval_seconds = max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 15) or 15))
         operation_heartbeat_interval_seconds = max(5, int(getattr(self.cfg.scheduler, "operation_heartbeat_interval_seconds", 15) or 15))
@@ -2720,35 +2725,61 @@ class TaskManager:
             default=None,
         )
         archive_worker_alive = bool(local_archive_jobs) and any(not worker.done() for worker in self._archive_workers)
+        tail_stage_name, tail_active_item_count, tail_has_downstream_refs = self._streaming_tail_active_context(db, task)
         units: list[dict[str, Any]] = []
 
         if task_status in active_task_statuses:
-            task_worker_status = "healthy" if (local_worker_alive and has_local_owner) else "degraded" if (local_worker_alive or has_local_owner or lease_expires_at) else "unhealthy"
-            if not local_worker_alive and not has_local_owner and lease_expires_at is None:
-                task_worker_status = "unhealthy"
+            if runtime_phase == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+                lease_active = lease_expires_at is not None and (_seconds_until(lease_expires_at) or 0) > 0
+                if lease_active and tail_active_item_count > 0:
+                    task_worker_status = "healthy"
+                elif lease_active or tail_active_item_count > 0 or tail_has_downstream_refs:
+                    task_worker_status = "degraded"
+                else:
+                    task_worker_status = "unhealthy"
+                task_worker_label = "Tail 收敛协程"
+                task_worker_detail = "负责流式 tail 的对账、同步与终态收敛"
+                task_worker_reason = (
+                    "tail runtime lease 与活跃 tail 子项均存在"
+                    if task_worker_status == "healthy"
+                    else "tail 收敛仍在继续，但 lease 或活跃子项证据不完整"
+                    if task_worker_status == "degraded"
+                    else "tail 收敛期缺少有效 lease 或活跃 tail 证据"
+                )
+            else:
+                task_worker_status = "healthy" if (local_worker_alive and has_local_owner) else "degraded" if (local_worker_alive or has_local_owner or lease_expires_at) else "unhealthy"
+                if not local_worker_alive and not has_local_owner and lease_expires_at is None:
+                    task_worker_status = "unhealthy"
+                task_worker_label = "主任务执行协程"
+                task_worker_detail = "负责当前父任务阶段推进与调度衔接"
+                task_worker_reason = (
+                    "本地任务协程与执行 owner 正常存在"
+                    if task_worker_status == "healthy"
+                    else "主任务协程存在但 owner/lease 信号不完整"
+                    if task_worker_status == "degraded"
+                    else "任务处于活动态，但当前看不到稳定的本地执行协程或 owner"
+                )
             units.append(
                 self._build_runtime_health_unit(
                     unit_key="task_worker",
-                    unit_label="主任务执行协程",
+                    unit_label=task_worker_label,
                     unit_kind="coroutine",
                     status=task_worker_status,
                     owner_instance_id=str(task.dispatcher_instance_id or "").strip() or lease_owner,
                     started_at=task.started_at,
                     last_heartbeat_at=last_task_heartbeat_at,
-                    detail="负责当前父任务阶段推进与调度衔接",
-                    reason=(
-                        "本地任务协程与执行 owner 正常存在"
-                        if task_worker_status == "healthy"
-                        else "主任务协程存在但 owner/lease 信号不完整"
-                        if task_worker_status == "degraded"
-                        else "任务处于活动态，但当前看不到稳定的本地执行协程或 owner"
-                    ),
+                    detail=task_worker_detail,
+                    reason=task_worker_reason,
                     evidence=[
+                        ("runtime_phase", runtime_phase),
                         ("local_worker_alive", local_worker_alive),
                         ("local_owner_count", owner_count),
                         ("lease_owner", lease_owner),
                         ("lease_source", lease_source),
                         ("lease_expires_at", lease_expires_at),
+                        ("tail_stage_name", tail_stage_name),
+                        ("tail_active_item_count", tail_active_item_count),
+                        ("tail_has_downstream_refs", tail_has_downstream_refs),
                     ],
                 )
             )
@@ -2776,6 +2807,14 @@ class TaskManager:
                     healthy_threshold_seconds=heartbeat_interval_seconds * 2,
                     degraded_threshold_seconds=worker_stale_seconds,
                 )
+            elif runtime_phase == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+                stage_status = self._runtime_health_age_status(
+                    stage_age_seconds,
+                    healthy_threshold_seconds=heartbeat_interval_seconds * 2,
+                    degraded_threshold_seconds=worker_stale_seconds,
+                )
+                if stage_status == "unknown":
+                    stage_status = "degraded"
             else:
                 stage_status = "unhealthy" if task_status in {"dispatching", "running"} else "degraded"
             units.append(
@@ -2930,6 +2969,11 @@ class TaskManager:
             )
             if last_task_heartbeat_at is None and lease_expires_at is not None:
                 heartbeat_status = "degraded" if _seconds_until(lease_expires_at) and _seconds_until(lease_expires_at) > 0 else "unhealthy"
+            if runtime_phase == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+                if lease_expires_at is not None and (_seconds_until(lease_expires_at) or 0) > 0 and tail_active_item_count > 0:
+                    heartbeat_status = "healthy"
+                elif lease_expires_at is not None and (_seconds_until(lease_expires_at) or 0) > 0:
+                    heartbeat_status = "degraded"
             units.append(
                 self._build_runtime_health_unit(
                     unit_key="task_heartbeat",
@@ -2948,10 +2992,12 @@ class TaskManager:
                         else "任务保活信号已经明显老化或缺失"
                     ),
                     evidence=[
+                        ("runtime_phase", runtime_phase),
                         ("lease_owner", lease_owner),
                         ("lease_source", lease_source),
                         ("lease_expires_at", lease_expires_at),
                         ("local_owner_count", owner_count),
+                        ("tail_active_item_count", tail_active_item_count),
                     ],
                 )
             )
@@ -2979,6 +3025,8 @@ class TaskManager:
                 )
             if sync_age_reference is None and never_synced_item_count > 0:
                 sync_status = "degraded"
+            if runtime_phase == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION and sync_status == "unknown" and tail_active_item_count > 0:
+                sync_status = "degraded"
             units.append(
                 self._build_runtime_health_unit(
                     unit_key="downstream_sync",
@@ -2997,6 +3045,7 @@ class TaskManager:
                         else "下游同步长时间没有新鲜进展"
                     ),
                     evidence=[
+                        ("runtime_phase", runtime_phase),
                         ("last_successful_sync_at", last_successful_sync_at),
                         ("last_sync_attempt_at", last_sync_attempt_at),
                         ("last_sync_error_at", last_sync_error_at),
@@ -14279,6 +14328,7 @@ class TaskManager:
             self._sync_task_abnormal_reason_snapshot(db, task, None)
             return
         if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
+            self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
             self._sync_task_abnormal_reason_snapshot(db, task, None)
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
@@ -14286,6 +14336,7 @@ class TaskManager:
             self._last_task_heartbeat_at.pop(task.id, None)
             return
         if task.status == "cancelled":
+            self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TERMINAL)
             stage_sequence = self._stage_sequence_for_task(task)
             stage_summaries = self._build_stage_summaries(db, task, stage_sequence, db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all(), db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all())
             items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
@@ -14298,6 +14349,7 @@ class TaskManager:
             self._last_task_heartbeat_at.pop(task.id, None)
             return
         if task.status == TASK_STATUS_CANCEL_FAILED:
+            self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TERMINAL)
             stage_sequence = self._stage_sequence_for_task(task)
             stage_summaries = self._build_stage_summaries(db, task, stage_sequence, db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all(), db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all())
             items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
@@ -14312,12 +14364,14 @@ class TaskManager:
         has_active_streaming_upstream, active_streaming_stage, active_streaming_status = self._streaming_has_active_upstream_stage(task, stage_runs)
         if has_active_streaming_upstream:
             task.status = "running" if active_streaming_status in {"running", "dispatching", "applying"} else "pending"
+            self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TAIL_RECONCILIATION)
             task.current_stage = active_streaming_stage
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
             task.lease_expires_at = None
             task.finished_at = None
             task.last_error = None
+            self._upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
             self._last_task_heartbeat_at.pop(task.id, None)
             self._record_event(
                 db,
@@ -14339,6 +14393,11 @@ class TaskManager:
             task.lease_expires_at = None
             task.finished_at = None
             task.last_error = None
+            if self._is_streaming_tail_stage(task, active_stage_name):
+                self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TAIL_RECONCILIATION)
+                self._upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
+            else:
+                self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
             self._last_task_heartbeat_at.pop(task.id, None)
             self._record_event(
                 db,
@@ -14369,6 +14428,7 @@ class TaskManager:
                         next_stage_status = item_status
                 if next_stage_status in {"failed", "downstream_missing", "cancelled"} and next_stage_items and not self._stage_has_nonterminal_items(next_stage_items):
                     task.status = "failed"
+                    self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TERMINAL)
                     task.current_stage = next_stage
                     task.dispatcher_instance_id = None
                     task.dispatch_started_at = None
@@ -14382,12 +14442,18 @@ class TaskManager:
                     self._sync_task_abnormal_reason_snapshot(db, task, self._task_abnormal_reason(task, stage_summaries, items, archive_jobs))
                     return
                 task.status = "running" if next_stage_status in {"running", "dispatching", "applying"} else "pending"
+                self._set_task_runtime_phase(
+                    task,
+                    TASK_RUNTIME_PHASE_TAIL_RECONCILIATION if self._is_streaming_tail_stage(task, next_stage) else TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                )
                 task.current_stage = next_stage
                 task.dispatcher_instance_id = None
                 task.dispatch_started_at = None
                 task.lease_expires_at = None
                 task.finished_at = None
                 task.last_error = None
+                if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+                    self._upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
                 self._last_task_heartbeat_at.pop(task.id, None)
                 self._record_event(
                     db,
@@ -14414,6 +14480,7 @@ class TaskManager:
             )
             if missing_enabled_stage and not (vuln_run and vuln_run.status in {"success", "partial_success"}):
                 task.status = "pending"
+                self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
                 task.current_stage = missing_enabled_stage
                 task.dispatcher_instance_id = None
                 task.dispatch_started_at = None
@@ -14444,6 +14511,7 @@ class TaskManager:
         stale_stages = list((task.summary or {}).get("stale_stages") or [])
         if stale_stages and task.status == "success":
             task.status = "partial_success"
+        self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TERMINAL)
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
         task.finished_at = _now()
@@ -14903,6 +14971,32 @@ class TaskManager:
     def _service_token(self) -> str | None:
         return self.cfg.auth_service.service_machine_token
 
+    def _task_runtime_phase(self, task: BinarySecurityTask) -> str:
+        value = str(getattr(task, "runtime_phase", "") or "").strip()
+        if value in {
+            TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            TASK_RUNTIME_PHASE_TERMINAL,
+        }:
+            return value
+        status = str(getattr(task, "status", "") or "").strip().lower()
+        if status in TASK_TERMINAL_STATUSES:
+            return TASK_RUNTIME_PHASE_TERMINAL
+        if self._streaming_mode_enabled(task) and not str(getattr(task, "dispatcher_instance_id", "") or "").strip():
+            return TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
+        return TASK_RUNTIME_PHASE_OWNED_EXECUTION
+
+    def _set_task_runtime_phase(self, task: BinarySecurityTask, phase: str) -> None:
+        task.runtime_phase = str(phase or "").strip() or TASK_RUNTIME_PHASE_OWNED_EXECUTION
+
+    def _task_control_mode(self, task: BinarySecurityTask) -> str:
+        phase = self._task_runtime_phase(task)
+        if phase == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+            return TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
+        if phase == TASK_RUNTIME_PHASE_TERMINAL:
+            return TASK_RUNTIME_PHASE_TERMINAL
+        return TASK_RUNTIME_PHASE_OWNED_EXECUTION
+
     def _dispatch_token(self, task: BinarySecurityTask) -> str | None:
         return task.dispatch_started_at.isoformat() if task.dispatch_started_at else None
 
@@ -14910,7 +15004,7 @@ class TaskManager:
         setattr(task, "_execution_dispatcher_id", task.dispatcher_instance_id)
         setattr(task, "_execution_token", self._dispatch_token(task))
 
-    def _ensure_task_execution_current(self, task: BinarySecurityTask) -> None:
+    def _ensure_owned_execution_current(self, task: BinarySecurityTask) -> None:
         expected_dispatcher_id = getattr(task, "_execution_dispatcher_id", None)
         expected_token = getattr(task, "_execution_token", None)
         if expected_dispatcher_id is None and expected_token is None and not task.dispatcher_instance_id and not task.dispatch_started_at:
@@ -14933,6 +15027,34 @@ class TaskManager:
                 raise StaleTaskExecution(f"任务 {task.id} 当前执行 token 已失效")
         finally:
             session.close()
+
+    def _ensure_tail_reconciliation_current(self, task: BinarySecurityTask) -> None:
+        session = get_session_factory()()
+        try:
+            row = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task.id).first()
+            if row is None:
+                raise StaleTaskExecution(f"任务 {task.id} 不存在")
+            if self._task_runtime_phase(row) != TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+                raise StaleTaskExecution(f"任务 {task.id} 当前 tail 收敛上下文已失效")
+            if str(row.status or "").strip().lower() in TASK_TERMINAL_STATUSES:
+                raise StaleTaskExecution(f"任务 {task.id} 已进入终态")
+            lease = self._runtime_lease_for_task(session, task.id)
+            if not self._runtime_lease_is_active(lease):
+                raise StaleTaskExecution(f"任务 {task.id} 当前 tail 收敛 lease 已失效")
+            if str(lease.owner_instance_id or "").strip() != str(self.instance_id or "").strip():
+                raise StaleTaskExecution(f"任务 {task.id} 当前 tail 收敛 owner 已变更")
+            active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(session, row)
+            if active_item_count <= 0 and not has_downstream_refs:
+                raise StaleTaskExecution(f"任务 {task.id} 当前 tail 收敛上下文已结束")
+        finally:
+            session.close()
+
+    def _ensure_task_execution_current(self, task: BinarySecurityTask) -> None:
+        phase = self._task_runtime_phase(task)
+        if phase == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+            self._ensure_tail_reconciliation_current(task)
+            return
+        self._ensure_owned_execution_current(task)
 
     async def _ensure_task_execution_current_async(self, task: BinarySecurityTask) -> None:
         await asyncio.to_thread(self._ensure_task_execution_current, task)
@@ -15010,12 +15132,14 @@ class TaskManager:
         previous_status = str(task.status or "").strip()
         previous_dispatcher = str(task.dispatcher_instance_id or "").strip() or None
         task.status = "running"
+        self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TAIL_RECONCILIATION)
         task.current_stage = active_stage_name or task.current_stage
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
         task.lease_expires_at = None
         task.finished_at = None
         task.last_error = None
+        self._upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
         self._clear_task_abnormal_reason_snapshot(db, task)
         if record_event:
             self._record_event(
@@ -17913,12 +18037,26 @@ class TaskManager:
     ) -> tuple[str | None, datetime | None, str | None]:
         lease = self._runtime_lease_for_task(db, task.id)
         if lease is not None:
+            if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+                return lease.owner_instance_id, lease.lease_expires_at, "tail_runtime_lease"
             return lease.owner_instance_id, lease.lease_expires_at, "runtime_lease"
         return (
             str(task.dispatcher_instance_id or "").strip() or None,
             task.lease_expires_at,
             "legacy_task_row" if task.lease_expires_at is not None else None,
         )
+
+    def _reconcile_lease_view(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> tuple[str | None, datetime | None]:
+        if self._task_runtime_phase(task) != TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+            return None, None
+        lease = self._runtime_lease_for_task(db, task.id)
+        if lease is None:
+            return None, None
+        return str(lease.owner_instance_id or "").strip() or None, lease.lease_expires_at
 
     def _task_sync_status_view(
         self,
@@ -18015,6 +18153,9 @@ class TaskManager:
             except Exception:
                 abnormal_reason = None
         lease_owner, lease_expires_at, lease_source = self._task_runtime_lease_view(db, task)
+        runtime_phase = self._task_runtime_phase(task)
+        task_control_mode = self._task_control_mode(task)
+        reconcile_owner, reconcile_lease_expires_at = self._reconcile_lease_view(db, task)
         (
             last_successful_sync_at,
             last_sync_attempt_at,
@@ -18036,6 +18177,8 @@ class TaskManager:
             task_type=self._task_type(task),
             name=task.name,
             status=task.status,
+            runtime_phase=runtime_phase,
+            task_control_mode=task_control_mode,
             current_operation_id=task.current_operation_id,
             execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
             current_stage=task.current_stage,
@@ -18048,6 +18191,8 @@ class TaskManager:
             task_lease_owner_instance_id=lease_owner,
             task_lease_expires_at=lease_expires_at,
             task_lease_source=lease_source,
+            reconcile_owner_instance_id=reconcile_owner,
+            reconcile_lease_expires_at=reconcile_lease_expires_at,
             last_successful_downstream_sync_at=last_successful_sync_at,
             last_sync_attempt_at=last_sync_attempt_at,
             last_sync_error_at=last_sync_error_at,
@@ -18366,6 +18511,9 @@ class TaskManager:
         task_continue_supported, task_continue_reason, _ = self._task_continue_support(db, task)
         task_retry_failed_supported, task_retry_failed_reason, _, _ = self._task_retry_failed_items_support(db, task)
         lease_owner, lease_expires_at, lease_source = self._task_runtime_lease_view(db, task)
+        runtime_phase = self._task_runtime_phase(task)
+        task_control_mode = self._task_control_mode(task)
+        reconcile_owner, reconcile_lease_expires_at = self._reconcile_lease_view(db, task)
         if detail_ctx is not None:
             last_successful_sync_at = detail_ctx.last_successful_sync_at
             last_sync_attempt_at = detail_ctx.last_sync_attempt_at
@@ -18413,6 +18561,8 @@ class TaskManager:
             task_type=self._task_type(task),
             name=task.name,
             status=task.status,
+            runtime_phase=runtime_phase,
+            task_control_mode=task_control_mode,
             current_operation_id=task.current_operation_id,
             execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
             current_stage=task.current_stage,
@@ -18425,6 +18575,8 @@ class TaskManager:
             task_lease_owner_instance_id=lease_owner,
             task_lease_expires_at=lease_expires_at,
             task_lease_source=lease_source,
+            reconcile_owner_instance_id=reconcile_owner,
+            reconcile_lease_expires_at=reconcile_lease_expires_at,
             last_successful_downstream_sync_at=last_successful_sync_at,
             last_sync_attempt_at=last_sync_attempt_at,
             last_sync_error_at=last_sync_error_at,
@@ -20194,20 +20346,25 @@ class TaskManager:
             return
         active_operation = self._active_operation(db, task.id)
         if task.status == "cancelled":
+            self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TERMINAL)
             self._invalidate_task_execution(task)
             task.finished_at = task.finished_at or _now()
             return
         if task.status == TASK_STATUS_CANCEL_FAILED:
+            self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TERMINAL)
             self._invalidate_task_execution(task)
             task.finished_at = task.finished_at or _now()
             return
         if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
+            self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
             task.lease_expires_at = None
             task.finished_at = None
             return
         if active_operation is not None:
+            if self._task_runtime_phase(task) != TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+                self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
             task.finished_at = None
             task.last_error = None if str(active_operation.status or "").strip() in {"accepted", "queued", "running"} else task.last_error
             task.current_operation_id = active_operation.id
@@ -20219,6 +20376,7 @@ class TaskManager:
             and not stage_runs
             and not db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).first()
         ):
+            self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TERMINAL)
             self._invalidate_task_execution(task)
             task.finished_at = task.finished_at or _now()
             return
@@ -20249,10 +20407,20 @@ class TaskManager:
             active_run = next((run for run in stage_runs if run.status in {"running", "dispatching"}), None)
             if active_run and active_run.stage_name:
                 task.current_stage = active_run.stage_name
-            if not self._should_preserve_task_dispatch_ownership(task, previous_status=current_status):
+            preserve_dispatch = self._should_preserve_task_dispatch_ownership(task, previous_status=current_status)
+            if preserve_dispatch:
+                self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+            else:
+                self._set_task_runtime_phase(
+                    task,
+                    TASK_RUNTIME_PHASE_TAIL_RECONCILIATION if self._is_streaming_tail_stage(task, task.current_stage) else TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                )
+            if not preserve_dispatch:
                 task.dispatcher_instance_id = None
                 task.dispatch_started_at = None
                 task.lease_expires_at = None
+                if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+                    self._upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
             task.finished_at = None
             task.last_error = None
             self._clear_task_abnormal_reason_snapshot(db, task)
@@ -20301,22 +20469,30 @@ class TaskManager:
             and not task_retry_mode
         ):
             task.status = "pending"
+            self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TAIL_RECONCILIATION)
             task.current_stage = failed_stage_run.stage_name or task.current_stage
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
             task.lease_expires_at = None
             task.finished_at = None
+            self._upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
             return
         next_stage = self._next_incomplete_stage(db, task)
         if stage_retry_mode and preferred_retry_next_stage:
             next_stage = preferred_retry_next_stage
         if failed_stage_run is not None and not stage_retry_mode and not task_retry_mode:
             task.status = "pending"
+            self._set_task_runtime_phase(
+                task,
+                TASK_RUNTIME_PHASE_TAIL_RECONCILIATION if self._is_streaming_tail_stage(task, failed_stage_run.stage_name) else TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            )
             task.current_stage = failed_stage_run.stage_name or task.current_stage
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
             task.lease_expires_at = None
             task.finished_at = None
+            if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+                self._upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
             return
         next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
         next_stage_status = next_stage_run.status if next_stage_run else "pending"
@@ -20329,12 +20505,18 @@ class TaskManager:
             )
         ):
             task.status = "running" if str(next_stage_status or "").strip() in {"running", "dispatching"} else "pending"
+            self._set_task_runtime_phase(
+                task,
+                TASK_RUNTIME_PHASE_TAIL_RECONCILIATION if self._is_streaming_tail_stage(task, next_stage) else TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            )
             task.current_stage = next_stage
             task.finished_at = None
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
             task.lease_expires_at = None
             task.last_error = None
+            if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+                self._upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
             summary = dict(task.summary or {})
             if summary.get("stale_from_stage") and next_stage in set(summary.get("stale_stages") or []):
                 summary["stale_stages"] = []
@@ -20369,6 +20551,7 @@ class TaskManager:
             return
         if failed_stage_run is not None and not stage_retry_mode and not task_retry_mode and not next_stage:
             task.status = "failed"
+            self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TERMINAL)
             task.current_stage = failed_stage_run.stage_name or task.current_stage
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
@@ -20379,6 +20562,7 @@ class TaskManager:
             failed_items = self._stage_items(db, task.id, str(failed_stage_run.stage_name or ""))
             if failed_items and not self._stage_has_nonterminal_items(failed_items):
                 task.status = "failed"
+                self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TERMINAL)
                 task.current_stage = failed_stage_run.stage_name or task.current_stage
                 task.dispatcher_instance_id = None
                 task.dispatch_started_at = None

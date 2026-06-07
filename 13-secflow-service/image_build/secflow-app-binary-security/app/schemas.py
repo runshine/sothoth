@@ -142,6 +142,8 @@ class BinarySecurityTaskResponse(BaseModel):
     task_type: str = TASK_TYPE_BINARY
     name: str
     status: str
+    runtime_phase: str = "owned_execution"
+    task_control_mode: str = "owned_execution"
     current_operation_id: Optional[str] = None
     execution_epoch: int = 0
     current_stage: Optional[str] = None
@@ -154,6 +156,8 @@ class BinarySecurityTaskResponse(BaseModel):
     task_lease_owner_instance_id: Optional[str] = None
     task_lease_expires_at: Optional[datetime] = None
     task_lease_source: Optional[str] = None
+    reconcile_owner_instance_id: Optional[str] = None
+    reconcile_lease_expires_at: Optional[datetime] = None
     last_successful_downstream_sync_at: Optional[datetime] = None
     last_sync_attempt_at: Optional[datetime] = None
     last_sync_error_at: Optional[datetime] = None

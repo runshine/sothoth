@@ -5,9 +5,16 @@ from unittest.mock import patch
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 
-from app.model import BinarySecurityTask, TASK_TYPE_BINARY
+from app.model import (
+    BinarySecurityStageItem,
+    BinarySecurityTask,
+    BinarySecurityTaskRuntimeLease,
+    TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+    TASK_TYPE_BINARY,
+    TASK_TYPE_SOURCE,
+)
 from app.service import task_manager as task_manager_module
-from app.service.task_manager import TaskManager, _now
+from app.service.task_manager import StaleTaskExecution, TaskManager, _now
 
 
 class TaskManagerRuntimeStatusTests(unittest.TestCase):
@@ -337,6 +344,13 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         sleep_calls = []
         observed_candidates = []
 
+        class _Db:
+            def rollback(self):
+                return None
+
+            def close(self):
+                return None
+
         async def _sleep(seconds):
             sleep_calls.append(seconds)
             if seconds == 1:
@@ -351,11 +365,13 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             return []
 
         manager._list_tasks_needing_downstream_sync = lambda _db: []
+        manager._list_tasks_with_deferred_cleanup = lambda _db: []
         manager._run_with_limits = _run_with_limits
         manager._observe_runtime_metrics = _observe_runtime_metrics
 
         with (
             patch("app.service.task_manager.asyncio.sleep", new=_sleep),
+            patch("app.service.task_manager.get_session_factory", return_value=lambda: _Db()),
             patch("app.service.task_manager.logger.exception") as logger_exception,
         ):
             await manager._downstream_reconcile_loop()
@@ -730,6 +746,152 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, calls["count"])
         self.assertEqual(1, len(failures))
         self.assertEqual("db_connection_refused", failures[0]["error_type"])
+
+    async def test_ensure_task_execution_current_async_uses_tail_runtime_lease(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-tail-1",
+            project_id="project-1",
+            name="tail",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json='{"pipeline_mode": "mixed_streaming"}',
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        )
+        item = BinarySecurityStageItem(
+            id="item-tail-1",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-a",
+            item_identity_key="module-a::source",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-1",
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=0,
+            owner_instance_id="worker-a",
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(seconds=120),
+        )
+
+        class _Query:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def filter(self, *args, **kwargs):
+                del args, kwargs
+                return self
+
+            def order_by(self, *args, **kwargs):
+                del args, kwargs
+                return self
+
+            def all(self):
+                return list(self._rows)
+
+            def first(self):
+                return self._rows[0] if self._rows else None
+
+        class _Session:
+            def query(self, model):
+                name = getattr(model, "__name__", "")
+                if name == "BinarySecurityTask":
+                    return _Query([task])
+                if name == "BinarySecurityTaskRuntimeLease":
+                    return _Query([lease])
+                if name == "BinarySecurityStageItem":
+                    return _Query([item])
+                return _Query([])
+
+            def close(self):
+                return None
+
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: _Session()):
+            await manager._ensure_task_execution_current_async(task)
+
+    async def test_ensure_task_execution_current_async_rejects_tail_runtime_lease_owner_takeover(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-tail-2",
+            project_id="project-1",
+            name="tail",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json='{"pipeline_mode": "mixed_streaming"}',
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        )
+        item = BinarySecurityStageItem(
+            id="item-tail-2",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-df",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-a",
+            parent_key="module-a",
+            item_identity_key="entry-a::module-a",
+            status="running",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dfa-1",
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=0,
+            owner_instance_id="worker-b",
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(seconds=120),
+        )
+
+        class _Query:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def filter(self, *args, **kwargs):
+                del args, kwargs
+                return self
+
+            def order_by(self, *args, **kwargs):
+                del args, kwargs
+                return self
+
+            def all(self):
+                return list(self._rows)
+
+            def first(self):
+                return self._rows[0] if self._rows else None
+
+        class _Session:
+            def query(self, model):
+                name = getattr(model, "__name__", "")
+                if name == "BinarySecurityTask":
+                    return _Query([task])
+                if name == "BinarySecurityTaskRuntimeLease":
+                    return _Query([lease])
+                if name == "BinarySecurityStageItem":
+                    return _Query([item])
+                return _Query([])
+
+            def close(self):
+                return None
+
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: _Session()):
+            with self.assertRaises(StaleTaskExecution):
+                await manager._ensure_task_execution_current_async(task)
 
     def test_stage_item_stale_uses_last_attempt_instead_of_last_success(self):
         manager = TaskManager()

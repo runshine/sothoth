@@ -27,6 +27,9 @@ from app.model import (
     BinarySecurityTaskOperation,
     BinarySecurityTaskRuntimeLease,
     BinarySecurityTaskStateLease,
+    TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+    TASK_RUNTIME_PHASE_TERMINAL,
     TASK_TYPE_BINARY,
     TASK_TYPE_BINARY_MODULE,
     TASK_TYPE_SOURCE,
@@ -2700,6 +2703,7 @@ class TaskManagerTests(unittest.TestCase):
         self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("cancelled", task.status)
+        self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, self.manager._task_runtime_phase(task))
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertIsNotNone(task.finished_at)
 
@@ -2724,6 +2728,7 @@ class TaskManagerTests(unittest.TestCase):
         self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("failed", task.status)
+        self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, self.manager._task_runtime_phase(task))
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertIsNotNone(task.finished_at)
 
@@ -2812,6 +2817,7 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual("running", task.status)
         self.assertEqual("dataflow_vuln_scan", task.current_stage)
+        self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, self.manager._task_runtime_phase(task))
         self.assertIsNone(task.finished_at)
         self.assertIsNone(task.last_error)
         self.assertEqual("pending", dataflow_run.status)
@@ -2882,6 +2888,7 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertEqual("running", task.status)
+        self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, self.manager._task_runtime_phase(task))
         self.assertFalse(any(row.event_type == "task_requeued_after_downstream_sync" and row.stage_name == "dataflow_vuln_scan" for row in db.events))
 
     def test_finalize_task_defers_incomplete_stage_instead_of_failed_terminal(self):
@@ -2941,6 +2948,7 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual("pending", task.status)
         self.assertEqual("dataflow_vuln_scan", task.current_stage)
+        self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, self.manager._task_runtime_phase(task))
         self.assertIsNone(task.finished_at)
         self.assertTrue(
             any(
@@ -2984,6 +2992,7 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual("running", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
+        self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, self.manager._task_runtime_phase(task))
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertIsNone(task.dispatch_started_at)
         self.assertIsNone(task.lease_expires_at)
@@ -3020,6 +3029,7 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual("running", task.status)
         self.assertEqual("binary_to_source", task.current_stage)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertEqual("worker-a", task.dispatcher_instance_id)
         self.assertIsNotNone(task.dispatch_started_at)
         self.assertIsNotNone(task.lease_expires_at)
@@ -7021,6 +7031,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
     def test_task_response_streaming_tail_snapshot_stays_consistent_for_list_view(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        now_value = _now()
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -7033,6 +7044,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             output_root="/o",
             workspace_root="/w",
             policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
         )
         task.summary = {}
         task.metrics = {}
@@ -7097,10 +7109,18 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             downstream_task_id="dfa-1",
         )
         dataflow_item.input_ref = {"entry_key": "entry-a", "function_name": "func_a", "module_key": "mod-a", "upstream_item_id": "i-entry"}
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=0,
+            owner_instance_id="runtime-owner",
+            heartbeat_at=now_value,
+            lease_expires_at=now_value + timedelta(seconds=120),
+        )
         db = _ModelAwareDb(
             tasks=[task],
             stage_runs=[entry_run, dataflow_run, vuln_run],
             stage_items=[entry_item, dataflow_item],
+            runtime_leases=[lease],
             archive_jobs=[],
             events=[],
         )
@@ -7117,6 +7137,59 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, by_stage["dataflow_vuln_scan"].running_items)
         self.assertEqual("pending", response.status)
         self.assertEqual("dataflow_vuln_scan", response.current_stage)
+        self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, response.runtime_phase)
+        self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, response.task_control_mode)
+        self.assertEqual("runtime-owner", response.task_lease_owner_instance_id)
+        self.assertEqual("tail_runtime_lease", response.task_lease_source)
+        self.assertEqual("runtime-owner", response.reconcile_owner_instance_id)
+        self.assertEqual(lease.lease_expires_at, response.reconcile_lease_expires_at)
+
+    def test_build_task_runtime_health_treats_tail_runtime_lease_without_dispatcher_as_healthy(self):
+        now_value = _now()
+        task = BinarySecurityTask(
+            id="tail-health-1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        )
+        item = BinarySecurityStageItem(
+            id="si-tail-health-1",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-a",
+            item_name="module-a",
+            parent_key="source_project",
+            item_identity_key="module-a::source_project",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-1",
+            updated_at=now_value,
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=0,
+            owner_instance_id="runtime-owner",
+            heartbeat_at=now_value,
+            lease_expires_at=now_value + timedelta(seconds=120),
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], runtime_leases=[lease])
+
+        health = self.manager._build_task_runtime_health(db, task)
+        units = {unit["unit_key"]: unit for unit in health["units"]}
+
+        self.assertEqual("healthy", units["task_worker"]["status"])
+        self.assertEqual("healthy", units["task_heartbeat"]["status"])
+        self.assertNotEqual("unhealthy", health["summary"]["overall_status"])
 
     def test_get_task_detail_streaming_tail_queued_item_is_exposed_as_running(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
