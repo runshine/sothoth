@@ -498,7 +498,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
                     name="demo",
                     status="running",
                     task_type=TASK_TYPE_BINARY,
-                    current_stage="vuln_scan",
+                    current_stage="dataflow_vuln_scan",
                     firmware_source="project_filesystem",
                     firmware_path="/fw",
                     output_root="/o",

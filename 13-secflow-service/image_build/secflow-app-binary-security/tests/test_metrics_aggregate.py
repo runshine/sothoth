@@ -117,7 +117,7 @@ class MetricsAggregateTests(unittest.TestCase):
                     samples={
                         ((("stage", "entry_analysis"), ("status", "queued"))): 3.0,
                         ((("stage", "entry_analysis"), ("status", "running"))): 1.0,
-                        ((("stage", "dataflow_analysis"), ("status", "queued"))): 4.0,
+                        ((("stage", "dataflow_vuln_scan"), ("status", "queued"))): 4.0,
                     },
                 ),
                 "secflow_binary_security_state_reducer_duration_seconds_sum": SimpleNamespace(

@@ -44,13 +44,13 @@ class _RouteManagerStub:
             task_type="source",
             name="streaming-task",
             status="pending",
-            current_stage="dataflow_analysis",
+            current_stage="dataflow_vuln_scan",
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
             stage_summaries=[
                 BinarySecurityStageSummary(
-                    stage_name="dataflow_analysis",
+                    stage_name="dataflow_vuln_scan",
                     sequence_no=3,
                     status="running",
                     running_items=1,
@@ -119,7 +119,7 @@ class _RouteManagerStub:
             "state_events": {
                 "status_counts": {"processing": 1, "retryable": 1},
                 "oldest_active_age_seconds": 12.5,
-                "processing": [{"id": "se-1", "stage_name": "dataflow_analysis"}],
+                "processing": [{"id": "se-1", "stage_name": "dataflow_vuln_scan"}],
                 "dead_letters": [],
                 "recent": [{"id": "se-2", "status": "retryable"}],
             },
@@ -132,7 +132,7 @@ class _RouteManagerStub:
             },
             "archive": {
                 "by_stage": {
-                    "dataflow_analysis": {"success": 1},
+                    "dataflow_vuln_scan": {"success": 1},
                 }
             },
             "reconcile": {
@@ -209,7 +209,7 @@ class _RouteManagerStub:
             task_type="source",
             name="entry-confirmed-task",
             status="pending",
-            current_stage="dataflow_analysis",
+            current_stage="dataflow_vuln_scan",
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
@@ -364,7 +364,7 @@ class TaskApiRouteTests(unittest.TestCase):
             with TestClient(app) as client:
                 response = client.get(
                     "/api/app/binary-security/projects/p1/tasks/t1/stage-items",
-                    params={"stage_name": "dataflow_analysis", "page": 2, "per_page": 10},
+                    params={"stage_name": "dataflow_vuln_scan", "page": 2, "per_page": 10},
                     headers={"Authorization": "Bearer token"},
                 )
 
@@ -374,7 +374,7 @@ class TaskApiRouteTests(unittest.TestCase):
         self.assertEqual(10, payload["per_page"])
         self.assertEqual("i-entry-1", payload["items"][0]["input_ref"]["upstream_item_id"])
         self.assertEqual(
-            ("get_task_stage_items_page", fake_db, "p1", "t1", "dataflow_analysis", 2, 10),
+            ("get_task_stage_items_page", fake_db, "p1", "t1", "dataflow_vuln_scan", 2, 10),
             manager.calls[0],
         )
 
@@ -457,13 +457,13 @@ class TaskApiRouteTests(unittest.TestCase):
             with TestClient(app) as client:
                 response = client.get(
                     "/api/app/binary-security/projects/p1/tasks/t1/archive-jobs",
-                    params={"stage_name": "vuln_scan", "page": 3, "per_page": 10},
+                    params={"stage_name": "dataflow_vuln_scan", "page": 3, "per_page": 10},
                     headers={"Authorization": "Bearer token"},
                 )
 
         self.assertEqual(200, response.status_code)
         self.assertEqual(
-            ("get_task_archive_jobs_page", fake_db, "p1", "t1", "vuln_scan", 3, 10),
+            ("get_task_archive_jobs_page", fake_db, "p1", "t1", "dataflow_vuln_scan", 3, 10),
             manager.calls[0],
         )
 

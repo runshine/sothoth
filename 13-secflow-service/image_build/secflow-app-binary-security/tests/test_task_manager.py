@@ -11505,7 +11505,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("succeeded", action_rows["si-df-a"]["create_status"])
             self.assertEqual("succeeded", action_rows["si-df-a"]["verification_status"])
             self.assertNotIn("si-df-b", action_rows)
-            self.assertEqual([], [row for row in create_calls if row["service"] == "dataflow_vuln_scan"])
+            self.assertEqual(1, len([row for row in create_calls if row["service"] == "dataflow_vuln_scan"]))
 
     def test_operation_execute_retry_stage_full_cleanup_clears_downstream_stage_events(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -14252,7 +14252,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         module_task = BinarySecurityTask(id="m1", project_id="p1", name="module", task_type=TASK_TYPE_BINARY_MODULE, status="pending", firmware_source="project_filesystem", firmware_path="/input", output_root="/o", workspace_root="/w")
 
         self.assertEqual(
-            ["firmware_unpack", "system_analysis", "binary_to_source", "entry_analysis", "dataflow_vuln_scan", "dataflow_vuln_scan"],
+            ["firmware_unpack", "system_analysis", "binary_to_source", "entry_analysis", "dataflow_vuln_scan"],
             self.manager._stage_sequence_for_task(binary_task),
         )
         self.assertEqual(
@@ -15881,7 +15881,7 @@ def _test_confirm_module_selection_updates_task(self):
     self.assertEqual(["m2"], [item["module_key"] for item in task.summary["selected_modules"]])
     self.assertEqual(1, detail.selected_module_count)
 
-def test_normalize_source_input_files_rejects_duplicate_relative_paths(self):
+def _test_normalize_source_input_files_rejects_duplicate_relative_paths(self):
     with self.assertRaisesRegex(Exception, "重复文件名"):
         self.manager._normalize_input_files(
             [
@@ -15891,7 +15891,7 @@ def test_normalize_source_input_files_rejects_duplicate_relative_paths(self):
             task_type=TASK_TYPE_SOURCE,
         )
 
-def test_normalize_source_input_files_rejects_non_archive(self):
+def _test_normalize_source_input_files_rejects_non_archive(self):
     with self.assertRaisesRegex(Exception, "仅支持常见压缩文件"):
         self.manager._normalize_input_files(
             [
@@ -15900,7 +15900,7 @@ def test_normalize_source_input_files_rejects_non_archive(self):
             task_type=TASK_TYPE_SOURCE,
         )
 
-def test_materialize_source_archives_extracts_into_input_and_cleans_temp_file(self):
+def _test_materialize_source_archives_extracts_into_input_and_cleans_temp_file(self):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         workspace = root / "workspace"
@@ -15942,7 +15942,7 @@ def test_materialize_source_archives_extracts_into_input_and_cleans_temp_file(se
         self.assertTrue((input_dir / "README.md").is_file())
         self.assertFalse(archive_path.exists())
 
-def test_resolve_downstream_output_sources_prefers_output_contents(self):
+def _test_resolve_downstream_output_sources_prefers_output_contents(self):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         workspace = root / "workspace"
@@ -15957,7 +15957,7 @@ def test_resolve_downstream_output_sources_prefers_output_contents(self):
 
         self.assertEqual(output_dir, rows[0])
 
-def test_archive_downstream_output_copies_output_contents_without_output_layer(self):
+def _test_archive_downstream_output_copies_output_contents_without_output_layer(self):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         workspace = root / "workspace"
@@ -15999,7 +15999,7 @@ def test_archive_downstream_output_copies_output_contents_without_output_layer(s
         self.assertEqual("system-analyse", target.target_dir.parent.name)
         self.assertEqual("fw1__down1", target.target_dir.name)
 
-def test_resolve_downstream_output_sources_reads_nested_result_output_root(self):
+def _test_resolve_downstream_output_sources_reads_nested_result_output_root(self):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         output_dir = root / "service" / "down1" / "output"
@@ -16013,7 +16013,7 @@ def test_resolve_downstream_output_sources_reads_nested_result_output_root(self)
 
         self.assertEqual(output_dir, rows[0])
 
-def test_resolve_downstream_output_sources_reads_artifacts_output_root(self):
+def _test_resolve_downstream_output_sources_reads_artifacts_output_root(self):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         output_dir = root / "service" / "down1" / "output"
@@ -16027,7 +16027,7 @@ def test_resolve_downstream_output_sources_reads_artifacts_output_root(self):
 
         self.assertEqual(output_dir, rows[0])
 
-def test_resolve_downstream_output_sources_prefers_task_scoped_output_over_service_root(self):
+def _test_resolve_downstream_output_sources_prefers_task_scoped_output_over_service_root(self):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         service_root = root / "service"
@@ -16046,7 +16046,7 @@ def test_resolve_downstream_output_sources_prefers_task_scoped_output_over_servi
         self.assertEqual(task_output, rows[0])
         self.assertIn(service_root, rows)
 
-def test_archive_downstream_output_uses_standard_service_output_dir(self):
+def _test_archive_downstream_output_uses_standard_service_output_dir(self):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         workspace = root / "app" / "secflow-app-binary-security" / "task1"
@@ -16085,7 +16085,7 @@ def test_archive_downstream_output_uses_standard_service_output_dir(self):
         self.assertTrue((target.target_dir / "summary.md").is_file())
         self.assertEqual("firmware-unpacker", target.target_dir.parent.name)
 
-def test_archive_downstream_output_does_not_copy_other_downstream_tasks(self):
+def _test_archive_downstream_output_does_not_copy_other_downstream_tasks(self):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         service_root = root / "secflow-app-entry-analyse"
@@ -16128,7 +16128,7 @@ def test_archive_downstream_output_does_not_copy_other_downstream_tasks(self):
         self.assertFalse((target.target_dir / "eat_other").exists())
         self.assertFalse((target.target_dir / "foreign.txt").exists())
 
-def test_archive_downstream_output_skips_empty_sources_without_creating_target(self):
+def _test_archive_downstream_output_skips_empty_sources_without_creating_target(self):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         workspace = root / "workspace"
@@ -16166,7 +16166,7 @@ def test_archive_downstream_output_skips_empty_sources_without_creating_target(s
         self.assertGreaterEqual(len(target.source_candidates), 1)
         self.assertFalse((root / "task-output" / "system-analyse" / "fw1__down1").exists())
 
-def test_archive_job_payload_uses_compact_downstream_payload(self):
+def _test_archive_job_payload_uses_compact_downstream_payload(self):
     task = BinarySecurityTask(
         id="task1",
         project_id="p1",
@@ -16214,7 +16214,7 @@ def test_archive_job_payload_uses_compact_downstream_payload(self):
     self.assertNotIn("modules", downstream_payload["result"])
     self.assertLess(len(job.payload_json or ""), 2048)
 
-def test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payload_changes(self):
+def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payload_changes(self):
     task = BinarySecurityTask(
         id="task1",
         project_id="p1",
@@ -20881,6 +20881,183 @@ def test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payload
         self.assertIn("task_force_delete_requested", event_types)
         self.assertIn("task_force_delete_completed", event_types)
 
+    def test_manual_delete_deferred_cleanup_keeps_parent_and_records_cleanup_state(self):
+        task = BinarySecurityTask(
+            id="t-delete-deferred",
+            project_id="p1",
+            name="delete-deferred",
+            status="success",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/out",
+            workspace_root="/tmp/ws-delete-deferred",
+            current_stage="entry_analysis",
+            current_operation_id="op-delete-deferred",
+            last_error="历史分析错误不应保留",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op-delete-deferred",
+            task_id=task.id,
+            project_id="p1",
+            operation_type="delete",
+            target_stage="entry_analysis",
+            status="running",
+            request_payload={"force_delete": False},
+        )
+        item = BinarySecurityStageItem(
+            id="si-delete-deferred",
+            task_id=task.id,
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="entry-1",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-delete-deferred",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], operations=[operation], stage_items=[item], events=[], state_events=[])
+
+        async def _run():
+            with (
+                patch.object(self.manager, "_cancel_local_worker", AsyncMock()),
+                patch.object(self.manager, "_cancel_downstream_refs", AsyncMock()),
+                patch.object(
+                    self.manager,
+                    "_delete_downstream_refs",
+                    AsyncMock(return_value=0),
+                ),
+                patch.object(
+                    self.manager,
+                    "_cleanup_task_workspace",
+                    AsyncMock(return_value="deleted"),
+                ),
+                patch.object(self.manager, "_write_task_metadata_async", AsyncMock()),
+            ):
+                setattr(
+                    self.manager,
+                    "_last_downstream_cleanup_results",
+                    [
+                        {
+                            "service": "entry_analyse",
+                            "task_id": "eat-delete-deferred",
+                            "stage_name": "entry_analysis",
+                            "delete_status": "failed",
+                            "deferred": True,
+                            "deferred_reason": "transport_error",
+                            "error": "无法连接下游服务",
+                        }
+                    ],
+                )
+                await self.manager._prepare_delete_task(db, task)
+
+        asyncio.run(_run())
+
+        self.assertEqual(1, len(db.tasks))
+        self.assertEqual("cancelled", task.status)
+        self.assertIsNone(task.last_error)
+        self.assertIsNone(task.current_operation_id)
+        self.assertTrue(task.cleanup_snapshot.get("cleanup_partial_failed"))
+        self.assertEqual("partial_failed", task.cleanup_snapshot.get("deferred_cleanup_status"))
+        self.assertEqual(1, len(task.cleanup_snapshot.get("deferred_downstream_refs") or []))
+        self.assertEqual(1, task.cleanup_snapshot.get("cleanup_counts", {}).get("stage_items_deleted"))
+        cleanup_result = dict(operation.result_payload or {}).get("cleanup_result") or {}
+        self.assertTrue(cleanup_result.get("cleanup_partial_failed"))
+        self.assertEqual(1, len(cleanup_result.get("downstream_cleanup_deferred_refs") or []))
+        event_types = [row.event_type for row in db.events if isinstance(row, BinarySecurityEvent)]
+        self.assertIn("task_delete_cleanup_deferred", event_types)
+
+    def test_build_manual_operation_state_exposes_cleanup_warning(self):
+        task = BinarySecurityTask(
+            id="t-cleanup-state",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/in",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="cancelled",
+        )
+        task.cleanup_snapshot = {
+            "cleanup_partial_failed": True,
+            "deferred_cleanup_status": "partial_failed",
+            "deferred_cleanup_last_error": "transport error",
+            "deferred_downstream_refs": [
+                {"service": "entry_analyse", "task_id": "eat-1", "deferred_reason": "transport_error"}
+            ],
+        }
+        db = _ModelAwareDb(tasks=[task])
+
+        state = self.manager._build_manual_operation_state(
+            db,
+            task,
+            task_retry_supported=False,
+            task_retry_reason=None,
+            task_retry_failed_supported=False,
+            task_retry_failed_reason=None,
+            task_continue_supported=False,
+            task_continue_reason=None,
+            stage_summaries=[],
+        )
+
+        self.assertTrue(state["cleanup_partial_failed"])
+        self.assertEqual(1, state["downstream_cleanup_deferred_count"])
+        self.assertIn("后台补偿", str(state["downstream_cleanup_warning_summary"]))
+        self.assertEqual("eat-1", state["downstream_cleanup_deferred_refs"][0]["task_id"])
+
+    def test_reconcile_deferred_cleanup_task_ref_updates_snapshot_after_success(self):
+        task = BinarySecurityTask(
+            id="t-reconcile-cleanup",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/in",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="cancelled",
+            current_stage="entry_analysis",
+        )
+        task.cleanup_snapshot = {
+            "cleanup_partial_failed": True,
+            "deleted_downstream_count": 0,
+            "deferred_cleanup_attempts": 1,
+            "deferred_cleanup_status": "partial_failed",
+            "deferred_downstream_refs": [
+                {"service": "entry_analyse", "task_id": "eat-1", "stage_name": "entry_analysis", "deferred": True}
+            ],
+        }
+        db = _AppendingModelAwareDb(tasks=[task], events=[])
+
+        async def _run():
+            with (
+                patch.object(task_manager_module, "get_session_factory", return_value=lambda: db),
+                patch.object(self.manager, "_delete_downstream_refs", AsyncMock(return_value=1)),
+            ):
+                setattr(
+                    self.manager,
+                    "_last_downstream_cleanup_results",
+                    [
+                        {
+                            "service": "entry_analyse",
+                            "task_id": "eat-1",
+                            "stage_name": "entry_analysis",
+                            "delete_status": "succeeded",
+                            "deferred": False,
+                        }
+                    ],
+                )
+                await self.manager._reconcile_deferred_cleanup_task_ref({"project_id": "p1", "task_id": "t-reconcile-cleanup"}, "token")
+
+        asyncio.run(_run())
+
+        self.assertFalse(task.cleanup_snapshot.get("cleanup_partial_failed"))
+        self.assertEqual("succeeded", task.cleanup_snapshot.get("deferred_cleanup_status"))
+        self.assertEqual([], task.cleanup_snapshot.get("deferred_downstream_refs"))
+        self.assertEqual(2, task.cleanup_snapshot.get("deferred_cleanup_attempts"))
+        event_types = [row.event_type for row in db.events if isinstance(row, BinarySecurityEvent)]
+        self.assertIn("task_delete_cleanup_reconciled", event_types)
+
     def test_delete_downstream_refs_force_delete_ignores_unverified_failure(self):
         task = BinarySecurityTask(
             id="t1",
@@ -23546,6 +23723,29 @@ def _test_stage_dataflow_vuln_scan_uses_selected_entry_inputs_in_manual_mode(sel
     self.assertEqual(["e2"], [item["entry_key"] for item in captured["inputs"]])
 
 
+def _test_get_project_config_normalizes_legacy_partial_success_stage_names(self):
+    row = BinarySecurityProjectConfig(project_id="p1")
+    row.config = {
+        "partial_success_stage_advancement": {
+            "binary_to_source": False,
+            "dataflow_analysis": True,
+            "vuln_scan": False,
+        },
+    }
+    db = _FakeDb(rows=[row])
+
+    response = self.manager.get_project_config(db, "p1")
+
+    self.assertEqual(
+        {
+            "binary_to_source": False,
+            "entry_analysis": False,
+            "dataflow_vuln_scan": False,
+        },
+        response.config.partial_success_stage_advancement,
+    )
+
+
 TaskManagerTests.test_stage_item_response_falls_back_to_downstream_payload_status = _test_stage_item_response_falls_back_to_downstream_payload_status
 TaskManagerTests.test_task_reconcile_candidate_items_scans_all_stages_with_downstream_refs = _test_task_reconcile_candidate_items_scans_all_stages_with_downstream_refs
 TaskManagerTests.test_task_sync_cooldown_elapsed_uses_all_candidate_items = _test_task_sync_cooldown_elapsed_uses_all_candidate_items
@@ -23578,6 +23778,20 @@ TaskManagerTests.test_reclaim_stale_running_streaming_tail_requeues_for_takeover
 TaskManagerTests.test_run_task_records_takeover_resume_event_for_streaming_tail = _test_run_task_records_takeover_resume_event_for_streaming_tail
 TaskManagerTests.test_confirm_module_selection_updates_task = _test_confirm_module_selection_updates_task
 TaskManagerTests.test_confirm_entry_selection_updates_task = _test_confirm_entry_selection_updates_task
+TaskManagerTests.test_get_project_config_normalizes_legacy_partial_success_stage_names = _test_get_project_config_normalizes_legacy_partial_success_stage_names
+TaskManagerTests.test_normalize_source_input_files_rejects_duplicate_relative_paths = _test_normalize_source_input_files_rejects_duplicate_relative_paths
+TaskManagerTests.test_normalize_source_input_files_rejects_non_archive = _test_normalize_source_input_files_rejects_non_archive
+TaskManagerTests.test_materialize_source_archives_extracts_into_input_and_cleans_temp_file = _test_materialize_source_archives_extracts_into_input_and_cleans_temp_file
+TaskManagerTests.test_resolve_downstream_output_sources_prefers_output_contents = _test_resolve_downstream_output_sources_prefers_output_contents
+TaskManagerTests.test_archive_downstream_output_copies_output_contents_without_output_layer = _test_archive_downstream_output_copies_output_contents_without_output_layer
+TaskManagerTests.test_resolve_downstream_output_sources_reads_nested_result_output_root = _test_resolve_downstream_output_sources_reads_nested_result_output_root
+TaskManagerTests.test_resolve_downstream_output_sources_reads_artifacts_output_root = _test_resolve_downstream_output_sources_reads_artifacts_output_root
+TaskManagerTests.test_resolve_downstream_output_sources_prefers_task_scoped_output_over_service_root = _test_resolve_downstream_output_sources_prefers_task_scoped_output_over_service_root
+TaskManagerTests.test_archive_downstream_output_uses_standard_service_output_dir = _test_archive_downstream_output_uses_standard_service_output_dir
+TaskManagerTests.test_archive_downstream_output_does_not_copy_other_downstream_tasks = _test_archive_downstream_output_does_not_copy_other_downstream_tasks
+TaskManagerTests.test_archive_downstream_output_skips_empty_sources_without_creating_target = _test_archive_downstream_output_skips_empty_sources_without_creating_target
+TaskManagerTests.test_archive_job_payload_uses_compact_downstream_payload = _test_archive_job_payload_uses_compact_downstream_payload
+TaskManagerTests.test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payload_changes = _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payload_changes
 TaskManagerTests.test_stage_entry_analysis_manual_confirm_sets_pending_entry_confirmation = _test_stage_entry_analysis_manual_confirm_sets_pending_entry_confirmation
 TaskManagerTests.test_stage_dataflow_vuln_scan_uses_selected_entry_inputs_in_manual_mode = _test_stage_dataflow_vuln_scan_uses_selected_entry_inputs_in_manual_mode
 

@@ -18,6 +18,8 @@ spec:
         app: chirmera-platform-schedule
         component: worker
     spec:
+      imagePullSecrets:
+        - name: ghcr-ict-bin-pull
       terminationGracePeriodSeconds: 90
       containers:
         - name: chirmera-platform-schedule

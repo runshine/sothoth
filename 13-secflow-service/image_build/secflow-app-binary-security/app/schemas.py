@@ -195,6 +195,7 @@ class BinarySecurityTaskResponse(BaseModel):
     stage_summaries: list[BinarySecurityStageSummary] = Field(default_factory=list)
     manual_operation_state: dict[str, Any] = Field(default_factory=dict)
     cancel_state: dict[str, Any] = Field(default_factory=dict)
+    cleanup_state: dict[str, Any] = Field(default_factory=dict)
 
 
 class BinarySecurityTaskOperationResponse(BaseModel):

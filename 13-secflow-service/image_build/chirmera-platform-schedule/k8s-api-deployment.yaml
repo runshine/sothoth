@@ -18,6 +18,8 @@ spec:
         app: chirmera-platform-schedule
         component: api
     spec:
+      imagePullSecrets:
+        - name: ghcr-ict-bin-pull
       terminationGracePeriodSeconds: 90
       affinity:
         podAntiAffinity:

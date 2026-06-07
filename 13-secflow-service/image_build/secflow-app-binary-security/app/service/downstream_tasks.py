@@ -16,7 +16,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
-from app.model import BinarySecurityStageItem, BinarySecurityTask
+from app.model import BinarySecurityStageItem, BinarySecurityTask, normalize_stage_name
 from app.time_utils import now_local
 
 
@@ -259,9 +259,8 @@ class DownstreamTaskGateway:
             )
         if stage_name == "entry_analysis" and normalized == "entry_analyse":
             return await self._entry_analyse_client().restart_task(task_id, token or "")
-        if stage_name == "dataflow_analysis" and normalized == "dataflow_vuln_scan":
-            return await self._dataflow_vuln_scan_client().retry_task(task_id, token or "")
-        if stage_name == "vuln_scan" and normalized == "dataflow_vuln_scan":
+        normalized_stage = normalize_stage_name(stage_name)
+        if normalized == "dataflow_vuln_scan" and normalized_stage == "dataflow_vuln_scan":
             return await self._dataflow_vuln_scan_client().retry_task(task_id, token or "")
         raise ValidationError(f"阶段 {stage_name} 未配置安全重试接口")
 
@@ -595,7 +594,7 @@ class DownstreamTaskController:
                 message=f"请求控制下游子任务: {item.downstream_service}:{item.downstream_task_id or '-'}",
                 payload={"operation": "retry_or_restart", "stage_name": stage_name},
             )
-        if stage_name in {"dataflow_analysis", "vuln_scan"} and self.manager._has_retryable_downstream_task(item):
+        if normalize_stage_name(stage_name) == "dataflow_vuln_scan" and self.manager._has_retryable_downstream_task(item):
             try:
                 payload = await self.fetch_child_payload(task, item, token or "")
             except NotFoundError:
@@ -818,6 +817,8 @@ class DownstreamTaskController:
         token: str | None,
         *,
         force_delete: bool = False,
+        best_effort: bool = False,
+        cleanup_scope: str = "retry_prepare",
     ) -> int:
         cleanup_results: list[dict[str, Any]] = []
         setattr(self.manager, "_last_downstream_cleanup_results", cleanup_results)
@@ -867,11 +868,16 @@ class DownstreamTaskController:
             result: dict[str, Any] = {
                 **ref,
                 "operation": "delete",
+                "cleanup_mode": "best_effort" if best_effort else "blocking",
+                "cleanup_scope": cleanup_scope,
                 "delete_status": "not_sent",
                 "verify_status": "not_checked",
                 "verified_absent": False,
                 "verified_deleted": False,
                 "blocking": False,
+                "deferred": False,
+                "deferred_reason": None,
+                "next_retry_at": None,
                 "error": None,
             }
             try:
@@ -916,9 +922,14 @@ class DownstreamTaskController:
                 cleanup_result = {
                     **ref,
                     "operation": "delete",
+                    "cleanup_mode": "best_effort" if best_effort else "blocking",
+                    "cleanup_scope": cleanup_scope,
                     "delete_status": "failed",
                     "verify_status": "not_checked",
                     "blocking": True,
+                    "deferred": False,
+                    "deferred_reason": None,
+                    "next_retry_at": None,
                     "error": str(exc),
                     "force_delete": force_delete,
                 }
@@ -966,6 +977,30 @@ class DownstreamTaskController:
                     event_item,
                     event_type="child_task_delete_failed_but_ignored",
                     message=f"下游删除失败但已按强制删除忽略: {ref['service']}:{ref['task_id']}",
+                    level="warning",
+                    payload=cleanup_result,
+                )
+                continue
+            if best_effort:
+                success_count += 1
+                cleanup_result["blocking"] = False
+                cleanup_result["deferred"] = True
+                cleanup_result["deferred_reason"] = (
+                    "conflict"
+                    if delete_status == "conflict"
+                    else "verify_failed"
+                    if verify_status == "failed"
+                    else "transport_error"
+                )
+                cleanup_result["next_retry_at"] = (
+                    now_local() + timedelta(seconds=max(60, int(self.manager.cfg.scheduler.downstream_reconcile_interval_seconds or 30) * 2))
+                ).isoformat()
+                self._record_downstream_item_disposition(
+                    db,
+                    task,
+                    event_item,
+                    event_type="child_task_delete_failed_but_ignored",
+                    message=f"下游删除失败，已转为后台补偿: {ref['service']}:{ref['task_id']}",
                     level="warning",
                     payload=cleanup_result,
                 )
