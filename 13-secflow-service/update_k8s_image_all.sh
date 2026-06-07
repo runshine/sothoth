@@ -39,6 +39,13 @@ CHIRMERA_SCHEDULE_DEPLOYMENTS=(
   "chirmera-platform-schedule-scheduler:chirmera-platform-schedule"
   "chirmera-platform-schedule-worker:chirmera-platform-schedule"
 )
+EXCLUDED_WORKLOADS=(
+  "statefulset/secflow-pi-re-agent"
+  "statefulset/secflow-platform-mysql"
+  "deployment/secflow-app-dataflow-vuln-scanner-api"
+  "deployment/secflow-app-dataflow-vuln-scanner-manager"
+  "statefulset/secflow-app-dataflow-vuln-scanner-worker"
+)
 
 usage() {
   cat <<'HELP'
@@ -98,6 +105,33 @@ is_managed_repo() {
   [[ "${repo}" == ghcr.io/runshine/* || "${repo}" == runshine0819/secflow-* ]]
 }
 
+is_excluded_workload() {
+  local workload_kind="${1:-}"
+  local workload_name="${2:-}"
+  local item
+  for item in "${EXCLUDED_WORKLOADS[@]}"; do
+    if [[ "${item}" == "${workload_kind}/${workload_name}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+workload_has_managed_repo() {
+  local workload_kind="${1:-}"
+  local workload_name="${2:-}"
+  local images image repo
+  images="$(kubectl -n "${NAMESPACE}" get "${workload_kind}" "${workload_name}" -o jsonpath='{range .spec.template.spec.containers[*]}{.image}{"\n"}{end}' 2>/dev/null || true)"
+  while IFS= read -r image; do
+    [[ -n "${image}" ]] || continue
+    repo="$(image_repo "${image}")"
+    if is_managed_repo "${repo}"; then
+      return 0
+    fi
+  done <<< "${images}"
+  return 1
+}
+
 image_repo() {
   local image="${1:-}"
   local without_digest="${image%@*}"
@@ -129,6 +163,10 @@ update_workload_container() {
   local container="${3:-}"
   local current_image="${4:-}"
   local requested="${5:-}"
+  if is_excluded_workload "${workload_kind}" "${workload_name}"; then
+    echo "[INFO] Skipping excluded workload ${workload_kind}/${workload_name}"
+    return 0
+  fi
   local target_image
   target_image="$(resolve_target_image "${current_image}" "${requested}")"
   if [[ "${target_image}" == "${current_image}" ]]; then
@@ -303,6 +341,10 @@ echo "[INFO] Scanning workloads in namespace: ${NAMESPACE}"
 while IFS=$'\t' read -r workload_kind workload_name containers; do
   [[ -n "${workload_name}" ]] || continue
   [[ "${workload_name}" == secflow-* ]] || continue
+  if is_excluded_workload "${workload_kind}" "${workload_name}"; then
+    echo "[INFO] Skip excluded workload during image scan: ${workload_kind}/${workload_name}"
+    continue
+  fi
   IFS=';' read -ra pairs <<< "${containers}"
   for pair in "${pairs[@]}"; do
     [[ -n "${pair}" ]] || continue
@@ -353,6 +395,14 @@ done < <(
 echo "[INFO] Forcing rollout restart for secflow workloads"
 while IFS=$'\t' read -r workload_kind workload_name; do
   [[ -n "${workload_name}" ]] || continue
+  if is_excluded_workload "${workload_kind}" "${workload_name}"; then
+    echo "[INFO] Skip excluded workload restart: ${workload_kind}/${workload_name}"
+    continue
+  fi
+  if ! workload_has_managed_repo "${workload_kind}" "${workload_name}"; then
+    echo "[INFO] Skip unmanaged workload restart: ${workload_kind}/${workload_name}"
+    continue
+  fi
   kubectl -n "${NAMESPACE}" rollout restart "${workload_kind}/${workload_name}"
 done < <(
   {
@@ -364,6 +414,12 @@ done < <(
 echo "[INFO] Waiting for secflow workloads to finish rollout"
 while IFS=$'\t' read -r workload_kind workload_name; do
   [[ -n "${workload_name}" ]] || continue
+  if is_excluded_workload "${workload_kind}" "${workload_name}"; then
+    continue
+  fi
+  if ! workload_has_managed_repo "${workload_kind}" "${workload_name}"; then
+    continue
+  fi
   kubectl -n "${NAMESPACE}" rollout status "${workload_kind}/${workload_name}" --timeout=300s
 done < <(
   {
