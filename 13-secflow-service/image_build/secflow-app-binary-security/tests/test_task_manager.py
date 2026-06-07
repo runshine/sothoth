@@ -23068,6 +23068,58 @@ def _test_worker_does_not_take_tail_runtime_lease_on_refresh(self):
     with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False):
         manager._refresh_task_status_after_sync(db, task)
     self.assertEqual("reducer-a", db.runtime_leases[0].owner_instance_id)
+    self.assertEqual("running", task.status)
+
+
+def _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_lease(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="tail-refresh-no-lease",
+        project_id="p1",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/out",
+        workspace_root="/ws",
+        dispatcher_instance_id="worker-z",
+        dispatch_started_at=_now() - timedelta(minutes=2),
+        lease_expires_at=_now() - timedelta(seconds=30),
+        policy_json='{"pipeline_mode": "mixed_streaming"}',
+    )
+    stage_run = BinarySecurityStageRun(
+        id="sr-tail-no-lease",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        sequence_no=1,
+        status="pending",
+    )
+    item = BinarySecurityStageItem(
+        id="si-tail-no-lease",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=stage_run.id,
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-1",
+        item_name="entry-1",
+        status="running",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], events=[])
+
+    with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False):
+        manager._refresh_task_status_after_sync(db, task)
+
+    self.assertEqual("pending", task.status)
+    self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, task.runtime_phase)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertEqual([], db.runtime_leases)
+    recovered_events = [event for event in db.events if event.event_type == "streaming_parent_state_recovered"]
+    self.assertTrue(recovered_events)
+    self.assertFalse(recovered_events[-1].payload.get("runtime_lease_established"))
 
 
 def _test_tail_control_plane_stale_error_does_not_pollute_sync_error(self):
@@ -24049,6 +24101,7 @@ TaskManagerTests.test_task_heartbeat_controller_refreshes_owned_running_task = _
 TaskManagerTests.test_task_heartbeat_controller_skips_task_without_owner = _test_task_heartbeat_controller_skips_task_without_owner
 TaskManagerTests.test_task_heartbeat_controller_refreshes_running_task_without_dispatcher_ownership = _test_task_heartbeat_controller_refreshes_running_task_without_dispatcher_ownership
 TaskManagerTests.test_worker_does_not_take_tail_runtime_lease_on_refresh = _test_worker_does_not_take_tail_runtime_lease_on_refresh
+TaskManagerTests.test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_lease = _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_lease
 TaskManagerTests.test_tail_control_plane_stale_error_does_not_pollute_sync_error = _test_tail_control_plane_stale_error_does_not_pollute_sync_error
 TaskManagerTests.test_worker_skips_tail_tasks_in_downstream_reconcile_candidates = _test_worker_skips_tail_tasks_in_downstream_reconcile_candidates
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_locally_owned_running_task = _test_task_needs_downstream_reconcile_skips_locally_owned_running_task

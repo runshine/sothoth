@@ -15370,7 +15370,9 @@ class TaskManager:
         task.lease_expires_at = None
         task.finished_at = None
         task.last_error = None
-        self._maybe_upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
+        lease = self._maybe_upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
+        if not self._runtime_lease_is_active(lease):
+            task.status = "pending"
         self._clear_task_abnormal_reason_snapshot(db, task)
         if record_event:
             self._record_event(
@@ -15382,11 +15384,12 @@ class TaskManager:
                 stage_name=task.current_stage,
                 payload={
                     "from_status": previous_status,
-                    "to_status": "running",
+                    "to_status": task.status,
                     "active_stage_name": task.current_stage,
                     "active_item_count": active_item_count,
                     "had_downstream_refs": has_downstream_refs,
                     "previous_dispatcher_instance_id": previous_dispatcher,
+                    "runtime_lease_established": self._runtime_lease_is_active(lease),
                     "reason": reason,
                 },
             )
@@ -20683,7 +20686,9 @@ class TaskManager:
                 task.dispatch_started_at = None
                 task.lease_expires_at = None
                 if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                    self._maybe_upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
+                    lease = self._maybe_upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
+                    if not self._runtime_lease_is_active(lease):
+                        task.status = "pending"
             task.finished_at = None
             task.last_error = None
             self._clear_task_abnormal_reason_snapshot(db, task)
@@ -20779,7 +20784,9 @@ class TaskManager:
             task.lease_expires_at = None
             task.last_error = None
             if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                self._maybe_upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
+                lease = self._maybe_upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
+                if not self._runtime_lease_is_active(lease):
+                    task.status = "pending"
             summary = dict(task.summary or {})
             if summary.get("stale_from_stage") and next_stage in set(summary.get("stale_stages") or []):
                 summary["stale_stages"] = []
