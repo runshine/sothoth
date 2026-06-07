@@ -137,6 +137,7 @@ from app.schemas import (
     BinarySecurityTaskOperationPageResponse,
     BinarySecurityTaskOperationResponse,
     BinarySecurityTaskPolicyUpdatePayload,
+    BinarySecurityTaskRuntimePolicyUpdatePayload,
     BinarySecurityTaskResponse,
     BinarySecurityTimelineResponse,
     BinarySecurityUploadCompletePayload,
@@ -2279,7 +2280,7 @@ class TaskManager:
             output_root=ctx.task.output_root,
             workspace_root=ctx.task.workspace_root,
             fileserver_subproject_name=ctx.task.fileserver_subproject_name,
-            policy=ctx.task.policy,
+            policy=self._effective_runtime_policy(ctx.task),
             summary=ctx.task.summary,
             metrics=ctx.task.metrics,
             item_stats=ctx.item_stats,
@@ -3450,19 +3451,66 @@ class TaskManager:
         task_id: str,
         payload: BinarySecurityTaskConcurrencyUpdatePayload,
     ) -> BinarySecurityTaskDetailResponse:
+        runtime_payload = BinarySecurityTaskRuntimePolicyUpdatePayload(
+            expected_version=0,
+            stage_parallelism=dict(payload.stage_parallelism or {}),
+        )
+        return self.update_task_runtime_policy(
+            db,
+            project_id=project_id,
+            task_id=task_id,
+            payload=runtime_payload,
+        )
+
+    def _task_runtime_policy_update_support(self, task: BinarySecurityTask, db: Session | None = None) -> tuple[bool, str | None]:
+        owns_session = db is None
+        if db is None:
+            db = get_session_factory()()
+        try:
+            active_operation = self._active_operation(db, task.id)
+        finally:
+            if owns_session:
+                db.close()
+        if active_operation is not None and str(active_operation.operation_type or "").strip() not in {"update_runtime_policy", "update_concurrency"}:
+            return False, f"当前任务正在执行 {active_operation.operation_type}，暂不允许运行时修改任务策略"
+        if str(task.status or "").strip() == "cancelled":
+            return False, "已取消任务不允许运行时修改任务策略"
+        if str(task.status or "").strip() not in {"pending", "dispatching", "running", TASK_STATUS_PENDING_ENTRY_CONFIRMATION, TASK_STATUS_PENDING_MODULE_CONFIRMATION, "failed", "success", "partial_success", "cancel_failed"}:
+            return False, f"当前任务状态不支持运行时修改任务策略: {task.status}"
+        return True, None
+
+    def update_task_runtime_policy(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        payload: BinarySecurityTaskRuntimePolicyUpdatePayload,
+    ) -> BinarySecurityTaskDetailResponse:
         task = self._task_or_404(db, project_id, task_id)
-        with self._task_operation_lock(db, task_id, operation="update_concurrency"):
+        supported, reason = self._task_runtime_policy_update_support(task, db)
+        if not supported:
+            raise ValidationError(reason or "当前任务不允许运行时修改任务策略")
+        with self._task_operation_lock(db, task_id, operation="update_runtime_policy"):
             stage_sequence = self._stage_sequence_for_task(task)
             allowed_stages = set(stage_sequence)
-            requested = payload.stage_parallelism or {}
+            requested = dict(payload.stage_parallelism or {})
             invalid_stage = next((stage for stage in requested if stage not in allowed_stages), None)
             if invalid_stage:
                 raise ValidationError(f"阶段不属于当前任务流程: {invalid_stage}")
+            requested_throttle = dict(payload.dispatch_throttle or {})
+            invalid_throttle_stage = next((stage for stage in requested_throttle if stage not in allowed_stages), None)
+            if invalid_throttle_stage:
+                raise ValidationError(f"阶段不属于当前任务流程: {invalid_throttle_stage}")
 
-            policy = dict(task.policy or {})
-            current_parallelism = policy.get("stage_parallelism") if isinstance(policy.get("stage_parallelism"), dict) else {}
+            current_version = int(getattr(task, "runtime_override_version", 0) or 0)
+            if int(payload.expected_version or 0) not in {0, current_version}:
+                raise ValidationError(f"运行时策略版本冲突，当前版本为 {current_version}")
+
+            effective_before = self._effective_runtime_policy(task)
+            current_parallelism = effective_before.get("stage_parallelism") if isinstance(effective_before.get("stage_parallelism"), dict) else {}
             before = {
-                stage: max(1, int(current_parallelism.get(stage) or policy.get("max_stage_parallelism") or 1))
+                stage: max(1, int(current_parallelism.get(stage) or effective_before.get("max_stage_parallelism") or 1))
                 for stage in stage_sequence
             }
             updated = dict(before)
@@ -3474,21 +3522,49 @@ class TaskManager:
                 if value < 1 or value > 32:
                     raise ValidationError(f"阶段 {stage_name} 并发必须是 1 到 32 之间的整数")
                 updated[stage_name] = value
+            normalized_throttle: dict[str, dict[str, int]] = {}
+            for stage_name, options in requested_throttle.items():
+                raw_tick = dict(options or {}).get("max_new_items_per_tick")
+                if raw_tick is None:
+                    continue
+                try:
+                    tick_value = int(raw_tick)
+                except (TypeError, ValueError):
+                    raise ValidationError(f"阶段 {stage_name} 放量阈值必须是 1 到 64 之间的整数") from None
+                if tick_value < 1 or tick_value > 64:
+                    raise ValidationError(f"阶段 {stage_name} 放量阈值必须是 1 到 64 之间的整数")
+                normalized_throttle[stage_name] = {"max_new_items_per_tick": tick_value}
 
-            policy["stage_parallelism"] = updated
-            policy["max_stage_parallelism"] = max(updated.values()) if updated else 1
+            runtime_override = self._task_runtime_override(task)
+            merged_override = dict(runtime_override)
+            if requested:
+                merged_override["stage_parallelism"] = updated
+            if normalized_throttle:
+                merged_override["dispatch_throttle"] = {
+                    **dict(runtime_override.get("dispatch_throttle") or {}),
+                    **normalized_throttle,
+                }
+            if payload.max_retries_per_item is not None:
+                merged_override["max_retries_per_item"] = int(payload.max_retries_per_item)
+            if payload.continue_on_item_failure is not None:
+                merged_override["continue_on_item_failure"] = bool(payload.continue_on_item_failure)
+            if payload.tail_reconcile_poll_interval_seconds is not None:
+                merged_override["tail_reconcile_poll_interval_seconds"] = int(payload.tail_reconcile_poll_interval_seconds)
             self._enqueue_state_event(
                 db,
                 task_id=task.id,
                 project_id=task.project_id,
                 event_type="manual_policy_update_requested",
-                idempotency_key=f"manual_policy_update_requested:{task.id}:concurrency:{uuid.uuid4().hex}",
+                idempotency_key=f"manual_policy_update_requested:{task.id}:runtime:{uuid.uuid4().hex}",
                 payload={
-                    "mode": "concurrency",
-                    "before": dict(task.policy or {}),
-                    "after": policy,
+                    "mode": "runtime_override",
+                    "before": dict(runtime_override),
+                    "after": merged_override,
                     "concurrency_before": before,
                     "concurrency_after": updated,
+                    "expected_version": current_version,
+                    "updated_by": str(payload.updated_by or "").strip() or None,
+                    "effective_scope": "tail_claim_immediate",
                 },
             )
             db.commit()
@@ -9875,6 +9951,7 @@ class TaskManager:
 
     def _claim_streaming_stage_items(self, db: Session) -> list[str]:
         claimed_ids: list[str] = []
+        claimed_counts_by_stage: dict[tuple[str, str], int] = {}
         pending_items = (
             db.query(BinarySecurityStageItem)
             .filter(BinarySecurityStageItem.status.in_(["pending", "queued"]))
@@ -9903,6 +9980,12 @@ class TaskManager:
             if not self._is_streaming_tail_stage(task, item.stage_name):
                 continue
             if self._stage_item_orchestration_in_retry_backoff(item):
+                continue
+            dispatch_throttle = self._effective_runtime_policy(task).get("dispatch_throttle") or {}
+            throttle_entry = dict(dispatch_throttle.get(item.stage_name) or {}) if isinstance(dispatch_throttle, dict) else {}
+            max_new_items_per_tick = int(throttle_entry.get("max_new_items_per_tick") or 0)
+            throttle_key = (str(task.id), str(item.stage_name))
+            if max_new_items_per_tick > 0 and claimed_counts_by_stage.get(throttle_key, 0) >= max_new_items_per_tick:
                 continue
             try:
                 active_count = int(
@@ -9955,6 +10038,7 @@ class TaskManager:
                 continue
             if updated:
                 claimed_ids.append(item.id)
+                claimed_counts_by_stage[throttle_key] = claimed_counts_by_stage.get(throttle_key, 0) + 1
         if claimed_ids:
             try:
                 db.commit()
@@ -11653,6 +11737,24 @@ class TaskManager:
         after = dict(payload.get("after") or {})
         if not after:
             raise ValidationError("策略更新事件缺少目标策略")
+        if mode == "runtime_override":
+            task.runtime_override = after
+            task.runtime_override_version = int(getattr(task, "runtime_override_version", 0) or 0) + 1
+            task.runtime_override_updated_at = _now()
+            task.runtime_override_updated_by = str(payload.get("updated_by") or "").strip() or None
+            self._record_event(
+                db,
+                task,
+                "task_runtime_policy_updated",
+                "任务运行时策略已由 reducer 更新",
+                payload={
+                    "before": before,
+                    "after": after,
+                    "effective_scope": payload.get("effective_scope") or "tail_claim_immediate",
+                    "state_event_id": event.id,
+                },
+            )
+            return
         task.policy = after
         if mode == "concurrency":
             self._record_event(
@@ -14961,12 +15063,60 @@ class TaskManager:
         if stage_name not in PARTIAL_SUCCESS_ADVANCEMENT_STAGES:
             return True
         stage_map = self._normalized_partial_success_stage_advancement_map(
-            (task.policy or {}).get("partial_success_stage_advancement"),
+            self._effective_runtime_policy(task).get("partial_success_stage_advancement"),
             allowed_stages=self._partial_success_advancement_stages_for_task(task),
             default_map=self._default_partial_success_stage_advancement_for_task(task),
             strict=False,
         )
         return bool(stage_map.get(stage_name, True))
+
+    def _task_base_policy(self, task: BinarySecurityTask) -> dict[str, Any]:
+        return dict(task.policy or {})
+
+    def _task_runtime_override(self, task: BinarySecurityTask) -> dict[str, Any]:
+        return dict(getattr(task, "runtime_override", {}) or {})
+
+    def _effective_runtime_policy(self, task: BinarySecurityTask) -> dict[str, Any]:
+        base = json.loads(json.dumps(self._task_base_policy(task)))
+        override = self._task_runtime_override(task)
+
+        if override.get("stage_parallelism"):
+            merged = dict(base.get("stage_parallelism") or {})
+            for stage_name, value in dict(override.get("stage_parallelism") or {}).items():
+                if stage_name in self._stage_sequence_for_task(task) and value is not None:
+                    merged[stage_name] = max(1, int(value))
+            base["stage_parallelism"] = merged
+            if merged:
+                base["max_stage_parallelism"] = max(int(v) for v in merged.values())
+
+        if override.get("dispatch_throttle"):
+            base["dispatch_throttle"] = {
+                **dict(base.get("dispatch_throttle") or {}),
+                **dict(override.get("dispatch_throttle") or {}),
+            }
+        if override.get("max_retries_per_item") is not None:
+            base["max_retries_per_item"] = int(override["max_retries_per_item"])
+        if override.get("continue_on_item_failure") is not None:
+            base["continue_on_item_failure"] = bool(override["continue_on_item_failure"])
+        if override.get("tail_reconcile_poll_interval_seconds") is not None:
+            base["tail_reconcile_poll_interval_seconds"] = int(override["tail_reconcile_poll_interval_seconds"])
+        return base
+
+    def _runtime_policy_effect_scope(self, task: BinarySecurityTask) -> dict[str, str]:
+        effective = self._effective_runtime_policy(task)
+        stage_scope: dict[str, str] = {}
+        for stage_name in self._stage_sequence_for_task(task):
+            if stage_name in STREAMING_TAIL_STAGES:
+                stage_scope[stage_name] = "tail_claim_immediate"
+            elif stage_name == str(task.current_stage or "").strip():
+                stage_scope[stage_name] = "next_dispatch_batch"
+            else:
+                stage_scope[stage_name] = "future_stage_only"
+        if effective.get("tail_reconcile_poll_interval_seconds") is not None:
+            stage_scope["_tail_reconcile_poll_interval_seconds"] = "tail_claim_immediate"
+        if effective.get("dispatch_throttle"):
+            stage_scope["_dispatch_throttle"] = "tail_claim_immediate"
+        return stage_scope
 
     def _service_token(self) -> str | None:
         return self.cfg.auth_service.service_machine_token
@@ -15648,7 +15798,7 @@ class TaskManager:
         return normalized in STREAMING_ACTIVE_ITEM_STATUSES
 
     def _stage_parallelism(self, task: BinarySecurityTask, stage_name: str) -> int:
-        policy = task.policy or {}
+        policy = self._effective_runtime_policy(task)
         stage_parallelism = policy.get("stage_parallelism") or {}
         if stage_name in stage_parallelism:
             return max(1, int(stage_parallelism[stage_name]))
@@ -18156,6 +18306,9 @@ class TaskManager:
         runtime_phase = self._task_runtime_phase(task)
         task_control_mode = self._task_control_mode(task)
         reconcile_owner, reconcile_lease_expires_at = self._reconcile_lease_view(db, task)
+        base_policy = self._task_base_policy(task)
+        runtime_override = self._task_runtime_override(task)
+        effective_runtime_policy = self._effective_runtime_policy(task)
         (
             last_successful_sync_at,
             last_sync_attempt_at,
@@ -18193,6 +18346,13 @@ class TaskManager:
             task_lease_source=lease_source,
             reconcile_owner_instance_id=reconcile_owner,
             reconcile_lease_expires_at=reconcile_lease_expires_at,
+            runtime_override_version=int(getattr(task, "runtime_override_version", 0) or 0),
+            runtime_override_updated_at=getattr(task, "runtime_override_updated_at", None),
+            runtime_override_updated_by=getattr(task, "runtime_override_updated_by", None),
+            runtime_policy_effect_scope=self._runtime_policy_effect_scope(task),
+            base_policy=base_policy,
+            runtime_override=runtime_override,
+            effective_runtime_policy=effective_runtime_policy,
             last_successful_downstream_sync_at=last_successful_sync_at,
             last_sync_attempt_at=last_sync_attempt_at,
             last_sync_error_at=last_sync_error_at,
@@ -18211,7 +18371,7 @@ class TaskManager:
             low_risk_module_count=int(metrics.get("low_risk_module_count", 0)),
             candidate_module_count=int(metrics.get("candidate_module_count", 0)),
             selected_module_count=int(metrics.get("selected_module_count", 0)),
-            selected_risk_levels=_normalize_module_risk_levels((task.policy or {}).get("module_risk_levels")),
+            selected_risk_levels=_normalize_module_risk_levels(effective_runtime_policy.get("module_risk_levels")),
             module_selection_mode=self._module_selection_mode(task),
             entry_selection_mode=self._entry_selection_mode(task),
             candidate_entry_count=len(self._entry_candidates(task)),
@@ -18514,6 +18674,9 @@ class TaskManager:
         runtime_phase = self._task_runtime_phase(task)
         task_control_mode = self._task_control_mode(task)
         reconcile_owner, reconcile_lease_expires_at = self._reconcile_lease_view(db, task)
+        base_policy = self._task_base_policy(task)
+        runtime_override = self._task_runtime_override(task)
+        effective_runtime_policy = self._effective_runtime_policy(task)
         if detail_ctx is not None:
             last_successful_sync_at = detail_ctx.last_successful_sync_at
             last_sync_attempt_at = detail_ctx.last_sync_attempt_at
@@ -18577,6 +18740,13 @@ class TaskManager:
             task_lease_source=lease_source,
             reconcile_owner_instance_id=reconcile_owner,
             reconcile_lease_expires_at=reconcile_lease_expires_at,
+            runtime_override_version=int(getattr(task, "runtime_override_version", 0) or 0),
+            runtime_override_updated_at=getattr(task, "runtime_override_updated_at", None),
+            runtime_override_updated_by=getattr(task, "runtime_override_updated_by", None),
+            runtime_policy_effect_scope=self._runtime_policy_effect_scope(task),
+            base_policy=base_policy,
+            runtime_override=runtime_override,
+            effective_runtime_policy=effective_runtime_policy,
             last_successful_downstream_sync_at=last_successful_sync_at,
             last_sync_attempt_at=last_sync_attempt_at,
             last_sync_error_at=last_sync_error_at,
@@ -18595,7 +18765,7 @@ class TaskManager:
             low_risk_module_count=int(metrics.get("low_risk_module_count", 0)),
             candidate_module_count=int(metrics.get("candidate_module_count", 0)),
             selected_module_count=int(metrics.get("selected_module_count", 0)),
-            selected_risk_levels=_normalize_module_risk_levels((task.policy or {}).get("module_risk_levels")),
+            selected_risk_levels=_normalize_module_risk_levels(effective_runtime_policy.get("module_risk_levels")),
             module_selection_mode=self._module_selection_mode(task),
             entry_selection_mode=self._entry_selection_mode(task),
             candidate_entry_count=len(self._entry_candidates(task)),

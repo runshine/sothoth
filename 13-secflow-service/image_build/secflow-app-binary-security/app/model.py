@@ -121,6 +121,10 @@ class BinarySecurityTask(Base, JsonMixin):
     fileserver_subproject_id = Column(String(64), nullable=True)
     fileserver_subproject_name = Column(String(128), nullable=True)
     policy_json = Column(Text, nullable=True)
+    runtime_override_json = Column(Text, nullable=True)
+    runtime_override_version = Column(Integer, nullable=False, default=0)
+    runtime_override_updated_at = Column(DateTime, nullable=True)
+    runtime_override_updated_by = Column(String(64), nullable=True)
     summary_json = Column(Text, nullable=True)
     metrics_json = Column(Text, nullable=True)
     stage_summary_json = Column(Text, nullable=True)
@@ -153,6 +157,14 @@ class BinarySecurityTask(Base, JsonMixin):
     @policy.setter
     def policy(self, value: dict[str, Any] | None) -> None:
         self.policy_json = self._dump_json(value or {})
+
+    @property
+    def runtime_override(self) -> dict[str, Any]:
+        return self._load_json(self.runtime_override_json, {})
+
+    @runtime_override.setter
+    def runtime_override(self, value: dict[str, Any] | None) -> None:
+        self.runtime_override_json = self._dump_json(value or {})
 
     @property
     def summary(self) -> dict[str, Any]:
@@ -668,6 +680,22 @@ def _ensure_compat_columns(engine) -> None:
         if "current_operation_id" not in columns:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN current_operation_id VARCHAR(48) NULL"
+            )
+        if "runtime_override_json" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN runtime_override_json TEXT NULL"
+            )
+        if "runtime_override_version" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN runtime_override_version INTEGER NOT NULL DEFAULT 0"
+            )
+        if "runtime_override_updated_at" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN runtime_override_updated_at DATETIME NULL"
+            )
+        if "runtime_override_updated_by" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN runtime_override_updated_by VARCHAR(64) NULL"
             )
         if "execution_epoch" not in columns:
             statements.append(

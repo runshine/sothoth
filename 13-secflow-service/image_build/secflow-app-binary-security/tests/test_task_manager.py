@@ -44,6 +44,7 @@ from app.schemas import (
     BinarySecurityTaskCreate,
     BinarySecurityTaskConcurrencyUpdatePayload,
     BinarySecurityTaskPolicyUpdatePayload,
+    BinarySecurityTaskRuntimePolicyUpdatePayload,
     BinarySecurityUploadCompletePayload,
 )
 from app.service import downstream_tasks as downstream_tasks_module
@@ -6709,6 +6710,114 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 task_id="t1",
                 payload=BinarySecurityTaskConcurrencyUpdatePayload(stage_parallelism={"system_analysis": 33}),
             )
+
+    def test_update_task_runtime_policy_updates_runtime_override_and_keeps_base_policy(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        )
+        task.policy = {
+            "max_stage_parallelism": 4,
+            "max_retries_per_item": 2,
+            "continue_on_item_failure": True,
+            "stage_parallelism": {
+                "binary_to_source": 4,
+                "entry_analysis": 4,
+                "dataflow_vuln_scan": 4,
+            },
+        }
+        db = _ModelAwareDb(tasks=[task])
+
+        self.manager.update_task_runtime_policy(
+            db,
+            project_id="p1",
+            task_id="t1",
+            payload=BinarySecurityTaskRuntimePolicyUpdatePayload(
+                expected_version=0,
+                stage_parallelism={"entry_analysis": 2, "dataflow_vuln_scan": 8},
+                dispatch_throttle={"dataflow_vuln_scan": {"max_new_items_per_tick": 3}},
+                max_retries_per_item=5,
+                updated_by="tester",
+            ),
+        )
+
+        self.manager._apply_manual_policy_update_requested_locked(db, db.added[-1])
+        detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
+
+        self.assertEqual(4, detail.base_policy["stage_parallelism"]["entry_analysis"])
+        self.assertEqual(2, detail.runtime_override["stage_parallelism"]["entry_analysis"])
+        self.assertEqual(8, detail.runtime_override["stage_parallelism"]["dataflow_vuln_scan"])
+        self.assertEqual(2, detail.policy["stage_parallelism"]["entry_analysis"])
+        self.assertEqual(2, detail.effective_runtime_policy["stage_parallelism"]["entry_analysis"])
+        self.assertEqual(8, detail.effective_runtime_policy["stage_parallelism"]["dataflow_vuln_scan"])
+        self.assertEqual(3, detail.effective_runtime_policy["dispatch_throttle"]["dataflow_vuln_scan"]["max_new_items_per_tick"])
+        self.assertEqual(5, detail.effective_runtime_policy["max_retries_per_item"])
+        self.assertEqual(1, detail.runtime_override_version)
+        self.assertEqual("tester", detail.runtime_override_updated_by)
+
+    def test_claim_streaming_stage_items_respects_runtime_dispatch_throttle(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming", "stage_parallelism": {"dataflow_vuln_scan": 4}}),
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        )
+        task.runtime_override = {
+            "dispatch_throttle": {
+                "dataflow_vuln_scan": {"max_new_items_per_tick": 1},
+            }
+        }
+        items = [
+            BinarySecurityStageItem(
+                id="si-vuln-1",
+                task_id="t1",
+                project_id="p1",
+                stage_run_id="sr-vuln",
+                stage_name="dataflow_vuln_scan",
+                item_key="entry-1",
+                item_name="func-1",
+                parent_key="module-1",
+                item_identity_key="entry-1::module-1",
+                status="pending",
+                downstream_service="dataflow_vuln_scan",
+            ),
+            BinarySecurityStageItem(
+                id="si-vuln-2",
+                task_id="t1",
+                project_id="p1",
+                stage_run_id="sr-vuln",
+                stage_name="dataflow_vuln_scan",
+                item_key="entry-2",
+                item_name="func-2",
+                parent_key="module-1",
+                item_identity_key="entry-2::module-1",
+                status="pending",
+                downstream_service="dataflow_vuln_scan",
+            ),
+        ]
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=items)
+
+        claimed = self.manager._claim_streaming_stage_items(db)
+
+        self.assertEqual(["si-vuln-1"], claimed)
 
     def test_update_task_policy_merges_fields_and_records_event(self):
         task = BinarySecurityTask(

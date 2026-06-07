@@ -62,6 +62,16 @@ class BinarySecurityTaskConcurrencyUpdatePayload(BaseModel):
     stage_parallelism: dict[str, int] = Field(default_factory=dict)
 
 
+class BinarySecurityTaskRuntimePolicyUpdatePayload(BaseModel):
+    expected_version: int = Field(default=0, ge=0)
+    stage_parallelism: dict[str, int] = Field(default_factory=dict)
+    dispatch_throttle: dict[str, dict[str, int]] = Field(default_factory=dict)
+    max_retries_per_item: Optional[int] = Field(default=None, ge=0, le=20)
+    continue_on_item_failure: Optional[bool] = None
+    tail_reconcile_poll_interval_seconds: Optional[int] = Field(default=None, ge=1, le=300)
+    updated_by: Optional[str] = None
+
+
 class BinarySecurityTaskPolicyUpdatePayload(BaseModel):
     pipeline_mode: Optional[str] = None
     stage_options: dict[str, StageOptions] = Field(default_factory=dict)
@@ -158,6 +168,13 @@ class BinarySecurityTaskResponse(BaseModel):
     task_lease_source: Optional[str] = None
     reconcile_owner_instance_id: Optional[str] = None
     reconcile_lease_expires_at: Optional[datetime] = None
+    runtime_override_version: int = 0
+    runtime_override_updated_at: Optional[datetime] = None
+    runtime_override_updated_by: Optional[str] = None
+    runtime_policy_effect_scope: dict[str, str] = Field(default_factory=dict)
+    base_policy: dict[str, Any] = Field(default_factory=dict)
+    runtime_override: dict[str, Any] = Field(default_factory=dict)
+    effective_runtime_policy: dict[str, Any] = Field(default_factory=dict)
     last_successful_downstream_sync_at: Optional[datetime] = None
     last_sync_attempt_at: Optional[datetime] = None
     last_sync_error_at: Optional[datetime] = None
