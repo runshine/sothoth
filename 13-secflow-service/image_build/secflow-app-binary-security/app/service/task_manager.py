@@ -1381,6 +1381,11 @@ class TaskManager:
                 self._stage_item_dispatch_loop(),
                 name="binary-security-stage-item-dispatcher",
             )
+            self._task_heartbeat_loop_task = asyncio.create_task(
+                self._task_heartbeat_loop(),
+                name="binary-security-task-heartbeat",
+            )
+        if run_reducer_loop:
             self._downstream_reconcile_task = asyncio.create_task(
                 self._downstream_reconcile_loop(),
                 name="binary-security-downstream-reconcile",
@@ -1400,10 +1405,6 @@ class TaskManager:
             self._state_repair_reconcile_task = asyncio.create_task(
                 self._state_repair_reconcile_loop(),
                 name="binary-security-state-repair-reconcile",
-            )
-            self._task_heartbeat_loop_task = asyncio.create_task(
-                self._task_heartbeat_loop(),
-                name="binary-security-task-heartbeat",
             )
         if run_reducer_loop:
             self._state_reducer_loop_task = asyncio.create_task(

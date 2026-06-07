@@ -23225,6 +23225,52 @@ def _test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_ta
     self.assertEqual(manager.instance_id, db.runtime_leases[0].owner_instance_id)
 
 
+def _test_start_reducer_role_runs_reconcile_loops(self):
+    manager = TaskManager()
+
+    async def _noop():
+        while True:
+            await asyncio.sleep(3600)
+
+    original_seed = manager._seed_work_queues
+    original_downstream = manager._downstream_reconcile_loop
+    original_readless = manager._readless_reconcile_loop
+    original_stage_sync = manager._stage_item_sync_reconcile_loop
+    original_archive_runtime = manager._archive_runtime_reconcile_loop
+    original_state_repair = manager._state_repair_reconcile_loop
+    original_state_reducer = manager._state_reducer_loop
+    original_metrics = manager._reducer_metrics_snapshot_loop
+    try:
+        manager._seed_work_queues = AsyncMock()
+        manager._downstream_reconcile_loop = _noop
+        manager._readless_reconcile_loop = _noop
+        manager._stage_item_sync_reconcile_loop = _noop
+        manager._archive_runtime_reconcile_loop = _noop
+        manager._state_repair_reconcile_loop = _noop
+        manager._state_reducer_loop = _noop
+        manager._reducer_metrics_snapshot_loop = _noop
+        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "reducer"}, clear=False):
+            asyncio.run(manager.start())
+            self.assertIsNotNone(manager._downstream_reconcile_task)
+            self.assertIsNotNone(manager._readless_reconcile_task)
+            self.assertIsNotNone(manager._stage_item_sync_reconcile_task)
+            self.assertIsNotNone(manager._archive_runtime_reconcile_task)
+            self.assertIsNotNone(manager._state_repair_reconcile_task)
+            self.assertIsNotNone(manager._state_reducer_loop_task)
+            self.assertIsNotNone(manager._reducer_metrics_snapshot_loop_task)
+            self.assertIsNone(manager._loop_task)
+        asyncio.run(manager.stop())
+    finally:
+        manager._seed_work_queues = original_seed
+        manager._downstream_reconcile_loop = original_downstream
+        manager._readless_reconcile_loop = original_readless
+        manager._stage_item_sync_reconcile_loop = original_stage_sync
+        manager._archive_runtime_reconcile_loop = original_archive_runtime
+        manager._state_repair_reconcile_loop = original_state_repair
+        manager._state_reducer_loop = original_state_reducer
+        manager._reducer_metrics_snapshot_loop = original_metrics
+
+
 def _test_tail_control_plane_stale_error_does_not_pollute_sync_error(self):
     manager = TaskManager()
     item = BinarySecurityStageItem(
@@ -24206,6 +24252,7 @@ TaskManagerTests.test_task_heartbeat_controller_refreshes_running_task_without_d
 TaskManagerTests.test_worker_does_not_take_tail_runtime_lease_on_refresh = _test_worker_does_not_take_tail_runtime_lease_on_refresh
 TaskManagerTests.test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_lease = _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_lease
 TaskManagerTests.test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_task = _test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_task
+TaskManagerTests.test_start_reducer_role_runs_reconcile_loops = _test_start_reducer_role_runs_reconcile_loops
 TaskManagerTests.test_tail_control_plane_stale_error_does_not_pollute_sync_error = _test_tail_control_plane_stale_error_does_not_pollute_sync_error
 TaskManagerTests.test_worker_skips_tail_tasks_in_downstream_reconcile_candidates = _test_worker_skips_tail_tasks_in_downstream_reconcile_candidates
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_locally_owned_running_task = _test_task_needs_downstream_reconcile_skips_locally_owned_running_task
