@@ -1,0 +1,134 @@
+name: build-chirmera-platform-schedule-image
+
+on:
+  push:
+    branches:
+      - 'v2.*'
+    paths:
+      - .github/workflows/build-chirmera-platform-schedule-image.yaml
+      - 13-secflow-service/image_build/chirmera-platform-schedule
+      - 13-secflow-service/image_build/chirmera-platform-schedule/**
+      - 13-secflow-service/00-secflow-104-**
+  workflow_dispatch:
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      date_tag: ${{ steps.date.outputs.date_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+
+      - name: Generate date tag
+        id: date
+        env:
+          MAIN_REPO_SHA: ${{ github.sha }}
+        run: |
+          SHORT_SHA="${MAIN_REPO_SHA::7}"
+          COMMIT_TS="$(git show -s --format=%ct "${MAIN_REPO_SHA}")"
+          DATE_TAG="$(TZ=Asia/Shanghai date -d "@${COMMIT_TS}" +'%Y%m%d-%H%M%S')-${SHORT_SHA}"
+          echo "date_tag=${DATE_TAG}" >> "$GITHUB_OUTPUT"
+
+  build-amd64:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Login to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
+      - name: Build and push amd64 image
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
+            --cache-from type=gha,scope=chirmera-platform-schedule-amd64 \
+            --cache-to type=gha,scope=chirmera-platform-schedule-amd64,mode=max \
+            --file 13-secflow-service/image_build/chirmera-platform-schedule/Dockerfile \
+            --tag ghcr.io/runshine/chirmera-platform-schedule:amd64-latest \
+            --tag ghcr.io/runshine/chirmera-platform-schedule:amd64-${{ needs.prepare.outputs.date_tag }} \
+            --push \
+            13-secflow-service/image_build/chirmera-platform-schedule/
+
+  build-arm64:
+    needs: prepare
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Login to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
+      - name: Build and push arm64 image
+        run: |
+          docker buildx build \
+            --platform linux/arm64 \
+            --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
+            --cache-from type=gha,scope=chirmera-platform-schedule-arm64 \
+            --cache-to type=gha,scope=chirmera-platform-schedule-arm64,mode=max \
+            --file 13-secflow-service/image_build/chirmera-platform-schedule/Dockerfile \
+            --tag ghcr.io/runshine/chirmera-platform-schedule:arm64-latest \
+            --tag ghcr.io/runshine/chirmera-platform-schedule:arm64-${{ needs.prepare.outputs.date_tag }} \
+            --push \
+            13-secflow-service/image_build/chirmera-platform-schedule/
+
+  merge-manifest:
+    needs: [prepare, build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Login to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
+      - name: Create and push multi-arch manifest (latest)
+        run: |
+          docker buildx imagetools create \
+            --tag ghcr.io/runshine/chirmera-platform-schedule:latest \
+            ghcr.io/runshine/chirmera-platform-schedule:amd64-latest \
+            ghcr.io/runshine/chirmera-platform-schedule:arm64-latest
+
+      - name: Create and push multi-arch manifest (date tag)
+        run: |
+          docker buildx imagetools create \
+            --tag ghcr.io/runshine/chirmera-platform-schedule:${{ needs.prepare.outputs.date_tag }} \
+            ghcr.io/runshine/chirmera-platform-schedule:amd64-${{ needs.prepare.outputs.date_tag }} \
+            ghcr.io/runshine/chirmera-platform-schedule:arm64-${{ needs.prepare.outputs.date_tag }}
