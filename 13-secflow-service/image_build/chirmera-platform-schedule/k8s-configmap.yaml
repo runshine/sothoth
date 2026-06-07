@@ -6,7 +6,7 @@ metadata:
 data:
   config.yaml: |
     database:
-      host: "secflow-platform-mysql"
+      host: "mysql.sothothv2-ns.svc.cluster.local"
       port: 3306
       username: "root"
       password: ""

@@ -70,10 +70,10 @@ class ScheduleExecution(Base):
     __tablename__ = f"{TABLE_PREFIX}schedule_execution"
     __table_args__ = (
         UniqueConstraint("project_id", "schedule_job_id", "dedupe_key", name=f"uk_{TABLE_PREFIX}schedule_execution_dedupe"),
-        Index(f"idx_{TABLE_PREFIX}execution_status_created", "status", "created_at"),
-        Index(f"idx_{TABLE_PREFIX}execution_status_retry", "status", "retry_at", "lease_expire_at"),
-        Index(f"idx_{TABLE_PREFIX}execution_job_status", "schedule_job_id", "status"),
-        Index(f"idx_{TABLE_PREFIX}execution_project_target_status", "project_id", "target_bucket", "status"),
+        Index(f"idx_{TABLE_PREFIX}exec_status_created", "status", "created_at"),
+        Index(f"idx_{TABLE_PREFIX}exec_status_retry", "status", "retry_at", "lease_expire_at"),
+        Index(f"idx_{TABLE_PREFIX}exec_job_status", "schedule_job_id", "status"),
+        Index(f"idx_{TABLE_PREFIX}exec_proj_target_status", "project_id", "target_bucket", "status"),
     )
 
     id = Column(String(64), primary_key=True, default=generate_id)
