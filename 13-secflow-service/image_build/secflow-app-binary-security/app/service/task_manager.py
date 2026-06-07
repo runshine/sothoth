@@ -12658,6 +12658,11 @@ class TaskManager:
         active_count = self._active_dispatch_count(db)
         if active_count >= service_config.max_concurrent_tasks:
             return None
+        task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
+        if task is None:
+            return None
+        if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION and not self._is_reducer_role():
+            return None
         started_at = _now()
         lease_expires_at = self._next_lease_expiry(db, now_value=started_at)
         updated = (
@@ -13961,8 +13966,8 @@ class TaskManager:
         if slots <= 0:
             return []
         lease_expires_at = self._next_lease_expiry(db)
-        candidates = (
-            db.query(BinarySecurityTask.id)
+        candidate_rows = (
+            db.query(BinarySecurityTask)
             .filter(
                 BinarySecurityTask.status == "pending",
                 self._lease_filter_available(),
@@ -13971,10 +13976,14 @@ class TaskManager:
             .limit(slots)
             .all()
         )
+        candidates: list[str] = []
+        for task in candidate_rows:
+            if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION and not self._is_reducer_role():
+                continue
+            candidates.append(str(task.id))
         claimed: list[str] = []
         dispatch_started_at = _now()
-        for row in candidates:
-            task_id = row[0]
+        for task_id in candidates:
             updated = (
                 db.query(BinarySecurityTask)
                 .filter(

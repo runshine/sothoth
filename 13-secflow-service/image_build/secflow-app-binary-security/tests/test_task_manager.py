@@ -18362,6 +18362,39 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual("other-worker", task.dispatcher_instance_id)
         self.assertLess(task.lease_expires_at, _now())
 
+    def test_claim_pending_tasks_skips_tail_reconciliation_for_worker(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="t-tail-pending",
+            project_id="p1",
+            name="tail-pending",
+            status="pending",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/ws",
+            policy_json='{"pipeline_mode": "mixed_streaming"}',
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        )
+
+        class _ClaimPendingDb(_ModelAwareDb):
+            def query(self, model, *args, **kwargs):
+                del args, kwargs
+                model_name = getattr(model, "__name__", "")
+                if model_name == "BinarySecurityTask":
+                    return _FakeQuery([task])
+                return _FakeQuery([])
+
+        db = _ClaimPendingDb(tasks=[task])
+
+        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False):
+            claimed = manager._claim_pending_tasks(db, 1)
+
+        self.assertEqual([], claimed)
+        self.assertEqual("pending", task.status)
+        self.assertIsNone(task.dispatcher_instance_id)
+
     def test_find_reusable_dataflow_payload_prefers_active_duplicate_task(self):
         task = BinarySecurityTask(id="t1", project_id="p1")
         item = BinarySecurityStageItem(
