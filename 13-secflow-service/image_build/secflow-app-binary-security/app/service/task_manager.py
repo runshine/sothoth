@@ -6399,6 +6399,25 @@ class TaskManager:
         apply_state: bool = False,
     ) -> BinarySecurityActionResponse:
         task = self._task_or_404(db, project_id, task_id)
+        if (
+            self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
+            and self._is_reducer_role()
+            and str(task.status or "").strip().lower() == "pending"
+        ):
+            active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
+            if active_item_count > 0 or has_downstream_refs:
+                task.status = "running"
+                task.current_stage = active_stage_name or task.current_stage
+                task.dispatcher_instance_id = None
+                task.dispatch_started_at = None
+                task.lease_expires_at = None
+                task.finished_at = None
+                task.last_error = None
+                lease = self._maybe_upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
+                if self._runtime_lease_is_active(lease):
+                    self._clear_task_abnormal_reason_snapshot(db, task)
+                    db.commit()
+                    task = self._task_or_404(db, project_id, task_id)
         batch_size = max(1, int(getattr(self.cfg.scheduler, "downstream_sync_batch_size", 50) or 50))
         if stage_name and stage_name not in self._stage_sequence_for_task(task):
             raise ValidationError(f"无效阶段: {stage_name}")

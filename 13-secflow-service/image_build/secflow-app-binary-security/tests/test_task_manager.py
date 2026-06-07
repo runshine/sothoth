@@ -23155,6 +23155,76 @@ def _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_l
     self.assertFalse(recovered_events[-1].payload.get("runtime_lease_established"))
 
 
+def _test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_task(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="tail-reconcile-pending-1",
+        project_id="p1",
+        status="pending",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/out",
+        workspace_root="/ws",
+        policy_json='{"pipeline_mode": "mixed_streaming"}',
+        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+    )
+    stage_run = BinarySecurityStageRun(
+        id="sr-tail-reconcile-pending-1",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        sequence_no=1,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si-tail-reconcile-pending-1",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=stage_run.id,
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-1",
+        status="running",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-1",
+        result={
+            "sync_status": "skipped",
+            "sync_observation": {
+                "last_attempt_at": (_now() - timedelta(minutes=10)).isoformat(),
+                "last_synced_at": (_now() - timedelta(minutes=10)).isoformat(),
+            },
+        },
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], events=[])
+
+    async def _fetch(_task, _item, _token):
+        return {"task_id": "dvs-1", "status": "running", "parent_stage_item_id": "si-tail-reconcile-pending-1"}
+
+    original_fetch = manager._fetch_downstream_task_payload
+    try:
+        manager._fetch_downstream_task_payload = _fetch
+        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "reducer"}, clear=False):
+            asyncio.run(
+                manager.sync_downstream_status(
+                    db,
+                    project_id=task.project_id,
+                    task_id=task.id,
+                    force=False,
+                    record_request_event=False,
+                    record_noop_events=False,
+                    apply_state=True,
+                )
+            )
+    finally:
+        manager._fetch_downstream_task_payload = original_fetch
+
+    self.assertEqual("running", task.status)
+    self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, task.runtime_phase)
+    self.assertEqual(1, len(db.runtime_leases))
+    self.assertEqual(manager.instance_id, db.runtime_leases[0].owner_instance_id)
+
+
 def _test_tail_control_plane_stale_error_does_not_pollute_sync_error(self):
     manager = TaskManager()
     item = BinarySecurityStageItem(
@@ -24135,6 +24205,7 @@ TaskManagerTests.test_task_heartbeat_controller_skips_task_without_owner = _test
 TaskManagerTests.test_task_heartbeat_controller_refreshes_running_task_without_dispatcher_ownership = _test_task_heartbeat_controller_refreshes_running_task_without_dispatcher_ownership
 TaskManagerTests.test_worker_does_not_take_tail_runtime_lease_on_refresh = _test_worker_does_not_take_tail_runtime_lease_on_refresh
 TaskManagerTests.test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_lease = _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_lease
+TaskManagerTests.test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_task = _test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_task
 TaskManagerTests.test_tail_control_plane_stale_error_does_not_pollute_sync_error = _test_tail_control_plane_stale_error_does_not_pollute_sync_error
 TaskManagerTests.test_worker_skips_tail_tasks_in_downstream_reconcile_candidates = _test_worker_skips_tail_tasks_in_downstream_reconcile_candidates
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_locally_owned_running_task = _test_task_needs_downstream_reconcile_skips_locally_owned_running_task
