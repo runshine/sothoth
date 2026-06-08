@@ -1,16 +1,21 @@
 """Fileserver API routes."""
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import asyncio
 import hashlib
+import json
 import logging
 import mimetypes
 import os
 import posixpath
 import shutil
+import stat as stat_module
 import tempfile
+import tarfile
 import zipfile
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 from fastapi import APIRouter, Body, Depends, File, Form, Header, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import FileResponse
@@ -21,7 +26,15 @@ from app.build_info import build_service_meta
 from app.concurrency import get_queue_class, get_queue_controller, get_request_id
 from app.config import get_config, get_data_nfs_base_path, get_data_nfs_server, get_data_pvc_name
 from app.exception import ConflictError, ForbiddenError, NotFoundError, UnauthorizedError, ValidationError
-from app.model import FileDirectory, FileSubproject, ManagedFile, get_db, get_db_session
+from app.model import (
+    FileDirectory,
+    FileSubproject,
+    ManagedFile,
+    ProjectInputUploadBatch,
+    ProjectInputUploadRecord,
+    get_db,
+    get_db_session,
+)
 from app.schemas import (
     DirectoryChildrenResponse,
     DirectoryCreate,
@@ -44,6 +57,14 @@ from app.schemas import (
     ProjectPathFileEntry,
     ProjectPathMkdirsRequest,
     ProjectPathOperationResponse,
+    ProjectInputUploadAcceptedResponse,
+    ProjectInputUploadBatchSummary,
+    ProjectInputUploadDeleteRequest,
+    ProjectInputUploadDeleteResponse,
+    ProjectInputUploadDetailResponse,
+    ProjectInputUploadListResponse,
+    ProjectInputUploadRecordResponse,
+    ProjectInputUploadStatsResponse,
     ProjectFilesystemBreadcrumbItem,
     ProjectFilesystemChildrenResponse,
     ProjectFilesystemDirectoryCreate,
@@ -82,6 +103,24 @@ SPECIAL_VULN_SUBPROJECT_NAME = "__vuln_cases__"
 ARCHIVE_TASK_TYPE = "archive_download"
 ARCHIVE_TASK_RETENTION_SECONDS = 3600
 ARCHIVE_TASK_SUBDIR = ".archive_tasks"
+PROJECT_INPUT_TASK_TYPE = "project_input_upload"
+PROJECT_INPUT_ALLOWED_TYPES = {"code", "document", "software", "other"}
+PROJECT_INPUT_ALLOWED_SUFFIXES = (
+    ".zip",
+    ".tar",
+    ".tar.gz",
+    ".tgz",
+    ".tar.bz2",
+    ".tbz2",
+    ".tar.xz",
+    ".txz",
+)
+PROJECT_INPUT_UPLOAD_TMP_SUBDIR = ".project_input_uploads"
+
+
+_project_input_executor: ThreadPoolExecutor | None = None
+_project_input_upload_locks: dict[str, asyncio.Lock] = {}
+_project_input_upload_locks_guard = asyncio.Lock()
 
 
 async def run_in_queue(queue_class: str, coro):
@@ -591,17 +630,6 @@ async def get_task_status(task_id: str, authorization: Optional[str] = Header(No
     )
 
 
-def sanitize_name(name: str) -> str:
-    value = (name or "").strip()
-    if not value:
-        raise ValidationError("名称不能为空")
-    if "/" in value or "\\" in value:
-        raise ValidationError("名称不能包含路径分隔符")
-    if value in {".", ".."}:
-        raise ValidationError("名称不合法")
-    return value
-
-
 async def get_current_user(authorization: Optional[str] = Header(None)) -> TokenUser:
     if not authorization:
         raise UnauthorizedError("缺少Authorization头")
@@ -617,6 +645,578 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> Token
         raise UnauthorizedError("Token无效或已过期")
     except AuthServiceError as exc:
         raise UnauthorizedError(str(exc))
+
+
+@router.get("/project-input/uploads", response_model=ProjectInputUploadListResponse)
+async def list_project_input_uploads(
+    project_id: str = Query(...),
+    input_type: str = Query(...),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    await verify_project_access(project_id, authorization)
+    validated_type = validate_project_input_type(input_type)
+    records = db.query(ProjectInputUploadRecord).filter(
+        ProjectInputUploadRecord.project_id == project_id,
+        ProjectInputUploadRecord.input_type == validated_type,
+    ).order_by(ProjectInputUploadRecord.created_at.desc()).all()
+    items = []
+    for record in records:
+        latest_batch = db.query(ProjectInputUploadBatch).filter(
+            ProjectInputUploadBatch.upload_id == record.upload_id,
+        ).order_by(ProjectInputUploadBatch.created_at.desc()).first()
+        items.append(project_input_record_to_response(record, latest_batch))
+    return ProjectInputUploadListResponse(total=len(items), items=items)
+
+
+@router.get("/project-input/uploads/stats", response_model=ProjectInputUploadStatsResponse)
+async def get_project_input_upload_stats(
+    project_id: str = Query(...),
+    input_type: str = Query(...),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    await verify_project_access(project_id, authorization)
+    validated_type = validate_project_input_type(input_type)
+    records = db.query(ProjectInputUploadRecord).filter(
+        ProjectInputUploadRecord.project_id == project_id,
+        ProjectInputUploadRecord.input_type == validated_type,
+    ).all()
+    total = len(records)
+    processing = sum(1 for item in records if item.status in {"pending", "processing"})
+    succeeded = sum(1 for item in records if item.status == "succeeded")
+    partial_failed = sum(1 for item in records if item.status == "partial_failed")
+    failed = sum(1 for item in records if item.status == "failed")
+    stored_file_count = sum(int(item.stored_file_count or 0) for item in records)
+    stored_total_size_bytes = sum(int(item.stored_total_size_bytes or 0) for item in records)
+    return ProjectInputUploadStatsResponse(
+        project_id=project_id,
+        input_type=validated_type,
+        total_uploads=total,
+        processing_uploads=processing,
+        succeeded_uploads=succeeded,
+        partial_failed_uploads=partial_failed,
+        failed_uploads=failed,
+        stored_file_count=stored_file_count,
+        stored_total_size_bytes=stored_total_size_bytes,
+    )
+
+
+@router.get("/project-input/uploads/{upload_id}", response_model=ProjectInputUploadDetailResponse)
+async def get_project_input_upload_detail(
+    upload_id: str,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    record = db.query(ProjectInputUploadRecord).filter(ProjectInputUploadRecord.upload_id == upload_id).first()
+    if record is None:
+        raise NotFoundError("上传记录", upload_id)
+    await verify_project_access(record.project_id, authorization)
+    batches = db.query(ProjectInputUploadBatch).filter(
+        ProjectInputUploadBatch.upload_id == upload_id,
+    ).order_by(ProjectInputUploadBatch.created_at.desc()).all()
+    return make_project_input_detail_response(record, batches)
+
+
+@router.post("/project-input/uploads", response_model=ProjectInputUploadAcceptedResponse)
+async def create_project_input_upload(
+    project_id: str = Form(...),
+    input_type: str = Form(...),
+    keep_original: bool = Form(False),
+    files: List[UploadFile] = File(...),
+    current_user: TokenUser = Depends(get_current_user),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    await verify_project_access(project_id, authorization)
+    validated_type = validate_project_input_type(input_type)
+    if not files:
+        raise ValidationError("至少上传一个压缩包")
+    for file in files:
+        ensure_allowed_project_input_file(file.filename or "")
+
+    upload_id = uuid4().hex
+    batch_id = uuid4().hex
+    _, target_path = project_input_upload_path(project_id, validated_type, upload_id)
+    project_input_root_path(project_id, validated_type)
+
+    temp_items: list[dict[str, Any]] = []
+    for file in files:
+        temp_path, sha256, total_size = await persist_upload(file, project_input_temp_root())
+        temp_items.append({
+            "temp_path": temp_path,
+            "original_name": file.filename or "upload.bin",
+            "sha256": sha256,
+            "size": total_size,
+        })
+
+    record = ProjectInputUploadRecord(
+        upload_id=upload_id,
+        project_id=project_id,
+        input_type=validated_type,
+        status="pending",
+        keep_original=keep_original,
+        source_archive_count=0,
+        stored_file_count=0,
+        stored_total_size_bytes=0,
+        target_path=target_path,
+        created_by=current_user.username or str(current_user.id),
+    )
+    batch = ProjectInputUploadBatch(
+        batch_id=batch_id,
+        upload_id=upload_id,
+        status="pending",
+        mode="create",
+        keep_original=keep_original,
+        submitted_file_count=len(temp_items),
+        processed_file_count=0,
+        processed_size_bytes=0,
+    )
+    db.add(record)
+    db.add(batch)
+    db.commit()
+
+    save_json_file(
+        os.path.join(project_input_temp_root(), f"{batch_id}.json"),
+        {"upload_id": upload_id, "items": temp_items},
+    )
+    _, accepted_at = await submit_project_input_batch_task(batch_id, upload_id, project_id)
+    return ProjectInputUploadAcceptedResponse(
+        upload_id=upload_id,
+        batch_id=batch_id,
+        status="pending",
+        accepted_at=accepted_at,
+        request_id=get_request_id(),
+        queue_class=get_queue_class(),
+    )
+
+
+@router.post("/project-input/uploads/{upload_id}/append", response_model=ProjectInputUploadAcceptedResponse)
+async def append_project_input_upload(
+    upload_id: str,
+    keep_original: bool = Form(False),
+    files: List[UploadFile] = File(...),
+    current_user: TokenUser = Depends(get_current_user),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    del current_user
+    if not files:
+        raise ValidationError("至少上传一个压缩包")
+    record = db.query(ProjectInputUploadRecord).filter(ProjectInputUploadRecord.upload_id == upload_id).first()
+    if record is None:
+        raise NotFoundError("上传记录", upload_id)
+    await verify_project_access(record.project_id, authorization)
+    if record.status in {"pending", "processing"}:
+        raise ConflictError("当前上传记录仍在处理中，暂不支持追加")
+    for file in files:
+        ensure_allowed_project_input_file(file.filename or "")
+
+    batch_id = uuid4().hex
+    temp_items: list[dict[str, Any]] = []
+    for file in files:
+        temp_path, sha256, total_size = await persist_upload(file, project_input_temp_root())
+        temp_items.append({
+            "temp_path": temp_path,
+            "original_name": file.filename or "upload.bin",
+            "sha256": sha256,
+            "size": total_size,
+        })
+
+    batch = ProjectInputUploadBatch(
+        batch_id=batch_id,
+        upload_id=upload_id,
+        status="pending",
+        mode="append",
+        keep_original=keep_original,
+        submitted_file_count=len(temp_items),
+        processed_file_count=0,
+        processed_size_bytes=0,
+    )
+    record.status = "pending"
+    record.keep_original = keep_original
+    record.updated_at = datetime.utcnow()
+    db.add(batch)
+    db.commit()
+
+    save_json_file(
+        os.path.join(project_input_temp_root(), f"{batch_id}.json"),
+        {"upload_id": upload_id, "items": temp_items},
+    )
+    _, accepted_at = await submit_project_input_batch_task(batch_id, upload_id, record.project_id)
+    return ProjectInputUploadAcceptedResponse(
+        upload_id=upload_id,
+        batch_id=batch_id,
+        status="pending",
+        accepted_at=accepted_at,
+        request_id=get_request_id(),
+        queue_class=get_queue_class(),
+    )
+
+
+@router.delete("/project-input/uploads", response_model=ProjectInputUploadDeleteResponse)
+async def delete_project_input_uploads(
+    payload: ProjectInputUploadDeleteRequest,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    await verify_project_access(payload.project_id, authorization)
+    validated_type = validate_project_input_type(payload.input_type)
+    deleted_ids: list[str] = []
+    failed_items = []
+    for upload_id in payload.upload_ids:
+        record = db.query(ProjectInputUploadRecord).filter(
+            ProjectInputUploadRecord.upload_id == upload_id,
+            ProjectInputUploadRecord.project_id == payload.project_id,
+            ProjectInputUploadRecord.input_type == validated_type,
+        ).first()
+        if record is None:
+            failed_items.append({"upload_id": upload_id, "message": "上传记录不存在"})
+            continue
+        if record.status in {"pending", "processing"}:
+            failed_items.append({"upload_id": upload_id, "message": "上传处理中，暂不支持删除"})
+            continue
+        target_dir, _ = project_input_upload_path(record.project_id, record.input_type, record.upload_id)
+        if os.path.isdir(target_dir):
+            shutil.rmtree(target_dir, ignore_errors=True)
+        db.delete(record)
+        deleted_ids.append(upload_id)
+    db.commit()
+    return ProjectInputUploadDeleteResponse(
+        deleted_ids=deleted_ids,
+        failed_items=failed_items,
+    )
+
+
+def get_project_input_executor() -> ThreadPoolExecutor:
+    global _project_input_executor
+    if _project_input_executor is None:
+        workers = max(1, int(get_config().storage.upload_worker_threads or 4))
+        _project_input_executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="project-input-upload")
+    return _project_input_executor
+
+
+async def get_project_input_upload_lock(upload_id: str) -> asyncio.Lock:
+    async with _project_input_upload_locks_guard:
+        lock = _project_input_upload_locks.get(upload_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _project_input_upload_locks[upload_id] = lock
+        return lock
+
+
+def validate_project_input_type(input_type: str) -> str:
+    value = (input_type or "").strip().lower()
+    if value not in PROJECT_INPUT_ALLOWED_TYPES:
+        raise ValidationError("input_type 仅支持 code/document/software/other")
+    return value
+
+
+def project_input_root_path(project_id: str, input_type: str) -> str:
+    _, normalized = normalize_project_filesystem_path(f"/user_input/{input_type}", project_id)
+    target_path, _ = project_filesystem_target_path(project_id, normalized)
+    os.makedirs(target_path, exist_ok=True)
+    return target_path
+
+
+def project_input_upload_path(project_id: str, input_type: str, upload_id: str) -> tuple[str, str]:
+    normalized = f"/user_input/{input_type}/{upload_id}"
+    target_path, normalized = project_filesystem_target_path(project_id, normalized)
+    return target_path, normalized
+
+
+def project_input_temp_root() -> str:
+    path = os.path.join(get_config().storage.temp_dir, PROJECT_INPUT_UPLOAD_TMP_SUBDIR)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def is_allowed_project_input_filename(filename: str) -> bool:
+    lowered = (filename or "").strip().lower()
+    return any(lowered.endswith(suffix) for suffix in PROJECT_INPUT_ALLOWED_SUFFIXES)
+
+
+def ensure_allowed_project_input_file(filename: str) -> None:
+    if not is_allowed_project_input_filename(filename):
+        raise ValidationError("仅支持 zip、tar、tar.gz、tgz、tar.bz2、tbz2、tar.xz、txz 压缩包")
+
+
+def project_input_batch_to_summary(batch: ProjectInputUploadBatch) -> ProjectInputUploadBatchSummary:
+    return ProjectInputUploadBatchSummary.model_validate(batch)
+
+
+def project_input_record_to_response(record: ProjectInputUploadRecord, latest_batch: Optional[ProjectInputUploadBatch]) -> ProjectInputUploadRecordResponse:
+    return ProjectInputUploadRecordResponse(
+        upload_id=record.upload_id,
+        project_id=record.project_id,
+        input_type=record.input_type,
+        status=record.status,
+        keep_original=record.keep_original,
+        source_archive_count=record.source_archive_count,
+        stored_file_count=record.stored_file_count,
+        stored_total_size_bytes=record.stored_total_size_bytes,
+        target_path=record.target_path,
+        last_error=record.last_error,
+        created_by=record.created_by,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+        finished_at=record.finished_at,
+        latest_batch=project_input_batch_to_summary(latest_batch) if latest_batch else None,
+    )
+
+
+def make_project_input_detail_response(record: ProjectInputUploadRecord, batches: list[ProjectInputUploadBatch]) -> ProjectInputUploadDetailResponse:
+    latest_batch = batches[0] if batches else None
+    base = project_input_record_to_response(record, latest_batch)
+    return ProjectInputUploadDetailResponse(
+        **base.model_dump(),
+        batches=[project_input_batch_to_summary(batch) for batch in batches],
+    )
+
+
+def sanitize_archive_member_name(name: str) -> Optional[str]:
+    value = (name or "").replace("\\", "/").strip()
+    if not value or value.endswith("/"):
+        return None
+    normalized = posixpath.normpath(value)
+    if normalized in {".", ""}:
+        return None
+    if normalized.startswith("../") or normalized == ".." or normalized.startswith("/"):
+        return None
+    parts = [part for part in normalized.split("/") if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        return None
+    return "/".join(parts)
+
+
+def ensure_path_inside_directory(base_dir: str, target_path: str) -> None:
+    base_real = os.path.realpath(base_dir)
+    target_real = os.path.realpath(target_path)
+    if os.path.commonpath([target_real, base_real]) != base_real:
+        raise ValidationError("解压路径越界")
+
+
+def save_json_file(path: str, payload: dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fp:
+        json.dump(payload, fp, ensure_ascii=False, indent=2)
+
+
+def collect_directory_snapshot(base_dir: str) -> tuple[int, int]:
+    total_files = 0
+    total_size = 0
+    if not os.path.isdir(base_dir):
+        return 0, 0
+    for root, _, files in os.walk(base_dir):
+        for filename in files:
+            file_path = os.path.join(root, filename)
+            if os.path.islink(file_path):
+                continue
+            try:
+                stat_result = os.stat(file_path)
+            except OSError:
+                continue
+            if not stat_module.S_ISREG(stat_result.st_mode):
+                continue
+            total_files += 1
+            total_size += int(stat_result.st_size or 0)
+    return total_files, total_size
+
+
+def extract_project_input_archive(archive_path: str, destination_dir: str, original_name: Optional[str] = None) -> dict[str, Any]:
+    processed_files = 0
+    warnings: list[str] = []
+    lowered_name = (original_name or archive_path or "").lower()
+    if lowered_name.endswith(".zip"):
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            for member in zf.infolist():
+                sanitized = sanitize_archive_member_name(member.filename)
+                if member.is_dir():
+                    if sanitized:
+                        os.makedirs(os.path.join(destination_dir, sanitized), exist_ok=True)
+                    continue
+                if sanitized is None:
+                    warnings.append(f"skip invalid path: {member.filename}")
+                    continue
+                mode = (member.external_attr >> 16) & 0xFFFF
+                file_type_bits = stat_module.S_IFMT(mode)
+                is_symlink = file_type_bits == stat_module.S_IFLNK
+                is_directory = file_type_bits == stat_module.S_IFDIR
+                is_regular = file_type_bits in {0, stat_module.S_IFREG}
+                if is_symlink or is_directory or not is_regular:
+                    warnings.append(f"skip special entry: {member.filename}")
+                    continue
+                target_path = os.path.join(destination_dir, sanitized)
+                ensure_path_inside_directory(destination_dir, target_path)
+                if os.path.exists(target_path):
+                    warnings.append(f"skip conflict: {sanitized}")
+                    continue
+                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                with zf.open(member, "r") as src, open(target_path, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                processed_files += 1
+    else:
+        with tarfile.open(archive_path, "r:*") as tf:
+            for member in tf.getmembers():
+                sanitized = sanitize_archive_member_name(member.name)
+                if member.isdir():
+                    if sanitized:
+                        os.makedirs(os.path.join(destination_dir, sanitized), exist_ok=True)
+                    continue
+                if sanitized is None:
+                    warnings.append(f"skip invalid path: {member.name}")
+                    continue
+                if member.issym() or member.islnk() or not member.isfile():
+                    warnings.append(f"skip special entry: {member.name}")
+                    continue
+                target_path = os.path.join(destination_dir, sanitized)
+                ensure_path_inside_directory(destination_dir, target_path)
+                if os.path.exists(target_path):
+                    warnings.append(f"skip conflict: {sanitized}")
+                    continue
+                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                extracted = tf.extractfile(member)
+                if extracted is None:
+                    warnings.append(f"skip unreadable entry: {member.name}")
+                    continue
+                with extracted, open(target_path, "wb") as dst:
+                    shutil.copyfileobj(extracted, dst)
+                processed_files += 1
+    return {"processed_files": processed_files, "warnings": warnings}
+
+
+def store_project_input_original_file(source_path: str, original_name: str, destination_dir: str) -> dict[str, Any]:
+    filename = sanitize_name(os.path.basename(original_name or "upload.bin"))
+    target_path = os.path.join(destination_dir, filename)
+    ensure_path_inside_directory(destination_dir, target_path)
+    if os.path.exists(target_path):
+        stem, ext = os.path.splitext(filename)
+        filename = f"{stem}-{uuid4().hex[:8]}{ext}"
+        target_path = os.path.join(destination_dir, filename)
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    shutil.copy2(source_path, target_path)
+    return {"processed_files": 1, "warnings": []}
+
+
+async def run_project_input_batch_in_executor(batch_id: str) -> dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(get_project_input_executor(), process_project_input_batch_sync, batch_id)
+
+
+def process_project_input_batch_sync(batch_id: str) -> dict[str, Any]:
+    db = get_db_session()
+    try:
+        batch = db.query(ProjectInputUploadBatch).filter(ProjectInputUploadBatch.batch_id == batch_id).first()
+        if batch is None:
+            raise ValidationError("上传批次不存在")
+        record = db.query(ProjectInputUploadRecord).filter(ProjectInputUploadRecord.upload_id == batch.upload_id).first()
+        if record is None:
+            raise ValidationError("上传记录不存在")
+
+        upload_dir_path, _ = project_input_upload_path(record.project_id, record.input_type, record.upload_id)
+        os.makedirs(upload_dir_path, exist_ok=True)
+
+        meta_path = os.path.join(project_input_temp_root(), f"{batch_id}.json")
+        if not os.path.exists(meta_path):
+            raise ValidationError("上传批次临时元数据不存在")
+        with open(meta_path, "r", encoding="utf-8") as fp:
+            temp_payload = json.load(fp)
+        items = temp_payload.get("items") or []
+        warnings: list[str] = []
+        processed_count = 0
+        batch.status = "processing"
+        record.status = "processing"
+        record.last_error = None
+        db.commit()
+
+        for item in items:
+            temp_path = str(item.get("temp_path") or "")
+            original_name = str(item.get("original_name") or "upload.bin")
+            if not temp_path or not os.path.exists(temp_path):
+                warnings.append(f"missing temp file: {original_name}")
+                continue
+            try:
+                if batch.keep_original:
+                    result = store_project_input_original_file(temp_path, original_name, upload_dir_path)
+                else:
+                    result = extract_project_input_archive(temp_path, upload_dir_path, original_name=original_name)
+                processed_count += int(result.get("processed_files") or 0)
+                warnings.extend([str(message) for message in (result.get("warnings") or [])])
+            except Exception as exc:
+                warnings.append(f"{original_name}: {exc}")
+            finally:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+        stored_file_count, stored_total_size = collect_directory_snapshot(upload_dir_path)
+        batch.processed_file_count = processed_count
+        batch.processed_size_bytes = stored_total_size
+        batch.error_summary = "；".join(warnings[:20]) if warnings else None
+        batch.status = "partial_failed" if warnings else "succeeded"
+        batch.finished_at = datetime.utcnow()
+
+        record.source_archive_count = int(record.source_archive_count or 0) + int(batch.submitted_file_count or 0)
+        record.stored_file_count = stored_file_count
+        record.stored_total_size_bytes = stored_total_size
+        record.last_error = batch.error_summary
+        record.status = batch.status
+        record.finished_at = batch.finished_at
+        record.updated_at = datetime.utcnow()
+
+        db.commit()
+        try:
+            os.remove(meta_path)
+        except OSError:
+            pass
+        return {
+            "upload_id": record.upload_id,
+            "batch_id": batch.batch_id,
+            "status": batch.status,
+            "stored_file_count": stored_file_count,
+            "stored_total_size_bytes": stored_total_size,
+            "warning_count": len(warnings),
+        }
+    except Exception as exc:
+        db.rollback()
+        batch = db.query(ProjectInputUploadBatch).filter(ProjectInputUploadBatch.batch_id == batch_id).first()
+        if batch is not None:
+            batch.status = "failed"
+            batch.error_summary = str(exc)
+            batch.finished_at = datetime.utcnow()
+            record = db.query(ProjectInputUploadRecord).filter(ProjectInputUploadRecord.upload_id == batch.upload_id).first()
+            if record is not None:
+                record.status = "failed"
+                record.last_error = str(exc)
+                record.finished_at = batch.finished_at
+                record.updated_at = datetime.utcnow()
+            db.commit()
+        raise
+    finally:
+        db.close()
+
+
+async def submit_project_input_batch_task(batch_id: str, upload_id: str, project_id: str) -> tuple[str, datetime]:
+    lock = await get_project_input_upload_lock(upload_id)
+
+    async def _runner():
+        async with lock:
+            return await run_project_input_batch_in_executor(batch_id)
+
+    task = await get_task_manager().submit(_runner, task_type=PROJECT_INPUT_TASK_TYPE, project_id=project_id)
+    return task.task_id, task.accepted_at
+
+
+def sanitize_name(name: str) -> str:
+    value = (name or "").strip()
+    if not value:
+        raise ValidationError("名称不能为空")
+    if "/" in value or "\\" in value:
+        raise ValidationError("名称不能包含路径分隔符")
+    if value in {".", ".."}:
+        raise ValidationError("名称不合法")
+    return value
 
 
 @router.get("/storage/pvc", response_model=StoragePVCResponse)

@@ -24339,8 +24339,18 @@ class TaskManager:
         token: str | None,
         *,
         force_delete: bool = False,
+        best_effort: bool = False,
+        cleanup_scope: str = "retry_prepare",
     ) -> int:
-        return await self._downstream_delete_refs(db, task, refs, token, force_delete=force_delete)
+        return await self._downstream_delete_refs(
+            db,
+            task,
+            refs,
+            token,
+            force_delete=force_delete,
+            best_effort=best_effort,
+            cleanup_scope=cleanup_scope,
+        )
 
     async def _cleanup_task_workspace(self, task: BinarySecurityTask, token: str | None) -> str:
         workspace_root = Path(task.workspace_root)

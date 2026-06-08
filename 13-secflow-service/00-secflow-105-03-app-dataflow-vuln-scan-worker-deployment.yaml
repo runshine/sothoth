@@ -4,7 +4,7 @@ metadata:
   name: secflow-app-dataflow-vuln-scan-worker
   namespace: secflow-ns
 spec:
-  replicas: 8
+  replicas: 4
   selector:
     matchLabels:
       name: secflow-app-dataflow-vuln-scan

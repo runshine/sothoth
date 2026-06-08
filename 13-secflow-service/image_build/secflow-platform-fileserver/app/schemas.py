@@ -334,3 +334,83 @@ class ArchiveTaskCreateRequest(BaseModel):
     project_id: str = Field(..., min_length=1, max_length=32)
     items: List[str] = Field(default_factory=list)
     archive_name: Optional[str] = Field(None, min_length=1, max_length=255)
+
+
+class ProjectInputUploadBatchSummary(BaseModel):
+    batch_id: str
+    status: str
+    mode: str
+    keep_original: bool
+    submitted_file_count: int
+    processed_file_count: int
+    processed_size_bytes: int
+    error_summary: Optional[str] = None
+    created_at: datetime
+    finished_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ProjectInputUploadRecordResponse(BaseModel):
+    upload_id: str
+    project_id: str
+    input_type: str
+    status: str
+    keep_original: bool
+    source_archive_count: int
+    stored_file_count: int
+    stored_total_size_bytes: int
+    target_path: str
+    last_error: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    finished_at: Optional[datetime] = None
+    latest_batch: Optional[ProjectInputUploadBatchSummary] = None
+
+
+class ProjectInputUploadListResponse(BaseModel):
+    total: int
+    items: List[ProjectInputUploadRecordResponse]
+
+
+class ProjectInputUploadStatsResponse(BaseModel):
+    project_id: str
+    input_type: str
+    total_uploads: int
+    processing_uploads: int
+    succeeded_uploads: int
+    partial_failed_uploads: int
+    failed_uploads: int
+    stored_file_count: int
+    stored_total_size_bytes: int
+
+
+class ProjectInputUploadAcceptedResponse(BaseModel):
+    upload_id: str
+    batch_id: str
+    status: str
+    accepted_at: datetime
+    request_id: Optional[str] = None
+    queue_class: Optional[str] = None
+
+
+class ProjectInputUploadDeleteRequest(BaseModel):
+    project_id: str = Field(..., min_length=1, max_length=32)
+    input_type: str = Field(..., min_length=1, max_length=32)
+    upload_ids: List[str] = Field(default_factory=list)
+
+
+class ProjectInputUploadDeleteFailedItem(BaseModel):
+    upload_id: str
+    message: str
+
+
+class ProjectInputUploadDeleteResponse(BaseModel):
+    deleted_ids: List[str] = Field(default_factory=list)
+    failed_items: List[ProjectInputUploadDeleteFailedItem] = Field(default_factory=list)
+
+
+class ProjectInputUploadDetailResponse(ProjectInputUploadRecordResponse):
+    batches: List[ProjectInputUploadBatchSummary] = Field(default_factory=list)

@@ -88,6 +88,7 @@ class StorageConfig(BaseModel):
     max_upload_size: int = 2147483648
     nfs_server: Optional[str] = None
     nfs_base_path: Optional[str] = None
+    upload_worker_threads: int = 4
 
 
 class AppConfig(BaseModel):

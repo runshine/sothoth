@@ -8,8 +8,8 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: secflow-app-dataflow-vuln-scan-worker
-  minReplicas: 8
-  maxReplicas: 8
+  minReplicas: 4
+  maxReplicas: 4
   behavior:
     scaleDown:
       stabilizationWindowSeconds: 600
