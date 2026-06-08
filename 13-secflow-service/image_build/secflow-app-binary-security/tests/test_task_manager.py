@@ -8895,6 +8895,61 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 self.manager._delete_task_state_event_rows = original_delete_state_events
 
+    def test_prepare_retry_task_hard_restart_preserves_binary_module_input_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            input_dir = workspace / "input"
+            output_dir = workspace / "output" / "binary-to-source"
+            run_dir = workspace / "run" / "upload-tmp"
+            logs_dir = workspace / "logs"
+            input_dir.mkdir(parents=True)
+            output_dir.mkdir(parents=True)
+            run_dir.mkdir(parents=True)
+            logs_dir.mkdir(parents=True)
+            (input_dir / "libipsec.so").write_text("binary", encoding="utf-8")
+            (input_dir / "module-files.list").write_text("libipsec.so\n", encoding="utf-8")
+            (input_dir / "task-metadata.json").write_text("{\"status\":\"failed\"}", encoding="utf-8")
+            (output_dir / "stale.txt").write_text("stale", encoding="utf-8")
+            (workspace / "run" / "stage-items").mkdir(parents=True)
+            (workspace / "logs" / "worker.log").write_text("old", encoding="utf-8")
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="IPSEC_MODULE",
+                status="failed",
+                task_type=TASK_TYPE_BINARY_MODULE,
+                current_stage="binary_to_source",
+                firmware_source="project_filesystem",
+                firmware_path=str(input_dir),
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+                execution_epoch=0,
+            )
+            task.summary = {
+                "input_files": [{"filename": "libipsec.so", "size": 6, "relative_path": "libipsec.so"}],
+                "selected_modules": [{"module_key": "ipsec", "module_name": "IPSEC"}],
+                "module_input": {"module_name": "IPSEC_MODULE", "file_count": 1},
+            }
+            db = _AppendingModelAwareDb(tasks=[task], stage_runs=[], stage_items=[], archive_jobs=[], events=[], state_events=[])
+
+            async def fake_cleanup_downstream_refs(_db, _task, refs, _token):
+                self.assertEqual([], refs)
+
+            self.manager._cleanup_downstream_refs = fake_cleanup_downstream_refs
+
+            stage_sequence = asyncio.run(self.manager._prepare_retry_task(db, task))
+
+            self.assertEqual(["binary_to_source", "entry_analysis", "dataflow_vuln_scan"], stage_sequence)
+            self.assertTrue((input_dir / "libipsec.so").exists())
+            self.assertEqual("binary", (input_dir / "libipsec.so").read_text(encoding="utf-8"))
+            self.assertTrue((input_dir / "module-files.list").exists())
+            self.assertEqual("libipsec.so\n", (input_dir / "module-files.list").read_text(encoding="utf-8"))
+            self.assertTrue((input_dir / "task-metadata.json").exists())
+            self.assertFalse((output_dir / "stale.txt").exists())
+            self.assertTrue((workspace / "output").exists())
+            self.assertTrue((workspace / "run" / "upload-tmp").exists())
+            self.assertTrue((workspace / "logs").exists())
+
     def test_retry_failed_items_end_to_end_requeues_target_stage_for_streaming_tail_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -9399,19 +9454,22 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             original_cleanup = self.manager._cleanup_downstream_refs
-            original_discover = self.manager._discover_parent_linked_downstream_refs
+            original_discover = self.manager._discover_parent_linked_downstream_refs_detailed
             self.manager._cleanup_downstream_refs = fake_cleanup
-            self.manager._discover_parent_linked_downstream_refs = lambda _db, _task: [
-                {"service": "system_analyse", "task_id": "sa-1", "project_id": "p1", "stage_name": "system_analysis"},
-                {"service": "system_analyse", "task_id": "sa-orphan", "project_id": "p1", "stage_name": "system_analysis"},
-                {"service": "dataflow_vuln_scan", "task_id": "dfa-other", "project_id": "p1", "stage_name": "dataflow_vuln_scan"},
-            ]
+            self.manager._discover_parent_linked_downstream_refs_detailed = lambda _db, _task: (
+                [
+                    {"service": "system_analyse", "task_id": "sa-1", "project_id": "p1", "stage_name": "system_analysis"},
+                    {"service": "system_analyse", "task_id": "sa-orphan", "project_id": "p1", "stage_name": "system_analysis"},
+                    {"service": "dataflow_vuln_scan", "task_id": "dfa-other", "project_id": "p1", "stage_name": "dataflow_vuln_scan"},
+                ],
+                [],
+            )
             try:
                 self.manager.retry_task(db, project_id="p1", task_id="task1")
                 self._finish_retry_prepare(db, task)
             finally:
                 self.manager._cleanup_downstream_refs = original_cleanup
-                self.manager._discover_parent_linked_downstream_refs = original_discover
+                self.manager._discover_parent_linked_downstream_refs_detailed = original_discover
 
             self.assertEqual(1, len(calls))
             self.assertEqual("task1", calls[0]["task_id"])
@@ -9453,21 +9511,29 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             original_cleanup = self.manager._cleanup_downstream_refs
             original_discover = self.manager._discover_parent_linked_downstream_refs_detailed
             self.manager._cleanup_downstream_refs = fake_cleanup
-            self.manager._discover_parent_linked_downstream_refs_detailed = lambda _db, _task: (
-                [
-                    {
-                        "service": "firmware_unpacker",
-                        "task_id": "fw-orphan",
-                        "project_id": "p1",
-                        "stage_name": "firmware_unpack",
-                        "parent_stage_name": None,
-                        "stage_name_inferred": True,
-                        "inferred_stage_name": "firmware_unpack",
-                        "collect_source": "parent_linked_scan",
-                    }
-                ],
-                [],
-            )
+            discover_calls = {"count": 0}
+
+            def fake_discover(_db, _task):
+                discover_calls["count"] += 1
+                if discover_calls["count"] == 1:
+                    return (
+                        [
+                            {
+                                "service": "firmware_unpacker",
+                                "task_id": "fw-orphan",
+                                "project_id": "p1",
+                                "stage_name": "firmware_unpack",
+                                "parent_stage_name": None,
+                                "stage_name_inferred": True,
+                                "inferred_stage_name": "firmware_unpack",
+                                "collect_source": "parent_linked_scan",
+                            }
+                        ],
+                        [],
+                    )
+                return ([], [])
+
+            self.manager._discover_parent_linked_downstream_refs_detailed = fake_discover
             try:
                 self.manager.retry_task(db, project_id="p1", task_id="task1")
                 self._finish_retry_prepare(db, task)

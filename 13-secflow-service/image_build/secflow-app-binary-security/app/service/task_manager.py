@@ -6700,16 +6700,7 @@ class TaskManager:
 
     def _delete_workspace_runtime_children(self, task: BinarySecurityTask) -> None:
         workspace_root = Path(task.workspace_root)
-        input_dir = workspace_root / "input"
-        keep_files = {"task-metadata.json"}
-        if input_dir.exists():
-            for child in input_dir.iterdir():
-                if child.name in keep_files:
-                    continue
-                if child.is_dir():
-                    shutil.rmtree(child, ignore_errors=True)
-                else:
-                    child.unlink(missing_ok=True)
+        ensure_dir(workspace_root / "input")
         for folder_name in ("output", "run", "logs"):
             target = workspace_root / folder_name
             if target.exists():
