@@ -230,6 +230,29 @@ class EngineProjectConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc, index=True)
 
 
+class DownloadJob(Base):
+    __tablename__ = "secflow_vuln_download_job"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(64), index=True)
+    source_type: Mapped[str] = mapped_column(String(64), default="vuln_intake_report")
+    scope_type: Mapped[str] = mapped_column(String(32), default="single")
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    report_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    report_count: Mapped[int] = mapped_column(Integer, default=0)
+    output_format: Mapped[str] = mapped_column(String(32), default="zip")
+    output_filename: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    output_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    output_size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    created_by: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc, index=True)
+
+
 _engine = None
 _SessionFactory = None
 
@@ -278,6 +301,60 @@ def run_auto_migrations() -> None:
     if "ix_secflow_vuln_case_global_vuln_id" not in case_indexes and "ix_secflow_vuln_case_global_vuln_id" not in unique_indexes:
         with engine.begin() as connection:
             connection.execute(text("CREATE UNIQUE INDEX ix_secflow_vuln_case_global_vuln_id ON secflow_vuln_case (global_vuln_id)"))
+
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+    if DownloadJob.__tablename__ not in table_names:
+        DownloadJob.__table__.create(bind=engine, checkfirst=True)
+    else:
+        download_columns = {column["name"] for column in inspector.get_columns(DownloadJob.__tablename__)}
+        with engine.begin() as connection:
+            if "source_type" not in download_columns:
+                connection.execute(text(f"ALTER TABLE {DownloadJob.__tablename__} ADD COLUMN source_type VARCHAR(64) DEFAULT 'vuln_intake_report'"))
+            if "scope_type" not in download_columns:
+                connection.execute(text(f"ALTER TABLE {DownloadJob.__tablename__} ADD COLUMN scope_type VARCHAR(32) DEFAULT 'single'"))
+            if "status" not in download_columns:
+                connection.execute(text(f"ALTER TABLE {DownloadJob.__tablename__} ADD COLUMN status VARCHAR(32) DEFAULT 'pending'"))
+            if "report_ids_json" not in download_columns:
+                connection.execute(text(f"ALTER TABLE {DownloadJob.__tablename__} ADD COLUMN report_ids_json TEXT"))
+            if "report_count" not in download_columns:
+                connection.execute(text(f"ALTER TABLE {DownloadJob.__tablename__} ADD COLUMN report_count INTEGER DEFAULT 0"))
+            if "output_format" not in download_columns:
+                connection.execute(text(f"ALTER TABLE {DownloadJob.__tablename__} ADD COLUMN output_format VARCHAR(32) DEFAULT 'zip'"))
+            if "output_filename" not in download_columns:
+                connection.execute(text(f"ALTER TABLE {DownloadJob.__tablename__} ADD COLUMN output_filename VARCHAR(255)"))
+            if "output_path" not in download_columns:
+                connection.execute(text(f"ALTER TABLE {DownloadJob.__tablename__} ADD COLUMN output_path VARCHAR(1024)"))
+            if "output_size_bytes" not in download_columns:
+                connection.execute(text(f"ALTER TABLE {DownloadJob.__tablename__} ADD COLUMN output_size_bytes INTEGER DEFAULT 0"))
+            if "created_by" not in download_columns:
+                connection.execute(text(f"ALTER TABLE {DownloadJob.__tablename__} ADD COLUMN created_by VARCHAR(128)"))
+            if "started_at" not in download_columns:
+                connection.execute(text(f"ALTER TABLE {DownloadJob.__tablename__} ADD COLUMN started_at DATETIME"))
+            if "finished_at" not in download_columns:
+                connection.execute(text(f"ALTER TABLE {DownloadJob.__tablename__} ADD COLUMN finished_at DATETIME"))
+            if "expires_at" not in download_columns:
+                connection.execute(text(f"ALTER TABLE {DownloadJob.__tablename__} ADD COLUMN expires_at DATETIME"))
+            if "last_error" not in download_columns:
+                connection.execute(text(f"ALTER TABLE {DownloadJob.__tablename__} ADD COLUMN last_error TEXT"))
+            if "created_at" not in download_columns:
+                connection.execute(text(f"ALTER TABLE {DownloadJob.__tablename__} ADD COLUMN created_at DATETIME"))
+            if "updated_at" not in download_columns:
+                connection.execute(text(f"ALTER TABLE {DownloadJob.__tablename__} ADD COLUMN updated_at DATETIME"))
+
+    inspector = inspect(engine)
+    download_indexes = {index["name"] for index in inspector.get_indexes(DownloadJob.__tablename__)}
+    with engine.begin() as connection:
+        if "ix_secflow_vuln_download_job_project_id" not in download_indexes:
+            connection.execute(text("CREATE INDEX ix_secflow_vuln_download_job_project_id ON secflow_vuln_download_job (project_id)"))
+        if "ix_secflow_vuln_download_job_status" not in download_indexes:
+            connection.execute(text("CREATE INDEX ix_secflow_vuln_download_job_status ON secflow_vuln_download_job (status)"))
+        if "ix_secflow_vuln_download_job_expires_at" not in download_indexes:
+            connection.execute(text("CREATE INDEX ix_secflow_vuln_download_job_expires_at ON secflow_vuln_download_job (expires_at)"))
+        if "ix_secflow_vuln_download_job_created_at" not in download_indexes:
+            connection.execute(text("CREATE INDEX ix_secflow_vuln_download_job_created_at ON secflow_vuln_download_job (created_at)"))
+        if "ix_secflow_vuln_download_job_updated_at" not in download_indexes:
+            connection.execute(text("CREATE INDEX ix_secflow_vuln_download_job_updated_at ON secflow_vuln_download_job (updated_at)"))
 
     session = get_session_factory()()
     try:

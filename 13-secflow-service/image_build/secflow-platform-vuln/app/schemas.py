@@ -392,3 +392,55 @@ class VulnEngineProjectConfigResponse(BaseModel):
     updated_by: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+
+class DownloadCenterJobCreateRequest(BaseModel):
+    project_id: str = Field(min_length=1, max_length=64)
+    report_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("report_ids")
+    @classmethod
+    def validate_report_ids(cls, value: list[str]) -> list[str]:
+        normalized = [str(item).strip() for item in value if str(item).strip()]
+        if not normalized:
+            raise ValueError("report_ids must not be empty")
+        return normalized
+
+
+class DownloadCenterJobRetryRequest(BaseModel):
+    pass
+
+
+class DownloadCenterJobResponse(BaseModel):
+    job_id: str
+    project_id: str
+    source_type: str
+    scope_type: str
+    status: str
+    report_ids: list[str] = Field(default_factory=list)
+    report_count: int
+    output_format: str
+    output_filename: Optional[str] = None
+    output_size_bytes: int = 0
+    created_by: Optional[str] = None
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    last_error: Optional[str] = None
+    downloadable: bool = False
+
+
+class DownloadCenterJobListResponse(BaseModel):
+    items: list[DownloadCenterJobResponse] = Field(default_factory=list)
+    total: int = 0
+
+
+class DownloadCenterStatsResponse(BaseModel):
+    total: int = 0
+    pending: int = 0
+    processing: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    expired: int = 0
+    downloadable: int = 0

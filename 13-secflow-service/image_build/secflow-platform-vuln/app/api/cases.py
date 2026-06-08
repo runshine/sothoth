@@ -11,11 +11,15 @@ from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import ensure_project_access, get_current_subject
-from app.models.database import ActionExecution, Case, CaseEvent, ManualTask, Result, ServiceRegistry, StageHistory, WorkflowRun, get_db
+from app.models.database import ActionExecution, Case, CaseEvent, DownloadJob, ManualTask, Result, ServiceRegistry, StageHistory, WorkflowRun, get_db
 from app.schemas import (
     CaseUpdateRequest,
     CaseCreateRequest,
     DecisionRequest,
+    DownloadCenterJobCreateRequest,
+    DownloadCenterJobListResponse,
+    DownloadCenterJobResponse,
+    DownloadCenterStatsResponse,
     DraftCaseCreateRequest,
     FinishCaseRequest,
     ManualTaskCreateRequest,
@@ -29,6 +33,7 @@ from app.schemas import (
     TriageRoundStartRequest,
     ValidationResultRequest,
 )
+from app.services.download_center import create_job, delete_job, get_job_stats, list_jobs, retry_job, serialize_job
 from app.services.lifecycle_engine import (
     FINISHED_REASONS,
     FINISHED_STATUS_DONE,
@@ -202,6 +207,103 @@ def _manual_task_payload(item: ManualTask) -> dict:
         "completed_at": item.completed_at,
         "created_at": item.created_at,
     }
+
+
+@router.get("/download-center/jobs", response_model=DownloadCenterJobListResponse)
+async def list_download_center_jobs(
+    project_id: str = Query(...),
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    _, token = user_and_token
+    await ensure_project_access(project_id, token)
+    items = list_jobs(db, project_id)
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/download-center/stats", response_model=DownloadCenterStatsResponse)
+async def get_download_center_stats(
+    project_id: str = Query(...),
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    _, token = user_and_token
+    await ensure_project_access(project_id, token)
+    return get_job_stats(db, project_id)
+
+
+@router.get("/download-center/jobs/{job_id}", response_model=DownloadCenterJobResponse)
+async def get_download_center_job(
+    job_id: str,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    _, token = user_and_token
+    download_job = db.query(DownloadJob).filter(DownloadJob.id == job_id).first()
+    if download_job is None:
+        raise HTTPException(status_code=404, detail="download job not found")
+    await ensure_project_access(download_job.project_id, token)
+    return serialize_job(download_job)
+
+
+@router.post("/download-center/jobs", response_model=DownloadCenterJobResponse)
+async def create_download_center_job(
+    request: DownloadCenterJobCreateRequest,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    subject, token = user_and_token
+    await ensure_project_access(request.project_id, token)
+    created_by = subject.get("username") or str(subject.get("id"))
+    return create_job(db, project_id=request.project_id, report_ids=request.report_ids, created_by=created_by)
+
+
+@router.post("/download-center/jobs/{job_id}/retry", response_model=DownloadCenterJobResponse)
+async def retry_download_center_job(
+    job_id: str,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    _, token = user_and_token
+    job = db.query(DownloadJob).filter(DownloadJob.id == job_id).first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="download job not found")
+    await ensure_project_access(job.project_id, token)
+    return retry_job(db, job.project_id, job_id)
+
+
+@router.delete("/download-center/jobs/{job_id}", response_model=DownloadCenterJobResponse)
+async def delete_download_center_job(
+    job_id: str,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    _, token = user_and_token
+    job = db.query(DownloadJob).filter(DownloadJob.id == job_id).first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="download job not found")
+    await ensure_project_access(job.project_id, token)
+    return delete_job(db, job.project_id, job_id)
+
+
+@router.get("/download-center/jobs/{job_id}/download")
+async def download_download_center_job(
+    job_id: str,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    _, token = user_and_token
+    job = db.query(DownloadJob).filter(DownloadJob.id == job_id).first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="download job not found")
+    await ensure_project_access(job.project_id, token)
+    payload = serialize_job(job)
+    if not payload.get("downloadable") or not job.output_path:
+        raise HTTPException(status_code=400, detail="download job output is not ready")
+    path = Path(job.output_path)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="download file missing")
+    return FileResponse(path, media_type="application/zip", filename=job.output_filename or path.name)
 
 
 def _validate_stage_transition(

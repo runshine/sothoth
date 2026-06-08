@@ -1,6 +1,8 @@
 import os
 import re
 import sys
+import zipfile
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,7 @@ from app.api import cases as cases_api  # noqa: E402
 from app.api import actions as actions_api  # noqa: E402
 from app.api import public as public_api  # noqa: E402
 from app.models.database import Base, get_db  # noqa: E402
+from app.services.download_center import process_job  # noqa: E402
 
 
 def make_suspicion_payload(**overrides):
@@ -374,6 +377,103 @@ def test_duplicate_report_id_returns_existing_case(client: TestClient):
     assert second.status_code == 200
     assert second.json()["id"] == first.json()["id"]
     assert second.json()["global_vuln_id"] == first.json()["global_vuln_id"]
+
+
+def test_download_center_job_create_process_and_download(client: TestClient):
+    first = client.post(
+        "/api/vuln/cases",
+        json=make_suspicion_payload(
+            title="Download center case one",
+            report_id="download-center-001",
+            artifacts=[
+                {
+                    "kind": "text",
+                    "name": "evidence.txt",
+                    "path": "evidence/evidence.txt",
+                    "content": "hello from evidence",
+                    "encoding": "utf-8",
+                }
+            ],
+        ),
+    )
+    assert first.status_code == 200
+    case_id = first.json()["id"]
+
+    create_job_resp = client.post(
+        "/api/vuln/cases/download-center/jobs",
+        json={"project_id": "demo-project", "report_ids": [case_id]},
+    )
+    assert create_job_resp.status_code == 200
+    job_payload = create_job_resp.json()
+    assert job_payload["status"] == "pending"
+    assert job_payload["scope_type"] == "single"
+
+    db_gen = app.dependency_overrides[get_db]()
+    db = next(db_gen)
+    try:
+        processed = process_job(db, job_payload["job_id"])
+    finally:
+        db.close()
+    assert processed is not None
+    assert processed["status"] == "succeeded"
+    assert processed["downloadable"] is True
+
+    list_resp = client.get("/api/vuln/cases/download-center/jobs", params={"project_id": "demo-project"})
+    assert list_resp.status_code == 200
+    assert list_resp.json()["total"] >= 1
+
+    stats_resp = client.get("/api/vuln/cases/download-center/stats", params={"project_id": "demo-project"})
+    assert stats_resp.status_code == 200
+    assert stats_resp.json()["downloadable"] >= 1
+
+    download_resp = client.get(f"/api/vuln/cases/download-center/jobs/{job_payload['job_id']}/download")
+    assert download_resp.status_code == 200
+    assert download_resp.headers["content-type"].startswith("application/zip")
+
+    archive = zipfile.ZipFile(BytesIO(download_resp.content))
+    names = archive.namelist()
+    assert any(name.endswith("manifest.json") for name in names)
+    assert any(name.endswith("artifacts.json") for name in names)
+    assert any(name.endswith("evidence/evidence.txt") for name in names)
+
+
+def test_download_center_failed_job_can_retry_and_delete(client: TestClient):
+    create_case_resp = client.post(
+        "/api/vuln/cases",
+        json=make_suspicion_payload(
+            title="Download retry case",
+            report_id="download-center-002",
+        ),
+    )
+    assert create_case_resp.status_code == 200
+    case_id = create_case_resp.json()["id"]
+
+    create_job_resp = client.post(
+        "/api/vuln/cases/download-center/jobs",
+        json={"project_id": "demo-project", "report_ids": [case_id]},
+    )
+    assert create_job_resp.status_code == 200
+    job_id = create_job_resp.json()["job_id"]
+
+    db_gen = app.dependency_overrides[get_db]()
+    db = next(db_gen)
+    try:
+        from app.models.database import DownloadJob
+        job = db.query(DownloadJob).filter(DownloadJob.id == job_id).first()
+        assert job is not None
+        job.status = "failed"
+        job.last_error = "mock failed"
+        db.add(job)
+        db.commit()
+    finally:
+        db.close()
+
+    retry_resp = client.post(f"/api/vuln/cases/download-center/jobs/{job_id}/retry")
+    assert retry_resp.status_code == 200
+    assert retry_resp.json()["status"] == "pending"
+
+    delete_before_done = client.delete(f"/api/vuln/cases/download-center/jobs/{job_id}")
+    assert delete_before_done.status_code == 400
 
 
 def test_get_case_by_global_vuln_id(client: TestClient):
