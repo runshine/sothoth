@@ -130,3 +130,4 @@ jobs:
             --tag ghcr.io/runshine/secflow-app-dataflow-vuln-scan:${{ needs.prepare.outputs.date_tag }} \
             ghcr.io/runshine/secflow-app-dataflow-vuln-scan:amd64-${{ needs.prepare.outputs.date_tag }} \
             ghcr.io/runshine/secflow-app-dataflow-vuln-scan:arm64-${{ needs.prepare.outputs.date_tag }}
+# rebuild-token: 20260608072449
