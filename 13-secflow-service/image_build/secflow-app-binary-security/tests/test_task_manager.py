@@ -6098,6 +6098,101 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(task.lease_expires_at)
 
+    def test_refresh_task_status_after_sync_keeps_business_failure_terminal(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {
+            "failure_code": "no_candidate_modules",
+            "failure_category": "business",
+            "failure_message": "系统分析已完成，但未发现匹配所选风险等级的风险模块",
+        }
+        failed_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="failed",
+            output_summary={
+                "failure_code": "no_candidate_modules",
+                "failure_category": "business",
+                "failure_message": "系统分析已完成，但未发现匹配所选风险等级的风险模块",
+                "status_synced": True,
+                "sync_status": "failed",
+            },
+            last_error="系统分析已完成，但未发现匹配所选风险等级的风险模块",
+        )
+        next_run = BinarySecurityStageRun(
+            id="sr2",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            sequence_no=2,
+            status="pending",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[failed_run, next_run], stage_items=[])
+
+        self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual("failed", task.status)
+        self.assertEqual("system_analysis", task.current_stage)
+        self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, self.manager._task_runtime_phase(task))
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertIsNotNone(task.finished_at)
+        event_types = [
+            getattr(event, "event_type", "")
+            for event in getattr(db, "added", [])
+            if isinstance(event, BinarySecurityEvent)
+        ]
+        self.assertIn("task_finalized_after_business_failure", event_types)
+
+    def test_refresh_task_status_after_sync_preserves_transient_failed_stage_requeue(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        failed_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="failed",
+            output_summary={
+                "failure_code": "downstream_missing",
+                "failure_category": "sync",
+                "failure_message": "下游子任务不存在",
+                "status_synced": True,
+                "sync_status": "failed",
+            },
+            last_error="下游子任务不存在",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[failed_run], stage_items=[])
+
+        self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual("pending", task.status)
+        self.assertEqual("entry_analysis", task.current_stage)
+        self.assertIsNone(task.finished_at)
+
     def test_requeue_stale_operations_requeues_expired_running_operation(self):
         task = BinarySecurityTask(
             id="t1",
