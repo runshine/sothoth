@@ -944,3 +944,139 @@ def test_finish_stage_requires_reason_and_blocks_orchestration(client: TestClien
         json={"to_stage": "validation", "reason": "should_fail"},
     )
     assert illegal_transition.status_code == 400
+
+
+def test_case_list_defaults_to_paginated_lightweight_response(client: TestClient):
+    for index in range(25):
+        response = client.post(
+            "/api/vuln/cases",
+            json=make_suspicion_payload(
+                title=f"Case {index:02d}",
+                summary=f"summary {index}",
+                report_id=f"report-{index:02d}",
+            ),
+        )
+        assert response.status_code == 200
+
+    list_resp = client.get("/api/vuln/cases", params={"project_id": "demo-project"})
+    assert list_resp.status_code == 200
+    payload = list_resp.json()
+    assert payload["page"] == 1
+    assert payload["page_size"] == 20
+    assert payload["total"] == 25
+    assert len(payload["items"]) == 20
+    first_item = payload["items"][0]
+    assert "evidence" not in first_item
+    assert "fileserver_root" not in first_item
+    assert "display_summary" in first_item
+
+
+def test_case_list_supports_server_side_filters_sort_and_paging(client: TestClient):
+    fixtures = [
+        {
+            "title": "Alpha critical plugin",
+            "summary": "kernel overflow in alpha service",
+            "severity": "critical",
+            "cvss_score": 9.7,
+            "confidence": 91,
+            "current_stage": None,
+            "reporter": {"name": "plugin-alpha", "version": "1.0.0", "type": "plugin"},
+            "subject": {"type": "binary", "locator": "bin://alpha", "name": "alpha"},
+        },
+        {
+            "title": "Zulu medium api",
+            "summary": "http parsing issue",
+            "severity": "medium",
+            "cvss_score": 5.2,
+            "confidence": 65,
+            "current_stage": "triage",
+            "reporter": {"name": "api-zulu", "version": "1.0.0", "type": "api"},
+            "subject": {"type": "http", "locator": "svc://zulu", "name": "zulu"},
+        },
+        {
+            "title": "Bravo high human",
+            "summary": "manual finding for bravo target",
+            "severity": "high",
+            "cvss_score": 8.4,
+            "confidence": 72,
+            "current_stage": "validation",
+            "reporter": {"name": "manual-bravo", "version": "1.0.0", "type": "human"},
+            "subject": {"type": "repo", "locator": "repo://bravo", "name": "bravo"},
+        },
+    ]
+
+    created_ids: list[str] = []
+    for index, fixture in enumerate(fixtures):
+        create_resp = client.post(
+            "/api/vuln/cases",
+            json=make_suspicion_payload(
+                title=fixture["title"],
+                summary=fixture["summary"],
+                severity=fixture["severity"],
+                cvss_score=fixture["cvss_score"],
+                confidence=fixture["confidence"],
+                report_id=f"filter-{index}",
+                reporter=fixture["reporter"],
+                subject=fixture["subject"],
+            ),
+        )
+        assert create_resp.status_code == 200
+        case_id = create_resp.json()["id"]
+        created_ids.append(case_id)
+        if fixture["current_stage"]:
+            transition_resp = client.post(
+                f"/api/vuln/cases/{case_id}/stage-transition",
+                json={"to_stage": fixture["current_stage"], "reason": f"test-transition-{index}"},
+            )
+            assert transition_resp.status_code == 200
+
+    page_two = client.get(
+        "/api/vuln/cases",
+        params={"project_id": "demo-project", "page": 2, "page_size": 2, "sort_field": "title", "sort_direction": "asc"},
+    )
+    assert page_two.status_code == 200
+    page_payload = page_two.json()
+    assert page_payload["page"] == 2
+    assert page_payload["page_size"] == 2
+    assert page_payload["total"] == 3
+    assert [item["title"] for item in page_payload["items"]] == ["Zulu medium api"]
+
+    severity_filtered = client.get(
+        "/api/vuln/cases",
+        params={"project_id": "demo-project", "severity": "critical"},
+    )
+    assert severity_filtered.status_code == 200
+    assert severity_filtered.json()["total"] == 1
+    assert severity_filtered.json()["items"][0]["title"] == "Alpha critical plugin"
+
+    stage_filtered = client.get(
+        "/api/vuln/cases",
+        params={"project_id": "demo-project", "current_stage": "triage"},
+    )
+    assert stage_filtered.status_code == 200
+    assert stage_filtered.json()["total"] == 1
+    assert stage_filtered.json()["items"][0]["title"] == "Zulu medium api"
+
+    reporter_filtered = client.get(
+        "/api/vuln/cases",
+        params={"project_id": "demo-project", "reporter_type": "human"},
+    )
+    assert reporter_filtered.status_code == 200
+    assert reporter_filtered.json()["total"] == 1
+    assert reporter_filtered.json()["items"][0]["title"] == "Bravo high human"
+
+    cvss_filtered = client.get(
+        "/api/vuln/cases",
+        params={"project_id": "demo-project", "cvss_band": "critical"},
+    )
+    assert cvss_filtered.status_code == 200
+    assert cvss_filtered.json()["total"] == 1
+    assert cvss_filtered.json()["items"][0]["title"] == "Alpha critical plugin"
+
+    search_filtered = client.get(
+        "/api/vuln/cases",
+        params={"project_id": "demo-project", "search": "bravo"},
+    )
+    assert search_filtered.status_code == 200
+    assert search_filtered.json()["total"] == 1
+    assert search_filtered.json()["items"][0]["title"] == "Bravo high human"
