@@ -13557,6 +13557,67 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("running", item.status)
         self.assertEqual([("t1", "dataflow_vuln_scan")], reconciled)
 
+    def test_apply_downstream_status_event_ignores_stale_child_payload(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            parent_key="mod-1",
+            status="queued",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dfa_new",
+        )
+        event = BinarySecurityStateEvent(
+            id="sev1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            item_id="si1",
+            event_type="downstream_status_observed",
+            idempotency_key="sev1",
+            status="processing",
+            leased_by=self.manager.instance_id,
+            available_at=_now(),
+            created_at=_now(),
+        )
+        event.payload = {
+            "mapped_status": "running",
+            "before_status": "queued",
+            "downstream_status": "running",
+            "downstream_payload": {"task_id": "dfa_old", "status": "running"},
+        }
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], state_events=[event])
+
+        original_write = self.manager._write_task_metadata_async
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._write_task_metadata_async = _noop_write
+        try:
+            asyncio.run(self.manager._apply_downstream_status_event_locked(db, event))
+        finally:
+            self.manager._write_task_metadata_async = original_write
+
+        self.assertEqual("queued", item.status)
+        self.assertIn("latest_binding_mismatch", self.manager._load_stage_item_result_payload(item))
+        self.assertIn("downstream_binding_mismatch_detected", [record.event_type for record in db.events])
+
     def test_apply_archive_job_status_reuses_unified_reconcile(self):
         task = BinarySecurityTask(
             id="t1",
@@ -13632,6 +13693,64 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("archive_root", item.result)
         self.assertEqual("/tmp/archive", item.output_ref.get("archive_root"))
         self.assertEqual({"copied_files": 2}, item.output_ref.get("archive_copy_stats"))
+
+    def test_apply_archive_job_status_detects_binding_mismatch(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="firmware_unpack",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="firmware_unpack",
+            item_key="fw-1",
+            status="running",
+            downstream_service="firmware_unpacker",
+            downstream_task_id="child_new",
+        )
+        job = BinarySecurityArchiveJob(
+            id="job1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            item_id="si1",
+            item_key="fw-1",
+            downstream_service="firmware_unpacker",
+            downstream_task_id="child_old",
+            archive_status="archived",
+        )
+        job.payload = {
+            "mapped_status": "success",
+            "bound_downstream_task_id": "child_old",
+            "downstream_payload": {"task_id": "child_old", "status": "success"},
+        }
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[job])
+
+        original_write = self.manager._write_task_metadata_async
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._write_task_metadata_async = _noop_write
+        try:
+            asyncio.run(self.manager._apply_archive_job_status_locked(db, "job1", "/tmp/archive"))
+        finally:
+            self.manager._write_task_metadata_async = original_write
+
+        self.assertEqual("running", item.status)
+        self.assertEqual("failed", job.archive_status)
+        self.assertIn("latest_binding_mismatch", self.manager._load_stage_item_result_payload(item))
+        self.assertIn("archive_binding_mismatch_detected", [event.event_type for event in db.events])
 
     def test_archive_downstream_output_records_copy_stats_only_in_output_ref(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -16309,6 +16428,49 @@ def _test_archive_downstream_output_does_not_copy_other_downstream_tasks(self):
         self.assertTrue((target.target_dir / "entry-details.json").is_file())
         self.assertFalse((target.target_dir / "eat_other").exists())
         self.assertFalse((target.target_dir / "foreign.txt").exists())
+
+def _test_archive_downstream_output_uses_bound_downstream_task_id(self):
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        service_root = root / "secflow-app-firmware-unpacker"
+        bound_output = service_root / "child_old" / "output"
+        current_output = service_root / "child_new" / "output"
+        bound_output.mkdir(parents=True)
+        current_output.mkdir(parents=True)
+        (bound_output / "summary.md").write_text("old", encoding="utf-8")
+        (current_output / "summary.md").write_text("new", encoding="utf-8")
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root=str(root / "task-output"),
+            workspace_root=str(root / "workspace-root"),
+        )
+        item = type("Item", (), {
+            "downstream_service": "firmware_unpacker",
+            "stage_name": "firmware_unpack",
+            "downstream_task_id": "child_new",
+            "item_key": "fw1",
+            "id": "si1",
+            "output_ref": {},
+        })()
+
+        target = self.manager._archive_downstream_output(
+            _FakeDb(),
+            task,
+            item,
+            semantic_key="fw1",
+            bound_downstream_task_id="child_old",
+            payload={"output_path": str(service_root)},
+        )
+
+        self.assertEqual("archived", target.status)
+        assert target.target_dir is not None
+        self.assertEqual("old", (target.target_dir / "summary.md").read_text(encoding="utf-8"))
 
 def _test_archive_downstream_output_skips_empty_sources_without_creating_target(self):
     with tempfile.TemporaryDirectory() as tmp:
@@ -24339,6 +24501,7 @@ TaskManagerTests.test_resolve_downstream_output_sources_reads_artifacts_output_r
 TaskManagerTests.test_resolve_downstream_output_sources_prefers_task_scoped_output_over_service_root = _test_resolve_downstream_output_sources_prefers_task_scoped_output_over_service_root
 TaskManagerTests.test_archive_downstream_output_uses_standard_service_output_dir = _test_archive_downstream_output_uses_standard_service_output_dir
 TaskManagerTests.test_archive_downstream_output_does_not_copy_other_downstream_tasks = _test_archive_downstream_output_does_not_copy_other_downstream_tasks
+TaskManagerTests.test_archive_downstream_output_uses_bound_downstream_task_id = _test_archive_downstream_output_uses_bound_downstream_task_id
 TaskManagerTests.test_archive_downstream_output_skips_empty_sources_without_creating_target = _test_archive_downstream_output_skips_empty_sources_without_creating_target
 TaskManagerTests.test_archive_job_payload_uses_compact_downstream_payload = _test_archive_job_payload_uses_compact_downstream_payload
 TaskManagerTests.test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payload_changes = _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payload_changes

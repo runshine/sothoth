@@ -741,6 +741,12 @@ def _no_candidate_modules_failure() -> dict[str, str]:
     }
 
 
+def _failure_shape(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
 STAGE_RETRY_ALLOWED_STATUSES = {"success", "failed", "partial_success", "cancelled"}
 STAGE_RETRY_BLOCKED_TASK_STATUSES = {"pending", "dispatching", "running", "pending_upload", "uploading", "ready_to_start"}
 TASK_STATUS_PENDING_MODULE_CONFIRMATION = "pending_module_confirmation"
@@ -3193,6 +3199,7 @@ class TaskManager:
                     item_key=job.item_key,
                     downstream_service=job.downstream_service,
                     downstream_task_id=job.downstream_task_id,
+                    bound_output_path=self._string_or_none(dict(job.payload or {}).get("bound_output_path")),
                     archive_status=job.archive_status,
                     archive_root=job.archive_root,
                     error_message=job.error_message,
@@ -3210,6 +3217,117 @@ class TaskManager:
                 )
             )
         return archive_job_responses
+
+    def _current_downstream_task_id(self, item: BinarySecurityStageItem | None) -> str:
+        return str(getattr(item, "downstream_task_id", "") or "").strip()
+
+    def _payload_downstream_task_id(self, payload: dict[str, Any] | None) -> str:
+        payload = dict(payload or {})
+        return str(payload.get("task_id") or payload.get("id") or "").strip()
+
+    def _archive_job_bound_downstream_task_id(self, job: BinarySecurityArchiveJob | None) -> str:
+        if job is None:
+            return ""
+        payload = dict(getattr(job, "payload", None) or {})
+        return str(payload.get("bound_downstream_task_id") or getattr(job, "downstream_task_id", "") or "").strip()
+
+    def _binding_mismatch_payload(
+        self,
+        *,
+        source: str,
+        expected_downstream_task_id: str | None,
+        actual_downstream_task_id: str | None,
+        archive_job_id: str | None = None,
+        payload_downstream_task_id: str | None = None,
+    ) -> dict[str, Any]:
+        mismatch_payload = {
+            "source": source,
+            "expected_downstream_task_id": str(expected_downstream_task_id or "").strip() or None,
+            "actual_downstream_task_id": str(actual_downstream_task_id or "").strip() or None,
+        }
+        if archive_job_id:
+            mismatch_payload["archive_job_id"] = archive_job_id
+        if payload_downstream_task_id:
+            mismatch_payload["payload_downstream_task_id"] = str(payload_downstream_task_id or "").strip() or None
+        return mismatch_payload
+
+    def _record_binding_mismatch_event(
+        self,
+        db: Session | None,
+        task: BinarySecurityTask | None,
+        item: BinarySecurityStageItem | None,
+        *,
+        event_type: str,
+        message: str,
+        payload: dict[str, Any],
+        level: str = "warning",
+    ) -> None:
+        if item is None:
+            return
+        latest = {
+            **payload,
+            "message": message,
+            "recorded_at": _now().isoformat(),
+        }
+        result = self._load_stage_item_result_payload(item)
+        if db is None or task is None:
+            item.result = {**result, "latest_binding_mismatch": latest}
+            return
+        result = self._load_stage_item_result_payload(item)
+        self._persist_stage_item_result(
+            task,
+            item,
+            stage_name=item.stage_name,
+            result={
+                **result,
+                "latest_binding_mismatch": {
+                    **payload,
+                    "message": message,
+                    "recorded_at": _now().isoformat(),
+                },
+            },
+        )
+        self._record_event(
+            db,
+            task,
+            event_type,
+            message,
+            stage_name=item.stage_name,
+            item=item,
+            level=level,
+            payload=payload,
+        )
+
+    def _is_payload_bound_to_current_item(
+        self,
+        item: BinarySecurityStageItem | None,
+        payload: dict[str, Any] | None,
+        *,
+        allow_empty_payload_task_id: bool = True,
+    ) -> bool:
+        if item is None:
+            return False
+        current_task_id = self._current_downstream_task_id(item)
+        payload_task_id = self._payload_downstream_task_id(payload)
+        if not payload_task_id:
+            return allow_empty_payload_task_id
+        if not current_task_id:
+            return True
+        return payload_task_id == current_task_id
+
+    def _retry_cleanup_refs(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_names: list[str],
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        direct_refs = self._retry_downstream_refs_for_stages(db, task, stage_names)
+        orphan_refs = [
+            ref
+            for ref in self._discover_parent_linked_downstream_refs(db, task)
+            if self._normalize_downstream_ref_stage_name(ref) in set(stage_names)
+        ]
+        return self._dedupe_downstream_refs(direct_refs + orphan_refs), orphan_refs
 
     def _build_orchestration_observability(self, db: Session, task: BinarySecurityTask) -> dict[str, Any]:
         now_value = _now()
@@ -4698,6 +4816,10 @@ class TaskManager:
         if not affected_stages:
             affected_stages = await self._prepare_retry_stage_full(db, task, target_stage)
         downstream_refs = [dict(ref) for ref in (plan.get("downstream_refs") or []) if isinstance(ref, dict)]
+        if not downstream_refs:
+            downstream_refs, orphan_refs = self._retry_cleanup_refs(db, task, affected_stages)
+        else:
+            _, orphan_refs = self._retry_cleanup_refs(db, task, affected_stages)
         cleared_output_roots = []
         output_root = Path(str(task.output_root or "")).resolve()
         for stage_name in affected_stages:
@@ -4719,6 +4841,17 @@ class TaskManager:
             operation_id=operation.id,
         )
         self._invalidate_task_execution(task)
+        for ref in orphan_refs:
+            self._record_event(
+                db,
+                task,
+                "retry_cleanup_orphan_child_detected",
+                "阶段完全重试识别到历史 orphan 下游子任务",
+                stage_name=target_stage,
+                level="warning",
+                payload=ref,
+                operation_id=operation.id,
+            )
         if downstream_refs:
             await self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token())
         downstream_cleanup_results = [
@@ -6272,11 +6405,18 @@ class TaskManager:
             "cleanup_counts": {},
         }
         self._invalidate_task_execution(task)
-        refs = self._dedupe_downstream_refs(
-            self._retry_downstream_refs_for_stages(db, task, stage_sequence)
-            + self._discover_parent_linked_downstream_refs(db, task)
-        )
+        refs, orphan_refs = self._retry_cleanup_refs(db, task, stage_sequence)
         cleanup_snapshot["downstream_refs"] = refs
+        cleanup_snapshot["orphan_downstream_refs"] = orphan_refs
+        for ref in orphan_refs:
+            self._record_event(
+                db,
+                task,
+                "retry_cleanup_orphan_child_detected",
+                "任务重跑识别到历史 orphan 下游子任务",
+                level="warning",
+                payload=ref,
+            )
         if refs:
             await self._cleanup_downstream_refs(db, task, refs, self._service_token())
         self._clear_stage_outputs_from(task, stage_sequence[0], mark_stale=False)
@@ -8476,12 +8616,15 @@ class TaskManager:
         extra_paths: list[str | Path] | None = None,
     ) -> BinarySecurityArchiveJob:
         downstream_task_id = str(item.downstream_task_id or "").strip()
+        bound_output_path = str(payload.get("output_path") or "").strip()
         job_dedupe_key = build_archive_job_dedupe_key(item.id, downstream_task_id)
         next_payload = self._build_archive_job_payload(
             mapped_status=mapped_status,
             before_status=before_status,
             force=force,
             payload=payload,
+            bound_downstream_task_id=downstream_task_id,
+            bound_output_path=bound_output_path,
             extra_paths=extra_paths,
         )
         lock_digest = hashlib.sha1(f"{item.id}:{downstream_task_id}".encode("utf-8")).hexdigest()
@@ -8563,6 +8706,8 @@ class TaskManager:
                 before_status=before_status,
                 force=force,
                 payload=payload,
+                bound_downstream_task_id=downstream_task_id,
+                bound_output_path=bound_output_path,
                 extra_paths=extra_paths,
             )
             db.add(job)
@@ -11130,6 +11275,28 @@ class TaskManager:
             return
         mapped_status = self._map_downstream_status(mapped_status) or mapped_status
         downstream_payload = dict(payload.get("downstream_payload") or {})
+        payload_downstream_task_id = self._payload_downstream_task_id(downstream_payload) or self._payload_downstream_task_id(payload)
+        current_downstream_task_id = self._current_downstream_task_id(item)
+        if (
+            payload_downstream_task_id
+            and current_downstream_task_id
+            and payload_downstream_task_id != current_downstream_task_id
+        ):
+            self._record_binding_mismatch_event(
+                db,
+                task,
+                item,
+                event_type="downstream_binding_mismatch_detected",
+                message="旧 child 的下游状态事件已被忽略，未回写当前阶段项",
+                payload=self._binding_mismatch_payload(
+                    source="downstream_status_event",
+                    expected_downstream_task_id=current_downstream_task_id,
+                    actual_downstream_task_id=payload_downstream_task_id,
+                    payload_downstream_task_id=payload_downstream_task_id,
+                ),
+            )
+            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+            return
         self._apply_child_task_status_change(
             db,
             task=task,
@@ -12404,11 +12571,13 @@ class TaskManager:
                 db.commit()
                 return None, job.error_message, False
             payload = dict(job.payload or {})
+            bound_downstream_task_id = self._archive_job_bound_downstream_task_id(job)
             archive_result = self._archive_downstream_output(
                 db,
                 task,
                 item,
                 semantic_key=item.item_key,
+                bound_downstream_task_id=bound_downstream_task_id,
                 payload=payload.get("downstream_payload") or {},
                 extra_paths=payload.get("extra_paths") or None,
             )
@@ -12470,6 +12639,11 @@ class TaskManager:
             copy_stats = dict((item.output_ref or {}).get("archive_copy_stats") or {})
             job.payload = {
                 **self._clear_archive_job_retry_metadata(job),
+                "bound_downstream_task_id": bound_downstream_task_id,
+                "bound_output_path": str(payload.get("bound_output_path") or ""),
+                "downstream_payload": payload.get("downstream_payload") or {},
+                "extra_paths": payload.get("extra_paths") or None,
+                "mapped_status": payload.get("mapped_status"),
                 "archive_copy_stats": copy_stats,
             }
             observe_archive_duration(
@@ -12527,6 +12701,38 @@ class TaskManager:
         item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == job.item_id).first()
         if task is None or item is None:
             return
+        job_bound_downstream_task_id = self._archive_job_bound_downstream_task_id(job)
+        current_downstream_task_id = self._current_downstream_task_id(item)
+        if (
+            job_bound_downstream_task_id
+            and current_downstream_task_id
+            and job_bound_downstream_task_id != current_downstream_task_id
+        ):
+            mismatch_payload = self._binding_mismatch_payload(
+                source="archive_apply",
+                expected_downstream_task_id=current_downstream_task_id,
+                actual_downstream_task_id=job_bound_downstream_task_id,
+                archive_job_id=job.id,
+            )
+            self._record_binding_mismatch_event(
+                db,
+                task,
+                item,
+                event_type="archive_binding_mismatch_detected",
+                message="归档作业绑定的 child 已过期，已阻止旧归档结果回写当前阶段项",
+                payload=mismatch_payload,
+            )
+            job.archive_status = "failed"
+            job.error_message = "archive job bound downstream task does not match current stage item binding"
+            job.completed_at = _now()
+            job.updated_at = _now()
+            observe_archive_action("apply", "failed")
+            observe_archive_duration(
+                action="apply",
+                result="failed",
+                duration_seconds=_elapsed_seconds_since(job.started_at),
+            )
+            return
         if str(task.status or "").strip() in {TASK_STATUS_CANCELLING, "cancelled"}:
             job.archive_status = "success"
             job.error_message = None
@@ -12545,6 +12751,7 @@ class TaskManager:
                     "state_event_id": state_event_id,
                     "archive_root": archived_root or job.archive_root,
                     "task_status": task.status,
+                    "archive_bound_downstream_task_id": job_bound_downstream_task_id or None,
                 },
             )
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
@@ -12605,6 +12812,7 @@ class TaskManager:
                     task,
                     item,
                     archived_dir=Path(effective_archive_root) if effective_archive_root else None,
+                    bound_downstream_task_id=job_bound_downstream_task_id or None,
                     downstream_payload=downstream_payload,
                 )
             if normalized_mapped_status in {"success", "partial_success"}:
@@ -12635,6 +12843,7 @@ class TaskManager:
                     "mapped_status": mapped_status,
                     "downstream_service": item.downstream_service,
                     "downstream_task_id": item.downstream_task_id,
+                    "archive_bound_downstream_task_id": job_bound_downstream_task_id or None,
                 },
             )
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
@@ -18451,6 +18660,18 @@ class TaskManager:
             stage_summaries=stage_summaries,
             active_operation=active_operation,
         )
+        failure_snapshot = self._stage_failure_snapshot(
+            task,
+            next(
+                (
+                    run
+                    for run in stage_runs or []
+                    if str(run.stage_name or "").strip() == str(task.current_stage or "").strip()
+                ),
+                None,
+            ),
+        )
+        terminal_failure = str(failure_snapshot.get("failure_category") or "").strip() == "business"
         return BinarySecurityTaskResponse(
             id=task.id,
             project_id=task.project_id,
@@ -18463,6 +18684,11 @@ class TaskManager:
             execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
             current_stage=task.current_stage,
             last_error=task.last_error,
+            terminal_failure=terminal_failure,
+            requeue_suppressed=terminal_failure,
+            failure_code=self._string_or_none(failure_snapshot.get("failure_code")),
+            failure_category=self._string_or_none(failure_snapshot.get("failure_category")),
+            failure_message=self._string_or_none(failure_snapshot.get("failure_message") or failure_snapshot.get("error")),
             firmware_path=task.firmware_path,
             stage_sequence=stage_sequence,
             is_queued=task.status == "pending",
@@ -18840,6 +19066,16 @@ class TaskManager:
             task_retry_failed_reason=task_retry_failed_reason,
             stage_summaries=stage_summaries,
         )
+        active_stage_run = next(
+            (
+                run
+                for run in stage_runs
+                if str(run.stage_name or "").strip() == str(task.current_stage or "").strip()
+            ),
+            None,
+        )
+        failure_snapshot = self._stage_failure_snapshot(task, active_stage_run)
+        terminal_failure = str(failure_snapshot.get("failure_category") or "").strip() == "business"
         active_operation = self._active_operation(db, task.id)
         if active_operation is not None and str(active_operation.operation_type or "").strip() != TASK_ACTION_CANCEL:
             cancel_operation = None
@@ -18857,6 +19093,11 @@ class TaskManager:
             execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
             current_stage=task.current_stage,
             last_error=task.last_error,
+            terminal_failure=terminal_failure,
+            requeue_suppressed=terminal_failure,
+            failure_code=self._string_or_none(failure_snapshot.get("failure_code")),
+            failure_category=self._string_or_none(failure_snapshot.get("failure_category")),
+            failure_message=self._string_or_none(failure_snapshot.get("failure_message") or failure_snapshot.get("error")),
             firmware_path=task.firmware_path,
             stage_sequence=stage_sequence,
             is_queued=task.status == "pending",
@@ -19159,6 +19400,13 @@ class TaskManager:
         total_retry_count = int(item.retry_count or 0) + int(item.rerun_count or 0)
         binding = self._downstream_binding_snapshot(item)
         binding_state = self._downstream_binding_state(item)
+        latest_binding_mismatch = dict(result.get("latest_binding_mismatch") or {}) or None
+        archive_bound_downstream_task_id = None
+        if archive_jobs:
+            for job in reversed(archive_jobs):
+                archive_bound_downstream_task_id = self._archive_job_bound_downstream_task_id(job) or archive_bound_downstream_task_id
+                if archive_bound_downstream_task_id:
+                    break
         freshness_state = self._stage_item_sync_freshness_state(
             item,
             last_attempt_at=parsed_last_attempt_at if isinstance(parsed_last_attempt_at, datetime) else None,
@@ -19178,6 +19426,8 @@ class TaskManager:
             total_retry_count=total_retry_count,
             downstream_service=item.downstream_service,
             downstream_task_id=item.downstream_task_id,
+            archive_bound_downstream_task_id=archive_bound_downstream_task_id,
+            latest_binding_mismatch=latest_binding_mismatch,
             downstream_status=downstream_status,
             downstream_binding_state=binding_state,
             downstream_create_attempts=max(0, int(binding.get("attempts") or 0)),
@@ -20034,6 +20284,85 @@ class TaskManager:
             cleaned.pop(key, None)
         return cleaned
 
+    def _stage_failure_snapshot(
+        self,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun | None,
+    ) -> dict[str, Any]:
+        candidates: list[dict[str, Any]] = []
+        if stage_run is not None:
+            candidates.append(_failure_shape(stage_run.output_summary))
+        summary = _failure_shape(task.summary)
+        stage_name = str(getattr(stage_run, "stage_name", "") or "").strip()
+        if stage_name:
+            candidates.append(_failure_shape(summary.get(stage_name)))
+        candidates.append(summary)
+
+        merged: dict[str, Any] = {}
+        for payload in candidates:
+            for key in ("failure_code", "failure_category", "failure_message", "error", "sync_status", "status_synced"):
+                value = payload.get(key)
+                if value is not None and value != "":
+                    merged.setdefault(key, value)
+        return merged
+
+    def _is_terminal_business_stage_failure(
+        self,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun | None,
+    ) -> bool:
+        snapshot = self._stage_failure_snapshot(task, stage_run)
+        return str(snapshot.get("failure_category") or "").strip() == "business"
+
+    def _record_business_failure_terminalization(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun | None,
+    ) -> None:
+        snapshot = self._stage_failure_snapshot(task, stage_run)
+        stage_name = str(getattr(stage_run, "stage_name", "") or task.current_stage or "").strip() or None
+        payload = {
+            "stage_name": stage_name,
+            "failure_code": snapshot.get("failure_code"),
+            "failure_category": snapshot.get("failure_category"),
+            "failure_message": snapshot.get("failure_message") or snapshot.get("error"),
+            "requeue_suppressed": True,
+        }
+        existing = (
+            db.query(BinarySecurityEvent)
+            .filter(
+                BinarySecurityEvent.task_id == task.id,
+                BinarySecurityEvent.event_type == "task_finalized_after_business_failure",
+                BinarySecurityEvent.stage_name == stage_name,
+            )
+            .order_by(BinarySecurityEvent.created_at.desc())
+            .first()
+        )
+        existing_payload = dict(getattr(existing, "payload", None) or {}) if existing is not None else {}
+        if (
+            existing is not None
+            and str(existing_payload.get("failure_code") or "").strip() == str(payload.get("failure_code") or "").strip()
+            and str(existing_payload.get("failure_category") or "").strip() == str(payload.get("failure_category") or "").strip()
+        ):
+            return
+        self._record_event(
+            db,
+            task,
+            "task_finalized_after_business_failure",
+            "业务终态失败已直接收口，不再进入补偿重排",
+            level="warning",
+            stage_name=stage_name,
+            payload=payload,
+        )
+        logger.info(
+            "binary-security business failure requeue suppressed task_id=%s stage_name=%s failure_code=%s failure_category=%s decision=terminal_failed requeue_suppressed=true",
+            task.id,
+            stage_name or "-",
+            payload.get("failure_code") or "-",
+            payload.get("failure_category") or "-",
+        )
+
     def _retry_snapshot_for_item(self, task: BinarySecurityTask, stage_name: str, item_key: str) -> dict[str, Any] | None:
         summary = task.summary or {}
         stage_context = (summary.get("stage_retry_context") or {}).get(stage_name) or {}
@@ -20103,15 +20432,17 @@ class TaskManager:
         item: BinarySecurityStageItem,
         *,
         archived_dir: Path | None,
+        bound_downstream_task_id: str | None = None,
         downstream_payload: dict[str, Any] | None = None,
     ) -> None:
         input_ref = dict(item.input_ref or {})
         result = self._load_stage_item_result_payload(item)
         firmware_key = str(item.item_key or input_ref.get("firmware_key") or result.get("firmware_key") or "")
         filename = str(input_ref.get("filename") or item.item_name or result.get("filename") or firmware_key)
+        effective_downstream_task_id = str(bound_downstream_task_id or item.downstream_task_id or "").strip()
         metadata_sources = self._resolve_downstream_output_sources(
             downstream_payload or result.get("downstream") or {},
-            downstream_task_id=item.downstream_task_id,
+            downstream_task_id=effective_downstream_task_id,
             task=task,
             downstream_service=item.downstream_service,
         )
@@ -20135,6 +20466,7 @@ class TaskManager:
                 "task_type": result.get("task_type", TASK_TYPE_BINARY),
                 "downstream": self._lightweight_downstream_payload(downstream_payload or result.get("downstream") or {}),
                 "downstream_status_synced_at": _now().isoformat(),
+                "bound_downstream_task_id": effective_downstream_task_id or None,
             },
         )
         item.output_ref = {
@@ -20779,6 +21111,16 @@ class TaskManager:
         next_stage = self._next_incomplete_stage(db, task)
         if stage_retry_mode and preferred_retry_next_stage:
             next_stage = preferred_retry_next_stage
+        if failed_stage_run is not None and self._is_terminal_business_stage_failure(task, failed_stage_run):
+            task.status = "failed"
+            self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TERMINAL)
+            task.current_stage = failed_stage_run.stage_name or task.current_stage
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.lease_expires_at = None
+            task.finished_at = task.finished_at or _now()
+            self._record_business_failure_terminalization(db, task, failed_stage_run)
+            return
         if failed_stage_run is not None and not stage_retry_mode and not task_retry_mode:
             task.status = "pending"
             self._set_task_runtime_phase(
@@ -25079,6 +25421,8 @@ class TaskManager:
         before_status: str | None,
         force: bool,
         payload: dict[str, Any] | None,
+        bound_downstream_task_id: str | None = None,
+        bound_output_path: str | None = None,
         extra_paths: list[str | Path] | None = None,
         previous_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -25089,6 +25433,8 @@ class TaskManager:
             "mapped_status": mapped_status,
             "before_status": before_status,
             "force": force,
+            "bound_downstream_task_id": str(bound_downstream_task_id or "").strip() or None,
+            "bound_output_path": str(bound_output_path or "").strip() or None,
             "downstream_payload": self._archive_job_downstream_payload(payload),
             "extra_paths": [str(path) for path in (extra_paths or [])],
         }
@@ -25106,6 +25452,8 @@ class TaskManager:
         next_extra_paths = [str(path) for path in (next_payload.get("extra_paths") or [])]
         return (
             str(current_payload.get("mapped_status") or "").strip() != str(next_payload.get("mapped_status") or "").strip()
+            or str(current_payload.get("bound_downstream_task_id") or "").strip() != str(next_payload.get("bound_downstream_task_id") or "").strip()
+            or str(current_payload.get("bound_output_path") or "").strip() != str(next_payload.get("bound_output_path") or "").strip()
             or current_downstream != next_downstream
             or current_extra_paths != next_extra_paths
         )
@@ -25525,10 +25873,11 @@ class TaskManager:
         item: BinarySecurityStageItem,
         *,
         semantic_key: str,
+        bound_downstream_task_id: str | None = None,
         payload: dict[str, Any] | None = None,
         extra_paths: list[str | Path] | None = None,
     ) -> _ArchiveOutputResult:
-        downstream_task_id = str(item.downstream_task_id or "").strip()
+        downstream_task_id = str(bound_downstream_task_id or item.downstream_task_id or "").strip()
         if not downstream_task_id:
             return _ArchiveOutputResult(status="source_not_ready", target_dir=None, source_candidates=[])
         if not str(task.output_root or "").strip():
@@ -25549,7 +25898,7 @@ class TaskManager:
             and source.resolve() != target_dir.resolve()
             and not _is_within_path(target_dir, source)
         ]
-        existing_sources = _prefer_specific_paths(existing_sources, downstream_task_id=item.downstream_task_id)
+        existing_sources = _prefer_specific_paths(existing_sources, downstream_task_id=downstream_task_id)
         if not existing_sources:
             self._record_event(
                 db,
@@ -25562,6 +25911,7 @@ class TaskManager:
                 payload={
                     "target_dir": str(target_dir),
                     "sources": [str(path) for path in sources],
+                    "bound_downstream_task_id": downstream_task_id,
                 },
             )
             return _ArchiveOutputResult(
@@ -25601,6 +25951,7 @@ class TaskManager:
                     "target_dir": str(target_dir),
                     "sources": [str(path) for path in existing_sources],
                     "copy_stats": copy_stats,
+                    "bound_downstream_task_id": downstream_task_id,
                 },
             )
         self._record_event(
@@ -25615,6 +25966,7 @@ class TaskManager:
                 "sources": [str(path) for path in existing_sources],
                 "copied_file_count": _count_files(target_dir),
                 "copy_stats": copy_stats,
+                "bound_downstream_task_id": downstream_task_id,
             },
         )
         self._merge_stage_item_output_ref(item, archive_copy_stats=copy_stats)
