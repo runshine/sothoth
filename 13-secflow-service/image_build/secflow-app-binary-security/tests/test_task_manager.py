@@ -21330,44 +21330,6 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         event_types = [getattr(event, "event_type", "") for event in db.added]
         self.assertIn("child_task_delete_failed_but_ignored", event_types)
 
-    def test_delete_downstream_refs_forwards_best_effort_and_cleanup_scope(self):
-        task = BinarySecurityTask(
-            id="t-forward-delete",
-            project_id="p1",
-            name="binary",
-            status="cancelled",
-            task_type=TASK_TYPE_BINARY,
-            current_stage="entry_analysis",
-            firmware_source="project_filesystem",
-            firmware_path="/fw",
-            output_root="/tmp/out",
-            workspace_root="/tmp/ws",
-        )
-        db = _AppendingModelAwareDb(tasks=[task], events=[])
-
-        async def _run():
-            with patch.object(
-                self.manager,
-                "_downstream_delete_refs",
-                AsyncMock(return_value=1),
-            ) as delete_mock:
-                deleted = await self.manager._delete_downstream_refs(
-                    db,
-                    task,
-                    [{"service": "entry_analyse", "task_id": "eat_x", "stage_name": "entry_analysis"}],
-                    "token",
-                    force_delete=True,
-                    best_effort=True,
-                    cleanup_scope="delete",
-                )
-                self.assertEqual(1, deleted)
-                self.assertTrue(delete_mock.await_args.kwargs.get("force_delete"))
-                self.assertTrue(delete_mock.await_args.kwargs.get("best_effort"))
-                self.assertEqual("delete", delete_mock.await_args.kwargs.get("cleanup_scope"))
-
-        asyncio.run(_run())
-
-
 def _test_manual_cancel_collects_dispatching_and_orphan_downstream_refs(self):
     task = BinarySecurityTask(
         id="t1",
@@ -21629,9 +21591,48 @@ def _test_delete_downstream_refs_blocks_when_entry_delete_conflict_and_task_acti
     self.assertTrue(cleanup_results[0]["blocking"])
 
 
+def _test_delete_downstream_refs_forwards_best_effort_and_cleanup_scope(self):
+    task = BinarySecurityTask(
+        id="t-forward-delete",
+        project_id="p1",
+        name="binary",
+        status="cancelled",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/tmp/out",
+        workspace_root="/tmp/ws",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], events=[])
+
+    async def _run():
+        with patch.object(
+            self.manager,
+            "_downstream_delete_refs",
+            AsyncMock(return_value=1),
+        ) as delete_mock:
+            deleted = await self.manager._delete_downstream_refs(
+                db,
+                task,
+                [{"service": "entry_analyse", "task_id": "eat_x", "stage_name": "entry_analysis"}],
+                "token",
+                force_delete=True,
+                best_effort=True,
+                cleanup_scope="delete",
+            )
+            self.assertEqual(1, deleted)
+            self.assertTrue(delete_mock.await_args.kwargs.get("force_delete"))
+            self.assertTrue(delete_mock.await_args.kwargs.get("best_effort"))
+            self.assertEqual("delete", delete_mock.await_args.kwargs.get("cleanup_scope"))
+
+    asyncio.run(_run())
+
+
 TaskManagerTests.test_delete_downstream_refs_treats_entry_delete_500_with_absent_task_as_success = _test_delete_downstream_refs_treats_entry_delete_500_with_absent_task_as_success
 TaskManagerTests.test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exists = _test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exists
 TaskManagerTests.test_delete_downstream_refs_blocks_when_entry_delete_conflict_and_task_active = _test_delete_downstream_refs_blocks_when_entry_delete_conflict_and_task_active
+TaskManagerTests.test_delete_downstream_refs_forwards_best_effort_and_cleanup_scope = _test_delete_downstream_refs_forwards_best_effort_and_cleanup_scope
 
 
 def _test_task_manager_does_not_access_downstream_clients_directly(self):
