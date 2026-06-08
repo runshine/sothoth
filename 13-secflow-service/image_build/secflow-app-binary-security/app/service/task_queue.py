@@ -130,12 +130,24 @@ class TaskQueue:
         if task_id:
             await client.srem(f"{queue_key}:dedupe", task_id)
             await client.zrem(f"{queue_key}:enqueued_at", task_id)
+            try:
+                while await client.lpos(queue_key, task_id) is not None:
+                    await client.lrem(queue_key, 1, task_id)
+            except AttributeError:
+                pass
         return task_id
 
     async def queue_stats(self, queue_key: str) -> dict[str, float | int]:
         client = await self._client_or_create()
-        length = int(await client.llen(queue_key) or 0)
-        oldest = await client.zrange(f"{queue_key}:enqueued_at", 0, 0, withscores=True)
+        try:
+            length = int(await client.llen(queue_key) or 0)
+            oldest = await client.zrange(f"{queue_key}:enqueued_at", 0, 0, withscores=True)
+        except (RedisTimeoutError, RedisConnectionError, OSError):
+            await self._reset_client_after_error("queue_stats")
+            return {
+                "length": 0,
+                "oldest_age_seconds": 0.0,
+            }
         oldest_age_seconds = 0.0
         if oldest:
             _, score = oldest[0]

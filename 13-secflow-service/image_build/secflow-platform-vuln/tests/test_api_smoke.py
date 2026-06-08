@@ -1,6 +1,8 @@
 import os
 import re
 import sys
+import zipfile
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,7 @@ from app.api import cases as cases_api  # noqa: E402
 from app.api import actions as actions_api  # noqa: E402
 from app.api import public as public_api  # noqa: E402
 from app.models.database import Base, get_db  # noqa: E402
+from app.services.download_center import process_job  # noqa: E402
 
 
 def make_suspicion_payload(**overrides):
@@ -374,6 +377,103 @@ def test_duplicate_report_id_returns_existing_case(client: TestClient):
     assert second.status_code == 200
     assert second.json()["id"] == first.json()["id"]
     assert second.json()["global_vuln_id"] == first.json()["global_vuln_id"]
+
+
+def test_download_center_job_create_process_and_download(client: TestClient):
+    first = client.post(
+        "/api/vuln/cases",
+        json=make_suspicion_payload(
+            title="Download center case one",
+            report_id="download-center-001",
+            artifacts=[
+                {
+                    "kind": "text",
+                    "name": "evidence.txt",
+                    "path": "evidence/evidence.txt",
+                    "content": "hello from evidence",
+                    "encoding": "utf-8",
+                }
+            ],
+        ),
+    )
+    assert first.status_code == 200
+    case_id = first.json()["id"]
+
+    create_job_resp = client.post(
+        "/api/vuln/cases/download-center/jobs",
+        json={"project_id": "demo-project", "report_ids": [case_id]},
+    )
+    assert create_job_resp.status_code == 200
+    job_payload = create_job_resp.json()
+    assert job_payload["status"] == "pending"
+    assert job_payload["scope_type"] == "single"
+
+    db_gen = app.dependency_overrides[get_db]()
+    db = next(db_gen)
+    try:
+        processed = process_job(db, job_payload["job_id"])
+    finally:
+        db.close()
+    assert processed is not None
+    assert processed["status"] == "succeeded"
+    assert processed["downloadable"] is True
+
+    list_resp = client.get("/api/vuln/cases/download-center/jobs", params={"project_id": "demo-project"})
+    assert list_resp.status_code == 200
+    assert list_resp.json()["total"] >= 1
+
+    stats_resp = client.get("/api/vuln/cases/download-center/stats", params={"project_id": "demo-project"})
+    assert stats_resp.status_code == 200
+    assert stats_resp.json()["downloadable"] >= 1
+
+    download_resp = client.get(f"/api/vuln/cases/download-center/jobs/{job_payload['job_id']}/download")
+    assert download_resp.status_code == 200
+    assert download_resp.headers["content-type"].startswith("application/zip")
+
+    archive = zipfile.ZipFile(BytesIO(download_resp.content))
+    names = archive.namelist()
+    assert any(name.endswith("manifest.json") for name in names)
+    assert any(name.endswith("artifacts.json") for name in names)
+    assert any(name.endswith("evidence/evidence.txt") for name in names)
+
+
+def test_download_center_failed_job_can_retry_and_delete(client: TestClient):
+    create_case_resp = client.post(
+        "/api/vuln/cases",
+        json=make_suspicion_payload(
+            title="Download retry case",
+            report_id="download-center-002",
+        ),
+    )
+    assert create_case_resp.status_code == 200
+    case_id = create_case_resp.json()["id"]
+
+    create_job_resp = client.post(
+        "/api/vuln/cases/download-center/jobs",
+        json={"project_id": "demo-project", "report_ids": [case_id]},
+    )
+    assert create_job_resp.status_code == 200
+    job_id = create_job_resp.json()["job_id"]
+
+    db_gen = app.dependency_overrides[get_db]()
+    db = next(db_gen)
+    try:
+        from app.models.database import DownloadJob
+        job = db.query(DownloadJob).filter(DownloadJob.id == job_id).first()
+        assert job is not None
+        job.status = "failed"
+        job.last_error = "mock failed"
+        db.add(job)
+        db.commit()
+    finally:
+        db.close()
+
+    retry_resp = client.post(f"/api/vuln/cases/download-center/jobs/{job_id}/retry")
+    assert retry_resp.status_code == 200
+    assert retry_resp.json()["status"] == "pending"
+
+    delete_before_done = client.delete(f"/api/vuln/cases/download-center/jobs/{job_id}")
+    assert delete_before_done.status_code == 400
 
 
 def test_get_case_by_global_vuln_id(client: TestClient):
@@ -844,3 +944,139 @@ def test_finish_stage_requires_reason_and_blocks_orchestration(client: TestClien
         json={"to_stage": "validation", "reason": "should_fail"},
     )
     assert illegal_transition.status_code == 400
+
+
+def test_case_list_defaults_to_paginated_lightweight_response(client: TestClient):
+    for index in range(25):
+        response = client.post(
+            "/api/vuln/cases",
+            json=make_suspicion_payload(
+                title=f"Case {index:02d}",
+                summary=f"summary {index}",
+                report_id=f"report-{index:02d}",
+            ),
+        )
+        assert response.status_code == 200
+
+    list_resp = client.get("/api/vuln/cases", params={"project_id": "demo-project"})
+    assert list_resp.status_code == 200
+    payload = list_resp.json()
+    assert payload["page"] == 1
+    assert payload["page_size"] == 20
+    assert payload["total"] == 25
+    assert len(payload["items"]) == 20
+    first_item = payload["items"][0]
+    assert "evidence" not in first_item
+    assert "fileserver_root" not in first_item
+    assert "display_summary" in first_item
+
+
+def test_case_list_supports_server_side_filters_sort_and_paging(client: TestClient):
+    fixtures = [
+        {
+            "title": "Alpha critical plugin",
+            "summary": "kernel overflow in alpha service",
+            "severity": "critical",
+            "cvss_score": 9.7,
+            "confidence": 91,
+            "current_stage": None,
+            "reporter": {"name": "plugin-alpha", "version": "1.0.0", "type": "plugin"},
+            "subject": {"type": "binary", "locator": "bin://alpha", "name": "alpha"},
+        },
+        {
+            "title": "Zulu medium api",
+            "summary": "http parsing issue",
+            "severity": "medium",
+            "cvss_score": 5.2,
+            "confidence": 65,
+            "current_stage": "triage",
+            "reporter": {"name": "api-zulu", "version": "1.0.0", "type": "api"},
+            "subject": {"type": "http", "locator": "svc://zulu", "name": "zulu"},
+        },
+        {
+            "title": "Bravo high human",
+            "summary": "manual finding for bravo target",
+            "severity": "high",
+            "cvss_score": 8.4,
+            "confidence": 72,
+            "current_stage": "validation",
+            "reporter": {"name": "manual-bravo", "version": "1.0.0", "type": "human"},
+            "subject": {"type": "repo", "locator": "repo://bravo", "name": "bravo"},
+        },
+    ]
+
+    created_ids: list[str] = []
+    for index, fixture in enumerate(fixtures):
+        create_resp = client.post(
+            "/api/vuln/cases",
+            json=make_suspicion_payload(
+                title=fixture["title"],
+                summary=fixture["summary"],
+                severity=fixture["severity"],
+                cvss_score=fixture["cvss_score"],
+                confidence=fixture["confidence"],
+                report_id=f"filter-{index}",
+                reporter=fixture["reporter"],
+                subject=fixture["subject"],
+            ),
+        )
+        assert create_resp.status_code == 200
+        case_id = create_resp.json()["id"]
+        created_ids.append(case_id)
+        if fixture["current_stage"]:
+            transition_resp = client.post(
+                f"/api/vuln/cases/{case_id}/stage-transition",
+                json={"to_stage": fixture["current_stage"], "reason": f"test-transition-{index}"},
+            )
+            assert transition_resp.status_code == 200
+
+    page_two = client.get(
+        "/api/vuln/cases",
+        params={"project_id": "demo-project", "page": 2, "page_size": 2, "sort_field": "title", "sort_direction": "asc"},
+    )
+    assert page_two.status_code == 200
+    page_payload = page_two.json()
+    assert page_payload["page"] == 2
+    assert page_payload["page_size"] == 2
+    assert page_payload["total"] == 3
+    assert [item["title"] for item in page_payload["items"]] == ["Zulu medium api"]
+
+    severity_filtered = client.get(
+        "/api/vuln/cases",
+        params={"project_id": "demo-project", "severity": "critical"},
+    )
+    assert severity_filtered.status_code == 200
+    assert severity_filtered.json()["total"] == 1
+    assert severity_filtered.json()["items"][0]["title"] == "Alpha critical plugin"
+
+    stage_filtered = client.get(
+        "/api/vuln/cases",
+        params={"project_id": "demo-project", "current_stage": "triage"},
+    )
+    assert stage_filtered.status_code == 200
+    assert stage_filtered.json()["total"] == 1
+    assert stage_filtered.json()["items"][0]["title"] == "Zulu medium api"
+
+    reporter_filtered = client.get(
+        "/api/vuln/cases",
+        params={"project_id": "demo-project", "reporter_type": "human"},
+    )
+    assert reporter_filtered.status_code == 200
+    assert reporter_filtered.json()["total"] == 1
+    assert reporter_filtered.json()["items"][0]["title"] == "Bravo high human"
+
+    cvss_filtered = client.get(
+        "/api/vuln/cases",
+        params={"project_id": "demo-project", "cvss_band": "critical"},
+    )
+    assert cvss_filtered.status_code == 200
+    assert cvss_filtered.json()["total"] == 1
+    assert cvss_filtered.json()["items"][0]["title"] == "Alpha critical plugin"
+
+    search_filtered = client.get(
+        "/api/vuln/cases",
+        params={"project_id": "demo-project", "search": "bravo"},
+    )
+    assert search_filtered.status_code == 200
+    assert search_filtered.json()["total"] == 1
+    assert search_filtered.json()["items"][0]["title"] == "Bravo high human"

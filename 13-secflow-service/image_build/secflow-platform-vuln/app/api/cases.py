@@ -1,6 +1,7 @@
 """Case endpoints."""
 
 import json
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -8,14 +9,19 @@ from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
+from sqlalchemy import Float, String, asc, cast, desc, func, or_
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import ensure_project_access, get_current_subject
-from app.models.database import ActionExecution, Case, CaseEvent, ManualTask, Result, ServiceRegistry, StageHistory, WorkflowRun, get_db
+from app.models.database import ActionExecution, Case, CaseEvent, DownloadJob, ManualTask, Result, ServiceRegistry, StageHistory, WorkflowRun, get_db
 from app.schemas import (
     CaseUpdateRequest,
     CaseCreateRequest,
     DecisionRequest,
+    DownloadCenterJobCreateRequest,
+    DownloadCenterJobListResponse,
+    DownloadCenterJobResponse,
+    DownloadCenterStatsResponse,
     DraftCaseCreateRequest,
     FinishCaseRequest,
     ManualTaskCreateRequest,
@@ -29,6 +35,7 @@ from app.schemas import (
     TriageRoundStartRequest,
     ValidationResultRequest,
 )
+from app.services.download_center import create_job, delete_job, get_job_stats, list_jobs, retry_job, serialize_job
 from app.services.lifecycle_engine import (
     FINISHED_REASONS,
     FINISHED_STATUS_DONE,
@@ -72,6 +79,21 @@ from app.services.reporting import (
 )
 
 router = APIRouter(prefix="/api/vuln/cases", tags=["cases"])
+
+DEFAULT_CASE_PAGE_SIZE = 20
+MAX_CASE_PAGE_SIZE = 1000
+ALLOWED_SORT_FIELDS = {
+    "updated_at": Case.updated_at,
+    "created_at": Case.created_at,
+    "title": Case.title,
+    "severity": Case.severity,
+    "confidence": Case.confidence,
+    "cvss_score": cast(func.json_extract(Case.source_meta_json, "$.cvss_score"), Float),
+    "current_stage": Case.current_stage,
+    "reporter": cast(func.json_extract(Case.source_meta_json, "$.reporter.name"), String),
+    "subject": cast(func.json_extract(Case.target_meta_json, "$.locator"), String),
+}
+ALLOWED_SORT_DIRECTIONS = {"asc", "desc"}
 
 
 def _source_refs(source_meta: dict) -> list[dict]:
@@ -181,6 +203,101 @@ def _case_payload(item: Case) -> dict:
     return payload
 
 
+def _lightweight_case_payload(item: Case) -> dict:
+    source_meta = json.loads(item.source_meta_json or "{}")
+    subject = json.loads(item.target_meta_json or "{}")
+    display_meta = json.loads(item.display_meta_json or "{}")
+    lifecycle = get_lifecycle_state(item)
+    metadata = display_meta.get("metadata") or {}
+    source_task = metadata.get("source") if isinstance(metadata.get("source"), dict) else {}
+    fileserver_root = display_meta.get("fileserver_root") or {}
+    artifacts = display_meta.get("artifacts") or []
+    payload = {
+        "id": item.id,
+        "global_vuln_id": item.global_vuln_id or source_meta.get("global_vuln_id"),
+        "project_id": item.project_id,
+        "title": item.title,
+        "summary": item.summary,
+        "severity": item.severity,
+        "cvss_score": source_meta.get("cvss_score", 0.0),
+        "confidence": item.confidence,
+        "report_id": source_meta.get("report_id"),
+        "reported_at": source_meta.get("reported_at"),
+        "reporter": source_meta.get("reporter") or {},
+        "subject": subject,
+        "metadata": metadata,
+        "has_artifact_files": bool(artifacts),
+        "source_task": {
+            "service_name": source_task.get("service_name"),
+            "service_id": source_task.get("service_id"),
+            "task_id": source_task.get("task_id"),
+            "execution_id": source_task.get("execution_id"),
+            "run_id": source_task.get("run_id"),
+            "run_name": source_task.get("run_name"),
+            "finding_id": source_task.get("finding_id"),
+            "result_file": source_task.get("result_file"),
+            "result_path": source_task.get("result_path"),
+            "project_id": source_task.get("project_id"),
+            "parent_task_id": source_task.get("parent_task_id"),
+            "parent_stage_name": source_task.get("parent_stage_name"),
+            "parent_stage_item_id": source_task.get("parent_stage_item_id"),
+            "task_purpose": source_task.get("task_purpose"),
+            "evolution_task_id": source_task.get("evolution_task_id"),
+            "evolution_round": source_task.get("evolution_round"),
+            "evolution_source_task_id": source_task.get("evolution_source_task_id"),
+            "evolution_source_execution_id": source_task.get("evolution_source_execution_id"),
+            "reported_severity": source_task.get("reported_severity"),
+        } if source_task else None,
+        "files_root_path": fileserver_root.get("root_path"),
+        "current_stage": item.current_stage,
+        "current_status": lifecycle.get("stage_status", item.current_status),
+        "decision_status": item.decision_status,
+        "validation_result": lifecycle.get("validation_result"),
+        "finished_reason": lifecycle.get("finished_reason"),
+        "created_by_type": item.created_by_type,
+        "created_by": item.created_by,
+        "created_at": item.created_at,
+        "updated_at": item.updated_at,
+    }
+    payload["display_summary"] = build_display_summary(payload, None)
+    return payload
+
+
+def _coerce_cvss_band(value: str | None) -> str | None:
+    normalized = str(value or "").strip().lower()
+    return normalized or None
+
+
+def _normalize_case_pagination(
+    *,
+    page: int,
+    page_size: int,
+    limit: int | None,
+    offset: int | None,
+) -> tuple[int, int, int]:
+    if limit is not None or offset is not None:
+        effective_limit = max(1, min(int(limit or DEFAULT_CASE_PAGE_SIZE), MAX_CASE_PAGE_SIZE))
+        effective_offset = max(0, int(offset or 0))
+        effective_page = effective_offset // effective_limit + 1
+        return effective_page, effective_limit, effective_offset
+    effective_page_size = max(1, min(int(page_size or DEFAULT_CASE_PAGE_SIZE), MAX_CASE_PAGE_SIZE))
+    effective_page = max(1, int(page or 1))
+    effective_offset = (effective_page - 1) * effective_page_size
+    return effective_page, effective_page_size, effective_offset
+
+
+def _apply_case_text_search(query, keyword: str):
+    pattern = f"%{keyword.lower()}%"
+    return query.filter(
+        or_(
+            func.lower(func.coalesce(Case.title, "")).like(pattern),
+            func.lower(func.coalesce(Case.summary, "")).like(pattern),
+            func.lower(func.coalesce(Case.source_meta_json, "")).like(pattern),
+            func.lower(func.coalesce(Case.target_meta_json, "")).like(pattern),
+        )
+    )
+
+
 def _get_case_by_id_or_global_vuln_id(db: Session, case_id: str) -> Case | None:
     item = db.query(Case).filter(Case.id == case_id).first()
     if item is not None:
@@ -202,6 +319,103 @@ def _manual_task_payload(item: ManualTask) -> dict:
         "completed_at": item.completed_at,
         "created_at": item.created_at,
     }
+
+
+@router.get("/download-center/jobs", response_model=DownloadCenterJobListResponse)
+async def list_download_center_jobs(
+    project_id: str = Query(...),
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    _, token = user_and_token
+    await ensure_project_access(project_id, token)
+    items = list_jobs(db, project_id)
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/download-center/stats", response_model=DownloadCenterStatsResponse)
+async def get_download_center_stats(
+    project_id: str = Query(...),
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    _, token = user_and_token
+    await ensure_project_access(project_id, token)
+    return get_job_stats(db, project_id)
+
+
+@router.get("/download-center/jobs/{job_id}", response_model=DownloadCenterJobResponse)
+async def get_download_center_job(
+    job_id: str,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    _, token = user_and_token
+    download_job = db.query(DownloadJob).filter(DownloadJob.id == job_id).first()
+    if download_job is None:
+        raise HTTPException(status_code=404, detail="download job not found")
+    await ensure_project_access(download_job.project_id, token)
+    return serialize_job(download_job)
+
+
+@router.post("/download-center/jobs", response_model=DownloadCenterJobResponse)
+async def create_download_center_job(
+    request: DownloadCenterJobCreateRequest,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    subject, token = user_and_token
+    await ensure_project_access(request.project_id, token)
+    created_by = subject.get("username") or str(subject.get("id"))
+    return create_job(db, project_id=request.project_id, report_ids=request.report_ids, created_by=created_by)
+
+
+@router.post("/download-center/jobs/{job_id}/retry", response_model=DownloadCenterJobResponse)
+async def retry_download_center_job(
+    job_id: str,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    _, token = user_and_token
+    job = db.query(DownloadJob).filter(DownloadJob.id == job_id).first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="download job not found")
+    await ensure_project_access(job.project_id, token)
+    return retry_job(db, job.project_id, job_id)
+
+
+@router.delete("/download-center/jobs/{job_id}", response_model=DownloadCenterJobResponse)
+async def delete_download_center_job(
+    job_id: str,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    _, token = user_and_token
+    job = db.query(DownloadJob).filter(DownloadJob.id == job_id).first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="download job not found")
+    await ensure_project_access(job.project_id, token)
+    return delete_job(db, job.project_id, job_id)
+
+
+@router.get("/download-center/jobs/{job_id}/download")
+async def download_download_center_job(
+    job_id: str,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    _, token = user_and_token
+    job = db.query(DownloadJob).filter(DownloadJob.id == job_id).first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="download job not found")
+    await ensure_project_access(job.project_id, token)
+    payload = serialize_job(job)
+    if not payload.get("downloadable") or not job.output_path:
+        raise HTTPException(status_code=400, detail="download job output is not ready")
+    path = Path(job.output_path)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="download file missing")
+    return FileResponse(path, media_type="application/zip", filename=job.output_filename or path.name)
 
 
 def _validate_stage_transition(
@@ -324,6 +538,16 @@ async def list_cases(
     project_id: str | None = Query(None),
     global_vuln_id: str | None = Query(None),
     current_stage: str | None = Query(None),
+    severity: str | None = Query(None),
+    reporter_type: str | None = Query(None),
+    cvss_band: str | None = Query(None),
+    search: str | None = Query(None),
+    sort_field: str = Query("updated_at"),
+    sort_direction: str = Query("desc"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_CASE_PAGE_SIZE, ge=1, le=MAX_CASE_PAGE_SIZE),
+    limit: int | None = Query(None, ge=1, le=MAX_CASE_PAGE_SIZE),
+    offset: int | None = Query(None, ge=0),
     source_service_name: str | None = Query(None),
     source_task_id: str | None = Query(None),
     source_execution_id: str | None = Query(None),
@@ -336,6 +560,13 @@ async def list_cases(
     _, token = user_and_token
     if project_id:
         await ensure_project_access(project_id, token)
+    started_at = time.perf_counter()
+    effective_page, effective_page_size, effective_offset = _normalize_case_pagination(
+        page=page,
+        page_size=page_size,
+        limit=limit,
+        offset=offset,
+    )
     query = db.query(Case)
     if project_id:
         query = query.filter(Case.project_id == project_id)
@@ -343,42 +574,75 @@ async def list_cases(
         query = query.filter(Case.global_vuln_id == global_vuln_id)
     if current_stage:
         query = query.filter(Case.current_stage == current_stage)
-    items = query.order_by(Case.updated_at.desc()).all()
-    payloads = [_case_payload(item) for item in items]
+    if severity:
+        query = query.filter(Case.severity == severity)
+    if reporter_type:
+        query = query.filter(
+            func.lower(func.coalesce(func.json_extract(Case.source_meta_json, "$.reporter.type"), "")).like(f"%{reporter_type.lower()}%")
+        )
     if source_service_name:
-        payloads = [
-            item for item in payloads
-            if str((item.get("source_task") or {}).get("service_name") or "") == source_service_name
-            or str((item.get("source_task") or {}).get("service_id") or "") == source_service_name
-        ]
+        lowered = f"%{source_service_name.lower()}%"
+        query = query.filter(
+            or_(
+                func.lower(func.coalesce(func.json_extract(Case.display_meta_json, "$.metadata.source.service_name"), "")).like(lowered),
+                func.lower(func.coalesce(func.json_extract(Case.display_meta_json, "$.metadata.source.service_id"), "")).like(lowered),
+            )
+        )
     if source_task_id:
-        payloads = [
-            item for item in payloads
-            if str((item.get("source_task") or {}).get("task_id") or "") == source_task_id
-        ]
+        query = query.filter(
+            func.coalesce(func.json_extract(Case.display_meta_json, "$.metadata.source.task_id"), "") == source_task_id
+        )
     if source_execution_id:
-        payloads = [
-            item for item in payloads
-            if str((item.get("source_task") or {}).get("execution_id") or "") == source_execution_id
-        ]
+        query = query.filter(
+            func.coalesce(func.json_extract(Case.display_meta_json, "$.metadata.source.execution_id"), "") == source_execution_id
+        )
     if pool_type:
-        payloads = [
-            item for item in payloads
-            if str((item.get("metadata") or {}).get("pool_type") or "") == pool_type
-        ]
+        query = query.filter(
+            func.coalesce(func.json_extract(Case.display_meta_json, "$.metadata.pool_type"), "") == pool_type
+        )
     if evolution_task_id:
-        payloads = [
-            item for item in payloads
-            if str((item.get("source_task") or {}).get("evolution_task_id") or "") == evolution_task_id
-            or str(((item.get("metadata") or {}).get("source") or {}).get("evolution_task_id") or "") == evolution_task_id
-        ]
+        query = query.filter(
+            or_(
+                func.coalesce(func.json_extract(Case.display_meta_json, "$.metadata.source.evolution_task_id"), "") == evolution_task_id,
+                func.coalesce(func.json_extract(Case.display_meta_json, "$.metadata.source.evolution_source_task_id"), "") == evolution_task_id,
+            )
+        )
     if evolution_round is not None:
-        payloads = [
-            item for item in payloads
-            if str((item.get("source_task") or {}).get("evolution_round") or "") == str(evolution_round)
-            or str(((item.get("metadata") or {}).get("source") or {}).get("evolution_round") or "") == str(evolution_round)
-        ]
-    return {"items": payloads, "total": len(payloads)}
+        query = query.filter(
+            func.coalesce(func.json_extract(Case.display_meta_json, "$.metadata.source.evolution_round"), "") == str(evolution_round)
+        )
+    normalized_cvss_band = _coerce_cvss_band(cvss_band)
+    if normalized_cvss_band:
+        cvss_value = cast(func.json_extract(Case.source_meta_json, "$.cvss_score"), Float)
+        if normalized_cvss_band == "critical":
+            query = query.filter(cvss_value >= 9.0)
+        elif normalized_cvss_band == "high":
+            query = query.filter(cvss_value >= 7.0, cvss_value < 9.0)
+        elif normalized_cvss_band == "medium":
+            query = query.filter(cvss_value >= 4.0, cvss_value < 7.0)
+        elif normalized_cvss_band == "low":
+            query = query.filter(cvss_value >= 0.0, cvss_value < 4.0)
+    if search and search.strip():
+        query = _apply_case_text_search(query, search.strip())
+
+    total = query.count()
+    sort_column = ALLOWED_SORT_FIELDS.get(sort_field, Case.updated_at)
+    direction = sort_direction if sort_direction in ALLOWED_SORT_DIRECTIONS else "desc"
+    ordered_query = query.order_by(asc(sort_column) if direction == "asc" else desc(sort_column), desc(Case.updated_at))
+    items = ordered_query.offset(effective_offset).limit(effective_page_size).all()
+    payloads = [_lightweight_case_payload(item) for item in items]
+    duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+    print(
+        f"[vuln.cases.list] duration_ms={duration_ms} total={total} page={effective_page} page_size={effective_page_size} "
+        f"sort={sort_field}:{direction} search={'yes' if search else 'no'}",
+        flush=True,
+    )
+    return {
+        "items": payloads,
+        "total": total,
+        "page": effective_page,
+        "page_size": effective_page_size,
+    }
 
 
 @router.get("/{case_id}")
@@ -765,12 +1029,14 @@ async def get_dashboard_overview(
     decision_counts: dict[str, int] = {}
     finished_reason_counts: dict[str, int] = {}
     severity_counts: dict[str, int] = {}
+    created_by_type_counts: dict[str, int] = {}
     action_status_counts: dict[str, int] = {}
     result_type_counts: dict[str, int] = {}
     for item in cases:
         stage_counts[item.current_stage] = stage_counts.get(item.current_stage, 0) + 1
         decision_counts[item.decision_status] = decision_counts.get(item.decision_status, 0) + 1
         severity_counts[item.severity] = severity_counts.get(item.severity, 0) + 1
+        created_by_type_counts[item.created_by_type] = created_by_type_counts.get(item.created_by_type, 0) + 1
         finished_reason = get_lifecycle_state(item).get("finished_reason")
         if item.current_stage == MAIN_STAGE_FINISHED and finished_reason:
             finished_reason_counts[finished_reason] = finished_reason_counts.get(finished_reason, 0) + 1
@@ -814,6 +1080,7 @@ async def get_dashboard_overview(
         "decision_counts": decision_counts,
         "finished_reason_counts": finished_reason_counts,
         "severity_counts": severity_counts,
+        "created_by_type_counts": created_by_type_counts,
         "action_status_counts": action_status_counts,
         "result_type_counts": result_type_counts,
         "recent_trend": recent_trend,

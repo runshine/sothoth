@@ -158,6 +158,11 @@ class BinarySecurityTaskResponse(BaseModel):
     execution_epoch: int = 0
     current_stage: Optional[str] = None
     last_error: Optional[str] = None
+    terminal_failure: bool = False
+    requeue_suppressed: bool = False
+    failure_code: Optional[str] = None
+    failure_category: Optional[str] = None
+    failure_message: Optional[str] = None
     firmware_path: str
     stage_sequence: list[str] = Field(default_factory=list)
     is_queued: bool = False
@@ -372,7 +377,9 @@ class BinarySecurityStageItemResponse(BaseModel):
     total_retry_count: int = 0
     downstream_service: Optional[str] = None
     downstream_task_id: Optional[str] = None
+    archive_bound_downstream_task_id: Optional[str] = None
     downstream_status: Optional[str] = None
+    latest_binding_mismatch: Optional[dict[str, Any]] = None
     downstream_binding_state: Optional[str] = None
     downstream_create_attempts: int = 0
     downstream_create_last_attempt_at: Optional[datetime] = None
@@ -415,6 +422,10 @@ class BinarySecurityArchiveJobResponse(BaseModel):
     item_key: Optional[str] = None
     downstream_service: Optional[str] = None
     downstream_task_id: Optional[str] = None
+    bound_output_path: Optional[str] = None
+    source_root: Optional[str] = None
+    source_root_path: Optional[str] = None
+    source_dir: Optional[str] = None
     archive_status: str
     archive_root: Optional[str] = None
     error_message: Optional[str] = None

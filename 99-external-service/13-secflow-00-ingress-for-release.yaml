@@ -183,6 +183,14 @@ spec:
             port:
               number: 80
 
+      - path: /api/app/vuln-verify
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-app-vuln-verify
+            port:
+              number: 80
+
       - path: /api/app/firmware-unpacker
         pathType: Prefix
         backend:

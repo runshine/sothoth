@@ -79,6 +79,7 @@ def build_client(tmp_path, monkeypatch):
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[files_api.get_current_user] = override_get_current_user
     monkeypatch.setattr(files_api, "verify_project_access", override_project_access)
+    monkeypatch.setattr(files_api, "get_db_session", testing_session_local)
 
     return TestClient(app)
 

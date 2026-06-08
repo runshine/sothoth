@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import BigInteger, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine
 from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 
 from app.config import get_config
@@ -74,6 +74,50 @@ class ManagedFile(Base):
 
     subproject = relationship("FileSubproject", back_populates="files")
     directory = relationship("FileDirectory", back_populates="files")
+
+
+class ProjectInputUploadRecord(Base):
+    __tablename__ = "secflow_fileserver_project_input_upload"
+
+    upload_id = Column(String(64), primary_key=True)
+    project_id = Column(String(32), nullable=False, index=True)
+    input_type = Column(String(32), nullable=False, index=True)
+    status = Column(String(32), nullable=False, default="pending", index=True)
+    keep_original = Column(Boolean, nullable=False, default=False)
+    source_archive_count = Column(Integer, nullable=False, default=0)
+    stored_file_count = Column(Integer, nullable=False, default=0)
+    stored_total_size_bytes = Column(BigInteger, nullable=False, default=0)
+    target_path = Column(String(1024), nullable=False)
+    last_error = Column(Text, nullable=True)
+    created_by = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    finished_at = Column(DateTime, nullable=True)
+
+    batches = relationship(
+        "ProjectInputUploadBatch",
+        back_populates="upload",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class ProjectInputUploadBatch(Base):
+    __tablename__ = "secflow_fileserver_project_input_upload_batch"
+
+    batch_id = Column(String(64), primary_key=True)
+    upload_id = Column(String(64), ForeignKey("secflow_fileserver_project_input_upload.upload_id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String(32), nullable=False, default="pending", index=True)
+    mode = Column(String(32), nullable=False, default="create")
+    keep_original = Column(Boolean, nullable=False, default=False)
+    submitted_file_count = Column(Integer, nullable=False, default=0)
+    processed_file_count = Column(Integer, nullable=False, default=0)
+    processed_size_bytes = Column(BigInteger, nullable=False, default=0)
+    error_summary = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    finished_at = Column(DateTime, nullable=True)
+
+    upload = relationship("ProjectInputUploadRecord", back_populates="batches")
 
 
 _engine = None

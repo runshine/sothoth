@@ -20,6 +20,7 @@ from app.exception import setup_exception_handlers
 from app.models import init_database
 from app.services.lifecycle_engine import ensure_default_workflow
 from app.services.auth import init_auth_service
+from app.services.download_center import get_download_center_service
 from app.services.project import init_project_service
 from app.services.registry import get_registry_service
 
@@ -58,6 +59,7 @@ async def lifespan(_: FastAPI):
             finally:
                 session.close()
             await get_registry_service().start()
+            await get_download_center_service().start()
     except Exception as exc:
         logger.error("Startup failed: %s", exc)
         raise
@@ -65,6 +67,10 @@ async def lifespan(_: FastAPI):
     yield
 
     if os.environ.get("SECFLOW_VULN_SKIP_STARTUP") != "1":
+        try:
+            await get_download_center_service().stop()
+        except Exception as exc:
+            logger.warning("Download center stop failed: %s", exc)
         try:
             await get_registry_service().stop()
         except Exception as exc:

@@ -1,5 +1,6 @@
 import io
 import sys
+import tarfile
 import time
 import zipfile
 from pathlib import Path
@@ -82,6 +83,7 @@ def build_client(tmp_path, monkeypatch):
     app.dependency_overrides[files_api.get_current_user] = override_get_current_user
     monkeypatch.setattr(files_api, "verify_project_access", override_project_access)
     monkeypatch.setattr(files_api, "verify_project_access_by_token", override_project_access)
+    monkeypatch.setattr(files_api, "get_db_session", testing_session_local)
     return TestClient(app)
 
 
@@ -94,6 +96,17 @@ def _wait_task_done(client: TestClient, task_id: str, headers: dict) -> dict:
             return payload
         time.sleep(0.05)
     raise AssertionError("task timeout")
+
+
+def _wait_upload_done(client: TestClient, upload_id: str, headers: dict) -> dict:
+    for _ in range(60):
+        response = client.get(f"/api/fileserver/project-input/uploads/{upload_id}", headers=headers)
+        assert response.status_code == 200
+        payload = response.json()
+        if payload["status"] in {"succeeded", "partial_failed", "failed"}:
+            return payload
+        time.sleep(0.05)
+    raise AssertionError("upload timeout")
 
 
 def test_project_filesystem_archive_task(tmp_path, monkeypatch):
@@ -158,3 +171,99 @@ def test_vuln_project_path_archive_task(tmp_path, monkeypatch):
         with zipfile.ZipFile(archive_file, "r") as zf:
             names = set(zf.namelist())
             assert "__vuln_cases__/case-1/evidence/raw.txt" in names
+
+
+def test_project_input_upload_extract_and_stats(tmp_path, monkeypatch):
+    with build_client(tmp_path, monkeypatch) as client:
+        headers = {"Authorization": "Bearer fake-token"}
+        archive_buffer = io.BytesIO()
+        with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("src/main.c", b"int main(void){return 0;}")
+            zf.writestr("../escape.txt", b"blocked")
+        archive_buffer.seek(0)
+
+        create = client.post(
+            "/api/fileserver/project-input/uploads",
+            data={"project_id": "demo-project", "input_type": "code", "keep_original": "false"},
+            files=[("files", ("source.zip", archive_buffer, "application/zip"))],
+            headers=headers,
+        )
+        assert create.status_code == 200
+        payload = create.json()
+        upload_id = payload["upload_id"]
+
+        done = _wait_upload_done(client, upload_id, headers)
+        assert done["status"] == "partial_failed"
+        assert done["stored_file_count"] == 1
+        assert done["latest_batch"]["submitted_file_count"] == 1
+        assert "skip invalid path" in (done["last_error"] or "")
+
+        list_resp = client.get(
+            "/api/fileserver/project-input/uploads",
+            params={"project_id": "demo-project", "input_type": "code"},
+            headers=headers,
+        )
+        assert list_resp.status_code == 200
+        assert list_resp.json()["total"] == 1
+
+        stats_resp = client.get(
+            "/api/fileserver/project-input/uploads/stats",
+            params={"project_id": "demo-project", "input_type": "code"},
+            headers=headers,
+        )
+        assert stats_resp.status_code == 200
+        stats = stats_resp.json()
+        assert stats["total_uploads"] == 1
+        assert stats["partial_failed_uploads"] == 1
+        assert stats["stored_file_count"] == 1
+
+        fs_resp = client.get(
+            "/api/fileserver/project-filesystem/children",
+            params={"project_id": "demo-project", "path": f"/user_input/code/{upload_id}/src"},
+            headers=headers,
+        )
+        assert fs_resp.status_code == 200
+        assert fs_resp.json()["files"][0]["path"] == f"/user_input/code/{upload_id}/src/main.c"
+
+
+def test_project_input_upload_keep_original_and_delete(tmp_path, monkeypatch):
+    with build_client(tmp_path, monkeypatch) as client:
+        headers = {"Authorization": "Bearer fake-token"}
+        tar_path = tmp_path / "demo.tar.gz"
+        with tarfile.open(tar_path, "w:gz") as tf:
+            data = b"payload"
+            info = tarfile.TarInfo(name="docs/readme.txt")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+
+        with tar_path.open("rb") as fp:
+            create = client.post(
+                "/api/fileserver/project-input/uploads",
+                data={"project_id": "demo-project", "input_type": "document", "keep_original": "true"},
+                files=[("files", ("demo.tar.gz", fp, "application/gzip"))],
+                headers=headers,
+            )
+        assert create.status_code == 200
+        upload_id = create.json()["upload_id"]
+
+        done = _wait_upload_done(client, upload_id, headers)
+        assert done["status"] == "succeeded"
+        assert done["stored_file_count"] == 1
+        assert done["keep_original"] is True
+
+        fs_resp = client.get(
+            "/api/fileserver/project-filesystem/children",
+            params={"project_id": "demo-project", "path": f"/user_input/document/{upload_id}"},
+            headers=headers,
+        )
+        assert fs_resp.status_code == 200
+        assert fs_resp.json()["files"][0]["name"] == "demo.tar.gz"
+
+        delete_resp = client.request(
+            "DELETE",
+            "/api/fileserver/project-input/uploads",
+            json={"project_id": "demo-project", "input_type": "document", "upload_ids": [upload_id]},
+            headers=headers,
+        )
+        assert delete_resp.status_code == 200
+        assert delete_resp.json()["deleted_ids"] == [upload_id]
