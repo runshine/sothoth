@@ -6636,6 +6636,10 @@ class TaskManager:
                     level="info",
                     payload={"deleted_downstream_count": int(snapshot.get("deleted_downstream_count") or 0)},
                 )
+                # Once all deferred downstream refs are cleaned up, the parent task
+                # should be removed as well so the accepted delete action becomes final.
+                db.flush()
+                db.delete(task)
             db.commit()
         finally:
             db.close()

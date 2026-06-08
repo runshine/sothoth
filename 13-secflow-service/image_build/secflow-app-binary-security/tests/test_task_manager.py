@@ -22081,12 +22081,63 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
 
         asyncio.run(_run())
 
-        self.assertFalse(task.cleanup_snapshot.get("cleanup_partial_failed"))
-        self.assertEqual("succeeded", task.cleanup_snapshot.get("deferred_cleanup_status"))
-        self.assertEqual([], task.cleanup_snapshot.get("deferred_downstream_refs"))
-        self.assertEqual(2, task.cleanup_snapshot.get("deferred_cleanup_attempts"))
+        self.assertEqual([], db.tasks)
         event_types = [row.event_type for row in db.events if isinstance(row, BinarySecurityEvent)]
         self.assertIn("task_delete_cleanup_reconciled", event_types)
+
+    def test_reconcile_deferred_cleanup_task_ref_keeps_task_when_cleanup_still_deferred(self):
+        task = BinarySecurityTask(
+            id="t-reconcile-cleanup-pending",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/in",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="cancelled",
+            current_stage="firmware_unpack",
+        )
+        task.cleanup_snapshot = {
+            "cleanup_partial_failed": True,
+            "deleted_downstream_count": 0,
+            "deferred_cleanup_attempts": 1,
+            "deferred_cleanup_status": "partial_failed",
+            "deferred_downstream_refs": [
+                {"service": "firmware_unpacker", "task_id": "fw-1", "stage_name": "firmware_unpack", "deferred": True}
+            ],
+        }
+        db = _AppendingModelAwareDb(tasks=[task], events=[])
+
+        async def _run():
+            with (
+                patch.object(task_manager_module, "get_session_factory", return_value=lambda: db),
+                patch.object(self.manager, "_delete_downstream_refs", AsyncMock(return_value=0)),
+            ):
+                setattr(
+                    self.manager,
+                    "_last_downstream_cleanup_results",
+                    [
+                        {
+                            "service": "firmware_unpacker",
+                            "task_id": "fw-1",
+                            "stage_name": "firmware_unpack",
+                            "delete_status": "failed",
+                            "deferred": True,
+                            "error": "still busy",
+                        }
+                    ],
+                )
+                await self.manager._reconcile_deferred_cleanup_task_ref({"project_id": "p1", "task_id": "t-reconcile-cleanup-pending"}, "token")
+
+        asyncio.run(_run())
+
+        self.assertEqual(1, len(db.tasks))
+        self.assertTrue(task.cleanup_snapshot.get("cleanup_partial_failed"))
+        self.assertEqual("partial_failed", task.cleanup_snapshot.get("deferred_cleanup_status"))
+        self.assertEqual(1, len(task.cleanup_snapshot.get("deferred_downstream_refs") or []))
+        event_types = [row.event_type for row in db.events if isinstance(row, BinarySecurityEvent)]
+        self.assertIn("task_delete_cleanup_retry_deferred", event_types)
 
     def test_delete_downstream_refs_force_delete_ignores_unverified_failure(self):
         task = BinarySecurityTask(
