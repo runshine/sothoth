@@ -3318,6 +3318,7 @@ class TaskManager:
         for job in archive_jobs:
             retry_supported, retry_reason = self._archive_job_retry_support(db, task, job)
             source_refs = self._archive_job_source_refs(job, stage_item_by_id.get(job.item_id))
+            archive_sources = self._archive_job_archive_sources(db, task, job)
             archive_job_responses.append(
                 BinarySecurityArchiveJobResponse(
                     id=job.id,
@@ -3327,6 +3328,8 @@ class TaskManager:
                     downstream_service=job.downstream_service,
                     downstream_task_id=job.downstream_task_id,
                     bound_output_path=self._string_or_none(dict(job.payload or {}).get("bound_output_path")),
+                    archive_source_primary_path=archive_sources[0] if archive_sources else None,
+                    archive_source_paths=archive_sources,
                     source_root=source_refs["source_root"],
                     source_root_path=source_refs["source_root_path"],
                     source_dir=source_refs["source_dir"],
@@ -3399,6 +3402,54 @@ class TaskManager:
             "source_root_path": source_root_path,
             "source_dir": source_dir,
         }
+
+    def _archive_job_archive_sources(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        job: BinarySecurityArchiveJob,
+    ) -> list[str]:
+        payload = dict(job.payload or {})
+        payload_sources = payload.get("archive_source_paths")
+        if isinstance(payload_sources, list):
+            normalized = [str(path).strip() for path in payload_sources if str(path).strip()]
+            if normalized:
+                return normalized
+        fallback_sources = self._archive_job_sources_from_events(db, task, job)
+        return fallback_sources
+
+    def _archive_job_sources_from_events(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        job: BinarySecurityArchiveJob,
+    ) -> list[str]:
+        rows = (
+            db.query(BinarySecurityEvent)
+            .filter(
+                BinarySecurityEvent.task_id == task.id,
+                BinarySecurityEvent.item_id == job.item_id,
+                BinarySecurityEvent.event_type.in_(["downstream_output_copied", "downstream_output_copy_partial"]),
+            )
+            .order_by(BinarySecurityEvent.created_at.desc())
+            .all()
+        )
+        expected_target_dir = str(job.archive_root or "").strip()
+        expected_downstream_task_id = self._archive_job_bound_downstream_task_id(job)
+        for row in rows:
+            payload = dict(getattr(row, "payload", None) or {})
+            target_dir = str(payload.get("target_dir") or "").strip()
+            if expected_target_dir and target_dir and target_dir != expected_target_dir:
+                continue
+            event_downstream_task_id = str(payload.get("bound_downstream_task_id") or "").strip()
+            if expected_downstream_task_id and event_downstream_task_id and event_downstream_task_id != expected_downstream_task_id:
+                continue
+            sources = payload.get("sources")
+            if isinstance(sources, list):
+                normalized = [str(path).strip() for path in sources if str(path).strip()]
+                if normalized:
+                    return normalized
+        return []
 
     def _current_downstream_task_id(self, item: BinarySecurityStageItem | None) -> str:
         return str(getattr(item, "downstream_task_id", "") or "").strip()
@@ -25695,6 +25746,18 @@ class TaskManager:
             "extra_paths": [str(path) for path in (extra_paths or [])],
         }
 
+    def _with_archive_source_payload(
+        self,
+        payload: dict[str, Any] | None,
+        *,
+        archive_source_paths: list[str] | None,
+    ) -> dict[str, Any]:
+        next_payload = dict(payload or {})
+        normalized = [str(path).strip() for path in list(archive_source_paths or []) if str(path).strip()]
+        next_payload["archive_source_paths"] = normalized
+        next_payload["archive_source_primary_path"] = normalized[0] if normalized else None
+        return next_payload
+
     def _archive_job_payload_requires_refresh(
         self,
         job: BinarySecurityArchiveJob,
@@ -26235,6 +26298,22 @@ class TaskManager:
                 "bound_downstream_task_id": downstream_task_id,
             },
         )
+        job_dedupe_key = build_archive_job_dedupe_key(item.id, downstream_task_id)
+        archive_job = (
+            db.query(BinarySecurityArchiveJob)
+            .filter(
+                BinarySecurityArchiveJob.task_id == task.id,
+                BinarySecurityArchiveJob.stage_name == item.stage_name,
+                BinarySecurityArchiveJob.job_dedupe_key == job_dedupe_key,
+            )
+            .order_by(BinarySecurityArchiveJob.created_at.desc())
+            .first()
+        )
+        if archive_job is not None:
+            archive_job.payload = self._with_archive_source_payload(
+                archive_job.payload,
+                archive_source_paths=[str(path) for path in existing_sources],
+            )
         self._merge_stage_item_output_ref(item, archive_copy_stats=copy_stats)
         return _ArchiveOutputResult(
             status="archived",
