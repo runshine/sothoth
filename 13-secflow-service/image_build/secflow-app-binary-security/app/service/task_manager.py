@@ -26175,6 +26175,11 @@ class TaskManager:
                 target_dir=None,
                 source_candidates=[str(path) for path in sources],
             )
+        if target_dir.exists() or target_dir.is_symlink():
+            if target_dir.is_dir() and not target_dir.is_symlink():
+                shutil.rmtree(target_dir, ignore_errors=True)
+            else:
+                target_dir.unlink(missing_ok=True)
         ensure_dir(target_dir)
         copy_stats = {
             "copied_files": 0,
