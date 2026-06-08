@@ -5446,6 +5446,8 @@ class TaskManager:
         *,
         workspace_root: str | None = None,
     ) -> Path | None:
+        if str(getattr(operation, "operation_type", "") or "").strip() == TASK_ACTION_DELETE:
+            return None
         task_root_value = str(workspace_root or "").strip()
         task_root = Path(task_root_value) if task_root_value else None
         if task_root is None:
