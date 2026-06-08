@@ -42,9 +42,6 @@ CHIRMERA_SCHEDULE_DEPLOYMENTS=(
 EXCLUDED_WORKLOADS=(
   "statefulset/secflow-pi-re-agent"
   "statefulset/secflow-platform-mysql"
-  "deployment/secflow-app-dataflow-vuln-scanner-api"
-  "deployment/secflow-app-dataflow-vuln-scanner-manager"
-  "statefulset/secflow-app-dataflow-vuln-scanner-worker"
 )
 
 usage() {
@@ -66,11 +63,11 @@ Examples:
   ./update_k8s_image_all.sh --chirmera-schedule-image 20260606
 
 Behavior:
-  - No args: update all secflow-* deployments in the namespace to :latest for managed repos.
-  - global tag: update all secflow-* deployments in the namespace to the same tag for managed repos.
-  - Always force rollout restart for secflow-* deployments, so unchanged tags such as :latest are pulled again.
+  - No args: update all matched secflow-* / chirmera-platform-schedule-* deployments/statefulsets in the namespace to :latest.
+  - global tag: update all matched secflow-* / chirmera-platform-schedule-* deployments/statefulsets in the namespace to the same tag.
+  - Always force rollout restart for matched workloads, so unchanged tags such as :latest are pulled again.
   - Managed repos:
-      ghcr.io/runshine/*
+      ghcr.io/*
       runshine0819/secflow-*
   - b2s image: override binary-to-source manager/worker image.
   - binary-security image: override binary-security api/worker image.
@@ -82,7 +79,7 @@ Behavior:
   - firmware-unpacker image: override secflow-app-firmware-unpacker image.
   - chirmera-schedule image: override chirmera-platform-schedule api/scheduler/worker image.
   - ENTRY_ANALYSE_WORKER_REPLICAS env: desired entry-analyse worker replicas, default 4.
-  - Non-secflow deployments and third-party sidecars are skipped.
+  - Only `statefulset/secflow-pi-re-agent` and `statefulset/secflow-platform-mysql` are excluded.
 HELP
 }
 
@@ -102,7 +99,7 @@ resolve_image() {
 
 is_managed_repo() {
   local repo="${1:-}"
-  [[ "${repo}" == ghcr.io/runshine/* || "${repo}" == runshine0819/secflow-* ]]
+  [[ "${repo}" == ghcr.io/* || "${repo}" == runshine0819/secflow-* ]]
 }
 
 is_excluded_workload() {
@@ -350,10 +347,6 @@ while IFS=$'\t' read -r workload_kind workload_name containers; do
     [[ -n "${pair}" ]] || continue
     container="${pair%%=*}"
     current_image="${pair#*=}"
-    repo="$(image_repo "${current_image}")"
-    if ! is_managed_repo "${repo}"; then
-      continue
-    fi
     requested_tag="${GLOBAL_TAG}"
     case "${workload_name}:${container}" in
       "${B2S_MANAGER_DEPLOYMENT}:${B2S_MANAGER_CONTAINER}"|"${B2S_WORKER_DEPLOYMENT}:${B2S_WORKER_CONTAINER}")
@@ -399,10 +392,6 @@ while IFS=$'\t' read -r workload_kind workload_name; do
     echo "[INFO] Skip excluded workload restart: ${workload_kind}/${workload_name}"
     continue
   fi
-  if ! workload_has_managed_repo "${workload_kind}" "${workload_name}"; then
-    echo "[INFO] Skip unmanaged workload restart: ${workload_kind}/${workload_name}"
-    continue
-  fi
   kubectl -n "${NAMESPACE}" rollout restart "${workload_kind}/${workload_name}"
 done < <(
   {
@@ -415,9 +404,6 @@ echo "[INFO] Waiting for secflow workloads to finish rollout"
 while IFS=$'\t' read -r workload_kind workload_name; do
   [[ -n "${workload_name}" ]] || continue
   if is_excluded_workload "${workload_kind}" "${workload_name}"; then
-    continue
-  fi
-  if ! workload_has_managed_repo "${workload_kind}" "${workload_name}"; then
     continue
   fi
   kubectl -n "${NAMESPACE}" rollout status "${workload_kind}/${workload_name}" --timeout=300s

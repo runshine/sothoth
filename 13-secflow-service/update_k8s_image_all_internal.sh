@@ -48,9 +48,6 @@ CHIRMERA_SCHEDULE_DEPLOYMENTS=(
 EXCLUDED_WORKLOADS=(
   "statefulset/secflow-pi-re-agent"
   "statefulset/secflow-platform-mysql"
-  "deployment/secflow-app-dataflow-vuln-scanner-api"
-  "deployment/secflow-app-dataflow-vuln-scanner-manager"
-  "statefulset/secflow-app-dataflow-vuln-scanner-worker"
 )
 
 usage() {
@@ -381,10 +378,6 @@ while IFS=$'\t' read -r workload_kind workload_name containers; do
     [[ -n "${pair}" ]] || continue
     container="${pair%%=*}"
     current_image="${pair#*=}"
-    repo="$(image_repo "${current_image}")"
-    if ! is_managed_repo "${repo}"; then
-      continue
-    fi
     requested_tag="${GLOBAL_TAG}"
     case "${workload_name}:${container}" in
       "${B2S_MANAGER_DEPLOYMENT}:${B2S_MANAGER_CONTAINER}"|"${B2S_WORKER_DEPLOYMENT}:${B2S_WORKER_CONTAINER}")
@@ -426,15 +419,11 @@ done < <(
   }
 )
 
-echo "[INFO] Forcing rollout restart for managed workloads"
+echo "[INFO] Forcing rollout restart for matched workloads"
 while IFS=$'\t' read -r workload_kind workload_name; do
   [[ -n "${workload_name}" ]] || continue
   if is_excluded_workload "${workload_kind}" "${workload_name}"; then
     echo "[INFO] Skip excluded workload restart: ${workload_kind}/${workload_name}"
-    continue
-  fi
-  if ! workload_has_managed_repo "${workload_kind}" "${workload_name}"; then
-    echo "[INFO] Skip unmanaged workload restart: ${workload_kind}/${workload_name}"
     continue
   fi
   kubectl -n "${NAMESPACE}" rollout restart "${workload_kind}/${workload_name}"
