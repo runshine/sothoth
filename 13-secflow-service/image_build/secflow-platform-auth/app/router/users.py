@@ -298,8 +298,8 @@ def _validate_import_row(
         messages.append("密码长度至少6位")
 
     platform_role = normalize_role_name(platform_role_raw) or "ordinary_user"
-    if platform_role not in {"ordinary_admin", "ordinary_user"}:
-        messages.append("platform_role 仅支持 ordinary_admin 或 ordinary_user")
+    if platform_role not in {"ordinary_admin", "developer", "ordinary_user"}:
+        messages.append("platform_role 仅支持 ordinary_admin、developer 或 ordinary_user")
 
     resolved_roles: List[Role] = []
     for role_name in role_names:
@@ -311,7 +311,7 @@ def _validate_import_row(
         if cached_role is None:
             messages.append(f"角色不存在: {role_name}")
             continue
-        if normalize_role(cached_role) in {"super_admin", "ordinary_admin", "ordinary_user"}:
+        if normalize_role(cached_role) in {"super_admin", "ordinary_admin", "developer", "ordinary_user"}:
             messages.append(f"role_names 不允许包含平台保留角色: {role_name}")
             continue
         resolved_roles.append(cached_role)
@@ -709,7 +709,7 @@ def commit_user_import(
             db.add(user)
             db.flush()
 
-            if normalized.platform_role == "ordinary_admin":
+            if normalized.platform_role in {"ordinary_admin", "developer"}:
                 set_user_platform_role(db, user, normalized.platform_role)
 
             if normalized.role_names:

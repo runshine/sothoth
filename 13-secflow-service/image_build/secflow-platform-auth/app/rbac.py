@@ -11,14 +11,17 @@ from app.model import Role, User
 
 SUPER_ADMIN_ROLE = "super_admin"
 ORDINARY_ADMIN_ROLE = "ordinary_admin"
+DEVELOPER_ROLE = "developer"
 ORDINARY_USER_ROLE = "ordinary_user"
 SUPER_ADMIN_ROLE_ID = 1
 ORDINARY_ADMIN_ROLE_ID = 2
+DEVELOPER_ROLE_ID = 3
 BOOTSTRAP_SUPER_ADMIN_USER_ID = 1
 
 PLATFORM_ROLE_PRIORITY = {
-    SUPER_ADMIN_ROLE: 3,
-    ORDINARY_ADMIN_ROLE: 2,
+    SUPER_ADMIN_ROLE: 4,
+    ORDINARY_ADMIN_ROLE: 3,
+    DEVELOPER_ROLE: 2,
     ORDINARY_USER_ROLE: 1,
 }
 
@@ -31,6 +34,10 @@ FIXED_PLATFORM_ROLES: Dict[int, Dict[str, str]] = {
         "name": ORDINARY_ADMIN_ROLE,
         "description": "普通管理员：仅可在所属部门及下级部门范围内调整用户所属部门。",
     },
+    DEVELOPER_ROLE_ID: {
+        "name": DEVELOPER_ROLE,
+        "description": "开发者：可访问完整的平台功能页签，但不具备平台管理权限。",
+    },
 }
 
 ROLE_ALIASES = {
@@ -40,12 +47,14 @@ ROLE_ALIASES = {
     "管理员": SUPER_ADMIN_ROLE,
     "ordinary_admin": ORDINARY_ADMIN_ROLE,
     "普通管理员": ORDINARY_ADMIN_ROLE,
+    "developer": DEVELOPER_ROLE,
+    "开发者": DEVELOPER_ROLE,
     "ordinary_user": ORDINARY_USER_ROLE,
     "普通用户": ORDINARY_USER_ROLE,
     "user": ORDINARY_USER_ROLE,
 }
 
-ASSIGNABLE_PLATFORM_ROLES = {ORDINARY_ADMIN_ROLE, ORDINARY_USER_ROLE}
+ASSIGNABLE_PLATFORM_ROLES = {ORDINARY_ADMIN_ROLE, DEVELOPER_ROLE, ORDINARY_USER_ROLE}
 RESERVED_PLATFORM_ROLE_IDS = set(FIXED_PLATFORM_ROLES.keys())
 
 
@@ -64,6 +73,8 @@ def normalize_role(role: Optional[Role]) -> Optional[str]:
         return SUPER_ADMIN_ROLE
     if role.id == ORDINARY_ADMIN_ROLE_ID:
         return ORDINARY_ADMIN_ROLE
+    if role.id == DEVELOPER_ROLE_ID:
+        return DEVELOPER_ROLE
     return normalize_role_name(role.name)
 
 
@@ -165,6 +176,7 @@ def get_or_create_platform_role(db: Session, role_name: str) -> Role:
     target_role_id = {
         SUPER_ADMIN_ROLE: SUPER_ADMIN_ROLE_ID,
         ORDINARY_ADMIN_ROLE: ORDINARY_ADMIN_ROLE_ID,
+        DEVELOPER_ROLE: DEVELOPER_ROLE_ID,
     }.get(normalized)
     if target_role_id is None:
         raise HTTPException(
@@ -195,7 +207,7 @@ def set_user_platform_role(db: Session, user: User, role_name: str):
     if normalized not in ASSIGNABLE_PLATFORM_ROLES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="只允许分配普通管理员或普通用户角色"
+            detail="只允许分配普通管理员、开发者或普通用户角色"
         )
 
     preserved_roles = [
