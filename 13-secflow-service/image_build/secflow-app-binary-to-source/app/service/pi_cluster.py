@@ -6,6 +6,7 @@ import asyncio
 import os
 import socket
 from pathlib import Path
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -15,6 +16,18 @@ from app.config import get_config
 from app.service.pod_metrics import fetch_pod_resource_map
 from app.service.pi_re_agent import get_pi_client
 from app.time_utils import isoformat_local, now_local
+
+
+def _infer_pod_name_from_url(url: str) -> str | None:
+    try:
+        host = (urlparse(url).hostname or "").strip()
+    except Exception:
+        host = ""
+    if not host:
+        return None
+    if host.startswith("secflow-pi-re-agent-"):
+        return host.split(".", 1)[0]
+    return None
 
 
 @dataclass
@@ -234,10 +247,11 @@ async def probe_worker(url: str) -> PiWorkerSnapshot:
 def _snapshot_from_capacity(url: str, payload: dict[str, Any]) -> PiWorkerSnapshot:
     cfg = get_config().pi_re_agent
     worker_id = str(payload.get("worker_id") or url.rsplit("//", 1)[-1].split(":", 1)[0])
+    inferred_pod_name = _infer_pod_name_from_url(url)
     return PiWorkerSnapshot(
         worker_id=worker_id,
         url=url.rstrip("/"),
-        pod_name=str(payload.get("pod_name") or "").strip() or None,
+        pod_name=str(payload.get("pod_name") or "").strip() or inferred_pod_name,
         pod_ip=str(payload.get("pod_ip") or "").strip() or None,
         healthy=bool(payload.get("healthy", True)),
         max_concurrent_jobs=int(payload.get("max_concurrent_jobs") or cfg.default_worker_max_concurrent_jobs),
