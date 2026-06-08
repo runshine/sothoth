@@ -5208,6 +5208,7 @@ class TaskManager:
             for result in downstream_cleanup_results
             if bool(result.get("blocking"))
         ]
+        self._clear_task_failure_state(task)
         self._clear_stage_outputs_from(task, target_stage, mark_stale=False)
         deleted_archive_job_count = self._delete_archive_children_for_stages(db, task, affected_stages)
         deleted_stage_item_count = self._delete_stage_items_for_stages(db, task.id, affected_stages)
@@ -24414,6 +24415,10 @@ class TaskManager:
         task.summary = summary
         task.metrics = metrics
         task.stage_summary = stage_summary
+
+    def _clear_task_failure_state(self, task: BinarySecurityTask) -> None:
+        task.summary = self._clear_failure_fields_from_summary(task.summary or {})
+        task.last_error = None
 
     def _base_task_summary(
         self,

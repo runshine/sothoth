@@ -12129,6 +12129,90 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("stage_retry_full_cleanup_started", [row.event_type for row in db.events])
             self.assertIn("stage_retry_full_cleanup_finished", [row.event_type for row in db.events])
 
+    def test_operation_execute_retry_stage_full_cleanup_clears_file_backed_failure_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            workspace.mkdir(parents=True, exist_ok=True)
+            task_summary_path = workspace / "task-summary.json"
+            task_summary_path.write_text(
+                json.dumps(
+                    {
+                        "input_files": [{"filename": "fw.bin", "size": 12}],
+                        "failure_code": "no_candidate_modules",
+                        "failure_category": "business",
+                        "failure_message": "系统分析已完成，但未发现匹配所选风险等级的风险模块",
+                        "error": "系统分析已完成，但未发现匹配所选风险等级的风险模块",
+                        "firmware_unpack_results": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="running",
+                task_type=TASK_TYPE_BINARY,
+                current_stage="firmware_unpack",
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+                last_error="系统分析已完成，但未发现匹配所选风险等级的风险模块",
+            )
+            operation = BinarySecurityTaskOperation(
+                id="op1",
+                task_id="task1",
+                project_id="p1",
+                operation_type="retry_stage_full",
+                target_stage="firmware_unpack",
+                status="running",
+            )
+            operation.result_payload = {
+                "cleanup_plan": {
+                    "target_stage": "firmware_unpack",
+                    "affected_stages": ["firmware_unpack", "system_analysis", "binary_to_source", "entry_analysis", "dataflow_vuln_scan"],
+                    "downstream_refs": [],
+                }
+            }
+            stage_runs = [
+                BinarySecurityStageRun(id="sr-fw", task_id="task1", project_id="p1", stage_name="firmware_unpack", sequence_no=1, status="running"),
+                BinarySecurityStageRun(id="sr-sa", task_id="task1", project_id="p1", stage_name="system_analysis", sequence_no=2, status="pending"),
+            ]
+            db = _AppendingModelAwareDb(
+                tasks=[task],
+                operations=[operation],
+                stage_runs=stage_runs,
+                stage_items=[],
+                archive_jobs=[],
+                state_events=[],
+                events=[],
+            )
+
+            async def _noop_cleanup(*args, **kwargs):
+                del args, kwargs
+                return None
+
+            original_cleanup = self.manager._cleanup_downstream_refs
+            try:
+                self.manager._cleanup_downstream_refs = _noop_cleanup
+                cleanup_summary = asyncio.run(self.manager._operation_execute_retry_stage_full_cleanup(db, task, operation))
+            finally:
+                self.manager._cleanup_downstream_refs = original_cleanup
+
+            self.assertEqual("firmware_unpack", cleanup_summary["target_stage"])
+            self.assertIsNone(task.last_error)
+            self.assertNotIn("failure_code", task.summary)
+            self.assertNotIn("failure_category", task.summary)
+            self.assertNotIn("failure_message", task.summary)
+            self.assertNotIn("error", task.summary)
+            persisted = json.loads(task_summary_path.read_text(encoding="utf-8"))
+            self.assertNotIn("failure_code", persisted)
+            self.assertNotIn("failure_category", persisted)
+            self.assertNotIn("failure_message", persisted)
+            self.assertNotIn("error", persisted)
+
     def test_run_task_operation_steps_retry_stage_full_executes_cleanup_before_requeue(self):
         task = BinarySecurityTask(
             id="task1",
