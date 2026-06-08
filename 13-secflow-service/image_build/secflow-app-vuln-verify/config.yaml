@@ -35,7 +35,7 @@ worker:
   max_local_running_tasks: 1
   default_concurrency: 4
   max_concurrency: 16
-  default_model: "icsl_vllm_2/MiniMax/MiniMax-M2.5"
+  default_model: "local_minimax/MiniMax/MiniMax-M2.5"
   task_timeout_seconds: 0
 
 registry:

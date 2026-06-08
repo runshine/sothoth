@@ -62,7 +62,7 @@ class WorkerConfig(BaseModel):
     max_local_running_tasks: int = 1
     default_concurrency: int = 4
     max_concurrency: int = 16
-    default_model: str | None = "icsl_vllm_2/MiniMax/MiniMax-M2.5"
+    default_model: str | None = "local_minimax/MiniMax/MiniMax-M2.5"
     task_timeout_seconds: int = 0
 
 
