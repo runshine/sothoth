@@ -3562,6 +3562,110 @@ class TaskManager:
         ]
         return self._dedupe_downstream_refs(direct_refs + orphan_refs), orphan_refs
 
+    def _parent_linked_downstream_candidates(self) -> list[tuple[str, str, str, str, str | None]]:
+        return [
+            ("firmware_unpacker", "secflow_app_firmware_unpacker_unpack_tasks", "id", "parent_task_id", "parent_stage_name"),
+            ("binary_to_source", "secflow_b2s_task", "id", "parent_task_id", "parent_stage_name"),
+            ("system_analyse", "secflow_app_sa_tasks", "task_id", "parent_task_id", "parent_stage_name"),
+            ("entry_analyse", "secflow_app_ea_tasks", "task_id", "parent_task_id", "parent_stage_name"),
+            ("dataflow_vuln_scan", "secflow_dataflow_vuln_scan_run_index", "id", "linked_task_id", None),
+        ]
+
+    def _discover_parent_linked_downstream_refs_detailed(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        refs: list[dict[str, Any]] = []
+        scan_errors: list[dict[str, Any]] = []
+        for service, table_name, task_id_column, parent_column, stage_column in self._parent_linked_downstream_candidates():
+            try:
+                column_rows = db.execute(
+                    text(
+                        """
+                        SELECT column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = DATABASE()
+                          AND table_name = :table_name
+                          AND (
+                            column_name = :task_id_column
+                            OR column_name = :parent_column
+                            OR column_name = :stage_column
+                          )
+                        """
+                    ),
+                    {
+                        "table_name": table_name,
+                        "task_id_column": task_id_column,
+                        "parent_column": parent_column,
+                        "stage_column": stage_column or "",
+                    },
+                ).fetchall()
+                available_columns = {str(row[0]) for row in column_rows}
+                if task_id_column not in available_columns or parent_column not in available_columns:
+                    error = {
+                        "service": service,
+                        "table_name": table_name,
+                        "reason": "required_columns_missing",
+                        "task_id_column": task_id_column,
+                        "parent_column": parent_column,
+                    }
+                    scan_errors.append(error)
+                    logger.warning(
+                        "parent-linked downstream scan unavailable: service=%s table=%s task_id=%s reason=%s",
+                        service,
+                        table_name,
+                        task.id,
+                        error["reason"],
+                    )
+                    continue
+                select_stage = f"`{stage_column}`" if stage_column and stage_column in available_columns else "NULL"
+                rows = db.execute(
+                    text(
+                        f"""
+                        SELECT `{task_id_column}` AS task_id, {select_stage} AS stage_name
+                        FROM `{table_name}`
+                        WHERE `{parent_column}` = :parent_task_id
+                        """
+                    ),
+                    {"parent_task_id": task.id},
+                ).fetchall()
+            except Exception as exc:
+                error = {
+                    "service": service,
+                    "table_name": table_name,
+                    "reason": "scan_failed",
+                    "error": str(exc),
+                }
+                scan_errors.append(error)
+                logger.warning(
+                    "failed to discover parent-linked downstream refs: service=%s table=%s task_id=%s error=%s",
+                    service,
+                    table_name,
+                    task.id,
+                    exc,
+                )
+                continue
+            for row in rows:
+                downstream_task_id = str(row[0] or "").strip()
+                if not downstream_task_id:
+                    continue
+                parent_stage_name = str(row[1] or "").strip() or None
+                inferred_stage_name = SERVICE_STAGE_NAMES.get(service)
+                refs.append(
+                    {
+                        "service": service,
+                        "task_id": downstream_task_id,
+                        "project_id": task.project_id,
+                        "stage_name": parent_stage_name or inferred_stage_name,
+                        "parent_stage_name": parent_stage_name,
+                        "stage_name_inferred": not bool(parent_stage_name) and bool(inferred_stage_name),
+                        "inferred_stage_name": inferred_stage_name if not parent_stage_name else None,
+                        "collect_source": "parent_linked_scan",
+                    }
+                )
+        return refs, scan_errors
+
     def _build_orchestration_observability(self, db: Session, task: BinarySecurityTask) -> dict[str, Any]:
         now_value = _now()
         events = (
@@ -4729,6 +4833,8 @@ class TaskManager:
             item_ids = [item.id for item in items if str(item.id or "").strip()]
             if not item_ids:
                 continue
+            archive_jobs = self._archive_jobs_for_stage_items(db, task.id, stage_name, item_ids)
+            self._delete_archive_roots_for_jobs(task, archive_jobs)
             self._clear_archive_jobs_for_stage_items(db, task.id, stage_name, item_ids)
             self._delete_stage_items_by_ids(db, item_ids)
             self._delete_state_event_rows_for_stages(db, task.id, [stage_name])
@@ -4815,6 +4921,11 @@ class TaskManager:
         else:
             if all_downstream_refs:
                 await self._cleanup_downstream_refs(db, task, all_downstream_refs, self._service_token())
+            retry_item_ids = [item.id for item in retry_items if str(item.id or "").strip()]
+            if retry_item_ids:
+                target_archive_jobs = self._archive_jobs_for_stage_items(db, task.id, target_stage, retry_item_ids)
+                self._delete_archive_roots_for_jobs(task, target_archive_jobs)
+                self._clear_archive_jobs_for_stage_items(db, task.id, target_stage, retry_item_ids)
             if downstream_stages:
                 self._clear_stage_outputs_from(task, downstream_stages[0], mark_stale=False)
                 self._delete_archive_children_for_stages(db, task, downstream_stages)
@@ -6635,12 +6746,30 @@ class TaskManager:
             "previous_epoch": int(getattr(task, "execution_epoch", 0) or 0),
             "stage_sequence": stage_sequence,
             "downstream_refs": [],
+            "orphan_downstream_refs": [],
+            "deferred_downstream_refs": [],
+            "remaining_downstream_refs": [],
+            "service_scan_unavailable": [],
+            "cleanup_partial_failed": False,
             "cleanup_counts": {},
         }
         self._invalidate_task_execution(task)
-        refs, orphan_refs = self._retry_cleanup_refs(db, task, stage_sequence)
+        refs, orphan_refs, scan_errors = self._retry_cleanup_refs_for_hard_restart(db, task, stage_sequence)
         cleanup_snapshot["downstream_refs"] = refs
         cleanup_snapshot["orphan_downstream_refs"] = orphan_refs
+        cleanup_snapshot["service_scan_unavailable"] = scan_errors
+        self._record_event(
+            db,
+            task,
+            "task_retry_cleanup_collected",
+            "清空并从头开始已收集下游清理计划",
+            level="info",
+            payload={
+                "downstream_ref_count": len(refs),
+                "orphan_ref_count": len(orphan_refs),
+                "service_scan_unavailable_count": len(scan_errors),
+            },
+        )
         for ref in orphan_refs:
             self._record_event(
                 db,
@@ -6650,8 +6779,54 @@ class TaskManager:
                 level="warning",
                 payload=ref,
             )
+        for error in scan_errors:
+            self._record_event(
+                db,
+                task,
+                "task_retry_cleanup_scan_unavailable",
+                "下游服务扫描不可用，可能影响历史子任务清理完整性",
+                level="warning",
+                payload=error,
+            )
         if refs:
             await self._cleanup_downstream_refs(db, task, refs, self._service_token())
+        cleanup_results = [
+            dict(result)
+            for result in list(getattr(self, "_last_downstream_cleanup_results", []) or [])
+            if isinstance(result, dict)
+        ]
+        cleanup_snapshot["downstream_cleanup_results"] = cleanup_results
+        deferred_refs = [dict(result) for result in cleanup_results if bool(result.get("deferred"))]
+        remaining_refs = self._verify_remaining_parent_linked_downstream_refs(db, task, refs)
+        cleanup_snapshot["deferred_downstream_refs"] = deferred_refs
+        cleanup_snapshot["remaining_downstream_refs"] = remaining_refs
+        cleanup_snapshot["remaining_downstream_count"] = len(remaining_refs)
+        cleanup_snapshot["cleanup_partial_failed"] = bool(deferred_refs or remaining_refs)
+        if remaining_refs:
+            self._record_event(
+                db,
+                task,
+                "task_retry_cleanup_remaining_downstream_detected",
+                "清空并从头开始后仍检测到历史下游任务残留",
+                level="warning",
+                payload={
+                    "remaining_downstream_count": len(remaining_refs),
+                    "remaining_downstream_refs": remaining_refs,
+                },
+            )
+        if cleanup_snapshot["cleanup_partial_failed"]:
+            self._record_event(
+                db,
+                task,
+                "task_retry_cleanup_partial_failed",
+                "清空并从头开始存在未完全清理的下游任务，系统将暴露残留信息供排查",
+                level="warning",
+                payload={
+                    "deferred_ref_count": len(deferred_refs),
+                    "remaining_downstream_count": len(remaining_refs),
+                    "service_scan_unavailable_count": len(scan_errors),
+                },
+            )
         self._clear_stage_outputs_from(task, stage_sequence[0], mark_stale=False)
         cleanup_snapshot["cleanup_counts"]["archive_jobs_deleted"] = self._delete_archive_children_for_stages(db, task, stage_sequence)
         cleanup_snapshot["cleanup_counts"]["stage_items_deleted"] = self._delete_stage_items_for_stages(db, task.id, stage_sequence)
@@ -6664,6 +6839,7 @@ class TaskManager:
         task.cleanup_snapshot = cleanup_snapshot
         self._validate_hard_restart_cleanup(db, task)
         self._reset_task_for_hard_restart(task)
+        task.cleanup_snapshot = cleanup_snapshot
         return cleanup_snapshot
 
     def _expand_stage_name_aliases(self, stage_names: list[str] | tuple[str, ...]) -> list[str]:
@@ -7932,6 +8108,8 @@ class TaskManager:
         normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
         if not normalized:
             return 0
+        jobs = self._archive_jobs_for_stages(db, task.id, normalized)
+        self._delete_archive_roots_for_jobs(task, jobs)
         self._clear_stage_output_artifacts(task, normalized)
         if hasattr(db, "archive_jobs") and isinstance(getattr(db, "archive_jobs"), list):
             allowed_stage_names = set(normalized)
@@ -8179,6 +8357,7 @@ class TaskManager:
         supported, reason, jobs = self._archive_retry_support(db, task, target_stage, ignore_operation_lock=True)
         if not supported:
             raise ValidationError(reason or f"阶段 {target_stage} 暂无可重试的归档任务")
+        self._delete_archive_roots_for_jobs(task, jobs)
         self._requeue_archive_jobs(
             db,
             task,
@@ -8200,6 +8379,7 @@ class TaskManager:
         if not supported:
             raise ValidationError(reason or f"阶段 {target_stage} 暂无可完全重试的归档任务")
         if jobs:
+            self._delete_archive_roots_for_jobs(task, jobs)
             self._clear_archive_jobs_for_stages(db, task.id, [target_stage])
         rebuilt = self._rebuild_archive_jobs_for_stage(db, task, target_stage, stage_items)
         self._mark_task_waiting_for_archive_retry(db, task, target_stage)
@@ -24356,6 +24536,89 @@ class TaskManager:
                     if exc.errno != errno.ESTALE:
                         raise
 
+    def _delete_archive_root_path(self, task: BinarySecurityTask, archive_root: str | Path | None) -> bool:
+        raw = str(archive_root or "").strip()
+        if not raw:
+            return False
+        try:
+            target = Path(raw).resolve()
+            output_root = Path(str(task.output_root or "")).resolve()
+        except Exception:
+            return False
+        if not output_root or not str(output_root).strip():
+            return False
+        if target == output_root:
+            return False
+        if not _is_within_path(output_root, target):
+            return False
+        if not target.exists() and not target.is_symlink():
+            return False
+        try:
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                target.unlink(missing_ok=True)
+        except OSError as exc:
+            if exc.errno != errno.ESTALE:
+                raise
+        return True
+
+    def _delete_archive_roots_for_jobs(
+        self,
+        task: BinarySecurityTask,
+        jobs: list[BinarySecurityArchiveJob],
+    ) -> list[str]:
+        deleted: list[str] = []
+        seen: set[str] = set()
+        for job in jobs:
+            archive_root = str(getattr(job, "archive_root", "") or "").strip()
+            if not archive_root or archive_root in seen:
+                continue
+            if self._delete_archive_root_path(task, archive_root):
+                deleted.append(archive_root)
+                seen.add(archive_root)
+        return deleted
+
+    def _archive_jobs_for_stage_items(
+        self,
+        db: Session,
+        task_id: str,
+        stage_name: str,
+        item_ids: list[str],
+    ) -> list[BinarySecurityArchiveJob]:
+        normalized_item_ids = [str(item_id or "").strip() for item_id in item_ids if str(item_id or "").strip()]
+        if not normalized_item_ids:
+            return []
+        jobs = (
+            db.query(BinarySecurityArchiveJob)
+            .filter(
+                BinarySecurityArchiveJob.task_id == task_id,
+                BinarySecurityArchiveJob.stage_name == stage_name,
+                BinarySecurityArchiveJob.item_id.in_(normalized_item_ids),
+            )
+            .all()
+        )
+        return [job for job in jobs if job is not None]
+
+    def _archive_jobs_for_stages(
+        self,
+        db: Session,
+        task_id: str,
+        stage_names: list[str],
+    ) -> list[BinarySecurityArchiveJob]:
+        normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
+        if not normalized:
+            return []
+        jobs = (
+            db.query(BinarySecurityArchiveJob)
+            .filter(
+                BinarySecurityArchiveJob.task_id == task_id,
+                BinarySecurityArchiveJob.stage_name.in_(normalized),
+            )
+            .all()
+        )
+        return [job for job in jobs if job is not None]
+
     def _clear_single_stage_outputs(self, task: BinarySecurityTask, stage_name: str) -> None:
         summary = dict(task.summary or {})
         metrics = dict(task.metrics or {})
@@ -24543,73 +24806,54 @@ class TaskManager:
 
     def _discover_parent_linked_downstream_refs(self, db: Session, task: BinarySecurityTask) -> list[dict[str, str]]:
         """Find old child tasks that are no longer referenced by current stage items."""
-        candidates = [
-            ("firmware_unpacker", "secflow_app_firmware_unpacker_unpack_tasks", "id", "parent_task_id", "parent_stage_name"),
-            ("binary_to_source", "secflow_b2s_task", "id", "parent_task_id", "parent_stage_name"),
-            ("system_analyse", "secflow_app_sa_tasks", "task_id", "parent_task_id", "parent_stage_name"),
-            ("entry_analyse", "secflow_app_ea_tasks", "task_id", "parent_task_id", "parent_stage_name"),
-            ("dataflow_vuln_scan", "secflow_dataflow_vuln_scan_run_index", "id", "linked_task_id", None),
-        ]
-        refs: list[dict[str, str]] = []
-        for service, table_name, task_id_column, parent_column, stage_column in candidates:
-            try:
-                column_rows = db.execute(
-                    text(
-                        """
-                        SELECT column_name
-                        FROM information_schema.columns
-                        WHERE table_schema = DATABASE()
-                          AND table_name = :table_name
-                          AND (
-                            column_name = :task_id_column
-                            OR column_name = :parent_column
-                            OR column_name = :stage_column
-                          )
-                        """
-                    ),
-                    {
-                        "table_name": table_name,
-                        "task_id_column": task_id_column,
-                        "parent_column": parent_column,
-                        "stage_column": stage_column or "",
-                    },
-                ).fetchall()
-                available_columns = {str(row[0]) for row in column_rows}
-                if task_id_column not in available_columns or parent_column not in available_columns:
-                    continue
-                select_stage = f"`{stage_column}`" if stage_column and stage_column in available_columns else "NULL"
-                rows = db.execute(
-                    text(
-                        f"""
-                        SELECT `{task_id_column}` AS task_id, {select_stage} AS stage_name
-                        FROM `{table_name}`
-                        WHERE `{parent_column}` = :parent_task_id
-                        """
-                    ),
-                    {"parent_task_id": task.id},
-                ).fetchall()
-            except Exception:
-                logger.debug(
-                    "failed to discover parent-linked downstream refs: service=%s table=%s task_id=%s",
-                    service,
-                    table_name,
-                    task.id,
-                    exc_info=True,
-                )
-                continue
-            for row in rows:
-                downstream_task_id = str(row[0] or "").strip()
-                if not downstream_task_id:
-                    continue
-                refs.append(
-                    {
-                        "service": service,
-                        "task_id": downstream_task_id,
-                        "project_id": task.project_id,
-                        "stage_name": str(row[1] or "") or None,
-                    }
-                )
+        refs, _scan_errors = self._discover_parent_linked_downstream_refs_detailed(db, task)
         return refs
+
+    def _retry_cleanup_refs_for_hard_restart(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_names: list[str],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
+        direct_refs = self._downstream_refs_for_stages(db, task, normalized)
+        parent_linked_refs, scan_errors = self._discover_parent_linked_downstream_refs_detailed(db, task)
+        return self._dedupe_downstream_refs(direct_refs + parent_linked_refs), parent_linked_refs, scan_errors
+
+    def _verify_remaining_parent_linked_downstream_refs(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        attempted_refs: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        current_refs, _scan_errors = self._discover_parent_linked_downstream_refs_detailed(db, task)
+        attempted_keys = {
+            (str(ref.get("service") or "").strip(), str(ref.get("task_id") or "").strip())
+            for ref in attempted_refs
+            if str(ref.get("service") or "").strip() and str(ref.get("task_id") or "").strip()
+        }
+        last_results = [
+            dict(result)
+            for result in list(getattr(self, "_last_downstream_cleanup_results", []) or [])
+            if isinstance(result, dict)
+        ]
+        result_map = {
+            (str(result.get("service") or "").strip(), str(result.get("task_id") or "").strip()): result
+            for result in last_results
+            if str(result.get("service") or "").strip() and str(result.get("task_id") or "").strip()
+        }
+        remaining: list[dict[str, Any]] = []
+        for ref in current_refs:
+            key = (str(ref.get("service") or "").strip(), str(ref.get("task_id") or "").strip())
+            if key not in attempted_keys:
+                remaining.append({**ref, "deferred": True, "deferred_reason": "collect_missed"})
+                continue
+            cleanup_result = result_map.get(key) or {}
+            if bool(cleanup_result.get("deferred")):
+                remaining.append({**ref, **cleanup_result})
+                continue
+            remaining.append({**ref, **cleanup_result, "deferred": True, "deferred_reason": "verify_remaining"})
+        return remaining
 
     def _downstream_refs_for_stages(
         self,

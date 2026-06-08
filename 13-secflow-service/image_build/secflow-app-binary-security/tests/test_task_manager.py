@@ -8842,7 +8842,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([], db.events)
             self.assertEqual([], db.state_events)
             self.assertEqual({}, task.stage_summary)
-            self.assertEqual({}, task.cleanup_snapshot)
+            self.assertEqual(stage_sequence, task.cleanup_snapshot.get("stage_sequence"))
+            self.assertFalse(task.cleanup_snapshot.get("cleanup_partial_failed"))
             self.assertEqual([], task.summary.get("selected_modules") or [])
             self.assertEqual([], task.summary.get("entry_results") or [])
             self.assertTrue((workspace / "task-summary.json").exists())
@@ -9416,6 +9417,165 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("task1", calls[0]["task_id"])
             self.assertEqual(["sa-1", "sa-orphan", "dfa-other"], [ref["task_id"] for ref in calls[0]["refs"]])
 
+    def test_retry_task_full_restart_collects_parent_linked_ref_without_parent_stage_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="failed",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(Path(tmp) / "output"),
+                workspace_root=tmp,
+            )
+            db = _ModelAwareDb(tasks=[task], stage_items=[])
+            calls = []
+
+            async def fake_cleanup(db_arg, task_arg, refs_arg, token_arg):
+                calls.append({"db": db_arg, "task_id": task_arg.id, "refs": refs_arg, "token": token_arg})
+                setattr(
+                    self.manager,
+                    "_last_downstream_cleanup_results",
+                    [
+                        {
+                            "service": ref["service"],
+                            "task_id": ref["task_id"],
+                            "stage_name": ref.get("stage_name"),
+                            "deferred": False,
+                            "delete_status": "succeeded",
+                        }
+                        for ref in refs_arg
+                    ],
+                )
+
+            original_cleanup = self.manager._cleanup_downstream_refs
+            original_discover = self.manager._discover_parent_linked_downstream_refs_detailed
+            self.manager._cleanup_downstream_refs = fake_cleanup
+            self.manager._discover_parent_linked_downstream_refs_detailed = lambda _db, _task: (
+                [
+                    {
+                        "service": "firmware_unpacker",
+                        "task_id": "fw-orphan",
+                        "project_id": "p1",
+                        "stage_name": "firmware_unpack",
+                        "parent_stage_name": None,
+                        "stage_name_inferred": True,
+                        "inferred_stage_name": "firmware_unpack",
+                        "collect_source": "parent_linked_scan",
+                    }
+                ],
+                [],
+            )
+            try:
+                self.manager.retry_task(db, project_id="p1", task_id="task1")
+                self._finish_retry_prepare(db, task)
+            finally:
+                self.manager._cleanup_downstream_refs = original_cleanup
+                self.manager._discover_parent_linked_downstream_refs_detailed = original_discover
+
+            self.assertEqual(1, len(calls))
+            self.assertEqual(["fw-orphan"], [ref["task_id"] for ref in calls[0]["refs"]])
+            self.assertFalse(task.cleanup_snapshot.get("cleanup_partial_failed"))
+
+    def test_prepare_hard_restart_marks_remaining_parent_linked_ref_as_partial_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "input").mkdir(parents=True, exist_ok=True)
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="failed",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            task.summary = {
+                "input_files": [
+                    {"firmware_key": "fw1", "filename": "fw.bin", "size": 1},
+                ]
+            }
+            db = _AppendingModelAwareDb(tasks=[task], stage_items=[], stage_runs=[], archive_jobs=[], events=[], state_events=[])
+
+            async def fake_cleanup(*args, **kwargs):
+                del args, kwargs
+                setattr(self.manager, "_last_downstream_cleanup_results", [])
+                return None
+
+            original_cleanup = self.manager._cleanup_downstream_refs
+            original_discover = self.manager._discover_parent_linked_downstream_refs_detailed
+            self.manager._cleanup_downstream_refs = fake_cleanup
+            discover_calls = {"count": 0}
+
+            def fake_discover(_db, _task):
+                discover_calls["count"] += 1
+                ref = {
+                    "service": "firmware_unpacker",
+                    "task_id": "fw-leftover",
+                    "project_id": "p1",
+                    "stage_name": "firmware_unpack",
+                    "parent_stage_name": None,
+                    "stage_name_inferred": True,
+                    "inferred_stage_name": "firmware_unpack",
+                    "collect_source": "parent_linked_scan",
+                }
+                if discover_calls["count"] == 1:
+                    return ([ref], [])
+                return ([ref], [])
+
+            self.manager._discover_parent_linked_downstream_refs_detailed = fake_discover
+            try:
+                self.manager.retry_task(db, project_id="p1", task_id="task1")
+                self._finish_retry_prepare(db, task)
+            finally:
+                self.manager._cleanup_downstream_refs = original_cleanup
+                self.manager._discover_parent_linked_downstream_refs_detailed = original_discover
+
+            self.assertTrue(task.cleanup_snapshot.get("cleanup_partial_failed"))
+            self.assertEqual(1, task.cleanup_snapshot.get("remaining_downstream_count"))
+            self.assertEqual("fw-leftover", task.cleanup_snapshot.get("remaining_downstream_refs")[0]["task_id"])
+
+    def test_prepare_hard_restart_records_service_scan_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "input").mkdir(parents=True, exist_ok=True)
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="failed",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            task.summary = {"input_files": [{"firmware_key": "fw1", "filename": "fw.bin", "size": 1}]}
+            db = _AppendingModelAwareDb(tasks=[task], stage_items=[], stage_runs=[], archive_jobs=[], events=[], state_events=[])
+
+            original_cleanup = self.manager._cleanup_downstream_refs
+            original_discover = self.manager._discover_parent_linked_downstream_refs_detailed
+
+            async def fake_cleanup(*args, **kwargs):
+                del args, kwargs
+                setattr(self.manager, "_last_downstream_cleanup_results", [])
+                return None
+
+            self.manager._cleanup_downstream_refs = fake_cleanup
+            self.manager._discover_parent_linked_downstream_refs_detailed = lambda _db, _task: ([], [{"service": "firmware_unpacker", "reason": "required_columns_missing"}])
+            try:
+                self.manager.retry_task(db, project_id="p1", task_id="task1")
+                self._finish_retry_prepare(db, task)
+            finally:
+                self.manager._cleanup_downstream_refs = original_cleanup
+                self.manager._discover_parent_linked_downstream_refs_detailed = original_discover
+
+            self.assertEqual(1, len(task.cleanup_snapshot.get("service_scan_unavailable") or []))
+
     def test_cleanup_downstream_refs_waits_for_system_analyse_to_stop_before_delete(self):
         refs = [{"service": "system_analyse", "task_id": "sat-1", "project_id": "p1", "stage_name": "system_analysis"}]
         task = BinarySecurityTask(
@@ -9694,6 +9854,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             event_types = [getattr(event, "event_type", "") for event in db.added]
             self.assertEqual("retry_archive_failed_items", operation.operation_type)
             self.assertIn("archive_stage_retry_accepted", event_types)
+            (workspace / "entry-archive").mkdir(parents=True, exist_ok=True)
+            ((workspace / "entry-archive") / "stale.txt").write_text("stale\n", encoding="utf-8")
             asyncio.run(self.manager._prepare_archive_retry_failed_items(db, task, "entry_analysis"))
 
             self.assertEqual("pending", entry_job.archive_status)
@@ -9701,6 +9863,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("running", task.status)
             self.assertEqual("entry_analysis", task.current_stage)
             self.assertIsNone(task.finished_at)
+            self.assertFalse((workspace / "entry-archive").exists())
             event_types = [getattr(event, "event_type", "") for event in db.added]
             self.assertIn("archive_stage_retry_requested", event_types)
             self.assertIn("task_archive_retry_requeued", event_types)
@@ -10472,6 +10635,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 self.manager._cleanup_downstream_refs = fake_cleanup
                 self.manager._delete_stage_items_by_ids = fake_delete_items
                 self.manager._clear_archive_jobs_for_stage_items = fake_clear_archive
+                target_archive_root = Path(task.output_root) / "entry-analysis" / "entry-a__eata"
+                target_archive_root.mkdir(parents=True, exist_ok=True)
+                (target_archive_root / "stale.txt").write_text("stale\n", encoding="utf-8")
                 affected = asyncio.run(self.manager._prepare_retry_failed_items(db, task, "entry_analysis"))
             finally:
                 self.manager.sync_downstream_status = original_sync
@@ -10488,6 +10654,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(["entry-b"], [row.get("entry_key") for row in task.summary.get("vuln_results") or []])
             self.assertEqual([], [row.id for row in db.state_events if row.stage_name in {"dataflow_vuln_scan"}])
             self.assertEqual([], [row.id for row in db.events if row.stage_name in {"dataflow_vuln_scan"}])
+            self.assertFalse(target_archive_root.exists())
 
     def test_prepare_retry_failed_items_for_entry_analysis_syncs_without_applying_old_terminal_state(self):
         task = BinarySecurityTask(
@@ -11860,6 +12027,12 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             original_cleanup = self.manager._cleanup_downstream_refs
             try:
                 self.manager._cleanup_downstream_refs = _noop_cleanup
+                entry_root = Path(task.output_root) / "entry-analysis" / "entry-a__eat-a"
+                dataflow_root = Path(task.output_root) / "dataflow-vuln-scan" / "entry-a__df-a"
+                vuln_root = Path(task.output_root) / "dataflow-vuln-scan" / "entry-a__vuln-a"
+                for root in (entry_root, dataflow_root, vuln_root):
+                    root.mkdir(parents=True, exist_ok=True)
+                    (root / "stale.txt").write_text("stale\n", encoding="utf-8")
                 cleanup_summary = asyncio.run(self.manager._operation_execute_retry_stage_full_cleanup(db, task, operation))
             finally:
                 self.manager._cleanup_downstream_refs = original_cleanup
@@ -11875,6 +12048,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(3, cleanup_summary["deleted_archive_job_count"])
             self.assertEqual(3, cleanup_summary["deleted_state_event_count"])
             self.assertEqual(3, cleanup_summary["deleted_timeline_event_count"])
+            self.assertFalse(entry_root.exists())
+            self.assertFalse(dataflow_root.exists())
+            self.assertFalse(vuln_root.exists())
             self.assertEqual(
                 [],
                 [
