@@ -423,6 +423,9 @@ class BinarySecurityArchiveJobResponse(BaseModel):
     downstream_service: Optional[str] = None
     downstream_task_id: Optional[str] = None
     bound_output_path: Optional[str] = None
+    source_root: Optional[str] = None
+    source_root_path: Optional[str] = None
+    source_dir: Optional[str] = None
     archive_status: str
     archive_root: Optional[str] = None
     error_message: Optional[str] = None

@@ -16006,6 +16006,84 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("aj1", response.output_ref.get("archive_job_id"))
         self.assertEqual("success", response.output_ref.get("archive_status"))
 
+    def test_archive_job_responses_include_source_paths_from_stage_item(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            status="success",
+        )
+        item.input_ref = {
+            "source_root": "/repo/src",
+            "source_root_path": "/repo/src/root",
+            "source_dir": "/repo/src/dir",
+        }
+        archive_job = BinarySecurityArchiveJob(
+            id="aj1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            item_id="si1",
+            archive_status="success",
+            archive_root="/archive/dfa-1",
+        )
+
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[archive_job])
+
+        response = self.manager._archive_job_responses(db, task, [archive_job])
+
+        self.assertEqual(1, len(response))
+        self.assertEqual("/repo/src", response[0].source_root)
+        self.assertEqual("/repo/src/root", response[0].source_root_path)
+        self.assertEqual("/repo/src/dir", response[0].source_dir)
+
+    def test_archive_job_responses_fall_back_to_payload_source_paths(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw.bin",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        archive_job = BinarySecurityArchiveJob(
+            id="aj1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_id="si1",
+            archive_status="success",
+            archive_root="/archive/system",
+        )
+        archive_job.payload = {
+            "source_root": "/payload/root",
+            "source_root_path": "/payload/root/path",
+            "source_dir": "/payload/root/dir",
+        }
+
+        response = self.manager._archive_job_responses(_ModelAwareDb(tasks=[task], archive_jobs=[archive_job]), task, [archive_job])
+
+        self.assertEqual("/payload/root", response[0].source_root)
+        self.assertEqual("/payload/root/path", response[0].source_root_path)
+        self.assertEqual("/payload/root/dir", response[0].source_dir)
+
     def test_get_task_stage_items_page_includes_archive_refs_from_jobs(self):
         task = BinarySecurityTask(
             id="t1",

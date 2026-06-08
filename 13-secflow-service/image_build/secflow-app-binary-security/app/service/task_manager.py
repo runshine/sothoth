@@ -3189,8 +3189,10 @@ class TaskManager:
         archive_jobs: list[BinarySecurityArchiveJob],
     ) -> list[BinarySecurityArchiveJobResponse]:
         archive_job_responses: list[BinarySecurityArchiveJobResponse] = []
+        stage_item_by_id = self._archive_job_stage_item_map(db, task, archive_jobs)
         for job in archive_jobs:
             retry_supported, retry_reason = self._archive_job_retry_support(db, task, job)
+            source_refs = self._archive_job_source_refs(job, stage_item_by_id.get(job.item_id))
             archive_job_responses.append(
                 BinarySecurityArchiveJobResponse(
                     id=job.id,
@@ -3200,6 +3202,9 @@ class TaskManager:
                     downstream_service=job.downstream_service,
                     downstream_task_id=job.downstream_task_id,
                     bound_output_path=self._string_or_none(dict(job.payload or {}).get("bound_output_path")),
+                    source_root=source_refs["source_root"],
+                    source_root_path=source_refs["source_root_path"],
+                    source_dir=source_refs["source_dir"],
                     archive_status=job.archive_status,
                     archive_root=job.archive_root,
                     error_message=job.error_message,
@@ -3217,6 +3222,58 @@ class TaskManager:
                 )
             )
         return archive_job_responses
+
+    def _archive_job_stage_item_map(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        archive_jobs: list[BinarySecurityArchiveJob],
+    ) -> dict[str, BinarySecurityStageItem]:
+        item_ids = [str(job.item_id or "").strip() for job in archive_jobs if str(job.item_id or "").strip()]
+        if not item_ids:
+            return {}
+        rows = (
+            db.query(BinarySecurityStageItem)
+            .filter(
+                BinarySecurityStageItem.task_id == task.id,
+                BinarySecurityStageItem.id.in_(item_ids),
+            )
+            .all()
+        )
+        return {str(row.id): row for row in rows}
+
+    def _archive_job_source_refs(
+        self,
+        job: BinarySecurityArchiveJob,
+        stage_item: BinarySecurityStageItem | None,
+    ) -> dict[str, str | None]:
+        payload = dict(job.payload or {})
+        item_input = dict(getattr(stage_item, "input_ref", {}) or {})
+        item_output = dict(getattr(stage_item, "output_ref", {}) or {})
+        item_result = dict(getattr(stage_item, "result", {}) or {})
+        source_root_path = self._string_or_none(
+            payload.get("source_root_path")
+            or item_output.get("source_root_path")
+            or item_result.get("source_root_path")
+            or item_input.get("source_root_path")
+        )
+        source_root = self._string_or_none(
+            payload.get("source_root")
+            or item_output.get("source_root")
+            or item_result.get("source_root")
+            or item_input.get("source_root")
+        )
+        source_dir = self._string_or_none(
+            payload.get("source_dir")
+            or item_output.get("source_dir")
+            or item_result.get("source_dir")
+            or item_input.get("source_dir")
+        )
+        return {
+            "source_root": source_root,
+            "source_root_path": source_root_path,
+            "source_dir": source_dir,
+        }
 
     def _current_downstream_task_id(self, item: BinarySecurityStageItem | None) -> str:
         return str(getattr(item, "downstream_task_id", "") or "").strip()
