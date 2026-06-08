@@ -74,6 +74,9 @@ from app.observability import (
     observe_heartbeat_update,
     observe_queue_depths,
     observe_running_requeue,
+    observe_runtime_lease_claim,
+    observe_runtime_lease_conflict,
+    observe_runtime_lease_takeover,
     observe_runtime_lease_owner_mismatch,
     observe_scheduler_loop,
     observe_slot_usage,
@@ -958,6 +961,14 @@ class OrchestrationSupervisorState:
     last_result: str | None = None
 
 
+@dataclass
+class RuntimeLeaseClaimResult:
+    lease: BinarySecurityTaskRuntimeLease | None
+    result: str
+    conflict_owner_instance_id: str | None = None
+    conflict_lease_expires_at: datetime | None = None
+
+
 class TaskManager:
     def __init__(self) -> None:
         # Isolate per-manager runtime config so local mutations do not leak
@@ -1622,33 +1633,221 @@ class TaskManager:
         now_value: datetime,
         owner_instance_id: str | None = None,
     ) -> BinarySecurityTaskRuntimeLease:
+        claim = self._claim_or_refresh_runtime_lease(
+            db,
+            task,
+            now_value=now_value,
+            owner_instance_id=owner_instance_id,
+        )
+        if claim.result == "conflict_active_owner":
+            phase = self._task_runtime_phase(task)
+            raise StaleTaskExecution(f"任务 {task.id} 当前 {phase or 'unknown'} runtime lease owner 已变更")
+        return claim.lease
+
+    def _claim_or_refresh_runtime_lease(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        now_value: datetime,
+        owner_instance_id: str | None = None,
+    ) -> RuntimeLeaseClaimResult:
         phase = self._task_runtime_phase(task)
         requested_owner = str(owner_instance_id or self.instance_id or "").strip() or self.instance_id
         if not self._can_own_runtime_phase(phase):
             lease = self._runtime_lease_for_task(db, task.id)
             if lease is None:
                 raise StaleTaskExecution(f"任务 {task.id} 当前实例无权持有 {phase or 'unknown'} runtime lease")
-            return lease
-        lease = self._runtime_lease_for_task(db, task.id)
-        if lease is None:
-            lease = BinarySecurityTaskRuntimeLease(
-                task_id=task.id,
-                execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
-                owner_instance_id=requested_owner,
-                heartbeat_at=now_value,
-                lease_expires_at=self._next_runtime_lease_expiry(now_value=now_value),
+            return RuntimeLeaseClaimResult(lease=lease, result="not_owner_phase")
+        if hasattr(db, "connection"):
+            claim = self._claim_runtime_lease_atomic(
+                db,
+                task=task,
+                requested_owner=requested_owner,
+                now_value=now_value,
             )
-            db.add(lease)
-        else:
-            current_owner = str(lease.owner_instance_id or "").strip() or None
-            lease_active = self._runtime_lease_is_active(lease)
-            if lease_active and current_owner and current_owner != requested_owner:
-                raise StaleTaskExecution(f"任务 {task.id} 当前 {phase or 'unknown'} runtime lease owner 已变更")
-            lease.execution_epoch = int(getattr(task, "execution_epoch", 0) or 0)
-            lease.owner_instance_id = requested_owner
-            lease.heartbeat_at = now_value
-            lease.lease_expires_at = self._next_runtime_lease_expiry(now_value=now_value)
-        return lease
+            if claim is not None:
+                return claim
+        return self._claim_runtime_lease_with_fallback(
+            db,
+            task=task,
+            requested_owner=requested_owner,
+            now_value=now_value,
+        )
+
+    def _claim_runtime_lease_atomic(
+        self,
+        db: Session,
+        *,
+        task: BinarySecurityTask,
+        requested_owner: str,
+        now_value: datetime,
+    ) -> RuntimeLeaseClaimResult | None:
+        connection_getter = getattr(db, "connection", None)
+        if not callable(connection_getter):
+            return None
+        connection = connection_getter()
+        dialect_name = str(getattr(getattr(connection, "dialect", None), "name", "") or "").lower()
+        if "mysql" not in dialect_name:
+            return None
+        table_name = BinarySecurityTaskRuntimeLease.__tablename__
+        execution_epoch = int(getattr(task, "execution_epoch", 0) or 0)
+        lease_expires_at = self._next_runtime_lease_expiry(now_value=now_value)
+        previous = self._runtime_lease_for_task(db, task.id)
+        connection.execute(
+            text(
+                f"""
+                INSERT INTO {table_name}
+                    (task_id, execution_epoch, owner_instance_id, lease_expires_at, heartbeat_at, created_at, updated_at)
+                VALUES
+                    (:task_id, :execution_epoch, :owner_instance_id, :lease_expires_at, :heartbeat_at, :created_at, :updated_at)
+                ON DUPLICATE KEY UPDATE
+                    execution_epoch = CASE
+                        WHEN owner_instance_id = VALUES(owner_instance_id)
+                          OR lease_expires_at < :now_value
+                          OR execution_epoch <> VALUES(execution_epoch)
+                        THEN VALUES(execution_epoch)
+                        ELSE execution_epoch
+                    END,
+                    owner_instance_id = CASE
+                        WHEN owner_instance_id = VALUES(owner_instance_id)
+                          OR lease_expires_at < :now_value
+                          OR execution_epoch <> VALUES(execution_epoch)
+                        THEN VALUES(owner_instance_id)
+                        ELSE owner_instance_id
+                    END,
+                    lease_expires_at = CASE
+                        WHEN owner_instance_id = VALUES(owner_instance_id)
+                          OR lease_expires_at < :now_value
+                          OR execution_epoch <> VALUES(execution_epoch)
+                        THEN VALUES(lease_expires_at)
+                        ELSE lease_expires_at
+                    END,
+                    heartbeat_at = CASE
+                        WHEN owner_instance_id = VALUES(owner_instance_id)
+                          OR lease_expires_at < :now_value
+                          OR execution_epoch <> VALUES(execution_epoch)
+                        THEN VALUES(heartbeat_at)
+                        ELSE heartbeat_at
+                    END,
+                    updated_at = CASE
+                        WHEN owner_instance_id = VALUES(owner_instance_id)
+                          OR lease_expires_at < :now_value
+                          OR execution_epoch <> VALUES(execution_epoch)
+                        THEN VALUES(updated_at)
+                        ELSE updated_at
+                    END
+                """
+            ),
+            {
+                "task_id": task.id,
+                "execution_epoch": execution_epoch,
+                "owner_instance_id": requested_owner,
+                "lease_expires_at": lease_expires_at,
+                "heartbeat_at": now_value,
+                "created_at": now_value,
+                "updated_at": now_value,
+                "now_value": now_value,
+            },
+        )
+        db.flush()
+        current = self._runtime_lease_for_task(db, task.id)
+        if current is None:
+            return RuntimeLeaseClaimResult(lease=None, result="missing_after_claim")
+        current_owner = str(current.owner_instance_id or "").strip() or None
+        if current_owner != requested_owner:
+            observe_runtime_lease_claim("conflict_active_owner")
+            observe_runtime_lease_conflict(phase=self._task_runtime_phase(task))
+            return RuntimeLeaseClaimResult(
+                lease=current,
+                result="conflict_active_owner",
+                conflict_owner_instance_id=current_owner,
+                conflict_lease_expires_at=current.lease_expires_at,
+            )
+        if previous is None:
+            observe_runtime_lease_claim("claimed")
+            return RuntimeLeaseClaimResult(lease=current, result="claimed")
+        previous_owner = str(previous.owner_instance_id or "").strip() or None
+        previous_epoch = int(getattr(previous, "execution_epoch", 0) or 0)
+        previous_active = self._runtime_lease_is_active(previous)
+        if previous_owner == requested_owner and previous_epoch == execution_epoch:
+            observe_runtime_lease_claim("refreshed")
+            return RuntimeLeaseClaimResult(lease=current, result="refreshed")
+        if previous_epoch != execution_epoch:
+            observe_runtime_lease_claim("stolen_epoch_changed")
+            observe_runtime_lease_takeover(reason="epoch_changed")
+            return RuntimeLeaseClaimResult(lease=current, result="stolen_epoch_changed")
+        if previous_active and previous_owner and previous_owner != requested_owner:
+            observe_runtime_lease_claim("stolen_expired")
+            observe_runtime_lease_takeover(reason="expired_owner")
+            return RuntimeLeaseClaimResult(lease=current, result="stolen_expired")
+        observe_runtime_lease_claim("refreshed")
+        return RuntimeLeaseClaimResult(lease=current, result="refreshed")
+
+    def _claim_runtime_lease_with_fallback(
+        self,
+        db: Session,
+        *,
+        task: BinarySecurityTask,
+        requested_owner: str,
+        now_value: datetime,
+    ) -> RuntimeLeaseClaimResult:
+        execution_epoch = int(getattr(task, "execution_epoch", 0) or 0)
+        max_attempts = self._retryable_write_attempts()
+        for attempt in range(max_attempts):
+            previous = self._runtime_lease_for_task(db, task.id)
+            try:
+                if previous is None:
+                    lease = BinarySecurityTaskRuntimeLease(
+                        task_id=task.id,
+                        execution_epoch=execution_epoch,
+                        owner_instance_id=requested_owner,
+                        heartbeat_at=now_value,
+                        lease_expires_at=self._next_runtime_lease_expiry(now_value=now_value),
+                    )
+                    with self._savepoint(db):
+                        db.add(lease)
+                        db.flush()
+                    observe_runtime_lease_claim("claimed")
+                    return RuntimeLeaseClaimResult(lease=lease, result="claimed")
+                current_owner = str(previous.owner_instance_id or "").strip() or None
+                lease_active = self._runtime_lease_is_active(previous)
+                previous_epoch = int(getattr(previous, "execution_epoch", 0) or 0)
+                if lease_active and current_owner and current_owner != requested_owner and previous_epoch == execution_epoch:
+                    observe_runtime_lease_claim("conflict_active_owner")
+                    observe_runtime_lease_conflict(phase=self._task_runtime_phase(task))
+                    return RuntimeLeaseClaimResult(
+                        lease=previous,
+                        result="conflict_active_owner",
+                        conflict_owner_instance_id=current_owner,
+                        conflict_lease_expires_at=previous.lease_expires_at,
+                    )
+                previous.execution_epoch = execution_epoch
+                previous.owner_instance_id = requested_owner
+                previous.heartbeat_at = now_value
+                previous.lease_expires_at = self._next_runtime_lease_expiry(now_value=now_value)
+                db.flush()
+                if current_owner == requested_owner and previous_epoch == execution_epoch:
+                    observe_runtime_lease_claim("refreshed")
+                    return RuntimeLeaseClaimResult(lease=previous, result="refreshed")
+                takeover_reason = "epoch_changed" if previous_epoch != execution_epoch else "expired_owner"
+                observe_runtime_lease_claim("stolen_expired" if takeover_reason == "expired_owner" else "stolen_epoch_changed")
+                observe_runtime_lease_takeover(reason=takeover_reason)
+                return RuntimeLeaseClaimResult(
+                    lease=previous,
+                    result="stolen_expired" if takeover_reason == "expired_owner" else "stolen_epoch_changed",
+                )
+            except IntegrityError:
+                db.rollback()
+                if attempt >= max_attempts - 1:
+                    raise
+            except OperationalError as exc:
+                db.rollback()
+                if not self._is_retryable_lock_error(exc) or attempt >= max_attempts - 1:
+                    raise
+                self._sleep_after_retryable_lock_error(attempt + 1)
+        lease = self._runtime_lease_for_task(db, task.id)
+        return RuntimeLeaseClaimResult(lease=lease, result="exhausted")
 
     def _maybe_upsert_runtime_lease(
         self,
@@ -1662,12 +1861,15 @@ class TaskManager:
         if not self._can_own_runtime_phase(phase):
             return self._runtime_lease_for_task(db, task.id)
         try:
-            return self._upsert_runtime_lease(
+            claim = self._claim_or_refresh_runtime_lease(
                 db,
                 task,
                 now_value=now_value or _now(),
                 owner_instance_id=owner_instance_id,
             )
+            if claim.result == "conflict_active_owner":
+                return claim.lease
+            return claim.lease
         except StaleTaskExecution:
             return self._runtime_lease_for_task(db, task.id)
 

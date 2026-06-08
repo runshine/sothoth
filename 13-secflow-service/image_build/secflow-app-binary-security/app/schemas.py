@@ -168,6 +168,8 @@ class BinarySecurityTaskResponse(BaseModel):
     task_lease_source: Optional[str] = None
     reconcile_owner_instance_id: Optional[str] = None
     reconcile_lease_expires_at: Optional[datetime] = None
+    reconcile_block_reason: Optional[str] = None
+    reconcile_block_item_count: int = 0
     runtime_override_version: int = 0
     runtime_override_updated_at: Optional[datetime] = None
     runtime_override_updated_by: Optional[str] = None
@@ -373,7 +375,9 @@ class BinarySecurityStageItemResponse(BaseModel):
     downstream_service: Optional[str] = None
     downstream_task_id: Optional[str] = None
     downstream_status: Optional[str] = None
+    child_actual_status: Optional[str] = None
     downstream_binding_state: Optional[str] = None
+    child_binding_state: Optional[str] = None
     downstream_create_attempts: int = 0
     downstream_create_last_attempt_at: Optional[datetime] = None
     downstream_create_next_retry_at: Optional[datetime] = None
@@ -389,6 +393,8 @@ class BinarySecurityStageItemResponse(BaseModel):
     error_message: Optional[str] = None
     abnormal_reason: Optional[BinarySecurityAbnormalReason] = None
     sync_status: Optional[str] = None
+    child_sync_result: Optional[str] = None
+    child_sync_retry_state: Optional[str] = None
     last_synced_at: Optional[datetime] = None
     last_sync_attempt_at: Optional[datetime] = None
     last_sync_success_at: Optional[datetime] = None
@@ -399,6 +405,7 @@ class BinarySecurityStageItemResponse(BaseModel):
     downstream_raw_status: Optional[str] = None
     downstream_mapped_status: Optional[str] = None
     downstream_state_applied: Optional[bool] = None
+    child_state_applied: Optional[bool] = None
     sync_observation_error_message: Optional[str] = None
     sync_observation_error_type: Optional[str] = None
     sync_observation_http_status: Optional[int] = None

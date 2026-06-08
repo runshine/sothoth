@@ -218,6 +218,21 @@ RUNTIME_LEASE_OWNER_MISMATCH_TOTAL = Counter(
     "Total runtime lease owner mismatch or stale-owner recoveries.",
     labelnames=("reason",),
 )
+RUNTIME_LEASE_CLAIM_TOTAL = Counter(
+    "secflow_binary_security_runtime_lease_claim_total",
+    "Total runtime lease claim or refresh attempts by result.",
+    labelnames=("result",),
+)
+RUNTIME_LEASE_CONFLICT_TOTAL = Counter(
+    "secflow_binary_security_runtime_lease_conflict_total",
+    "Total runtime lease conflicts with another active owner.",
+    labelnames=("phase",),
+)
+RUNTIME_LEASE_TAKEOVER_TOTAL = Counter(
+    "secflow_binary_security_runtime_lease_takeover_total",
+    "Total runtime lease takeovers from expired or superseded owners.",
+    labelnames=("reason",),
+)
 STREAMING_PARENT_RECOVERED_TOTAL = Counter(
     "secflow_binary_security_streaming_parent_recovered_total",
     "Total streaming-tail parent state recoveries.",
@@ -642,6 +657,18 @@ def observe_running_requeue(reason: str) -> None:
 
 def observe_runtime_lease_owner_mismatch(reason: str) -> None:
     RUNTIME_LEASE_OWNER_MISMATCH_TOTAL.labels(reason=str(reason or "unknown")).inc()
+
+
+def observe_runtime_lease_claim(result: str) -> None:
+    RUNTIME_LEASE_CLAIM_TOTAL.labels(result=str(result or "unknown")).inc()
+
+
+def observe_runtime_lease_conflict(*, phase: str) -> None:
+    RUNTIME_LEASE_CONFLICT_TOTAL.labels(phase=str(phase or "unknown")).inc()
+
+
+def observe_runtime_lease_takeover(*, reason: str) -> None:
+    RUNTIME_LEASE_TAKEOVER_TOTAL.labels(reason=str(reason or "unknown")).inc()
 
 
 def observe_streaming_parent_recovered(*, stage: str, from_status: str) -> None:
