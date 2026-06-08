@@ -3189,33 +3189,54 @@ def _is_legacy_re_work_dir(path: str | Path | None) -> bool:
     return name.startswith(".re_work_")
 
 
+def is_b2s_runtime_temp_dir(path: str | Path | None) -> bool:
+    if not path:
+        return False
+    try:
+        candidate = Path(str(path))
+    except Exception:
+        return False
+    name = candidate.name.lower()
+    return name == "run" or name.startswith(".re_work_")
+
+
+def is_b2s_runtime_temp_path(path: str | Path | None) -> bool:
+    if not path:
+        return False
+    try:
+        parts = [part.lower() for part in Path(str(path)).parts]
+    except Exception:
+        return False
+    return any(part == "run" or part.startswith(".re_work_") for part in parts)
+
+
 def remove_ida_intermediate_outputs(output_dir: str | Path | None) -> list[str]:
     root = Path(str(output_dir or "")).expanduser()
     if not root.exists():
         return []
     removed: list[str] = []
+    temp_dirs: list[Path] = []
+    intermediate_files: list[Path] = []
     for path in sorted(root.rglob("*")):
-        try:
-            relative_parts = [part.lower() for part in path.relative_to(root).parts]
-        except Exception:
-            relative_parts = [part.lower() for part in path.parts]
-        if "run" in relative_parts or any(part.startswith(".re_work_") for part in relative_parts):
-            continue
         if path.is_dir():
-            if not _is_legacy_re_work_dir(path):
-                continue
-            try:
-                shutil.rmtree(path)
-                removed.append(str(path))
-            except FileNotFoundError:
-                continue
+            if is_b2s_runtime_temp_dir(path):
+                temp_dirs.append(path)
             continue
-        if path.is_file() and _is_ida_intermediate_path(path):
-            try:
-                path.unlink()
-                removed.append(str(path))
-            except FileNotFoundError:
-                continue
+        if path.is_file() and _is_ida_intermediate_path(path) and not is_b2s_runtime_temp_path(path.relative_to(root)):
+            intermediate_files.append(path)
+    # Delete deeper temp dirs first so nested artifacts are removed in one pass.
+    for path in sorted({path.resolve() for path in temp_dirs}, key=lambda current: (len(current.parts), str(current)), reverse=True):
+        try:
+            shutil.rmtree(path)
+            removed.append(str(path))
+        except FileNotFoundError:
+            continue
+    for path in intermediate_files:
+        try:
+            path.unlink()
+            removed.append(str(path))
+        except FileNotFoundError:
+            continue
     return removed
 
 

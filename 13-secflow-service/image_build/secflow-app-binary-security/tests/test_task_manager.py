@@ -16473,6 +16473,59 @@ def _test_archive_downstream_output_copies_output_contents_without_output_layer(
         self.assertEqual("system-analyse", target.target_dir.parent.name)
         self.assertEqual("fw1__down1", target.target_dir.name)
 
+def _test_archive_downstream_output_filters_b2s_runtime_temp_dirs(self):
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        workspace = root / "workspace"
+        output_dir = workspace / "output"
+        output_dir.mkdir(parents=True)
+        (output_dir / "libipsec.c").write_text("int main(void){return 0;}\n", encoding="utf-8")
+        (output_dir / "libipsec.h").write_text("#pragma once\n", encoding="utf-8")
+        artifacts_dir = output_dir / "artifacts"
+        artifacts_dir.mkdir(parents=True)
+        (artifacts_dir / "index.json").write_text("{}", encoding="utf-8")
+        legacy_dir = output_dir / ".re_work_libipsec"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "legacy.txt").write_text("legacy\n", encoding="utf-8")
+        run_dir = output_dir / "run" / "runs" / "run-1"
+        run_dir.mkdir(parents=True)
+        (run_dir / "trace.log").write_text("trace\n", encoding="utf-8")
+
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root=str(root / "task-output"),
+            workspace_root=str(root / "workspace-root"),
+        )
+        item = type("Item", (), {
+            "downstream_service": "binary_to_source",
+            "stage_name": "binary_to_source",
+            "downstream_task_id": "down1",
+            "item_key": "fw1",
+            "id": "si1",
+        })()
+
+        target = self.manager._archive_downstream_output(
+            _FakeDb(),
+            task,
+            item,
+            semantic_key="fw1",
+            payload={"workspace_root": str(workspace)},
+        )
+
+        self.assertEqual("archived", target.status)
+        assert target.target_dir is not None
+        self.assertTrue((target.target_dir / "libipsec.c").is_file())
+        self.assertTrue((target.target_dir / "libipsec.h").is_file())
+        self.assertTrue((target.target_dir / "artifacts" / "index.json").is_file())
+        self.assertFalse((target.target_dir / ".re_work_libipsec").exists())
+        self.assertFalse((target.target_dir / "run").exists())
+
 def _test_resolve_downstream_output_sources_reads_nested_result_output_root(self):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -24669,6 +24722,7 @@ TaskManagerTests.test_normalize_source_input_files_rejects_non_archive = _test_n
 TaskManagerTests.test_materialize_source_archives_extracts_into_input_and_cleans_temp_file = _test_materialize_source_archives_extracts_into_input_and_cleans_temp_file
 TaskManagerTests.test_resolve_downstream_output_sources_prefers_output_contents = _test_resolve_downstream_output_sources_prefers_output_contents
 TaskManagerTests.test_archive_downstream_output_copies_output_contents_without_output_layer = _test_archive_downstream_output_copies_output_contents_without_output_layer
+TaskManagerTests.test_archive_downstream_output_filters_b2s_runtime_temp_dirs = _test_archive_downstream_output_filters_b2s_runtime_temp_dirs
 TaskManagerTests.test_resolve_downstream_output_sources_reads_nested_result_output_root = _test_resolve_downstream_output_sources_reads_nested_result_output_root
 TaskManagerTests.test_resolve_downstream_output_sources_reads_artifacts_output_root = _test_resolve_downstream_output_sources_reads_artifacts_output_root
 TaskManagerTests.test_resolve_downstream_output_sources_prefers_task_scoped_output_over_service_root = _test_resolve_downstream_output_sources_prefers_task_scoped_output_over_service_root

@@ -176,11 +176,28 @@ class ResultKindSummaryTests(unittest.TestCase):
 
             removed = remove_ida_intermediate_outputs(root)
 
-            self.assertEqual(sorted([str(ida_root), str(legacy_work)]), sorted(removed))
+            self.assertEqual(
+                sorted([str(ida_root), str(legacy_work), str(root / "run"), str(run_legacy)]),
+                sorted(removed),
+            )
             self.assertFalse(ida_root.exists())
             self.assertFalse(legacy_work.exists())
-            self.assertTrue(run_ida_file.exists())
-            self.assertTrue(run_legacy_file.exists())
+            self.assertFalse(run_ida_file.exists())
+            self.assertFalse(run_legacy_file.exists())
+
+    def test_remove_ida_intermediate_outputs_removes_top_level_run_directory(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "main.c").write_text("int main(void){return 0;}\n", encoding="utf-8")
+            run_root = root / "run"
+            (run_root / "runs" / "run-1").mkdir(parents=True)
+            (run_root / "runs" / "run-1" / "trace.log").write_text("trace\n", encoding="utf-8")
+
+            removed = remove_ida_intermediate_outputs(root)
+
+            self.assertIn(str(run_root), removed)
+            self.assertFalse(run_root.exists())
+            self.assertTrue((root / "main.c").exists())
 
 
 if __name__ == "__main__":

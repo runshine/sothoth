@@ -22,7 +22,7 @@ import zipfile
 from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from dataclasses import dataclass, field
 
 from sqlalchemy import Integer, case, cast, func, or_, text
@@ -539,7 +539,13 @@ def _copytree(src: Path, dst: Path) -> None:
     )
 
 
-def _copytree_best_effort(src: Path, dst: Path, *, error_limit: int = 200) -> dict[str, Any]:
+def _copytree_best_effort(
+    src: Path,
+    dst: Path,
+    *,
+    error_limit: int = 200,
+    skip_path: Callable[[Path, Path], bool] | None = None,
+) -> dict[str, Any]:
     stats: dict[str, Any] = {
         "copied_files": 0,
         "copied_dirs": 0,
@@ -585,6 +591,8 @@ def _copytree_best_effort(src: Path, dst: Path, *, error_limit: int = 200) -> di
     if not src.exists() and not src.is_symlink():
         return stats
     if src.is_file() or src.is_symlink():
+        if skip_path and skip_path(src, src):
+            return stats
         copy_one(src, dst)
         return stats
 
@@ -600,14 +608,38 @@ def _copytree_best_effort(src: Path, dst: Path, *, error_limit: int = 200) -> di
         for dirname in list(dirnames):
             source_dir = current_path / dirname
             target_dir = target_root / dirname
+            if skip_path and skip_path(source_dir, src):
+                dirnames.remove(dirname)
+                continue
             copy_one(source_dir, target_dir)
             if source_dir.is_symlink():
                 dirnames.remove(dirname)
         for filename in filenames:
             source_file = current_path / filename
             target_file = target_root / filename
+            if skip_path and skip_path(source_file, src):
+                continue
             copy_one(source_file, target_file)
     return stats
+
+
+def _is_b2s_runtime_temp_dir(path: str | Path | None) -> bool:
+    if not path:
+        return False
+    try:
+        candidate = Path(str(path))
+    except Exception:
+        return False
+    name = candidate.name.lower()
+    return name == "run" or name.startswith(".re_work_")
+
+
+def _should_skip_b2s_archive_path(path: Path, *, source_root: Path) -> bool:
+    try:
+        relative = path.relative_to(source_root)
+    except ValueError:
+        relative = path
+    return any(_is_b2s_runtime_temp_dir(part) for part in relative.parts)
 
 
 def _path_has_content(path: Path) -> bool:
@@ -25986,7 +26018,12 @@ class TaskManager:
             "error_truncated": False,
         }
         for source in existing_sources:
-            current_stats = _copytree_best_effort(source, target_dir)
+            skip_path = (
+                (lambda candidate, root: _should_skip_b2s_archive_path(candidate, source_root=root))
+                if item.downstream_service == "binary_to_source" or item.stage_name == "binary_to_source"
+                else None
+            )
+            current_stats = _copytree_best_effort(source, target_dir, skip_path=skip_path)
             copy_stats["copied_files"] += int(current_stats.get("copied_files") or 0)
             copy_stats["copied_dirs"] += int(current_stats.get("copied_dirs") or 0)
             copy_stats["copied_symlinks"] += int(current_stats.get("copied_symlinks") or 0)
