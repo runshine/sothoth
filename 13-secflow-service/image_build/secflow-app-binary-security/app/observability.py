@@ -218,6 +218,26 @@ RUNTIME_LEASE_OWNER_MISMATCH_TOTAL = Counter(
     "Total runtime lease owner mismatch or stale-owner recoveries.",
     labelnames=("reason",),
 )
+TAIL_RECONCILE_OWNER_TOTAL = Counter(
+    "secflow_binary_security_tail_reconcile_owner_total",
+    "Total tail reconcile owner lifecycle events.",
+    labelnames=("action",),
+)
+TAIL_RECONCILE_HEARTBEAT_TOTAL = Counter(
+    "secflow_binary_security_tail_reconcile_heartbeat_total",
+    "Total tail reconcile heartbeat outcomes.",
+    labelnames=("result",),
+)
+TAIL_RECONCILE_TAKEOVER_TOTAL = Counter(
+    "secflow_binary_security_tail_reconcile_takeover_total",
+    "Total tail reconcile lease takeovers or reacquisitions.",
+    labelnames=("result",),
+)
+TAIL_RECONCILE_REQUEUE_BLOCKED_TOTAL = Counter(
+    "secflow_binary_security_tail_reconcile_requeue_blocked_total",
+    "Total released-running requeue attempts blocked by an active local tail reconcile lease.",
+    labelnames=("reason",),
+)
 STREAMING_PARENT_RECOVERED_TOTAL = Counter(
     "secflow_binary_security_streaming_parent_recovered_total",
     "Total streaming-tail parent state recoveries.",
@@ -642,6 +662,22 @@ def observe_running_requeue(reason: str) -> None:
 
 def observe_runtime_lease_owner_mismatch(reason: str) -> None:
     RUNTIME_LEASE_OWNER_MISMATCH_TOTAL.labels(reason=str(reason or "unknown")).inc()
+
+
+def observe_tail_reconcile_owner(action: str) -> None:
+    TAIL_RECONCILE_OWNER_TOTAL.labels(action=str(action or "unknown")).inc()
+
+
+def observe_tail_reconcile_heartbeat(result: str) -> None:
+    TAIL_RECONCILE_HEARTBEAT_TOTAL.labels(result=str(result or "unknown")).inc()
+
+
+def observe_tail_reconcile_takeover(result: str) -> None:
+    TAIL_RECONCILE_TAKEOVER_TOTAL.labels(result=str(result or "unknown")).inc()
+
+
+def observe_tail_reconcile_requeue_blocked(reason: str) -> None:
+    TAIL_RECONCILE_REQUEUE_BLOCKED_TOTAL.labels(reason=str(reason or "unknown")).inc()
 
 
 def observe_streaming_parent_recovered(*, stage: str, from_status: str) -> None:

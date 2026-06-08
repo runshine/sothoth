@@ -96,6 +96,10 @@ from app.observability import (
     observe_task_list_query_stage,
     observe_task_lifecycle,
     observe_task_operation,
+    observe_tail_reconcile_heartbeat,
+    observe_tail_reconcile_owner,
+    observe_tail_reconcile_requeue_blocked,
+    observe_tail_reconcile_takeover,
     observe_worker_counts,
     observe_streaming_parent_recovered,
     render_metrics,
@@ -156,6 +160,8 @@ from app.service.task_queue import get_task_queue
 from app.time_utils import now_local
 
 logger = logging.getLogger(__name__)
+
+TAIL_RECONCILE_OWNER = "tail_reconcile_worker"
 
 DB_SUMMARY_ITEM_LIMIT = 50
 DB_FAILURE_ITEM_LIMIT = 20
@@ -1589,6 +1595,34 @@ class TaskManager:
     def _has_local_task_execution_owner(self, task_id: str) -> bool:
         return self._task_execution_owner_count(task_id) > 0
 
+    def _acquire_tail_reconcile_owner(self, task_id: str) -> None:
+        if not self._is_reducer_role():
+            return
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return
+        if self._has_tail_reconcile_owner(normalized_task_id):
+            return
+        self._register_task_execution_owner(normalized_task_id, TAIL_RECONCILE_OWNER)
+        observe_tail_reconcile_owner("acquired")
+
+    def _release_tail_reconcile_owner(self, task_id: str) -> None:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return
+        had_owner = self._has_tail_reconcile_owner(normalized_task_id)
+        self._release_task_execution_owner(normalized_task_id, TAIL_RECONCILE_OWNER)
+        if had_owner:
+            observe_tail_reconcile_owner("released")
+
+    def _has_tail_reconcile_owner(self, task_id: str) -> bool:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return False
+        with self._task_execution_owner_lock:
+            owners = self._task_execution_owners.get(normalized_task_id) or set()
+            return TAIL_RECONCILE_OWNER in owners
+
     def _collect_heartbeat_candidates(self) -> list[str]:
         with self._task_execution_owner_lock:
             return sorted(task_id for task_id, owners in self._task_execution_owners.items() if owners)
@@ -1727,6 +1761,54 @@ class TaskManager:
         expires_at = lease.lease_expires_at if lease is not None else task.lease_expires_at
         return lease, owner, expires_at
 
+    def _tail_reconcile_context_active(self, db: Session, task: BinarySecurityTask) -> bool:
+        active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
+        return bool(active_stage_name) and (active_item_count > 0 or has_downstream_refs)
+
+    def _activate_tail_reconciliation(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        now_value: datetime | None = None,
+        fallback_status: str | None = None,
+        takeover_result: str | None = None,
+    ) -> BinarySecurityTaskRuntimeLease | None:
+        current_now = now_value or _now()
+        self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TAIL_RECONCILIATION)
+        task.dispatcher_instance_id = None
+        task.dispatch_started_at = None
+        task.lease_expires_at = None
+        lease = self._maybe_upsert_runtime_lease(db, task, now_value=current_now, owner_instance_id=self.instance_id)
+        lease_owner = str(lease.owner_instance_id or "").strip() if lease is not None else ""
+        if self._runtime_lease_is_active(lease) and lease_owner == str(self.instance_id or "").strip():
+            self._acquire_tail_reconcile_owner(task.id)
+            if takeover_result:
+                observe_tail_reconcile_takeover(takeover_result)
+            return lease
+        self._release_tail_reconcile_owner(task.id)
+        if fallback_status is not None:
+            task.status = fallback_status
+        observe_tail_reconcile_heartbeat("lease_conflict")
+        if takeover_result:
+            observe_tail_reconcile_takeover("conflict")
+        return lease
+
+    def _should_preserve_tail_runtime_lease(self, db: Session, task: BinarySecurityTask | None) -> bool:
+        if task is None:
+            return False
+        if self._task_runtime_phase(task) != TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+            return False
+        if str(task.status or "").strip().lower() in TASK_TERMINAL_STATUSES:
+            return False
+        lease = self._runtime_lease_for_task(db, task.id)
+        if (
+            self._runtime_lease_is_active(lease)
+            and str(lease.owner_instance_id or "").strip() == str(self.instance_id or "").strip()
+        ):
+            return True
+        return self._has_tail_reconcile_owner(task.id)
+
     def _acquire_coordinator_lease(self, lease_name: str) -> bool:
         normalized_name = str(lease_name or "").strip()
         if not normalized_name:
@@ -1792,6 +1874,14 @@ class TaskManager:
             return False
         if self._task_has_active_cancel_operation(db, task):
             return False
+        if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION and self._has_tail_reconcile_owner(task.id):
+            lease = self._runtime_lease_for_task(db, task.id)
+            if (
+                self._runtime_lease_is_active(lease)
+                and str(lease.owner_instance_id or "").strip() == str(self.instance_id or "").strip()
+                and self._tail_reconcile_context_active(db, task)
+            ):
+                return True
         if not self._has_local_task_execution_owner(task.id) and not self._task_has_active_streaming_stage_workers(task.id):
             return False
         return True
@@ -1808,9 +1898,12 @@ class TaskManager:
             session.commit()
             self._last_task_heartbeat_at[task_id] = now_value
             observe_heartbeat_update(f"{source}_written")
+            if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+                observe_tail_reconcile_heartbeat("written")
             return True
         session.rollback()
         observe_heartbeat_update(f"{source}_skipped")
+        observe_tail_reconcile_heartbeat("skipped")
         return False
 
     def _refresh_task_heartbeats_once(self) -> None:
@@ -6645,7 +6738,13 @@ class TaskManager:
                 task.lease_expires_at = None
                 task.finished_at = None
                 task.last_error = None
-                lease = self._maybe_upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
+                lease = self._activate_tail_reconciliation(
+                    db,
+                    task,
+                    now_value=_now(),
+                    fallback_status="pending",
+                    takeover_result="sync_reclaim",
+                )
                 if self._runtime_lease_is_active(lease):
                     self._clear_task_abnormal_reason_snapshot(db, task)
                     db.commit()
@@ -13099,10 +13198,17 @@ class TaskManager:
                 if (
                     task is None
                     or str(task.status or "").strip().lower() in TASK_TERMINAL_STATUSES
-                    or (not self._has_local_task_execution_owner(task_id) and not self._task_has_active_streaming_stage_workers(task_id))
+                    or (
+                        not self._has_local_task_execution_owner(task_id)
+                        and not self._task_has_active_streaming_stage_workers(task_id)
+                        and not self._should_preserve_tail_runtime_lease(cleanup_db, task)
+                    )
                 ):
                     self._clear_runtime_lease(cleanup_db, task_id, owner_instance_id=self.instance_id)
+                    self._release_tail_reconcile_owner(task_id)
                     cleanup_db.commit()
+                elif self._should_preserve_tail_runtime_lease(cleanup_db, task):
+                    observe_tail_reconcile_heartbeat("preserved_on_worker_exit")
             except Exception:
                 cleanup_db.rollback()
                 logger.exception("binary-security runtime lease cleanup failed: task_id=%s", task_id)
@@ -14353,6 +14459,13 @@ class TaskManager:
                 continue
             lease, runtime_lease_owner, runtime_lease_expires_at = self._runtime_lease_context(db, task)
             if self._runtime_lease_is_active(lease):
+                if (
+                    self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
+                    and str(lease.owner_instance_id or "").strip() == str(self.instance_id or "").strip()
+                    and self._has_tail_reconcile_owner(task.id)
+                ):
+                    observe_tail_reconcile_requeue_blocked("active_local_tail_lease")
+                    continue
                 continue
             active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
             if active_item_count > 0:
@@ -14883,7 +14996,13 @@ class TaskManager:
             task.lease_expires_at = None
             task.finished_at = None
             task.last_error = None
-            self._maybe_upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
+            self._activate_tail_reconciliation(
+                db,
+                task,
+                now_value=_now(),
+                fallback_status=task.status,
+                takeover_result="finalize",
+            )
             self._last_task_heartbeat_at.pop(task.id, None)
             self._record_event(
                 db,
@@ -14906,9 +15025,15 @@ class TaskManager:
             task.finished_at = None
             task.last_error = None
             if self._is_streaming_tail_stage(task, active_stage_name):
-                self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TAIL_RECONCILIATION)
-                self._maybe_upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
+                self._activate_tail_reconciliation(
+                    db,
+                    task,
+                    now_value=_now(),
+                    fallback_status=task.status,
+                    takeover_result="finalize",
+                )
             else:
+                self._release_tail_reconcile_owner(task.id)
                 self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
             self._last_task_heartbeat_at.pop(task.id, None)
             self._record_event(
@@ -15235,6 +15360,11 @@ class TaskManager:
                 raise ValidationError(f"源码压缩包过大: {filename}，大小 {size_bytes} 超过限制 {max_archive} 字节")
 
     def _safe_extract_archive(self, archive_path: Path, target_dir: Path) -> int:
+        if target_dir.exists() or target_dir.is_symlink():
+            if target_dir.is_dir() and not target_dir.is_symlink():
+                shutil.rmtree(target_dir, ignore_errors=True)
+            else:
+                target_dir.unlink(missing_ok=True)
         ensure_dir(target_dir)
         extracted = 0
         extracted_bytes = 0
@@ -15602,6 +15732,7 @@ class TaskManager:
             if not self._runtime_lease_is_active(lease):
                 raise StaleTaskExecution(f"任务 {task.id} 当前 tail 收敛 lease 已失效")
             if str(lease.owner_instance_id or "").strip() != str(self.instance_id or "").strip():
+                self._release_tail_reconcile_owner(task.id)
                 raise StaleTaskExecution(f"任务 {task.id} 当前 tail 收敛 owner 已变更")
             active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(session, row)
             if active_item_count <= 0 and not has_downstream_refs:
@@ -15699,7 +15830,13 @@ class TaskManager:
         task.lease_expires_at = None
         task.finished_at = None
         task.last_error = None
-        lease = self._maybe_upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
+        lease = self._activate_tail_reconciliation(
+            db,
+            task,
+            now_value=_now(),
+            fallback_status="pending",
+            takeover_result="recovered",
+        )
         if not self._runtime_lease_is_active(lease):
             task.status = "pending"
         self._clear_task_abnormal_reason_snapshot(db, task)
@@ -16137,7 +16274,7 @@ class TaskManager:
         if isinstance(task, dict):
             policy = task
         else:
-            policy = (task.policy if task is not None else {}) or {}
+            policy = (getattr(task, "policy", None) if task is not None else {}) or {}
         value = policy.get("pipeline_mode")
         if value is None:
             value = getattr(self.cfg.runtime_policy, "pipeline_mode", PIPELINE_MODE_BARRIER)
@@ -21134,13 +21271,21 @@ class TaskManager:
                     TASK_RUNTIME_PHASE_TAIL_RECONCILIATION if self._is_streaming_tail_stage(task, task.current_stage) else TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                 )
             if not preserve_dispatch:
-                task.dispatcher_instance_id = None
-                task.dispatch_started_at = None
-                task.lease_expires_at = None
                 if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                    lease = self._maybe_upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
+                    lease = self._activate_tail_reconciliation(
+                        db,
+                        task,
+                        now_value=_now(),
+                        fallback_status="pending",
+                        takeover_result="refresh",
+                    )
                     if not self._runtime_lease_is_active(lease):
                         task.status = "pending"
+                else:
+                    task.dispatcher_instance_id = None
+                    task.dispatch_started_at = None
+                    task.lease_expires_at = None
+                    self._release_tail_reconcile_owner(task.id)
             task.finished_at = None
             task.last_error = None
             self._clear_task_abnormal_reason_snapshot(db, task)
@@ -21195,7 +21340,13 @@ class TaskManager:
             task.dispatch_started_at = None
             task.lease_expires_at = None
             task.finished_at = None
-            self._maybe_upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
+            self._activate_tail_reconciliation(
+                db,
+                task,
+                now_value=_now(),
+                fallback_status="pending",
+                takeover_result="refresh",
+            )
             return
         next_stage = self._next_incomplete_stage(db, task)
         if stage_retry_mode and preferred_retry_next_stage:
@@ -21222,7 +21373,15 @@ class TaskManager:
             task.lease_expires_at = None
             task.finished_at = None
             if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                self._maybe_upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
+                self._activate_tail_reconciliation(
+                    db,
+                    task,
+                    now_value=_now(),
+                    fallback_status="pending",
+                    takeover_result="refresh",
+                )
+            else:
+                self._release_tail_reconcile_owner(task.id)
             return
         next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
         next_stage_status = next_stage_run.status if next_stage_run else "pending"
@@ -21246,9 +21405,17 @@ class TaskManager:
             task.lease_expires_at = None
             task.last_error = None
             if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                lease = self._maybe_upsert_runtime_lease(db, task, now_value=_now(), owner_instance_id=self.instance_id)
+                lease = self._activate_tail_reconciliation(
+                    db,
+                    task,
+                    now_value=_now(),
+                    fallback_status="pending",
+                    takeover_result="refresh",
+                )
                 if not self._runtime_lease_is_active(lease):
                     task.status = "pending"
+            else:
+                self._release_tail_reconcile_owner(task.id)
             summary = dict(task.summary or {})
             if summary.get("stale_from_stage") and next_stage in set(summary.get("stale_stages") or []):
                 summary["stale_stages"] = []

@@ -16526,6 +16526,55 @@ def _test_archive_downstream_output_filters_b2s_runtime_temp_dirs(self):
         self.assertFalse((target.target_dir / ".re_work_libipsec").exists())
         self.assertFalse((target.target_dir / "run").exists())
 
+def _test_archive_downstream_output_replaces_existing_archive_dir_for_b2s(self):
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        workspace = root / "workspace"
+        output_dir = workspace / "output"
+        output_dir.mkdir(parents=True)
+        (output_dir / "libipsec.c").write_text("int main(void){return 0;}\n", encoding="utf-8")
+        artifacts_dir = output_dir / "artifacts"
+        artifacts_dir.mkdir(parents=True)
+        (artifacts_dir / "index.json").write_text("{}", encoding="utf-8")
+
+        task_output_root = root / "task-output"
+        stale_target = task_output_root / "binary-to-source" / "fw1__down1" / "1" / "output" / ".re_work_libipsec"
+        stale_target.mkdir(parents=True)
+        (stale_target / "legacy.txt").write_text("legacy\n", encoding="utf-8")
+
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root=str(task_output_root),
+            workspace_root=str(root / "workspace-root"),
+        )
+        item = type("Item", (), {
+            "downstream_service": "binary_to_source",
+            "stage_name": "binary_to_source",
+            "downstream_task_id": "down1",
+            "item_key": "fw1",
+            "id": "si1",
+        })()
+
+        target = self.manager._archive_downstream_output(
+            _FakeDb(),
+            task,
+            item,
+            semantic_key="fw1",
+            payload={"workspace_root": str(workspace)},
+        )
+
+        self.assertEqual("archived", target.status)
+        assert target.target_dir is not None
+        self.assertTrue((target.target_dir / "libipsec.c").is_file())
+        self.assertTrue((target.target_dir / "artifacts" / "index.json").is_file())
+        self.assertFalse((target.target_dir / ".re_work_libipsec").exists())
+
 def _test_resolve_downstream_output_sources_reads_nested_result_output_root(self):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -23667,6 +23716,7 @@ def _test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_ta
     self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, task.runtime_phase)
     self.assertEqual(1, len(db.runtime_leases))
     self.assertEqual(manager.instance_id, db.runtime_leases[0].owner_instance_id)
+    self.assertTrue(manager._has_tail_reconcile_owner(task.id))
 
 
 def _test_start_reducer_role_runs_reconcile_loops(self):
@@ -24347,6 +24397,147 @@ def _test_requeue_released_running_locked_requeues_streaming_tail_with_active_it
     self.assertTrue(any(event.event_type == "running_execution_released_for_takeover" for event in db.events))
 
 
+def _test_requeue_released_running_locked_skips_locally_owned_tail_lease(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-tail-owned",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+    )
+    item = BinarySecurityStageItem(
+        id="si-tail-owned",
+        task_id=task.id,
+        project_id="p1",
+        stage_run_id="sr-entry",
+        stage_name="entry_analysis",
+        item_key="module-a",
+        item_name="module-a",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        execution_epoch=0,
+        owner_instance_id=manager.instance_id,
+        heartbeat_at=_now(),
+        lease_expires_at=_now() + timedelta(minutes=2),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[], runtime_leases=[lease])
+    manager._acquire_tail_reconcile_owner(task.id)
+
+    changed = manager._requeue_released_running_locked(db)
+
+    self.assertFalse(changed)
+    self.assertEqual("running", task.status)
+    self.assertTrue(manager._has_tail_reconcile_owner(task.id))
+
+
+def _test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-tail-heartbeat",
+        project_id="p1",
+        status="running",
+        current_stage="entry_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        updated_at=_now() - timedelta(minutes=5),
+    )
+    item = BinarySecurityStageItem(
+        id="si-tail-heartbeat",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        item_key="module-a",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        execution_epoch=0,
+        owner_instance_id=manager.instance_id,
+        heartbeat_at=_now() - timedelta(minutes=1),
+        lease_expires_at=_now() + timedelta(seconds=30),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], runtime_leases=[lease])
+    manager._acquire_tail_reconcile_owner(task.id)
+
+    with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+        manager._refresh_task_heartbeats_once()
+
+    self.assertEqual(manager.instance_id, db.runtime_leases[0].owner_instance_id)
+    self.assertGreaterEqual(task.updated_at, lease.heartbeat_at)
+
+
+def _test_run_task_finally_preserves_tail_runtime_lease(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-a"
+    task = BinarySecurityTask(
+        id="task-preserve-tail",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        current_stage="entry_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-a",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    task.dispatch_started_at = _now()
+    task.lease_expires_at = _now() + timedelta(seconds=120)
+    item = BinarySecurityStageItem(
+        id="si-preserve-tail",
+        task_id=task.id,
+        project_id="p1",
+        stage_run_id="sr-entry",
+        stage_name="entry_analysis",
+        item_key="module-a",
+        item_name="module-a",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+    async def _tail_execute(_task_id):
+        task.status = "running"
+        manager._activate_tail_reconciliation(db, task, now_value=_now(), fallback_status="pending", takeover_result="test")
+
+    original_factory = task_manager_module.get_session_factory
+    original_execute = manager._execute_task
+    try:
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+        manager._execute_task = _tail_execute
+        asyncio.run(manager._run_task(task.id))
+    finally:
+        task_manager_module.get_session_factory = original_factory
+        manager._execute_task = original_execute
+
+    self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, task.runtime_phase)
+    self.assertEqual(1, len(db.runtime_leases))
+    self.assertEqual(manager.instance_id, db.runtime_leases[0].owner_instance_id)
+    self.assertTrue(manager._has_tail_reconcile_owner(task.id))
+
+
 def _test_reclaim_stale_running_streaming_tail_requeues_for_takeover(self):
     manager = TaskManager()
     task = BinarySecurityTask(
@@ -24712,8 +24903,11 @@ TaskManagerTests.test_sync_downstream_status_keeps_dispatching_pending_for_entry
 TaskManagerTests.test_task_list_response_exposes_runtime_lease_and_sync_view = _test_task_list_response_exposes_runtime_lease_and_sync_view
 TaskManagerTests.test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent = _test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent
 TaskManagerTests.test_requeue_released_running_locked_requeues_streaming_tail_with_active_items = _test_requeue_released_running_locked_requeues_streaming_tail_with_active_items
+TaskManagerTests.test_requeue_released_running_locked_skips_locally_owned_tail_lease = _test_requeue_released_running_locked_skips_locally_owned_tail_lease
 TaskManagerTests.test_reclaim_stale_running_streaming_tail_requeues_for_takeover = _test_reclaim_stale_running_streaming_tail_requeues_for_takeover
 TaskManagerTests.test_run_task_records_takeover_resume_event_for_streaming_tail = _test_run_task_records_takeover_resume_event_for_streaming_tail
+TaskManagerTests.test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task = _test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task
+TaskManagerTests.test_run_task_finally_preserves_tail_runtime_lease = _test_run_task_finally_preserves_tail_runtime_lease
 TaskManagerTests.test_confirm_module_selection_updates_task = _test_confirm_module_selection_updates_task
 TaskManagerTests.test_confirm_entry_selection_updates_task = _test_confirm_entry_selection_updates_task
 TaskManagerTests.test_get_project_config_normalizes_legacy_partial_success_stage_names = _test_get_project_config_normalizes_legacy_partial_success_stage_names
@@ -24723,6 +24917,7 @@ TaskManagerTests.test_materialize_source_archives_extracts_into_input_and_cleans
 TaskManagerTests.test_resolve_downstream_output_sources_prefers_output_contents = _test_resolve_downstream_output_sources_prefers_output_contents
 TaskManagerTests.test_archive_downstream_output_copies_output_contents_without_output_layer = _test_archive_downstream_output_copies_output_contents_without_output_layer
 TaskManagerTests.test_archive_downstream_output_filters_b2s_runtime_temp_dirs = _test_archive_downstream_output_filters_b2s_runtime_temp_dirs
+TaskManagerTests.test_archive_downstream_output_replaces_existing_archive_dir_for_b2s = _test_archive_downstream_output_replaces_existing_archive_dir_for_b2s
 TaskManagerTests.test_resolve_downstream_output_sources_reads_nested_result_output_root = _test_resolve_downstream_output_sources_reads_nested_result_output_root
 TaskManagerTests.test_resolve_downstream_output_sources_reads_artifacts_output_root = _test_resolve_downstream_output_sources_reads_artifacts_output_root
 TaskManagerTests.test_resolve_downstream_output_sources_prefers_task_scoped_output_over_service_root = _test_resolve_downstream_output_sources_prefers_task_scoped_output_over_service_root
