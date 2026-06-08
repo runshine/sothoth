@@ -3,6 +3,7 @@ set -euo pipefail
 
 NAMESPACE="${NAMESPACE:-secflow-ns}"
 DEFAULT_IMAGE_TAG="${DEFAULT_IMAGE_TAG:-latest}"
+INTERNAL_GHCR_PREFIX="${INTERNAL_GHCR_PREFIX:-10.43.208.68/ghcr.io}"
 B2S_IMAGE_REPO="${B2S_IMAGE_REPO:-ghcr.io/runshine/secflow-app-binary-to-source}"
 BIN_EVOLUTION_IMAGE_REPO="${BIN_EVOLUTION_IMAGE_REPO:-ghcr.io/runshine/secflow-app-binary-evolution-center}"
 BIN_SECURITY_IMAGE_REPO="${BIN_SECURITY_IMAGE_REPO:-ghcr.io/runshine/secflow-app-binary-security}"
@@ -72,11 +73,12 @@ Examples:
   ./update_k8s_image_all.sh --chirmera-schedule-image 20260606
 
 Behavior:
-  - No args: update all secflow-* deployments in the namespace to :latest for managed repos.
-  - global tag: update all secflow-* deployments in the namespace to the same tag for managed repos.
+  - No args: update all secflow-* deployments/statefulsets in the namespace to 10.43.208.68/ghcr.io/...:latest for ghcr images.
+  - global tag: update all secflow-* deployments/statefulsets in the namespace to the same tag before rewriting ghcr images to the internal registry.
   - Always force rollout restart for secflow-* deployments, so unchanged tags such as :latest are pulled again.
   - Managed repos:
-      ghcr.io/runshine/*
+      ghcr.io/*
+      10.43.208.68/ghcr.io/*
       runshine0819/secflow-*
   - b2s image: override binary-to-source manager/worker image.
   - binary-evolution image: override binary-evolution-center manager/worker image.
@@ -109,7 +111,7 @@ resolve_image() {
 
 is_managed_repo() {
   local repo="${1:-}"
-  [[ "${repo}" == ghcr.io/runshine/* || "${repo}" == runshine0819/secflow-* ]]
+  [[ "${repo}" == ghcr.io/* || "${repo}" == "${INTERNAL_GHCR_PREFIX}"/* || "${repo}" == runshine0819/secflow-* ]]
 }
 
 is_excluded_workload() {
@@ -150,18 +152,33 @@ image_repo() {
   fi
 }
 
+rewrite_internal_ghcr_image() {
+  local image="${1:-}"
+  local tag="${2:-${DEFAULT_IMAGE_TAG}}"
+  local repo
+  repo="$(image_repo "${image}")"
+  if [[ "${repo}" == "${INTERNAL_GHCR_PREFIX}"/* ]]; then
+    repo="${repo#${INTERNAL_GHCR_PREFIX}/}"
+  fi
+  if [[ "${repo}" == ghcr.io/* ]]; then
+    echo "${INTERNAL_GHCR_PREFIX}/${repo}:${tag}"
+    return 0
+  fi
+  echo "${image}"
+}
+
 resolve_target_image() {
   local current_image="${1:-}"
   local requested="${2:-}"
   if [[ -z "${requested}" ]]; then
-    echo "${current_image}"
+    echo "$(rewrite_internal_ghcr_image "${current_image}" "${DEFAULT_IMAGE_TAG}")"
     return 0
   fi
   if [[ "${requested}" == *"/"* && "${requested}" == *":"* ]]; then
-    echo "${requested}"
+    echo "$(rewrite_internal_ghcr_image "${requested}" "${DEFAULT_IMAGE_TAG}")"
     return 0
   fi
-  echo "$(image_repo "${current_image}"):${requested}"
+  echo "$(rewrite_internal_ghcr_image "$(image_repo "${current_image}"):${requested}" "${DEFAULT_IMAGE_TAG}")"
 }
 
 update_workload_container() {
@@ -355,7 +372,6 @@ done
 echo "[INFO] Scanning workloads in namespace: ${NAMESPACE}"
 while IFS=$'\t' read -r workload_kind workload_name containers; do
   [[ -n "${workload_name}" ]] || continue
-  [[ "${workload_name}" == secflow-* ]] || continue
   if is_excluded_workload "${workload_kind}" "${workload_name}"; then
     echo "[INFO] Skip excluded workload during image scan: ${workload_kind}/${workload_name}"
     continue
@@ -410,7 +426,7 @@ done < <(
   }
 )
 
-echo "[INFO] Forcing rollout restart for secflow workloads"
+echo "[INFO] Forcing rollout restart for managed workloads"
 while IFS=$'\t' read -r workload_kind workload_name; do
   [[ -n "${workload_name}" ]] || continue
   if is_excluded_workload "${workload_kind}" "${workload_name}"; then
@@ -426,24 +442,7 @@ done < <(
   {
     kubectl -n "${NAMESPACE}" get deploy -o jsonpath='{range .items[*]}{"deployment"}{"\t"}{.metadata.name}{"\n"}{end}'
     kubectl -n "${NAMESPACE}" get sts -o jsonpath='{range .items[*]}{"statefulset"}{"\t"}{.metadata.name}{"\n"}{end}'
-  } | grep -E $'^.*\t(secflow-|chirmera-platform-schedule-)'
-)
-
-echo "[INFO] Waiting for secflow workloads to finish rollout"
-while IFS=$'\t' read -r workload_kind workload_name; do
-  [[ -n "${workload_name}" ]] || continue
-  if is_excluded_workload "${workload_kind}" "${workload_name}"; then
-    continue
-  fi
-  if ! workload_has_managed_repo "${workload_kind}" "${workload_name}"; then
-    continue
-  fi
-  kubectl -n "${NAMESPACE}" rollout status "${workload_kind}/${workload_name}" --timeout=300s
-done < <(
-  {
-    kubectl -n "${NAMESPACE}" get deploy -o jsonpath='{range .items[*]}{"deployment"}{"\t"}{.metadata.name}{"\n"}{end}'
-    kubectl -n "${NAMESPACE}" get sts -o jsonpath='{range .items[*]}{"statefulset"}{"\t"}{.metadata.name}{"\n"}{end}'
-  } | grep -E $'^.*\t(secflow-|chirmera-platform-schedule-)'
+  }
 )
 
 echo "[INFO] Done"
