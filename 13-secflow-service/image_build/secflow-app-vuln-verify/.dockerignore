@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.git/
+vendor/vuln-verify/.venv/
+vendor/vuln-verify/.git/
+vendor/vuln-verify/.pytest_cache/

@@ -1,0 +1,71 @@
+database:
+  host: "172.31.30.100"
+  port: 3306
+  username: "secflow"
+  password: "Huawei12#$"
+  name: "secflow"
+  pool_size: 10
+  max_overflow: 20
+
+auth_service:
+  host: "secflow-platform-auth"
+  port: 80
+  validate_token_path: "/api/auth/validate-token"
+  service_machine_token: ""
+  timeout: 10
+  token_cache_enabled: true
+  token_cache_ttl_minutes: 15
+
+project_service:
+  host: "secflow-platform-project"
+  port: 80
+  get_project_path: "/api/project"
+  timeout: 10
+
+storage:
+  project_root_template: "/data/files/{project_id}"
+  app_root_name: "app/secflow-app-vuln-verify"
+  require_input_exists: true
+
+worker:
+  enabled: true
+  poll_interval_seconds: 3
+  lease_seconds: 300
+  heartbeat_interval_seconds: 15
+  max_local_running_tasks: 1
+  default_concurrency: 4
+  max_concurrency: 16
+  task_timeout_seconds: 0
+
+registry:
+  enabled: true
+  menu_service_url: "http://secflow-platform-menu:80"
+  service_id: "secflow-app-vuln-verify"
+  service_name: "漏洞验证服务"
+  host: "secflow-app-vuln-verify"
+  port: 80
+  maturity: "已上线"
+  description: "基于漏洞报告、源码、二进制与威胁模型的自动化漏洞验证服务"
+  api_prefix: "/api/app/vuln-verify"
+  menu:
+    id: "app-vuln-verify"
+    path: "/app/vuln-verify"
+    icon: "shield-check"
+    order: 116
+    level1:
+      name: "应用工具"
+      name_en: "App Tools"
+    level2:
+      name: "漏洞验证"
+      name_en: "Vulnerability Verification"
+    level3:
+      name: "漏洞验证"
+      name_en: "Vuln Verify"
+
+app:
+  host: "0.0.0.0"
+  port: 8080
+  debug: false
+
+logging:
+  level: "INFO"
