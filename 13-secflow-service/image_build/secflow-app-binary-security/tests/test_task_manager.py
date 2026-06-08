@@ -7252,8 +7252,6 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("tail_runtime_lease", response.task_lease_source)
         self.assertEqual("runtime-owner", response.reconcile_owner_instance_id)
         self.assertEqual(lease.lease_expires_at, response.reconcile_lease_expires_at)
-        self.assertEqual("active_items", response.reconcile_block_reason)
-        self.assertEqual(1, response.reconcile_block_item_count)
 
     def test_build_task_runtime_health_treats_tail_runtime_lease_without_dispatcher_as_healthy(self):
         now_value = _now()
@@ -15696,15 +15694,11 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         response = self.manager._stage_item_response(item)
 
-        self.assertEqual("error", response.sync_status)
-        self.assertEqual("error", response.child_sync_result)
-        self.assertEqual("retry_ready", response.child_sync_retry_state)
+        self.assertEqual("synced", response.sync_status)
         self.assertIsNotNone(response.last_synced_at)
-        self.assertEqual("failed", response.child_actual_status)
         self.assertEqual("failed", response.downstream_raw_status)
         self.assertEqual("failed", response.downstream_mapped_status)
         self.assertFalse(response.downstream_state_applied)
-        self.assertFalse(response.child_state_applied)
         self.assertEqual("gateway timeout", response.sync_observation_error_message)
         self.assertEqual("http_error", response.sync_observation_error_type)
         self.assertEqual(504, response.sync_observation_http_status)

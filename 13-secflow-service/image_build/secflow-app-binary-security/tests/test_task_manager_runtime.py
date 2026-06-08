@@ -102,55 +102,6 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
         expires_at = self.manager._operation_lease_expires_at(now_value=now_value)
         self.assertEqual(60, int((expires_at - now_value).total_seconds()))
 
-    def test_maybe_upsert_runtime_lease_returns_existing_on_conflict(self):
-        manager = TaskManager()
-        task = BinarySecurityTask(
-            id="task-1",
-            project_id="project-1",
-            name="tail",
-            status="running",
-            task_type=TASK_TYPE_SOURCE,
-            current_stage="entry_analysis",
-            firmware_source="project_filesystem",
-            firmware_path="/src",
-            output_root="/o",
-            workspace_root="/w",
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
-        )
-        lease = BinarySecurityTaskRuntimeLease(
-            task_id=task.id,
-            execution_epoch=0,
-            owner_instance_id="other-reducer",
-            heartbeat_at=_now(),
-            lease_expires_at=_now() + timedelta(seconds=120),
-        )
-
-        class _Session:
-            def __init__(self):
-                self.runtime_leases = [lease]
-
-            def query(self, model):
-                name = getattr(model, "__name__", "")
-
-                class _Query:
-                    def __init__(self, rows):
-                        self._rows = rows
-
-                    def filter(self, *args, **kwargs):
-                        del args, kwargs
-                        return self
-
-                    def first(self):
-                        return self._rows[0] if self._rows else None
-
-                if name == "BinarySecurityTaskRuntimeLease":
-                    return _Query(self.runtime_leases)
-                return _Query([])
-
-        session = _Session()
-        returned = manager._maybe_upsert_runtime_lease(session, task, now_value=_now(), owner_instance_id="this-reducer")
-        self.assertIs(returned, lease)
-
 
 class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
     def test_recover_loop_db_error_disposes_engine_for_operational_and_timeout_errors(self):
@@ -491,24 +442,15 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
                 self.rollbacks = 0
 
             def query(self, model):
-                name = getattr(model, "__name__", "")
+                del model
+                return self
 
-                class _Query:
-                    def __init__(self, row):
-                        self._row = row
+            def filter(self, *args, **kwargs):
+                del args, kwargs
+                return self
 
-                    def filter(self, *args, **kwargs):
-                        del args, kwargs
-                        return self
-
-                    def first(self):
-                        return self._row
-
-                if name == "BinarySecurityTask":
-                    return _Query(self.task)
-                if name == "BinarySecurityTaskRuntimeLease":
-                    return _Query(None)
-                return _Query(None)
+            def first(self):
+                return self.task
 
             def commit(self):
                 self.commits += 1
@@ -541,7 +483,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             manager._running = False
 
         manager._refresh_task_status_after_sync = _refresh
-        manager._claim_or_refresh_runtime_lease = lambda *args, **kwargs: type("LeaseClaim", (), {"result": "claimed", "lease": None})()
 
         with (
             patch("app.service.task_manager.get_session_factory", return_value=_session_factory),

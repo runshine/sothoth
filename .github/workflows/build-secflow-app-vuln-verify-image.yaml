@@ -1,16 +1,14 @@
-name: build-secflow-app-dataflow-vuln-scan-image
+name: build-secflow-app-vuln-verify-image
 
 on:
   push:
     branches:
       - 'v2.*'
     paths:
-      - .github/workflows/build-secflow-app-dataflow-vuln-scan-image.yaml
-      - 13-secflow-service/image_build/secflow-app-dataflow-vuln-scan
-      - 13-secflow-service/image_build/secflow-app-dataflow-vuln-scan/**
-      - 13-secflow-service/image_build/secflow-base-python311-runtime/**
+      - .github/workflows/build-secflow-app-vuln-verify-image.yaml
+      - 13-secflow-service/image_build/secflow-app-vuln-verify/**
       - 13-secflow-service/image_build/secflow-base-pi-agent-runtime/**
-      - 13-secflow-service/00-secflow-105-**
+      - 101-Chimera-deploy/01-platform/00-secflow-116-**
   workflow_dispatch:
 
 jobs:
@@ -41,32 +39,27 @@ jobs:
       contents: read
       packages: write
     steps:
-      - name: Checkout (with submodules)
+      - name: Checkout
         uses: actions/checkout@v6
         with:
-          submodules: true
           token: ${{ secrets.PRIVATE_REPO_PAT }}
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Login to Docker Hub
-        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
-
       - name: Login to GitHub Container Registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
-
       - name: Build and push amd64 image
         run: |
           docker buildx build \
             --platform linux/amd64 \
             --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --build-arg SECFLOW_PI_AGENT_RUNTIME_IMAGE=ghcr.io/runshine/secflow-base-pi-agent-runtime:20260602 \
-            --cache-from type=gha,scope=secflow-app-dataflow-vuln-scan-amd64 \
-            --cache-to type=gha,scope=secflow-app-dataflow-vuln-scan-amd64,mode=max \
-            --file 13-secflow-service/image_build/secflow-app-dataflow-vuln-scan/Dockerfile \
-            --tag ghcr.io/runshine/secflow-app-dataflow-vuln-scan:amd64-latest \
-            --tag ghcr.io/runshine/secflow-app-dataflow-vuln-scan:amd64-${{ needs.prepare.outputs.date_tag }} \
+            --cache-from type=gha,scope=secflow-app-vuln-verify-amd64 \
+            --cache-to type=gha,scope=secflow-app-vuln-verify-amd64,mode=max \
+            --file 13-secflow-service/image_build/secflow-app-vuln-verify/Dockerfile \
+            --tag ghcr.io/runshine/secflow-app-vuln-verify:amd64-latest \
+            --tag ghcr.io/runshine/secflow-app-vuln-verify:amd64-${{ needs.prepare.outputs.date_tag }} \
             --push \
-            13-secflow-service/image_build/secflow-app-dataflow-vuln-scan/
+            13-secflow-service/image_build/secflow-app-vuln-verify/
 
   build-arm64:
     needs: prepare
@@ -75,32 +68,27 @@ jobs:
       contents: read
       packages: write
     steps:
-      - name: Checkout (with submodules)
+      - name: Checkout
         uses: actions/checkout@v6
         with:
-          submodules: true
           token: ${{ secrets.PRIVATE_REPO_PAT }}
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Login to Docker Hub
-        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
-
       - name: Login to GitHub Container Registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
-
       - name: Build and push arm64 image
         run: |
           docker buildx build \
             --platform linux/arm64 \
             --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
             --build-arg SECFLOW_PI_AGENT_RUNTIME_IMAGE=ghcr.io/runshine/secflow-base-pi-agent-runtime:20260602 \
-            --cache-from type=gha,scope=secflow-app-dataflow-vuln-scan-arm64 \
-            --cache-to type=gha,scope=secflow-app-dataflow-vuln-scan-arm64,mode=max \
-            --file 13-secflow-service/image_build/secflow-app-dataflow-vuln-scan/Dockerfile \
-            --tag ghcr.io/runshine/secflow-app-dataflow-vuln-scan:arm64-latest \
-            --tag ghcr.io/runshine/secflow-app-dataflow-vuln-scan:arm64-${{ needs.prepare.outputs.date_tag }} \
+            --cache-from type=gha,scope=secflow-app-vuln-verify-arm64 \
+            --cache-to type=gha,scope=secflow-app-vuln-verify-arm64,mode=max \
+            --file 13-secflow-service/image_build/secflow-app-vuln-verify/Dockerfile \
+            --tag ghcr.io/runshine/secflow-app-vuln-verify:arm64-latest \
+            --tag ghcr.io/runshine/secflow-app-vuln-verify:arm64-${{ needs.prepare.outputs.date_tag }} \
             --push \
-            13-secflow-service/image_build/secflow-app-dataflow-vuln-scan/
+            13-secflow-service/image_build/secflow-app-vuln-verify/
 
   merge-manifest:
     needs: [prepare, build-amd64, build-arm64]
@@ -111,23 +99,17 @@ jobs:
     steps:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Login to Docker Hub
-        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
-
       - name: Login to GitHub Container Registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
-
       - name: Create and push multi-arch manifest (latest)
         run: |
           docker buildx imagetools create \
-            --tag ghcr.io/runshine/secflow-app-dataflow-vuln-scan:latest \
-            ghcr.io/runshine/secflow-app-dataflow-vuln-scan:amd64-latest \
-            ghcr.io/runshine/secflow-app-dataflow-vuln-scan:arm64-latest
-
+            --tag ghcr.io/runshine/secflow-app-vuln-verify:latest \
+            ghcr.io/runshine/secflow-app-vuln-verify:amd64-latest \
+            ghcr.io/runshine/secflow-app-vuln-verify:arm64-latest
       - name: Create and push multi-arch manifest (date tag)
         run: |
           docker buildx imagetools create \
-            --tag ghcr.io/runshine/secflow-app-dataflow-vuln-scan:${{ needs.prepare.outputs.date_tag }} \
-            ghcr.io/runshine/secflow-app-dataflow-vuln-scan:amd64-${{ needs.prepare.outputs.date_tag }} \
-            ghcr.io/runshine/secflow-app-dataflow-vuln-scan:arm64-${{ needs.prepare.outputs.date_tag }}
-# rebuild-token: 20260608100628
+            --tag ghcr.io/runshine/secflow-app-vuln-verify:${{ needs.prepare.outputs.date_tag }} \
+            ghcr.io/runshine/secflow-app-vuln-verify:amd64-${{ needs.prepare.outputs.date_tag }} \
+            ghcr.io/runshine/secflow-app-vuln-verify:arm64-${{ needs.prepare.outputs.date_tag }}

@@ -84,11 +84,8 @@ class _RouteManagerStub:
                     status="queued",
                     downstream_service="dataflow_vuln_scan",
                     downstream_task_id="dfa-1",
-                    child_actual_status="pending",
-                    child_binding_state="created_pending_sync",
                     input_ref={"upstream_item_id": "i-entry-1"},
                     sync_status="pending",
-                    child_sync_result="pending",
                     last_synced_at=None,
                 )
             ],
