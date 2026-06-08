@@ -74,9 +74,6 @@ from app.observability import (
     observe_heartbeat_update,
     observe_queue_depths,
     observe_running_requeue,
-    observe_runtime_lease_claim,
-    observe_runtime_lease_conflict,
-    observe_runtime_lease_takeover,
     observe_runtime_lease_owner_mismatch,
     observe_scheduler_loop,
     observe_slot_usage,
@@ -961,14 +958,6 @@ class OrchestrationSupervisorState:
     last_result: str | None = None
 
 
-@dataclass
-class RuntimeLeaseClaimResult:
-    lease: BinarySecurityTaskRuntimeLease | None
-    result: str
-    conflict_owner_instance_id: str | None = None
-    conflict_lease_expires_at: datetime | None = None
-
-
 class TaskManager:
     def __init__(self) -> None:
         # Isolate per-manager runtime config so local mutations do not leak
@@ -1633,221 +1622,33 @@ class TaskManager:
         now_value: datetime,
         owner_instance_id: str | None = None,
     ) -> BinarySecurityTaskRuntimeLease:
-        claim = self._claim_or_refresh_runtime_lease(
-            db,
-            task,
-            now_value=now_value,
-            owner_instance_id=owner_instance_id,
-        )
-        if claim.result == "conflict_active_owner":
-            phase = self._task_runtime_phase(task)
-            raise StaleTaskExecution(f"任务 {task.id} 当前 {phase or 'unknown'} runtime lease owner 已变更")
-        return claim.lease
-
-    def _claim_or_refresh_runtime_lease(
-        self,
-        db: Session,
-        task: BinarySecurityTask,
-        *,
-        now_value: datetime,
-        owner_instance_id: str | None = None,
-    ) -> RuntimeLeaseClaimResult:
         phase = self._task_runtime_phase(task)
         requested_owner = str(owner_instance_id or self.instance_id or "").strip() or self.instance_id
         if not self._can_own_runtime_phase(phase):
             lease = self._runtime_lease_for_task(db, task.id)
             if lease is None:
                 raise StaleTaskExecution(f"任务 {task.id} 当前实例无权持有 {phase or 'unknown'} runtime lease")
-            return RuntimeLeaseClaimResult(lease=lease, result="not_owner_phase")
-        if hasattr(db, "connection"):
-            claim = self._claim_runtime_lease_atomic(
-                db,
-                task=task,
-                requested_owner=requested_owner,
-                now_value=now_value,
-            )
-            if claim is not None:
-                return claim
-        return self._claim_runtime_lease_with_fallback(
-            db,
-            task=task,
-            requested_owner=requested_owner,
-            now_value=now_value,
-        )
-
-    def _claim_runtime_lease_atomic(
-        self,
-        db: Session,
-        *,
-        task: BinarySecurityTask,
-        requested_owner: str,
-        now_value: datetime,
-    ) -> RuntimeLeaseClaimResult | None:
-        connection_getter = getattr(db, "connection", None)
-        if not callable(connection_getter):
-            return None
-        connection = connection_getter()
-        dialect_name = str(getattr(getattr(connection, "dialect", None), "name", "") or "").lower()
-        if "mysql" not in dialect_name:
-            return None
-        table_name = BinarySecurityTaskRuntimeLease.__tablename__
-        execution_epoch = int(getattr(task, "execution_epoch", 0) or 0)
-        lease_expires_at = self._next_runtime_lease_expiry(now_value=now_value)
-        previous = self._runtime_lease_for_task(db, task.id)
-        connection.execute(
-            text(
-                f"""
-                INSERT INTO {table_name}
-                    (task_id, execution_epoch, owner_instance_id, lease_expires_at, heartbeat_at, created_at, updated_at)
-                VALUES
-                    (:task_id, :execution_epoch, :owner_instance_id, :lease_expires_at, :heartbeat_at, :created_at, :updated_at)
-                ON DUPLICATE KEY UPDATE
-                    execution_epoch = CASE
-                        WHEN owner_instance_id = VALUES(owner_instance_id)
-                          OR lease_expires_at < :now_value
-                          OR execution_epoch <> VALUES(execution_epoch)
-                        THEN VALUES(execution_epoch)
-                        ELSE execution_epoch
-                    END,
-                    owner_instance_id = CASE
-                        WHEN owner_instance_id = VALUES(owner_instance_id)
-                          OR lease_expires_at < :now_value
-                          OR execution_epoch <> VALUES(execution_epoch)
-                        THEN VALUES(owner_instance_id)
-                        ELSE owner_instance_id
-                    END,
-                    lease_expires_at = CASE
-                        WHEN owner_instance_id = VALUES(owner_instance_id)
-                          OR lease_expires_at < :now_value
-                          OR execution_epoch <> VALUES(execution_epoch)
-                        THEN VALUES(lease_expires_at)
-                        ELSE lease_expires_at
-                    END,
-                    heartbeat_at = CASE
-                        WHEN owner_instance_id = VALUES(owner_instance_id)
-                          OR lease_expires_at < :now_value
-                          OR execution_epoch <> VALUES(execution_epoch)
-                        THEN VALUES(heartbeat_at)
-                        ELSE heartbeat_at
-                    END,
-                    updated_at = CASE
-                        WHEN owner_instance_id = VALUES(owner_instance_id)
-                          OR lease_expires_at < :now_value
-                          OR execution_epoch <> VALUES(execution_epoch)
-                        THEN VALUES(updated_at)
-                        ELSE updated_at
-                    END
-                """
-            ),
-            {
-                "task_id": task.id,
-                "execution_epoch": execution_epoch,
-                "owner_instance_id": requested_owner,
-                "lease_expires_at": lease_expires_at,
-                "heartbeat_at": now_value,
-                "created_at": now_value,
-                "updated_at": now_value,
-                "now_value": now_value,
-            },
-        )
-        db.flush()
-        current = self._runtime_lease_for_task(db, task.id)
-        if current is None:
-            return RuntimeLeaseClaimResult(lease=None, result="missing_after_claim")
-        current_owner = str(current.owner_instance_id or "").strip() or None
-        if current_owner != requested_owner:
-            observe_runtime_lease_claim("conflict_active_owner")
-            observe_runtime_lease_conflict(phase=self._task_runtime_phase(task))
-            return RuntimeLeaseClaimResult(
-                lease=current,
-                result="conflict_active_owner",
-                conflict_owner_instance_id=current_owner,
-                conflict_lease_expires_at=current.lease_expires_at,
-            )
-        if previous is None:
-            observe_runtime_lease_claim("claimed")
-            return RuntimeLeaseClaimResult(lease=current, result="claimed")
-        previous_owner = str(previous.owner_instance_id or "").strip() or None
-        previous_epoch = int(getattr(previous, "execution_epoch", 0) or 0)
-        previous_active = self._runtime_lease_is_active(previous)
-        if previous_owner == requested_owner and previous_epoch == execution_epoch:
-            observe_runtime_lease_claim("refreshed")
-            return RuntimeLeaseClaimResult(lease=current, result="refreshed")
-        if previous_epoch != execution_epoch:
-            observe_runtime_lease_claim("stolen_epoch_changed")
-            observe_runtime_lease_takeover(reason="epoch_changed")
-            return RuntimeLeaseClaimResult(lease=current, result="stolen_epoch_changed")
-        if previous_active and previous_owner and previous_owner != requested_owner:
-            observe_runtime_lease_claim("stolen_expired")
-            observe_runtime_lease_takeover(reason="expired_owner")
-            return RuntimeLeaseClaimResult(lease=current, result="stolen_expired")
-        observe_runtime_lease_claim("refreshed")
-        return RuntimeLeaseClaimResult(lease=current, result="refreshed")
-
-    def _claim_runtime_lease_with_fallback(
-        self,
-        db: Session,
-        *,
-        task: BinarySecurityTask,
-        requested_owner: str,
-        now_value: datetime,
-    ) -> RuntimeLeaseClaimResult:
-        execution_epoch = int(getattr(task, "execution_epoch", 0) or 0)
-        max_attempts = self._retryable_write_attempts()
-        for attempt in range(max_attempts):
-            previous = self._runtime_lease_for_task(db, task.id)
-            try:
-                if previous is None:
-                    lease = BinarySecurityTaskRuntimeLease(
-                        task_id=task.id,
-                        execution_epoch=execution_epoch,
-                        owner_instance_id=requested_owner,
-                        heartbeat_at=now_value,
-                        lease_expires_at=self._next_runtime_lease_expiry(now_value=now_value),
-                    )
-                    with self._savepoint(db):
-                        db.add(lease)
-                        db.flush()
-                    observe_runtime_lease_claim("claimed")
-                    return RuntimeLeaseClaimResult(lease=lease, result="claimed")
-                current_owner = str(previous.owner_instance_id or "").strip() or None
-                lease_active = self._runtime_lease_is_active(previous)
-                previous_epoch = int(getattr(previous, "execution_epoch", 0) or 0)
-                if lease_active and current_owner and current_owner != requested_owner and previous_epoch == execution_epoch:
-                    observe_runtime_lease_claim("conflict_active_owner")
-                    observe_runtime_lease_conflict(phase=self._task_runtime_phase(task))
-                    return RuntimeLeaseClaimResult(
-                        lease=previous,
-                        result="conflict_active_owner",
-                        conflict_owner_instance_id=current_owner,
-                        conflict_lease_expires_at=previous.lease_expires_at,
-                    )
-                previous.execution_epoch = execution_epoch
-                previous.owner_instance_id = requested_owner
-                previous.heartbeat_at = now_value
-                previous.lease_expires_at = self._next_runtime_lease_expiry(now_value=now_value)
-                db.flush()
-                if current_owner == requested_owner and previous_epoch == execution_epoch:
-                    observe_runtime_lease_claim("refreshed")
-                    return RuntimeLeaseClaimResult(lease=previous, result="refreshed")
-                takeover_reason = "epoch_changed" if previous_epoch != execution_epoch else "expired_owner"
-                observe_runtime_lease_claim("stolen_expired" if takeover_reason == "expired_owner" else "stolen_epoch_changed")
-                observe_runtime_lease_takeover(reason=takeover_reason)
-                return RuntimeLeaseClaimResult(
-                    lease=previous,
-                    result="stolen_expired" if takeover_reason == "expired_owner" else "stolen_epoch_changed",
-                )
-            except IntegrityError:
-                db.rollback()
-                if attempt >= max_attempts - 1:
-                    raise
-            except OperationalError as exc:
-                db.rollback()
-                if not self._is_retryable_lock_error(exc) or attempt >= max_attempts - 1:
-                    raise
-                self._sleep_after_retryable_lock_error(attempt + 1)
+            return lease
         lease = self._runtime_lease_for_task(db, task.id)
-        return RuntimeLeaseClaimResult(lease=lease, result="exhausted")
+        if lease is None:
+            lease = BinarySecurityTaskRuntimeLease(
+                task_id=task.id,
+                execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
+                owner_instance_id=requested_owner,
+                heartbeat_at=now_value,
+                lease_expires_at=self._next_runtime_lease_expiry(now_value=now_value),
+            )
+            db.add(lease)
+        else:
+            current_owner = str(lease.owner_instance_id or "").strip() or None
+            lease_active = self._runtime_lease_is_active(lease)
+            if lease_active and current_owner and current_owner != requested_owner:
+                raise StaleTaskExecution(f"任务 {task.id} 当前 {phase or 'unknown'} runtime lease owner 已变更")
+            lease.execution_epoch = int(getattr(task, "execution_epoch", 0) or 0)
+            lease.owner_instance_id = requested_owner
+            lease.heartbeat_at = now_value
+            lease.lease_expires_at = self._next_runtime_lease_expiry(now_value=now_value)
+        return lease
 
     def _maybe_upsert_runtime_lease(
         self,
@@ -1861,13 +1662,12 @@ class TaskManager:
         if not self._can_own_runtime_phase(phase):
             return self._runtime_lease_for_task(db, task.id)
         try:
-            claim = self._claim_or_refresh_runtime_lease(
+            return self._upsert_runtime_lease(
                 db,
                 task,
                 now_value=now_value or _now(),
                 owner_instance_id=owner_instance_id,
             )
-            return claim.lease
         except StaleTaskExecution:
             return self._runtime_lease_for_task(db, task.id)
 
@@ -4760,64 +4560,6 @@ class TaskManager:
             if binding_state == "created_pending_sync":
                 display_status = "pending"
         return display_status, sync_observation, repaired
-
-    def _normalize_sync_result(self, raw_status: str | None) -> str | None:
-        value = str(raw_status or "").strip().lower()
-        if not value:
-            return None
-        if value in {"pending", "not_applicable"}:
-            return value
-        if value in {"synced", "success", "observed", "skipped"}:
-            return "success"
-        if value == "transport_error":
-            return "error"
-        if value in {"binding_mismatch", "binding_missing_during_recreate", "error"}:
-            return "error"
-        return value
-
-    def _child_sync_retry_state(self, item: BinarySecurityStageItem) -> str | None:
-        if self._stage_item_sync_in_retry_backoff(item):
-            return "backoff"
-        if self._stage_item_sync_error_budget_exhausted(item):
-            return "budget_exhausted"
-        sync_result = self._normalize_sync_result(self._stage_item_sync_status_value(item))
-        if sync_result == "error":
-            return "retry_ready"
-        return None
-
-    def _reconcile_block_context(
-        self,
-        db: Session,
-        task: BinarySecurityTask,
-        *,
-        stage_items: list[BinarySecurityStageItem] | None = None,
-    ) -> tuple[str | None, int]:
-        if self._task_runtime_phase(task) != TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-            return None, 0
-        items = list(stage_items or [])
-        if not items and getattr(task, "id", None):
-            items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
-        active_items = [
-            item for item in items
-            if str(item.status or "").strip().lower() in {"pending", "queued", "running", "dispatching"}
-        ]
-        if active_items:
-            return "active_items", len(active_items)
-        unapplied_terminal = 0
-        for item in items:
-            result = self._load_stage_item_result_payload(item)
-            downstream_status, sync_observation, _repaired = self._effective_stage_item_downstream_status(item, result=result)
-            normalized_item = self._normalize_downstream_status(item.status) or self._string_or_none(item.status)
-            normalized_downstream = self._normalize_downstream_status(downstream_status)
-            state_applied = self._bool_or_none(sync_observation.get("state_applied"))
-            if (
-                normalized_downstream in {"success", "failed", "cancelled", "partial_success", "downstream_missing"}
-                and (not state_applied or normalized_item != normalized_downstream)
-            ):
-                unapplied_terminal += 1
-        if unapplied_terminal:
-            return "terminal_child_status_not_applied", unapplied_terminal
-        return None, 0
 
     def _repair_stage_item_terminal_downstream_observation(
         self,
@@ -16095,7 +15837,7 @@ class TaskManager:
         if isinstance(task, dict):
             policy = task
         else:
-            policy = (getattr(task, "policy", {}) if task is not None else {}) or {}
+            policy = (task.policy if task is not None else {}) or {}
         value = policy.get("pipeline_mode")
         if value is None:
             value = getattr(self.cfg.runtime_policy, "pipeline_mode", PIPELINE_MODE_BARRIER)
@@ -16326,15 +16068,6 @@ class TaskManager:
                 return True, False
             before_status = str(task.status or "").strip()
             before_stage = str(task.current_stage or "").strip()
-            lease_claim = self._claim_or_refresh_runtime_lease(
-                session,
-                task,
-                now_value=_now(),
-                owner_instance_id=self.instance_id,
-            )
-            if lease_claim.result == "conflict_active_owner":
-                session.rollback()
-                return True, False
             self._refresh_task_status_after_sync(session, task)
             changed = str(task.status or "").strip() != before_status or str(task.current_stage or "").strip() != before_stage
             session.commit()
@@ -19105,7 +18838,6 @@ class TaskManager:
             task_retry_failed_reason=task_retry_failed_reason,
             stage_summaries=stage_summaries,
         )
-        reconcile_block_reason, reconcile_block_item_count = self._reconcile_block_context(db, task, stage_items=items)
         active_operation = self._active_operation(db, task.id)
         if active_operation is not None and str(active_operation.operation_type or "").strip() != TASK_ACTION_CANCEL:
             cancel_operation = None
@@ -19133,8 +18865,6 @@ class TaskManager:
             task_lease_source=lease_source,
             reconcile_owner_instance_id=reconcile_owner,
             reconcile_lease_expires_at=reconcile_lease_expires_at,
-            reconcile_block_reason=reconcile_block_reason,
-            reconcile_block_item_count=reconcile_block_item_count,
             runtime_override_version=int(getattr(task, "runtime_override_version", 0) or 0),
             runtime_override_updated_at=getattr(task, "runtime_override_updated_at", None),
             runtime_override_updated_by=getattr(task, "runtime_override_updated_by", None),
@@ -19385,26 +19115,25 @@ class TaskManager:
             result.setdefault(key, value)
         downstream_status, sync_observation, repaired = self._effective_stage_item_downstream_status(item, result=result)
         downstream_payload = dict(result.get("downstream") or {})
-        child_actual_status = (
-            self._normalize_downstream_status(self._string_or_none(sync_observation.get("mapped_status")))
-            or self._normalize_downstream_status(self._string_or_none(sync_observation.get("downstream_status")))
-            or self._normalize_downstream_status(self._string_or_none(sync_observation.get("status_raw")))
-            or downstream_status
-        )
         last_synced_at = result.get("last_sync_success_at") or result.get("downstream_status_synced_at")
         last_attempt_at = result.get("last_sync_attempt_at") or sync_observation.get("last_attempt_at") or sync_observation.get("last_synced_at")
         last_error_at = result.get("last_sync_error_at") or sync_observation.get("last_error_at")
         raw_sync_status = result.get("sync_status")
-        sync_status = self._normalize_sync_result(str(raw_sync_status).strip().lower() if raw_sync_status is not None else None)
+        sync_status = str(raw_sync_status).strip().lower() if raw_sync_status is not None else None
+        if sync_status == "transport_error" and (downstream_status or last_synced_at):
+            # Keep surfacing the latest observation error fields, but do not let
+            # a transient fetch failure permanently override the last known good
+            # child state in the primary sync_status badge.
+            sync_status = "synced"
         if not sync_status:
             if item.downstream_task_id and (downstream_status or last_synced_at):
-                sync_status = "success" if last_synced_at else "pending"
+                sync_status = "synced" if last_synced_at else "pending"
                 if downstream_status and not last_synced_at:
-                    sync_status = "success"
+                    sync_status = "synced"
             else:
                 sync_status = "not_applicable"
         if repaired and sync_status in {None, "", "pending"}:
-            sync_status = "success"
+            sync_status = "synced"
         parsed_last_synced_at = last_synced_at
         if isinstance(last_synced_at, str):
             try:
@@ -19448,9 +19177,7 @@ class TaskManager:
             downstream_service=item.downstream_service,
             downstream_task_id=item.downstream_task_id,
             downstream_status=downstream_status,
-            child_actual_status=child_actual_status,
             downstream_binding_state=binding_state,
-            child_binding_state=binding_state,
             downstream_create_attempts=max(0, int(binding.get("attempts") or 0)),
             downstream_create_last_attempt_at=self._parse_comparable_datetime(binding.get("last_attempt_at")),
             downstream_create_next_retry_at=self._parse_comparable_datetime(binding.get("next_retry_at")),
@@ -19466,8 +19193,6 @@ class TaskManager:
             error_message=item.error_message,
             abnormal_reason=self._stage_item_abnormal_reason(item),
             sync_status=str(sync_status) if sync_status is not None else None,
-            child_sync_result=str(sync_status) if sync_status is not None else None,
-            child_sync_retry_state=self._child_sync_retry_state(item),
             last_synced_at=parsed_last_synced_at,
             last_sync_attempt_at=parsed_last_attempt_at if isinstance(parsed_last_attempt_at, datetime) else None,
             last_sync_success_at=parsed_last_synced_at if isinstance(parsed_last_synced_at, datetime) else None,
@@ -19478,7 +19203,6 @@ class TaskManager:
             downstream_raw_status=self._string_or_none(sync_observation.get("status_raw")),
             downstream_mapped_status=self._string_or_none(sync_observation.get("mapped_status")),
             downstream_state_applied=self._bool_or_none(sync_observation.get("state_applied")),
-            child_state_applied=self._bool_or_none(sync_observation.get("state_applied")),
             sync_observation_error_message=self._string_or_none(sync_observation.get("error_message")),
             sync_observation_error_type=self._string_or_none(sync_observation.get("error_type")),
             sync_observation_http_status=self._int_or_none(sync_observation.get("http_status")),
@@ -20964,12 +20688,6 @@ class TaskManager:
             ):
                 self._refresh_stage_from_authoritative_items(db, task, stage_name)
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
-        stage_items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
-        reconcile_block_reason, reconcile_block_item_count = self._reconcile_block_context(
-            db,
-            task,
-            stage_items=stage_items,
-        )
         if self._recover_streaming_parent_running_state_locked(
             db,
             task,
@@ -21153,13 +20871,6 @@ class TaskManager:
         if task.status == "failed" and not self._task_has_active_reconcile_items(db, task):
             self._finalize_task(db, task)
             return
-        if reconcile_block_reason:
-            summary = dict(task.summary or {})
-            summary["reconcile_block_reason"] = reconcile_block_reason
-            summary["reconcile_block_item_count"] = reconcile_block_item_count
-            summary["reconcile_owner_instance_id"] = self.instance_id
-            task.summary = summary
-            db.flush()
         self._finalize_task(db, task)
 
     def _should_skip_readless_reconcile_for_active_task(self, task: BinarySecurityTask) -> bool:
