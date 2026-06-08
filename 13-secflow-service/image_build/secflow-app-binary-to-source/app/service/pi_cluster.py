@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 
 from app.config import get_config
+from app.service.pod_metrics import fetch_pod_resource_map
 from app.service.pi_re_agent import get_pi_client
 from app.time_utils import isoformat_local, now_local
 
@@ -22,8 +23,19 @@ class PiWorkerSnapshot:
     url: str
     healthy: bool
     max_concurrent_jobs: int
+    pod_name: str | None = None
+    pod_ip: str | None = None
     running_jobs: int = 0
     queued_jobs: int = 0
+    pod_created_at: str | None = None
+    pod_started_at: str | None = None
+    pod_metrics_at: str | None = None
+    pod_cpu_usage_millicores: int | None = None
+    pod_memory_usage_bytes: int | None = None
+    pod_cpu_request_millicores: int | None = None
+    pod_memory_request_bytes: int | None = None
+    pod_cpu_limit_millicores: int | None = None
+    pod_memory_limit_bytes: int | None = None
     source: str = "fallback"
     error: str | None = None
 
@@ -85,11 +97,42 @@ class PiClusterMonitor:
                 snapshots.append(PiWorkerSnapshot(
                     worker_id=url.rsplit("/", 1)[-1] or url,
                     url=url,
+                    pod_name=None,
+                    pod_ip=None,
                     healthy=False,
                     max_concurrent_jobs=0,
                     error=str(result),
                 ))
-        snapshot = PiClusterSnapshot(workers=snapshots, updated_at=isoformat_local(now_local()))
+        pod_resource_map = fetch_pod_resource_map(
+            pod_names=[str(worker.pod_name or "").strip() for worker in snapshots if str(worker.pod_name or "").strip()],
+        )
+        snapshot = PiClusterSnapshot(
+            workers=[
+                PiWorkerSnapshot(
+                    worker_id=worker.worker_id,
+                    url=worker.url,
+                    pod_name=worker.pod_name,
+                    pod_ip=worker.pod_ip,
+                    healthy=worker.healthy,
+                    max_concurrent_jobs=worker.max_concurrent_jobs,
+                    running_jobs=worker.running_jobs,
+                    queued_jobs=worker.queued_jobs,
+                    pod_created_at=(pod_resource_map.get(str(worker.pod_name or "").strip(), {}) or {}).get("pod_created_at"),
+                    pod_started_at=(pod_resource_map.get(str(worker.pod_name or "").strip(), {}) or {}).get("pod_started_at"),
+                    pod_metrics_at=(pod_resource_map.get(str(worker.pod_name or "").strip(), {}) or {}).get("pod_metrics_at"),
+                    pod_cpu_usage_millicores=(pod_resource_map.get(str(worker.pod_name or "").strip(), {}) or {}).get("pod_cpu_usage_millicores"),
+                    pod_memory_usage_bytes=(pod_resource_map.get(str(worker.pod_name or "").strip(), {}) or {}).get("pod_memory_usage_bytes"),
+                    pod_cpu_request_millicores=(pod_resource_map.get(str(worker.pod_name or "").strip(), {}) or {}).get("pod_cpu_request_millicores"),
+                    pod_memory_request_bytes=(pod_resource_map.get(str(worker.pod_name or "").strip(), {}) or {}).get("pod_memory_request_bytes"),
+                    pod_cpu_limit_millicores=(pod_resource_map.get(str(worker.pod_name or "").strip(), {}) or {}).get("pod_cpu_limit_millicores"),
+                    pod_memory_limit_bytes=(pod_resource_map.get(str(worker.pod_name or "").strip(), {}) or {}).get("pod_memory_limit_bytes"),
+                    source=worker.source,
+                    error=worker.error,
+                )
+                for worker in snapshots
+            ],
+            updated_at=isoformat_local(now_local()),
+        )
         async with self._lock:
             self._snapshot = snapshot
         return snapshot
@@ -177,6 +220,8 @@ async def probe_worker(url: str) -> PiWorkerSnapshot:
         return PiWorkerSnapshot(
             worker_id=worker_id,
             url=url.rstrip("/"),
+            pod_name=None,
+            pod_ip=None,
             healthy=True,
             max_concurrent_jobs=cfg.default_worker_max_concurrent_jobs,
             running_jobs=0,
@@ -192,6 +237,8 @@ def _snapshot_from_capacity(url: str, payload: dict[str, Any]) -> PiWorkerSnapsh
     return PiWorkerSnapshot(
         worker_id=worker_id,
         url=url.rstrip("/"),
+        pod_name=str(payload.get("pod_name") or "").strip() or None,
+        pod_ip=str(payload.get("pod_ip") or "").strip() or None,
         healthy=bool(payload.get("healthy", True)),
         max_concurrent_jobs=int(payload.get("max_concurrent_jobs") or cfg.default_worker_max_concurrent_jobs),
         running_jobs=int(payload.get("running_jobs") or payload.get("running") or 0),

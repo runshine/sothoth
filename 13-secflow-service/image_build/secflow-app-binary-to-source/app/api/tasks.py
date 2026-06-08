@@ -63,11 +63,22 @@ class ConfigSaveRequest(BaseModel):
 class PiWorkerCapacityResponse(BaseModel):
     worker_id: str
     url: str
+    pod_name: str | None = None
+    pod_ip: str | None = None
     healthy: bool
     max_concurrent_jobs: int
     running_jobs: int = 0
     queued_jobs: int = 0
     available_slots: int = 0
+    pod_created_at: str | None = None
+    pod_started_at: str | None = None
+    pod_metrics_at: str | None = None
+    pod_cpu_usage_millicores: int | None = None
+    pod_memory_usage_bytes: int | None = None
+    pod_cpu_request_millicores: int | None = None
+    pod_memory_request_bytes: int | None = None
+    pod_cpu_limit_millicores: int | None = None
+    pod_memory_limit_bytes: int | None = None
     source: str = "capacity"
     error: str | None = None
     active_jobs: list["PiWorkerActiveJobResponse"] = Field(default_factory=list)
@@ -441,11 +452,22 @@ async def get_pi_cluster_capacity(
         workers.append(PiWorkerCapacityResponse(
             worker_id=worker.worker_id,
             url=worker.url,
+            pod_name=worker.pod_name,
+            pod_ip=worker.pod_ip,
             healthy=worker.healthy,
             max_concurrent_jobs=worker.max_concurrent_jobs,
             running_jobs=worker.running_jobs,
             queued_jobs=worker.queued_jobs,
             available_slots=max(0, worker.max_concurrent_jobs - worker.running_jobs) if worker.healthy else 0,
+            pod_created_at=worker.pod_created_at,
+            pod_started_at=worker.pod_started_at,
+            pod_metrics_at=worker.pod_metrics_at,
+            pod_cpu_usage_millicores=worker.pod_cpu_usage_millicores,
+            pod_memory_usage_bytes=worker.pod_memory_usage_bytes,
+            pod_cpu_request_millicores=worker.pod_cpu_request_millicores,
+            pod_memory_request_bytes=worker.pod_memory_request_bytes,
+            pod_cpu_limit_millicores=worker.pod_cpu_limit_millicores,
+            pod_memory_limit_bytes=worker.pod_memory_limit_bytes,
             source=worker.source,
             error=_merge_worker_error(worker.error, detail_error),
             active_jobs=active_jobs,
@@ -488,11 +510,22 @@ async def get_global_pi_cluster_capacity(
         workers.append(PiWorkerCapacityResponse(
             worker_id=worker.worker_id,
             url=worker.url,
+            pod_name=worker.pod_name,
+            pod_ip=worker.pod_ip,
             healthy=worker.healthy,
             max_concurrent_jobs=worker.max_concurrent_jobs,
             running_jobs=worker.running_jobs,
             queued_jobs=worker.queued_jobs,
             available_slots=max(0, worker.max_concurrent_jobs - worker.running_jobs) if worker.healthy else 0,
+            pod_created_at=worker.pod_created_at,
+            pod_started_at=worker.pod_started_at,
+            pod_metrics_at=worker.pod_metrics_at,
+            pod_cpu_usage_millicores=worker.pod_cpu_usage_millicores,
+            pod_memory_usage_bytes=worker.pod_memory_usage_bytes,
+            pod_cpu_request_millicores=worker.pod_cpu_request_millicores,
+            pod_memory_request_bytes=worker.pod_memory_request_bytes,
+            pod_cpu_limit_millicores=worker.pod_cpu_limit_millicores,
+            pod_memory_limit_bytes=worker.pod_memory_limit_bytes,
             source=worker.source,
             error=_merge_worker_error(worker.error, detail_error),
             active_jobs=active_jobs,
