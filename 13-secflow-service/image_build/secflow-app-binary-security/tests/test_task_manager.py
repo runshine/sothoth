@@ -24481,10 +24481,9 @@ def _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_l
     with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False):
         manager._refresh_task_status_after_sync(db, task)
 
-    self.assertEqual("pending", task.status)
-    self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, task.runtime_phase)
-    self.assertIsNone(task.dispatcher_instance_id)
-    self.assertEqual([], db.runtime_leases)
+    self.assertEqual("running", task.status)
+    self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
+    self.assertEqual("worker-z", task.dispatcher_instance_id)
     recovered_events = [event for event in db.events if event.event_type == "streaming_parent_state_recovered"]
     self.assertTrue(recovered_events)
     self.assertFalse(recovered_events[-1].payload.get("runtime_lease_established"))
@@ -25253,10 +25252,90 @@ def _test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent(s
 
     self.assertEqual("running", task.status)
     self.assertEqual("entry_analysis", task.current_stage)
+    self.assertEqual("worker-z", task.dispatcher_instance_id)
+    self.assertIsNotNone(task.dispatch_started_at)
+    self.assertIsNotNone(task.lease_expires_at)
+    self.assertTrue(any(event.event_type == "streaming_parent_state_recovered" for event in db.events))
+
+
+def _test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_failed(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-firmware-failed",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="firmware_unpack",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-z",
+        dispatch_started_at=_now() - timedelta(minutes=3),
+        lease_expires_at=_now() - timedelta(seconds=10),
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    firmware_run = BinarySecurityStageRun(
+        id="sr-fw",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="firmware_unpack",
+        sequence_no=1,
+        status="failed",
+        last_error="Task owner pod lost",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[firmware_run], stage_items=[], events=[])
+
+    manager._refresh_task_status_after_sync(db, task)
+
+    self.assertEqual("failed", task.status)
+    self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
     self.assertIsNone(task.dispatcher_instance_id)
     self.assertIsNone(task.dispatch_started_at)
     self.assertIsNone(task.lease_expires_at)
-    self.assertTrue(any(event.event_type == "streaming_parent_state_recovered" for event in db.events))
+    self.assertEqual("firmware_unpack", task.current_stage)
+
+
+def _test_reclaim_stale_dispatching_skips_failed_streaming_task(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-firmware-failed-reclaim",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="firmware_unpack",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-z",
+        dispatch_started_at=_now() - timedelta(minutes=10),
+        lease_expires_at=_now() - timedelta(minutes=5),
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    firmware_run = BinarySecurityStageRun(
+        id="sr-fw-reclaim",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="firmware_unpack",
+        sequence_no=1,
+        status="failed",
+        last_error="Task owner pod lost",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[firmware_run], stage_items=[], events=[])
+
+    with patch.object(manager, "_runtime_lease_context", return_value=(None, None, None)), patch.object(
+        manager, "_streaming_tail_active_context", return_value=(None, 0, False)
+    ):
+        reclaimed = manager._reclaim_stale_dispatching_locked(db)
+
+    self.assertTrue(reclaimed)
+    self.assertEqual("pending", task.status)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
 
 
 def _test_requeue_released_running_locked_requeues_streaming_tail_with_active_items(self):
@@ -25810,6 +25889,8 @@ TaskManagerTests.test_reclaim_stale_running_streaming_tail_requeues_for_takeover
 TaskManagerTests.test_run_task_records_takeover_resume_event_for_streaming_tail = _test_run_task_records_takeover_resume_event_for_streaming_tail
 TaskManagerTests.test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task = _test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task
 TaskManagerTests.test_run_task_finally_preserves_tail_runtime_lease = _test_run_task_finally_preserves_tail_runtime_lease
+TaskManagerTests.test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_failed = _test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_failed
+TaskManagerTests.test_reclaim_stale_dispatching_skips_failed_streaming_task = _test_reclaim_stale_dispatching_skips_failed_streaming_task
 TaskManagerTests.test_confirm_module_selection_updates_task = _test_confirm_module_selection_updates_task
 TaskManagerTests.test_confirm_entry_selection_updates_task = _test_confirm_entry_selection_updates_task
 TaskManagerTests.test_get_project_config_normalizes_legacy_partial_success_stage_names = _test_get_project_config_normalizes_legacy_partial_success_stage_names

@@ -1904,6 +1904,17 @@ class TaskManager:
         summary = self._tail_stage_work_summary(db, task)
         return bool(summary.get("tail_control_mode") == "execution_takeover" and summary.get("takeover_required"))
 
+    def _can_preserve_dispatching_state(self, db: Session, task: BinarySecurityTask, *, stage_runs: list[BinarySecurityStageRun] | None = None) -> bool:
+        if str(task.status or "").strip() != "dispatching":
+            return False
+        if stage_runs is None:
+            stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+        if any(self._is_terminal_business_stage_failure(task, run) for run in stage_runs if str(run.status or "").strip() == "failed"):
+            return False
+        if self._tail_requires_execution_takeover(db, task):
+            return True
+        return any(str(run.status or "").strip() == "dispatching" for run in stage_runs)
+
     def _should_enter_tail_reconciliation(self, db: Session, task: BinarySecurityTask) -> bool:
         summary = self._tail_stage_work_summary(db, task)
         return bool(summary.get("tail_control_mode") == "reconciliation")
@@ -15171,6 +15182,13 @@ class TaskManager:
                 continue
             if task.id in local_workers and str(task.dispatcher_instance_id or "").strip() == self.instance_id:
                 continue
+            if not self._can_preserve_dispatching_state(db, task):
+                task.status = "pending"
+                task.dispatcher_instance_id = None
+                task.dispatch_started_at = None
+                task.lease_expires_at = None
+                reclaimed = True
+                continue
             lease, runtime_lease_owner, runtime_lease_expires_at = self._runtime_lease_context(db, task)
             if self._runtime_lease_is_active(lease):
                 if (
@@ -15219,6 +15237,21 @@ class TaskManager:
                     "has_downstream_refs": has_downstream_refs,
                 },
             )
+            if has_downstream_refs:
+                self._record_event(
+                    db,
+                    task,
+                    "dispatch_backoff_scheduled",
+                    "检测到下游仍存活，回收后进入退让等待",
+                    level="warning",
+                    stage_name=task.current_stage,
+                    payload={
+                        "reclaim_reason": "dispatch_timeout",
+                        "backoff_seconds": max(int(service_config.dispatch_timeout_seconds or 0), 60),
+                        "has_downstream_refs": has_downstream_refs,
+                        "active_stage_name": active_stage_name or task.current_stage,
+                    },
+                )
             reclaimed = True
         if reclaimed:
             db.flush()
@@ -21409,6 +21442,26 @@ class TaskManager:
             payload.get("failure_category") or "-",
         )
 
+    def _should_terminalize_parent_for_failed_stage(
+        self,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun | None,
+    ) -> bool:
+        if stage_run is None or str(stage_run.status or "").strip() != "failed":
+            return False
+        error_text = " ".join(
+            str(part or "").strip()
+            for part in (
+                stage_run.last_error,
+                getattr(stage_run, "error_message", None),
+                getattr(stage_run, "reason", None),
+            )
+            if str(part or "").strip()
+        ).lower()
+        if "task owner pod lost" in error_text or "owner pod lost" in error_text:
+            return True
+        return self._is_terminal_business_stage_failure(task, stage_run)
+
     def _retry_snapshot_for_item(self, task: BinarySecurityTask, stage_name: str, item_key: str) -> dict[str, Any] | None:
         summary = task.summary or {}
         stage_context = (summary.get("stage_retry_context") or {}).get(stage_name) or {}
@@ -22085,6 +22138,35 @@ class TaskManager:
         statuses = [run.status for run in stage_runs]
         vuln_run = next((run for run in stage_runs if normalize_stage_name(run.stage_name) == "dataflow_vuln_scan"), None)
         if any(status in {"running", "dispatching"} for status in statuses):
+            if not self._can_preserve_dispatching_state(db, task, stage_runs=stage_runs):
+                failed_stage_run = next((run for run in stage_runs if str(run.status or "").strip() == "failed"), None)
+                if failed_stage_run is not None:
+                    task.status = "failed"
+                    task.current_stage = failed_stage_run.stage_name or task.current_stage
+                    task.finished_at = task.finished_at or _now()
+                    task.last_error = failed_stage_run.last_error or task.last_error
+                    self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TERMINAL)
+                    task.dispatcher_instance_id = None
+                    task.dispatch_started_at = None
+                    task.lease_expires_at = None
+                    self._clear_task_abnormal_reason_snapshot(db, task)
+                    return
+                task.status = "pending"
+                task.finished_at = None
+                task.last_error = None
+                if self._is_streaming_tail_stage(task, task.current_stage) and self._tail_requires_execution_takeover(db, task):
+                    self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+                    task.tail_reconcile_state = "idle"
+                else:
+                    self._set_task_runtime_phase(
+                        task,
+                        TASK_RUNTIME_PHASE_TAIL_RECONCILIATION if self._is_streaming_tail_stage(task, task.current_stage) else TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                    )
+                    task.dispatcher_instance_id = None
+                    task.dispatch_started_at = None
+                    task.lease_expires_at = None
+                self._clear_task_abnormal_reason_snapshot(db, task)
+                return
             task.status = "running"
             active_run = next((run for run in stage_runs if run.status in {"running", "dispatching"}), None)
             if active_run and active_run.stage_name:
@@ -22189,7 +22271,7 @@ class TaskManager:
         next_stage = self._next_incomplete_stage(db, task)
         if stage_retry_mode and preferred_retry_next_stage:
             next_stage = preferred_retry_next_stage
-        if failed_stage_run is not None and self._is_terminal_business_stage_failure(task, failed_stage_run):
+        if failed_stage_run is not None and self._should_terminalize_parent_for_failed_stage(task, failed_stage_run):
             task.status = "failed"
             self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TERMINAL)
             task.current_stage = failed_stage_run.stage_name or task.current_stage
@@ -29782,7 +29864,13 @@ class TaskManager:
         failed = failed_like_all[:DB_FAILURE_ITEM_LIMIT]
         cancelled = cancelled_all[:DB_FAILURE_ITEM_LIMIT]
         running_active = [result for result in active_results if result.get("status") == "running" or result.get("deferred_mode") == "reconcile"]
-        dispatching_active = [result for result in active_results if result.get("status") == "dispatching"]
+        dispatching_active = [
+            result
+            for result in active_results
+            if result.get("status") == "dispatching"
+            and not result.get("failed")
+            and not result.get("terminal")
+        ]
         pending_active = [
             result
             for result in active_results
