@@ -72,10 +72,12 @@ from app.services.reporting import (
     build_evidence_summary,
     build_result_summary,
     build_workspace_summary,
+    ensure_case_raw_report,
     ensure_case_report_documents,
     get_current_report_summary,
     list_case_reports,
     read_report_content,
+    resolve_raw_report,
 )
 
 router = APIRouter(prefix="/api/vuln/cases", tags=["cases"])
@@ -136,6 +138,7 @@ def _case_payload(item: Case) -> dict:
     finding_id = _finding_id(source_meta, metadata, source_task)
     source_refs = _source_refs(source_meta)
     fileserver_root = display_meta.get("fileserver_root") or {}
+    raw_report = ensure_case_raw_report(item)
     payload = {
         "id": item.id,
         "global_vuln_id": item.global_vuln_id or source_meta.get("global_vuln_id"),
@@ -159,6 +162,14 @@ def _case_payload(item: Case) -> dict:
         "subject": subject,
         "evidence": display_meta.get("evidence") or {},
         "artifacts": display_meta.get("artifacts") or [],
+        "raw_report_summary": {
+            "title": raw_report.get("title"),
+            "report_id": raw_report.get("report_id"),
+            "source": raw_report.get("source"),
+            "reported_at": raw_report.get("reported_at"),
+            "ingest_source": raw_report.get("ingest_source"),
+        } if raw_report else None,
+        "has_raw_report": bool(raw_report),
         "metadata": metadata,
         "source_task": {
             "service_name": source_task.get("service_name"),
@@ -212,6 +223,7 @@ def _lightweight_case_payload(item: Case) -> dict:
     source_task = metadata.get("source") if isinstance(metadata.get("source"), dict) else {}
     fileserver_root = display_meta.get("fileserver_root") or {}
     artifacts = display_meta.get("artifacts") or []
+    raw_report = resolve_raw_report(display_meta)
     payload = {
         "id": item.id,
         "global_vuln_id": item.global_vuln_id or source_meta.get("global_vuln_id"),
@@ -227,6 +239,14 @@ def _lightweight_case_payload(item: Case) -> dict:
         "subject": subject,
         "metadata": metadata,
         "has_artifact_files": bool(artifacts),
+        "has_raw_report": bool(raw_report),
+        "raw_report_summary": {
+            "title": raw_report.get("title"),
+            "report_id": raw_report.get("report_id"),
+            "source": raw_report.get("source"),
+            "reported_at": raw_report.get("reported_at"),
+            "ingest_source": raw_report.get("ingest_source"),
+        } if raw_report else None,
         "source_task": {
             "service_name": source_task.get("service_name"),
             "service_id": source_task.get("service_id"),
@@ -843,6 +863,7 @@ async def update_case(
     metadata = dict(display_meta.get("metadata") or {})
     evidence = dict(display_meta.get("evidence") or {})
     artifacts = list(display_meta.get("artifacts") or [])
+    raw_report = resolve_raw_report(display_meta)
     fileserver_root = display_meta.get("fileserver_root")
 
     changed_fields: list[str] = []
@@ -902,6 +923,9 @@ async def update_case(
     if "artifacts" in fields_set:
         artifacts = [artifact.model_dump(mode="json") for artifact in (request.artifacts or [])]
         changed_fields.append("artifacts")
+    if "raw_report" in fields_set:
+        raw_report = request.raw_report.model_dump(mode="json") if request.raw_report else None
+        changed_fields.append("raw_report")
     if "metadata" in fields_set:
         metadata = dict(request.metadata or {})
         changed_fields.append("metadata")
@@ -911,6 +935,7 @@ async def update_case(
         "preferred_render_type": display_meta.get("preferred_render_type") or "generic",
         "evidence": evidence,
         "artifacts": artifacts,
+        "raw_report": raw_report,
         "metadata": metadata,
     }
     if fileserver_root:

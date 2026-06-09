@@ -110,6 +110,22 @@ class ArtifactItem(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class RawReportInfo(BaseModel):
+    markdown: str
+    title: Optional[str] = None
+    report_id: Optional[str] = None
+    source: Optional[str] = None
+    reported_at: Optional[datetime] = None
+
+    @field_validator("markdown")
+    @classmethod
+    def validate_markdown(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("raw_report.markdown cannot be empty")
+        return value
+
+
 class SuspicionSubmissionRequest(BaseModel):
     project_id: str
     report_id: Optional[str] = None
@@ -128,6 +144,7 @@ class SuspicionSubmissionRequest(BaseModel):
     subject: SubjectInfo
     evidence: EvidenceInfo = Field(default_factory=EvidenceInfo)
     artifacts: list[ArtifactItem] = Field(default_factory=list)
+    raw_report: Optional[RawReportInfo] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     def to_case_create_request(
@@ -159,6 +176,7 @@ class SuspicionSubmissionRequest(BaseModel):
             subject=self.subject,
             evidence=self.evidence,
             artifacts=self.artifacts,
+            raw_report=self.raw_report,
             metadata=metadata,
             created_by_type=created_by_type,
             created_by=created_by or self.reporter.name,
@@ -187,6 +205,7 @@ class CaseCreateRequest(SuspicionSubmissionRequest):
             "preferred_render_type": "generic",
             "evidence": self.evidence.model_dump(mode="json"),
             "artifacts": [artifact.model_dump(mode="json") for artifact in self.artifacts],
+            "raw_report": self.raw_report.model_dump(mode="json") if self.raw_report else None,
             "metadata": self.metadata,
         }
         return source_meta, target_meta, display_meta
@@ -248,6 +267,7 @@ class DraftCaseCreateRequest(BaseModel):
             subject=subject,
             evidence=self.evidence,
             artifacts=self.artifacts,
+            raw_report=None,
             metadata=metadata,
             created_by_type=created_by_type,
             created_by=created_by,
@@ -292,6 +312,7 @@ class CaseUpdateRequest(BaseModel):
     subject: Optional[SubjectInfo] = None
     evidence: Optional[EvidenceInfo] = None
     artifacts: Optional[list[ArtifactItem]] = None
+    raw_report: Optional[RawReportInfo] = None
     metadata: Optional[dict[str, Any]] = None
 
 

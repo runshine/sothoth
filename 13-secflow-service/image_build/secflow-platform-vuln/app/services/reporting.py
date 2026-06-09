@@ -15,6 +15,7 @@ REPORT_INDEX_KEY = "report_registry"
 CURRENT_REPORT_KEY = "current_report_id"
 DOCUMENTS_KEY = "documents"
 REPORT_TIME_FMT = "%Y-%m-%d %H:%M:%S UTC"
+RAW_REPORT_KEY = "raw_report"
 
 
 def _now_iso() -> str:
@@ -36,6 +37,10 @@ def _display_meta(case: Case) -> dict[str, Any]:
         return json.loads(case.display_meta_json or "{}")
     except Exception:
         return {}
+
+
+def _save_display_meta(case: Case, display_meta: dict[str, Any]) -> None:
+    case.display_meta_json = json.dumps(display_meta, ensure_ascii=False)
 
 
 def _source_meta(case: Case) -> dict[str, Any]:
@@ -104,9 +109,15 @@ def list_case_reports(case: Case) -> list[dict[str, Any]]:
 
 
 def get_current_report_summary(case: Case) -> dict[str, Any] | None:
+    raw_report = ensure_case_raw_report(case)
     registry = _load_registry(case)
     current_report_id = registry.get(CURRENT_REPORT_KEY)
     items = registry.get(DOCUMENTS_KEY, [])
+    raw_report_id = raw_report.get("report_id") if raw_report else None
+    if raw_report_id:
+        for item in items:
+            if item.get("report_id") == raw_report_id:
+                return item
     if current_report_id:
         for item in items:
             if item.get("report_id") == current_report_id:
@@ -118,6 +129,67 @@ def _excerpt(markdown: str, limit: int = 220) -> str:
     plain = re.sub(r"[#>*_`~\[\]\(\)-]", " ", markdown or "")
     plain = re.sub(r"\s+", " ", plain).strip()
     return plain[:limit]
+
+
+def _normalize_raw_report(raw_report: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(raw_report, dict):
+        return None
+    markdown = str(raw_report.get("markdown") or "").strip()
+    if not markdown:
+        return None
+    return {
+        "title": str(raw_report.get("title") or "原始漏洞报告").strip() or "原始漏洞报告",
+        "markdown": markdown,
+        "report_id": str(raw_report.get("report_id") or "raw-intake").strip() or "raw-intake",
+        "source": str(raw_report.get("source") or "").strip() or None,
+        "reported_at": raw_report.get("reported_at"),
+        "ingest_source": str(raw_report.get("ingest_source") or "").strip() or "field",
+    }
+
+
+def _extract_raw_report_from_artifact(artifact: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(artifact, dict) or artifact.get("kind") != "report":
+        return None
+    metadata = artifact.get("metadata") if isinstance(artifact.get("metadata"), dict) else {}
+    markdown = str(
+        artifact.get("content")
+        or metadata.get("markdown")
+        or metadata.get("content")
+        or ""
+    ).strip()
+    if not markdown:
+        return None
+    return {
+        "title": str(artifact.get("name") or metadata.get("title") or "原始漏洞报告").strip() or "原始漏洞报告",
+        "markdown": markdown,
+        "report_id": str(artifact.get("artifact_id") or metadata.get("report_id") or "raw-intake").strip() or "raw-intake",
+        "source": str(metadata.get("source") or artifact.get("content_ref") or "artifact").strip() or "artifact",
+        "reported_at": metadata.get("reported_at"),
+        "ingest_source": "artifact",
+    }
+
+
+def resolve_raw_report(display_meta: dict[str, Any]) -> dict[str, Any] | None:
+    normalized = _normalize_raw_report(display_meta.get(RAW_REPORT_KEY))
+    if normalized:
+        return normalized
+    artifacts = display_meta.get("artifacts")
+    if isinstance(artifacts, list):
+        for artifact in artifacts:
+            extracted = _extract_raw_report_from_artifact(artifact)
+            if extracted:
+                return extracted
+    return None
+
+
+def ensure_case_raw_report(case: Case) -> dict[str, Any] | None:
+    display_meta = _display_meta(case)
+    normalized = resolve_raw_report(display_meta)
+    current = _normalize_raw_report(display_meta.get(RAW_REPORT_KEY))
+    if normalized != current:
+        display_meta[RAW_REPORT_KEY] = normalized
+        _save_display_meta(case, display_meta)
+    return normalized
 
 
 def read_report_content(storage_path: str | None) -> str | None:
@@ -343,7 +415,24 @@ def ensure_case_report_documents(
     results: list[Result],
     manual_tasks: list[ManualTask],
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    raw_report = ensure_case_raw_report(case)
     existing_docs = {item.get("report_id"): item for item in list_case_reports(case)}
+    if raw_report:
+        raw_report_id = raw_report.get("report_id") or "raw-intake"
+        write_case_report_document(
+            case,
+            report_id=raw_report_id,
+            title=raw_report.get("title") or "原始漏洞报告",
+            report_kind="imported_raw",
+            render_format="markdown",
+            stage="intake",
+            markdown=raw_report.get("markdown") or "",
+            generated_by=raw_report.get("source") or "vuln-intake",
+            generated_at=str(raw_report.get("reported_at") or case.created_at.isoformat()),
+            source_service_id=raw_report.get("source"),
+            set_as_current=True,
+        )
+        existing_docs = {item.get("report_id"): item for item in list_case_reports(case)}
     if "intake" not in existing_docs:
         write_case_report_document(
             case,

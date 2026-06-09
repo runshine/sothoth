@@ -529,6 +529,71 @@ def test_get_case_by_global_vuln_id(client: TestClient):
     assert list_resp.json()["items"][0]["global_vuln_id"] == global_vuln_id
 
 
+def test_case_raw_report_is_promoted_to_current_report(client: TestClient):
+    create_resp = client.post(
+        "/api/vuln/cases",
+        json=make_suspicion_payload(
+            title="Raw report case",
+            raw_report={
+                "markdown": "# Imported report\n\nThis is the upstream markdown report.",
+                "title": "Imported raw report",
+                "report_id": "raw-upstream-001",
+                "source": "upstream-service",
+            },
+        ),
+    )
+    assert create_resp.status_code == 200
+    case_id = create_resp.json()["id"]
+
+    detail_resp = client.get(f"/api/vuln/cases/{case_id}")
+    assert detail_resp.status_code == 200
+    payload = detail_resp.json()
+    assert payload["has_raw_report"] is True
+    assert payload["raw_report_summary"]["report_id"] == "raw-upstream-001"
+    assert payload["report_summary"]["report_id"] == "raw-upstream-001"
+    assert payload["report_summary"]["report_kind"] == "imported_raw"
+    assert payload["display_summary"]["current_report_id"] == "raw-upstream-001"
+
+    reports_resp = client.get(f"/api/vuln/cases/{case_id}/reports")
+    assert reports_resp.status_code == 200
+    assert any(item["report_id"] == "raw-upstream-001" and item["report_kind"] == "imported_raw" for item in reports_resp.json()["items"])
+
+    report_resp = client.get(f"/api/vuln/cases/{case_id}/report", params={"report_id": "raw-upstream-001"})
+    assert report_resp.status_code == 200
+    assert "This is the upstream markdown report." in report_resp.json()["content"]
+
+
+def test_case_report_artifact_is_used_as_raw_report_fallback(client: TestClient):
+    create_resp = client.post(
+        "/api/vuln/cases",
+        json=make_suspicion_payload(
+            title="Artifact raw report case",
+            artifacts=[
+                {
+                    "kind": "report",
+                    "name": "scanner-report.md",
+                    "content": "# Artifact report\n\nFallback from artifact body.",
+                    "encoding": "utf-8",
+                    "metadata": {
+                        "report_id": "artifact-raw-001",
+                        "source": "artifact-scanner",
+                    },
+                }
+            ],
+        ),
+    )
+    assert create_resp.status_code == 200
+    case_id = create_resp.json()["id"]
+
+    detail_resp = client.get(f"/api/vuln/cases/{case_id}")
+    assert detail_resp.status_code == 200
+    payload = detail_resp.json()
+    assert payload["has_raw_report"] is True
+    assert payload["raw_report_summary"]["report_id"] == "artifact-raw-001"
+    assert payload["report_summary"]["report_id"] == "artifact-raw-001"
+    assert payload["report_summary"]["report_kind"] == "imported_raw"
+
+
 def test_update_case_intake_partial_fields(client: TestClient):
     create_resp = client.post(
         "/api/vuln/cases",
