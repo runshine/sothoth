@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from dataclasses import dataclass, field
 
-from sqlalchemy import Integer, case, cast, func, or_, text
+from sqlalchemy import Integer, and_, case, cast, func, or_, text
 from sqlalchemy.exc import IntegrityError, OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.orm import Session, load_only
 
