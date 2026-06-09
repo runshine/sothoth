@@ -7790,6 +7790,7 @@ class TaskManager:
                         recovered_after_errors = (
                             sync_supervisor_state.consecutive_error_count > 0
                             and str(sync_supervisor_state.last_result or "").strip() == "error"
+                            and mapped_status not in {"failed", "cancelled", "downstream_missing"}
                         )
                         should_apply = observed_apply_state and (mapped_status != before_status or force)
                         if should_apply:
@@ -14280,8 +14281,10 @@ class TaskManager:
 
     def _task_needs_downstream_reconcile(self, db: Session, task: BinarySecurityTask) -> bool:
         status = str(task.status or "").strip().lower()
-        if status in {"pending", "failed"}:
+        if status == "pending":
             return True
+        if status == "failed":
+            return self._failed_task_needs_downstream_reconcile(db, task)
         if status not in {"dispatching", "running"}:
             return False
         if self._streaming_mode_enabled(task) and self._is_streaming_tail_stage(task, task.current_stage):
@@ -14305,6 +14308,9 @@ class TaskManager:
             30,
         )
         return elapsed_seconds >= grace_seconds
+
+    def _failed_task_needs_downstream_reconcile(self, db: Session, task: BinarySecurityTask) -> bool:
+        return bool(self._task_reconcile_candidate_items(db, task, include_failed_terminal_items=False))
 
     def _active_reconcile_stage_name(self, task: BinarySecurityTask) -> str | None:
         if (
@@ -14386,6 +14392,7 @@ class TaskManager:
         stage_name: str | None = None,
         item_id: str | None = None,
         force: bool = False,
+        include_failed_terminal_items: bool = True,
     ) -> list[BinarySecurityStageItem]:
         query = db.query(BinarySecurityStageItem).filter(
             BinarySecurityStageItem.task_id == task.id,
@@ -14403,7 +14410,16 @@ class TaskManager:
         if force:
             return items
         candidates: list[BinarySecurityStageItem] = []
+        task_status = str(task.status or "").strip().lower() or None
         for item in items:
+            item_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()
+            if (
+                not include_failed_terminal_items
+                and task_status == "failed"
+                and item_status in {"failed", "cancelled", "downstream_missing", "partial_success", "success"}
+                and not self._item_missing_recorded_downstream_status(item)
+            ):
+                continue
             if (
                 normalize_stage_name(item.stage_name) == "dataflow_vuln_scan"
                 and not str(item.downstream_task_id or "").strip()
@@ -14413,7 +14429,7 @@ class TaskManager:
                 continue
             if self._item_needs_downstream_sync(
                 item,
-                for_task_status=str(task.status or "").strip().lower() or None,
+                for_task_status=task_status,
             ):
                 candidates.append(item)
                 continue

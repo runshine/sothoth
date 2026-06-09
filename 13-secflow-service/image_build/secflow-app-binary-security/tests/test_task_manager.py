@@ -24815,6 +24815,44 @@ def _test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with
     self.assertTrue(manager._task_needs_downstream_reconcile(db, task))
 
 
+def _test_task_needs_downstream_reconcile_skips_failed_task_with_terminal_child(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-failed-terminal",
+        project_id="p1",
+        status="failed",
+        current_stage="firmware_unpack",
+        last_error="Task owner pod lost",
+    )
+    item = BinarySecurityStageItem(
+        id="si-failed-terminal",
+        task_id="task-failed-terminal",
+        project_id="p1",
+        stage_run_id="sr-failed-terminal",
+        stage_name="firmware_unpack",
+        item_key="fw.bin",
+        status="failed",
+        downstream_service="firmware_unpacker",
+        downstream_task_id="fu-failed-terminal",
+        error_message="Task owner pod lost",
+        result={
+            "downstream_status": "failed",
+            "downstream": {"status": "failed"},
+            "sync_status": "synced",
+            "sync_observation": {
+                "sync_status": "synced",
+                "mapped_status": "failed",
+                "downstream_status": "failed",
+                "last_result": "success",
+                "last_synced_at": _now().isoformat(),
+            },
+        },
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item])
+    self.assertFalse(manager._task_needs_downstream_reconcile(db, task))
+    self.assertEqual([], manager._task_reconcile_candidate_items(db, task, include_failed_terminal_items=False))
+
+
 def _test_ensure_stage_inputs_available_rebuilds_system_summary_before_dataflow_stage(self):
     manager = TaskManager()
     task = BinarySecurityTask(
@@ -25345,7 +25383,7 @@ def _test_reclaim_stale_dispatching_skips_failed_streaming_task(self):
     self.assertIn("task_finalized_after_child_failure", event_types)
 
 
-def _test_sync_downstream_status_records_recovery_event_only_once(self):
+def _test_sync_downstream_status_does_not_record_recovery_event_for_failed_terminal_child(self):
     manager = TaskManager()
     task = BinarySecurityTask(
         id="task-recovery-once",
@@ -25440,8 +25478,89 @@ def _test_sync_downstream_status_records_recovery_event_only_once(self):
         manager._write_task_metadata_async = original_write
         manager._enqueue_task = original_enqueue
 
-    self.assertEqual(1, first_count)
-    self.assertEqual(1, second_count)
+    self.assertEqual(0, first_count)
+    self.assertEqual(0, second_count)
+
+
+def _test_sync_downstream_status_skips_recovery_event_for_terminal_failed_child(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-recovery-terminal-failed",
+        project_id="p1",
+        name="demo",
+        status="failed",
+        current_stage="firmware_unpack",
+        task_type=TASK_TYPE_BINARY,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    run = BinarySecurityStageRun(
+        id="sr-recovery-terminal-failed",
+        task_id="task-recovery-terminal-failed",
+        project_id="p1",
+        stage_name="firmware_unpack",
+        sequence_no=1,
+        status="failed",
+        last_error="Task owner pod lost",
+    )
+    item = BinarySecurityStageItem(
+        id="si-recovery-terminal-failed",
+        task_id="task-recovery-terminal-failed",
+        project_id="p1",
+        stage_run_id="sr-recovery-terminal-failed",
+        stage_name="firmware_unpack",
+        item_key="fw.bin",
+        item_name="fw.bin",
+        status="failed",
+        downstream_service="firmware_unpacker",
+        downstream_task_id="fu-terminal",
+        error_message="Task owner pod lost",
+        result={
+            "downstream_status": "failed",
+            "sync_observation": {
+                "sync_status": "transport_error",
+                "error_message": "temporary timeout",
+                "error_type": "timeout",
+                "last_result": "error",
+                "consecutive_error_count": 2,
+                "last_error_at": (_now() - timedelta(minutes=2)).isoformat(),
+            },
+        },
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
+
+    async def _fetch(_task, _item, _token):
+        return {"task_id": "fu-terminal", "status": "failed", "error": "Task owner pod lost"}
+
+    async def _noop_write(*_args, **_kwargs):
+        return None
+
+    original_fetch = manager._fetch_downstream_task_payload
+    original_write = manager._write_task_metadata_async
+    original_enqueue = manager._enqueue_task
+    try:
+        manager._fetch_downstream_task_payload = _fetch
+        manager._write_task_metadata_async = _noop_write
+        manager._enqueue_task = lambda *_args, **_kwargs: None
+        asyncio.run(
+            manager.sync_downstream_status(
+                db,
+                project_id="p1",
+                task_id="task-recovery-terminal-failed",
+                stage_name="firmware_unpack",
+                apply_state=False,
+                force=True,
+            )
+        )
+    finally:
+        manager._fetch_downstream_task_payload = original_fetch
+        manager._write_task_metadata_async = original_write
+        manager._enqueue_task = original_enqueue
+
+    recovery_events = [event for event in db.events if getattr(event, "event_type", None) == "downstream_poll_recovered_after_errors"]
+    self.assertEqual([], recovery_events)
 
 
 def _test_requeue_released_running_locked_requeues_streaming_tail_with_active_items(self):
@@ -25979,6 +26098,7 @@ TaskManagerTests.test_tail_control_plane_stale_error_does_not_pollute_sync_error
 TaskManagerTests.test_worker_skips_tail_tasks_in_downstream_reconcile_candidates = _test_worker_skips_tail_tasks_in_downstream_reconcile_candidates
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_locally_owned_running_task = _test_task_needs_downstream_reconcile_skips_locally_owned_running_task
 TaskManagerTests.test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items = _test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items
+TaskManagerTests.test_task_needs_downstream_reconcile_skips_failed_task_with_terminal_child = _test_task_needs_downstream_reconcile_skips_failed_task_with_terminal_child
 TaskManagerTests.test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged = _test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged
 TaskManagerTests.test_active_operation_ignores_expired_claim_lease = _test_active_operation_ignores_expired_claim_lease
 TaskManagerTests.test_persist_child_sync_observation_records_observation_persist_failed = _test_persist_child_sync_observation_records_observation_persist_failed
@@ -25997,7 +26117,8 @@ TaskManagerTests.test_task_heartbeat_controller_refreshes_tail_reconcile_owner_t
 TaskManagerTests.test_run_task_finally_preserves_tail_runtime_lease = _test_run_task_finally_preserves_tail_runtime_lease
 TaskManagerTests.test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_failed = _test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_failed
 TaskManagerTests.test_reclaim_stale_dispatching_skips_failed_streaming_task = _test_reclaim_stale_dispatching_skips_failed_streaming_task
-TaskManagerTests.test_sync_downstream_status_records_recovery_event_only_once = _test_sync_downstream_status_records_recovery_event_only_once
+TaskManagerTests.test_sync_downstream_status_does_not_record_recovery_event_for_failed_terminal_child = _test_sync_downstream_status_does_not_record_recovery_event_for_failed_terminal_child
+TaskManagerTests.test_sync_downstream_status_skips_recovery_event_for_terminal_failed_child = _test_sync_downstream_status_skips_recovery_event_for_terminal_failed_child
 TaskManagerTests.test_confirm_module_selection_updates_task = _test_confirm_module_selection_updates_task
 TaskManagerTests.test_confirm_entry_selection_updates_task = _test_confirm_entry_selection_updates_task
 TaskManagerTests.test_get_project_config_normalizes_legacy_partial_success_stage_names = _test_get_project_config_normalizes_legacy_partial_success_stage_names
