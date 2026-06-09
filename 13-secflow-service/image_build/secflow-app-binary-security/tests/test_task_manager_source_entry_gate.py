@@ -107,3 +107,73 @@ def test_source_system_analysis_rebuild_restores_entry_analysis_input_contract_f
     assert selected["source_root_path"] == "/w/input"
     assert selected["source_dir"] == "/w/input"
     assert selected["module_dir"] == "/w/input"
+
+
+def test_source_entry_analysis_inputs_refreshes_legacy_selected_modules_missing_contract_fields():
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-source-entry-input-refresh",
+        project_id="p1",
+        name="source-task",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.summary = {
+        "selected_modules": [
+            {
+                "module_key": "source_project-dns",
+                "module_name": "dns",
+                "risk_level": "高",
+                "risk_score": 78,
+            }
+        ]
+    }
+    stage_run = BinarySecurityStageRun(
+        id="sr-system-refresh",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        sequence_no=1,
+        status="success",
+    )
+    system_item = BinarySecurityStageItem(
+        id="si-system-refresh",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=stage_run.id,
+        stage_name="system_analysis",
+        item_key="source_project",
+        item_name="source-project",
+        status="success",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-demo",
+    )
+    system_item.input_ref = {"input_path": "/w/input", "firmware_key": "source_project", "task_type": TASK_TYPE_SOURCE}
+    system_item.result = {
+        "firmware_key": "source_project",
+        "firmware_name": "demo",
+        "filename": "source-project",
+        "unpacked_root": "/w/input",
+        "source_root": "/w/input",
+        "task_type": TASK_TYPE_SOURCE,
+        "modules": [
+            {
+                "module_key": "source_project-dns",
+                "module_name": "dns",
+                "risk_level": "高",
+                "risk_score": 78,
+            }
+        ],
+    }
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[system_item], events=[])
+
+    inputs = manager._entry_analysis_inputs(db, task)
+
+    assert inputs[0]["firmware_key"] == "source_project"
+    assert inputs[0]["source_root"] == "/w/input"
+    assert inputs[0]["source_dir"] == "/w/input"

@@ -27157,7 +27157,16 @@ class TaskManager:
 
     def _entry_analysis_inputs(self, db: Session, task: BinarySecurityTask) -> list[dict[str, Any]]:
         if self._task_type(task) == TASK_TYPE_SOURCE:
-            return list(task.summary.get("selected_modules") or [])
+            selected_modules = [dict(module) for module in (task.summary.get("selected_modules") or []) if isinstance(module, dict)]
+            if selected_modules and any(
+                not str(module.get("firmware_key") or "").strip()
+                or not str(module.get("source_root") or module.get("source_root_path") or "").strip()
+                or not str(module.get("source_dir") or module.get("module_dir") or "").strip()
+                for module in selected_modules
+            ):
+                self._refresh_system_analysis_stage_from_synced_items(db, task)
+                selected_modules = [dict(module) for module in (task.summary.get("selected_modules") or []) if isinstance(module, dict)]
+            return selected_modules
         b2s_results = list(task.summary.get("b2s_results") or [])
         if b2s_results:
             normalized = [self._normalize_entry_analysis_module_input(task, module) for module in b2s_results if isinstance(module, dict)]
