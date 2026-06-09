@@ -168,6 +168,9 @@ class BinarySecurityTaskResponse(BaseModel):
     stage_sequence: list[str] = Field(default_factory=list)
     is_queued: bool = False
     queue_position: Optional[int] = None
+    queue_state: str = "idle"
+    recoverable_reason: Optional[str] = None
+    last_reconcile_at: Optional[datetime] = None
     dispatcher_instance_id: Optional[str] = None
     task_lease_owner_instance_id: Optional[str] = None
     task_lease_expires_at: Optional[datetime] = None
@@ -364,6 +367,7 @@ class BinarySecurityTaskListResponse(BaseModel):
     max_concurrent_tasks: int = 50
     project_stats: BinarySecurityProjectStats = Field(default_factory=BinarySecurityProjectStats)
     project_stage_aggregates: list[BinarySecurityProjectStageAggregate] = Field(default_factory=list)
+    queue_runtime: dict[str, Any] = Field(default_factory=dict)
     items: list[BinarySecurityTaskResponse] = Field(default_factory=list)
 
 

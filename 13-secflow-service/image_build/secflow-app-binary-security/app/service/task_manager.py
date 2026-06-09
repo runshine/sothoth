@@ -1882,7 +1882,10 @@ class TaskManager:
             },
         )
         if fallback_status is not None:
-            task.status = fallback_status
+            if self._is_streaming_tail_stage(task, task.current_stage):
+                task.status = "running"
+            else:
+                task.status = fallback_status
         task.tail_reconcile_state = "handoff_waiting"
         observe_tail_reconcile_heartbeat("handoff")
         observe_tail_reconcile_owner("handoff_started")
@@ -2473,7 +2476,7 @@ class TaskManager:
                 task_type=normalized_task_type,
                 ttl_seconds=3.0,
                 loader=lambda: self._build_queue_info(db, project_id=project_id),
-                fallback={"running_count": 0, "queued_count": 0, "pending_positions": {}},
+                fallback={"running_count": 0, "queued_count": 0, "pending_positions": {}, "last_reconcile_at": None},
             )
             observe_task_list_query_stage(
                 stage="queue_info",
@@ -2568,6 +2571,9 @@ class TaskManager:
                 max_concurrent_tasks=service_config.max_concurrent_tasks,
                 project_stats=project_stats,
                 project_stage_aggregates=project_stage_aggregates,
+                queue_runtime={
+                    "last_reconcile_at": queue_info.get("last_reconcile_at"),
+                },
                 items=items,
             )
         except Exception:
@@ -3804,6 +3810,8 @@ class TaskManager:
 
     def _build_orchestration_observability(self, db: Session, task: BinarySecurityTask) -> dict[str, Any]:
         now_value = _now()
+        queue_info = self._build_queue_info(db, project_id=task.project_id)
+        queue_state, recoverable_reason = self._task_queue_state(task, queue_info)
         events = (
             db.query(BinarySecurityStateEvent)
             .filter(BinarySecurityStateEvent.task_id == task.id)
@@ -3875,6 +3883,11 @@ class TaskManager:
                 "processing": processing[:10],
                 "dead_letters": dead_letters[:10],
                 "recent": recent_events[:20],
+            },
+            "queue_runtime": {
+                "queue_state": queue_state,
+                "recoverable_reason": recoverable_reason,
+                "last_reconcile_at": self._last_queue_reconcile_at,
             },
             "task_state_lock": {
                 "active": bool(lease and lease.lease_expires_at and lease.lease_expires_at > now_value),
@@ -7015,22 +7028,39 @@ class TaskManager:
             released_running_requeued,
             recovered_missing_terminal_events,
         ) = self._run_parent_reclaim_pass(db)
+        idle_tail_recovered = self._recover_idle_tail_reconciliation_tasks_locked(db)
         if (
             stale_dispatching_reclaimed
             or stale_stage_item_reclaimed
             or stale_running_reclaimed
             or released_running_requeued
             or recovered_missing_terminal_events
+            or idle_tail_recovered
         ):
             # Persist the reclaimed task state before seeding Redis queues.
             # Otherwise the surrounding loop closes the session and rolls the
             # reclaim back, leaving tasks permanently stuck on dead workers.
             db.commit()
+        task_queue_runtime = await get_task_queue().cleanup_dedupe_orphans(self.cfg.queue.task_queue_key)
+        operation_queue_runtime = await get_task_queue().cleanup_dedupe_orphans(self.cfg.queue.operation_queue_key)
         seed_batch = max(1, int(self.cfg.queue.seed_batch_size or 20))
         pending_ids = [
             row[0]
             for row in db.query(BinarySecurityTask.id)
-            .filter(BinarySecurityTask.status == "pending")
+            .filter(
+                or_(
+                    BinarySecurityTask.status == "pending",
+                    and_(
+                        BinarySecurityTask.status == "dispatching",
+                        BinarySecurityTask.lease_expires_at.isnot(None),
+                        BinarySecurityTask.lease_expires_at < now,
+                    ),
+                    and_(
+                        BinarySecurityTask.runtime_phase == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+                        BinarySecurityTask.status.in_(["pending", "running"]),
+                    ),
+                )
+            )
             .order_by(BinarySecurityTask.updated_at.asc(), BinarySecurityTask.created_at.asc(), BinarySecurityTask.id.asc())
             .limit(seed_batch)
             .all()
@@ -7044,9 +7074,15 @@ class TaskManager:
             .all()
         ]
         for task_id in pending_ids:
-            await get_task_queue().push_task(task_id)
+            if task_queue_runtime.get("orphan_ids") and task_id in set(task_queue_runtime["orphan_ids"]):
+                await get_task_queue().force_requeue_task(task_id)
+            else:
+                await get_task_queue().push_task(task_id)
         for operation_id in operation_ids:
-            await get_task_queue().push_operation(operation_id)
+            if operation_queue_runtime.get("orphan_ids") and operation_id in set(operation_queue_runtime["orphan_ids"]):
+                await get_task_queue().force_requeue_operation(operation_id)
+            else:
+                await get_task_queue().push_operation(operation_id)
 
     def _run_parent_reclaim_pass(self, db: Session) -> tuple[bool, bool, bool, bool, bool]:
         if not isinstance(db, Session):
@@ -7066,6 +7102,56 @@ class TaskManager:
             self._requeue_released_running_locked(db),
             self._recover_missing_stage_terminal_events_locked(db),
         )
+
+    def _recover_idle_tail_reconciliation_tasks_locked(self, db: Session) -> bool:
+        rows = (
+            db.query(BinarySecurityTask)
+            .filter(
+                BinarySecurityTask.runtime_phase == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+                BinarySecurityTask.status == "pending",
+            )
+            .all()
+        )
+        if not rows:
+            return False
+        recovered = False
+        for task in rows:
+            active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
+            if active_item_count > 0 or has_downstream_refs:
+                continue
+            next_stage = self._next_incomplete_stage(db, task)
+            if next_stage and self._is_streaming_tail_stage(task, next_stage):
+                continue
+            previous_stage = str(task.current_stage or "").strip() or None
+            self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+            task.tail_reconcile_state = "idle"
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.lease_expires_at = None
+            task.finished_at = None
+            task.last_error = None
+            if next_stage:
+                task.current_stage = next_stage
+            self._clear_runtime_lease(db, task.id)
+            self._release_tail_reconcile_owner(task.id)
+            self._record_event(
+                db,
+                task,
+                "tail_reconciliation_released_idle",
+                "流式尾段已无活跃子任务，父任务已退出 tail 收口并回到普通调度态",
+                level="warning",
+                stage_name=previous_stage or task.current_stage,
+                payload={
+                    "previous_stage": previous_stage,
+                    "next_stage": next_stage,
+                    "active_item_count": active_item_count,
+                    "has_downstream_refs": has_downstream_refs,
+                },
+            )
+            recovered = True
+        if recovered:
+            db.flush()
+        return recovered
 
     async def sync_downstream_status(
         self,
@@ -15218,7 +15304,25 @@ class TaskManager:
             "running_count": running_count,
             "queued_count": len(queued_rows),
             "pending_positions": pending_positions,
+            "last_reconcile_at": self._last_queue_reconcile_at,
         }
+
+    def _task_queue_state(self, task: BinarySecurityTask, queue_info: dict[str, Any] | None = None) -> tuple[str, str | None]:
+        queue_info = queue_info or {}
+        pending_positions = queue_info.get("pending_positions", {}) or {}
+        status = str(task.status or "").strip().lower()
+        runtime_phase = self._task_runtime_phase(task)
+        if runtime_phase == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+            return "tail_reconciling", "tail_reconciliation_active"
+        if status in {"dispatching", "running"}:
+            if task.dispatcher_instance_id or task.lease_expires_at:
+                return "dispatching", None
+            return "leased", "execution_owner_missing"
+        if status == "pending":
+            if task.id in pending_positions:
+                return "queued", None
+            return "db_pending_not_enqueued", "pending_task_not_present_in_redis_queue"
+        return "idle", None
 
     def _observe_worker_counts(self) -> None:
         observe_worker_counts(
@@ -16229,7 +16333,7 @@ class TaskManager:
             takeover_result="recovered",
         )
         if not self._runtime_lease_is_active(lease):
-            task.status = "pending"
+            task.status = "running"
         self._clear_task_abnormal_reason_snapshot(db, task)
         if record_event:
             self._record_event(
@@ -19264,6 +19368,7 @@ class TaskManager:
         metrics = task.metrics or {}
         queue_info = queue_info or {"pending_positions": {}}
         queue_position = queue_info.get("pending_positions", {}).get(task.id)
+        queue_state, recoverable_reason = self._task_queue_state(task, queue_info)
         stage_sequence = self._stage_sequence_for_task(task)
         stage_summaries = self._build_task_list_stage_summaries(
             db,
@@ -19331,8 +19436,11 @@ class TaskManager:
             failure_message=self._string_or_none(failure_snapshot.get("failure_message") or failure_snapshot.get("error")),
             firmware_path=task.firmware_path,
             stage_sequence=stage_sequence,
-            is_queued=task.status == "pending",
+            is_queued=queue_state == "queued",
             queue_position=queue_position,
+            queue_state=queue_state,
+            recoverable_reason=recoverable_reason,
+            last_reconcile_at=queue_info.get("last_reconcile_at"),
             dispatcher_instance_id=task.dispatcher_instance_id,
             task_lease_owner_instance_id=lease_owner,
             task_lease_expires_at=lease_expires_at,
@@ -19664,6 +19772,7 @@ class TaskManager:
         metrics = task.metrics or {}
         queue_info = queue_info or {"pending_positions": {}}
         queue_position = queue_info.get("pending_positions", {}).get(task.id)
+        queue_state, recoverable_reason = self._task_queue_state(task, queue_info)
         task_retry_supported, task_retry_reason, _ = self._task_retry_support(db, task)
         task_continue_supported, task_continue_reason, _ = self._task_continue_support(db, task)
         task_retry_failed_supported, task_retry_failed_reason, _, _ = self._task_retry_failed_items_support(db, task)
@@ -19744,8 +19853,11 @@ class TaskManager:
             failure_message=self._string_or_none(failure_snapshot.get("failure_message") or failure_snapshot.get("error")),
             firmware_path=task.firmware_path,
             stage_sequence=stage_sequence,
-            is_queued=task.status == "pending",
+            is_queued=queue_state == "queued",
             queue_position=queue_position,
+            queue_state=queue_state,
+            recoverable_reason=recoverable_reason,
+            last_reconcile_at=queue_info.get("last_reconcile_at"),
             dispatcher_instance_id=task.dispatcher_instance_id,
             task_lease_owner_instance_id=lease_owner,
             task_lease_expires_at=lease_expires_at,
@@ -21698,7 +21810,10 @@ class TaskManager:
                         takeover_result="refresh",
                     )
                     if not self._runtime_lease_is_active(lease):
-                        task.status = "pending"
+                        if str(task.current_stage or "").strip() and self._is_streaming_tail_stage(task, task.current_stage):
+                            task.status = "running"
+                        else:
+                            task.status = "pending"
                 else:
                     task.dispatcher_instance_id = None
                     task.dispatch_started_at = None
@@ -21751,7 +21866,7 @@ class TaskManager:
             and not stage_retry_mode
             and not task_retry_mode
         ):
-            task.status = "pending"
+            task.status = "running"
             self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TAIL_RECONCILIATION)
             task.current_stage = failed_stage_run.stage_name or task.current_stage
             task.dispatcher_instance_id = None

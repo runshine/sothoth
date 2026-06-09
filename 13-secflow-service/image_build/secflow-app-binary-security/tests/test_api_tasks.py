@@ -44,6 +44,8 @@ class _RouteManagerStub:
             task_type="source",
             name="streaming-task",
             status="pending",
+            queue_state="tail_reconciling",
+            recoverable_reason="tail_reconciliation_active",
             current_stage="dataflow_vuln_scan",
             firmware_path="/src",
             output_root="/o",
@@ -209,6 +211,7 @@ class _RouteManagerStub:
             task_type="source",
             name="entry-confirmed-task",
             status="pending",
+            queue_state="queued",
             current_stage="dataflow_vuln_scan",
             firmware_path="/src",
             output_root="/o",
@@ -265,6 +268,7 @@ class _RouteManagerStub:
             max_concurrent_tasks=12,
             project_stats=BinarySecurityProjectStats(total=1, running=1),
             project_stage_aggregates=[],
+            queue_runtime={"last_reconcile_at": None},
             items=[
                 BinarySecurityTaskResponse(
                     id="t-list-1",
@@ -272,6 +276,7 @@ class _RouteManagerStub:
                     task_type=task_type or "source",
                     name="list-task",
                     status="running",
+                    queue_state="dispatching",
                     current_stage="entry_analysis",
                     firmware_path="/src",
                     stage_summaries=[

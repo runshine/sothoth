@@ -19,6 +19,9 @@ class _FakeRedis:
         bucket.add(value)
         return 1 if len(bucket) != before else 0
 
+    async def smembers(self, key):
+        return self.sets.get(key) or set()
+
     async def rpush(self, key, value):
         self.lists.setdefault(key, []).append(value)
 
@@ -40,6 +43,9 @@ class _FakeRedis:
         if not withscores:
             return [item[0] for item in items]
         return items
+
+    async def zscore(self, key, value):
+        return (self.sorted_sets.get(key) or {}).get(value)
 
     async def lpos(self, key, value):
         values = self.lists.get(key) or []
@@ -130,6 +136,56 @@ class TaskQueueTests(unittest.TestCase):
 
         self.assertEqual(["task-1"], fake.lists[queue.config.task_queue_key])
         self.assertEqual({"task-1"}, fake.sets[f"{queue.config.task_queue_key}:dedupe"])
+
+    def test_force_requeue_restores_orphaned_task(self):
+        queue = TaskQueue()
+        fake = _FakeRedis()
+        queue._client = fake
+        fake.sets[f"{queue.config.task_queue_key}:dedupe"] = {"task-1"}
+
+        asyncio.run(queue.force_requeue_task("task-1"))
+
+        self.assertEqual(["task-1"], fake.lists[queue.config.task_queue_key])
+        self.assertEqual({"task-1"}, fake.sets[f"{queue.config.task_queue_key}:dedupe"])
+
+    def test_dedupe_orphans_reports_set_without_list(self):
+        queue = TaskQueue()
+        fake = _FakeRedis()
+        queue._client = fake
+        fake.sets[f"{queue.config.task_queue_key}:dedupe"] = {"task-1"}
+
+        snapshot = asyncio.run(queue.dedupe_orphans(queue.config.task_queue_key))
+
+        self.assertEqual(1, snapshot["orphan_count"])
+        self.assertEqual(["task-1"], snapshot["orphan_ids"])
+
+    def test_dedupe_orphans_restores_missing_timestamp_for_live_entry(self):
+        queue = TaskQueue()
+        fake = _FakeRedis()
+        queue._client = fake
+        fake.sets[f"{queue.config.task_queue_key}:dedupe"] = {"task-1"}
+        fake.lists[queue.config.task_queue_key] = ["task-1"]
+
+        snapshot = asyncio.run(queue.dedupe_orphans(queue.config.task_queue_key))
+
+        self.assertEqual(0, snapshot["orphan_count"])
+        self.assertEqual(1, snapshot["missing_timestamp_count"])
+        self.assertEqual(["task-1"], snapshot["missing_timestamp_ids"])
+        self.assertIn("task-1", fake.sorted_sets[f"{queue.config.task_queue_key}:enqueued_at"])
+
+    def test_cleanup_dedupe_orphans_removes_orphan_members(self):
+        queue = TaskQueue()
+        fake = _FakeRedis()
+        queue._client = fake
+        fake.sets[f"{queue.config.task_queue_key}:dedupe"] = {"task-1"}
+        fake.sorted_sets[f"{queue.config.task_queue_key}:enqueued_at"] = {"task-1": 1.0}
+
+        snapshot = asyncio.run(queue.cleanup_dedupe_orphans(queue.config.task_queue_key))
+
+        self.assertEqual(1, snapshot["removed_orphan_count"])
+        self.assertEqual(["task-1"], snapshot["removed_orphan_ids"])
+        self.assertEqual(set(), fake.sets[f"{queue.config.task_queue_key}:dedupe"])
+        self.assertEqual({}, fake.sorted_sets[f"{queue.config.task_queue_key}:enqueued_at"])
 
     def test_pop_task_removes_dedupe_marker(self):
         queue = TaskQueue()

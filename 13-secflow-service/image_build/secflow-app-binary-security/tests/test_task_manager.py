@@ -18287,6 +18287,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             sequence_no=5,
             status="running",
         )
+
         item = BinarySecurityStageItem(
             id="si1",
             task_id="task1",
@@ -18317,6 +18318,81 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual("queued", item.status)
         self.assertIn("temporary downstream error", item.error_message or "")
         self.assertTrue(any(event.event_type == "streaming_stage_item_requeued_after_worker_error" for event in fake_session.events))
+
+    def test_task_queue_state_marks_pending_without_queue_membership(self):
+        task = BinarySecurityTask(
+            id="task-pending",
+            project_id="p1",
+            name="demo",
+            status="pending",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+
+        queue_state, recoverable_reason = self.manager._task_queue_state(task, {"pending_positions": {}, "last_reconcile_at": None})
+
+        self.assertEqual("db_pending_not_enqueued", queue_state)
+        self.assertEqual("pending_task_not_present_in_redis_queue", recoverable_reason)
+
+    def test_task_queue_state_marks_pending_with_queue_membership_as_queued(self):
+        task = BinarySecurityTask(
+            id="task-pending-queued",
+            project_id="p1",
+            name="demo",
+            status="pending",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+
+        queue_state, recoverable_reason = self.manager._task_queue_state(
+            task,
+            {"pending_positions": {"task-pending-queued": 1}, "last_reconcile_at": None},
+        )
+
+        self.assertEqual("queued", queue_state)
+        self.assertIsNone(recoverable_reason)
+
+    def test_recover_idle_tail_reconciliation_task_releases_to_owned_execution(self):
+        task = BinarySecurityTask(
+            id="task-tail-idle",
+            project_id="p1",
+            name="demo",
+            status="pending",
+            current_stage="dataflow_vuln_scan",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json='{"pipeline_mode": "mixed_streaming"}',
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            tail_reconcile_state="handoff_waiting",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-tail-idle",
+            task_id="task-tail-idle",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            sequence_no=3,
+            status="pending",
+        )
+        fake_db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[], events=[])
+
+        recovered = self.manager._recover_idle_tail_reconciliation_tasks_locked(fake_db)
+
+        self.assertTrue(recovered)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
+        self.assertEqual("idle", task.tail_reconcile_state)
+        self.assertEqual("pending", task.status)
+        self.assertTrue(any(event.event_type == "tail_reconciliation_released_idle" for event in fake_db.events))
 
     def test_run_task_ignores_stale_worker_failure_after_retry(self):
         task = BinarySecurityTask(
