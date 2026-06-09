@@ -18426,6 +18426,38 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
 
         self.assertIsNone(next_stage)
 
+    def test_next_incomplete_stage_skips_missing_entry_stage_when_no_entries_exist(self):
+        task = BinarySecurityTask(
+            id="task-no-entry-missing-run",
+            project_id="p1",
+            name="demo",
+            status="pending",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        )
+        task.metrics = {
+            "entry_count": 0,
+            "selected_module_count": 2,
+        }
+        system_run = BinarySecurityStageRun(
+            id="sr-system-success-missing-entry",
+            task_id="task-no-entry-missing-run",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="success",
+        )
+        fake_db = _AppendingModelAwareDb(tasks=[task], stage_runs=[system_run], stage_items=[], events=[])
+
+        next_stage = self.manager._next_incomplete_stage(fake_db, task)
+
+        self.assertIsNone(next_stage)
+
     def test_finalize_task_does_not_requeue_missing_entry_stage_when_no_entries_exist(self):
         task = BinarySecurityTask(
             id="task-finalize-no-entry",

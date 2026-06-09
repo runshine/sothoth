@@ -20860,6 +20860,8 @@ class TaskManager:
                 continue
             run = runs_by_stage.get(stage_name)
             if run is None:
+                if self._should_finalize_without_entries(db, task, stage_name):
+                    continue
                 if (
                     self._is_streaming_tail_stage(task, stage_name)
                     and normalize_stage_name(stage_name) == "dataflow_vuln_scan"
