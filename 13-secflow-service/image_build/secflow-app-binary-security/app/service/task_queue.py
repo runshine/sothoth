@@ -21,10 +21,21 @@ class TaskQueue:
     def __init__(self) -> None:
         self.config = get_config().queue
         self._client: Redis | None = None
+        self._client_loop_id: int | None = None
         self._lock = asyncio.Lock()
 
     async def _client_or_create(self) -> Redis:
+        loop = asyncio.get_running_loop()
+        current_loop_id = id(loop)
         async with self._lock:
+            if self._client is not None and self._client_loop_id != current_loop_id:
+                old_client = self._client
+                self._client = None
+                self._client_loop_id = None
+                try:
+                    await old_client.aclose()
+                except Exception:
+                    logger.debug("failed closing redis client bound to previous event loop", exc_info=True)
             if self._client is None:
                 self._client = Redis.from_url(
                     self.config.redis_url,
@@ -34,6 +45,7 @@ class TaskQueue:
                     health_check_interval=30,
                     socket_keepalive=True,
                 )
+                self._client_loop_id = current_loop_id
             return self._client
 
     async def push_task(self, task_id: str) -> None:
@@ -79,6 +91,7 @@ class TaskQueue:
         async with self._lock:
             client = self._client
             self._client = None
+            self._client_loop_id = None
         if client is not None:
             try:
                 await client.aclose()
@@ -90,6 +103,7 @@ class TaskQueue:
         async with self._lock:
             client = self._client
             self._client = None
+            self._client_loop_id = None
         if client is not None:
             try:
                 await client.aclose()
@@ -174,6 +188,7 @@ class TaskQueue:
         async with self._lock:
             client = self._client
             self._client = None
+            self._client_loop_id = None
         if client is not None:
             await client.aclose()
 

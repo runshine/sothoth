@@ -22,12 +22,24 @@ class ReducerMetricsSnapshotStore:
     def __init__(self) -> None:
         self._redis_url = get_config().queue.redis_url
         self._client: Redis | None = None
+        self._client_loop_id: int | None = None
         self._lock = asyncio.Lock()
 
     async def _client_or_create(self) -> Redis:
+        loop = asyncio.get_running_loop()
+        current_loop_id = id(loop)
         async with self._lock:
+            if self._client is not None and self._client_loop_id != current_loop_id:
+                old_client = self._client
+                self._client = None
+                self._client_loop_id = None
+                try:
+                    await old_client.aclose()
+                except Exception:
+                    pass
             if self._client is None:
                 self._client = Redis.from_url(self._redis_url, decode_responses=True)
+                self._client_loop_id = current_loop_id
             return self._client
 
     async def write_snapshot(
@@ -113,6 +125,7 @@ class ReducerMetricsSnapshotStore:
         async with self._lock:
             client = self._client
             self._client = None
+            self._client_loop_id = None
         if client is not None:
             await client.aclose()
 
