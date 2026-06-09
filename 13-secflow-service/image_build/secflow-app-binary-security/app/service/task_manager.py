@@ -1909,6 +1909,8 @@ class TaskManager:
             return False
         if stage_runs is None:
             stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+        if self._current_stage_authoritative_failure_context(db, task, stage_runs=stage_runs) is not None:
+            return False
         if any(self._is_terminal_business_stage_failure(task, run) for run in stage_runs if str(run.status or "").strip() == "failed"):
             return False
         if self._tail_requires_execution_takeover(db, task):
@@ -7784,7 +7786,11 @@ class TaskManager:
                         continue
                     if mapped_status not in ARCHIVE_SUCCESS_MAPPED_STATUSES:
                         error_message = observed_error_message
-                        recovered_after_errors = self._stage_item_sync_consecutive_error_count(item) > 0
+                        sync_supervisor_state = self._read_stage_item_sync_supervisor_state(item)
+                        recovered_after_errors = (
+                            sync_supervisor_state.consecutive_error_count > 0
+                            and str(sync_supervisor_state.last_result or "").strip() == "error"
+                        )
                         should_apply = observed_apply_state and (mapped_status != before_status or force)
                         if should_apply:
                             if not self._apply_child_state_with_savepoint(
@@ -7864,7 +7870,11 @@ class TaskManager:
                                 "下游状态同步已从异常中恢复",
                                 stage_name=item.stage_name,
                                 item=item,
-                                payload={"downstream_status": downstream_status},
+                                payload={
+                                    "downstream_status": downstream_status,
+                                    "downstream_task_id": item.downstream_task_id,
+                                    "consecutive_error_count_before_recovery": sync_supervisor_state.consecutive_error_count,
+                                },
                             )
                         if force or mapped_status != before_status or record_noop_events or not apply_state:
                             self._record_event(
@@ -15183,10 +15193,19 @@ class TaskManager:
             if task.id in local_workers and str(task.dispatcher_instance_id or "").strip() == self.instance_id:
                 continue
             if not self._can_preserve_dispatching_state(db, task):
-                task.status = "pending"
-                task.dispatcher_instance_id = None
-                task.dispatch_started_at = None
-                task.lease_expires_at = None
+                authoritative_failure_ctx = self._current_stage_authoritative_failure_context(db, task)
+                if authoritative_failure_ctx is not None:
+                    self._finalize_task_after_authoritative_failure(
+                        db,
+                        task,
+                        failure_ctx=authoritative_failure_ctx,
+                        previous_status="dispatching",
+                    )
+                else:
+                    task.status = "pending"
+                    task.dispatcher_instance_id = None
+                    task.dispatch_started_at = None
+                    task.lease_expires_at = None
                 reclaimed = True
                 continue
             lease, runtime_lease_owner, runtime_lease_expires_at = self._runtime_lease_context(db, task)
@@ -21462,6 +21481,111 @@ class TaskManager:
             return True
         return self._is_terminal_business_stage_failure(task, stage_run)
 
+    def _current_stage_authoritative_failure_context(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_runs: list[BinarySecurityStageRun] | None = None,
+    ) -> dict[str, Any] | None:
+        stage_name = str(task.current_stage or "").strip()
+        if not stage_name:
+            return None
+        if stage_runs is None:
+            stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+        stage_run = next((run for run in stage_runs if str(run.stage_name or "").strip() == stage_name), None)
+        if stage_run is not None and self._should_terminalize_parent_for_failed_stage(task, stage_run):
+            snapshot = self._stage_failure_snapshot(task, stage_run)
+            return {
+                "stage_name": stage_name,
+                "stage_run": stage_run,
+                "failure_code": snapshot.get("failure_code"),
+                "failure_category": snapshot.get("failure_category"),
+                "failure_message": snapshot.get("failure_message") or snapshot.get("error") or stage_run.last_error,
+                "reason": "stage_run_failed",
+            }
+        items = self._stage_items(db, task.id, stage_name)
+        if not items:
+            return None
+        normalized_statuses = [
+            self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()
+            for item in items
+        ]
+        if any(status in {"pending", "queued", "running", "dispatching"} for status in normalized_statuses):
+            return None
+        aggregate_status = self._aggregate_item_statuses(normalized_statuses)
+        if aggregate_status not in {"failed", "cancelled", "downstream_missing", "partial_success"}:
+            return None
+        snapshot = self._stage_failure_snapshot(task, stage_run)
+        failure_message = next((str(item.error_message or "").strip() for item in items if str(item.error_message or "").strip()), None)
+        return {
+            "stage_name": stage_name,
+            "stage_run": stage_run,
+            "failure_code": snapshot.get("failure_code"),
+            "failure_category": snapshot.get("failure_category"),
+            "failure_message": snapshot.get("failure_message") or snapshot.get("error") or failure_message or getattr(stage_run, "last_error", None),
+            "reason": "authoritative_stage_items_terminal",
+        }
+
+    def _finalize_task_after_authoritative_failure(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        failure_ctx: dict[str, Any],
+        previous_status: str | None = None,
+        event_type: str = "dispatching_state_force_terminalized",
+    ) -> None:
+        stage_name = str(failure_ctx.get("stage_name") or task.current_stage or "").strip() or None
+        failure_code = self._string_or_none(failure_ctx.get("failure_code"))
+        failure_category = self._string_or_none(failure_ctx.get("failure_category"))
+        failure_message = self._string_or_none(failure_ctx.get("failure_message")) or task.last_error
+        stage_run = failure_ctx.get("stage_run")
+        task.status = "failed"
+        if stage_name:
+            task.current_stage = stage_name
+        task.finished_at = task.finished_at or _now()
+        task.last_error = failure_message
+        self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TERMINAL)
+        task.dispatcher_instance_id = None
+        task.dispatch_started_at = None
+        task.lease_expires_at = None
+        self._record_event(
+            db,
+            task,
+            event_type,
+            "检测到当前阶段已进入终态失败，父任务已自动结束 dispatching 收口",
+            level="warning",
+            stage_name=stage_name,
+            payload={
+                "stage_name": stage_name,
+                "failure_code": failure_code,
+                "failure_category": failure_category,
+                "failure_message": failure_message,
+                "previous_status": previous_status,
+                "reason": self._string_or_none(failure_ctx.get("reason")),
+            },
+        )
+        if str(failure_category or "").strip() == "business":
+            self._record_business_failure_terminalization(db, task, stage_run)
+        else:
+            self._record_event(
+                db,
+                task,
+                "task_finalized_after_child_failure",
+                "下游子任务已终态失败，父任务已直接收口为 failed",
+                level="warning",
+                stage_name=stage_name,
+                payload={
+                    "stage_name": stage_name,
+                    "failure_code": failure_code,
+                    "failure_category": failure_category,
+                    "failure_message": failure_message,
+                    "requeue_suppressed": True,
+                },
+            )
+        self._clear_task_abnormal_reason_snapshot(db, task)
+
     def _retry_snapshot_for_item(self, task: BinarySecurityTask, stage_name: str, item_key: str) -> dict[str, Any] | None:
         summary = task.summary or {}
         stage_context = (summary.get("stage_retry_context") or {}).get(stage_name) or {}
@@ -22138,18 +22262,32 @@ class TaskManager:
         statuses = [run.status for run in stage_runs]
         vuln_run = next((run for run in stage_runs if normalize_stage_name(run.stage_name) == "dataflow_vuln_scan"), None)
         if any(status in {"running", "dispatching"} for status in statuses):
+            authoritative_failure_ctx = self._current_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
+            if authoritative_failure_ctx is not None:
+                self._finalize_task_after_authoritative_failure(
+                    db,
+                    task,
+                    failure_ctx=authoritative_failure_ctx,
+                    previous_status=current_status,
+                )
+                return
             if not self._can_preserve_dispatching_state(db, task, stage_runs=stage_runs):
                 failed_stage_run = next((run for run in stage_runs if str(run.status or "").strip() == "failed"), None)
                 if failed_stage_run is not None:
-                    task.status = "failed"
-                    task.current_stage = failed_stage_run.stage_name or task.current_stage
-                    task.finished_at = task.finished_at or _now()
-                    task.last_error = failed_stage_run.last_error or task.last_error
-                    self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TERMINAL)
-                    task.dispatcher_instance_id = None
-                    task.dispatch_started_at = None
-                    task.lease_expires_at = None
-                    self._clear_task_abnormal_reason_snapshot(db, task)
+                    failure_snapshot = self._stage_failure_snapshot(task, failed_stage_run)
+                    self._finalize_task_after_authoritative_failure(
+                        db,
+                        task,
+                        failure_ctx={
+                            "stage_name": failed_stage_run.stage_name or task.current_stage,
+                            "stage_run": failed_stage_run,
+                            "failure_code": failure_snapshot.get("failure_code"),
+                            "failure_category": failure_snapshot.get("failure_category"),
+                            "failure_message": failed_stage_run.last_error or failure_snapshot.get("failure_message") or failure_snapshot.get("error"),
+                            "reason": "failed_stage_run_present_after_dispatching_preserve_rejected",
+                        },
+                        previous_status=current_status,
+                    )
                     return
                 task.status = "pending"
                 task.finished_at = None
@@ -22272,14 +22410,21 @@ class TaskManager:
         if stage_retry_mode and preferred_retry_next_stage:
             next_stage = preferred_retry_next_stage
         if failed_stage_run is not None and self._should_terminalize_parent_for_failed_stage(task, failed_stage_run):
-            task.status = "failed"
-            self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TERMINAL)
-            task.current_stage = failed_stage_run.stage_name or task.current_stage
-            task.dispatcher_instance_id = None
-            task.dispatch_started_at = None
-            task.lease_expires_at = None
-            task.finished_at = task.finished_at or _now()
-            self._record_business_failure_terminalization(db, task, failed_stage_run)
+            failure_snapshot = self._stage_failure_snapshot(task, failed_stage_run)
+            self._finalize_task_after_authoritative_failure(
+                db,
+                task,
+                failure_ctx={
+                    "stage_name": failed_stage_run.stage_name or task.current_stage,
+                    "stage_run": failed_stage_run,
+                    "failure_code": failure_snapshot.get("failure_code"),
+                    "failure_category": failure_snapshot.get("failure_category"),
+                    "failure_message": failed_stage_run.last_error or failure_snapshot.get("failure_message") or failure_snapshot.get("error"),
+                    "reason": "failed_stage_run_terminalized_after_sync",
+                },
+                previous_status=current_status,
+                event_type="task_finalized_after_stage_failure",
+            )
             return
         if failed_stage_run is not None and not stage_retry_mode and not task_retry_mode:
             task.status = "pending"

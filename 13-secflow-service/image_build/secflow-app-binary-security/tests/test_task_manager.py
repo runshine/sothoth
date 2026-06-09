@@ -25295,6 +25295,9 @@ def _test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_fai
     self.assertIsNone(task.dispatch_started_at)
     self.assertIsNone(task.lease_expires_at)
     self.assertEqual("firmware_unpack", task.current_stage)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("task_finalized_after_stage_failure", event_types)
+    self.assertIn("task_finalized_after_child_failure", event_types)
 
 
 def _test_reclaim_stale_dispatching_skips_failed_streaming_task(self):
@@ -25332,10 +25335,113 @@ def _test_reclaim_stale_dispatching_skips_failed_streaming_task(self):
         reclaimed = manager._reclaim_stale_dispatching_locked(db)
 
     self.assertTrue(reclaimed)
-    self.assertEqual("pending", task.status)
+    self.assertEqual("failed", task.status)
     self.assertIsNone(task.dispatcher_instance_id)
     self.assertIsNone(task.dispatch_started_at)
     self.assertIsNone(task.lease_expires_at)
+    self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("dispatching_state_force_terminalized", event_types)
+    self.assertIn("task_finalized_after_child_failure", event_types)
+
+
+def _test_sync_downstream_status_records_recovery_event_only_once(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-recovery-once",
+        project_id="p1",
+        name="demo",
+        status="running",
+        current_stage="firmware_unpack",
+        task_type=TASK_TYPE_BINARY,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    run = BinarySecurityStageRun(
+        id="sr-recovery-once",
+        task_id="task-recovery-once",
+        project_id="p1",
+        stage_name="firmware_unpack",
+        sequence_no=1,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si-recovery-once",
+        task_id="task-recovery-once",
+        project_id="p1",
+        stage_run_id="sr-recovery-once",
+        stage_name="firmware_unpack",
+        item_key="fw.bin",
+        item_name="fw.bin",
+        status="running",
+        downstream_service="firmware_unpacker",
+        downstream_task_id="fu-1",
+        result={
+            "downstream_status": "running",
+            "sync_observation": {
+                "sync_status": "transport_error",
+                "error_message": "temporary timeout",
+                "error_type": "timeout",
+                "last_result": "error",
+                "consecutive_error_count": 2,
+                "last_error_at": (_now() - timedelta(minutes=2)).isoformat(),
+            },
+        },
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
+
+    async def _fetch(_task, _item, _token):
+        return {"task_id": "fu-1", "status": "failed"}
+
+    async def _noop_write(*_args, **_kwargs):
+        return None
+
+    original_fetch = manager._fetch_downstream_task_payload
+    original_write = manager._write_task_metadata_async
+    original_enqueue = manager._enqueue_task
+    def _unique_recovery_event_count():
+        return len(
+            {
+                getattr(event, "id", id(event))
+                for event in db.events
+                if getattr(event, "event_type", None) == "downstream_poll_recovered_after_errors"
+            }
+        )
+    try:
+        manager._fetch_downstream_task_payload = _fetch
+        manager._write_task_metadata_async = _noop_write
+        manager._enqueue_task = lambda *_args, **_kwargs: None
+        asyncio.run(
+            manager.sync_downstream_status(
+                db,
+                project_id="p1",
+                task_id="task-recovery-once",
+                stage_name="firmware_unpack",
+                apply_state=False,
+                force=True,
+            )
+        )
+        first_count = _unique_recovery_event_count()
+        asyncio.run(
+            manager.sync_downstream_status(
+                db,
+                project_id="p1",
+                task_id="task-recovery-once",
+                stage_name="firmware_unpack",
+                apply_state=False,
+                force=True,
+            )
+        )
+        second_count = _unique_recovery_event_count()
+    finally:
+        manager._fetch_downstream_task_payload = original_fetch
+        manager._write_task_metadata_async = original_write
+        manager._enqueue_task = original_enqueue
+
+    self.assertEqual(1, first_count)
+    self.assertEqual(1, second_count)
 
 
 def _test_requeue_released_running_locked_requeues_streaming_tail_with_active_items(self):
@@ -25891,6 +25997,7 @@ TaskManagerTests.test_task_heartbeat_controller_refreshes_tail_reconcile_owner_t
 TaskManagerTests.test_run_task_finally_preserves_tail_runtime_lease = _test_run_task_finally_preserves_tail_runtime_lease
 TaskManagerTests.test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_failed = _test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_failed
 TaskManagerTests.test_reclaim_stale_dispatching_skips_failed_streaming_task = _test_reclaim_stale_dispatching_skips_failed_streaming_task
+TaskManagerTests.test_sync_downstream_status_records_recovery_event_only_once = _test_sync_downstream_status_records_recovery_event_only_once
 TaskManagerTests.test_confirm_module_selection_updates_task = _test_confirm_module_selection_updates_task
 TaskManagerTests.test_confirm_entry_selection_updates_task = _test_confirm_entry_selection_updates_task
 TaskManagerTests.test_get_project_config_normalizes_legacy_partial_success_stage_names = _test_get_project_config_normalizes_legacy_partial_success_stage_names
