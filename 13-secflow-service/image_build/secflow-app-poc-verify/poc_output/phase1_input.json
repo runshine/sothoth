@@ -1,0 +1,7 @@
+{
+  "vuln_report": "/tmp/pytest-of-icsl/pytest-702/test_missing_file0/nope.md",
+  "entry_function": "main",
+  "source_dir": "/tmp/pytest-of-icsl/pytest-702/test_missing_file0/source",
+  "binary_dir": "/tmp/pytest-of-icsl/pytest-702/test_missing_file0/binaries",
+  "output_dir": "/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-poc-verify/poc_output"
+}
