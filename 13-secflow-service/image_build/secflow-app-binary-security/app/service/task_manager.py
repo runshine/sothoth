@@ -7162,7 +7162,12 @@ class TaskManager:
         normalized_stage = normalize_stage_name(stage_name)
         if normalized_stage != "entry_analysis":
             return False
-        if self._task_type(task) not in {TASK_TYPE_SOURCE, TASK_TYPE_BINARY_MODULE}:
+        task_type = self._task_type(task)
+        if task_type not in {TASK_TYPE_SOURCE, TASK_TYPE_BINARY_MODULE}:
+            return False
+        # Source tasks do not produce entry_count during system_analysis.
+        # They must still execute entry_analysis to discover real entries.
+        if task_type == TASK_TYPE_SOURCE:
             return False
         if self._stage_items(db, task.id, stage_name):
             return False
@@ -7179,7 +7184,7 @@ class TaskManager:
         if summary.get("entry_results"):
             return False
         selected_modules = list(summary.get("selected_modules") or [])
-        if task.task_type == TASK_TYPE_BINARY_MODULE and not selected_modules:
+        if task_type == TASK_TYPE_BINARY_MODULE and not selected_modules:
             return False
         upstream_run = db.query(BinarySecurityStageRun).filter(
             BinarySecurityStageRun.task_id == task.id,
