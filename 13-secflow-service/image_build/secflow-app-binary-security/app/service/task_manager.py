@@ -2974,7 +2974,14 @@ class TaskManager:
         never_synced_item_count = int(ctx.never_synced_item_count or 0) if ctx is not None else 0
         stale_synced_item_count = int(ctx.stale_synced_item_count or 0) if ctx is not None else 0
         active_operation = self._active_operation(db, task.id)
-        lease_owner, lease_expires_at, lease_source = self._task_runtime_lease_view(db, task)
+        (
+            lease_owner,
+            lease_expires_at,
+            lease_source,
+            lease_pod_uid,
+            lease_boot_id,
+            lease_generation,
+        ) = self._task_runtime_lease_view(db, task)
         local_worker = self._workers.get(task.id)
         local_worker_alive = bool(local_worker is not None and not local_worker.done())
         last_task_heartbeat_at = self._last_task_heartbeat_at.get(task.id)
