@@ -18426,6 +18426,40 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
 
         self.assertIsNone(next_stage)
 
+    def test_finalize_task_does_not_requeue_missing_entry_stage_when_no_entries_exist(self):
+        task = BinarySecurityTask(
+            id="task-finalize-no-entry",
+            project_id="p1",
+            name="demo",
+            status="pending",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        )
+        task.metrics = {
+            "entry_count": 0,
+            "selected_module_count": 1,
+        }
+        stage_run = BinarySecurityStageRun(
+            id="sr-system-success",
+            task_id="task-finalize-no-entry",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="success",
+        )
+        fake_db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[], events=[])
+
+        self.manager._finalize_task(fake_db, task)
+
+        self.assertEqual("success", task.status)
+        self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
+        self.assertTrue(any(event.event_type == "task_finished" for event in fake_db.events))
+
     def test_run_task_ignores_stale_worker_failure_after_retry(self):
         task = BinarySecurityTask(
             id="task1",

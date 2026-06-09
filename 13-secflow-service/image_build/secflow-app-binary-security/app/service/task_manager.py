@@ -15640,7 +15640,11 @@ class TaskManager:
                 (
                     stage_name
                     for stage_name in self._stage_sequence_for_task(task)
-                    if self._stage_enabled(task, stage_name) and runs_by_stage.get(stage_name) is None
+                    if (
+                        self._stage_enabled(task, stage_name)
+                        and runs_by_stage.get(stage_name) is None
+                        and not self._should_finalize_without_entries(db, task, stage_name)
+                    )
                 ),
                 None,
             )
