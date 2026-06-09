@@ -7,6 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Header, Query
 from sqlalchemy.orm import Session
 
+from app.build_info import build_service_meta
 from app.exception import UnauthorizedError
 from app.model import VulnVerifyTask, get_db
 from app.schemas import (
@@ -42,7 +43,11 @@ router = APIRouter(prefix="/api/app/vuln-verify", tags=["vuln-verify"])
 
 @router.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "secflow-app-vuln-verify"}
+    return {
+        "status": "ok",
+        "service": "secflow-app-vuln-verify",
+        **build_service_meta(),
+    }
 
 
 @router.get("/ready")

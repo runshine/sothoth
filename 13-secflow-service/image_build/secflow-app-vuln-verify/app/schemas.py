@@ -108,3 +108,6 @@ class TaskResultResponse(BaseModel):
     result_count: int
     results: list[dict[str, Any]] = Field(default_factory=list)
     summary: dict[str, Any] = Field(default_factory=dict)
+
+
+TaskDetailResponse.model_rebuild()
