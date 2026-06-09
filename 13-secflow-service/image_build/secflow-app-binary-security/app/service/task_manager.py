@@ -16334,7 +16334,11 @@ class TaskManager:
             if active_items and active_stage_name is None:
                 active_stage_name = stage_name
             active_item_count += len(active_items)
-            if any(str(item.downstream_task_id or "").strip() for item in active_items):
+            if any(
+                str(item.downstream_task_id or "").strip()
+                and self._is_streaming_active_item_status(item.status)
+                for item in items
+            ):
                 has_downstream_refs = True
         return active_stage_name, active_item_count, has_downstream_refs
 

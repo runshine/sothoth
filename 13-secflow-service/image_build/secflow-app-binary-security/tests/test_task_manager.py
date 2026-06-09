@@ -18460,6 +18460,57 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
         self.assertTrue(any(event.event_type == "task_finished" for event in fake_db.events))
 
+    def test_recover_idle_tail_reconciliation_ignores_non_tail_downstream_refs(self):
+        task = BinarySecurityTask(
+            id="task-tail-history-only",
+            project_id="p1",
+            name="demo",
+            status="pending",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json='{"pipeline_mode": "mixed_streaming"}',
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            tail_reconcile_state="idle",
+        )
+        system_run = BinarySecurityStageRun(
+            id="sr-system-only",
+            task_id="task-tail-history-only",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="success",
+        )
+        system_item = BinarySecurityStageItem(
+            id="si-system-only",
+            task_id="task-tail-history-only",
+            project_id="p1",
+            stage_run_id="sr-system-only",
+            stage_name="system_analysis",
+            item_key="source_project",
+            item_name="source-project",
+            status="success",
+            downstream_service="system_analyse",
+            downstream_task_id="sat-demo",
+        )
+        fake_db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[system_run],
+            stage_items=[system_item],
+            events=[],
+        )
+
+        recovered = self.manager._recover_idle_tail_reconciliation_tasks_locked(fake_db)
+
+        self.assertTrue(recovered)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
+        self.assertEqual("idle", task.tail_reconcile_state)
+        self.assertEqual("pending", task.status)
+        self.assertTrue(any(event.event_type == "tail_reconciliation_released_idle" for event in fake_db.events))
+
     def test_run_task_ignores_stale_worker_failure_after_retry(self):
         task = BinarySecurityTask(
             id="task1",
