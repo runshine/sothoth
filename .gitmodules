@@ -1,12 +1,3 @@
-[submodule "04-static-binary-service/image_build/static-binary-manager-frontend"]
-	path = 04-static-binary-service/image_build/static-binary-manager-frontend
-	url = https://github.com/runshine/static-binary-manager-frontend.git
-[submodule "10-vscode-web-manager-service/image_build/vscode-web-manager-frontend"]
-	path = 10-vscode-web-manager-service/image_build/vscode-web-manager-frontend
-	url = https://github.com/runshine/vscode-web-manager-frontend.git
-[submodule "07-agent-service-manager-service/image_build/agent-service-manager-frontend"]
-	path = 07-agent-service-manager-service/image_build/agent-service-manager-frontend
-	url = https://github.com/runshine/agent-service-manager-frontend.git
 [submodule "13-secflow-service/image_build/secflow-frontend"]
 	path = 13-secflow-service/image_build/secflow-frontend
 	url = https://github.com/GaiaSecHW/Chimera.git

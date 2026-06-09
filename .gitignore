@@ -19,6 +19,11 @@ config.mysql.json
 .vscode/
 .playwright-mcp/
 
+# Agent state
+.plan/
+.context/
+.pi/
+
 # Node.js
 node_modules/
 13-secflow-service/image_build/secflow-platform-workflow/app/config.py
@@ -27,4 +32,3 @@ package-lock.json
 package.json
 openvpn_service
 .plans/nul
-.pi/
