@@ -157,12 +157,33 @@ def _infer_value_type(value: str) -> str:
 
 def _normalize_runtime_config_value(key: str, value: str) -> str:
     normalized = str(value or "").strip()
+    if key == "agent_run_timeout_seconds":
+        try:
+            timeout_seconds = int(normalized)
+        except Exception as exc:
+            raise ValidationError("agent_run_timeout_seconds 必须是整数秒数") from exc
+        if timeout_seconds == 0 or timeout_seconds < -1:
+            raise ValidationError("agent_run_timeout_seconds 仅支持 -1 或大于 0 的整数")
+        return str(timeout_seconds)
+    if key == "agent_timeout_max_retries":
+        try:
+            max_retries = int(normalized)
+        except Exception as exc:
+            raise ValidationError("agent_timeout_max_retries 必须是整数") from exc
+        if max_retries < -1:
+            raise ValidationError("agent_timeout_max_retries 仅支持 -1 或大于等于 0 的整数")
+        return str(max_retries)
+    if key == "agent_timeout_retry_enabled":
+        lowered = normalized.lower()
+        if lowered not in {"1", "0", "true", "false", "yes", "no", "on", "off"}:
+            raise ValidationError("agent_timeout_retry_enabled 仅支持 true/false")
+        return "true" if lowered in {"1", "true", "yes", "on"} else "false"
     if key == "max_retries_reached_action":
         lowered = normalized.lower()
         if lowered not in {"success", "failed"}:
             raise ValidationError("max_retries_reached_action 仅支持 success 或 failed")
         return lowered
-    return value
+    return normalized
 
 
 def _resolve_runtime_root(root: Optional[str] = None) -> Path:

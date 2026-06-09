@@ -31,6 +31,14 @@ spec:
               value: worker
             - name: SECFLOW_BINARY_SECURITY_ENABLE_SCHEDULER
               value: "true"
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: BOOT_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -82,7 +90,7 @@ spec:
           lifecycle:
             preStop:
               exec:
-                command: ["sh", "-c", "sleep 20"]
+                command: ["sh", "-c", "sleep 30"]
       volumes:
         - name: secflow-app-binary-security-config
           configMap:

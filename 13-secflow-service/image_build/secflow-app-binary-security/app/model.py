@@ -136,6 +136,7 @@ class BinarySecurityTask(Base, JsonMixin):
     last_error = Column(Text, nullable=True)
     latest_abnormal_reason_json = Column(Text, nullable=True)
     runtime_phase = Column(String(32), nullable=False, default=TASK_RUNTIME_PHASE_OWNED_EXECUTION, index=True)
+    tail_reconcile_state = Column(String(32), nullable=False, default="idle", index=True)
     operation_lock_owner = Column(String(128), nullable=True, index=True)
     operation_lock_token = Column(String(64), nullable=True, index=True)
     operation_lock_type = Column(String(32), nullable=True, index=True)
@@ -546,6 +547,10 @@ class BinarySecurityTaskRuntimeLease(Base):
     task_id = Column(String(32), primary_key=True)
     execution_epoch = Column(Integer, nullable=False, default=0)
     owner_instance_id = Column(String(128), nullable=False, index=True)
+    owner_pod_uid = Column(String(128), nullable=True, index=True)
+    owner_boot_id = Column(String(128), nullable=True, index=True)
+    generation = Column(Integer, nullable=False, default=0, index=True)
+    owner_started_at = Column(DateTime, nullable=True, index=True)
     lease_expires_at = Column(DateTime, nullable=False, index=True)
     heartbeat_at = Column(DateTime, nullable=False, index=True)
     created_at = Column(DateTime, default=now_local, nullable=False)
@@ -708,6 +713,12 @@ def _ensure_compat_columns(engine) -> None:
         if "runtime_phase" not in columns:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN runtime_phase VARCHAR(32) NOT NULL DEFAULT '{TASK_RUNTIME_PHASE_OWNED_EXECUTION}'"
+            )
+        if "tail_reconcile_state" not in columns:
+            statements.append(
+                "ALTER TABLE {task_table} ADD COLUMN tail_reconcile_state VARCHAR(32) NOT NULL DEFAULT 'idle'".format(
+                    task_table=task_table
+                )
             )
         if "operation_lock_owner" not in columns:
             statements.append(
@@ -874,11 +885,34 @@ def _ensure_compat_columns(engine) -> None:
         Base.metadata.tables[operation_table].create(bind=engine, checkfirst=True)
     runtime_lease_table = BinarySecurityTaskRuntimeLease.__tablename__
     if inspector.has_table(runtime_lease_table):
+        columns = {column["name"] for column in inspector.get_columns(runtime_lease_table)}
+        statements = []
+        if "owner_pod_uid" not in columns:
+            statements.append(
+                f"ALTER TABLE {runtime_lease_table} ADD COLUMN owner_pod_uid VARCHAR(128) NULL"
+            )
+        if "owner_boot_id" not in columns:
+            statements.append(
+                f"ALTER TABLE {runtime_lease_table} ADD COLUMN owner_boot_id VARCHAR(128) NULL"
+            )
+        if "generation" not in columns:
+            statements.append(
+                f"ALTER TABLE {runtime_lease_table} ADD COLUMN generation INTEGER NOT NULL DEFAULT 0"
+            )
+        if "owner_started_at" not in columns:
+            statements.append(
+                f"ALTER TABLE {runtime_lease_table} ADD COLUMN owner_started_at DATETIME NULL"
+            )
+        _execute_compat_statements(statements)
         indexes = {index["name"] for index in inspector.get_indexes(runtime_lease_table)}
         index_statements = []
         if "ix_bstrl_owner_expires" not in indexes:
             index_statements.append(
                 f"CREATE INDEX ix_bstrl_owner_expires ON {runtime_lease_table} (owner_instance_id, lease_expires_at)"
+            )
+        if "ix_bstrl_owner_generation" not in indexes:
+            index_statements.append(
+                f"CREATE INDEX ix_bstrl_owner_generation ON {runtime_lease_table} (owner_instance_id, generation, lease_expires_at)"
             )
         _execute_compat_statements(index_statements)
     else:

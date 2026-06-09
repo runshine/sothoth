@@ -356,23 +356,36 @@ class PiRpcClient:
         timeout_seconds: int | float | None = None,
     ) -> str:
         self._mark_session_active()
-        timer: threading.Timer | None = None
+        timer: threading.Thread | None = None
         timed_out = threading.Event()
+        watchdog_stop = threading.Event()
+        last_activity_at = time.monotonic()
+
+        def _mark_activity() -> None:
+            nonlocal last_activity_at
+            last_activity_at = time.monotonic()
         try:
             if timeout_seconds is not None and float(timeout_seconds) > 0:
-                def _kill_for_timeout() -> None:
-                    timed_out.set()
-                    try:
-                        if self.proc.poll() is None:
+                idle_timeout_seconds = float(timeout_seconds)
+
+                def _kill_for_idle_timeout() -> None:
+                    while not watchdog_stop.wait(timeout=1.0):
+                        if self.proc.poll() is not None:
+                            return
+                        if (time.monotonic() - last_activity_at) < idle_timeout_seconds:
+                            continue
+                        timed_out.set()
+                        try:
                             pgid = os.getpgid(self.proc.pid)
                             os.killpg(pgid, signal.SIGKILL)
-                    except Exception:
-                        try:
-                            self.proc.kill()
                         except Exception:
-                            pass
-                timer = threading.Timer(float(timeout_seconds), _kill_for_timeout)
-                timer.daemon = True
+                            try:
+                                self.proc.kill()
+                            except Exception:
+                                pass
+                        return
+
+                timer = threading.Thread(target=_kill_for_idle_timeout, name="pi-rpc-idle-timeout", daemon=True)
                 timer.start()
             self.send(
                 {
@@ -381,9 +394,11 @@ class PiRpcClient:
                     "streamingBehavior": "followUp",
                 }
             )
+            _mark_activity()
 
             events: list[dict[str, Any]] = []
             for event in self._read_until("agent_end"):
+                _mark_activity()
                 event_type = event.get("type", "")
                 if (
                     event_type == "response"
@@ -420,11 +435,12 @@ class PiRpcClient:
             return self.extract_assistant_text(events)
         except RuntimeError:
             if timed_out.is_set() and self.proc.poll() is not None and timeout_seconds is not None and float(timeout_seconds) > 0:
-                raise RuntimeError(f"Prompt timed out after {float(timeout_seconds):.0f}s")
+                raise RuntimeError(f"Prompt idle timed out after {float(timeout_seconds):.0f}s")
             raise
         finally:
+            watchdog_stop.set()
             if timer is not None:
-                timer.cancel()
+                timer.join(timeout=0.1)
 
     def prompt(
         self,

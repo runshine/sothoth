@@ -1008,6 +1008,10 @@ class TaskManager:
         # across test cases or long-lived in-process manager instances.
         self.cfg = copy.deepcopy(get_config())
         self.instance_id = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or f"binary-security-{uuid.uuid4().hex[:12]}"
+        self.owner_pod_uid = os.environ.get("POD_UID") or self.instance_id
+        self.owner_boot_id = os.environ.get("BOOT_ID") or uuid.uuid4().hex
+        self.owner_started_at = _now()
+        self._owner_generation = 1
         self._running = False
         self._loop_task: Optional[asyncio.Task] = None
         self._archive_loop_task: Optional[asyncio.Task] = None
@@ -1038,6 +1042,7 @@ class TaskManager:
         self._loop_heartbeats: dict[str, datetime] = {}
         self._last_stale_operation_requeue_at: datetime | None = None
         self._last_stage_item_sync_reconcile_at: datetime | None = None
+        self._tail_reconcile_handoff_reason: dict[str, str] = {}
 
     def _service_role(self) -> str:
         raw_role = os.environ.get("SECFLOW_BINARY_SECURITY_ROLE") or "all"
@@ -1623,6 +1628,20 @@ class TaskManager:
             owners = self._task_execution_owners.get(normalized_task_id) or set()
             return TAIL_RECONCILE_OWNER in owners
 
+    def _tail_reconcile_owner_token(self) -> dict[str, Any]:
+        return {
+            "owner_instance_id": self.instance_id,
+            "owner_pod_uid": self.owner_pod_uid,
+            "owner_boot_id": self.owner_boot_id,
+            "generation": self._owner_generation,
+            "owner_started_at": self.owner_started_at,
+        }
+
+    def _next_tail_reconcile_generation(self, current_generation: int | None = None) -> int:
+        base = int(current_generation or self._owner_generation or 0)
+        self._owner_generation = max(self._owner_generation, base + 1)
+        return self._owner_generation
+
     def _collect_heartbeat_candidates(self) -> list[str]:
         with self._task_execution_owner_lock:
             return sorted(task_id for task_id, owners in self._task_execution_owners.items() if owners)
@@ -1685,6 +1704,7 @@ class TaskManager:
         if normalized_owner:
             query = query.filter(BinarySecurityTaskRuntimeLease.owner_instance_id == normalized_owner)
         query.delete(synchronize_session=False)
+        db.commit()
 
     def _upsert_runtime_lease(
         self,
@@ -1693,9 +1713,17 @@ class TaskManager:
         *,
         now_value: datetime,
         owner_instance_id: str | None = None,
+        owner_pod_uid: str | None = None,
+        owner_boot_id: str | None = None,
+        generation: int | None = None,
+        owner_started_at: datetime | None = None,
     ) -> BinarySecurityTaskRuntimeLease:
         phase = self._task_runtime_phase(task)
         requested_owner = str(owner_instance_id or self.instance_id or "").strip() or self.instance_id
+        requested_pod_uid = str(owner_pod_uid or self.owner_pod_uid or "").strip() or self.owner_pod_uid
+        requested_boot_id = str(owner_boot_id or self.owner_boot_id or "").strip() or self.owner_boot_id
+        requested_generation = int(generation if generation is not None else self._owner_generation or 1)
+        requested_started_at = owner_started_at or self.owner_started_at
         if not self._can_own_runtime_phase(phase):
             lease = self._runtime_lease_for_task(db, task.id)
             if lease is None:
@@ -1707,6 +1735,10 @@ class TaskManager:
                 task_id=task.id,
                 execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
                 owner_instance_id=requested_owner,
+                owner_pod_uid=requested_pod_uid,
+                owner_boot_id=requested_boot_id,
+                generation=requested_generation,
+                owner_started_at=requested_started_at,
                 heartbeat_at=now_value,
                 lease_expires_at=self._next_runtime_lease_expiry(now_value=now_value),
             )
@@ -1714,10 +1746,24 @@ class TaskManager:
         else:
             current_owner = str(lease.owner_instance_id or "").strip() or None
             lease_active = self._runtime_lease_is_active(lease)
-            if lease_active and current_owner and current_owner != requested_owner:
-                raise StaleTaskExecution(f"任务 {task.id} 当前 {phase or 'unknown'} runtime lease owner 已变更")
+            current_generation = int(getattr(lease, "generation", 0) or 0)
+            current_pod_uid = str(getattr(lease, "owner_pod_uid", "") or "").strip() or None
+            current_boot_id = str(getattr(lease, "owner_boot_id", "") or "").strip() or None
+            if lease_active:
+                stale_owner = (
+                    (current_owner and current_owner != requested_owner)
+                    or (current_pod_uid and current_pod_uid != requested_pod_uid)
+                    or (current_boot_id and current_boot_id != requested_boot_id)
+                    or (current_generation and requested_generation < current_generation)
+                )
+                if stale_owner:
+                    raise StaleTaskExecution(f"任务 {task.id} 当前 {phase or 'unknown'} runtime lease owner 已变更")
             lease.execution_epoch = int(getattr(task, "execution_epoch", 0) or 0)
             lease.owner_instance_id = requested_owner
+            lease.owner_pod_uid = requested_pod_uid
+            lease.owner_boot_id = requested_boot_id
+            lease.generation = max(current_generation, requested_generation)
+            lease.owner_started_at = requested_started_at
             lease.heartbeat_at = now_value
             lease.lease_expires_at = self._next_runtime_lease_expiry(now_value=now_value)
         return lease
@@ -1729,6 +1775,10 @@ class TaskManager:
         *,
         now_value: datetime | None = None,
         owner_instance_id: str | None = None,
+        owner_pod_uid: str | None = None,
+        owner_boot_id: str | None = None,
+        generation: int | None = None,
+        owner_started_at: datetime | None = None,
     ) -> BinarySecurityTaskRuntimeLease | None:
         phase = self._task_runtime_phase(task)
         if not self._can_own_runtime_phase(phase):
@@ -1739,6 +1789,10 @@ class TaskManager:
                 task,
                 now_value=now_value or _now(),
                 owner_instance_id=owner_instance_id,
+                owner_pod_uid=owner_pod_uid,
+                owner_boot_id=owner_boot_id,
+                generation=generation,
+                owner_started_at=owner_started_at,
             )
         except StaleTaskExecution:
             return self._runtime_lease_for_task(db, task.id)
@@ -1776,20 +1830,34 @@ class TaskManager:
     ) -> BinarySecurityTaskRuntimeLease | None:
         current_now = now_value or _now()
         self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TAIL_RECONCILIATION)
+        task.tail_reconcile_state = "handoff_waiting"
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
         task.lease_expires_at = None
-        lease = self._maybe_upsert_runtime_lease(db, task, now_value=current_now, owner_instance_id=self.instance_id)
+        lease = self._maybe_upsert_runtime_lease(
+            db,
+            task,
+            now_value=current_now,
+            owner_instance_id=self.instance_id,
+            owner_pod_uid=self.owner_pod_uid,
+            owner_boot_id=self.owner_boot_id,
+            generation=self._owner_generation,
+            owner_started_at=self.owner_started_at,
+        )
         lease_owner = str(lease.owner_instance_id or "").strip() if lease is not None else ""
         if self._runtime_lease_is_active(lease) and lease_owner == str(self.instance_id or "").strip():
+            task.tail_reconcile_state = "active"
             self._acquire_tail_reconcile_owner(task.id)
             if takeover_result:
                 observe_tail_reconcile_takeover(takeover_result)
+            self._tail_reconcile_handoff_reason.pop(task.id, None)
             return lease
         self._release_tail_reconcile_owner(task.id)
+        self._tail_reconcile_handoff_reason[task.id] = "owner_conflict"
         if fallback_status is not None:
             task.status = fallback_status
-        observe_tail_reconcile_heartbeat("lease_conflict")
+        observe_tail_reconcile_heartbeat("handoff")
+        observe_tail_reconcile_owner("handoff_started")
         if takeover_result:
             observe_tail_reconcile_takeover("conflict")
         return lease
@@ -1808,6 +1876,14 @@ class TaskManager:
         ):
             return True
         return self._has_tail_reconcile_owner(task.id)
+
+    def _tail_reconcile_state(self, task: BinarySecurityTask | None) -> str:
+        if task is None:
+            return "idle"
+        raw = str(getattr(task, "tail_reconcile_state", "") or "").strip().lower()
+        if raw in {"active", "handoff_waiting", "idle"}:
+            return raw
+        return "idle"
 
     def _acquire_coordinator_lease(self, lease_name: str) -> bool:
         normalized_name = str(lease_name or "").strip()
@@ -1892,14 +1968,26 @@ class TaskManager:
             BinarySecurityTask.status == "running",
         ).first()
         if task is not None:
-            self._upsert_runtime_lease(session, task, now_value=now_value, owner_instance_id=self.instance_id)
+            self._upsert_runtime_lease(
+                session,
+                task,
+                now_value=now_value,
+                owner_instance_id=self.instance_id,
+                owner_pod_uid=self.owner_pod_uid,
+                owner_boot_id=self.owner_boot_id,
+                generation=self._owner_generation,
+                owner_started_at=self.owner_started_at,
+            )
             task.lease_expires_at = self._next_runtime_lease_expiry(now_value=now_value)
+            if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+                task.tail_reconcile_state = "active"
             task.updated_at = now_value
             session.commit()
             self._last_task_heartbeat_at[task_id] = now_value
             observe_heartbeat_update(f"{source}_written")
             if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
                 observe_tail_reconcile_heartbeat("written")
+                observe_tail_reconcile_owner("handoff_completed")
             return True
         session.rollback()
         observe_heartbeat_update(f"{source}_skipped")
@@ -13760,6 +13848,22 @@ class TaskManager:
             "reducer_metrics_snapshot": self._loop_runtime_detail("reducer_metrics_snapshot", self._reducer_metrics_snapshot_loop_task),
             "task_heartbeat": self._loop_runtime_detail("task_heartbeat", self._task_heartbeat_loop_task),
         }
+        tail_reconcile_active = False
+        try:
+            session = get_session_factory()()
+            try:
+                rows = (
+                    session.query(BinarySecurityTask)
+                    .filter(BinarySecurityTask.tail_reconcile_state == "active")
+                    .filter(BinarySecurityTask.runtime_phase == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION)
+                    .limit(1)
+                    .all()
+                )
+                tail_reconcile_active = bool(rows)
+            finally:
+                session.close()
+        except Exception:
+            tail_reconcile_active = False
         return {
             "running": self._running,
             "loops": {loop_name: bool(detail.get("alive")) for loop_name, detail in loop_details.items() if loop_name != "task_heartbeat"},
@@ -13770,6 +13874,7 @@ class TaskManager:
                 "stage_item_workers": len([task for task in self._stage_item_workers.values() if not task.done()]),
                 "archive_workers": len([task for task in self._archive_workers if not task.done()]),
             },
+            "tail_reconcile_active": tail_reconcile_active,
         }
 
     def _lease_is_active(self, task: BinarySecurityTask, db: Session | None = None) -> bool:
@@ -18973,29 +19078,52 @@ class TaskManager:
         self,
         db: Session,
         task: BinarySecurityTask,
-    ) -> tuple[str | None, datetime | None, str | None]:
+    ) -> tuple[str | None, datetime | None, str | None, str | None, str | None, int | None]:
         lease = self._runtime_lease_for_task(db, task.id)
         if lease is not None:
             if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                return lease.owner_instance_id, lease.lease_expires_at, "tail_runtime_lease"
-            return lease.owner_instance_id, lease.lease_expires_at, "runtime_lease"
+                return (
+                    lease.owner_instance_id,
+                    lease.lease_expires_at,
+                    "tail_runtime_lease",
+                    lease.owner_pod_uid,
+                    lease.owner_boot_id,
+                    lease.generation,
+                )
+            return (
+                lease.owner_instance_id,
+                lease.lease_expires_at,
+                "runtime_lease",
+                lease.owner_pod_uid,
+                lease.owner_boot_id,
+                lease.generation,
+            )
         return (
             str(task.dispatcher_instance_id or "").strip() or None,
             task.lease_expires_at,
             "legacy_task_row" if task.lease_expires_at is not None else None,
+            None,
+            None,
+            None,
         )
 
     def _reconcile_lease_view(
         self,
         db: Session,
         task: BinarySecurityTask,
-    ) -> tuple[str | None, datetime | None]:
+    ) -> tuple[str | None, datetime | None, str | None, str | None, int | None]:
         if self._task_runtime_phase(task) != TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-            return None, None
+            return None, None, None, None, None
         lease = self._runtime_lease_for_task(db, task.id)
         if lease is None:
-            return None, None
-        return str(lease.owner_instance_id or "").strip() or None, lease.lease_expires_at
+            return None, None, None, None, None
+        return (
+            str(lease.owner_instance_id or "").strip() or None,
+            lease.lease_expires_at,
+            str(lease.owner_pod_uid or "").strip() or None,
+            str(lease.owner_boot_id or "").strip() or None,
+            lease.generation,
+        )
 
     def _task_sync_status_view(
         self,
@@ -19091,10 +19219,10 @@ class TaskManager:
                 abnormal_reason = BinarySecurityAbnormalReason(**task.latest_abnormal_reason)
             except Exception:
                 abnormal_reason = None
-        lease_owner, lease_expires_at, lease_source = self._task_runtime_lease_view(db, task)
+        lease_owner, lease_expires_at, lease_source, lease_pod_uid, lease_boot_id, lease_generation = self._task_runtime_lease_view(db, task)
         runtime_phase = self._task_runtime_phase(task)
         task_control_mode = self._task_control_mode(task)
-        reconcile_owner, reconcile_lease_expires_at = self._reconcile_lease_view(db, task)
+        reconcile_owner, reconcile_lease_expires_at, reconcile_pod_uid, reconcile_boot_id, reconcile_generation = self._reconcile_lease_view(db, task)
         base_policy = self._task_base_policy(task)
         runtime_override = self._task_runtime_override(task)
         effective_runtime_policy = self._effective_runtime_policy(task)
@@ -19150,8 +19278,12 @@ class TaskManager:
             task_lease_owner_instance_id=lease_owner,
             task_lease_expires_at=lease_expires_at,
             task_lease_source=lease_source,
+            tail_reconcile_state=self._tail_reconcile_state(task),
             reconcile_owner_instance_id=reconcile_owner,
             reconcile_lease_expires_at=reconcile_lease_expires_at,
+            reconcile_owner_pod_uid=reconcile_pod_uid,
+            reconcile_owner_boot_id=reconcile_boot_id,
+            reconcile_generation=reconcile_generation,
             runtime_override_version=int(getattr(task, "runtime_override_version", 0) or 0),
             runtime_override_updated_at=getattr(task, "runtime_override_updated_at", None),
             runtime_override_updated_by=getattr(task, "runtime_override_updated_by", None),
@@ -19476,10 +19608,10 @@ class TaskManager:
         task_retry_supported, task_retry_reason, _ = self._task_retry_support(db, task)
         task_continue_supported, task_continue_reason, _ = self._task_continue_support(db, task)
         task_retry_failed_supported, task_retry_failed_reason, _, _ = self._task_retry_failed_items_support(db, task)
-        lease_owner, lease_expires_at, lease_source = self._task_runtime_lease_view(db, task)
+        lease_owner, lease_expires_at, lease_source, lease_pod_uid, lease_boot_id, lease_generation = self._task_runtime_lease_view(db, task)
         runtime_phase = self._task_runtime_phase(task)
         task_control_mode = self._task_control_mode(task)
-        reconcile_owner, reconcile_lease_expires_at = self._reconcile_lease_view(db, task)
+        reconcile_owner, reconcile_lease_expires_at, reconcile_pod_uid, reconcile_boot_id, reconcile_generation = self._reconcile_lease_view(db, task)
         base_policy = self._task_base_policy(task)
         runtime_override = self._task_runtime_override(task)
         effective_runtime_policy = self._effective_runtime_policy(task)

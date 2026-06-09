@@ -153,6 +153,7 @@ class BinarySecurityTaskResponse(BaseModel):
     name: str
     status: str
     runtime_phase: str = "owned_execution"
+    tail_reconcile_state: str = "idle"
     task_control_mode: str = "owned_execution"
     current_operation_id: Optional[str] = None
     execution_epoch: int = 0
@@ -173,6 +174,9 @@ class BinarySecurityTaskResponse(BaseModel):
     task_lease_source: Optional[str] = None
     reconcile_owner_instance_id: Optional[str] = None
     reconcile_lease_expires_at: Optional[datetime] = None
+    reconcile_owner_pod_uid: Optional[str] = None
+    reconcile_owner_boot_id: Optional[str] = None
+    reconcile_generation: Optional[int] = None
     runtime_override_version: int = 0
     runtime_override_updated_at: Optional[datetime] = None
     runtime_override_updated_by: Optional[str] = None

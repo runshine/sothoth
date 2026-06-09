@@ -90,11 +90,11 @@ def get_agent_run_timeout_seconds() -> int:
 
         db = get_db_session()
         try:
-            return int(get_config_value(db, "agent_run_timeout_seconds", default=3600))
+            return int(get_config_value(db, "agent_run_timeout_seconds", default=1800))
         finally:
             db.close()
     except Exception:
-        return 3600
+        return 1800
 
 
 def get_agent_thinking_level() -> str | None:
@@ -131,11 +131,11 @@ def get_agent_timeout_max_retries() -> int:
 
         db = get_db_session()
         try:
-            return int(get_config_value(db, "agent_timeout_max_retries", default=3))
+            return int(get_config_value(db, "agent_timeout_max_retries", default=20))
         finally:
             db.close()
     except Exception:
-        return 3
+        return 20
 
 
 def get_max_retries_reached_action() -> str:
