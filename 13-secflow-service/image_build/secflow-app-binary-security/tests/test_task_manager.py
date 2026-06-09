@@ -7716,6 +7716,39 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, len(abnormal_events))
         self.assertEqual("archive_failed", task.latest_abnormal_reason["code"])
 
+    def test_task_abnormal_reason_skips_waiting_confirmation_task(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="pending_module_confirmation",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        stage_summary = BinarySecurityStageSummary(
+            stage_name="system_analysis",
+            sequence_no=2,
+            status="waiting_confirmation",
+            retry_count=0,
+            total_items=1,
+            success_items=1,
+            failed_items=0,
+            orchestration_failed_items=0,
+            downstream_missing_items=0,
+            skipped_items=0,
+            running_items=0,
+            cancelled_items=0,
+            downstream_status_counts={},
+        )
+
+        reason = self.manager._task_abnormal_reason(task, [stage_summary], [], [])
+
+        self.assertIsNone(reason)
+
     def test_update_task_policy_rejects_running_task(self):
         task = BinarySecurityTask(
             id="t1",
@@ -18713,6 +18746,87 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertIsNone(task.last_error)
         self.assertIsNone(task.latest_abnormal_reason)
         self.assertTrue(db.closed)
+
+    def test_record_polled_child_sync_failure_skips_confirmation_waiting_tasks(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="pending_module_confirmation",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="item1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_key="k1",
+            status="running",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item])
+
+        with patch.object(task_manager_module, "get_session_factory", return_value=lambda: db):
+            self.manager._record_polled_child_sync_failure(
+                task_id="task1",
+                item_id="item1",
+                error_message="tail reconciliation owner lost",
+                error_type="StaleTaskExecution",
+                http_status=500,
+            )
+
+        self.assertEqual([], [event for event in db.added if isinstance(event, BinarySecurityEvent)])
+
+    def test_record_polled_child_sync_failure_deduplicates_tail_owner_lost_events(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="item1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_key="k1",
+            status="running",
+        )
+        event = BinarySecurityEvent(
+            id="evt1",
+            task_id="task1",
+            project_id="p1",
+            event_type="tail_reconcile_owner_lost",
+            stage_name="system_analysis",
+            message="tail 收口 owner 已丢失，等待新的 reducer 接管: tail reconciliation owner lost",
+        )
+        event.payload = {
+            "error_type": "StaleTaskExecution",
+            "error_message": "tail reconciliation owner lost",
+        }
+        event.created_at = _now()
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], events=[event])
+
+        with patch.object(task_manager_module, "get_session_factory", return_value=lambda: db):
+            self.manager._record_polled_child_sync_failure(
+                task_id="task1",
+                item_id="item1",
+                error_message="tail reconciliation owner lost",
+                error_type="StaleTaskExecution",
+                http_status=500,
+            )
+
+        self.assertEqual(1, len(db.events))
 
     def test_touch_task_heartbeat_skips_when_local_worker_is_not_active(self):
         manager = TaskManager()

@@ -1088,6 +1088,57 @@ class TaskManager:
         )
         return any(token.lower() in normalized_message for token in control_tokens)
 
+    def _task_is_waiting_for_manual_confirmation(
+        self,
+        task: BinarySecurityTask,
+        stage_summaries: list[BinarySecurityStageSummary] | None = None,
+    ) -> bool:
+        task_status = str(task.status or "").strip()
+        if task_status in {TASK_STATUS_PENDING_MODULE_CONFIRMATION, TASK_STATUS_PENDING_ENTRY_CONFIRMATION, "waiting_confirmation"}:
+            return True
+        if not stage_summaries:
+            return False
+        return any(str(summary.status or "").strip() == "waiting_confirmation" for summary in stage_summaries)
+
+    def _has_recent_matching_task_event(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        event_type: str,
+        stage_name: str | None,
+        message: str | None = None,
+        payload_keys: dict[str, Any] | None = None,
+        within_seconds: int = 300,
+    ) -> bool:
+        if within_seconds <= 0:
+            return False
+        threshold = _now() - timedelta(seconds=within_seconds)
+        rows = (
+            db.query(BinarySecurityEvent)
+            .filter(
+                BinarySecurityEvent.task_id == task.id,
+                BinarySecurityEvent.event_type == event_type,
+                BinarySecurityEvent.created_at >= threshold,
+            )
+            .order_by(BinarySecurityEvent.created_at.desc())
+            .limit(20)
+            .all()
+        )
+        expected_message = str(message or "").strip()
+        expected_stage = str(stage_name or "").strip()
+        expected_payload = dict(payload_keys or {})
+        for row in rows:
+            if expected_stage and str(row.stage_name or "").strip() != expected_stage:
+                continue
+            if expected_message and str(row.message or "").strip() != expected_message:
+                continue
+            payload = dict(row.payload or {})
+            if any(payload.get(key) != value for key, value in expected_payload.items()):
+                continue
+            return True
+        return False
+
     def _downstream_tasks(self):
         return get_downstream_task_controller(self)
 
@@ -12336,19 +12387,38 @@ class TaskManager:
             if task is None or item is None:
                 return
             if self._is_tail_control_plane_stale_error(error_message=error_message, error_type=error_type):
+                if str(task.status or "").strip() in {TASK_STATUS_PENDING_MODULE_CONFIRMATION, TASK_STATUS_PENDING_ENTRY_CONFIRMATION, "waiting_confirmation"}:
+                    session.commit()
+                    return
+                event_message = f"tail 收口 owner 已丢失，等待新的 reducer 接管: {error_message}"
+                event_payload = {
+                    "error_type": error_type,
+                    "error_message": error_message,
+                    "http_status": http_status,
+                }
+                if self._has_recent_matching_task_event(
+                    session,
+                    task,
+                    event_type="tail_reconcile_owner_lost",
+                    stage_name=item.stage_name,
+                    message=event_message,
+                    payload_keys={
+                        "error_type": error_type,
+                        "error_message": error_message,
+                    },
+                    within_seconds=max(60, self._stage_item_sync_reconcile_interval_seconds() * 2),
+                ):
+                    session.commit()
+                    return
                 self._record_event(
                     session,
                     task,
                     "tail_reconcile_owner_lost",
-                    f"tail 收口 owner 已丢失，等待新的 reducer 接管: {error_message}",
+                    event_message,
                     level="warning",
                     stage_name=item.stage_name,
                     item=item,
-                    payload={
-                        "error_type": error_type,
-                        "error_message": error_message,
-                        "http_status": http_status,
-                    },
+                    payload=event_payload,
                 )
                 session.commit()
                 return
@@ -18724,6 +18794,8 @@ class TaskManager:
         archive_jobs: list[BinarySecurityArchiveJob],
     ) -> BinarySecurityAbnormalReason | None:
         status = str(task.status or "")
+        if self._task_is_waiting_for_manual_confirmation(task, stage_summaries):
+            return None
         if status in {"success", "pending", "queued", "running", "dispatching", "ready_to_start", "pending_upload", "uploading"}:
             return None
         if status == "cancelled":
