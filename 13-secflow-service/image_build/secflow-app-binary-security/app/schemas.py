@@ -175,6 +175,13 @@ class BinarySecurityTaskResponse(BaseModel):
     task_lease_owner_instance_id: Optional[str] = None
     task_lease_expires_at: Optional[datetime] = None
     task_lease_source: Optional[str] = None
+    tail_control_mode: str = "idle"
+    tail_has_runnable_unbound_items: bool = False
+    tail_unbound_runnable_item_count: int = 0
+    tail_bound_active_item_count: int = 0
+    tail_has_downstream_refs: bool = False
+    tail_takeover_required: bool = False
+    tail_takeover_reason: Optional[str] = None
     reconcile_owner_instance_id: Optional[str] = None
     reconcile_lease_expires_at: Optional[datetime] = None
     reconcile_owner_pod_uid: Optional[str] = None

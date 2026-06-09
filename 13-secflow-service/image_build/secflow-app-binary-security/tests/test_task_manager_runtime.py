@@ -7,19 +7,39 @@ from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 
 from app.model import (
     BinarySecurityStageItem,
+    BinarySecurityStageRun,
     BinarySecurityTask,
     BinarySecurityTaskRuntimeLease,
+    TASK_RUNTIME_PHASE_OWNED_EXECUTION,
     TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
     TASK_TYPE_BINARY,
     TASK_TYPE_SOURCE,
 )
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import StaleTaskExecution, TaskManager, _now
+from test_task_manager import _ModelAwareDb
 
 
 class TaskManagerRuntimeStatusTests(unittest.TestCase):
     def setUp(self):
         self.manager = TaskManager()
+
+    def test_task_runtime_phase_defaults_to_owned_execution_for_streaming_task_without_explicit_phase(self):
+        task = BinarySecurityTask(
+            id="task-phase-default",
+            project_id="project-1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            status="pending",
+            current_stage="dataflow_vuln_scan",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id=None,
+        )
+        task.policy = {"pipeline_mode": "mixed_streaming"}
+
+        self.assertEqual("owned_execution", self.manager._task_runtime_phase(task))
 
     def test_runtime_status_reports_reducer_snapshot_loop(self):
         self.manager._running = True
@@ -245,6 +265,187 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(["called", "called"], pop_calls)
         logger_exception.assert_not_called()
+
+
+class StreamingTailTakeoverTests(unittest.TestCase):
+    def setUp(self):
+        self.manager = TaskManager()
+
+    def test_tail_stage_work_summary_prefers_execution_takeover_for_unbound_items(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            status="pending",
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            current_stage="dataflow_vuln_scan",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+        )
+        task.policy = {"pipeline_mode": "mixed_streaming"}
+        stage_item = BinarySecurityStageItem(
+            id="item-1",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-1",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            status="queued",
+            downstream_service="dataflow_vuln_scan",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[stage_item])
+
+        summary = self.manager._tail_stage_work_summary(db, task)
+
+        self.assertEqual("execution_takeover", summary["tail_control_mode"])
+        self.assertTrue(summary["has_runnable_unbound_items"])
+        self.assertEqual(1, summary["unbound_runnable_item_count"])
+        self.assertEqual(0, summary["bound_active_item_count"])
+        self.assertTrue(self.manager._tail_requires_execution_takeover(db, task))
+        self.assertFalse(self.manager._should_enter_tail_reconciliation(db, task))
+
+    def test_refresh_task_status_keeps_owned_execution_when_tail_has_unbound_items(self):
+        task = BinarySecurityTask(
+            id="task-2",
+            project_id="project-1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            status="pending",
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            current_stage="dataflow_vuln_scan",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+        )
+        task.policy = {"pipeline_mode": "mixed_streaming"}
+        stage_run = BinarySecurityStageRun(
+            id="sr-2",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="dataflow_vuln_scan",
+            sequence_no=1,
+            status="pending",
+        )
+        stage_item = BinarySecurityStageItem(
+            id="item-2",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=stage_run.id,
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-2",
+            status="queued",
+            downstream_service="dataflow_vuln_scan",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[stage_item])
+
+        with (
+            patch.object(self.manager, "_ensure_task_remains_cancelling", return_value=None),
+            patch.object(self.manager, "_recover_failed_cancelled_task_state", return_value=False),
+            patch.object(self.manager, "_active_operation", return_value=None),
+            patch.object(self.manager, "_refresh_stage_from_authoritative_items", side_effect=lambda *_args, **_kwargs: None),
+            patch.object(self.manager, "_release_tail_reconcile_owner", side_effect=lambda *_args, **_kwargs: None),
+            patch.object(self.manager, "_clear_task_abnormal_reason_snapshot", side_effect=lambda *_args, **_kwargs: None),
+            patch.object(self.manager, "_activate_tail_reconciliation", side_effect=AssertionError("should not enter tail reconciliation")),
+        ):
+            self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual("running", task.status)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
+        self.assertEqual("idle", task.tail_reconcile_state)
+
+    def test_tail_stage_work_summary_marks_incomplete_stage_as_execution_takeover(self):
+        task = BinarySecurityTask(
+            id="task-3",
+            project_id="project-1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            status="running",
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            current_stage="dataflow_vuln_scan",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+        )
+        task.policy = {"pipeline_mode": "mixed_streaming"}
+        stage_run = BinarySecurityStageRun(
+            id="sr-3",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="dataflow_vuln_scan",
+            sequence_no=1,
+            status="running",
+        )
+        bound_item = BinarySecurityStageItem(
+            id="item-3",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=stage_run.id,
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-3",
+            status="running",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dvs-1",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[bound_item])
+
+        summary = self.manager._tail_stage_work_summary(db, task)
+
+        self.assertEqual("execution_takeover", summary["tail_control_mode"])
+        self.assertTrue(summary["takeover_required"])
+        self.assertEqual("incomplete_tail_stage", summary["takeover_reason"])
+        self.assertEqual(1, summary["bound_active_item_count"])
+
+    def test_refresh_task_status_keeps_owned_execution_for_incomplete_tail_stage_without_unbound_items(self):
+        task = BinarySecurityTask(
+            id="task-4",
+            project_id="project-1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            status="running",
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            current_stage="dataflow_vuln_scan",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+        )
+        task.policy = {"pipeline_mode": "mixed_streaming"}
+        stage_run = BinarySecurityStageRun(
+            id="sr-4",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="dataflow_vuln_scan",
+            sequence_no=1,
+            status="running",
+        )
+        bound_item = BinarySecurityStageItem(
+            id="item-4",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=stage_run.id,
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-4",
+            status="running",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dvs-4",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[bound_item])
+
+        with (
+            patch.object(self.manager, "_ensure_task_remains_cancelling", return_value=None),
+            patch.object(self.manager, "_recover_failed_cancelled_task_state", return_value=False),
+            patch.object(self.manager, "_active_operation", return_value=None),
+            patch.object(self.manager, "_refresh_stage_from_authoritative_items", side_effect=lambda *_args, **_kwargs: None),
+            patch.object(self.manager, "_release_tail_reconcile_owner", side_effect=lambda *_args, **_kwargs: None),
+            patch.object(self.manager, "_clear_task_abnormal_reason_snapshot", side_effect=lambda *_args, **_kwargs: None),
+            patch.object(self.manager, "_activate_tail_reconciliation", side_effect=AssertionError("should not enter tail reconciliation")),
+        ):
+            self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual("running", task.status)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
+        self.assertEqual("idle", task.tail_reconcile_state)
 
     async def test_retry_target_stage_sync_batches_specific_item_ids(self):
         manager = TaskManager()

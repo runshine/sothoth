@@ -2947,7 +2947,7 @@ class TaskManagerTests(unittest.TestCase):
 
         self.manager._finalize_task(db, task)
 
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual("dataflow_vuln_scan", task.current_stage)
         self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, self.manager._task_runtime_phase(task))
         self.assertIsNone(task.finished_at)
@@ -5625,6 +5625,58 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("running", task.status)
         self.assertEqual("binary_to_source", task.current_stage)
         self.assertIsNone(task.finished_at)
+        self.assertTrue(
+            any(
+                isinstance(obj, BinarySecurityEvent) and obj.event_type == "task_finalize_deferred_for_active_stage"
+                for obj in db.added
+            )
+        )
+
+    def test_finalize_task_keeps_owned_execution_for_incomplete_streaming_tail_stage(self):
+        task = BinarySecurityTask(
+            id="t-tail",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="dataflow_vuln_scan",
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[
+                BinarySecurityStageRun(id="sr-fw", task_id="t-tail", project_id="p1", stage_name="firmware_unpack", sequence_no=1, status="success"),
+                BinarySecurityStageRun(id="sr0", task_id="t-tail", project_id="p1", stage_name="system_analysis", sequence_no=2, status="success"),
+                BinarySecurityStageRun(id="sr1", task_id="t-tail", project_id="p1", stage_name="binary_to_source", sequence_no=3, status="success"),
+                BinarySecurityStageRun(id="sr2", task_id="t-tail", project_id="p1", stage_name="entry_analysis", sequence_no=4, status="success"),
+                BinarySecurityStageRun(id="sr3", task_id="t-tail", project_id="p1", stage_name="dataflow_vuln_scan", sequence_no=5, status="running"),
+            ],
+            stage_items=[
+                BinarySecurityStageItem(
+                    id="si-tail",
+                    task_id="t-tail",
+                    project_id="p1",
+                    stage_run_id="sr3",
+                    stage_name="dataflow_vuln_scan",
+                    item_key="entry-1",
+                    status="queued",
+                    downstream_service="dataflow_vuln_scan",
+                )
+            ],
+            events=[],
+        )
+
+        self.manager._finalize_task(db, task)
+
+        self.assertEqual("running", task.status)
+        self.assertEqual("dataflow_vuln_scan", task.current_stage)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
+        self.assertEqual("idle", task.tail_reconcile_state)
         self.assertTrue(
             any(
                 isinstance(obj, BinarySecurityEvent) and obj.event_type == "task_finalize_deferred_for_active_stage"
@@ -19487,6 +19539,89 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual([], claimed)
         self.assertEqual("pending", task.status)
         self.assertIsNone(task.dispatcher_instance_id)
+
+    def test_claim_pending_tasks_repairs_tail_takeover_phase_for_worker(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="t-tail-takeover",
+            project_id="p1",
+            name="tail-takeover",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/ws",
+            policy_json='{"pipeline_mode": "mixed_streaming"}',
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            current_stage="dataflow_vuln_scan",
+        )
+        stage_item = BinarySecurityStageItem(
+            id="si-tail-takeover",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-tail-takeover",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            status="queued",
+            downstream_service="dataflow_vuln_scan",
+        )
+
+        class _ClaimPendingDb(_ModelAwareDb):
+            def query(self, model, *args, **kwargs):
+                del args, kwargs
+                model_name = getattr(model, "__name__", "")
+                if model_name == "BinarySecurityTask":
+                    return _FakeQuery([task])
+                return _FakeQuery([])
+
+        db = _ClaimPendingDb(tasks=[task], stage_items=[stage_item])
+
+        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False):
+            claimed = manager._claim_pending_tasks(db, 1)
+
+        self.assertEqual(["t-tail-takeover"], claimed)
+        self.assertEqual("dispatching", task.status)
+        self.assertEqual(manager.instance_id, task.dispatcher_instance_id)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, manager._task_runtime_phase(task))
+        self.assertEqual("idle", task.tail_reconcile_state)
+
+    def test_dispatch_task_by_id_repairs_tail_takeover_phase_for_worker(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="t-tail-dispatch",
+            project_id="p1",
+            name="tail-dispatch",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/ws",
+            policy_json='{"pipeline_mode": "mixed_streaming"}',
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            current_stage="dataflow_vuln_scan",
+        )
+        stage_item = BinarySecurityStageItem(
+            id="si-tail-dispatch",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-tail-dispatch",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            status="queued",
+            downstream_service="dataflow_vuln_scan",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[stage_item])
+
+        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False):
+            claimed = manager._dispatch_task_by_id(db, task.id)
+
+        self.assertEqual(task.id, claimed)
+        self.assertEqual("dispatching", task.status)
+        self.assertEqual(manager.instance_id, task.dispatcher_instance_id)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, manager._task_runtime_phase(task))
+        self.assertEqual("idle", task.tail_reconcile_state)
 
     def test_find_reusable_dataflow_payload_prefers_active_duplicate_task(self):
         task = BinarySecurityTask(id="t1", project_id="p1")
