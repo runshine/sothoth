@@ -87,7 +87,12 @@ async def unregister(service_id: str, _: tuple[dict, str] = Depends(get_current_
 @router.get("")
 async def list_services(_: tuple[dict, str] = Depends(get_current_subject), db: Session = Depends(get_db)):
     reconcile_service_statuses(db)
-    services = db.query(ServiceRegistry).order_by(ServiceRegistry.updated_at.desc()).all()
+    services = (
+        db.query(ServiceRegistry)
+        .filter(ServiceRegistry.status == "active")
+        .order_by(ServiceRegistry.updated_at.desc())
+        .all()
+    )
     return {"items": [_to_response(service) for service in services], "total": len(services)}
 
 

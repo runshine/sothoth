@@ -379,6 +379,37 @@ def test_duplicate_report_id_returns_existing_case(client: TestClient):
     assert second.json()["global_vuln_id"] == first.json()["global_vuln_id"]
 
 
+def test_list_cases_ignores_undefined_filter_values(client: TestClient):
+    created = client.post(
+        "/api/vuln/cases",
+        json=make_suspicion_payload(
+            title="Undefined filter tolerance case",
+            reporter={"name": "undefined-filter", "version": "1.0.0", "type": "service"},
+            subject={"type": "repo", "locator": "repo://demo/undefined-filter", "name": "undefined-filter"},
+        ),
+    )
+    assert created.status_code == 200
+
+    response = client.get(
+        "/api/vuln/cases",
+        params={
+            "project_id": "demo-project",
+            "current_stage": "undefined",
+            "severity": "undefined",
+            "reporter_type": "undefined",
+            "cvss_band": "undefined",
+            "search": "undefined",
+            "page": 1,
+            "page_size": 20,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] >= 1
+    assert any(item["id"] == created.json()["id"] for item in payload["items"])
+
+
 def test_download_center_job_create_process_and_download(client: TestClient):
     first = client.post(
         "/api/vuln/cases",
@@ -1026,9 +1057,31 @@ def test_case_list_supports_server_side_filters_sort_and_paging(client: TestClie
         if fixture["current_stage"]:
             transition_resp = client.post(
                 f"/api/vuln/cases/{case_id}/stage-transition",
-                json={"to_stage": fixture["current_stage"], "reason": f"test-transition-{index}"},
+                json={"to_stage": "triage", "reason": f"test-transition-triage-{index}"},
             )
             assert transition_resp.status_code == 200
+            if fixture["current_stage"] == "validation":
+                decision_resp = client.post(
+                    f"/api/vuln/cases/{case_id}/decisions",
+                    json={
+                        "decision_status": "issue",
+                        "summary": f"test decision after triage {index}",
+                    },
+                )
+                assert decision_resp.status_code == 200
+                gate_resp = client.post(
+                    f"/api/vuln/cases/{case_id}/triage/gate",
+                    json={
+                        "triage_gate": "approved_to_validation",
+                        "summary": f"test gate after triage {index}",
+                    },
+                )
+                assert gate_resp.status_code == 200
+                validation_resp = client.post(
+                    f"/api/vuln/cases/{case_id}/stage-transition",
+                    json={"to_stage": "validation", "reason": f"test-transition-validation-{index}"},
+                )
+                assert validation_resp.status_code == 200
 
     page_two = client.get(
         "/api/vuln/cases",

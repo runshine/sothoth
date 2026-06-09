@@ -557,6 +557,28 @@ async def list_cases(
     user_and_token: tuple[dict, str] = Depends(get_current_subject),
     db: Session = Depends(get_db),
 ):
+    def _normalize_optional_query(value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        if not normalized:
+            return None
+        if normalized.lower() in {"undefined", "null", "none", "all"}:
+            return None
+        return normalized
+
+    project_id = _normalize_optional_query(project_id)
+    global_vuln_id = _normalize_optional_query(global_vuln_id)
+    current_stage = _normalize_optional_query(current_stage)
+    severity = _normalize_optional_query(severity)
+    reporter_type = _normalize_optional_query(reporter_type)
+    cvss_band = _normalize_optional_query(cvss_band)
+    search = _normalize_optional_query(search)
+    source_service_name = _normalize_optional_query(source_service_name)
+    source_task_id = _normalize_optional_query(source_task_id)
+    source_execution_id = _normalize_optional_query(source_execution_id)
+    pool_type = _normalize_optional_query(pool_type)
+    evolution_task_id = _normalize_optional_query(evolution_task_id)
     _, token = user_and_token
     if project_id:
         await ensure_project_access(project_id, token)
@@ -1499,6 +1521,8 @@ async def auto_orchestrate_case_actions(
     if case is None:
         raise HTTPException(status_code=404, detail="case not found")
     await ensure_project_access(case.project_id, token)
+    if case.current_stage == MAIN_STAGE_FINISHED:
+        raise HTTPException(status_code=400, detail="finished cases cannot orchestrate actions")
     actions = auto_orchestrate_case(db, case)
     db.commit()
     return {
