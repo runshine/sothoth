@@ -26599,16 +26599,52 @@ class TaskManager:
         result = self._load_stage_item_result_payload(item)
         artifact_root = Path(self._stage_item_artifact_root(item, archive_jobs=archive_jobs))
         modules_file = artifact_root / "system_analysis_modules.json"
+        base_firmware = self._normalize_system_analysis_input(
+            {
+                **dict(item.input_ref or {}),
+                **result,
+                "firmware_key": result.get("firmware_key") or item.item_key or (item.input_ref or {}).get("firmware_key"),
+                "firmware_name": result.get("firmware_name") or item.item_name or (item.input_ref or {}).get("firmware_name"),
+                "filename": result.get("filename") or (item.input_ref or {}).get("filename") or item.item_name or item.item_key,
+                "input_path": result.get("input_path") or (item.input_ref or {}).get("input_path") or (item.input_ref or {}).get("path"),
+                "unpacked_root": result.get("unpacked_root") or result.get("source_root") or str(artifact_root),
+                "source_root": result.get("source_root") or result.get("unpacked_root") or str(artifact_root),
+                "task_type": result.get("task_type") or self._task_type(task),
+            }
+        )
+
+        def _enrich(row: dict[str, Any], index: int) -> dict[str, Any]:
+            module_name = str(row.get("module_name") or row.get("name") or "").strip()
+            module_key = str(row.get("module_key") or "").strip() or _slug(f"{base_firmware['firmware_key']}-{module_name or index + 1}")
+            source_root = str(row.get("source_root") or base_firmware.get("source_root") or base_firmware.get("unpacked_root") or "").strip()
+            module_dir = str(row.get("module_dir") or row.get("module_dir_path") or "").strip()
+            source_dir = str(row.get("source_dir") or module_dir or source_root).strip()
+            files_list = str(row.get("files_list") or row.get("files_list_path") or "").strip()
+            enriched = {
+                **base_firmware,
+                **dict(row),
+                "module_key": module_key,
+                "module_name": module_name or module_key,
+                "module_dir": module_dir or source_dir,
+                "source_dir": source_dir,
+                "source_root": source_root,
+                "source_root_path": str(row.get("source_root_path") or source_root).strip(),
+                "files_list": files_list,
+                "files_list_path": str(row.get("files_list_path") or files_list).strip(),
+                "task_type": row.get("task_type") or base_firmware.get("task_type") or self._task_type(task),
+            }
+            return enriched
+
         if modules_file.is_file():
             try:
                 payload = json.loads(_read_text(modules_file) or "{}")
                 rows = payload.get("items") or []
                 if isinstance(rows, list):
-                    return [dict(row) for row in rows if isinstance(row, dict)]
+                    return [_enrich(dict(row), index) for index, row in enumerate(rows) if isinstance(row, dict)]
             except Exception:
                 pass
         modules = result.get("modules") or []
-        return [dict(row) for row in modules if isinstance(row, dict)]
+        return [_enrich(dict(row), index) for index, row in enumerate(modules) if isinstance(row, dict)]
 
     def _parse_system_analysis_modules(self, root: Path, firmware: dict[str, Any], result_payload: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         result_payload = result_payload or {}
