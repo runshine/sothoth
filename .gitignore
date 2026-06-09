@@ -35,4 +35,4 @@ node_modules/
 package-lock.json
 package.json
 openvpn_service
-.plans/nul
+.plans/
