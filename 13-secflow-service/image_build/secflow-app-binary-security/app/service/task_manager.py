@@ -7153,6 +7153,40 @@ class TaskManager:
             db.flush()
         return recovered
 
+    def _should_finalize_without_entries(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> bool:
+        normalized_stage = normalize_stage_name(stage_name)
+        if normalized_stage != "entry_analysis":
+            return False
+        if self._task_type(task) not in {TASK_TYPE_SOURCE, TASK_TYPE_BINARY_MODULE}:
+            return False
+        if self._stage_items(db, task.id, stage_name):
+            return False
+        if db.query(BinarySecurityStageRun).filter(
+            BinarySecurityStageRun.task_id == task.id,
+            BinarySecurityStageRun.stage_name == stage_name,
+        ).first() is not None:
+            return False
+        metrics = dict(task.metrics or {})
+        summary = dict(task.summary or {})
+        entry_count = int(metrics.get("entry_count") or 0)
+        if entry_count > 0:
+            return False
+        if summary.get("entry_results"):
+            return False
+        selected_modules = list(summary.get("selected_modules") or [])
+        if task.task_type == TASK_TYPE_BINARY_MODULE and not selected_modules:
+            return False
+        upstream_run = db.query(BinarySecurityStageRun).filter(
+            BinarySecurityStageRun.task_id == task.id,
+            BinarySecurityStageRun.stage_name == "system_analysis",
+        ).first()
+        return upstream_run is not None and str(upstream_run.status or "").strip() == "success"
+
     async def sync_downstream_status(
         self,
         db: Session,
@@ -20839,6 +20873,8 @@ class TaskManager:
                 and normalize_stage_name(stage_name) == "dataflow_vuln_scan"
                 and self._continue_stage_input_error(db, task, stage_name)
             ):
+                continue
+            if self._should_finalize_without_entries(db, task, stage_name):
                 continue
             if run.status == "partial_success":
                 if not self._partial_success_advancement_enabled(task, stage_name):

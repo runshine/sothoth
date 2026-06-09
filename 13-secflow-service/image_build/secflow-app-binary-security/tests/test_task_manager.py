@@ -18394,6 +18394,38 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual("pending", task.status)
         self.assertTrue(any(event.event_type == "tail_reconciliation_released_idle" for event in fake_db.events))
 
+    def test_next_incomplete_stage_skips_entry_analysis_when_no_entries_exist(self):
+        task = BinarySecurityTask(
+            id="task-no-entry",
+            project_id="p1",
+            name="demo",
+            status="pending",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        )
+        task.metrics = {
+            "entry_count": 0,
+            "selected_module_count": 2,
+        }
+        stage_run = BinarySecurityStageRun(
+            id="sr-system",
+            task_id="task-no-entry",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="success",
+        )
+        fake_db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[], events=[])
+
+        next_stage = self.manager._next_incomplete_stage(fake_db, task)
+
+        self.assertIsNone(next_stage)
+
     def test_run_task_ignores_stale_worker_failure_after_retry(self):
         task = BinarySecurityTask(
             id="task1",
