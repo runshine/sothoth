@@ -1,4 +1,4 @@
-from app.model import BinarySecurityStageRun, BinarySecurityTask, TASK_TYPE_SOURCE
+from app.model import BinarySecurityStageItem, BinarySecurityStageRun, BinarySecurityTask, TASK_TYPE_SOURCE
 from app.service.task_manager import TaskManager
 from tests.test_task_manager import _AppendingModelAwareDb
 
@@ -43,3 +43,67 @@ def test_source_task_does_not_skip_entry_analysis_when_system_analysis_has_no_en
 
     assert should_skip is False
     assert next_stage == "entry_analysis"
+
+
+def test_source_system_analysis_rebuild_restores_entry_analysis_input_contract_fields():
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-source-summary-rebuild",
+        project_id="p1",
+        name="source-task",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.summary = {}
+    stage_run = BinarySecurityStageRun(
+        id="sr-system",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        sequence_no=1,
+        status="success",
+    )
+    system_item = BinarySecurityStageItem(
+        id="si-system",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=stage_run.id,
+        stage_name="system_analysis",
+        item_key="source_project",
+        item_name="source-project",
+        status="success",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-demo",
+    )
+    system_item.input_ref = {"input_path": "/w/input", "firmware_key": "source_project", "task_type": TASK_TYPE_SOURCE}
+    system_item.result = {
+        "firmware_key": "source_project",
+        "firmware_name": "demo",
+        "filename": "source-project",
+        "unpacked_root": "/w/input",
+        "source_root": "/w/input",
+        "task_type": TASK_TYPE_SOURCE,
+        "modules": [
+            {
+                "module_key": "m1",
+                "module_name": "module-1",
+                "risk_level": "高",
+                "risk_score": 90,
+            }
+        ],
+    }
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[system_item], events=[])
+
+    manager._refresh_system_analysis_stage_from_synced_items(db, task)
+
+    selected = task.summary["selected_modules"][0]
+    assert selected["firmware_key"] == "source_project"
+    assert selected["source_root"] == "/w/input"
+    assert selected["source_root_path"] == "/w/input"
+    assert selected["source_dir"] == "/w/input"
+    assert selected["module_dir"] == "/w/input"
