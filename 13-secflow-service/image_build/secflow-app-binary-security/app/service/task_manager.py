@@ -24624,6 +24624,12 @@ class TaskManager:
         if stage_name in {"binary_to_source", "entry_analysis"} and not summary.get("selected_modules"):
             self._refresh_system_analysis_stage_from_synced_items(db, task)
             summary = dict(task.summary or {})
+        if normalize_stage_name(stage_name) == "dataflow_vuln_scan" and not summary.get("entry_results"):
+            self._refresh_system_analysis_stage_from_synced_items(db, task)
+            summary = dict(task.summary or {})
+            if summary.get("selected_modules") and not self._stage_items(db, task.id, "entry_analysis"):
+                task.current_stage = "entry_analysis"
+                stage_name = "entry_analysis"
         if stage_name == "entry_analysis" and self._task_type(task) != TASK_TYPE_SOURCE and not summary.get("b2s_results"):
             self._rebuild_summary_results_from_stage_items(db, task, "binary_to_source", "b2s_results")
             summary = dict(task.summary or {})

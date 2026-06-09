@@ -24681,6 +24681,66 @@ def _test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with
     self.assertTrue(manager._task_needs_downstream_reconcile(db, task))
 
 
+def _test_ensure_stage_inputs_available_rebuilds_system_summary_before_dataflow_stage(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-dataflow-missing-entry",
+        project_id="p1",
+        name="demo",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json='{"pipeline_mode": "mixed_streaming"}',
+    )
+    task.summary = {}
+    stage_run = BinarySecurityStageRun(
+        id="sr-system-rebuild",
+        task_id="task-dataflow-missing-entry",
+        project_id="p1",
+        stage_name="system_analysis",
+        sequence_no=1,
+        status="success",
+    )
+    system_item = BinarySecurityStageItem(
+        id="si-system-rebuild",
+        task_id="task-dataflow-missing-entry",
+        project_id="p1",
+        stage_run_id="sr-system-rebuild",
+        stage_name="system_analysis",
+        item_key="source_project",
+        item_name="source-project",
+        status="success",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-demo",
+    )
+    system_item.result = {
+        "firmware_key": "source_project",
+        "firmware_name": "demo",
+        "filename": "source-project",
+        "unpacked_root": "/w/input",
+        "source_root": "/w/input",
+        "task_type": TASK_TYPE_SOURCE,
+        "modules": [
+            {
+                "module_key": "m1",
+                "module_name": "module-1",
+                "risk_level": "高",
+                "risk_score": 90,
+            }
+        ],
+    }
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[system_item], events=[])
+
+    manager._ensure_stage_inputs_available(db, task, "dataflow_vuln_scan")
+
+    self.assertEqual("entry_analysis", task.current_stage)
+    self.assertEqual(["m1"], [module["module_key"] for module in task.summary["selected_modules"]])
+
+
 def _test_persist_child_sync_observation_records_observation_persist_failed(self):
     manager = TaskManager()
     task = BinarySecurityTask(id="task-5", project_id="p1", name="demo", status="running")
