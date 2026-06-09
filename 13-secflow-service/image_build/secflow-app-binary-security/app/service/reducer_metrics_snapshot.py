@@ -21,26 +21,10 @@ _SNAPSHOT_KEY = "secflow:binary-security:reducer:metrics-snapshot:v1"
 class ReducerMetricsSnapshotStore:
     def __init__(self) -> None:
         self._redis_url = get_config().queue.redis_url
-        self._client: Redis | None = None
-        self._client_loop_id: int | None = None
         self._lock = asyncio.Lock()
 
-    async def _client_or_create(self) -> Redis:
-        loop = asyncio.get_running_loop()
-        current_loop_id = id(loop)
-        async with self._lock:
-            if self._client is not None and self._client_loop_id != current_loop_id:
-                old_client = self._client
-                self._client = None
-                self._client_loop_id = None
-                try:
-                    await old_client.aclose()
-                except Exception:
-                    pass
-            if self._client is None:
-                self._client = Redis.from_url(self._redis_url, decode_responses=True)
-                self._client_loop_id = current_loop_id
-            return self._client
+    def _new_client(self) -> Redis:
+        return Redis.from_url(self._redis_url, decode_responses=True)
 
     async def write_snapshot(
         self,
@@ -49,18 +33,24 @@ class ReducerMetricsSnapshotStore:
         source_pod: str,
         generated_at: float | None = None,
     ) -> None:
-        client = await self._client_or_create()
+        client = self._new_client()
         created_at = float(generated_at or time.time())
         payload = {
             "metrics_payload": str(metrics_payload or ""),
             "source_pod": str(source_pod or "unknown"),
             "generated_at": created_at,
         }
-        await client.set(_SNAPSHOT_KEY, json.dumps(payload, ensure_ascii=True), ex=_SNAPSHOT_TTL_SECONDS)
+        try:
+            await client.set(_SNAPSHOT_KEY, json.dumps(payload, ensure_ascii=True), ex=_SNAPSHOT_TTL_SECONDS)
+        finally:
+            await self._close_client(client)
 
     async def read_snapshot(self) -> dict[str, Any] | None:
-        client = await self._client_or_create()
-        raw = await client.get(_SNAPSHOT_KEY)
+        client = self._new_client()
+        try:
+            raw = await client.get(_SNAPSHOT_KEY)
+        finally:
+            await self._close_client(client)
         if not raw:
             return None
         try:
@@ -122,12 +112,13 @@ class ReducerMetricsSnapshotStore:
         return ("\n".join(line for line in lines if line).strip() + "\n").encode("utf-8"), CONTENT_TYPE_LATEST
 
     async def close(self) -> None:
-        async with self._lock:
-            client = self._client
-            self._client = None
-            self._client_loop_id = None
-        if client is not None:
+        return
+
+    async def _close_client(self, client: Redis) -> None:
+        try:
             await client.aclose()
+        except Exception:
+            pass
 
 
 def _escape_label_value(value: str) -> str:
