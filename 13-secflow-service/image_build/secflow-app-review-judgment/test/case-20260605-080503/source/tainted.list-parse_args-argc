@@ -1,3 +1,0 @@
-src/cmd/isulad/isulad_commands.c###command_init_isulad###L233###argc
-src/cmd/isulad/isulad_commands.c###command_init_isulad###L233###argv
-src/cmd/command_parser.h###command_parse_args###L234###&args->argc,&args->argv

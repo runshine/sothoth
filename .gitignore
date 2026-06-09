@@ -24,6 +24,10 @@ config.mysql.json
 .context/
 .pi/
 
+# Disabled services - keep code locally, not pushed to remote
+13-secflow-service/image_build/secflow-app-review-judgment/
+13-secflow-service/image_build/secflow-app-dataflow-vuln-scanner-evolver/
+
 # Node.js
 node_modules/
 13-secflow-service/image_build/secflow-platform-workflow/app/config.py
