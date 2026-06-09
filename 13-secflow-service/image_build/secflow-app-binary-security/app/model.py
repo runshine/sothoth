@@ -551,6 +551,7 @@ class BinarySecurityTaskRuntimeLease(Base):
     owner_boot_id = Column(String(128), nullable=True, index=True)
     generation = Column(Integer, nullable=False, default=0, index=True)
     owner_started_at = Column(DateTime, nullable=True, index=True)
+    last_renewed_at = Column(DateTime, nullable=True, index=True)
     lease_expires_at = Column(DateTime, nullable=False, index=True)
     heartbeat_at = Column(DateTime, nullable=False, index=True)
     created_at = Column(DateTime, default=now_local, nullable=False)
@@ -902,6 +903,10 @@ def _ensure_compat_columns(engine) -> None:
         if "owner_started_at" not in columns:
             statements.append(
                 f"ALTER TABLE {runtime_lease_table} ADD COLUMN owner_started_at DATETIME NULL"
+            )
+        if "last_renewed_at" not in columns:
+            statements.append(
+                f"ALTER TABLE {runtime_lease_table} ADD COLUMN last_renewed_at DATETIME NULL"
             )
         _execute_compat_statements(statements)
         indexes = {index["name"] for index in inspector.get_indexes(runtime_lease_table)}

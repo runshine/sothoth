@@ -1009,7 +1009,7 @@ class TaskManager:
         self.cfg = copy.deepcopy(get_config())
         self.instance_id = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or f"binary-security-{uuid.uuid4().hex[:12]}"
         self.owner_pod_uid = os.environ.get("POD_UID") or self.instance_id
-        self.owner_boot_id = os.environ.get("BOOT_ID") or uuid.uuid4().hex
+        self.owner_boot_id = uuid.uuid4().hex
         self.owner_started_at = _now()
         self._owner_generation = 1
         self._running = False
@@ -1704,7 +1704,6 @@ class TaskManager:
         if normalized_owner:
             query = query.filter(BinarySecurityTaskRuntimeLease.owner_instance_id == normalized_owner)
         query.delete(synchronize_session=False)
-        db.commit()
 
     def _upsert_runtime_lease(
         self,
@@ -1740,6 +1739,7 @@ class TaskManager:
                 generation=requested_generation,
                 owner_started_at=requested_started_at,
                 heartbeat_at=now_value,
+                last_renewed_at=now_value,
                 lease_expires_at=self._next_runtime_lease_expiry(now_value=now_value),
             )
             db.add(lease)
@@ -1765,6 +1765,7 @@ class TaskManager:
             lease.generation = max(current_generation, requested_generation)
             lease.owner_started_at = requested_started_at
             lease.heartbeat_at = now_value
+            lease.last_renewed_at = now_value
             lease.lease_expires_at = self._next_runtime_lease_expiry(now_value=now_value)
         return lease
 
@@ -1851,13 +1852,53 @@ class TaskManager:
             if takeover_result:
                 observe_tail_reconcile_takeover(takeover_result)
             self._tail_reconcile_handoff_reason.pop(task.id, None)
+            self._record_event(
+                db,
+                task,
+                "tail_reconcile_handoff_completed",
+                f"tail 收口接管完成: {task.id}",
+                level="info",
+                payload={
+                    "lease_owner": lease_owner,
+                    "lease_generation": int(getattr(lease, "generation", 0) or 0),
+                    "owner_pod_uid": getattr(lease, "owner_pod_uid", None),
+                    "owner_boot_id": getattr(lease, "owner_boot_id", None),
+                },
+            )
             return lease
         self._release_tail_reconcile_owner(task.id)
         self._tail_reconcile_handoff_reason[task.id] = "owner_conflict"
+        self._record_event(
+            db,
+            task,
+            "tail_reconcile_owner_conflict",
+            f"tail 收口 owner 冲突: {task.id}",
+            level="warning",
+            payload={
+                "lease_owner": lease_owner or None,
+                "lease_generation": int(getattr(lease, "generation", 0) or 0) if lease is not None else None,
+                "owner_pod_uid": getattr(lease, "owner_pod_uid", None) if lease is not None else None,
+                "owner_boot_id": getattr(lease, "owner_boot_id", None) if lease is not None else None,
+            },
+        )
         if fallback_status is not None:
             task.status = fallback_status
+        task.tail_reconcile_state = "handoff_waiting"
         observe_tail_reconcile_heartbeat("handoff")
         observe_tail_reconcile_owner("handoff_started")
+        self._record_event(
+            db,
+            task,
+            "tail_reconcile_handoff_started",
+            f"tail 收口 handoff 开始: {task.id}",
+            level="info",
+            payload={
+                "lease_owner": lease_owner or None,
+                "lease_generation": int(getattr(lease, "generation", 0) or 0) if lease is not None else None,
+                "owner_pod_uid": getattr(lease, "owner_pod_uid", None) if lease is not None else None,
+                "owner_boot_id": getattr(lease, "owner_boot_id", None) if lease is not None else None,
+            },
+        )
         if takeover_result:
             observe_tail_reconcile_takeover("conflict")
         return lease
@@ -12001,6 +12042,23 @@ class TaskManager:
             item = session.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == item_id).first()
             if task is None or item is None:
                 return
+            if self._is_tail_control_plane_stale_error(error_message=error_message, error_type=error_type):
+                self._record_event(
+                    session,
+                    task,
+                    "tail_reconcile_owner_lost",
+                    f"tail 收口 owner 已丢失，等待新的 reducer 接管: {error_message}",
+                    level="warning",
+                    stage_name=item.stage_name,
+                    item=item,
+                    payload={
+                        "error_type": error_type,
+                        "error_message": error_message,
+                        "http_status": http_status,
+                    },
+                )
+                session.commit()
+                return
             state = self._build_next_downstream_sync_failure_state(item)
             self._persist_child_sync_observation(
                 session,
@@ -13855,22 +13913,6 @@ class TaskManager:
             "reducer_metrics_snapshot": self._loop_runtime_detail("reducer_metrics_snapshot", self._reducer_metrics_snapshot_loop_task),
             "task_heartbeat": self._loop_runtime_detail("task_heartbeat", self._task_heartbeat_loop_task),
         }
-        tail_reconcile_active = False
-        try:
-            session = get_session_factory()()
-            try:
-                rows = (
-                    session.query(BinarySecurityTask)
-                    .filter(BinarySecurityTask.tail_reconcile_state == "active")
-                    .filter(BinarySecurityTask.runtime_phase == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION)
-                    .limit(1)
-                    .all()
-                )
-                tail_reconcile_active = bool(rows)
-            finally:
-                session.close()
-        except Exception:
-            tail_reconcile_active = False
         return {
             "running": self._running,
             "loops": {loop_name: bool(detail.get("alive")) for loop_name, detail in loop_details.items() if loop_name != "task_heartbeat"},
@@ -13881,8 +13923,18 @@ class TaskManager:
                 "stage_item_workers": len([task for task in self._stage_item_workers.values() if not task.done()]),
                 "archive_workers": len([task for task in self._archive_workers if not task.done()]),
             },
-            "tail_reconcile_active": tail_reconcile_active,
+            "tail_reconcile_active": bool(self._is_reducer_role() and self._runtime_lease_capable()),
         }
+
+    def _runtime_lease_capable(self) -> bool:
+        if not self._is_reducer_role():
+            return False
+        return bool(
+            self._state_reducer_loop_task
+            and not self._state_reducer_loop_task.done()
+            and self._reducer_metrics_snapshot_loop_task
+            and not self._reducer_metrics_snapshot_loop_task.done()
+        )
 
     def _lease_is_active(self, task: BinarySecurityTask, db: Session | None = None) -> bool:
         lease: BinarySecurityTaskRuntimeLease | None = None

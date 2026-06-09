@@ -96,6 +96,24 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
         self.assertFalse(status["loop_details"]["operation_dispatch"]["task_running"])
         self.assertTrue(status["loop_details"]["operation_dispatch"]["heartbeat_alive"])
 
+    def test_runtime_status_marks_tail_reconcile_capable_for_live_reducer_loops(self):
+        self.manager._running = True
+
+        class _Task:
+            def __init__(self, done=False):
+                self._done = done
+
+            def done(self):
+                return self._done
+
+        self.manager._state_reducer_loop_task = _Task(False)
+        self.manager._reducer_metrics_snapshot_loop_task = _Task(False)
+        self.manager._service_role = lambda: "reducer"
+
+        status = self.manager.runtime_status()
+
+        self.assertTrue(status["tail_reconcile_active"])
+
     def test_operation_lease_uses_short_configured_ttl(self):
         self.manager.cfg.scheduler.operation_lease_ttl_seconds = 60
         now_value = _now()
