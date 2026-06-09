@@ -647,9 +647,9 @@ def _ensure_compat_columns(engine) -> None:
                         args = getattr(orig, "args", ())
                         if args:
                             errno = args[0]
-                    # MySQL duplicate-key-on-create-index should be treated as
-                    # idempotent during multi-pod startup.
-                    if int(errno or 0) == 1061:
+                    # MySQL duplicate column/index errors should be treated as
+                    # idempotent during multi-pod startup migrations.
+                    if int(errno or 0) in {1060, 1061}:
                         continue
                     raise
 
