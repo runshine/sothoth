@@ -77,7 +77,7 @@ def _scheduler_readiness() -> tuple[bool, dict[str, Any]]:
         return True, {"enabled": False, "running": False, "loops": loops, "loop_details": loop_details}
 
     running = bool(runtime.get("running"))
-    required_loops = ("task_dispatch", "operation_dispatch", "archive_dispatch", "downstream_reconcile", "readless_reconcile")
+    required_loops = ("task_dispatch", "operation_dispatch", "archive_dispatch", "stage_item_dispatch", "task_heartbeat")
     missing = [loop_name for loop_name in required_loops if not _loop_ready(loop_name, runtime)]
     return running and not missing, {
         "enabled": True,
@@ -97,16 +97,15 @@ def _reducer_readiness() -> tuple[bool, dict[str, Any]]:
         return True, {"enabled": False, "running": False, "loops": loops, "loop_details": loop_details}
 
     running = bool(runtime.get("running"))
-    required_loops = ("state_reducer", "reducer_metrics_snapshot")
+    required_loops = ("downstream_reconcile", "stage_item_sync_reconcile", "archive_runtime_reconcile", "state_repair_reconcile", "readless_reconcile", "state_reducer", "reducer_metrics_snapshot")
     missing = [loop_name for loop_name in required_loops if not _loop_ready(loop_name, runtime)]
-    reducer_has_active_tail = bool(runtime.get("tail_reconcile_active"))
     return running and not missing, {
         "enabled": True,
         "running": running,
         "loops": loops,
         "loop_details": loop_details,
         "missing_loops": missing,
-        "tail_reconcile_active": reducer_has_active_tail,
+        "tail_reconcile_active": bool(runtime.get("tail_reconcile_active")),
     }
 
 
