@@ -16601,6 +16601,59 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("success", stage_run.status)
             self.assertEqual("entry_analysis", task.current_stage)
             self.assertEqual(1, int(task.metrics.get("high_risk_module_count") or 0))
+            self.assertEqual(["m1"], [item["module_key"] for item in task.summary["selected_modules"]])
+
+    def test_reconcile_stage_and_task_state_rebuilds_missing_system_summary_from_items(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source-task",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.policy = {}
+        task.summary = {}
+        task.metrics = {}
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="success",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="system_analysis",
+            item_key="source_project",
+            item_name="source-project",
+            status="success",
+            downstream_service="system_analyse",
+            downstream_task_id="sat1",
+        )
+        item.result = {
+            "firmware_key": "source_project",
+            "firmware_name": "source-task",
+            "filename": "source-project",
+            "unpacked_root": "/w/input",
+            "source_root": "/w/input",
+            "task_type": TASK_TYPE_SOURCE,
+            "modules": [{"module_key": "m1", "module_name": "m1", "risk_level": "高", "risk_score": 90}],
+        }
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], events=[])
+
+        self.manager._reconcile_stage_and_task_state_after_item_update(db, task, "system_analysis")
+
+        self.assertEqual(["m1"], [module["module_key"] for module in task.summary["selected_modules"]])
+        self.assertEqual(1, int(task.metrics.get("selected_module_count") or 0))
 
     def test_stage_system_analysis_success_clears_stale_failure_fields(self):
         task = BinarySecurityTask(

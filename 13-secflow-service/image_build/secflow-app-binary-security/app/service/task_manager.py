@@ -12433,6 +12433,24 @@ class TaskManager:
                 "candidate_module_count": int(stage_summary.get("candidate_module_count", summary.get("candidate_module_count", 0)) or 0),
                 "selected_module_count": int(stage_summary.get("selected_module_count", summary.get("selected_module_count", 0)) or 0),
             }
+            task_summary = dict(task.summary or {})
+            if self._normalize_downstream_status(stage_run.status) == "success" and not task_summary.get("selected_modules"):
+                self._refresh_system_analysis_stage_from_synced_items(db, task)
+                task_summary = dict(task.summary or {})
+                if task_summary.get("selected_modules"):
+                    stage_run = db.query(BinarySecurityStageRun).filter(
+                        BinarySecurityStageRun.task_id == task.id,
+                        BinarySecurityStageRun.stage_name == stage_name,
+                    ).first() or stage_run
+                    stage_summary = dict(stage_run.output_summary or stage_summary)
+                    task.metrics = {
+                        **task.metrics,
+                        "high_risk_module_count": int(stage_summary.get("high_risk_module_count", summary.get("high_risk_module_count", 0)) or 0),
+                        "medium_risk_module_count": int(stage_summary.get("medium_risk_module_count", summary.get("medium_risk_module_count", 0)) or 0),
+                        "low_risk_module_count": int(stage_summary.get("low_risk_module_count", summary.get("low_risk_module_count", 0)) or 0),
+                        "candidate_module_count": int(stage_summary.get("candidate_module_count", summary.get("candidate_module_count", 0)) or 0),
+                        "selected_module_count": int(stage_summary.get("selected_module_count", summary.get("selected_module_count", 0)) or 0),
+                    }
         elif stage_name == "entry_analysis":
             task.metrics = {**task.metrics, "entry_count": int(summary.get("entry_count", 0))}
         elif normalize_stage_name(stage_name) == "dataflow_vuln_scan":
