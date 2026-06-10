@@ -19966,7 +19966,10 @@ class TaskManager:
                 None,
             ),
         )
-        terminal_failure = str(failure_snapshot.get("failure_category") or "").strip() == "business"
+        terminal_failure = (
+            self._task_status_is_terminal(task.status)
+            and str(failure_snapshot.get("failure_category") or "").strip() == "business"
+        )
         return BinarySecurityTaskResponse(
             id=task.id,
             project_id=task.project_id,
@@ -19981,9 +19984,9 @@ class TaskManager:
             last_error=task.last_error,
             terminal_failure=terminal_failure,
             requeue_suppressed=terminal_failure,
-            failure_code=self._string_or_none(failure_snapshot.get("failure_code")),
-            failure_category=self._string_or_none(failure_snapshot.get("failure_category")),
-            failure_message=self._string_or_none(failure_snapshot.get("failure_message") or failure_snapshot.get("error")),
+            failure_code=self._string_or_none(failure_snapshot.get("failure_code")) if terminal_failure else None,
+            failure_category=self._string_or_none(failure_snapshot.get("failure_category")) if terminal_failure else None,
+            failure_message=self._string_or_none(failure_snapshot.get("failure_message") or failure_snapshot.get("error")) if terminal_failure else None,
             firmware_path=task.firmware_path,
             stage_sequence=stage_sequence,
             is_queued=queue_state == "queued",
@@ -20386,7 +20389,10 @@ class TaskManager:
         )
         tail_summary = self._tail_stage_work_summary(db, task)
         failure_snapshot = self._stage_failure_snapshot(task, active_stage_run)
-        terminal_failure = str(failure_snapshot.get("failure_category") or "").strip() == "business"
+        terminal_failure = (
+            self._task_status_is_terminal(task.status)
+            and str(failure_snapshot.get("failure_category") or "").strip() == "business"
+        )
         active_operation = self._active_operation(db, task.id)
         if active_operation is not None and str(active_operation.operation_type or "").strip() != TASK_ACTION_CANCEL:
             cancel_operation = None
@@ -20406,9 +20412,9 @@ class TaskManager:
             last_error=task.last_error,
             terminal_failure=terminal_failure,
             requeue_suppressed=terminal_failure,
-            failure_code=self._string_or_none(failure_snapshot.get("failure_code")),
-            failure_category=self._string_or_none(failure_snapshot.get("failure_category")),
-            failure_message=self._string_or_none(failure_snapshot.get("failure_message") or failure_snapshot.get("error")),
+            failure_code=self._string_or_none(failure_snapshot.get("failure_code")) if terminal_failure else None,
+            failure_category=self._string_or_none(failure_snapshot.get("failure_category")) if terminal_failure else None,
+            failure_message=self._string_or_none(failure_snapshot.get("failure_message") or failure_snapshot.get("error")) if terminal_failure else None,
             firmware_path=task.firmware_path,
             stage_sequence=stage_sequence,
             is_queued=queue_state == "queued",
@@ -21609,6 +21615,10 @@ class TaskManager:
             cleaned.pop(key, None)
         return cleaned
 
+    @staticmethod
+    def _task_status_is_terminal(status: str | None) -> bool:
+        return str(status or "").strip() in {"success", "failed", "downstream_missing", "partial_success", "cancelled"}
+
     def _stage_failure_snapshot(
         self,
         task: BinarySecurityTask,
@@ -22324,10 +22334,42 @@ class TaskManager:
             success.append({**result, "modules": self._lightweight_modules_for_storage(item_modules), "module_count": len(item_modules)})
         status = self._aggregate_item_statuses([item.status for item in items])
         candidate_modules = self._filter_candidate_modules(all_modules, self._module_risk_levels(task))
+        summary = dict(task.summary or {})
+        existing_selected_modules = [
+            dict(module)
+            for module in list(summary.get("selected_modules") or [])
+            if isinstance(module, dict) and str(module.get("module_key") or "").strip()
+        ]
+        candidate_keys = {
+            str(module.get("module_key") or "").strip()
+            for module in candidate_modules
+            if str(module.get("module_key") or "").strip()
+        }
+        existing_selected_map = {
+            str(module.get("module_key") or "").strip(): module
+            for module in existing_selected_modules
+        }
+        confirmed_selected_modules = [
+            {
+                **dict(next(module for module in candidate_modules if str(module.get("module_key") or "").strip() == module_key)),
+                **{
+                    "selected_by": existing_selected_map[module_key].get("selected_by"),
+                    "selected_at": existing_selected_map[module_key].get("selected_at"),
+                },
+            }
+            for module_key in existing_selected_map.keys()
+            if module_key in candidate_keys
+        ]
+        has_confirmed_manual_selection = any(
+            str(module.get("selected_by") or "").strip() == MODULE_SELECTION_MODE_MANUAL_CONFIRM
+            for module in confirmed_selected_modules
+        )
         selected_modules: list[dict[str, Any]] = []
         if status in {"success", "partial_success"} and candidate_modules:
             if self._module_selection_mode(task) == MODULE_SELECTION_MODE_AUTO:
                 selected_modules = self._mark_selected_modules(candidate_modules, selected_by=MODULE_SELECTION_MODE_AUTO)
+            elif has_confirmed_manual_selection:
+                selected_modules = confirmed_selected_modules
             else:
                 task.status = TASK_STATUS_PENDING_MODULE_CONFIRMATION
                 self._record_event(
@@ -22343,7 +22385,6 @@ class TaskManager:
             failure = _no_candidate_modules_failure()
             status = "failed"
             failed = failed or [{"status": "failed", **failure}]
-        summary = dict(task.summary or {})
         summary.update(
             {
                 "system_analysis_results": self._lightweight_system_analysis_items(success),
@@ -22518,7 +22559,7 @@ class TaskManager:
                     return
                 task.status = "pending"
                 task.finished_at = None
-                task.last_error = None
+                self._clear_task_failure_state(task)
                 if self._is_streaming_tail_stage(task, task.current_stage) and self._tail_requires_execution_takeover(db, task):
                     self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
                     task.tail_reconcile_state = "idle"
@@ -22568,7 +22609,7 @@ class TaskManager:
                     task.lease_expires_at = None
                     self._release_tail_reconcile_owner(task.id)
             task.finished_at = None
-            task.last_error = None
+            self._clear_task_failure_state(task)
             self._clear_task_abnormal_reason_snapshot(db, task)
             return
         stage_retry_mode = task.execution_mode in {"stage_retry", "stage_retry_failed_items", "stage_retry_full"} and bool(task.target_stage_name)
