@@ -4554,16 +4554,16 @@ class TaskManager:
     def get_module_selection(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityModuleSelectionResponse:
         task = self._task_or_404(db, project_id, task_id)
         summary = task.summary or {}
-        entry_results = self._entry_results(task)
-        candidate_entries = self._entry_candidates(task)
-        selected_entries = self._selected_entries(task)
+        system_analysis_modules = self._system_analysis_modules_for_task(db, task)
+        if not system_analysis_modules:
+            system_analysis_modules = list(summary.get("system_analysis_modules") or [])
         return BinarySecurityModuleSelectionResponse(
             task_id=task.id,
             status=task.status,
             selection_mode=self._module_selection_mode(task),
             risk_levels=self._module_risk_levels(task),
             requires_confirmation=task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION,
-            system_analysis_modules=list(summary.get("system_analysis_modules") or []),
+            system_analysis_modules=system_analysis_modules,
             candidate_modules=list(summary.get("candidate_modules") or []),
             selected_modules=list(summary.get("selected_modules") or []),
         )
@@ -27332,6 +27332,27 @@ class TaskManager:
                 }
             )
         return rows
+
+    def _system_analysis_modules_for_task(self, db: Session, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        items = self._stage_items(db, task.id, "system_analysis")
+        archive_jobs_by_item = self._stage_archive_jobs_by_item(db, task.id, "system_analysis")
+        modules: list[dict[str, Any]] = []
+        seen_module_keys: set[str] = set()
+        for item in items:
+            if item.status != "success":
+                continue
+            item_modules = self._system_analysis_modules_from_item(
+                task,
+                item,
+                archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []),
+            )
+            for module in item_modules:
+                module_key = str(module.get("module_key") or "").strip()
+                if not module_key or module_key in seen_module_keys:
+                    continue
+                seen_module_keys.add(module_key)
+                modules.append(module)
+        return modules
 
     def _system_analysis_modules_from_item(
         self,
