@@ -6,39 +6,29 @@ import re
 from typing import Any
 
 
+DEFAULT_THREAT_MODEL_CONTENT = """# 威胁模型
+
+## 攻击者假设
+<!-- 攻击者在哪里？拥有什么能力？ -->
+
+## 攻击面
+<!-- 哪些入口点暴露给攻击者？无需前置认证的协议解析入口、网络包处理路径等 -->
+
+## 信任边界与补偿控制
+<!-- 可信域范围，已知的防御措施（认证门、输入校验层、W^X 等） -->
+
+## 排除范围
+<!-- 不在分析范围内的代码：测试代码、mock 文件、第三方库、debug 路径等 -->
+""".strip()
+
+
 BUILTIN_TEMPLATES: list[dict[str, Any]] = [
     {
         "id": "builtin-default-validation",
         "scope": "builtin",
         "name": "通用漏洞可利用性验证",
         "description": "围绕漏洞成因、前置条件、利用路径和影响面进行自动化验证。",
-        "content": """# 威胁模型
-
-## 攻击者假设
-<!-- 攻击者在哪里？拥有什么能力？ -->
-- 案例：`{{case_id}}` / {{case_title}}
-- 默认假设：攻击者可到达与 `{{subject_locator}}` 相关的输入入口，并可控制触发该路径所需的外部数据。
-- 验证目标：判断报告问题是否具备实际可利用性，而不仅是静态告警。
-
-## 攻击面
-<!-- 哪些入口点暴露给攻击者？无需前置认证的协议解析入口、网络包处理路径等 -->
-- 关注对象：`{{subject_locator}}`
-- 漏洞类型/分类：{{category}}
-- 严重性：{{severity}}
-- 报告摘要：{{summary}}
-- 证据线索：{{evidence_summary}}
-
-## 信任边界与补偿控制
-<!-- 可信域范围，已知的防御措施（认证门、输入校验层、W^X 等） -->
-- 需要确认攻击输入进入目标代码前是否存在认证、授权、格式校验、长度限制、沙箱、编译期/运行期缓解等补偿控制。
-- 需要确认源码位置、二进制符号、配置和实际可达路径是否一致。
-- 若补偿控制足以阻断利用，请给出证据并说明判定为 ruled_out / inconclusive 的原因。
-
-## 排除范围
-<!-- 不在分析范围内的代码：测试代码、mock 文件、第三方库、debug 路径等 -->
-- 默认排除测试代码、mock/demo、第三方库、仅 debug 可达路径以及与 `{{subject_locator}}` 无关的变体。
-- 不生成 HTML 报告；验证结果由 SecFlow React 报告视图消费结构化 report-data。
-""".strip(),
+        "content": DEFAULT_THREAT_MODEL_CONTENT,
     },
     {
         "id": "builtin-memory-safety",
