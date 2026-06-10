@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, inspect, text
 from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 
 from app.config import get_config
@@ -83,6 +83,7 @@ class ProjectInputUploadRecord(Base):
     project_id = Column(String(32), nullable=False, index=True)
     input_type = Column(String(32), nullable=False, index=True)
     status = Column(String(32), nullable=False, default="pending", index=True)
+    display_name = Column(String(255), nullable=True)
     keep_original = Column(Boolean, nullable=False, default=False)
     source_archive_count = Column(Integer, nullable=False, default=0)
     stored_file_count = Column(Integer, nullable=False, default=0)
@@ -148,6 +149,7 @@ def get_session_factory():
 
 def init_database():
     Base.metadata.create_all(bind=get_engine())
+    _ensure_project_input_upload_columns(get_engine())
 
 
 def get_db():
@@ -167,3 +169,12 @@ def ensure_storage_dirs():
     config = get_config()
     os.makedirs(config.storage.root_dir, exist_ok=True)
     os.makedirs(config.storage.temp_dir, exist_ok=True)
+
+
+def _ensure_project_input_upload_columns(engine) -> None:
+    table_name = ProjectInputUploadRecord.__tablename__
+    columns = {column["name"] for column in inspect(engine).get_columns(table_name)}
+    if "display_name" in columns:
+        return
+    with engine.begin() as connection:
+        connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN display_name VARCHAR(255) NULL"))

@@ -61,6 +61,7 @@ from app.schemas import (
     ProjectInputUploadBatchSummary,
     ProjectInputUploadDeleteRequest,
     ProjectInputUploadDeleteResponse,
+    ProjectInputUploadDisplayNameUpdateRequest,
     ProjectInputUploadDetailResponse,
     ProjectInputUploadBrowseEntry,
     ProjectInputUploadBrowseResponse,
@@ -757,6 +758,25 @@ async def get_project_input_upload_detail(
     return make_project_input_detail_response(record, batches)
 
 
+@router.post("/project-input/uploads/{upload_id}/display-name", response_model=ProjectInputUploadRecordResponse)
+async def update_project_input_upload_display_name(
+    upload_id: str,
+    payload: ProjectInputUploadDisplayNameUpdateRequest,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    await verify_project_access(payload.project_id, authorization)
+    record = get_project_input_upload_record_or_404(db, payload.project_id, upload_id)
+    record.display_name = normalize_project_input_display_name(payload.display_name)
+    record.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(record)
+    latest_batch = db.query(ProjectInputUploadBatch).filter(
+        ProjectInputUploadBatch.upload_id == record.upload_id,
+    ).order_by(ProjectInputUploadBatch.created_at.desc()).first()
+    return project_input_record_to_response(record, latest_batch)
+
+
 @router.get("/project-input/uploads/{upload_id}/browse", response_model=ProjectInputUploadBrowseResponse)
 async def browse_project_input_upload(
     upload_id: str,
@@ -1146,6 +1166,7 @@ def project_input_record_to_response(record: ProjectInputUploadRecord, latest_ba
         project_id=record.project_id,
         input_type=record.input_type,
         status=record.status,
+        display_name=record.display_name,
         keep_original=record.keep_original,
         source_archive_count=record.source_archive_count,
         stored_file_count=record.stored_file_count,
@@ -1168,6 +1189,15 @@ def make_project_input_detail_response(record: ProjectInputUploadRecord, batches
         **base.model_dump(),
         batches=[project_input_batch_to_summary(batch) for batch in batches],
     )
+
+
+def normalize_project_input_display_name(value: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        raise ValidationError("上传记录名称不能为空")
+    if len(normalized) > 255:
+        raise ValidationError("上传记录名称长度不能超过255个字符")
+    return normalized
 
 
 def sanitize_archive_member_name(name: str) -> Optional[str]:

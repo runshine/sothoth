@@ -86,7 +86,7 @@ class ProjectInputResolver:
                     keep_original=bool(item.get("keep_original")),
                     target_path=str(item.get("target_path") or ""),
                     latest_batch_id=str(latest_batch.get("batch_id")) if latest_batch.get("batch_id") else None,
-                    display_name=str(item.get("target_path") or item.get("upload_id") or ""),
+                    display_name=str(item.get("display_name") or item.get("target_path") or item.get("upload_id") or ""),
                 )
         raise ValidationError(f"未找到任务输入记录: {upload_id}")
 

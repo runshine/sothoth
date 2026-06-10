@@ -357,6 +357,7 @@ class ProjectInputUploadRecordResponse(BaseModel):
     project_id: str
     input_type: str
     status: str
+    display_name: Optional[str] = None
     keep_original: bool
     source_archive_count: int
     stored_file_count: int
@@ -418,6 +419,11 @@ class ProjectInputUploadDeleteFailedItem(BaseModel):
 class ProjectInputUploadDeleteResponse(BaseModel):
     deleted_ids: List[str] = Field(default_factory=list)
     failed_items: List[ProjectInputUploadDeleteFailedItem] = Field(default_factory=list)
+
+
+class ProjectInputUploadDisplayNameUpdateRequest(BaseModel):
+    project_id: str = Field(..., min_length=1, max_length=32)
+    display_name: str = Field(..., min_length=1, max_length=255)
 
 
 class ProjectInputUploadDetailResponse(ProjectInputUploadRecordResponse):
