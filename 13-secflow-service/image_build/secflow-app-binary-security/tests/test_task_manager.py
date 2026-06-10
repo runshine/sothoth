@@ -17567,6 +17567,48 @@ def _test_archive_job_payload_uses_compact_downstream_payload(self):
     self.assertNotIn("modules", downstream_payload["result"])
     self.assertLess(len(job.payload_json or ""), 2048)
 
+
+def _test_archive_job_payload_does_not_persist_bound_output_path(self):
+    task = BinarySecurityTask(
+        id="task1",
+        project_id="p1",
+        name="n",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = type("Item", (), {
+        "id": "si1",
+        "stage_name": "entry_analysis",
+        "item_key": "source_project-images",
+        "downstream_service": "entry_analyse",
+        "downstream_task_id": "eat_1",
+    })()
+    db = _ModelAwareDb()
+
+    long_output_path = "/data/files/" + "/".join(f"segment-{idx:04d}" for idx in range(2048))
+    job = self.manager._ensure_downstream_archive_job(
+        db,
+        task,
+        item,
+        payload={
+            "task_id": "eat_1",
+            "status": "success",
+            "workspace_root": "/tmp/entry/eat_1",
+            "output_path": long_output_path,
+        },
+        mapped_status="success",
+        before_status="running",
+    )
+
+    payload = job.payload
+    self.assertNotIn("bound_output_path", payload)
+    self.assertEqual(long_output_path, payload["downstream_payload"]["output_path"])
+    self.assertLess(len(job.payload_json or ""), len(long_output_path))
+
 def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payload_changes(self):
     task = BinarySecurityTask(
         id="task1",

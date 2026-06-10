@@ -3642,7 +3642,6 @@ class TaskManager:
                     item_key=job.item_key,
                     downstream_service=job.downstream_service,
                     downstream_task_id=job.downstream_task_id,
-                    bound_output_path=self._string_or_none(dict(job.payload or {}).get("bound_output_path")),
                     archive_source_primary_path=archive_sources[0] if archive_sources else None,
                     archive_source_paths=archive_sources,
                     source_root=source_refs["source_root"],
@@ -9650,7 +9649,6 @@ class TaskManager:
         extra_paths: list[str | Path] | None = None,
     ) -> BinarySecurityArchiveJob:
         downstream_task_id = str(item.downstream_task_id or "").strip()
-        bound_output_path = str(payload.get("output_path") or "").strip()
         job_dedupe_key = build_archive_job_dedupe_key(item.id, downstream_task_id)
         next_payload = self._build_archive_job_payload(
             mapped_status=mapped_status,
@@ -9658,7 +9656,6 @@ class TaskManager:
             force=force,
             payload=payload,
             bound_downstream_task_id=downstream_task_id,
-            bound_output_path=bound_output_path,
             extra_paths=extra_paths,
         )
         lock_digest = hashlib.sha1(f"{item.id}:{downstream_task_id}".encode("utf-8")).hexdigest()
@@ -9741,7 +9738,6 @@ class TaskManager:
                 force=force,
                 payload=payload,
                 bound_downstream_task_id=downstream_task_id,
-                bound_output_path=bound_output_path,
                 extra_paths=extra_paths,
             )
             db.add(job)
@@ -13728,7 +13724,6 @@ class TaskManager:
             job.payload = {
                 **self._clear_archive_job_retry_metadata(job),
                 "bound_downstream_task_id": bound_downstream_task_id,
-                "bound_output_path": str(payload.get("bound_output_path") or ""),
                 "downstream_payload": payload.get("downstream_payload") or {},
                 "extra_paths": payload.get("extra_paths") or None,
                 "mapped_status": payload.get("mapped_status"),
@@ -27098,7 +27093,6 @@ class TaskManager:
         force: bool,
         payload: dict[str, Any] | None,
         bound_downstream_task_id: str | None = None,
-        bound_output_path: str | None = None,
         extra_paths: list[str | Path] | None = None,
         previous_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -27110,7 +27104,6 @@ class TaskManager:
             "before_status": before_status,
             "force": force,
             "bound_downstream_task_id": str(bound_downstream_task_id or "").strip() or None,
-            "bound_output_path": str(bound_output_path or "").strip() or None,
             "downstream_payload": self._archive_job_downstream_payload(payload),
             "extra_paths": [str(path) for path in (extra_paths or [])],
         }
@@ -27141,7 +27134,6 @@ class TaskManager:
         return (
             str(current_payload.get("mapped_status") or "").strip() != str(next_payload.get("mapped_status") or "").strip()
             or str(current_payload.get("bound_downstream_task_id") or "").strip() != str(next_payload.get("bound_downstream_task_id") or "").strip()
-            or str(current_payload.get("bound_output_path") or "").strip() != str(next_payload.get("bound_output_path") or "").strip()
             or current_downstream != next_downstream
             or current_extra_paths != next_extra_paths
         )
