@@ -14,8 +14,31 @@ from sqlalchemy.orm import Session
 
 from app.config import get_config
 from app.models.database import Case, CaseEvent
-from app.services.lifecycle_engine import MAIN_STAGE_RECEIVE, MAIN_STAGE_TRIAGE, MAIN_STAGE_VALIDATION, advance_case_stage
+from app.services.lifecycle_engine import (
+    MAIN_STAGE_RECEIVE,
+    MAIN_STAGE_TRIAGE,
+    MAIN_STAGE_VALIDATION,
+    VALIDATION_STATUS_COMPLETED,
+    VALIDATION_STATUS_EVIDENCE_COLLECTING,
+    VALIDATION_STATUS_EXP_GENERATING,
+    VALIDATION_STATUS_POC_GENERATING,
+    VALIDATION_STATUS_QUEUED,
+    VALIDATION_STATUS_REPRODUCING,
+    advance_case_stage,
+    get_lifecycle_state,
+    set_lifecycle_state,
+)
 from app.services.reporting import ensure_case_raw_report
+
+
+_VALIDATION_STAGE_STATUSES = {
+    VALIDATION_STATUS_QUEUED,
+    VALIDATION_STATUS_POC_GENERATING,
+    VALIDATION_STATUS_EXP_GENERATING,
+    VALIDATION_STATUS_REPRODUCING,
+    VALIDATION_STATUS_EVIDENCE_COLLECTING,
+    VALIDATION_STATUS_COMPLETED,
+}
 
 
 def _safe_json(value: str | None, default: Any) -> Any:
@@ -288,13 +311,38 @@ async def create_auto_verify_task(
             "actor": actor,
         }, ensure_ascii=False),
     ))
-    if getattr(request, "advance_to_validation", True) and case.current_stage != MAIN_STAGE_VALIDATION:
+    should_advance_to_validation = getattr(request, "advance_to_validation", True)
+    was_validation_stage = case.current_stage == MAIN_STAGE_VALIDATION
+    if should_advance_to_validation and case.current_stage != MAIN_STAGE_VALIDATION:
         if case.current_stage == MAIN_STAGE_RECEIVE:
             advance_case_stage(db, case, MAIN_STAGE_TRIAGE, "auto verify task created", source_type="system")
         if case.current_stage == MAIN_STAGE_TRIAGE:
             advance_case_stage(db, case, MAIN_STAGE_VALIDATION, "auto verify task created", source_type="system")
         elif case.current_stage != MAIN_STAGE_VALIDATION:
             advance_case_stage(db, case, MAIN_STAGE_VALIDATION, "auto verify task created", source_type="system")
+
+    if case.current_stage == MAIN_STAGE_VALIDATION:
+        lifecycle = get_lifecycle_state(case)
+        lifecycle_status = lifecycle.get("stage_status")
+        case_status = case.current_status
+        should_sync_validation_status = should_advance_to_validation and not was_validation_stage
+        if should_sync_validation_status:
+            validation_status = VALIDATION_STATUS_QUEUED
+        elif lifecycle_status in _VALIDATION_STAGE_STATUSES:
+            validation_status = lifecycle_status
+        elif case_status in _VALIDATION_STAGE_STATUSES:
+            validation_status = case_status
+        else:
+            validation_status = VALIDATION_STATUS_QUEUED
+
+        if (
+            should_sync_validation_status
+            or lifecycle_status != validation_status
+            or case_status != validation_status
+        ):
+            lifecycle["stage_status"] = validation_status
+            set_lifecycle_state(case, lifecycle)
+            case.current_status = validation_status
     db.commit()
     return {
         "case_id": case.id,
