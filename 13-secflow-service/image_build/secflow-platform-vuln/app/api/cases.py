@@ -16,6 +16,7 @@ from app.api.dependencies import ensure_project_access, get_current_subject
 from app.models.database import ActionExecution, Case, CaseEvent, DownloadJob, ManualTask, Result, ServiceRegistry, StageHistory, WorkflowRun, get_db
 from app.schemas import (
     AutoVerifyTaskCreateRequest,
+    AutoVerifyTaskSyncRequest,
     CaseUpdateRequest,
     CaseCreateRequest,
     DecisionRequest,
@@ -36,7 +37,7 @@ from app.schemas import (
     TriageRoundStartRequest,
     ValidationResultRequest,
 )
-from app.services.auto_verify import build_auto_verify_context, create_auto_verify_task
+from app.services.auto_verify import build_auto_verify_context, create_auto_verify_task, sync_auto_verify_task
 from app.services.download_center import create_job, delete_job, get_job_stats, list_jobs, retry_job, serialize_job
 from app.services.lifecycle_engine import (
     FINISHED_REASONS,
@@ -369,6 +370,19 @@ async def create_case_auto_verify_task(
     item = await _get_accessible_case(case_id, token, db)
     actor = str(subject.get("username") or subject.get("id") or "") if isinstance(subject, dict) else None
     return await create_auto_verify_task(db, item, _case_payload(item), request, token, actor=actor)
+
+
+@router.post("/{case_id}/auto-verify/sync")
+async def sync_case_auto_verify_task(
+    case_id: str,
+    request: AutoVerifyTaskSyncRequest | None = None,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    subject, token = user_and_token
+    item = await _get_accessible_case(case_id, token, db)
+    actor = str(subject.get("username") or subject.get("id") or "") if isinstance(subject, dict) else None
+    return await sync_auto_verify_task(db, item, request or AutoVerifyTaskSyncRequest(), token, actor=actor)
 
 
 @router.get("/download-center/jobs", response_model=DownloadCenterJobListResponse)

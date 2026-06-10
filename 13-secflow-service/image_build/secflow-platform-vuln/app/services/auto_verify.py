@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -229,6 +230,258 @@ def _vuln_verify_base_url() -> str:
     except Exception:
         pass
     return "http://secflow-app-vuln-verify/api/app/vuln-verify"
+
+
+def _normalize_task_status(value: Any) -> str:
+    return str(value or "").strip().lower() or "unknown"
+
+
+def _latest_auto_verify_task_event(db: Session, case: Case, task_id: str | None = None) -> tuple[str, str | None, dict[str, Any]]:
+    query = db.query(CaseEvent).filter(
+        CaseEvent.case_id == case.id,
+        CaseEvent.event_type == "auto_verify_task_created",
+    )
+    events = query.order_by(CaseEvent.created_at.desc()).all()
+    wanted = str(task_id or "").strip()
+    for event in events:
+        payload = _safe_json(event.payload_json, {})
+        if not isinstance(payload, dict):
+            continue
+        event_task_id = str(payload.get("vuln_verify_task_id") or payload.get("task_id") or "").strip()
+        if not event_task_id:
+            continue
+        if wanted and event_task_id != wanted:
+            continue
+        report_data_url = _string_or_none(payload.get("report_data_url"))
+        return event_task_id, report_data_url, payload
+    if wanted:
+        report_data_url = f"/api/app/vuln-verify/projects/{case.project_id}/tasks/{wanted}/report-data"
+        return wanted, report_data_url, {"vuln_verify_task_id": wanted, "report_data_url": report_data_url}
+    raise HTTPException(status_code=404, detail="auto verify task event not found")
+
+
+def _compact_report_data(report_data: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(report_data, dict):
+        return None
+    return {
+        "task_id": report_data.get("task_id"),
+        "status": report_data.get("status"),
+        "title": report_data.get("title"),
+        "target": report_data.get("target"),
+        "total_verified": report_data.get("total_verified"),
+        "total_reports": report_data.get("total_reports"),
+        "total_groups": report_data.get("total_groups"),
+        "verdicts": report_data.get("verdicts") if isinstance(report_data.get("verdicts"), dict) else {},
+        "severities": report_data.get("severities") if isinstance(report_data.get("severities"), dict) else {},
+    }
+
+
+def _normalize_verdict_counts(report_data: dict[str, Any] | None) -> tuple[dict[str, int], int]:
+    if not isinstance(report_data, dict):
+        return {}, 0
+    counts: dict[str, int] = {}
+
+    def add_verdict(value: Any, amount: Any = 1) -> None:
+        key = str(value or "").strip().lower()
+        if not key:
+            return
+        try:
+            count = int(amount or 0)
+        except Exception:
+            count = 0
+        if count <= 0:
+            return
+        counts[key] = counts.get(key, 0) + count
+
+    verdicts = report_data.get("verdicts")
+    if isinstance(verdicts, dict):
+        for key, value in verdicts.items():
+            add_verdict(key, value)
+
+    if not counts:
+        groups = report_data.get("groups")
+        if isinstance(groups, list):
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                group_verdicts = group.get("verdicts")
+                if isinstance(group_verdicts, dict):
+                    for key, value in group_verdicts.items():
+                        add_verdict(key, value)
+                reports = group.get("reports")
+                if isinstance(reports, list):
+                    for report in reports:
+                        if isinstance(report, dict):
+                            add_verdict(report.get("verdict"), 1)
+
+    total_reports = 0
+    for key in ("total_reports", "total_verified"):
+        try:
+            total_reports = max(total_reports, int(report_data.get(key) or 0))
+        except Exception:
+            pass
+    total_reports = max(total_reports, sum(counts.values()))
+    return counts, total_reports
+
+
+def _derive_validation_result(report_data: dict[str, Any] | None) -> str:
+    verdicts, total_reports = _normalize_verdict_counts(report_data)
+    confirmed = {
+        "confirmed",
+        "exploitable",
+        "vulnerable",
+        "verified",
+        "true_positive",
+        "true-positive",
+        "tp",
+        "confirmed_vulnerable",
+    }
+    ruled_out = {
+        "ruled_out",
+        "ruled-out",
+        "rejected",
+        "not_vulnerable",
+        "not-vulnerable",
+        "false_positive",
+        "false-positive",
+        "fp",
+        "non_vulnerable",
+        "non-vulnerable",
+    }
+    if any(verdicts.get(item, 0) > 0 for item in confirmed):
+        return "vulnerable"
+    if total_reports > 0:
+        known = sum(verdicts.values())
+        ruled_out_count = sum(count for verdict, count in verdicts.items() if verdict in ruled_out)
+        if known > 0 and ruled_out_count == known:
+            return "not_vulnerable"
+    return "inconclusive"
+
+
+def _ensure_validation_stage(db: Session, case: Case) -> None:
+    if case.current_stage == MAIN_STAGE_VALIDATION:
+        return
+    if case.current_stage == MAIN_STAGE_RECEIVE:
+        advance_case_stage(db, case, MAIN_STAGE_TRIAGE, "auto verify task synced", source_type="system")
+    if case.current_stage == MAIN_STAGE_TRIAGE:
+        advance_case_stage(db, case, MAIN_STAGE_VALIDATION, "auto verify task synced", source_type="system")
+    elif case.current_stage != MAIN_STAGE_VALIDATION:
+        advance_case_stage(db, case, MAIN_STAGE_VALIDATION, "auto verify task synced", source_type="system")
+
+
+def _sync_case_validation_state(db: Session, case: Case, task_status: str, validation_result: str) -> str:
+    _ensure_validation_stage(db, case)
+    lifecycle = get_lifecycle_state(case)
+    if task_status in {"pending", "queued", "created"}:
+        stage_status = VALIDATION_STATUS_QUEUED
+        lifecycle["validation_result"] = "inconclusive"
+    elif task_status in {"running", "cancelling", "terminating"}:
+        stage_status = VALIDATION_STATUS_EVIDENCE_COLLECTING
+        lifecycle["validation_result"] = "inconclusive"
+    elif task_status == "success":
+        stage_status = VALIDATION_STATUS_COMPLETED
+        lifecycle["validation_result"] = validation_result
+    elif task_status in {"failed", "terminated", "cancelled", "canceled"}:
+        stage_status = VALIDATION_STATUS_COMPLETED
+        lifecycle["validation_result"] = "inconclusive"
+    else:
+        stage_status = VALIDATION_STATUS_EVIDENCE_COLLECTING
+        lifecycle["validation_result"] = "inconclusive"
+    lifecycle["stage_status"] = stage_status
+    set_lifecycle_state(case, lifecycle)
+    case.current_status = stage_status
+    return str(lifecycle.get("validation_result") or "inconclusive")
+
+
+async def sync_auto_verify_task(
+    db: Session,
+    case: Case,
+    request: Any,
+    token: str,
+    actor: str | None = None,
+) -> dict[str, Any]:
+    requested_task_id = _string_or_none(getattr(request, "vuln_verify_task_id", None))
+    vuln_verify_task_id, report_data_url, event_payload = _latest_auto_verify_task_event(db, case, requested_task_id)
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    base_url = _vuln_verify_base_url()
+    detail_url = f"{base_url}/projects/{case.project_id}/tasks/{vuln_verify_task_id}"
+    report_url = f"{base_url}/projects/{case.project_id}/tasks/{vuln_verify_task_id}/report-data"
+
+    task: dict[str, Any]
+    report_data: dict[str, Any] | None = None
+    report_error: str | None = None
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            detail_resp = await client.get(detail_url, headers=headers)
+            if detail_resp.status_code >= 400:
+                raise HTTPException(status_code=502, detail=f"vuln-verify task detail failed: {detail_resp.text[:500]}")
+            task = detail_resp.json()
+            task_status = _normalize_task_status(task.get("status"))
+            if task_status in {"success", "failed", "terminated", "cancelled", "canceled"}:
+                try:
+                    report_resp = await client.get(report_url, headers=headers)
+                    if report_resp.status_code < 400:
+                        report_payload = report_resp.json()
+                        if isinstance(report_payload, dict):
+                            report_data = report_payload
+                    else:
+                        report_error = report_resp.text[:500]
+                except Exception as exc:
+                    report_error = str(exc)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"vuln-verify service unavailable: {exc}") from exc
+
+    task_status = _normalize_task_status(task.get("status"))
+    derived_validation_result = _derive_validation_result(report_data) if task_status == "success" else "inconclusive"
+    validation_result = _sync_case_validation_state(db, case, task_status, derived_validation_result)
+    verdicts, total_reports = _normalize_verdict_counts(report_data)
+    synced_at = datetime.utcnow().isoformat()
+    effective_report_data_url = report_data_url or f"/api/app/vuln-verify/projects/{case.project_id}/tasks/{vuln_verify_task_id}/report-data"
+
+    event_type = "auto_verify_task_completed" if task_status in {"success", "failed", "terminated", "cancelled", "canceled"} else "auto_verify_task_synced"
+    db.add(CaseEvent(
+        id=uuid4().hex,
+        case_id=case.id,
+        event_type=event_type,
+        summary=f"自动化验证任务同步：{task_status} / {validation_result}",
+        payload_json=json.dumps(
+            {
+                "task_id": vuln_verify_task_id,
+                "vuln_verify_task_id": vuln_verify_task_id,
+                "task_status": task_status,
+                "report_data_url": effective_report_data_url,
+                "verdicts": verdicts,
+                "total_reports": total_reports,
+                "validation_result": validation_result,
+                "synced_at": synced_at,
+                "actor": actor,
+                "report_error": report_error,
+            },
+            ensure_ascii=False,
+        ),
+    ))
+
+    db.add(case)
+    db.commit()
+    db.refresh(case)
+    return {
+        "case_id": case.id,
+        "project_id": case.project_id,
+        "vuln_verify_task_id": vuln_verify_task_id,
+        "task_status": task_status,
+        "case_stage": case.current_stage,
+        "case_status": case.current_status,
+        "validation_result": validation_result,
+        "report_data_url": effective_report_data_url,
+        "verdicts": verdicts,
+        "total_reports": total_reports,
+        "task": task,
+        "report_data": _compact_report_data(report_data),
+        "report_error": report_error,
+        "event_payload": event_payload,
+    }
 
 
 async def create_auto_verify_task(

@@ -17,6 +17,10 @@ class AutoVerifyTaskCreateRequest(BaseModel):
     advance_to_validation: bool = True
 
 
+class AutoVerifyTaskSyncRequest(BaseModel):
+    vuln_verify_task_id: Optional[str] = None
+
+
 class ThreatModelTemplateRenderRequest(BaseModel):
     case_id: str = Field(min_length=1, max_length=128)
     variables: dict[str, Any] = Field(default_factory=dict)
