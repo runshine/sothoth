@@ -2675,6 +2675,178 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual(1, observability["state_events"]["status_counts"]["processed"])
             self.assertTrue(any(row.event_type == "downstream_status_event_applied" for row in db.events))
 
+    def test_get_task_detail_does_not_refresh_authoritative_items_for_active_stage(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.stage_summary = {"entry_analysis": {"status": "failed", "last_error": "stale"}}
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=1,
+            status="pending",
+        )
+        entry_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-a",
+            item_name="module-a",
+            parent_key="source_project",
+            item_identity_key="module-a::source_project",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-1",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[entry_run], stage_items=[entry_item], archive_jobs=[])
+
+        with patch.object(
+            self.manager,
+            "_refresh_stage_from_authoritative_items",
+            side_effect=AssertionError("detail read should stay projection-only"),
+        ):
+            detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
+
+        self.assertEqual("running", detail.status)
+        self.assertEqual("running", next(summary.status for summary in detail.stage_summaries if summary.stage_name == "entry_analysis"))
+        self.assertEqual("failed", task.stage_summary["entry_analysis"]["status"])
+        self.assertEqual("stale", task.stage_summary["entry_analysis"]["last_error"])
+
+    def test_get_task_overview_does_not_refresh_authoritative_items_for_active_stage(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.stage_summary = {"entry_analysis": {"status": "failed", "last_error": "stale"}}
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=1,
+            status="pending",
+        )
+        entry_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-a",
+            item_name="module-a",
+            parent_key="source_project",
+            item_identity_key="module-a::source_project",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-1",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[entry_run], stage_items=[entry_item], archive_jobs=[])
+
+        with patch.object(
+            self.manager,
+            "_refresh_stage_from_authoritative_items",
+            side_effect=AssertionError("overview read should stay projection-only"),
+        ):
+            overview = self.manager.get_task_overview(db, project_id="p1", task_id="t1")
+
+        self.assertTrue(overview.nodes)
+        self.assertEqual("failed", task.stage_summary["entry_analysis"]["status"])
+        self.assertEqual("stale", task.stage_summary["entry_analysis"]["last_error"])
+
+    def test_get_entry_selection_stays_readonly(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            summary={
+                "entry_selection": {
+                    "candidates": [{"entry_key": "e1", "selected": True}],
+                    "selected_entry_keys": ["e1"],
+                }
+            },
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[], stage_items=[], archive_jobs=[])
+
+        with patch.object(
+            self.manager,
+            "_refresh_stage_from_authoritative_items",
+            side_effect=AssertionError("entry selection read should stay projection-only"),
+        ):
+            response = self.manager.get_entry_selection(db, project_id="p1", task_id="t1")
+
+        self.assertEqual("t1", response.task_id)
+        self.assertEqual(["e1"], response.selected_entry_keys)
+
+    def test_get_task_stage_items_page_stays_readonly(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        entry_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-a",
+            item_name="module-a",
+            parent_key="source_project",
+            item_identity_key="module-a::source_project",
+            status="running",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[], stage_items=[entry_item], archive_jobs=[])
+
+        with patch.object(
+            self.manager,
+            "_refresh_stage_from_authoritative_items",
+            side_effect=AssertionError("stage items read should stay projection-only"),
+        ):
+            response = self.manager.get_task_stage_items_page(
+                db,
+                project_id="p1",
+                task_id="t1",
+                stage_name="entry_analysis",
+            )
+
+        self.assertEqual("t1", response.task_id)
+        self.assertEqual(1, response.total)
+        self.assertEqual("si-entry", response.items[0].id)
+
     def test_refresh_task_status_after_sync_does_not_resurrect_cancelled_task(self):
         task = BinarySecurityTask(
             id="t1",

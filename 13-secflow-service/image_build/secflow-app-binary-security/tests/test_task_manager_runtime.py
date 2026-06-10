@@ -917,6 +917,58 @@ class StreamingTailTakeoverTests(unittest.TestCase):
         self.assertEqual(manager.instance_id, captured.get("processed_by"))
         self.assertEqual("processing", captured.get("processing_result"))
 
+    def test_refresh_stage_from_authoritative_items_retries_retryable_lock_error(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(id="task-1", project_id="project-1")
+        expected_run = BinarySecurityStageRun(
+            id="sr-1",
+            task_id="task-1",
+            project_id="project-1",
+            stage_name="entry_analysis",
+            sequence_no=1,
+            status="running",
+        )
+
+        class _Query:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def filter(self, *args, **kwargs):
+                del args, kwargs
+                return self
+
+            def first(self):
+                return self._rows[0] if self._rows else None
+
+        class _Session:
+            def __init__(self, rows):
+                self.rollbacks = 0
+                self._rows = rows
+
+            def rollback(self):
+                self.rollbacks += 1
+
+            def query(self, _model):
+                return _Query(self._rows)
+
+        session = _Session([task])
+        error = task_manager_module.OperationalError(
+            "UPDATE secflow_binary_security_task SET stage_summary_json = ...",
+            {},
+            Exception(1205, "Lock wait timeout exceeded; try restarting transaction"),
+        )
+
+        with (
+            patch.object(manager, "_refresh_stage_from_authoritative_items_once", side_effect=[error, expected_run]) as refresh_once,
+            patch.object(manager, "_sleep_after_retryable_lock_error", side_effect=lambda attempt: None) as sleep_retry,
+        ):
+            result = manager._refresh_stage_from_authoritative_items(session, task, "entry_analysis", operation="unit_test")
+
+        self.assertIs(result, expected_run)
+        self.assertEqual(2, refresh_once.call_count)
+        self.assertEqual(1, session.rollbacks)
+        sleep_retry.assert_called_once_with(1)
+
     async def test_poll_until_terminal_survives_operational_error_and_records_failure(self):
         manager = TaskManager()
         task = BinarySecurityTask(id="task-1", project_id="project-1")

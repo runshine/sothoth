@@ -481,6 +481,12 @@ DOWNSTREAM_RECONCILE_OBSERVATIONS_TOTAL = Counter(
     labelnames=("stage", "service", "result"),
 )
 
+TASK_SNAPSHOT_LOCK_RETRIES_TOTAL = Counter(
+    "secflow_binary_security_task_snapshot_lock_retries_total",
+    "Total retryable task snapshot lock conflicts.",
+    labelnames=("operation", "stage", "result"),
+)
+
 _PATH_ID_SEGMENT_RE = re.compile(r"/(?:\d+|[0-9a-f]{8,}|[0-9a-f]{8}-[0-9a-f-]{27,})(?=/|$)", re.IGNORECASE)
 
 
@@ -863,6 +869,14 @@ def observe_downstream_reconcile_observation(*, stage: str | None, service: str 
     DOWNSTREAM_RECONCILE_OBSERVATIONS_TOTAL.labels(
         stage=str(stage or "none"),
         service=str(service or "none"),
+        result=str(result or "unknown"),
+    ).inc()
+
+
+def observe_task_snapshot_lock_retry(*, operation: str, stage: str | None, result: str) -> None:
+    TASK_SNAPSHOT_LOCK_RETRIES_TOTAL.labels(
+        operation=str(operation or "unknown"),
+        stage=str(stage or "none"),
         result=str(result or "unknown"),
     ).inc()
 

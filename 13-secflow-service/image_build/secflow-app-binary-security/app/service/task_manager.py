@@ -87,6 +87,7 @@ from app.observability import (
     observe_state_reducer_event,
     observe_state_reducer_run,
     observe_task_readless_reconcile,
+    observe_task_snapshot_lock_retry,
     observe_task_state_lock,
     observe_task_duration,
     observe_task_error,
@@ -192,6 +193,7 @@ DB_ENTRY_PREVIEW_LIMIT = 50
 DB_ARTIFACT_PREVIEW_LIMIT = 50
 DB_EVENT_PAYLOAD_LIMIT_BYTES = 32768
 DETAIL_STAGE_ITEMS_LIMIT = 100
+READONLY_TASK_PROJECTION_CACHE_TTL_SECONDS = 1.0
 MODULE_TASK_INPUT_KEY = "module-input"
 ARCHIVE_COPY_MISSING_SOURCE_RETRY_REASON = "source_not_ready"
 DOWNSTREAM_CREATE_RETRY_BACKOFF_SECONDS = (10, 30, 60, 120)
@@ -1044,6 +1046,8 @@ class TaskManager:
         self._state_reducer_consecutive_crash_count = 0
         self._task_list_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
         self._task_list_cache_lock = threading.Lock()
+        self._readonly_projection_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
+        self._readonly_projection_cache_lock = threading.Lock()
         self._loop_heartbeats: dict[str, datetime] = {}
         self._last_stale_operation_requeue_at: datetime | None = None
         self._last_stage_item_sync_reconcile_at: datetime | None = None
@@ -2770,43 +2774,75 @@ class TaskManager:
             )
 
     def get_task_detail(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskDetailResponse:
-        ctx = self._build_light_task_detail_context(db, project_id=project_id, task_id=task_id)
-        base = self._task_response(db, ctx.task, queue_info=ctx.queue_info, detail_ctx=ctx).model_dump()
-        base.pop("execution_epoch", None)
-        archive_jobs_by_item = self._archive_jobs_by_item_id(ctx.archive_jobs)
-        archive_job_responses = self._archive_job_responses(db, ctx.task, ctx.archive_jobs)
-        stage_item_responses = [
-            self._stage_item_response(item, archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []))
-            for item in ctx.stage_items[:DETAIL_STAGE_ITEMS_LIMIT]
-        ]
-        overview_nodes = self._build_stage_overview_nodes(
-            db,
-            ctx.task,
-            ctx.stage_summaries,
-            archive_job_responses,
-            ctx.stage_items[:DETAIL_STAGE_ITEMS_LIMIT],
+        def _build() -> BinarySecurityTaskDetailResponse:
+            ctx = self._build_light_task_detail_context(db, project_id=project_id, task_id=task_id)
+            base = self._task_response(
+                db,
+                ctx.task,
+                queue_info=ctx.queue_info,
+                detail_ctx=ctx,
+                projection_only=True,
+            ).model_dump()
+            base.pop("execution_epoch", None)
+            archive_jobs_by_item = self._archive_jobs_by_item_id(ctx.archive_jobs)
+            archive_job_responses = self._archive_job_responses(db, ctx.task, ctx.archive_jobs)
+            stage_item_responses = [
+                self._stage_item_response(item, archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []))
+                for item in ctx.stage_items[:DETAIL_STAGE_ITEMS_LIMIT]
+            ]
+            overview_nodes = self._build_stage_overview_nodes(
+                db,
+                ctx.task,
+                ctx.stage_summaries,
+                archive_job_responses,
+                ctx.stage_items[:DETAIL_STAGE_ITEMS_LIMIT],
+            )
+            response = BinarySecurityTaskDetailResponse(
+                **base,
+                execution_epoch=int(getattr(ctx.task, "execution_epoch", 0) or 0),
+                description=ctx.task.description,
+                output_root=ctx.task.output_root,
+                workspace_root=ctx.task.workspace_root,
+                fileserver_subproject_name=ctx.task.fileserver_subproject_name,
+                policy=self._effective_runtime_policy(ctx.task),
+                summary=ctx.task.summary,
+                metrics=ctx.task.metrics,
+                item_stats=ctx.item_stats,
+                stage_items_total=ctx.stage_items_total,
+                stage_items_truncated=ctx.stage_items_total > DETAIL_STAGE_ITEMS_LIMIT,
+                stage_items=stage_item_responses,
+                archive_jobs=archive_job_responses,
+                abnormal_reason_history=[],
+                overview_nodes=overview_nodes,
+                orchestration_observability={},
+                cleanup_snapshot=dict(ctx.task.cleanup_snapshot or {}),
+                runtime_health=self._build_task_runtime_health(db, ctx.task, ctx=ctx),
+            )
+            self._log_task_read_projection_built(
+                projection_kind="task_detail_read_projection_built",
+                task=ctx.task,
+                stage_items_count=ctx.stage_items_total,
+                active_stage_name=self._active_reconcile_stage_name(ctx.task),
+                used_cached_projection=False,
+            )
+            return response
+
+        response, used_cached = self._load_readonly_projection_cached_value(
+            cache_group="task_detail",
+            project_id=project_id,
+            task_id=task_id,
+            ttl_seconds=READONLY_TASK_PROJECTION_CACHE_TTL_SECONDS,
+            loader=_build,
         )
-        return BinarySecurityTaskDetailResponse(
-            **base,
-            execution_epoch=int(getattr(ctx.task, "execution_epoch", 0) or 0),
-            description=ctx.task.description,
-            output_root=ctx.task.output_root,
-            workspace_root=ctx.task.workspace_root,
-            fileserver_subproject_name=ctx.task.fileserver_subproject_name,
-            policy=self._effective_runtime_policy(ctx.task),
-            summary=ctx.task.summary,
-            metrics=ctx.task.metrics,
-            item_stats=ctx.item_stats,
-            stage_items_total=ctx.stage_items_total,
-            stage_items_truncated=ctx.stage_items_total > DETAIL_STAGE_ITEMS_LIMIT,
-            stage_items=stage_item_responses,
-            archive_jobs=archive_job_responses,
-            abnormal_reason_history=[],
-            overview_nodes=overview_nodes,
-            orchestration_observability={},
-            cleanup_snapshot=dict(ctx.task.cleanup_snapshot or {}),
-            runtime_health=self._build_task_runtime_health(db, ctx.task, ctx=ctx),
-        )
+        if used_cached:
+            self._log_task_read_projection_built(
+                projection_kind="task_detail_read_projection_built",
+                task=response,
+                stage_items_count=len(getattr(response, "stage_items", []) or []),
+                active_stage_name=getattr(response, "current_stage", None),
+                used_cached_projection=True,
+            )
+        return response
 
     def get_task_stage_items_page(
         self,
@@ -2845,18 +2881,41 @@ class TaskManager:
         return self._build_orchestration_observability(db, task)
 
     def get_task_overview(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityOverviewResponse:
-        ctx = self._build_task_detail_context(db, project_id=project_id, task_id=task_id)
-        archive_job_responses = self._archive_job_responses(db, ctx.task, ctx.archive_jobs)
-        return BinarySecurityOverviewResponse(
-            task_id=ctx.task.id,
-            nodes=self._build_stage_overview_nodes(
-                db,
-                ctx.task,
-                ctx.stage_summaries,
-                archive_job_responses,
-                ctx.stage_items,
-            ),
+        def _build() -> BinarySecurityOverviewResponse:
+            ctx = self._build_task_detail_context(db, project_id=project_id, task_id=task_id)
+            archive_job_responses = self._archive_job_responses(db, ctx.task, ctx.archive_jobs)
+            response = BinarySecurityOverviewResponse(
+                task_id=ctx.task.id,
+                nodes=self._build_stage_overview_nodes(
+                    db,
+                    ctx.task,
+                    ctx.stage_summaries,
+                    archive_job_responses,
+                    ctx.stage_items,
+                ),
+            )
+            self._log_task_read_projection_built(
+                projection_kind="task_overview_read_projection_built",
+                task=ctx.task,
+                stage_items_count=ctx.stage_items_total,
+                active_stage_name=self._active_reconcile_stage_name(ctx.task),
+                used_cached_projection=False,
+            )
+            return response
+
+        response, used_cached = self._load_readonly_projection_cached_value(
+            cache_group="task_overview",
+            project_id=project_id,
+            task_id=task_id,
+            ttl_seconds=READONLY_TASK_PROJECTION_CACHE_TTL_SECONDS,
+            loader=_build,
         )
+        if used_cached:
+            logger.info(
+                "binary-security task_overview_read_projection_built projection_only=true task_id=%s used_cached_projection=true",
+                task_id,
+            )
+        return response
 
     def get_task_archive_jobs_page(
         self,
@@ -2900,9 +2959,6 @@ class TaskManager:
 
     def _build_task_detail_context(self, db: Session, *, project_id: str, task_id: str) -> _TaskDetailContext:
         task = self._task_or_404(db, project_id, task_id)
-        active_stage_name = self._active_reconcile_stage_name(task)
-        if active_stage_name:
-            self._refresh_stage_from_authoritative_items(db, task, active_stage_name)
         stage_runs = (
             db.query(BinarySecurityStageRun)
             .options(
@@ -2938,7 +2994,7 @@ class TaskManager:
             .all()
         )
         stage_sequence = self._stage_sequence_for_task(task)
-        stage_summaries = self._build_stage_summaries(db, task, stage_sequence, stage_runs, stage_items)
+        stage_summaries = self._build_stage_summaries_readonly(db, task, stage_sequence, stage_runs, stage_items)
         abnormal_reason = None
         if isinstance(task.latest_abnormal_reason, dict):
             try:
@@ -3066,7 +3122,7 @@ class TaskManager:
             .all()
         )
         stage_sequence = self._stage_sequence_for_task(task)
-        stage_summaries = self._build_stage_summaries(
+        stage_summaries = self._build_stage_summaries_readonly(
             db,
             task,
             stage_sequence,
@@ -19293,6 +19349,25 @@ class TaskManager:
             summaries.append(stage_summary)
         return summaries
 
+    def _build_stage_summaries_readonly(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_sequence: list[str],
+        stage_runs: list[BinarySecurityStageRun],
+        items: list[BinarySecurityStageItem],
+        *,
+        include_retry_support: bool = True,
+    ) -> list[BinarySecurityStageSummary]:
+        return self._build_stage_summaries(
+            db,
+            task,
+            stage_sequence,
+            stage_runs,
+            items,
+            include_retry_support=include_retry_support,
+        )
+
     def _aggregate_archive_stage_status(self, statuses: list[str]) -> str:
         if not statuses:
             return "pending"
@@ -20382,6 +20457,49 @@ class TaskManager:
             self._task_list_cache[cache_key] = (now_ts + max(0.1, float(ttl_seconds)), copy.deepcopy(value))
         return value
 
+    def _load_readonly_projection_cached_value(
+        self,
+        *,
+        cache_group: str,
+        project_id: str,
+        task_id: str,
+        ttl_seconds: float,
+        loader: Callable[[], Any],
+    ) -> tuple[Any, bool]:
+        if self._service_role() != "api":
+            return loader(), False
+        cache_key = (cache_group, project_id, task_id)
+        now_ts = time.monotonic()
+        with self._readonly_projection_cache_lock:
+            cached = self._readonly_projection_cache.get(cache_key)
+            if cached and now_ts < cached[0]:
+                return copy.deepcopy(cached[1]), True
+        value = loader()
+        with self._readonly_projection_cache_lock:
+            self._readonly_projection_cache[cache_key] = (
+                now_ts + max(0.1, float(ttl_seconds)),
+                copy.deepcopy(value),
+            )
+        return value, False
+
+    def _log_task_read_projection_built(
+        self,
+        *,
+        projection_kind: str,
+        task: Any,
+        stage_items_count: int,
+        active_stage_name: str | None,
+        used_cached_projection: bool,
+    ) -> None:
+        logger.info(
+            "binary-security %s projection_only=true task_id=%s active_stage_name=%s stage_items_count=%s used_cached_projection=%s",
+            projection_kind,
+            task.id,
+            str(active_stage_name or "").strip() or "-",
+            int(stage_items_count or 0),
+            bool(used_cached_projection),
+        )
+
     def _log_task_list_query(
         self,
         *,
@@ -20424,10 +20542,12 @@ class TaskManager:
         task: BinarySecurityTask,
         queue_info: dict[str, Any] | None = None,
         detail_ctx: _TaskDetailContext | None = None,
+        *,
+        projection_only: bool = False,
     ) -> BinarySecurityTaskResponse:
         if detail_ctx is None:
             active_stage_name = self._active_reconcile_stage_name(task)
-            if active_stage_name:
+            if active_stage_name and not projection_only:
                 self._refresh_stage_from_authoritative_items(db, task, active_stage_name)
             stage_runs = (
                 db.query(BinarySecurityStageRun)
@@ -20438,7 +20558,11 @@ class TaskManager:
             items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
             archive_jobs = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id).all()
             stage_sequence = self._stage_sequence_for_task(task)
-            stage_summaries = self._build_stage_summaries(db, task, stage_sequence, stage_runs, items)
+            stage_summaries = (
+                self._build_stage_summaries_readonly(db, task, stage_sequence, stage_runs, items)
+                if projection_only
+                else self._build_stage_summaries(db, task, stage_sequence, stage_runs, items)
+            )
             abnormal_reason = None
             if isinstance(task.latest_abnormal_reason, dict):
                 try:
@@ -22229,7 +22353,7 @@ class TaskManager:
         elif normalize_stage_name(stage_name) == "dataflow_vuln_scan":
             self._rebuild_summary_results_from_stage_items(db, task, "dataflow_vuln_scan", "dataflow_results")
 
-    def _refresh_stage_from_authoritative_items(self, db: Session, task: BinarySecurityTask, stage_name: str) -> BinarySecurityStageRun | None:
+    def _refresh_stage_from_authoritative_items_once(self, db: Session, task: BinarySecurityTask, stage_name: str) -> BinarySecurityStageRun | None:
         if stage_name == "system_analysis":
             self._refresh_system_analysis_stage_from_synced_items(db, task)
         elif self._is_streaming_tail_stage(task, stage_name):
@@ -22240,6 +22364,53 @@ class TaskManager:
             BinarySecurityStageRun.task_id == task.id,
             BinarySecurityStageRun.stage_name == stage_name,
         ).first()
+
+    def _refresh_stage_from_authoritative_items(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+        *,
+        retry_on_lock: bool = True,
+        operation: str = "authoritative_stage_refresh",
+    ) -> BinarySecurityStageRun | None:
+        attempts = self._retryable_write_attempts() if retry_on_lock else 1
+        task_id = str(task.id or "").strip()
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._refresh_stage_from_authoritative_items_once(db, task, stage_name)
+            except OperationalError as exc:
+                if not self._is_retryable_lock_error(exc):
+                    raise
+                result = "retry_scheduled" if attempt < attempts else "failed"
+                observe_task_snapshot_lock_retry(
+                    operation=operation,
+                    stage=stage_name,
+                    result=result,
+                )
+                logger.warning(
+                    "binary-security task snapshot lock conflict task_id=%s stage_name=%s operation=%s attempt=%s result=%s runtime_role=%s",
+                    task_id or "-",
+                    stage_name or "-",
+                    operation,
+                    attempt,
+                    result,
+                    self._service_role(),
+                    exc_info=(attempt >= attempts),
+                )
+                with suppress(Exception):
+                    db.rollback()
+                if attempt >= attempts:
+                    raise
+                self._sleep_after_retryable_lock_error(attempt)
+                refreshed_task = (
+                    db.query(BinarySecurityTask)
+                    .filter(BinarySecurityTask.id == task_id)
+                    .first()
+                )
+                if refreshed_task is not None:
+                    task = refreshed_task
+        return None
 
     def _reconcile_stage_and_task_state_after_item_update(
         self,
