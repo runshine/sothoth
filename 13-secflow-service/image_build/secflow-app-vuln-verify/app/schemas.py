@@ -110,4 +110,57 @@ class TaskResultResponse(BaseModel):
     summary: dict[str, Any] = Field(default_factory=dict)
 
 
+class ReportDimension(BaseModel):
+    status: bool | None = None
+    detail: str = ""
+
+
+class ReportExploitability(BaseModel):
+    preconditions: str = ""
+    complexity: str = ""
+    impact: str = ""
+
+
+class ReportEvidence(BaseModel):
+    type: str = ""
+    claim: str = ""
+    finding: str = ""
+
+
+class ReportDataItem(BaseModel):
+    id: str
+    title: str = ""
+    severity: str = "unknown"
+    verdict: str = "unverified"
+    ruled_out_by: str | None = None
+    dimensions: dict[str, ReportDimension] = Field(default_factory=dict)
+    root_cause: str = ""
+    exploit: ReportExploitability | None = None
+    evidence: list[ReportEvidence] = Field(default_factory=list)
+    raw_result: dict[str, Any] | None = None
+
+
+class ReportDataGroup(BaseModel):
+    id: str
+    file: str = ""
+    function: str = ""
+    report_count: int = 0
+    verdicts: dict[str, int] = Field(default_factory=dict)
+    dominant: str = "unverified"
+    reports: list[ReportDataItem] = Field(default_factory=list)
+
+
+class ReportDataResponse(BaseModel):
+    task_id: str
+    status: str
+    title: str = "漏洞验证报告"
+    target: str = ""
+    total_verified: int = 0
+    total_reports: int = 0
+    total_groups: int = 0
+    verdicts: dict[str, int] = Field(default_factory=dict)
+    severities: dict[str, int] = Field(default_factory=dict)
+    groups: list[ReportDataGroup] = Field(default_factory=list)
+
+
 TaskDetailResponse.model_rebuild()

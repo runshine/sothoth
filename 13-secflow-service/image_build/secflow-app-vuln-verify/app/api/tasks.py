@@ -16,6 +16,7 @@ from app.schemas import (
     ArtifactEntry,
     ArtifactListResponse,
     TaskCreate,
+    ReportDataResponse,
     TaskDetailResponse,
     TaskListResponse,
     TaskResponse,
@@ -27,6 +28,7 @@ from app.service.project import get_project_service
 from app.service.security import validate_project_id
 from app.service.task_service import (
     build_detail,
+    build_report_data,
     build_response,
     create_task,
     get_task_or_404,
@@ -151,6 +153,17 @@ def get_result(
         results=load_results(task, limit=limit),
         summary=summary,
     )
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/report-data", response_model=ReportDataResponse)
+def get_report_data(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    return ReportDataResponse(**build_report_data(task))
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/artifacts", response_model=ArtifactListResponse)
