@@ -5067,6 +5067,9 @@ class TaskManager:
         synced_count = 0
         skipped_count = 0
         failed_count = 0
+        revived_count = 0
+        binding_mismatch_count = 0
+        revival_rejected_count = 0
         touched_stages: set[str] = set()
         auth_token = token or self._service_token()
         ready_items: list[BinarySecurityStageItem] = []
@@ -5105,35 +5108,45 @@ class TaskManager:
                 if exc is not None:
                     raise exc
                 assert isinstance(payload, dict)
-                if item.downstream_service == "entry_analyse":
-                    payload, rebound_notice_payload = await self._reconcile_entry_payload_binding(task, item, payload, auth_token)
-                    if rebound_notice_payload is not None:
-                        self._record_event(
-                            db,
-                            task,
-                            "downstream_parent_mismatch",
-                            "下游子任务绑定到旧轮次阶段项，已阻断旧轮次状态回写",
-                            level="warning",
-                            stage_name=item.stage_name,
-                            item=item,
-                            payload=rebound_notice_payload,
-                        )
-                    if payload is None:
-                        if not self._persist_child_sync_observation(
-                            db,
-                            task=task,
-                            item=item,
-                            change_source="downstream_sync",
-                            sync_status="binding_mismatch",
-                            error_message="下游子任务仍绑定旧轮次阶段项",
-                            error_type="parent_mismatch",
-                            state_applied=False,
-                            extra_payload={"operation": "downstream_sync"},
-                        ):
-                            failed_count += 1
-                            continue
-                        skipped_count += 1
+                binding_mismatch_payload = self._downstream_binding_mismatch_observation(item, payload)
+                if binding_mismatch_payload is not None:
+                    binding_mismatch_count += 1
+                    payload_status_raw = self._string_or_none(payload.get("status"))
+                    payload_status_mapped = self._map_downstream_status(str(payload.get("status") or "").lower())
+                    revival_candidate = (
+                        str(before_status or "").strip().lower() in {"failed", "cancelled", "downstream_missing"}
+                        and payload_status_mapped in {"pending", "queued", "dispatching", "running", "success"}
+                    )
+                    if revival_candidate:
+                        revival_rejected_count += 1
+                    self._record_event(
+                        db,
+                        task,
+                        "downstream_status_revival_rejected_due_to_binding_mismatch" if revival_candidate else "downstream_binding_mismatch_detected",
+                        "当前绑定下游任务返回的绑定上下文不匹配，已拒绝恢复状态" if revival_candidate else "当前绑定下游任务返回的绑定上下文不匹配，已跳过状态同步",
+                        level="warning",
+                        stage_name=item.stage_name,
+                        item=item,
+                        payload=binding_mismatch_payload,
+                    )
+                    if not self._persist_child_sync_observation(
+                        db,
+                        task=task,
+                        item=item,
+                        change_source="downstream_sync",
+                        sync_status="binding_mismatch",
+                        error_message="当前绑定下游任务返回的绑定上下文不匹配",
+                        error_type="binding_mismatch",
+                        status_raw=payload_status_raw,
+                        mapped_status=payload_status_mapped,
+                        downstream_status=payload_status_raw,
+                        state_applied=False,
+                        extra_payload=binding_mismatch_payload,
+                    ):
+                        failed_count += 1
                         continue
+                    skipped_count += 1
+                    continue
                 downstream_status = str(payload.get("status") or "").lower()
                 mapped_status = self._map_downstream_status(downstream_status)
                 current_item_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower() or None
@@ -5594,6 +5607,7 @@ class TaskManager:
                         payload=payload,
                     )
                 if should_apply:
+                    was_terminal = str(before_status or "").strip().lower() in {"failed", "cancelled", "downstream_missing"}
                     apply_error_message = None if mapped_status in {"queued", "running", "success"} else (
                         payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message
                     )
@@ -5645,6 +5659,24 @@ class TaskManager:
                     ):
                         failed_count += 1
                         continue
+                    if was_terminal and mapped_status in {"pending", "queued", "dispatching", "running", "success"}:
+                        revived_count += 1
+                        self._record_event(
+                            db,
+                            task,
+                            "downstream_status_revival_applied",
+                            "当前绑定下游任务恢复运行，已按最新状态回流到编排侧",
+                            stage_name=item.stage_name,
+                            item=item,
+                            payload={
+                                "downstream_service": item.downstream_service,
+                                "downstream_task_id": item.downstream_task_id,
+                                "before_status": before_status,
+                                "after_status": mapped_status,
+                                "status_raw": downstream_status,
+                                "mapped_status": mapped_status,
+                            },
+                        )
                     touched_stages.add(item.stage_name)
                     synced_count += 1
                 else:
@@ -5899,6 +5931,11 @@ class TaskManager:
             synced_downstream_count=response_synced_count,
             skipped_downstream_count=skipped_count,
             failed_downstream_count=failed_count,
+            cleanup_status=(
+                f"revived={revived_count},binding_mismatch={binding_mismatch_count},revival_rejected={revival_rejected_count}"
+                if (revived_count or binding_mismatch_count or revival_rejected_count)
+                else None
+            ),
         )
 
     def _clear_archive_jobs_for_stage_items(self, db: Session, task_id: str, stage_name: str, item_ids: list[str]) -> int:
@@ -8079,7 +8116,7 @@ class TaskManager:
         if service == "entry_analyse":
             return await self._find_reusable_entry_payload(task, item, token)
         if service == "dataflow_analyse":
-            return await self._find_reusable_dataflow_payload(task, item, allow_rebind=True)
+            return await self._find_reusable_dataflow_payload(task, item, allow_rebind=False)
         if service == "dataflow_vuln_scanner":
             return await self._find_reusable_vuln_payload(task, item, token)
         return None
@@ -9413,10 +9450,18 @@ class TaskManager:
     ) -> bool:
         before_status = str(item.status or "").strip().lower()
         if mapped_status == "running":
-            return before_status in {"pending", "queued", "running", "dispatching"}
+            if before_status in {"pending", "queued", "running", "dispatching"}:
+                return True
+            if before_status in {"failed", "cancelled", "downstream_missing"}:
+                mismatch = self._downstream_binding_mismatch_observation(item, payload)
+                return mismatch is None
+            return False
         if mapped_status == "queued":
             return before_status in {"running", "queued"}
         if mapped_status == "pending":
+            if before_status in {"failed", "cancelled", "downstream_missing"}:
+                mismatch = self._downstream_binding_mismatch_observation(item, payload)
+                return mismatch is None
             if before_status != "running":
                 return False
             if str(item.downstream_service or "").strip() == "entry_analyse":
@@ -19083,8 +19128,8 @@ class TaskManager:
         selected = candidates[0]
         selected_task_id = str(selected.get("task_id") or selected.get("id") or "").strip()
         current_task_id = str(item.downstream_task_id or "").strip()
-        if allow_rebind and selected_task_id and selected_task_id != current_task_id:
-            item.downstream_task_id = selected_task_id
+        if current_task_id and selected_task_id and selected_task_id != current_task_id:
+            return None
         return selected
 
     async def _find_reusable_entry_payload(
@@ -19132,8 +19177,8 @@ class TaskManager:
         selected = candidates[0]
         selected_task_id = str(selected.get("task_id") or selected.get("id") or "").strip()
         current_task_id = str(item.downstream_task_id or "").strip()
-        if selected_task_id and selected_task_id != current_task_id:
-            item.downstream_task_id = selected_task_id
+        if current_task_id and selected_task_id and selected_task_id != current_task_id:
+            return None
         return selected
 
     def _entry_payload_matches_stage_item(
@@ -19153,6 +19198,43 @@ class TaskManager:
             return bool(origin_item_key and origin_item_key == item_key)
         return False
 
+    def _downstream_binding_mismatch_observation(
+        self,
+        item: BinarySecurityStageItem,
+        payload: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+        observed_task_id = str(payload.get("task_id") or payload.get("id") or "").strip() or None
+        current_task_id = str(item.downstream_task_id or "").strip() or None
+        observed_parent_stage_item_id = str(payload.get("parent_stage_item_id") or "").strip() or None
+        observed_parent_stage_item_key = str(payload.get("parent_stage_item_key") or "").strip() or None
+        expected_parent_stage_item_id = str(item.id or "").strip() or None
+        expected_parent_stage_item_key = str(item.item_key or "").strip() or None
+        if current_task_id and observed_task_id and observed_task_id != current_task_id:
+            return {
+                "downstream_service": item.downstream_service,
+                "downstream_task_id": current_task_id,
+                "observed_downstream_task_id": observed_task_id,
+                "expected_parent_stage_item_id": expected_parent_stage_item_id,
+                "expected_parent_stage_item_key": expected_parent_stage_item_key,
+                "observed_parent_stage_item_id": observed_parent_stage_item_id,
+                "observed_parent_stage_item_key": observed_parent_stage_item_key,
+                "mismatch_reason": "downstream_task_id_mismatch",
+            }
+        if item.downstream_service == "entry_analyse" and not self._entry_payload_matches_stage_item(item, payload):
+            return {
+                "downstream_service": item.downstream_service,
+                "downstream_task_id": current_task_id,
+                "observed_downstream_task_id": observed_task_id,
+                "expected_parent_stage_item_id": expected_parent_stage_item_id,
+                "expected_parent_stage_item_key": expected_parent_stage_item_key,
+                "observed_parent_stage_item_id": observed_parent_stage_item_id,
+                "observed_parent_stage_item_key": observed_parent_stage_item_key,
+                "mismatch_reason": "parent_stage_item_mismatch",
+            }
+        return None
+
     async def _reconcile_entry_payload_binding(
         self,
         task: BinarySecurityTask,
@@ -19160,23 +19242,11 @@ class TaskManager:
         payload: dict[str, Any],
         token: str | None,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        if str(item.downstream_service or "").strip() != "entry_analyse":
-            return payload, None
-        if self._entry_payload_matches_stage_item(item, payload):
-            return payload, None
-        mismatch_payload = {
-            "downstream_service": item.downstream_service,
-            "downstream_task_id": str(item.downstream_task_id or "").strip() or None,
-            "expected_parent_stage_item_id": str(item.id or "").strip() or None,
-            "expected_parent_stage_item_key": str(item.item_key or "").strip() or None,
-            "observed_parent_stage_item_id": str(payload.get("parent_stage_item_id") or "").strip() or None,
-            "observed_parent_stage_item_key": str(payload.get("parent_stage_item_key") or "").strip() or None,
-        }
-        rebound = await self._find_reusable_entry_payload(task, item, token)
-        if rebound is not None and self._entry_payload_matches_stage_item(item, rebound):
-            mismatch_payload["rebound_downstream_task_id"] = str(rebound.get("task_id") or rebound.get("id") or "").strip() or None
-            return rebound, mismatch_payload
-        return None, mismatch_payload
+        del task, token
+        mismatch_payload = self._downstream_binding_mismatch_observation(item, payload)
+        if mismatch_payload is not None:
+            return None, mismatch_payload
+        return payload, None
 
     async def _find_reusable_firmware_unpack_payload(
         self,
@@ -19222,8 +19292,8 @@ class TaskManager:
         selected = candidates[0]
         selected_task_id = str(selected.get("task_id") or selected.get("id") or "").strip()
         current_task_id = str(item.downstream_task_id or "").strip()
-        if selected_task_id and selected_task_id != current_task_id:
-            item.downstream_task_id = selected_task_id
+        if current_task_id and selected_task_id and selected_task_id != current_task_id:
+            return None
         return selected
 
     async def _find_reusable_vuln_payload(
@@ -19269,8 +19339,8 @@ class TaskManager:
         selected = candidates[0]
         selected_task_id = str(selected.get("task_id") or selected.get("id") or "").strip()
         current_task_id = str(item.downstream_task_id or "").strip()
-        if selected_task_id and selected_task_id != current_task_id:
-            item.downstream_task_id = selected_task_id
+        if current_task_id and selected_task_id and selected_task_id != current_task_id:
+            return None
         return selected
 
     async def _find_reusable_system_analysis_payload(
@@ -19313,8 +19383,8 @@ class TaskManager:
         selected = candidates[0]
         selected_task_id = str(selected.get("task_id") or selected.get("id") or "").strip()
         current_task_id = str(item.downstream_task_id or "").strip()
-        if selected_task_id and selected_task_id != current_task_id:
-            item.downstream_task_id = selected_task_id
+        if current_task_id and selected_task_id and selected_task_id != current_task_id:
+            return None
         return selected
 
     async def _find_reusable_b2s_payload(
@@ -19359,8 +19429,8 @@ class TaskManager:
         selected = candidates[0]
         selected_task_id = str(selected.get("task_id") or selected.get("id") or "").strip()
         current_task_id = str(item.downstream_task_id or "").strip()
-        if selected_task_id and selected_task_id != current_task_id:
-            item.downstream_task_id = selected_task_id
+        if current_task_id and selected_task_id and selected_task_id != current_task_id:
+            return None
         return selected
 
     async def _duplicate_downstream_refs_for_item(

@@ -12284,7 +12284,6 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
 
         original_fetch = self.manager._fetch_downstream_task_payload
-        original_find = self.manager._find_reusable_entry_payload
         original_write = self.manager._write_task_metadata_async
         original_enqueue = self.manager._enqueue_task
 
@@ -12296,14 +12295,10 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 "parent_stage_item_key": "m1",
             }
 
-        async def _find(*_args, **_kwargs):
-            return None
-
         async def _noop_write(*_args, **_kwargs):
             return None
 
         self.manager._fetch_downstream_task_payload = _fetch
-        self.manager._find_reusable_entry_payload = _find
         self.manager._write_task_metadata_async = _noop_write
         self.manager._enqueue_task = lambda *_args, **_kwargs: None
         try:
@@ -12318,17 +12313,17 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             self.manager._fetch_downstream_task_payload = original_fetch
-            self.manager._find_reusable_entry_payload = original_find
             self.manager._write_task_metadata_async = original_write
             self.manager._enqueue_task = original_enqueue
 
         self.assertEqual("running", item.status)
         self.assertEqual("binding_mismatch", item.result.get("sync_status"))
-        mismatch_events = [event for event in db.events if event.event_type == "downstream_parent_mismatch"]
+        mismatch_events = [event for event in db.events if event.event_type == "downstream_binding_mismatch_detected"]
         self.assertTrue(mismatch_events)
         self.assertEqual("si1", mismatch_events[-1].payload.get("expected_parent_stage_item_id"))
         self.assertEqual("si-old", mismatch_events[-1].payload.get("observed_parent_stage_item_id"))
         self.assertEqual(0, resp.synced_downstream_count)
+        self.assertEqual("revived=0,binding_mismatch=1,revival_rejected=0", resp.cleanup_status)
 
     def test_sync_downstream_status_keeps_all_missing_children_after_multiple_404s(self):
         task = BinarySecurityTask(
@@ -12970,6 +12965,149 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([], reconciled)
 
+    def test_sync_downstream_status_revivals_apply_only_current_bound_child(self):
+        task = BinarySecurityTask(
+            id="s2",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        run = BinarySecurityStageRun(
+            id="sr2",
+            task_id="s2",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si2",
+            task_id="s2",
+            project_id="p1",
+            stage_run_id="sr2",
+            stage_name="system_analysis",
+            item_key="fw1",
+            parent_key="fw1",
+            status="failed",
+            downstream_service="system_analyse",
+            downstream_task_id="sat_1",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
+
+        original_fetch = self.manager._fetch_downstream_task_payload
+        original_write = self.manager._write_task_metadata_async
+        original_enqueue = self.manager._enqueue_task
+
+        async def _fetch(_task, _item, _token):
+            return {"task_id": "sat_1", "status": "running", "parent_stage_item_id": "si2"}
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._fetch_downstream_task_payload = _fetch
+        self.manager._write_task_metadata_async = _noop_write
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        try:
+            resp = asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id="p1",
+                    task_id="s2",
+                    stage_name="system_analysis",
+                    apply_state=True,
+                )
+            )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+            self.manager._write_task_metadata_async = original_write
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual("running", item.status)
+        self.assertEqual(1, resp.synced_downstream_count)
+        self.assertEqual("revived=1,binding_mismatch=0,revival_rejected=0", resp.cleanup_status)
+        revival_events = [event for event in db.events if event.event_type == "downstream_status_revival_applied"]
+        self.assertTrue(revival_events)
+
+    def test_sync_downstream_status_rejects_binding_mismatch_revival(self):
+        task = BinarySecurityTask(
+            id="s3",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        run = BinarySecurityStageRun(
+            id="sr3",
+            task_id="s3",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=1,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si3",
+            task_id="s3",
+            project_id="p1",
+            stage_run_id="sr3",
+            stage_name="entry_analysis",
+            item_key="mod1",
+            parent_key="source_project",
+            status="failed",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
+
+        original_fetch = self.manager._fetch_downstream_task_payload
+        original_write = self.manager._write_task_metadata_async
+        original_enqueue = self.manager._enqueue_task
+
+        async def _fetch(_task, _item, _token):
+            return {
+                "task_id": "eat_1",
+                "status": "running",
+                "parent_stage_item_id": "si-other",
+                "parent_stage_item_key": "other",
+            }
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._fetch_downstream_task_payload = _fetch
+        self.manager._write_task_metadata_async = _noop_write
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        try:
+            resp = asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id="p1",
+                    task_id="s3",
+                    stage_name="entry_analysis",
+                    apply_state=True,
+                )
+            )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+            self.manager._write_task_metadata_async = original_write
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual("failed", item.status)
+        self.assertEqual(0, resp.synced_downstream_count)
+        self.assertEqual("revived=0,binding_mismatch=1,revival_rejected=1", resp.cleanup_status)
+        mismatch_events = [event for event in db.events if event.event_type == "downstream_status_revival_rejected_due_to_binding_mismatch"]
+        self.assertTrue(mismatch_events)
+
     def test_sync_downstream_status_running_reconciles_dataflow_stage_summary(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         task = BinarySecurityTask(
@@ -13065,21 +13203,21 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._write_task_metadata_async = original_write
             self.manager._enqueue_task = original_enqueue
 
-        self.assertEqual(2, resp.synced_downstream_count)
-        self.assertEqual("running", item1.status)
+        self.assertEqual(1, resp.synced_downstream_count)
+        self.assertEqual("success", item1.status)
         self.assertEqual("running", item2.status)
-        self.assertEqual("synced", item1.result.get("sync_status"))
+        self.assertEqual("skipped", item1.result.get("sync_status"))
         self.assertEqual("synced", item2.result.get("sync_status"))
         self.assertEqual("running", item1.result.get("downstream_status"))
         self.assertEqual("running", item2.result.get("downstream_status"))
         self.assertIsNotNone(item1.result.get("downstream_status_synced_at"))
         self.assertIsNotNone(item2.result.get("downstream_status_synced_at"))
         self.assertEqual("running", run.status)
-        self.assertEqual(0, run.counts.get("success_items"))
-        self.assertEqual(2, run.counts.get("running_items"))
+        self.assertEqual(1, run.counts.get("success_items"))
+        self.assertEqual(1, run.counts.get("running_items"))
         self.assertEqual("running", task.stage_summary["dataflow_analysis"]["status"])
-        self.assertEqual(0, task.stage_summary["dataflow_analysis"]["counts"]["success_items"])
-        self.assertEqual(2, task.stage_summary["dataflow_analysis"]["counts"]["running_items"])
+        self.assertEqual(1, task.stage_summary["dataflow_analysis"]["counts"]["success_items"])
+        self.assertEqual(1, task.stage_summary["dataflow_analysis"]["counts"]["running_items"])
 
     def test_apply_downstream_status_event_reuses_unified_reconcile(self):
         task = BinarySecurityTask(
