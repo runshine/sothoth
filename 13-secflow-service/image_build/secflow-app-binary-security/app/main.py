@@ -52,6 +52,10 @@ logger = logging.getLogger(__name__)
 _probe_server: ThreadedProbeServer | None = None
 
 
+def _external_probe_process_enabled() -> bool:
+    return str(os.environ.get("SECFLOW_EXTERNAL_PROBE_PROCESS", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _service_role() -> str:
     raw_role = os.environ.get("SECFLOW_BINARY_SECURITY_ROLE") or ""
     normalized = str(raw_role).strip().lower()
@@ -188,7 +192,8 @@ async def lifespan(_: FastAPI):
     mark_startup_state(shutting_down=False, startup_ready=False, startup_error=None)
     try:
         load_config()
-        _ensure_probe_server_started()
+        if not _external_probe_process_enabled():
+            _ensure_probe_server_started()
         init_database()
         mark_startup_state(database_ready=True)
         with get_engine().connect() as conn:
@@ -221,7 +226,8 @@ async def lifespan(_: FastAPI):
         logger.warning("Binary Security 服务关闭警告: %s", exc)
     finally:
         mark_startup_state(registry_ready=False, auth_ready=False, database_ready=False)
-        _stop_probe_server()
+        if not _external_probe_process_enabled():
+            _stop_probe_server()
 
 
 app = FastAPI(
