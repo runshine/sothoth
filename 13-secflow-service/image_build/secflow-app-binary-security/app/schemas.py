@@ -368,6 +368,11 @@ class BinarySecurityArchiveJobResponse(BaseModel):
     item_key: Optional[str] = None
     downstream_service: Optional[str] = None
     downstream_task_id: Optional[str] = None
+    archive_source_primary_path: Optional[str] = None
+    archive_source_paths: list[str] = Field(default_factory=list)
+    source_root: Optional[str] = None
+    source_root_path: Optional[str] = None
+    source_dir: Optional[str] = None
     archive_status: str
     archive_root: Optional[str] = None
     error_message: Optional[str] = None

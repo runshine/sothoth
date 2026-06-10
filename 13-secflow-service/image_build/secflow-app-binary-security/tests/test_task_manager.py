@@ -16064,6 +16064,124 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("failed", refreshed.payload["downstream_payload"]["status"])
         self.assertIn("archive_copy_stats", refreshed.payload)
 
+def _test_archive_job_payload_does_not_persist_bound_output_path(self):
+    task = BinarySecurityTask(
+        id="task1",
+        project_id="p1",
+        name="n",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = type("Item", (), {
+        "id": "si1",
+        "stage_name": "entry_analysis",
+        "item_key": "source_project-images",
+        "downstream_service": "entry_analyse",
+        "downstream_task_id": "eat_1",
+    })()
+    db = _ModelAwareDb()
+
+    long_output_path = "/data/files/" + "/".join(f"segment-{idx:04d}" for idx in range(2048))
+    job = self.manager._ensure_downstream_archive_job(
+        db,
+        task,
+        item,
+        payload={
+            "task_id": "eat_1",
+            "status": "success",
+            "workspace_root": "/tmp/entry/eat_1",
+            "output_path": long_output_path,
+        },
+        mapped_status="success",
+        before_status="running",
+    )
+
+    payload = job.payload
+    self.assertNotIn("bound_output_path", payload)
+    self.assertEqual(long_output_path, payload["downstream_payload"]["output_path"])
+    self.assertLess(len(job.payload_json or ""), len(long_output_path))
+
+def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payload_changes(self):
+    task = BinarySecurityTask(
+        id="task1",
+        project_id="p1",
+        name="n",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="task1",
+        project_id="p1",
+        stage_run_id="sr1",
+        stage_name="entry_analysis",
+        item_key="source_project-images",
+        item_name="images",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat_1",
+        status="failed",
+    )
+    job = BinarySecurityArchiveJob(
+        id="aj1",
+        task_id="task1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_id="si1",
+        item_key="source_project-images",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat_1",
+        job_dedupe_key="si1::eat_1",
+        archive_status="success",
+        archive_root="/old/archive",
+    )
+    job.payload = {
+        "mapped_status": "failed",
+        "before_status": "running",
+        "force": False,
+        "downstream_payload": {
+            "task_id": "eat_1",
+            "status": "failed",
+            "updated_at": "2026-05-15T20:05:39+08:00",
+            "error": "old failed",
+        },
+        "extra_paths": [],
+        "archive_copy_stats": {"copied_files": 10},
+    }
+    db = _LockingDb(_FakeConnection(lock_result=True))
+    db.tasks.append(task)
+    db.stage_items.append(item)
+    db.archive_jobs.append(job)
+
+    refreshed = self.manager._ensure_downstream_archive_job(
+        db,
+        task,
+        item,
+        payload={
+            "task_id": "eat_1",
+            "status": "passed",
+            "updated_at": "2026-05-15T21:18:53+08:00",
+            "finished_at": "2026-05-15T21:18:53+08:00",
+            "output_path": "/data/files/p1/app/secflow-app-entry-analyse",
+        },
+        mapped_status="success",
+        before_status="failed",
+    )
+
+    self.assertIs(job, refreshed)
+    self.assertEqual("success", refreshed.archive_status)
+    self.assertEqual("/old/archive", refreshed.archive_root)
+    self.assertEqual("failed", refreshed.payload["mapped_status"])
+    self.assertEqual("failed", refreshed.payload["downstream_payload"]["status"])
+    self.assertIn("archive_copy_stats", refreshed.payload)
+
     def test_ensure_downstream_archive_job_keeps_failed_job_until_manual_retry(self):
         task = BinarySecurityTask(
             id="task1",
