@@ -15,6 +15,7 @@ from app.api.config import router as config_router
 from app.api.health import router as health_router
 from app.api.public import router as public_router
 from app.api.services import router as services_router
+from app.api.threat_model_templates import router as threat_model_templates_router
 from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
 from app.models import init_database
@@ -99,6 +100,7 @@ app.include_router(public_router)
 app.include_router(services_router)
 app.include_router(config_router)
 app.include_router(cases_router)
+app.include_router(threat_model_templates_router)
 app.include_router(actions_router)
 
 

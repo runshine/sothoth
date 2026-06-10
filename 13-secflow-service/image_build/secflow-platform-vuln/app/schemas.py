@@ -8,6 +8,20 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field, field_validator
 
 
+class AutoVerifyTaskCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    threat_model_markdown: str = Field(min_length=1)
+    template_id: Optional[str] = None
+    model: str = Field(default="gpt-4o-mini", min_length=1, max_length=128)
+    concurrency: int = Field(default=2, ge=1, le=64)
+    advance_to_validation: bool = True
+
+
+class ThreatModelTemplateRenderRequest(BaseModel):
+    case_id: str = Field(min_length=1, max_length=128)
+    variables: dict[str, Any] = Field(default_factory=dict)
+
+
 class ServiceCapabilityRegister(BaseModel):
     capability_code: str = Field(min_length=1, max_length=128)
     action_type: str = Field(min_length=1, max_length=64)
