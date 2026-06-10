@@ -123,6 +123,25 @@ class TurboModeTests(unittest.TestCase):
         item.extra_metadata = {"engine": "turbo", "mode": "turbo", "reuse_cache": True}
         self.assertEqual("turbo", task_service._item_engine(item))
 
+    def test_pi_job_payload_preserves_turbo_engine(self):
+        item = B2STaskItem(id="i1", task_id="t1", project_id="p1", sequence_no=1, elf_path="/tmp/in", output_dir="/tmp/out", status="pending")
+        item.extra_metadata = {"engine": "turbo", "mode": "turbo", "pi_idempotency_key": "idem-1"}
+
+        payload = task_service._pi_job_payload(
+            item,
+            pi_cfg=SimpleNamespace(batch_size=8192, max_retries=3),
+            job_model=None,
+            timeout_seconds=3600,
+            timeout_retry_enabled=True,
+            timeout_max_retries=3,
+            engine="turbo",
+            concurrency=4,
+            clean=False,
+        )
+
+        self.assertEqual("turbo", payload["engine"])
+        self.assertIsNone(payload["model"])
+
     def test_cache_service_supports_turbo_keys(self):
         service = B2SCacheService()
         digest = "a" * 64
