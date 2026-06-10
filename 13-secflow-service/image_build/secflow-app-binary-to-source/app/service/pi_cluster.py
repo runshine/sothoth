@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import socket
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 from dataclasses import dataclass, field
@@ -13,9 +16,14 @@ from typing import Any
 import httpx
 
 from app.config import get_config
+from app.observability import get_observability
 from app.service.pod_metrics import fetch_pod_resource_map
 from app.service.pi_re_agent import get_pi_client
-from app.time_utils import isoformat_local, now_local
+from app.time_utils import ensure_local, isoformat_local, now_local
+
+
+_CACHE_REFRESH_INTERVAL_SECONDS = 60.0
+_CACHE_TTL_SECONDS = 60.0
 
 
 def _infer_pod_name_from_url(url: str) -> str | None:
@@ -51,6 +59,7 @@ class PiWorkerSnapshot:
     pod_memory_limit_bytes: int | None = None
     source: str = "fallback"
     error: str | None = None
+    active_jobs: list["PiWorkerActiveJobSnapshot"] = field(default_factory=list)
 
 
 @dataclass
@@ -94,12 +103,40 @@ class PiClusterSnapshot:
         return max(0, self.total_capacity - self.running_jobs)
 
 
+@dataclass
+class PiClusterCacheState:
+    snapshot: PiClusterSnapshot = field(default_factory=PiClusterSnapshot)
+    refreshed_at: str | None = None
+    expires_at: str | None = None
+    last_success_at: str | None = None
+    last_error: str | None = None
+    refresh_in_progress: bool = False
+
+    @property
+    def stale(self) -> bool:
+        if not self.expires_at:
+            return True
+        try:
+            expires_at = ensure_local(datetime.fromisoformat(self.expires_at))
+            return expires_at is None or now_local() > expires_at
+        except Exception:
+            return True
+
+
 class PiClusterMonitor:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
-        self._snapshot = PiClusterSnapshot(updated_at=isoformat_local(now_local()))
+        self._refresh_task: asyncio.Task | None = None
+        self._cache = PiClusterCacheState(
+            snapshot=PiClusterSnapshot(updated_at=None),
+            refreshed_at=None,
+            expires_at=None,
+            last_success_at=None,
+            last_error=None,
+            refresh_in_progress=False,
+        )
 
-    async def refresh(self) -> PiClusterSnapshot:
+    async def _collect_snapshot(self) -> PiClusterSnapshot:
         urls = await discover_worker_urls()
         workers = await asyncio.gather(*(probe_worker(url) for url in urls), return_exceptions=True)
         snapshots: list[PiWorkerSnapshot] = []
@@ -116,6 +153,7 @@ class PiClusterMonitor:
                     max_concurrent_jobs=0,
                     error=str(result),
                 ))
+        active_jobs_by_worker, worker_job_errors = await _load_worker_active_jobs(snapshots)
         pod_resource_map = fetch_pod_resource_map(
             pod_names=[str(worker.pod_name or "").strip() for worker in snapshots if str(worker.pod_name or "").strip()],
         )
@@ -140,19 +178,90 @@ class PiClusterMonitor:
                     pod_cpu_limit_millicores=(pod_resource_map.get(str(worker.pod_name or "").strip(), {}) or {}).get("pod_cpu_limit_millicores"),
                     pod_memory_limit_bytes=(pod_resource_map.get(str(worker.pod_name or "").strip(), {}) or {}).get("pod_memory_limit_bytes"),
                     source=worker.source,
-                    error=worker.error,
+                    error=_merge_worker_error(worker.error, worker_job_errors.get(worker.worker_id)),
+                    active_jobs=active_jobs_by_worker.get(worker.worker_id, []),
                 )
                 for worker in snapshots
             ],
             updated_at=isoformat_local(now_local()),
         )
-        async with self._lock:
-            self._snapshot = snapshot
         return snapshot
 
-    async def snapshot(self) -> PiClusterSnapshot:
+    async def refresh_once(self) -> PiClusterSnapshot:
+        started_at = time.perf_counter()
         async with self._lock:
-            return self._snapshot
+            if self._cache.refresh_in_progress:
+                return self._cache.snapshot
+            self._cache.refresh_in_progress = True
+        try:
+            snapshot = await self._collect_snapshot()
+            now = now_local()
+            refreshed_at = isoformat_local(now)
+            expires_at = isoformat_local(now + timedelta(seconds=_CACHE_TTL_SECONDS))
+            age_seconds = 0.0
+            async with self._lock:
+                self._cache.snapshot = snapshot
+                self._cache.refreshed_at = refreshed_at
+                self._cache.expires_at = expires_at
+                self._cache.last_success_at = refreshed_at
+                self._cache.last_error = None
+            duration = max(0.0, time.perf_counter() - started_at)
+            obs = get_observability().prom
+            obs.inc("pi_cluster_cache_refresh")
+            obs.observe("pi_cluster_cache_refresh_duration", duration)
+            obs.set_gauge("pi_cluster_cache_age_seconds", age_seconds)
+            return snapshot
+        except Exception as exc:
+            duration = max(0.0, time.perf_counter() - started_at)
+            async with self._lock:
+                self._cache.last_error = str(exc)
+            obs = get_observability().prom
+            obs.inc("pi_cluster_cache_refresh_failed")
+            obs.observe("pi_cluster_cache_refresh_duration", duration)
+            raise
+        finally:
+            async with self._lock:
+                self._cache.refresh_in_progress = False
+
+    async def get_cached_state(self) -> PiClusterCacheState:
+        async with self._lock:
+            cache = self._cache
+            return PiClusterCacheState(
+                snapshot=cache.snapshot,
+                refreshed_at=cache.refreshed_at,
+                expires_at=cache.expires_at,
+                last_success_at=cache.last_success_at,
+                last_error=cache.last_error,
+                refresh_in_progress=cache.refresh_in_progress,
+            )
+
+    async def snapshot(self) -> PiClusterSnapshot:
+        return (await self.get_cached_state()).snapshot
+
+    async def start(self) -> None:
+        if self._refresh_task and not self._refresh_task.done():
+            return
+        try:
+            await self.refresh_once()
+        except Exception:
+            pass
+        self._refresh_task = asyncio.create_task(self._refresh_loop(), name="b2s-pi-cluster-refresh")
+
+    async def stop(self) -> None:
+        if not self._refresh_task:
+            return
+        self._refresh_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._refresh_task
+        self._refresh_task = None
+
+    async def _refresh_loop(self) -> None:
+        while True:
+            await asyncio.sleep(_CACHE_REFRESH_INTERVAL_SECONDS)
+            try:
+                await self.refresh_once()
+            except Exception:
+                pass
 
 
 async def discover_worker_urls() -> list[str]:
@@ -261,6 +370,14 @@ def _snapshot_from_capacity(url: str, payload: dict[str, Any]) -> PiWorkerSnapsh
     )
 
 
+def _merge_worker_error(worker_error: str | None, detail_error: str | None) -> str | None:
+    left = str(worker_error or "").strip()
+    right = str(detail_error or "").strip()
+    if left and right:
+        return f"{left}; active_jobs={right}"
+    return left or right or None
+
+
 async def fetch_worker_active_jobs(worker: PiWorkerSnapshot) -> list[PiWorkerActiveJobSnapshot]:
     client = get_pi_client(worker.url)
     jobs = await client.list_jobs(active=True, worker_id=worker.worker_id)
@@ -304,6 +421,20 @@ def _int_or_none(value: object) -> int | None:
     except Exception:
         return None
     return parsed
+
+
+async def _load_worker_active_jobs(workers: list[PiWorkerSnapshot]) -> tuple[dict[str, list[PiWorkerActiveJobSnapshot]], dict[str, str]]:
+    healthy_workers = [worker for worker in workers if worker.healthy]
+    results = await asyncio.gather(*(fetch_worker_active_jobs(worker) for worker in healthy_workers), return_exceptions=True)
+    active_jobs_by_worker: dict[str, list[PiWorkerActiveJobSnapshot]] = {worker.worker_id: [] for worker in workers}
+    worker_errors: dict[str, str] = {}
+    for worker, result in zip(healthy_workers, results):
+        if isinstance(result, Exception):
+            worker_errors[worker.worker_id] = str(result)
+            active_jobs_by_worker[worker.worker_id] = []
+        else:
+            active_jobs_by_worker[worker.worker_id] = result
+    return active_jobs_by_worker, worker_errors
 
 
 _monitor = PiClusterMonitor()

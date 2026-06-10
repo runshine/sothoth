@@ -5,6 +5,10 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from app.api import tasks as tasks_api
 from app.service import pi_cluster
 
 
@@ -184,6 +188,74 @@ class PiClusterTests(unittest.TestCase):
         self.assertEqual(4, jobs[0].current_batch)
         self.assertEqual(2, jobs[0].current_attempt)
         self.assertEqual("demo_func", jobs[0].current_function)
+
+    def test_pi_cluster_api_uses_cached_snapshot_without_refresh(self):
+        app = FastAPI()
+        app.include_router(tasks_api.router)
+
+        cache_state = pi_cluster.PiClusterCacheState(
+            snapshot=pi_cluster.PiClusterSnapshot(workers=[
+                pi_cluster.PiWorkerSnapshot(
+                    worker_id="pi-1",
+                    url="http://pi-1:8000",
+                    healthy=True,
+                    max_concurrent_jobs=4,
+                    running_jobs=2,
+                    queued_jobs=1,
+                    pod_name="worker-1",
+                    source="capacity",
+                    active_jobs=[
+                        pi_cluster.PiWorkerActiveJobSnapshot(
+                            pi_job_id="job-1",
+                            status="running",
+                            worker_id="pi-1",
+                            started_at="2026-05-20T10:00:00",
+                            updated_at="2026-05-20T10:05:00",
+                        )
+                    ],
+                )
+            ], updated_at="2026-05-20T10:05:00"),
+            refreshed_at="2026-05-20T10:05:00",
+            expires_at="2026-05-20T10:06:00",
+            last_success_at="2026-05-20T10:05:00",
+            last_error=None,
+            refresh_in_progress=False,
+        )
+
+        class _FakeMonitor:
+            async def get_cached_state(self):
+                return cache_state
+
+        async def fake_context():
+            return tasks_api.TokenUser(user_id="1", username="tester", role=["admin"], platform_role="super_admin")
+
+        class _FakeQuery:
+            def filter(self, *_args, **_kwargs):
+                return self
+
+            def all(self):
+                return []
+
+        class _FakeDB:
+            def query(self, *_args, **_kwargs):
+                return _FakeQuery()
+
+        def fake_db():
+            yield _FakeDB()
+
+        app.dependency_overrides[tasks_api.get_current_user_context] = fake_context
+        app.dependency_overrides[tasks_api.get_db] = fake_db
+
+        with mock.patch.object(tasks_api, "get_pi_cluster_monitor", return_value=_FakeMonitor()):
+            client = TestClient(app)
+            resp = client.get("/api/app/binary-to-source/pi-cluster", headers={"Authorization": "Bearer test-token"})
+
+        self.assertEqual(200, resp.status_code)
+        payload = resp.json()
+        self.assertEqual("2026-05-20T10:05:00", payload["snapshot_refreshed_at"])
+        self.assertIsInstance(payload["snapshot_stale"], bool)
+        self.assertEqual("2026-05-20T10:06:00", payload["snapshot_expires_at"])
+        self.assertEqual(1, payload["worker_count"])
 
 
 if __name__ == "__main__":

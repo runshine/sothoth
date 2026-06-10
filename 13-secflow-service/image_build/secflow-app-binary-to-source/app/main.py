@@ -27,6 +27,7 @@ from app.observability import get_observability
 from app.runtime_role import get_service_role
 from app.service.dispatcher import get_dispatcher
 from app.service.llm_provider import is_materialized_provider_ready, materialize_llm_provider
+from app.service.pi_cluster import get_pi_cluster_monitor
 from app.service.registry import get_registry_service
 from app.service.task_syncer import get_task_syncer
 
@@ -130,6 +131,7 @@ async def lifespan(_: FastAPI):
         if _worker_enabled():
             get_dispatcher().start()
             get_task_syncer().start()
+        await get_pi_cluster_monitor().start()
         if get_config().configcenter_service.enabled:
             async def _materialize_in_background() -> None:
                 try:
@@ -153,6 +155,7 @@ async def lifespan(_: FastAPI):
             except asyncio.CancelledError:
                 pass
             _provider_materialize_task = None
+        await get_pi_cluster_monitor().stop()
         if _worker_enabled():
             await get_task_syncer().stop()
             await get_dispatcher().stop()

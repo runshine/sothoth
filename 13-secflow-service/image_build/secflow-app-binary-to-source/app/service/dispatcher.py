@@ -47,7 +47,7 @@ class B2SDispatcher:
         while not self._stopping.is_set():
             try:
                 if time.monotonic() - self._last_capacity_refresh >= max(1, cfg.capacity_refresh_seconds):
-                    await get_pi_cluster_monitor().refresh()
+                    await get_pi_cluster_monitor().refresh_once()
                     self._last_capacity_refresh = time.monotonic()
                 if await self._acquire_lease():
                     await self._dispatch_once()

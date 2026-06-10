@@ -7,6 +7,7 @@ from unittest import mock
 from app.api import tasks as task_api
 from app.model import B2STask, B2STaskItem
 from app.service.pi_cluster import PiWorkerActiveJobSnapshot, PiWorkerSnapshot
+from app.service import pi_cluster
 
 
 class PiClusterApiTests(unittest.TestCase):
@@ -97,8 +98,8 @@ class PiClusterApiTests(unittest.TestCase):
         )
 
         async def _run():
-            with mock.patch.object(task_api, "fetch_worker_active_jobs", side_effect=RuntimeError("detail boom")):
-                return await task_api._load_worker_active_jobs([healthy, unhealthy])
+            with mock.patch.object(pi_cluster, "fetch_worker_active_jobs", side_effect=RuntimeError("detail boom")):
+                return await pi_cluster._load_worker_active_jobs([healthy, unhealthy])
 
         active_jobs_by_worker, worker_errors = asyncio.run(_run())
 

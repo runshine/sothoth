@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.build_info import build_service_meta
 from app.exception import NotFoundError, UnauthorizedError, ValidationError
+from app.observability import get_observability
 from app.model import B2STask, B2STaskItem, get_db
 from app.runtime_role import get_service_role
 from app.schemas import ActionResponse, B2SAgentSessionRuntimeResponse, B2SArtifactContentResponse, B2SCacheBatchDeleteRequest, B2SCacheBatchDeleteResponse, B2SCacheDeleteResponse, B2SCacheDetailResponse, B2SCacheListResponse, B2SServiceConfig, B2STaskListStatsResponse, B2STaskTimelineResponse, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, SessionFileResponse, SessionIndexResponse, TaskBatchDeleteItemResult, TaskBatchDeleteRequest, TaskBatchDeleteResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskListResponse, TaskObservabilitySummary, TaskPrepareResponse, TaskRelationshipResponse, TaskResponse, TaskResultSummary, TokenUser
@@ -20,7 +21,7 @@ from app.service.cache_service import get_cache_service
 from app.service.configcenter import get_configcenter_client
 from app.service.config_service import get_config_service
 from app.service.project import get_project_service
-from app.service.pi_cluster import PiWorkerActiveJobSnapshot, PiWorkerSnapshot, fetch_worker_active_jobs, get_pi_cluster_monitor
+from app.service.pi_cluster import PiClusterCacheState, PiWorkerActiveJobSnapshot, PiWorkerSnapshot, get_pi_cluster_monitor
 from app.service.security import validate_project_id
 from app.service.task_service import (
     build_task_detail,
@@ -113,6 +114,10 @@ class PiClusterCapacityResponse(BaseModel):
     queued_jobs: int = 0
     available_slots: int = 0
     updated_at: str | None = None
+    snapshot_refreshed_at: str | None = None
+    snapshot_expires_at: str | None = None
+    snapshot_stale: bool = True
+    snapshot_last_error: str | None = None
     workers: list[PiWorkerCapacityResponse]
 
 
@@ -430,8 +435,21 @@ async def get_pi_cluster_capacity(
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    snapshot = await get_pi_cluster_monitor().refresh()
-    active_jobs_by_worker, worker_job_errors = await _load_worker_active_jobs(snapshot.workers)
+    return _build_pi_cluster_capacity_response(await get_pi_cluster_monitor().get_cached_state(), db=db, project_id=project_id)
+
+
+@router.get("/pi-cluster", response_model=PiClusterCapacityResponse)
+async def get_global_pi_cluster_capacity(
+    _: TokenUser = Depends(get_current_user_context),
+    db: Session = Depends(get_db),
+):
+    return _build_pi_cluster_capacity_response(await get_pi_cluster_monitor().get_cached_state(), db=db, project_id=None)
+
+
+def _build_pi_cluster_capacity_response(cache_state: PiClusterCacheState, *, db: Session, project_id: str | None) -> PiClusterCapacityResponse:
+    get_observability().prom.inc("pi_cluster_cache_request", stale=str(cache_state.stale).lower())
+    snapshot = cache_state.snapshot
+    active_jobs_by_worker, worker_job_errors = _load_cached_worker_active_jobs(snapshot.workers)
     item_by_job_id, task_by_id = _load_pi_job_item_mapping(
         db,
         project_id=project_id,
@@ -478,80 +496,28 @@ async def get_pi_cluster_capacity(
         running_jobs=snapshot.running_jobs,
         queued_jobs=snapshot.queued_jobs,
         available_slots=snapshot.available_slots,
-        updated_at=snapshot.updated_at,
+        updated_at=cache_state.refreshed_at or snapshot.updated_at,
+        snapshot_refreshed_at=cache_state.refreshed_at or snapshot.updated_at,
+        snapshot_expires_at=cache_state.expires_at,
+        snapshot_stale=cache_state.stale,
+        snapshot_last_error=cache_state.last_error,
         workers=workers,
     )
 
 
-@router.get("/pi-cluster", response_model=PiClusterCapacityResponse)
-async def get_global_pi_cluster_capacity(
-    _: TokenUser = Depends(get_current_user_context),
-    db: Session = Depends(get_db),
-):
-    snapshot = await get_pi_cluster_monitor().refresh()
-    active_jobs_by_worker, worker_job_errors = await _load_worker_active_jobs(snapshot.workers)
-    item_by_job_id, task_by_id = _load_pi_job_item_mapping(
-        db,
-        project_id=None,
-        pi_job_ids=[
-            job.pi_job_id
-            for jobs in active_jobs_by_worker.values()
-            for job in jobs
-            if job.pi_job_id
-        ],
-    )
-    workers = []
-    for worker in snapshot.workers:
-        detail_error = worker_job_errors.get(worker.worker_id)
-        active_jobs = [
-            _build_active_job_response(job, item_by_job_id=item_by_job_id, task_by_id=task_by_id)
-            for job in active_jobs_by_worker.get(worker.worker_id, [])
-        ] if worker.healthy and not detail_error else []
-        workers.append(PiWorkerCapacityResponse(
-            worker_id=worker.worker_id,
-            url=worker.url,
-            pod_name=worker.pod_name,
-            pod_ip=worker.pod_ip,
-            healthy=worker.healthy,
-            max_concurrent_jobs=worker.max_concurrent_jobs,
-            running_jobs=worker.running_jobs,
-            queued_jobs=worker.queued_jobs,
-            available_slots=max(0, worker.max_concurrent_jobs - worker.running_jobs) if worker.healthy else 0,
-            pod_created_at=worker.pod_created_at,
-            pod_started_at=worker.pod_started_at,
-            pod_metrics_at=worker.pod_metrics_at,
-            pod_cpu_usage_millicores=worker.pod_cpu_usage_millicores,
-            pod_memory_usage_bytes=worker.pod_memory_usage_bytes,
-            pod_cpu_request_millicores=worker.pod_cpu_request_millicores,
-            pod_memory_request_bytes=worker.pod_memory_request_bytes,
-            pod_cpu_limit_millicores=worker.pod_cpu_limit_millicores,
-            pod_memory_limit_bytes=worker.pod_memory_limit_bytes,
-            source=worker.source,
-            error=_merge_worker_error(worker.error, detail_error),
-            active_jobs=active_jobs,
-        ))
-    return PiClusterCapacityResponse(
-        worker_count=snapshot.worker_count,
-        total_capacity=snapshot.total_capacity,
-        running_jobs=snapshot.running_jobs,
-        queued_jobs=snapshot.queued_jobs,
-        available_slots=snapshot.available_slots,
-        updated_at=snapshot.updated_at,
-        workers=workers,
-    )
-
-
-async def _load_worker_active_jobs(workers: list[PiWorkerSnapshot]) -> tuple[dict[str, list[PiWorkerActiveJobSnapshot]], dict[str, str]]:
-    healthy_workers = [worker for worker in workers if worker.healthy]
-    results = await asyncio.gather(*(fetch_worker_active_jobs(worker) for worker in healthy_workers), return_exceptions=True)
-    active_jobs_by_worker: dict[str, list[PiWorkerActiveJobSnapshot]] = {worker.worker_id: [] for worker in workers}
+def _load_cached_worker_active_jobs(workers: list[PiWorkerSnapshot]) -> tuple[dict[str, list[PiWorkerActiveJobSnapshot]], dict[str, str]]:
+    active_jobs_by_worker: dict[str, list[PiWorkerActiveJobSnapshot]] = {}
     worker_errors: dict[str, str] = {}
-    for worker, result in zip(healthy_workers, results):
-        if isinstance(result, Exception):
-            worker_errors[worker.worker_id] = str(result)
-            active_jobs_by_worker[worker.worker_id] = []
+    for worker in workers:
+        cached_jobs = getattr(worker, "active_jobs", None)
+        if isinstance(cached_jobs, list):
+            active_jobs_by_worker[worker.worker_id] = [
+                job for job in cached_jobs if isinstance(job, PiWorkerActiveJobSnapshot)
+            ]
         else:
-            active_jobs_by_worker[worker.worker_id] = result
+            active_jobs_by_worker[worker.worker_id] = []
+        if worker.error and "active_jobs=" in worker.error:
+            worker_errors[worker.worker_id] = worker.error.split("active_jobs=", 1)[-1].strip()
     return active_jobs_by_worker, worker_errors
 
 
