@@ -62,6 +62,9 @@ from app.schemas import (
     ProjectInputUploadDeleteRequest,
     ProjectInputUploadDeleteResponse,
     ProjectInputUploadDetailResponse,
+    ProjectInputUploadBrowseEntry,
+    ProjectInputUploadBrowseResponse,
+    ProjectInputUploadResolveResponse,
     ProjectInputUploadOverviewResponse,
     ProjectInputUploadListResponse,
     ProjectInputUploadRecordResponse,
@@ -754,6 +757,71 @@ async def get_project_input_upload_detail(
     return make_project_input_detail_response(record, batches)
 
 
+@router.get("/project-input/uploads/{upload_id}/browse", response_model=ProjectInputUploadBrowseResponse)
+async def browse_project_input_upload(
+    upload_id: str,
+    project_id: str = Query(...),
+    relative_path: str = Query(""),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    await verify_project_access(project_id, authorization)
+    record = get_project_input_upload_record_or_404(db, project_id, upload_id)
+    current_abs, current_relative, current_absolute = resolve_project_input_upload_relative_path(record, relative_path)
+    if not await run_io(os.path.lexists, current_abs):
+        raise NotFoundError("任务输入路径", current_relative or "/")
+    if not await run_io(os.path.isdir, current_abs):
+        raise ValidationError("relative_path 必须是目录")
+
+    directories, files = await list_project_input_upload_entries(record, current_abs, current_relative)
+    breadcrumbs = build_project_input_upload_breadcrumbs(record.target_path, current_relative)
+    current_name = posixpath.basename(current_relative) if current_relative else posixpath.basename(record.target_path.rstrip("/")) or upload_id
+    return ProjectInputUploadBrowseResponse(
+        project_id=record.project_id,
+        upload_id=record.upload_id,
+        input_type=record.input_type,
+        target_path=record.target_path,
+        current_relative_path=current_relative,
+        current_absolute_path=current_abs,
+        root_relative_path="",
+        root_absolute_path=project_filesystem_target_path(record.project_id, record.target_path)[0],
+        current_name=current_name,
+        breadcrumbs=breadcrumbs,
+        directories=directories,
+        files=files,
+    )
+
+
+@router.get("/project-input/uploads/{upload_id}/resolve", response_model=ProjectInputUploadResolveResponse)
+async def resolve_project_input_upload_selection(
+    upload_id: str,
+    project_id: str = Query(...),
+    relative_path: str = Query(""),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    await verify_project_access(project_id, authorization)
+    record = get_project_input_upload_record_or_404(db, project_id, upload_id)
+    target_abs, normalized_relative, absolute_path = resolve_project_input_upload_relative_path(record, relative_path)
+    if not await run_io(os.path.lexists, target_abs):
+        raise NotFoundError("任务输入路径", normalized_relative or "/")
+    is_dir = await run_io(os.path.isdir, target_abs)
+    stat_result = await run_io(os.stat, target_abs)
+    return ProjectInputUploadResolveResponse(
+        project_id=record.project_id,
+        upload_id=record.upload_id,
+        input_type=record.input_type,
+        target_path=record.target_path,
+        relative_path=normalized_relative,
+        absolute_path=absolute_path,
+        node_type="directory" if is_dir else "file",
+        name=posixpath.basename(normalized_relative) if normalized_relative else posixpath.basename(record.target_path.rstrip("/")) or upload_id,
+        size=None if is_dir else int(stat_result.st_size),
+        updated_at=datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc).replace(tzinfo=None),
+        content_type=None if is_dir else guess_content_type(os.path.basename(target_abs), None),
+    )
+
+
 @router.post("/project-input/uploads", response_model=ProjectInputUploadAcceptedResponse)
 async def create_project_input_upload(
     project_id: str = Form(...),
@@ -946,6 +1014,97 @@ def validate_project_input_type(input_type: str) -> str:
     if value not in PROJECT_INPUT_ALLOWED_TYPES:
         raise ValidationError("input_type 仅支持 code/document/software/other")
     return value
+
+
+def get_project_input_upload_record_or_404(db: Session, project_id: str, upload_id: str) -> ProjectInputUploadRecord:
+    record = db.query(ProjectInputUploadRecord).filter(
+        ProjectInputUploadRecord.project_id == project_id,
+        ProjectInputUploadRecord.upload_id == upload_id,
+    ).first()
+    if record is None:
+        raise NotFoundError("上传记录", upload_id)
+    return record
+
+
+def normalize_upload_relative_path(relative_path: str) -> str:
+    raw = (relative_path or "").strip().replace("\\", "/")
+    if raw in {"", ".", "/"}:
+        return ""
+    if any(segment == ".." for segment in raw.split("/")):
+        raise ValidationError("relative_path 不能越界")
+    normalized = posixpath.normpath("/" + raw.lstrip("/"))
+    if normalized in {"/", "/."}:
+        return ""
+    if normalized == "/.." or normalized.startswith("/../"):
+        raise ValidationError("relative_path 不能越界")
+    return normalized.lstrip("/")
+
+
+def resolve_project_input_upload_relative_path(record: ProjectInputUploadRecord, relative_path: str) -> tuple[str, str, str]:
+    normalized_relative = normalize_upload_relative_path(relative_path)
+    request_path = record.target_path if not normalized_relative else posixpath.join(record.target_path.rstrip("/"), normalized_relative)
+    absolute_target, _ = project_filesystem_target_path(record.project_id, request_path)
+    root_abs, _ = project_filesystem_target_path(record.project_id, record.target_path)
+    if os.path.commonpath([absolute_target, root_abs]) != root_abs:
+        raise ValidationError("relative_path 超出上传记录目录范围")
+    return absolute_target, normalized_relative, absolute_target
+
+
+def build_project_input_upload_breadcrumbs(root_path: str, relative_path: str) -> list[ProjectFilesystemBreadcrumbItem]:
+    breadcrumbs = [
+        ProjectFilesystemBreadcrumbItem(
+            node_type="directory",
+            name=posixpath.basename(root_path.rstrip("/")) or "/",
+            path="",
+        )
+    ]
+    parts = [item for item in relative_path.split("/") if item]
+    current = ""
+    for part in parts:
+        current = f"{current}/{part}" if current else part
+        breadcrumbs.append(ProjectFilesystemBreadcrumbItem(node_type="directory", name=part, path=current))
+    return breadcrumbs
+
+
+async def list_project_input_upload_entries(
+    record: ProjectInputUploadRecord,
+    current_abs: str,
+    current_relative: str,
+) -> tuple[list[ProjectInputUploadBrowseEntry], list[ProjectInputUploadBrowseEntry]]:
+    def _scan_entries() -> tuple[list[ProjectInputUploadBrowseEntry], list[ProjectInputUploadBrowseEntry]]:
+        directories: list[ProjectInputUploadBrowseEntry] = []
+        files: list[ProjectInputUploadBrowseEntry] = []
+        with os.scandir(current_abs) as iterator:
+            entries = sorted(iterator, key=lambda item: (not item.is_dir(follow_symlinks=False), item.name.lower()))
+            for entry in entries:
+                child_relative = f"{current_relative}/{entry.name}" if current_relative else entry.name
+                child_absolute = os.path.abspath(entry.path)
+                stat_result = entry.stat(follow_symlinks=False)
+                is_dir = entry.is_dir(follow_symlinks=False)
+                has_children = False
+                if is_dir:
+                    try:
+                        with os.scandir(entry.path) as child_iterator:
+                            has_children = next(child_iterator, None) is not None
+                    except OSError:
+                        has_children = False
+                item = ProjectInputUploadBrowseEntry(
+                    name=entry.name,
+                    relative_path=child_relative,
+                    absolute_path=child_absolute,
+                    node_type="directory" if is_dir else "file",
+                    size=None if is_dir else int(stat_result.st_size),
+                    updated_at=datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc).replace(tzinfo=None),
+                    has_children=has_children,
+                    content_type=None if is_dir else guess_content_type(entry.name, None),
+                )
+                if is_dir:
+                    directories.append(item)
+                else:
+                    files.append(item)
+        return directories, files
+
+    return await run_io(_scan_entries)
 
 
 def project_input_root_path(project_id: str, input_type: str) -> str:

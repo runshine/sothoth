@@ -26,6 +26,9 @@ class ReducerMetricsSnapshotStore:
     def _new_client(self) -> Redis:
         return Redis.from_url(self._redis_url, decode_responses=True)
 
+    async def _client_or_create(self) -> Redis:
+        return self._new_client()
+
     async def write_snapshot(
         self,
         *,
@@ -33,7 +36,7 @@ class ReducerMetricsSnapshotStore:
         source_pod: str,
         generated_at: float | None = None,
     ) -> None:
-        client = self._new_client()
+        client = await self._client_or_create()
         created_at = float(generated_at or time.time())
         payload = {
             "metrics_payload": str(metrics_payload or ""),
@@ -46,7 +49,7 @@ class ReducerMetricsSnapshotStore:
             await self._close_client(client)
 
     async def read_snapshot(self) -> dict[str, Any] | None:
-        client = self._new_client()
+        client = await self._client_or_create()
         try:
             raw = await client.get(_SNAPSHOT_KEY)
         finally:

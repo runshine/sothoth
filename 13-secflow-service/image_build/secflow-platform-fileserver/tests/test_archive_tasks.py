@@ -307,3 +307,118 @@ def test_project_input_upload_overview_and_pagination(tmp_path, monkeypatch):
         assert page1.json()["page_size"] == 2
         assert page1.json()["total"] == 4
         assert len(page1.json()["items"]) == 2
+
+
+def test_project_input_upload_browse_and_resolve(tmp_path, monkeypatch):
+    with build_client(tmp_path, monkeypatch) as client:
+        headers = {"Authorization": "Bearer fake-token"}
+        archive_buffer = io.BytesIO()
+        with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("firmware/root.bin", b"bin")
+            zf.writestr("firmware/nested/module.bin", b"module")
+            zf.writestr("docs/readme.txt", b"readme")
+        archive_buffer.seek(0)
+
+        create = client.post(
+            "/api/fileserver/project-input/uploads",
+            data={"project_id": "demo-project", "input_type": "software", "keep_original": "false"},
+            files=[("files", ("input.zip", archive_buffer, "application/zip"))],
+            headers=headers,
+        )
+        assert create.status_code == 200
+        upload_id = create.json()["upload_id"]
+        detail = _wait_upload_done(client, upload_id, headers)
+        assert detail["status"] == "succeeded"
+
+        browse_root = client.get(
+            f"/api/fileserver/project-input/uploads/{upload_id}/browse",
+            params={"project_id": "demo-project", "relative_path": ""},
+            headers=headers,
+        )
+        assert browse_root.status_code == 200
+        root_payload = browse_root.json()
+        assert root_payload["target_path"] == f"/user_input/software/{upload_id}"
+        assert root_payload["current_relative_path"] == ""
+        assert {item["name"] for item in root_payload["directories"]} == {"docs", "firmware"}
+        assert root_payload["root_absolute_path"].endswith(f"/user_input/software/{upload_id}")
+
+        browse_nested = client.get(
+            f"/api/fileserver/project-input/uploads/{upload_id}/browse",
+            params={"project_id": "demo-project", "relative_path": "firmware"},
+            headers=headers,
+        )
+        assert browse_nested.status_code == 200
+        nested_payload = browse_nested.json()
+        assert nested_payload["current_relative_path"] == "firmware"
+        assert any(item["relative_path"] == "firmware/nested" and item["node_type"] == "directory" for item in nested_payload["directories"])
+        assert any(item["relative_path"] == "firmware/root.bin" and item["node_type"] == "file" for item in nested_payload["files"])
+
+        resolve_file = client.get(
+            f"/api/fileserver/project-input/uploads/{upload_id}/resolve",
+            params={"project_id": "demo-project", "relative_path": "firmware/root.bin"},
+            headers=headers,
+        )
+        assert resolve_file.status_code == 200
+        file_payload = resolve_file.json()
+        assert file_payload["node_type"] == "file"
+        assert file_payload["relative_path"] == "firmware/root.bin"
+        assert file_payload["absolute_path"].endswith(f"/user_input/software/{upload_id}/firmware/root.bin")
+        assert file_payload["size"] == 3
+
+        resolve_directory = client.get(
+            f"/api/fileserver/project-input/uploads/{upload_id}/resolve",
+            params={"project_id": "demo-project", "relative_path": "firmware/nested"},
+            headers=headers,
+        )
+        assert resolve_directory.status_code == 200
+        directory_payload = resolve_directory.json()
+        assert directory_payload["node_type"] == "directory"
+        assert directory_payload["relative_path"] == "firmware/nested"
+        assert directory_payload["absolute_path"].endswith(f"/user_input/software/{upload_id}/firmware/nested")
+
+
+def test_project_input_upload_browse_and_resolve_reject_invalid_relative_paths(tmp_path, monkeypatch):
+    with build_client(tmp_path, monkeypatch) as client:
+        headers = {"Authorization": "Bearer fake-token"}
+
+        def _create_upload(project_id: str, filename: str) -> str:
+            archive_buffer = io.BytesIO()
+            with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("root/file.txt", project_id.encode("utf-8"))
+            archive_buffer.seek(0)
+            response = client.post(
+                "/api/fileserver/project-input/uploads",
+                data={"project_id": project_id, "input_type": "other", "keep_original": "false"},
+                files=[("files", (filename, archive_buffer, "application/zip"))],
+                headers=headers,
+            )
+            assert response.status_code == 200
+            upload_id = response.json()["upload_id"]
+            _wait_upload_done(client, upload_id, headers)
+            return upload_id
+
+        upload_a = _create_upload("demo-project", "a.zip")
+        upload_b = _create_upload("demo-project-2", "b.zip")
+
+        escape_browse = client.get(
+            f"/api/fileserver/project-input/uploads/{upload_a}/browse",
+            params={"project_id": "demo-project", "relative_path": "../outside"},
+            headers=headers,
+        )
+        assert escape_browse.status_code == 400
+        assert "不能越界" in escape_browse.text
+
+        escape_resolve = client.get(
+            f"/api/fileserver/project-input/uploads/{upload_a}/resolve",
+            params={"project_id": "demo-project", "relative_path": "../outside"},
+            headers=headers,
+        )
+        assert escape_resolve.status_code == 400
+        assert "不能越界" in escape_resolve.text
+
+        cross_project = client.get(
+            f"/api/fileserver/project-input/uploads/{upload_b}/resolve",
+            params={"project_id": "demo-project", "relative_path": "root/file.txt"},
+            headers=headers,
+        )
+        assert cross_project.status_code == 404

@@ -275,6 +275,7 @@ class VirtualKeyEventResponse(BaseModel):
 
 
 UserTaskType = Literal["binary_firmware_e2e", "source_scan_e2e", "binary_module_e2e"]
+InputSelectionType = Literal["file", "file_list", "directory"]
 
 
 class UserTaskInputBindingResponse(BaseModel):
@@ -284,6 +285,42 @@ class UserTaskInputBindingResponse(BaseModel):
     target_path: str
     latest_batch_id: Optional[str] = None
     keep_original: bool = False
+    selection_type: Optional[str] = None
+    relative_path: Optional[str] = None
+    relative_paths: list[str] = Field(default_factory=list)
+    resolved_path: Optional[str] = None
+    display_name: Optional[str] = None
+
+
+class UserTaskInputBindingRequest(BaseModel):
+    upload_id: str
+    selection_type: InputSelectionType
+    relative_path: Optional[str] = None
+    relative_paths: list[str] = Field(default_factory=list)
+
+    @field_validator("upload_id")
+    @classmethod
+    def validate_upload_id(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value:
+            raise ValueError("upload_id 不能为空")
+        return value
+
+    @field_validator("relative_path")
+    @classmethod
+    def normalize_relative_path(cls, value: Optional[str]) -> Optional[str]:
+        normalized = str(value or "").strip().replace("\\", "/")
+        return normalized or None
+
+    @field_validator("relative_paths")
+    @classmethod
+    def normalize_relative_paths(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for item in value or []:
+            raw = str(item or "").strip().replace("\\", "/")
+            if raw:
+                normalized.append(raw)
+        return normalized
 
 
 class UserTaskCreateRequest(BaseModel):
@@ -291,6 +328,7 @@ class UserTaskCreateRequest(BaseModel):
     name: str
     description: Optional[str] = None
     input_upload_ids: list[str] = Field(default_factory=list)
+    input_binding: Optional[UserTaskInputBindingRequest] = None
     policy: dict[str, Any] = Field(default_factory=dict)
     dispatch_policy: dict[str, Any] = Field(default_factory=dict)
     task_key_ref: str
@@ -337,6 +375,7 @@ class UserTaskResponse(BaseModel):
     input_upload_count: int = 0
     inputs: list[UserTaskInputBindingResponse] = Field(default_factory=list)
     task_key_ref: str
+    module_name: Optional[str] = None
     active_work_key_prefix: Optional[str] = None
     downstream_task_id: Optional[str] = None
     downstream_detail_view: Optional[str] = None

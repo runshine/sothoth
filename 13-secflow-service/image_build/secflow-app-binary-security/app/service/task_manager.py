@@ -3994,7 +3994,7 @@ class TaskManager:
     def _build_orchestration_observability(self, db: Session, task: BinarySecurityTask) -> dict[str, Any]:
         now_value = _now()
         queue_info = self._build_queue_info(db, project_id=task.project_id)
-        queue_state, recoverable_reason = self._task_queue_state(task, queue_info)
+        queue_state, recoverable_reason = self._task_queue_state(task, queue_info, db=db)
         events = (
             db.query(BinarySecurityStateEvent)
             .filter(BinarySecurityStateEvent.task_id == task.id)
@@ -15884,20 +15884,31 @@ class TaskManager:
             "last_reconcile_at": self._last_queue_reconcile_at,
         }
 
-    def _task_queue_state(self, task: BinarySecurityTask, queue_info: dict[str, Any] | None = None) -> tuple[str, str | None]:
+    def _task_queue_state(
+        self,
+        task: BinarySecurityTask,
+        queue_info: dict[str, Any] | None = None,
+        *,
+        db: Session | None = None,
+    ) -> tuple[str, str | None]:
         queue_info = queue_info or {}
         pending_positions = queue_info.get("pending_positions", {}) or {}
         status = str(task.status or "").strip().lower()
         runtime_phase = self._task_runtime_phase(task)
         tail_takeover_required = False
         if runtime_phase == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-            session = get_session_factory()()
-            try:
-                row = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task.id).first()
+            if db is not None:
+                row = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task.id).first()
                 if row is not None:
-                    tail_takeover_required = self._tail_requires_execution_takeover(session, row)
-            finally:
-                session.close()
+                    tail_takeover_required = self._tail_requires_execution_takeover(db, row)
+            else:
+                session = get_session_factory()()
+                try:
+                    row = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task.id).first()
+                    if row is not None:
+                        tail_takeover_required = self._tail_requires_execution_takeover(session, row)
+                finally:
+                    session.close()
         if tail_takeover_required:
             if status == "pending":
                 if task.id in pending_positions:
@@ -16108,9 +16119,9 @@ class TaskManager:
             task.finished_at = None
             task.last_error = None
             if self._is_streaming_tail_stage(task, active_stage_name):
-                self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+                task.status = "running"
+                self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TAIL_RECONCILIATION)
                 task.tail_reconcile_state = "idle"
-                self._release_tail_reconcile_owner(task.id)
             else:
                 self._release_tail_reconcile_owner(task.id)
                 self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
@@ -19985,7 +19996,7 @@ class TaskManager:
         metrics = task.metrics or {}
         queue_info = queue_info or {"pending_positions": {}}
         queue_position = queue_info.get("pending_positions", {}).get(task.id)
-        queue_state, recoverable_reason = self._task_queue_state(task, queue_info)
+        queue_state, recoverable_reason = self._task_queue_state(task, queue_info, db=db)
         stage_sequence = self._stage_sequence_for_task(task)
         stage_summaries = self._build_task_list_stage_summaries(
             db,
@@ -20400,7 +20411,7 @@ class TaskManager:
         metrics = task.metrics or {}
         queue_info = queue_info or {"pending_positions": {}}
         queue_position = queue_info.get("pending_positions", {}).get(task.id)
-        queue_state, recoverable_reason = self._task_queue_state(task, queue_info)
+        queue_state, recoverable_reason = self._task_queue_state(task, queue_info, db=db)
         task_retry_supported, task_retry_reason, _ = self._task_retry_support(db, task)
         task_continue_supported, task_continue_reason, _ = self._task_continue_support(db, task)
         task_retry_failed_supported, task_retry_failed_reason, _, _ = self._task_retry_failed_items_support(db, task)

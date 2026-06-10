@@ -422,3 +422,43 @@ class ProjectInputUploadDeleteResponse(BaseModel):
 
 class ProjectInputUploadDetailResponse(ProjectInputUploadRecordResponse):
     batches: List[ProjectInputUploadBatchSummary] = Field(default_factory=list)
+
+
+class ProjectInputUploadBrowseEntry(BaseModel):
+    name: str
+    relative_path: str
+    absolute_path: str
+    node_type: str
+    size: Optional[int] = None
+    updated_at: Optional[datetime] = None
+    has_children: bool = False
+    content_type: Optional[str] = None
+
+
+class ProjectInputUploadBrowseResponse(BaseModel):
+    project_id: str
+    upload_id: str
+    input_type: str
+    target_path: str
+    current_relative_path: str
+    current_absolute_path: str
+    root_relative_path: str
+    root_absolute_path: str
+    current_name: str
+    breadcrumbs: List[ProjectFilesystemBreadcrumbItem] = Field(default_factory=list)
+    directories: List[ProjectInputUploadBrowseEntry] = Field(default_factory=list)
+    files: List[ProjectInputUploadBrowseEntry] = Field(default_factory=list)
+
+
+class ProjectInputUploadResolveResponse(BaseModel):
+    project_id: str
+    upload_id: str
+    input_type: str
+    target_path: str
+    relative_path: str
+    absolute_path: str
+    node_type: str
+    name: str
+    size: Optional[int] = None
+    updated_at: Optional[datetime] = None
+    content_type: Optional[str] = None

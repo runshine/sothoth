@@ -90,6 +90,23 @@ class ProjectInputResolver:
                 )
         raise ValidationError(f"未找到任务输入记录: {upload_id}")
 
+    async def resolve_path(self, project_id: str, upload_id: str, relative_path: str, bearer_token: str) -> dict[str, Any]:
+        client = await get_shared_async_client("schedule-fileserver", timeout=self.cfg.timeout)
+        params = httpx.QueryParams({"project_id": project_id, "relative_path": relative_path})
+        try:
+            response = await client.get(
+                f"{self.cfg.base_url.rstrip('/')}/api/fileserver/project-input/uploads/{upload_id}/resolve",
+                params=params,
+                headers={"Authorization": f"Bearer {bearer_token}"},
+            )
+        except httpx.TimeoutException as exc:
+            raise UpstreamError("解析任务输入路径超时") from exc
+        except httpx.RequestError as exc:
+            raise UpstreamError(f"解析任务输入路径失败: {exc}") from exc
+        if response.status_code != 200:
+            raise UpstreamError(f"任务输入服务返回异常状态码: {response.status_code}")
+        return response.json()
+
 
 class AiGatewayWorkKeyClient:
     def __init__(self) -> None:
@@ -207,10 +224,16 @@ class UserTaskManager:
                     "target_path": item.target_path,
                     "latest_batch_id": item.latest_batch_id,
                     "keep_original": item.keep_original,
+                    "selection_type": item.selection_type,
+                    "relative_path": item.relative_path,
+                    "relative_paths": list(item.relative_paths or []),
+                    "resolved_path": item.resolved_path,
+                    "display_name": item.display_name,
                 }
                 for item in bindings
             ],
             "task_key_ref": task.task_key_ref,
+            "module_name": task.module_name,
             "active_work_key_prefix": task.active_work_key_prefix,
             "downstream_task_id": task.downstream_task_id,
             "downstream_detail_view": task.downstream_detail_view,
@@ -219,6 +242,15 @@ class UserTaskManager:
             "updated_at": task.updated_at,
             "created_at": task.created_at,
         }
+
+    def _task_selection_type(self, task_type: str) -> str:
+        if task_type == "binary_firmware_e2e":
+            return "file"
+        if task_type == "binary_module_e2e":
+            return "file_list"
+        if task_type == "source_scan_e2e":
+            return "directory"
+        raise ValidationError(f"不支持的任务类型: {task_type}")
 
     def list_tasks(self, db: Session, project_id: str) -> tuple[int, list[dict[str, Any]], dict[str, int]]:
         rows = db.query(ScheduleUserTask).filter(
@@ -264,11 +296,60 @@ class UserTaskManager:
         if payload.task_type == "binary_module_e2e" and not str(payload.module_name or "").strip():
             raise ValidationError("二进制模块任务必须填写模块名")
 
+        selection_type = self._task_selection_type(payload.task_type)
+        input_binding_payload = payload.input_binding
+        if input_binding_payload is None:
+            raise ValidationError("必须提供结构化 input_binding")
+        binding_upload_id = str(input_binding_payload.upload_id or payload.input_upload_ids[0]).strip()
+        if binding_upload_id != resolved.upload_id:
+            raise ValidationError("input_binding.upload_id 与 input_upload_ids 不一致")
+        requested_selection_type = str(input_binding_payload.selection_type or selection_type).strip()
+        if requested_selection_type != selection_type:
+            raise ValidationError("所选输入模式与任务类型不匹配")
+
+        relative_path = str(input_binding_payload.relative_path or "").strip()
+        relative_paths = [str(item or "").strip() for item in (input_binding_payload.relative_paths or []) if str(item or "").strip()]
+        resolved_relative_path: Optional[str] = None
+        resolved_relative_paths: list[str] = []
+        resolved_path: Optional[str] = None
+        display_name = resolved.display_name
+        if selection_type == "file":
+            if not relative_path:
+                raise ValidationError("盖亚-二进制固件必须选择一个文件")
+            node = await self.input_resolver.resolve_path(project_id, resolved.upload_id, relative_path, bearer_token)
+            if node.get("node_type") != "file":
+                raise ValidationError("盖亚-二进制固件只允许选择文件")
+            resolved_relative_path = str(node.get("relative_path") or "").strip()
+            resolved_relative_paths = [resolved_relative_path]
+            resolved_path = str(node.get("absolute_path") or "").strip()
+            display_name = str(node.get("name") or resolved_relative_path or display_name)
+        elif selection_type == "file_list":
+            if not relative_paths:
+                raise ValidationError("盖亚-二进制模块必须至少选择一个文件")
+            for item in relative_paths:
+                node = await self.input_resolver.resolve_path(project_id, resolved.upload_id, item, bearer_token)
+                if node.get("node_type") != "file":
+                    raise ValidationError("盖亚-二进制模块只允许选择文件列表")
+                resolved_relative_paths.append(str(node.get("relative_path") or "").strip())
+            resolved_path = resolved.target_path
+            display_name = f"{len(resolved_relative_paths)} files"
+        else:
+            if not relative_path:
+                raise ValidationError("盖亚-源码必须显式选择一个文件夹")
+            node = await self.input_resolver.resolve_path(project_id, resolved.upload_id, relative_path, bearer_token)
+            if node.get("node_type") != "directory":
+                raise ValidationError("盖亚-源码只允许选择文件夹")
+            resolved_relative_path = str(node.get("relative_path") or "").strip()
+            resolved_relative_paths = [resolved_relative_path] if resolved_relative_path else []
+            resolved_path = str(node.get("absolute_path") or "").strip()
+            display_name = str(node.get("name") or resolved_relative_path or display_name)
+
         task = ScheduleUserTask(
             project_id=project_id,
             task_type=payload.task_type,
             name=payload.name,
             description=payload.description,
+            module_name=str(payload.module_name or "").strip() or None,
             create_status="created",
             dispatch_status="ready_for_dispatch",
             business_status="created",
@@ -284,10 +365,15 @@ class UserTaskManager:
             project_id=project_id,
             input_upload_id=resolved.upload_id,
             input_type=resolved.input_type,
-            input_label=resolved.display_name,
+            input_label=display_name,
             target_path=resolved.target_path,
             latest_batch_id=resolved.latest_batch_id,
             keep_original=resolved.keep_original,
+            selection_type=selection_type,
+            relative_path=resolved_relative_path,
+            relative_paths=resolved_relative_paths,
+            resolved_path=resolved_path,
+            display_name=display_name,
         )
         db.add(binding)
         db.commit()
@@ -326,13 +412,28 @@ class UserTaskManager:
             task.active_work_key_prefix = dispatch.work_key_prefix or None
 
             input_binding = bindings[0]
-            source_path = Path(input_binding.target_path)
+            source_path = Path(input_binding.resolved_path or input_binding.target_path)
             if not source_path.exists():
-                raise ValidationError(f"任务输入目录不存在: {input_binding.target_path}")
+                raise ValidationError(f"任务输入路径不存在: {source_path}")
             target_root = Path(f"/data/files/{project_id}/app/secflow-app-binary-security/{task.id}/input")
             await asyncio.to_thread(target_root.mkdir, parents=True, exist_ok=True)
             copied_files: list[dict[str, Any]] = []
-            if source_path.is_dir():
+            selected_paths = list(input_binding.relative_paths or [])
+            if input_binding.selection_type == "file_list" and selected_paths:
+                for item in selected_paths:
+                    child = Path(input_binding.target_path) / item
+                    if not child.is_file():
+                        raise ValidationError(f"选中的任务输入文件不存在: {item}")
+                    destination = target_root / item
+                    await asyncio.to_thread(destination.parent.mkdir, parents=True, exist_ok=True)
+                    await asyncio.to_thread(shutil.copy2, child, destination)
+                    copied_files.append({
+                        "filename": child.name,
+                        "relative_path": item,
+                        "size": child.stat().st_size,
+                        "metadata": {"input_upload_id": input_binding.input_upload_id},
+                    })
+            elif source_path.is_dir():
                 for child in sorted(source_path.rglob("*")):
                     if not child.is_file():
                         continue
@@ -366,7 +467,7 @@ class UserTaskManager:
                 "policy_overrides": {},
             }
             if task.task_type == "binary_module_e2e":
-                create_payload["module_name"] = str((task.description or "").strip() or task.name or "module")
+                create_payload["module_name"] = str(task.module_name or "").strip() or task.name or "module"
             await self.binary_security.create_task(
                 project_id=project_id,
                 task_id=task.id,

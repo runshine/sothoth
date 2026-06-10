@@ -173,6 +173,7 @@ class ScheduleUserTask(Base):
     task_type = Column(String(32), nullable=False, index=True)
     name = Column(String(128), nullable=False)
     description = Column(Text, nullable=True)
+    module_name = Column(String(255), nullable=True)
     create_status = Column(String(32), nullable=False, default="created")
     dispatch_status = Column(String(32), nullable=False, default="ready_for_dispatch")
     business_status = Column(String(32), nullable=False, default="created")
@@ -203,6 +204,11 @@ class ScheduleUserTaskInputBinding(Base):
     target_path = Column(String(1024), nullable=False)
     latest_batch_id = Column(String(64), nullable=True)
     keep_original = Column(Boolean, nullable=False, default=False)
+    selection_type = Column(String(32), nullable=True)
+    relative_path = Column(String(1024), nullable=True)
+    relative_paths = Column(JSON().with_variant(MySQLJSON, "mysql"), nullable=False, default=list)
+    resolved_path = Column(String(1024), nullable=True)
+    display_name = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=utcnow, nullable=False)
 
 
@@ -284,6 +290,7 @@ def _ensure_user_task_columns(engine) -> None:
     inspector = inspect(engine)
     for table_name, columns_to_add in {
         ScheduleUserTask.__tablename__: {
+            "module_name": "VARCHAR(255) NULL",
             "active_work_key_prefix": "VARCHAR(128) NULL",
             "downstream_task_id": "VARCHAR(128) NULL",
             "downstream_detail_view": "VARCHAR(128) NULL",
@@ -296,6 +303,13 @@ def _ensure_user_task_columns(engine) -> None:
             "downstream_task_id": "VARCHAR(128) NULL",
             "downstream_detail_view": "VARCHAR(128) NULL",
             "last_error": "TEXT NULL",
+        },
+        ScheduleUserTaskInputBinding.__tablename__: {
+            "selection_type": "VARCHAR(32) NULL",
+            "relative_path": "VARCHAR(1024) NULL",
+            "relative_paths": "JSON NULL",
+            "resolved_path": "VARCHAR(1024) NULL",
+            "display_name": "VARCHAR(255) NULL",
         },
     }.items():
         if table_name not in inspector.get_table_names():

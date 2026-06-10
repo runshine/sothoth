@@ -76,10 +76,14 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> Token
 
 @router.get("/health")
 async def health_check():
-    return {
-        **build_service_meta(),
+    meta = dict(build_service_meta() or {})
+    payload = {
+        **meta,
         **collect_liveness(),
     }
+    if meta.get("service_id") and "service" not in payload:
+        payload["service"] = meta.get("service_id")
+    return payload
 
 
 @router.get("/ready")
