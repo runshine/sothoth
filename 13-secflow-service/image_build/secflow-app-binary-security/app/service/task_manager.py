@@ -17388,6 +17388,11 @@ class TaskManager:
     def _module_risk_levels(self, task: BinarySecurityTask) -> list[str]:
         return _normalize_module_risk_levels((task.policy or {}).get("module_risk_levels"))
 
+    def _module_selection_candidate_levels(self, task: BinarySecurityTask) -> list[str]:
+        if self._module_selection_mode(task) == MODULE_SELECTION_MODE_MANUAL_CONFIRM:
+            return list(MODULE_RISK_LEVELS)
+        return self._module_risk_levels(task)
+
     def _mark_selected_modules(self, modules: list[dict[str, Any]], *, selected_by: str, selected_at: str | None = None) -> list[dict[str, Any]]:
         timestamp = selected_at or _now().isoformat()
         return [
@@ -22333,7 +22338,7 @@ class TaskManager:
             all_modules.extend(item_modules)
             success.append({**result, "modules": self._lightweight_modules_for_storage(item_modules), "module_count": len(item_modules)})
         status = self._aggregate_item_statuses([item.status for item in items])
-        candidate_modules = self._filter_candidate_modules(all_modules, self._module_risk_levels(task))
+        candidate_modules = self._filter_candidate_modules(all_modules, self._module_selection_candidate_levels(task))
         summary = dict(task.summary or {})
         existing_selected_modules = [
             dict(module)
@@ -26567,7 +26572,7 @@ class TaskManager:
         all_modules: list[dict[str, Any]] = []
         for result in success:
             all_modules.extend(result.get("modules", []))
-        candidate_modules = self._filter_candidate_modules(all_modules, self._module_risk_levels(task))
+        candidate_modules = self._filter_candidate_modules(all_modules, self._module_selection_candidate_levels(task))
         if status in {"success", "partial_success"} and success and not failed_like and not candidate_modules:
             failure = _no_candidate_modules_failure()
             task.summary = {
