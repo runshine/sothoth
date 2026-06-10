@@ -192,7 +192,7 @@ class ScheduleUserTaskInputBinding(Base):
     __tablename__ = f"{TABLE_PREFIX}user_task_input_binding"
     __table_args__ = (
         Index(f"idx_{TABLE_PREFIX}user_task_input_binding_task", "user_task_id"),
-        UniqueConstraint("user_task_id", "input_upload_id", name=f"uk_{TABLE_PREFIX}user_task_input_binding_task_input"),
+        UniqueConstraint("user_task_id", "input_upload_id", name="uk_cps_utib_task_input"),
     )
 
     id = Column(String(64), primary_key=True, default=generate_id)

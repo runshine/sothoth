@@ -38,10 +38,6 @@ def verify_auth_service_or_exit():
         logger.error("未配置auth_service.service_machine_token，拒绝启动")
         sys.exit(1)
 
-
-def _role_enabled(role: str, expected: str) -> bool:
-    return role in {"all", expected}
-
     base_url = f"http://{cfg.host}:{cfg.port}"
     health_url = f"{base_url}/api/auth/health"
     validate_url = cfg.validate_url
@@ -79,6 +75,10 @@ def _role_enabled(role: str, expected: str) -> bool:
         sys.exit(1)
 
 
+def _role_enabled(role: str, expected: str) -> bool:
+    return role in {"all", expected}
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     logger.info("正在启动 chirmera-platform-schedule 服务...")
@@ -91,7 +91,14 @@ async def lifespan(_: FastAPI):
         mark_state(database_ready=True)
         with get_engine().connect() as conn:
             conn.exec_driver_sql("SELECT 1")
-        mark_state(redis_ready=await get_redis_runtime().is_redis_available())
+        redis_available = await get_redis_runtime().is_redis_available()
+        if redis_available:
+            mark_state(redis_ready=True)
+        elif get_config().runtime.redis_degraded_ready:
+            logger.warning("Redis 不可用，按 degraded-ready 模式继续启动")
+            mark_state(redis_ready=True)
+        else:
+            mark_state(redis_ready=False)
         verify_auth_service_or_exit()
         mark_state(auth_ready=True)
         await get_registry_service().start()
