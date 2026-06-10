@@ -3772,6 +3772,17 @@ class TaskManager:
         payload = dict(payload or {})
         return str(payload.get("task_id") or payload.get("id") or "").strip()
 
+    def _payload_matches_current_child(
+        self,
+        item: BinarySecurityStageItem,
+        payload: dict[str, Any] | None,
+    ) -> bool:
+        expected_downstream_task_id = self._current_downstream_task_id(item)
+        observed_downstream_task_id = self._payload_downstream_task_id(payload)
+        if not expected_downstream_task_id or not observed_downstream_task_id:
+            return True
+        return expected_downstream_task_id == observed_downstream_task_id
+
     def _archive_job_bound_downstream_task_id(self, job: BinarySecurityArchiveJob | None) -> str:
         if job is None:
             return ""
@@ -7630,6 +7641,9 @@ class TaskManager:
         synced_count = 0
         skipped_count = 0
         failed_count = 0
+        binding_mismatch_count = 0
+        revived_count = 0
+        revival_rejected_count = 0
         touched_stages: set[str] = set()
         auth_token = token or self._service_token()
         ready_items: list[BinarySecurityStageItem] = []
@@ -7717,6 +7731,37 @@ class TaskManager:
                             continue
                         skipped_count += 1
                         continue
+                if not self._payload_matches_current_child(item, payload):
+                    if not self._persist_child_sync_observation(
+                        db,
+                        task=task,
+                        item=item,
+                        change_source="downstream_sync",
+                        sync_status="binding_mismatch",
+                        synced_at=sync_observed_at,
+                        error_message="下游状态来自旧 child，本次仅记录观测",
+                        error_type="binding_mismatch",
+                        state_applied=False,
+                        extra_payload={"operation": "downstream_sync"},
+                    ):
+                        failed_count += 1
+                        continue
+                    binding_mismatch_count += 1
+                    skipped_count += 1
+                    self._record_binding_mismatch_event(
+                        db,
+                        task,
+                        item,
+                        event_type="downstream_binding_mismatch_skipped",
+                        message="下游状态来自旧 child，已跳过当前阶段项状态回写",
+                        payload=self._binding_mismatch_payload(
+                            source="downstream_sync",
+                            expected_downstream_task_id=self._current_downstream_task_id(item),
+                            actual_downstream_task_id=self._payload_downstream_task_id(payload),
+                            payload_downstream_task_id=self._payload_downstream_task_id(payload),
+                        ),
+                    )
+                    continue
                 downstream_status = str(payload.get("status") or "").lower()
                 mapped_status = self._map_downstream_status(downstream_status)
                 current_item_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower() or None
@@ -7782,6 +7827,8 @@ class TaskManager:
                 ):
                     mapped_status = current_item_status
                     downstream_status = current_item_status
+                if terminal_status and current_item_status in {"success", "partial_success", "failed", "cancelled", "downstream_missing"} and mapped_status != current_item_status:
+                    revival_rejected_count += 1
                 if terminal_status:
                     observed_error_message = (
                         payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message
@@ -7934,6 +7981,8 @@ class TaskManager:
                                 continue
                             touched_stages.add(item.stage_name)
                             synced_count += 1
+                            if current_item_status in {"pending", "queued", "dispatching", "running"}:
+                                revived_count += 1
                         else:
                             if not self._persist_child_sync_observation(
                                 db,
@@ -8541,10 +8590,13 @@ class TaskManager:
         response_synced_count = synced_count if apply_state else min(synced_count, len(touched_stages))
         return BinarySecurityActionResponse(
             task_id=task.id,
-            message=f"下游状态同步完成：更新 {response_synced_count} 个，跳过 {skipped_count} 个，失败 {failed_count} 个",
+            message=f"下游状态同步完成：更新 {response_synced_count} 个，跳过 {skipped_count} 个，失败 {failed_count} 个，绑定不匹配 {binding_mismatch_count} 个",
             synced_downstream_count=response_synced_count,
             skipped_downstream_count=skipped_count,
             failed_downstream_count=failed_count,
+            binding_mismatch_count=binding_mismatch_count,
+            revived_count=revived_count,
+            revival_rejected_count=revival_rejected_count,
         )
 
     def _persist_downstream_sync_failure(
@@ -12312,6 +12364,22 @@ class TaskManager:
             and current_downstream_task_id
             and payload_downstream_task_id != current_downstream_task_id
         ):
+            self._record_binding_mismatch_event(
+                db,
+                task,
+                item,
+                event_type="downstream_binding_mismatch_detected",
+                message="旧 child 的下游状态事件已被忽略，未回写当前阶段项",
+                payload=self._binding_mismatch_payload(
+                    source="downstream_status_event",
+                    expected_downstream_task_id=current_downstream_task_id,
+                    actual_downstream_task_id=payload_downstream_task_id,
+                    payload_downstream_task_id=payload_downstream_task_id,
+                ),
+            )
+            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+            return
+        if not self._payload_matches_current_child(item, downstream_payload or payload):
             self._record_binding_mismatch_event(
                 db,
                 task,
@@ -27067,6 +27135,7 @@ class TaskManager:
 
     def _archive_job_downstream_payload(self, payload: dict[str, Any] | None) -> dict[str, Any]:
         compact = self._lightweight_downstream_payload(payload)
+        compact.pop("output_path", None)
         payload = payload or {}
         for key in ("output_root", "work_dir", "task_root"):
             value = payload.get(key)
@@ -27077,6 +27146,7 @@ class TaskManager:
             if not isinstance(nested, dict):
                 continue
             nested_compact = self._lightweight_downstream_payload(nested)
+            nested_compact.pop("output_path", None)
             for nested_key in ("output_root", "work_dir", "task_root"):
                 value = nested.get(nested_key)
                 if value is not None:

@@ -14030,6 +14030,76 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, task.stage_summary["dataflow_vuln_scan"]["counts"]["success_items"])
         self.assertEqual(2, task.stage_summary["dataflow_vuln_scan"]["counts"]["running_items"])
 
+    def test_sync_downstream_status_skips_stale_child_payload_and_counts_binding_mismatch(self):
+        task = BinarySecurityTask(
+            id="s2",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        run = BinarySecurityStageRun(
+            id="sr2",
+            task_id="s2",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            sequence_no=5,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="s2",
+            project_id="p1",
+            stage_run_id="sr2",
+            stage_name="dataflow_vuln_scan",
+            item_key="e1",
+            parent_key="m1",
+            status="queued",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dfa_new",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item])
+
+        original_fetch = self.manager._fetch_downstream_task_payload
+        original_write = self.manager._write_task_metadata_async
+        original_enqueue = self.manager._enqueue_task
+
+        async def _fetch(_task, _item, _token):
+            return {"task_id": "dfa_old", "status": "running"}
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._fetch_downstream_task_payload = _fetch
+        self.manager._write_task_metadata_async = _noop_write
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        try:
+            resp = asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id="p1",
+                    task_id="s2",
+                    stage_name="dataflow_vuln_scan",
+                    apply_state=True,
+                )
+            )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+            self.manager._write_task_metadata_async = original_write
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual(0, resp.synced_downstream_count)
+        self.assertEqual(1, resp.skipped_downstream_count)
+        self.assertEqual(1, resp.binding_mismatch_count)
+        self.assertEqual("queued", item.status)
+        self.assertEqual("binding_mismatch", item.result.get("sync_status"))
+        self.assertIn("latest_binding_mismatch", item.result)
+
     def test_apply_downstream_status_event_reuses_unified_reconcile(self):
         task = BinarySecurityTask(
             id="t1",
@@ -14156,6 +14226,66 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("queued", item.status)
         self.assertIn("latest_binding_mismatch", self.manager._load_stage_item_result_payload(item))
+        self.assertIn("downstream_binding_mismatch_detected", [record.event_type for record in db.events])
+
+    def test_apply_downstream_status_event_ignores_stale_child_payload_when_payload_shape_is_nested(self):
+        task = BinarySecurityTask(
+            id="t2",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        item = BinarySecurityStageItem(
+            id="si2",
+            task_id="t2",
+            project_id="p1",
+            stage_run_id="sr2",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-2",
+            parent_key="mod-2",
+            status="queued",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dfa_new",
+        )
+        event = BinarySecurityStateEvent(
+            id="sev2",
+            task_id="t2",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            item_id="si2",
+            event_type="downstream_status_observed",
+            idempotency_key="sev2",
+            status="processing",
+            leased_by=self.manager.instance_id,
+            available_at=_now(),
+            created_at=_now(),
+        )
+        event.payload = {
+            "mapped_status": "success",
+            "before_status": "queued",
+            "downstream_payload": {"task_id": "dfa_old", "status": "success"},
+        }
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], state_events=[event])
+
+        original_write = self.manager._write_task_metadata_async
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._write_task_metadata_async = _noop_write
+        try:
+            asyncio.run(self.manager._apply_downstream_status_event_locked(db, event))
+        finally:
+            self.manager._write_task_metadata_async = original_write
+
+        self.assertEqual("queued", item.status)
+        self.assertEqual("binding_mismatch", self.manager._load_stage_item_result_payload(item).get("sync_status"))
         self.assertIn("downstream_binding_mismatch_detected", [record.event_type for record in db.events])
 
     def test_apply_archive_job_status_reuses_unified_reconcile(self):
@@ -16610,6 +16740,23 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("/payload/root", response[0].source_root)
         self.assertEqual("/payload/root/path", response[0].source_root_path)
         self.assertEqual("/payload/root/dir", response[0].source_dir)
+
+    def test_archive_job_downstream_payload_drops_output_path(self):
+        payload = self.manager._archive_job_downstream_payload(
+            {
+                "task_id": "dfa-1",
+                "status": "success",
+                "output_path": "/tmp/old-output",
+                "workspace_root": "/tmp/ws",
+                "result": {
+                    "output_path": "/tmp/nested-old-output",
+                    "status": "success",
+                },
+            }
+        )
+
+        self.assertNotIn("output_path", payload)
+        self.assertNotIn("output_path", payload["result"])
 
     def test_archive_job_responses_fall_back_to_event_sources_for_real_archive_source_paths(self):
         task = BinarySecurityTask(

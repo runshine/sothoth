@@ -669,6 +669,9 @@ class BinarySecurityActionResponse(BaseModel):
     skipped_downstream_count: int = 0
     failed_downstream_count: int = 0
     deleted_event_count: int = 0
+    binding_mismatch_count: int = 0
+    revived_count: int = 0
+    revival_rejected_count: int = 0
 
 
 class BinarySecurityDownstreamStatusSyncPayload(BaseModel):
