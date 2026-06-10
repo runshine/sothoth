@@ -27,6 +27,11 @@ from app.schemas import (
     VirtualKeyCreateResponse,
     VirtualKeyListResponse,
     VirtualKeyResponse,
+    UserTaskCreateRequest,
+    UserTaskDispatchListResponse,
+    UserTaskDispatchRequest,
+    UserTaskListResponse,
+    UserTaskResponse,
 )
 from app.service.auth import get_auth_service
 from app.service.litellm import get_virtual_key_manager
@@ -34,6 +39,7 @@ from app.service.project import get_project_service
 from app.service.runtime_state import collect_liveness, collect_readiness
 from app.service.schedule_manager import get_schedule_manager
 from app.service.security import validate_project_id
+from app.service.user_task_manager import get_user_task_manager
 
 
 router = APIRouter(prefix="/api/chirmera-platform-schedule", tags=["chirmera-platform-schedule"])
@@ -150,6 +156,68 @@ async def metrics():
 @router.get("/projects/{project_id}/jobs/{job_id}/runtime", response_model=JobRuntimeResponse)
 def job_runtime(project_id: str, job_id: str, _: TokenUser = Depends(get_current_context), db: Session = Depends(get_db)):
     return JobRuntimeResponse.model_validate(get_schedule_manager().job_runtime(db, project_id, job_id))
+
+
+@router.get("/projects/{project_id}/user-tasks", response_model=UserTaskListResponse)
+def list_user_tasks(project_id: str, _: TokenUser = Depends(get_current_context), db: Session = Depends(get_db)):
+    total, items, stats = get_user_task_manager().list_tasks(db, project_id)
+    return UserTaskListResponse(total=total, items=[UserTaskResponse.model_validate(item) for item in items], stats=stats)
+
+
+@router.post("/projects/{project_id}/user-tasks", response_model=UserTaskResponse)
+async def create_user_task(
+    project_id: str,
+    payload: UserTaskCreateRequest,
+    user: TokenUser = Depends(get_current_context),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    actor = user.username or user.user_id or "unknown"
+    token = _token_from_header(authorization)
+    task = await get_user_task_manager().create_task(db, project_id=project_id, payload=payload, actor=actor, bearer_token=token)
+    return UserTaskResponse.model_validate(task)
+
+
+@router.get("/projects/{project_id}/user-tasks/{task_id}", response_model=UserTaskResponse)
+def get_user_task(project_id: str, task_id: str, _: TokenUser = Depends(get_current_context), db: Session = Depends(get_db)):
+    task = get_user_task_manager().get_task_detail(db, project_id, task_id)
+    return UserTaskResponse.model_validate(task)
+
+
+@router.post("/projects/{project_id}/user-tasks/{task_id}/dispatch", response_model=UserTaskResponse)
+async def dispatch_user_task(
+    project_id: str,
+    task_id: str,
+    _: UserTaskDispatchRequest,
+    user: TokenUser = Depends(get_current_context),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    actor = user.username or user.user_id or "unknown"
+    token = _token_from_header(authorization)
+    task = await get_user_task_manager().dispatch_task(db, project_id=project_id, task_id=task_id, actor=actor, bearer_token=token)
+    return UserTaskResponse.model_validate(task)
+
+
+@router.post("/projects/{project_id}/user-tasks/{task_id}/retry-dispatch", response_model=UserTaskResponse)
+async def retry_dispatch_user_task(
+    project_id: str,
+    task_id: str,
+    payload: UserTaskDispatchRequest,
+    user: TokenUser = Depends(get_current_context),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    actor = user.username or user.user_id or "unknown"
+    token = _token_from_header(authorization)
+    task = await get_user_task_manager().dispatch_task(db, project_id=project_id, task_id=task_id, actor=actor, bearer_token=token)
+    return UserTaskResponse.model_validate(task)
+
+
+@router.get("/projects/{project_id}/user-tasks/{task_id}/dispatches", response_model=UserTaskDispatchListResponse)
+def list_user_task_dispatches(project_id: str, task_id: str, _: TokenUser = Depends(get_current_context), db: Session = Depends(get_db)):
+    total, items = get_user_task_manager().list_dispatches(db, project_id, task_id)
+    return UserTaskDispatchListResponse(total=total, items=items)
 
 
 @router.get("/projects/{project_id}/keys", response_model=VirtualKeyListResponse)

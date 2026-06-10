@@ -272,3 +272,86 @@ class VirtualKeyEventResponse(BaseModel):
     event_type: str
     payload: dict[str, Any]
     created_at: datetime
+
+
+UserTaskType = Literal["binary_firmware_e2e", "source_scan_e2e", "binary_module_e2e"]
+
+
+class UserTaskInputBindingResponse(BaseModel):
+    input_upload_id: str
+    input_type: str
+    input_label: str
+    target_path: str
+    latest_batch_id: Optional[str] = None
+    keep_original: bool = False
+
+
+class UserTaskCreateRequest(BaseModel):
+    task_type: UserTaskType
+    name: str
+    description: Optional[str] = None
+    input_upload_ids: list[str] = Field(default_factory=list)
+    policy: dict[str, Any] = Field(default_factory=dict)
+    dispatch_policy: dict[str, Any] = Field(default_factory=dict)
+    task_key_ref: str
+    module_name: Optional[str] = None
+
+    @field_validator("name", "task_key_ref")
+    @classmethod
+    def validate_non_empty(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value:
+            raise ValueError("字段不能为空")
+        return value
+
+
+class UserTaskDispatchRequest(BaseModel):
+    force: bool = False
+
+
+class UserTaskDispatchResponse(BaseModel):
+    id: str
+    user_task_id: str
+    project_id: str
+    dispatch_status: str
+    task_key_ref: str
+    work_key_id: Optional[str] = None
+    work_key_prefix: Optional[str] = None
+    downstream_task_id: Optional[str] = None
+    downstream_detail_view: Optional[str] = None
+    last_error: Optional[str] = None
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class UserTaskResponse(BaseModel):
+    id: str
+    project_id: str
+    task_type: UserTaskType | str
+    name: str
+    description: Optional[str] = None
+    create_status: str
+    dispatch_status: str
+    business_status: str
+    input_upload_count: int = 0
+    inputs: list[UserTaskInputBindingResponse] = Field(default_factory=list)
+    task_key_ref: str
+    active_work_key_prefix: Optional[str] = None
+    downstream_task_id: Optional[str] = None
+    downstream_detail_view: Optional[str] = None
+    last_error: Optional[str] = None
+    created_by: str
+    updated_at: datetime
+    created_at: datetime
+
+
+class UserTaskListResponse(BaseModel):
+    total: int
+    items: list[UserTaskResponse]
+    stats: dict[str, int] = Field(default_factory=dict)
+
+
+class UserTaskDispatchListResponse(BaseModel):
+    total: int
+    items: list[UserTaskDispatchResponse]

@@ -47,6 +47,23 @@ class ProjectServiceConfig(BaseModel):
     timeout: int = 10
 
 
+class FileserverServiceConfig(BaseModel):
+    base_url: str = "http://secflow-platform-fileserver"
+    project_input_uploads_path: str = "/api/fileserver/project-input/uploads"
+    timeout: int = 30
+
+
+class AiGatewayServiceConfig(BaseModel):
+    base_url: str = "http://gaiasec-llm-gateway"
+    work_keys_path: str = "/api/aigw/work-keys"
+    timeout: int = 30
+
+
+class BinarySecurityServiceConfig(BaseModel):
+    base_url: str = "http://secflow-app-binary-security"
+    timeout: int = 120
+
+
 class MenuLevelConfig(BaseModel):
     name: Optional[str] = None
     name_en: Optional[str] = None
@@ -157,6 +174,9 @@ class Config(BaseModel):
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     auth_service: AuthServiceConfig = Field(default_factory=AuthServiceConfig)
     project_service: ProjectServiceConfig = Field(default_factory=ProjectServiceConfig)
+    fileserver_service: FileserverServiceConfig = Field(default_factory=FileserverServiceConfig)
+    aigw_service: AiGatewayServiceConfig = Field(default_factory=AiGatewayServiceConfig)
+    binary_security_service: BinarySecurityServiceConfig = Field(default_factory=BinarySecurityServiceConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
     app: AppConfig = Field(default_factory=AppConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)

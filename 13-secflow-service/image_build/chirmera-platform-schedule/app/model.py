@@ -161,6 +161,73 @@ class LiteLLMKeyEvent(Base):
     created_at = Column(DateTime, default=utcnow, nullable=False)
 
 
+class ScheduleUserTask(Base):
+    __tablename__ = f"{TABLE_PREFIX}user_task"
+    __table_args__ = (
+        UniqueConstraint("project_id", "name", name=f"uk_{TABLE_PREFIX}user_task_project_name"),
+        Index(f"idx_{TABLE_PREFIX}user_task_project_status", "project_id", "create_status", "dispatch_status"),
+    )
+
+    id = Column(String(64), primary_key=True, default=generate_id)
+    project_id = Column(String(128), nullable=False, index=True)
+    task_type = Column(String(32), nullable=False, index=True)
+    name = Column(String(128), nullable=False)
+    description = Column(Text, nullable=True)
+    create_status = Column(String(32), nullable=False, default="created")
+    dispatch_status = Column(String(32), nullable=False, default="ready_for_dispatch")
+    business_status = Column(String(32), nullable=False, default="created")
+    task_key_ref = Column(String(255), nullable=False)
+    active_work_key_prefix = Column(String(128), nullable=True)
+    downstream_task_id = Column(String(128), nullable=True, index=True)
+    downstream_detail_view = Column(String(128), nullable=True)
+    last_error = Column(Text, nullable=True)
+    created_by = Column(String(128), nullable=False)
+    updated_by = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+
+
+class ScheduleUserTaskInputBinding(Base):
+    __tablename__ = f"{TABLE_PREFIX}user_task_input_binding"
+    __table_args__ = (
+        Index(f"idx_{TABLE_PREFIX}user_task_input_binding_task", "user_task_id"),
+        UniqueConstraint("user_task_id", "input_upload_id", name=f"uk_{TABLE_PREFIX}user_task_input_binding_task_input"),
+    )
+
+    id = Column(String(64), primary_key=True, default=generate_id)
+    user_task_id = Column(String(64), nullable=False, index=True)
+    project_id = Column(String(128), nullable=False, index=True)
+    input_upload_id = Column(String(64), nullable=False, index=True)
+    input_type = Column(String(32), nullable=False, index=True)
+    input_label = Column(String(255), nullable=False)
+    target_path = Column(String(1024), nullable=False)
+    latest_batch_id = Column(String(64), nullable=True)
+    keep_original = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+
+class ScheduleUserTaskDispatch(Base):
+    __tablename__ = f"{TABLE_PREFIX}user_task_dispatch"
+    __table_args__ = (
+        Index(f"idx_{TABLE_PREFIX}user_task_dispatch_task", "user_task_id", "created_at"),
+    )
+
+    id = Column(String(64), primary_key=True, default=generate_id)
+    user_task_id = Column(String(64), nullable=False, index=True)
+    project_id = Column(String(128), nullable=False, index=True)
+    dispatch_status = Column(String(32), nullable=False, default="pending")
+    task_key_ref = Column(String(255), nullable=False)
+    work_key_id = Column(String(64), nullable=True)
+    work_key_prefix = Column(String(128), nullable=True)
+    work_key_secret = Column(Text, nullable=True)
+    downstream_task_id = Column(String(128), nullable=True)
+    downstream_detail_view = Column(String(128), nullable=True)
+    last_error = Column(Text, nullable=True)
+    created_by = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+
+
 _engine = None
 _SessionFactory = None
 
@@ -189,6 +256,7 @@ def init_database():
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
     _ensure_schedule_execution_columns(engine)
+    _ensure_user_task_columns(engine)
 
 
 def _ensure_schedule_execution_columns(engine) -> None:
@@ -210,6 +278,37 @@ def _ensure_schedule_execution_columns(engine) -> None:
     with engine.begin() as connection:
         for statement in statements:
             connection.execute(text(statement))
+
+
+def _ensure_user_task_columns(engine) -> None:
+    inspector = inspect(engine)
+    for table_name, columns_to_add in {
+        ScheduleUserTask.__tablename__: {
+            "active_work_key_prefix": "VARCHAR(128) NULL",
+            "downstream_task_id": "VARCHAR(128) NULL",
+            "downstream_detail_view": "VARCHAR(128) NULL",
+            "last_error": "TEXT NULL",
+        },
+        ScheduleUserTaskDispatch.__tablename__: {
+            "work_key_id": "VARCHAR(64) NULL",
+            "work_key_prefix": "VARCHAR(128) NULL",
+            "work_key_secret": "TEXT NULL",
+            "downstream_task_id": "VARCHAR(128) NULL",
+            "downstream_detail_view": "VARCHAR(128) NULL",
+            "last_error": "TEXT NULL",
+        },
+    }.items():
+        if table_name not in inspector.get_table_names():
+            continue
+        existing = {column["name"] for column in inspector.get_columns(table_name)}
+        statements: list[str] = []
+        for column_name, definition in columns_to_add.items():
+            if column_name not in existing:
+                statements.append(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+        if statements:
+            with engine.begin() as connection:
+                for statement in statements:
+                    connection.execute(text(statement))
 
 
 def get_db():
