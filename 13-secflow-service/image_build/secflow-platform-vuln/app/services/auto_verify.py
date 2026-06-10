@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_config
 from app.models.database import Case, CaseEvent
-from app.services.lifecycle_engine import MAIN_STAGE_VALIDATION, advance_case_stage
+from app.services.lifecycle_engine import MAIN_STAGE_RECEIVE, MAIN_STAGE_TRIAGE, MAIN_STAGE_VALIDATION, advance_case_stage
 from app.services.reporting import ensure_case_raw_report
 
 
@@ -76,6 +76,55 @@ def _resolve_path(payload: dict[str, Any], key: str) -> tuple[str | None, str | 
     return None, None
 
 
+def _derive_binary_root_from_source_root(project_id: str, source_root: str | None) -> tuple[str | None, str | None]:
+    """Derive a conservative binary_root for binary-security task workspaces.
+
+    Some binary-security intake records only carry source_root, typically pointing to
+    /data/files/{project}/app/secflow-app-binary-security/{task_id}/input.  The
+    verifier needs an existing binary_root as task context, so only return paths that
+    are inside the same project data root and already exist on disk.
+    """
+    source_text = _string_or_none(source_root)
+    if not source_text:
+        return None, None
+
+    project_root = _data_root(project_id)
+    try:
+        source_path = Path(source_text).expanduser().resolve()
+        relative_parts = source_path.relative_to(project_root).parts
+    except (OSError, RuntimeError, ValueError):
+        return None, None
+
+    if len(relative_parts) < 4:
+        return None, None
+    if relative_parts[0] != "app" or relative_parts[1] != "secflow-app-binary-security":
+        return None, None
+
+    task_root = (project_root / relative_parts[0] / relative_parts[1] / relative_parts[2]).resolve()
+    try:
+        task_root.relative_to(project_root)
+    except ValueError:
+        return None, None
+
+    candidates = [
+        ("derived.source_root.binary_security_task_root", task_root),
+        ("derived.source_root.binary_security_output_entry_analyse", task_root / "output" / "entry-analyse"),
+        ("derived.source_root.binary_security_output_system_analyse", task_root / "output" / "system-analyse"),
+        ("derived.source_root.binary_security_output_dataflow_vuln_scan", task_root / "output" / "dataflow-vuln-scan"),
+        ("derived.source_root.binary_security_output", task_root / "output"),
+        ("derived.source_root.binary_security_input", task_root / "input"),
+    ]
+    for source, candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(project_root)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if resolved.is_dir():
+            return str(resolved), source
+    return None, None
+
+
 def build_case_report_markdown(case: Case, payload: dict[str, Any]) -> tuple[str, str]:
     raw_report = ensure_case_raw_report(case)
     if raw_report and raw_report.get("markdown"):
@@ -111,6 +160,8 @@ def build_case_report_markdown(case: Case, payload: dict[str, Any]) -> tuple[str
 def build_auto_verify_context(case: Case, payload: dict[str, Any]) -> dict[str, Any]:
     source_root, source_from = _resolve_path(payload, "source_root")
     binary_root, binary_from = _resolve_path(payload, "binary_root")
+    if not binary_root:
+        binary_root, binary_from = _derive_binary_root_from_source_root(case.project_id, source_root)
     report_md, report_id = build_case_report_markdown(case, payload)
     path_status = {
         "source_root": {"ok": bool(source_root), "source": source_from, "message": None if source_root else "source_root missing"},
@@ -238,7 +289,12 @@ async def create_auto_verify_task(
         }, ensure_ascii=False),
     ))
     if getattr(request, "advance_to_validation", True) and case.current_stage != MAIN_STAGE_VALIDATION:
-        advance_case_stage(db, case, MAIN_STAGE_VALIDATION, "auto verify task created", source_type="system")
+        if case.current_stage == MAIN_STAGE_RECEIVE:
+            advance_case_stage(db, case, MAIN_STAGE_TRIAGE, "auto verify task created", source_type="system")
+        if case.current_stage == MAIN_STAGE_TRIAGE:
+            advance_case_stage(db, case, MAIN_STAGE_VALIDATION, "auto verify task created", source_type="system")
+        elif case.current_stage != MAIN_STAGE_VALIDATION:
+            advance_case_stage(db, case, MAIN_STAGE_VALIDATION, "auto verify task created", source_type="system")
     db.commit()
     return {
         "case_id": case.id,
