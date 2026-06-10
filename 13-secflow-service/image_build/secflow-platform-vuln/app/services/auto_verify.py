@@ -126,8 +126,8 @@ def build_auto_verify_context(case: Case, payload: dict[str, Any]) -> dict[str, 
         "report_preview": report_md[:4000],
         "path_status": path_status,
         "default_task_name": f"自动化验证-{case.title[:48]}",
-        "default_model": os.environ.get("SECFLOW_VULN_VERIFY_MODEL", "gpt-4o-mini"),
-        "default_concurrency": int(os.environ.get("SECFLOW_VULN_VERIFY_CONCURRENCY", "2")),
+        "default_model": os.environ.get("SECFLOW_VULN_VERIFY_MODEL", "local_minimax/MiniMax/MiniMax-M2.5"),
+        "default_concurrency": int(os.environ.get("SECFLOW_VULN_VERIFY_CONCURRENCY", "1")),
     }
 
 

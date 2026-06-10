@@ -12,8 +12,8 @@ class AutoVerifyTaskCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     threat_model_markdown: str = Field(min_length=1)
     template_id: Optional[str] = None
-    model: str = Field(default="gpt-4o-mini", min_length=1, max_length=128)
-    concurrency: int = Field(default=2, ge=1, le=64)
+    model: str = Field(default="local_minimax/MiniMax/MiniMax-M2.5", min_length=1, max_length=255)
+    concurrency: int = Field(default=1, ge=1, le=64)
     advance_to_validation: bool = True
 
 
