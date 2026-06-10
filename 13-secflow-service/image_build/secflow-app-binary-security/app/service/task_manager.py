@@ -17390,7 +17390,7 @@ class TaskManager:
 
     def _module_selection_candidate_levels(self, task: BinarySecurityTask) -> list[str]:
         if self._module_selection_mode(task) == MODULE_SELECTION_MODE_MANUAL_CONFIRM:
-            return list(MODULE_RISK_LEVELS)
+            return list(ALLOWED_MODULE_RISK_LEVELS)
         return self._module_risk_levels(task)
 
     def _mark_selected_modules(self, modules: list[dict[str, Any]], *, selected_by: str, selected_at: str | None = None) -> list[dict[str, Any]]:
