@@ -62,6 +62,7 @@ from app.schemas import (
     ProjectInputUploadDeleteRequest,
     ProjectInputUploadDeleteResponse,
     ProjectInputUploadDetailResponse,
+    ProjectInputUploadOverviewResponse,
     ProjectInputUploadListResponse,
     ProjectInputUploadRecordResponse,
     ProjectInputUploadStatsResponse,
@@ -650,23 +651,31 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> Token
 @router.get("/project-input/uploads", response_model=ProjectInputUploadListResponse)
 async def list_project_input_uploads(
     project_id: str = Query(...),
-    input_type: str = Query(...),
+    input_type: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
     authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db),
 ):
     await verify_project_access(project_id, authorization)
-    validated_type = validate_project_input_type(input_type)
-    records = db.query(ProjectInputUploadRecord).filter(
+    query = db.query(ProjectInputUploadRecord).filter(
         ProjectInputUploadRecord.project_id == project_id,
-        ProjectInputUploadRecord.input_type == validated_type,
-    ).order_by(ProjectInputUploadRecord.created_at.desc()).all()
+    )
+    validated_type = validate_project_input_type(input_type) if input_type else None
+    if validated_type:
+        query = query.filter(ProjectInputUploadRecord.input_type == validated_type)
+    if status:
+        query = query.filter(ProjectInputUploadRecord.status == status)
+    total = query.count()
+    records = query.order_by(ProjectInputUploadRecord.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
     items = []
     for record in records:
         latest_batch = db.query(ProjectInputUploadBatch).filter(
             ProjectInputUploadBatch.upload_id == record.upload_id,
         ).order_by(ProjectInputUploadBatch.created_at.desc()).first()
         items.append(project_input_record_to_response(record, latest_batch))
-    return ProjectInputUploadListResponse(total=len(items), items=items)
+    return ProjectInputUploadListResponse(total=total, items=items, page=page, page_size=page_size)
 
 
 @router.get("/project-input/uploads/stats", response_model=ProjectInputUploadStatsResponse)
@@ -700,6 +709,33 @@ async def get_project_input_upload_stats(
         stored_file_count=stored_file_count,
         stored_total_size_bytes=stored_total_size_bytes,
     )
+
+
+@router.get("/project-input/uploads/overview", response_model=ProjectInputUploadOverviewResponse)
+async def get_project_input_upload_overview(
+    project_id: str = Query(...),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    await verify_project_access(project_id, authorization)
+    categories = []
+    for input_type in ("document", "code", "software", "other"):
+        records = db.query(ProjectInputUploadRecord).filter(
+            ProjectInputUploadRecord.project_id == project_id,
+            ProjectInputUploadRecord.input_type == input_type,
+        ).all()
+        categories.append(ProjectInputUploadStatsResponse(
+            project_id=project_id,
+            input_type=input_type,
+            total_uploads=len(records),
+            processing_uploads=sum(1 for item in records if item.status in {"pending", "processing"}),
+            succeeded_uploads=sum(1 for item in records if item.status == "succeeded"),
+            partial_failed_uploads=sum(1 for item in records if item.status == "partial_failed"),
+            failed_uploads=sum(1 for item in records if item.status == "failed"),
+            stored_file_count=sum(int(item.stored_file_count or 0) for item in records),
+            stored_total_size_bytes=sum(int(item.stored_total_size_bytes or 0) for item in records),
+        ))
+    return ProjectInputUploadOverviewResponse(project_id=project_id, categories=categories)
 
 
 @router.get("/project-input/uploads/{upload_id}", response_model=ProjectInputUploadDetailResponse)
@@ -962,6 +998,7 @@ def project_input_record_to_response(record: ProjectInputUploadRecord, latest_ba
         updated_at=record.updated_at,
         finished_at=record.finished_at,
         latest_batch=project_input_batch_to_summary(latest_batch) if latest_batch else None,
+        batch_count=len(record.batches) if getattr(record, "batches", None) is not None else 0,
     )
 
 

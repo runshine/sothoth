@@ -368,11 +368,14 @@ class ProjectInputUploadRecordResponse(BaseModel):
     updated_at: datetime
     finished_at: Optional[datetime] = None
     latest_batch: Optional[ProjectInputUploadBatchSummary] = None
+    batch_count: int = 0
 
 
 class ProjectInputUploadListResponse(BaseModel):
     total: int
     items: List[ProjectInputUploadRecordResponse]
+    page: int = 1
+    page_size: int = 50
 
 
 class ProjectInputUploadStatsResponse(BaseModel):
@@ -385,6 +388,11 @@ class ProjectInputUploadStatsResponse(BaseModel):
     failed_uploads: int
     stored_file_count: int
     stored_total_size_bytes: int
+
+
+class ProjectInputUploadOverviewResponse(BaseModel):
+    project_id: str
+    categories: List[ProjectInputUploadStatsResponse]
 
 
 class ProjectInputUploadAcceptedResponse(BaseModel):

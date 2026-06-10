@@ -267,3 +267,43 @@ def test_project_input_upload_keep_original_and_delete(tmp_path, monkeypatch):
         )
         assert delete_resp.status_code == 200
         assert delete_resp.json()["deleted_ids"] == [upload_id]
+
+
+def test_project_input_upload_overview_and_pagination(tmp_path, monkeypatch):
+    with build_client(tmp_path, monkeypatch) as client:
+        headers = {"Authorization": "Bearer fake-token"}
+        for input_type, filename in [("code", "a.zip"), ("document", "b.zip"), ("software", "c.zip"), ("other", "d.zip")]:
+            archive_buffer = io.BytesIO()
+            with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr(f"{input_type}/readme.txt", f"{input_type}".encode("utf-8"))
+            archive_buffer.seek(0)
+            resp = client.post(
+                "/api/fileserver/project-input/uploads",
+                data={"project_id": "demo-project", "input_type": input_type, "keep_original": "false"},
+                files=[("files", (filename, archive_buffer, "application/zip"))],
+                headers=headers,
+            )
+            assert resp.status_code == 200
+            _wait_upload_done(client, resp.json()["upload_id"], headers)
+
+        overview = client.get(
+            "/api/fileserver/project-input/uploads/overview",
+            params={"project_id": "demo-project"},
+            headers=headers,
+        )
+        assert overview.status_code == 200
+        overview_payload = overview.json()
+        assert overview_payload["project_id"] == "demo-project"
+        assert len(overview_payload["categories"]) == 4
+        assert {item["input_type"] for item in overview_payload["categories"]} == {"code", "document", "software", "other"}
+
+        page1 = client.get(
+            "/api/fileserver/project-input/uploads",
+            params={"project_id": "demo-project", "page": 1, "page_size": 2},
+            headers=headers,
+        )
+        assert page1.status_code == 200
+        assert page1.json()["page"] == 1
+        assert page1.json()["page_size"] == 2
+        assert page1.json()["total"] == 4
+        assert len(page1.json()["items"]) == 2
