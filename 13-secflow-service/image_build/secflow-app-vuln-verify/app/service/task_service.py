@@ -396,6 +396,17 @@ def build_report_data(task: VulnVerifyTask) -> dict:
         "groups": groups,
     }
 
+def _is_hidden_artifact(rel_path: str) -> bool:
+    """Hide legacy/self-contained HTML reports from task artifacts.
+
+    The SecFlow detail page renders vulnerability verification reports natively in
+    React via the report-data API, so HTML report files must not be exposed as
+    downloadable or previewable artifacts.
+    """
+    normalized = rel_path.replace("\\", "/").lower()
+    return normalized.endswith(".html") or normalized.endswith(".htm") or normalized.endswith("vuln-verify-report.html")
+
+
 def list_artifacts(task: VulnVerifyTask) -> list[dict]:
     root = Path(task.output_dir).resolve()
     if not root.exists():
@@ -404,6 +415,8 @@ def list_artifacts(task: VulnVerifyTask) -> list[dict]:
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
         try:
             rel = str(path.resolve().relative_to(root))
+            if _is_hidden_artifact(rel):
+                continue
             stat = path.stat()
             items.append({"path": rel, "size": stat.st_size, "modified_at": now_local().fromtimestamp(stat.st_mtime), "kind": "file"})
         except Exception:
@@ -412,6 +425,8 @@ def list_artifacts(task: VulnVerifyTask) -> list[dict]:
 
 
 def read_artifact(task: VulnVerifyTask, rel_path: str, *, offset: int, limit: int) -> dict:
+    if _is_hidden_artifact(rel_path):
+        raise NotFoundError("产物文件不存在")
     root = Path(task.output_dir).resolve()
     target = (root / rel_path).resolve()
     if not target.is_relative_to(root) or not target.is_file():
