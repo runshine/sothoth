@@ -115,6 +115,7 @@ from app.schemas import (
     BinarySecurityArtifactsResponse,
     BinarySecurityEntrySelectionResponse,
     BinarySecurityInputFile,
+    BinarySecurityModuleReportDetailResponse,
     BinarySecurityModuleSelectionConfirmPayload,
     BinarySecurityModuleSelectionResponse,
     BinarySecurityOverviewResponse,
@@ -4565,6 +4566,144 @@ class TaskManager:
             system_analysis_modules=list(summary.get("system_analysis_modules") or []),
             candidate_modules=list(summary.get("candidate_modules") or []),
             selected_modules=list(summary.get("selected_modules") or []),
+        )
+
+    def _normalize_module_report_ref(self, module: dict[str, Any], source_tag: str) -> dict[str, Any] | None:
+        if not isinstance(module, dict):
+            return None
+        module_key = str(module.get("module_key") or "").strip()
+        if not module_key:
+            return None
+        module_name = str(module.get("module_name") or module_key).strip() or module_key
+        module_dir = str(module.get("module_dir") or module.get("source_dir") or "").strip()
+        raw_report_path = str(module.get("module_report") or module.get("module_report_path") or "").strip()
+        report_path = raw_report_path
+        if not report_path and module_dir:
+            report_path = str(Path(module_dir) / "module_report.md")
+        return {
+            "module_key": module_key,
+            "module_name": module_name,
+            "module_dir": module_dir or None,
+            "module_report_path": report_path or None,
+            "risk_level": module.get("risk_level"),
+            "risk_score": module.get("risk_score"),
+            "file_count": module.get("file_count"),
+            "files_list_path": str(module.get("files_list") or module.get("files_list_path") or "").strip() or None,
+            "source_tags": [source_tag],
+        }
+
+    def _module_report_refs(self, task: BinarySecurityTask) -> dict[str, dict[str, Any]]:
+        summary = task.summary or {}
+        merged: dict[str, dict[str, Any]] = {}
+
+        def absorb(modules: list[dict[str, Any]], source_tag: str) -> None:
+            for module in modules:
+                normalized = self._normalize_module_report_ref(module, source_tag)
+                if not normalized:
+                    continue
+                module_key = normalized["module_key"]
+                existing = merged.get(module_key)
+                if existing is None:
+                    merged[module_key] = normalized
+                    continue
+                existing_tags = existing.setdefault("source_tags", [])
+                for tag in normalized.get("source_tags") or []:
+                    if tag not in existing_tags:
+                        existing_tags.append(tag)
+                if not existing.get("module_report_path") and normalized.get("module_report_path"):
+                    existing["module_report_path"] = normalized["module_report_path"]
+                if not existing.get("module_dir") and normalized.get("module_dir"):
+                    existing["module_dir"] = normalized["module_dir"]
+                if existing.get("risk_level") in (None, "", "未知") and normalized.get("risk_level"):
+                    existing["risk_level"] = normalized["risk_level"]
+                if existing.get("risk_score") in (None, "") and normalized.get("risk_score") not in (None, ""):
+                    existing["risk_score"] = normalized["risk_score"]
+                if existing.get("file_count") in (None, "") and normalized.get("file_count") not in (None, ""):
+                    existing["file_count"] = normalized["file_count"]
+                if not existing.get("files_list_path") and normalized.get("files_list_path"):
+                    existing["files_list_path"] = normalized["files_list_path"]
+
+        absorb(list(summary.get("system_analysis_modules") or []), "系统分析")
+        absorb(list(summary.get("candidate_modules") or []), "候选")
+        absorb(list(summary.get("selected_modules") or []), "已选")
+        return merged
+
+    def _resolve_module_report_path(self, ref: dict[str, Any]) -> Path | None:
+        candidates: list[Path] = []
+        raw_report_path = str(ref.get("module_report_path") or "").strip()
+        if raw_report_path:
+            candidates.append(Path(raw_report_path))
+        raw_module_dir = str(ref.get("module_dir") or "").strip()
+        if raw_module_dir:
+            module_dir = Path(raw_module_dir)
+            candidates.append(module_dir / "module_report.md")
+            candidates.append(module_dir / "modules_report.md")
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = str(candidate)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            if candidate.is_file():
+                return candidate
+        return candidates[0] if candidates else None
+
+    def _infer_module_file_count(self, ref: dict[str, Any]) -> int | None:
+        raw_count = ref.get("file_count")
+        if raw_count not in (None, ""):
+            try:
+                return int(raw_count)
+            except (TypeError, ValueError):
+                pass
+        files_list_path = str(ref.get("files_list_path") or "").strip()
+        if not files_list_path:
+            return None
+        candidate = Path(files_list_path)
+        if not candidate.is_file():
+            return None
+        try:
+            return len([line for line in _read_text(candidate).splitlines() if line.strip()])
+        except OSError:
+            return None
+
+    def get_module_report(self, db: Session, *, project_id: str, task_id: str, module_key: str) -> BinarySecurityModuleReportDetailResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        normalized_module_key = str(module_key or "").strip()
+        if not normalized_module_key:
+            raise ValidationError("module_key 不能为空")
+        ref = self._module_report_refs(task).get(normalized_module_key)
+        if ref is None:
+            raise NotFoundError("模块不存在或不属于当前任务")
+        report_path = self._resolve_module_report_path(ref)
+        warning: str | None = None
+        error_message: str | None = None
+        markdown: str | None = None
+        available = False
+        if report_path is None:
+            error_message = "该模块尚未记录可读取的模块报告路径"
+        elif not report_path.is_file():
+            error_message = "该模块尚未生成可展示的系统分析报告"
+        else:
+            try:
+                markdown = _read_text(report_path)
+                available = True
+                if not markdown.strip():
+                    warning = "模块报告文件为空"
+            except OSError as exc:
+                error_message = f"模块报告读取失败: {exc}"
+        return BinarySecurityModuleReportDetailResponse(
+            task_id=task.id,
+            module_key=normalized_module_key,
+            module_name=str(ref.get("module_name") or normalized_module_key),
+            module_report_path=str(report_path) if report_path else None,
+            module_report_markdown=markdown,
+            risk_level=str(ref.get("risk_level") or "").strip() or None,
+            risk_score=float(ref["risk_score"]) if ref.get("risk_score") not in (None, "") else None,
+            file_count=self._infer_module_file_count(ref),
+            source_tags=list(ref.get("source_tags") or []),
+            available=available,
+            warning=warning,
+            error_message=error_message,
         )
 
     def get_entry_selection(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityEntrySelectionResponse:

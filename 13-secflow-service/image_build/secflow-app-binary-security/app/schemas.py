@@ -689,6 +689,21 @@ class BinarySecurityModuleSelectionResponse(BaseModel):
     selected_modules: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class BinarySecurityModuleReportDetailResponse(BaseModel):
+    task_id: str
+    module_key: str
+    module_name: str
+    module_report_path: Optional[str] = None
+    module_report_markdown: Optional[str] = None
+    risk_level: Optional[str] = None
+    risk_score: Optional[float] = None
+    file_count: Optional[int] = None
+    source_tags: list[str] = Field(default_factory=list)
+    available: bool = False
+    warning: Optional[str] = None
+    error_message: Optional[str] = None
+
+
 class BinarySecurityModuleSelectionConfirmPayload(BaseModel):
     selected_module_keys: list[str] = Field(default_factory=list)
 

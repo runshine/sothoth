@@ -20,6 +20,7 @@ from app.schemas import (
     BinarySecurityDownstreamStatusSyncPayload,
     BinarySecurityEntrySelectionConfirmPayload,
     BinarySecurityEntrySelectionResponse,
+    BinarySecurityModuleReportDetailResponse,
     BinarySecurityModuleSelectionConfirmPayload,
     BinarySecurityModuleSelectionResponse,
     BinarySecurityOverviewResponse,
@@ -589,6 +590,17 @@ def get_module_selection(
     db: Session = Depends(get_db),
 ):
     return get_task_manager().get_module_selection(db, project_id=project_id, task_id=task_id)
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/module-report", response_model=BinarySecurityModuleReportDetailResponse)
+def get_module_report(
+    project_id: str,
+    task_id: str,
+    module_key: str = Query(..., min_length=1),
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().get_module_report(db, project_id=project_id, task_id=task_id, module_key=module_key)
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/module-selection/confirm", response_model=BinarySecurityTaskDetailResponse)

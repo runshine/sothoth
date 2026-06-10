@@ -16871,6 +16871,114 @@ def _test_confirm_module_selection_updates_task(self):
     self.assertEqual(["m2"], [item["module_key"] for item in task.summary["selected_modules"]])
     self.assertEqual(1, detail.selected_module_count)
 
+
+def _test_get_module_report_reads_existing_markdown(self):
+    with tempfile.TemporaryDirectory() as tmp:
+        module_dir = Path(tmp) / "modules" / "openssl"
+        module_dir.mkdir(parents=True, exist_ok=True)
+        report_path = module_dir / "module_report.md"
+        report_path.write_text("# OpenSSL\n\n风险说明", encoding="utf-8")
+        files_list_path = module_dir / "files.list"
+        files_list_path.write_text("a.c\nb.c\n", encoding="utf-8")
+
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            status="pending_module_confirmation",
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root=tmp,
+        )
+        task.summary = {
+            "system_analysis_modules": [
+                {
+                    "module_key": "fw1-openssl",
+                    "module_name": "openssl",
+                    "module_dir": str(module_dir),
+                    "files_list": str(files_list_path),
+                    "risk_level": "高",
+                    "risk_score": 93,
+                }
+            ],
+            "candidate_modules": [
+                {
+                    "module_key": "fw1-openssl",
+                    "module_name": "openssl",
+                    "module_report": str(report_path),
+                }
+            ],
+            "selected_modules": [],
+        }
+
+        db = _ModelAwareDb(tasks=[task])
+        detail = self.manager.get_module_report(db, project_id="p1", task_id="t1", module_key="fw1-openssl")
+
+        self.assertTrue(detail.available)
+        self.assertEqual("openssl", detail.module_name)
+        self.assertEqual(str(report_path), detail.module_report_path)
+        self.assertEqual("# OpenSSL\n\n风险说明", detail.module_report_markdown)
+        self.assertEqual(2, detail.file_count)
+        self.assertEqual(["系统分析", "候选"], detail.source_tags)
+
+
+def _test_get_module_report_returns_unavailable_when_missing(self):
+    with tempfile.TemporaryDirectory() as tmp:
+        module_dir = Path(tmp) / "modules" / "busybox"
+        module_dir.mkdir(parents=True, exist_ok=True)
+
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            status="pending_module_confirmation",
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root=tmp,
+        )
+        task.summary = {
+            "system_analysis_modules": [
+                {
+                    "module_key": "fw1-busybox",
+                    "module_name": "busybox",
+                    "module_dir": str(module_dir),
+                }
+            ],
+        }
+
+        db = _ModelAwareDb(tasks=[task])
+        detail = self.manager.get_module_report(db, project_id="p1", task_id="t1", module_key="fw1-busybox")
+
+        self.assertFalse(detail.available)
+        self.assertIn("尚未生成", detail.error_message or "")
+        self.assertTrue((detail.module_report_path or "").endswith("module_report.md"))
+
+
+def _test_get_module_report_rejects_unknown_module(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="task",
+        task_type=TASK_TYPE_BINARY,
+        status="pending",
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/o",
+        workspace_root="/tmp",
+    )
+    task.summary = {"system_analysis_modules": [{"module_key": "known", "module_name": "known"}]}
+
+    db = _ModelAwareDb(tasks=[task])
+    with self.assertRaises(NotFoundError):
+        self.manager.get_module_report(db, project_id="p1", task_id="t1", module_key="unknown")
+
 def _test_normalize_source_input_files_rejects_duplicate_relative_paths(self):
     with self.assertRaisesRegex(Exception, "重复文件名"):
         self.manager._normalize_input_files(
@@ -26234,6 +26342,9 @@ TaskManagerTests.test_reclaim_stale_dispatching_skips_failed_streaming_task = _t
 TaskManagerTests.test_sync_downstream_status_does_not_record_recovery_event_for_failed_terminal_child = _test_sync_downstream_status_does_not_record_recovery_event_for_failed_terminal_child
 TaskManagerTests.test_sync_downstream_status_skips_recovery_event_for_terminal_failed_child = _test_sync_downstream_status_skips_recovery_event_for_terminal_failed_child
 TaskManagerTests.test_confirm_module_selection_updates_task = _test_confirm_module_selection_updates_task
+TaskManagerTests.test_get_module_report_reads_existing_markdown = _test_get_module_report_reads_existing_markdown
+TaskManagerTests.test_get_module_report_returns_unavailable_when_missing = _test_get_module_report_returns_unavailable_when_missing
+TaskManagerTests.test_get_module_report_rejects_unknown_module = _test_get_module_report_rejects_unknown_module
 TaskManagerTests.test_confirm_entry_selection_updates_task = _test_confirm_entry_selection_updates_task
 TaskManagerTests.test_get_project_config_normalizes_legacy_partial_success_stage_names = _test_get_project_config_normalizes_legacy_partial_success_stage_names
 TaskManagerTests.test_normalize_source_input_files_rejects_duplicate_relative_paths = _test_normalize_source_input_files_rejects_duplicate_relative_paths
