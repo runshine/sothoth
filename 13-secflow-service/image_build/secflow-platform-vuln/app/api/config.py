@@ -25,6 +25,7 @@ DEFAULT_VULN_ENGINE_CONFIG: dict = {
     },
     "receive": {
         "auto_accept_authenticated_reports": True,
+        "intake_require_project_token_auth": False,
         "intake_require_fingerprint": False,
         "intake_dedup_mode": "fingerprint_first",
         "minimum_confidence_for_auto_intake": 40,

@@ -12,8 +12,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import ensure_project_access, get_current_subject
+from app.api.config import DEFAULT_VULN_ENGINE_CONFIG
+from app.api.dependencies import ensure_project_access, get_current_subject, get_optional_subject
 from app.models.database import get_db
+from app.models.database import EngineProjectConfig
 from app.schemas import PublicIntakeSubmissionRequest
 from app.services.lifecycle_engine import build_case_fileserver_root
 from app.services.lifecycle_engine import create_case_with_runtime
@@ -39,6 +41,43 @@ EXAMPLE_FILES = {
     "skill": SDK_DIRS["skill"] / "example-skill-call.json",
     "openapi": SDK_DIRS["openapi"] / "authenticated-intake-openapi.json",
 }
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _normalize_project_config(config_value: object) -> dict:
+    if not isinstance(config_value, dict):
+        return json.loads(json.dumps(DEFAULT_VULN_ENGINE_CONFIG, ensure_ascii=False))
+    return _deep_merge(DEFAULT_VULN_ENGINE_CONFIG, config_value)
+
+
+def _intake_requires_project_token_auth(db: Session, project_id: str) -> bool:
+    record = db.query(EngineProjectConfig).filter(EngineProjectConfig.project_id == project_id).first()
+    raw_config = {}
+    if record and record.config_json:
+        try:
+            raw_config = json.loads(record.config_json)
+        except json.JSONDecodeError:
+            raw_config = {}
+    config = _normalize_project_config(raw_config)
+    return bool((config.get("receive") or {}).get("intake_require_project_token_auth"))
+
+
+def _assert_project_token_subject(subject: dict, project_id: str) -> None:
+    if str(subject.get("token_type") or "").strip().lower() != "machine":
+        raise HTTPException(status_code=403, detail="当前项目要求使用项目 Token 上报")
+    if str(subject.get("token_scope") or "").strip().lower() != "project":
+        raise HTTPException(status_code=403, detail="当前项目要求使用项目级 Token 上报")
+    if str(subject.get("project_id") or "").strip() != str(project_id or "").strip():
+        raise HTTPException(status_code=403, detail="项目 Token 未绑定当前项目")
 
 
 def _iter_files(base_dir: Path) -> list[Path]:
@@ -181,21 +220,45 @@ async def get_public_example(kind: str):
 @router.post("/intake/submissions", name="submit_authenticated_submission")
 async def submit_authenticated_submission(
     request: PublicIntakeSubmissionRequest,
-    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    user_and_token: tuple[dict, str] | None = Depends(get_optional_subject),
     db: Session = Depends(get_db),
 ):
-    subject, token = user_and_token
-    await ensure_project_access(request.project_id, token)
-    creator = subject.get("username") or str(subject.get("id"))
-    reporter_type = getattr(request.reporter, "type", None)
-    created_by_type = "service" if reporter_type == "service" else "human"
-    created_by = request.reporter.name if created_by_type == "service" else creator
+    requires_project_token_auth = _intake_requires_project_token_auth(db, request.project_id)
+    subject: dict | None = None
+    token: str | None = None
+    creator = request.reporter.name
+    created_by_type = "service" if getattr(request.reporter, "type", None) == "service" else "human"
+
+    if requires_project_token_auth:
+        if user_and_token is None:
+            raise HTTPException(status_code=401, detail="当前项目要求使用项目 Token 认证后才能上报")
+        subject, token = user_and_token
+        _assert_project_token_subject(subject, request.project_id)
+        await ensure_project_access(request.project_id, token)
+        creator = subject.get("username") or str(subject.get("id")) or request.reporter.name
+        if getattr(request.reporter, "type", None) == "service":
+            created_by_type = "service"
+            created_by = request.reporter.name
+        else:
+            created_by_type = "human"
+            created_by = creator
+    elif user_and_token is not None:
+        subject, token = user_and_token
+        await ensure_project_access(request.project_id, token)
+        creator = subject.get("username") or str(subject.get("id")) or request.reporter.name
+        if getattr(request.reporter, "type", None) == "service":
+            created_by_type = "service"
+            created_by = request.reporter.name
+        else:
+            created_by_type = "human"
+            created_by = creator
+
     item = create_case_with_runtime(
         db,
         request.to_case_create_request(
             created_by_type=created_by_type,
             created_by=created_by,
-            anonymous_submission=False,
+            anonymous_submission=not requires_project_token_auth and user_and_token is None,
         ),
     )
     source_meta = json.loads(item.source_meta_json or "{}")

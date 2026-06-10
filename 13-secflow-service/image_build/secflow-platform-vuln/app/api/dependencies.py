@@ -24,3 +24,16 @@ async def ensure_project_access(project_id: str, token: str) -> dict:
     if not ok:
         raise HTTPException(status_code=403, detail=f"No permission to access project {project_id}")
     return project or {}
+
+
+async def get_optional_subject(authorization: Optional[str] = Header(None)) -> tuple[dict, str] | None:
+    if not authorization:
+        return None
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+
+    token = authorization.replace("Bearer ", "", 1)
+    subject = await get_auth_service().validate_token(token)
+    if subject is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return subject, token
