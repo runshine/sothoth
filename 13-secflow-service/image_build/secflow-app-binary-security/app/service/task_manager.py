@@ -944,6 +944,10 @@ SERVICE_OUTPUT_FOLDERS = {
     "entry_analyse": "entry-analyse",
     "dataflow_vuln_scan": "dataflow-vuln-scan",
 }
+LEGACY_SERVICE_OUTPUT_FOLDERS = {
+    "system_analyse": ("system-analysis",),
+    "entry_analyse": ("entry-analysis",),
+}
 STAGE_OUTPUT_SERVICES = {
     "firmware_unpack": ["firmware_unpacker"],
     "system_analysis": ["system_analyse"],
@@ -1895,6 +1899,9 @@ class TaskManager:
         has_incomplete_stage = False
         for stage_name in self._streaming_tail_stage_names(task):
             items = self._stage_items(db, task.id, stage_name)
+            stage_bound_active_item_count = 0
+            stage_has_downstream_refs = False
+            stage_has_runnable_unbound_items = False
             stage_run = (
                 db.query(BinarySecurityStageRun)
                 .filter(
@@ -1904,8 +1911,6 @@ class TaskManager:
                 .first()
             )
             normalized_stage_status = self._normalize_downstream_status(getattr(stage_run, "status", None)) or str(getattr(stage_run, "status", "") or "").strip()
-            if normalized_stage_status in {"pending", "queued", "dispatching", "running", "applying"}:
-                has_incomplete_stage = True
             if active_stage_name is None and items:
                 active_stage_name = stage_name
             if active_stage_name is None and normalized_stage_status in {"pending", "queued", "dispatching", "running", "applying"}:
@@ -1915,15 +1920,25 @@ class TaskManager:
                 has_child = bool(str(item.downstream_task_id or "").strip())
                 if has_child and self._is_streaming_active_item_status(normalized_status):
                     bound_active_item_count += 1
+                    stage_bound_active_item_count += 1
                     has_downstream_refs = True
+                    stage_has_downstream_refs = True
                     if active_stage_name is None:
                         active_stage_name = stage_name
                 elif normalized_status in {"pending", "queued"}:
                     unbound_runnable_item_count += 1
+                    stage_has_runnable_unbound_items = True
                     if active_stage_name is None:
                         active_stage_name = stage_name
                 elif has_child:
                     has_downstream_refs = True
+                    stage_has_downstream_refs = True
+            if normalized_stage_status in {"pending", "queued"}:
+                has_incomplete_stage = True
+            elif normalized_stage_status in {"dispatching", "running", "applying"} and not (
+                stage_bound_active_item_count > 0 or stage_has_downstream_refs or stage_has_runnable_unbound_items
+            ):
+                has_incomplete_stage = True
         has_runnable_unbound_items = unbound_runnable_item_count > 0
         if has_runnable_unbound_items or has_incomplete_stage:
             tail_control_mode = "execution_takeover"
@@ -5381,6 +5396,8 @@ class TaskManager:
             cleared_business_stages = await self._cleanup_streaming_retry_descendants(db, task, target_stage, retry_items)
             cleared_archive_stages = list(cleared_business_stages)
             validation_affected_stages = [target_stage]
+            if target_stage == "entry_analysis":
+                self._clear_stage_output_artifacts(task, [target_stage])
             for downstream_stage in cleared_business_stages:
                 downstream_run = db.query(BinarySecurityStageRun).filter(
                     BinarySecurityStageRun.task_id == task.id,
@@ -5680,6 +5697,7 @@ class TaskManager:
         ]
         self._clear_task_failure_state(task)
         self._clear_stage_outputs_from(task, target_stage, mark_stale=False)
+        self._clear_stage_output_artifacts(task, affected_stages)
         deleted_archive_job_count = self._delete_archive_children_for_stages(db, task, affected_stages)
         deleted_stage_item_count = self._delete_stage_items_for_stages(db, task.id, affected_stages)
         deleted_state_event_count = self._delete_state_event_rows_for_stages(db, task.id, affected_stages)
@@ -12364,6 +12382,18 @@ class TaskManager:
             and current_downstream_task_id
             and payload_downstream_task_id != current_downstream_task_id
         ):
+            self._mark_stage_item_sync_observation(
+                item,
+                sync_status="binding_mismatch",
+                synced_at=_now(),
+                error_message="旧 child 的下游状态事件已被忽略",
+                error_type="binding_mismatch",
+                status_raw=self._string_or_none(payload.get("downstream_status") or downstream_payload.get("status")),
+                mapped_status=mapped_status,
+                downstream_status=self._string_or_none(payload.get("downstream_status") or downstream_payload.get("status")),
+                state_applied=False,
+                last_sync_result="error",
+            )
             self._record_binding_mismatch_event(
                 db,
                 task,
@@ -12380,6 +12410,18 @@ class TaskManager:
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
             return
         if not self._payload_matches_current_child(item, downstream_payload or payload):
+            self._mark_stage_item_sync_observation(
+                item,
+                sync_status="binding_mismatch",
+                synced_at=_now(),
+                error_message="旧 child 的下游状态事件已被忽略",
+                error_type="binding_mismatch",
+                status_raw=self._string_or_none(payload.get("downstream_status") or downstream_payload.get("status")),
+                mapped_status=mapped_status,
+                downstream_status=self._string_or_none(payload.get("downstream_status") or downstream_payload.get("status")),
+                state_applied=False,
+                last_sync_result="error",
+            )
             self._record_binding_mismatch_event(
                 db,
                 task,
@@ -16118,7 +16160,7 @@ class TaskManager:
             task.lease_expires_at = None
             task.finished_at = None
             task.last_error = None
-            if self._is_streaming_tail_stage(task, active_stage_name):
+            if self._is_streaming_tail_stage(task, active_stage_name) and self._should_enter_tail_reconciliation(db, task):
                 task.status = "running"
                 self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TAIL_RECONCILIATION)
                 task.tail_reconcile_state = "idle"
@@ -16913,6 +16955,10 @@ class TaskManager:
         if self._tail_requires_execution_takeover(db, task):
             self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
             task.tail_reconcile_state = "idle"
+            if not self._should_preserve_task_dispatch_ownership(task, previous_status=previous_status):
+                task.dispatcher_instance_id = None
+                task.dispatch_started_at = None
+                task.lease_expires_at = None
         else:
             self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TAIL_RECONCILIATION)
             task.dispatcher_instance_id = None
@@ -22618,7 +22664,8 @@ class TaskManager:
                     previous_status=current_status,
                 )
                 return
-            if not self._can_preserve_dispatching_state(db, task, stage_runs=stage_runs):
+            preserve_dispatching = self._can_preserve_dispatching_state(db, task, stage_runs=stage_runs)
+            if str(current_status or "").strip() == "dispatching" and not preserve_dispatching:
                 failed_stage_run = next((run for run in stage_runs if str(run.status or "").strip() == "failed"), None)
                 if failed_stage_run is not None:
                     failure_snapshot = self._stage_failure_snapshot(task, failed_stage_run)
@@ -22645,7 +22692,9 @@ class TaskManager:
                 else:
                     self._set_task_runtime_phase(
                         task,
-                        TASK_RUNTIME_PHASE_TAIL_RECONCILIATION if self._is_streaming_tail_stage(task, task.current_stage) else TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                        TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
+                        if self._is_streaming_tail_stage(task, task.current_stage) and self._should_enter_tail_reconciliation(db, task)
+                        else TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                     )
                     task.dispatcher_instance_id = None
                     task.dispatch_started_at = None
@@ -22666,7 +22715,9 @@ class TaskManager:
                 else:
                     self._set_task_runtime_phase(
                         task,
-                        TASK_RUNTIME_PHASE_TAIL_RECONCILIATION if self._is_streaming_tail_stage(task, task.current_stage) else TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                        TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
+                        if self._is_streaming_tail_stage(task, task.current_stage) and self._should_enter_tail_reconciliation(db, task)
+                        else TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                     )
             if not preserve_dispatch:
                 if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
@@ -22741,17 +22792,23 @@ class TaskManager:
                 self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
                 task.tail_reconcile_state = "idle"
             else:
-                self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TAIL_RECONCILIATION)
+                self._set_task_runtime_phase(
+                    task,
+                    TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
+                    if self._should_enter_tail_reconciliation(db, task)
+                    else TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                )
                 task.dispatcher_instance_id = None
                 task.dispatch_started_at = None
                 task.lease_expires_at = None
-                self._activate_tail_reconciliation(
-                    db,
-                    task,
-                    now_value=_now(),
-                    fallback_status="pending",
-                    takeover_result="refresh",
-                )
+                if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+                    self._activate_tail_reconciliation(
+                        db,
+                        task,
+                        now_value=_now(),
+                        fallback_status="pending",
+                        takeover_result="refresh",
+                    )
             return
         next_stage = self._next_incomplete_stage(db, task)
         if stage_retry_mode and preferred_retry_next_stage:
@@ -22783,7 +22840,9 @@ class TaskManager:
             else:
                 self._set_task_runtime_phase(
                     task,
-                    TASK_RUNTIME_PHASE_TAIL_RECONCILIATION if self._is_streaming_tail_stage(task, failed_stage_run.stage_name) else TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                    TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
+                    if self._is_streaming_tail_stage(task, failed_stage_run.stage_name) and self._should_enter_tail_reconciliation(db, task)
+                    else TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                 )
                 task.dispatcher_instance_id = None
                 task.dispatch_started_at = None
@@ -22819,7 +22878,9 @@ class TaskManager:
             else:
                 self._set_task_runtime_phase(
                     task,
-                    TASK_RUNTIME_PHASE_TAIL_RECONCILIATION if self._is_streaming_tail_stage(task, next_stage) else TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                    TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
+                    if self._is_streaming_tail_stage(task, next_stage) and self._should_enter_tail_reconciliation(db, task)
+                    else TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                 )
                 task.dispatcher_instance_id = None
                 task.dispatch_started_at = None
@@ -25726,14 +25787,18 @@ class TaskManager:
             for downstream_service in STAGE_OUTPUT_SERVICES.get(stage_name, []):
                 services.add(downstream_service)
         for downstream_service in services:
-            folder = SERVICE_OUTPUT_FOLDERS.get(downstream_service, downstream_service.replace("_", "-"))
-            target = output_root / folder
-            if target.exists():
-                try:
-                    shutil.rmtree(target, ignore_errors=True)
-                except OSError as exc:
-                    if exc.errno != errno.ESTALE:
-                        raise
+            folder_names = [
+                SERVICE_OUTPUT_FOLDERS.get(downstream_service, downstream_service.replace("_", "-")),
+                *LEGACY_SERVICE_OUTPUT_FOLDERS.get(downstream_service, ()),
+            ]
+            for folder in folder_names:
+                target = output_root / folder
+                if target.exists():
+                    try:
+                        shutil.rmtree(target, ignore_errors=True)
+                    except OSError as exc:
+                        if exc.errno != errno.ESTALE:
+                            raise
 
     def _delete_archive_root_path(self, task: BinarySecurityTask, archive_root: str | Path | None) -> bool:
         raw = str(archive_root or "").strip()
@@ -25742,13 +25807,16 @@ class TaskManager:
         try:
             target = Path(raw).resolve()
             output_root = Path(str(task.output_root or "")).resolve()
+            workspace_root = Path(str(task.workspace_root or "")).resolve()
         except Exception:
             return False
         if not output_root or not str(output_root).strip():
             return False
         if target == output_root:
             return False
-        if not _is_within_path(output_root, target):
+        within_output_root = _is_within_path(output_root, target)
+        within_workspace_root = bool(str(task.workspace_root or "").strip()) and _is_within_path(workspace_root, target)
+        if not within_output_root and not within_workspace_root:
             return False
         if not target.exists() and not target.is_symlink():
             return False

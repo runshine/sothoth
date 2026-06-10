@@ -2468,12 +2468,12 @@ class TaskManagerTests(unittest.TestCase):
             detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
             observability = self.manager.get_orchestration_observability(db, project_id="p1", task_id="t1")
 
-            self.assertEqual("pending", task.status)
+            self.assertEqual("running", task.status)
             self.assertEqual("processed", terminal_event.status)
             self.assertEqual("processed", downstream_event.status)
             self.assertEqual("downstream_missing", dataflow_item.status)
             self.assertEqual("downstream_missing", detail.stage_summaries[2].status)
-            self.assertEqual("pending", detail.status)
+            self.assertEqual("running", detail.status)
             self.assertEqual("downstream_missing", detail.stage_items[0].abnormal_reason.code)
             self.assertIsInstance(detail.overview_nodes, list)
             self.assertFalse(detail.manual_operation_state["can_retry"])
@@ -2576,10 +2576,10 @@ class TaskManagerTests(unittest.TestCase):
                 self.manager._release_task_state_lease = original_release
 
             detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
-            self.assertEqual("pending", task.status)
+            self.assertEqual("running", task.status)
             self.assertEqual("failed", dataflow_item.status)
             self.assertEqual("failed", detail.stage_summaries[2].status)
-            self.assertEqual("pending", detail.status)
+            self.assertEqual("running", detail.status)
             self.assertEqual("downstream_failed", detail.stage_items[0].abnormal_reason.code)
             self.assertFalse(detail.manual_operation_state["can_retry"])
             self.assertTrue(any(row.event_type == "downstream_status_event_applied" for row in db.events))
@@ -2664,13 +2664,13 @@ class TaskManagerTests(unittest.TestCase):
 
             detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
             observability = self.manager.get_orchestration_observability(db, project_id="p1", task_id="t1")
-            self.assertEqual("pending", task.status)
+            self.assertEqual("running", task.status)
             self.assertEqual("success", vuln_item.status)
             self.assertEqual(
                 "success",
                 next(summary.status for summary in detail.stage_summaries if summary.stage_name == "dataflow_vuln_scan"),
             )
-            self.assertEqual("pending", detail.status)
+            self.assertEqual("running", detail.status)
             self.assertFalse(detail.manual_operation_state["can_retry"])
             self.assertEqual(1, observability["state_events"]["status_counts"]["processed"])
             self.assertTrue(any(row.event_type == "downstream_status_event_applied" for row in db.events))
@@ -2818,7 +2818,7 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual("running", task.status)
         self.assertEqual("dataflow_vuln_scan", task.current_stage)
-        self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, self.manager._task_runtime_phase(task))
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertIsNone(task.finished_at)
         self.assertIsNone(task.last_error)
         self.assertEqual("pending", dataflow_run.status)
@@ -2889,7 +2889,7 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertEqual("running", task.status)
-        self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, self.manager._task_runtime_phase(task))
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertFalse(any(row.event_type == "task_requeued_after_downstream_sync" and row.stage_name == "dataflow_vuln_scan" for row in db.events))
 
     def test_finalize_task_defers_incomplete_stage_instead_of_failed_terminal(self):
@@ -2947,9 +2947,9 @@ class TaskManagerTests(unittest.TestCase):
 
         self.manager._finalize_task(db, task)
 
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual("dataflow_vuln_scan", task.current_stage)
-        self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, self.manager._task_runtime_phase(task))
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertIsNone(task.finished_at)
         self.assertTrue(
             any(
@@ -2993,7 +2993,7 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual("running", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
-        self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, self.manager._task_runtime_phase(task))
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertIsNone(task.dispatch_started_at)
         self.assertIsNone(task.lease_expires_at)
@@ -5676,7 +5676,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("running", task.status)
         self.assertEqual("dataflow_vuln_scan", task.current_stage)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
-        self.assertEqual("idle", task.tail_reconcile_state)
+        self.assertIsNone(task.tail_reconcile_state)
         self.assertTrue(
             any(
                 isinstance(obj, BinarySecurityEvent) and obj.event_type == "task_finalize_deferred_for_active_stage"
@@ -25003,11 +25003,14 @@ def _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_l
         manager._refresh_task_status_after_sync(db, task)
 
     self.assertEqual("running", task.status)
-    self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
-    self.assertEqual("worker-z", task.dispatcher_instance_id)
+    self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, task.runtime_phase)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertFalse(bool(task.dispatch_started_at))
+    self.assertFalse(bool(task.lease_expires_at))
+    self.assertEqual("handoff_waiting", task.tail_reconcile_state)
     recovered_events = [event for event in db.events if event.event_type == "streaming_parent_state_recovered"]
     self.assertTrue(recovered_events)
-    self.assertFalse(recovered_events[-1].payload.get("runtime_lease_established"))
+    self.assertTrue(recovered_events[-1].payload.get("runtime_lease_established"))
 
 
 def _test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_task(self):
@@ -25811,9 +25814,11 @@ def _test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent(s
 
     self.assertEqual("running", task.status)
     self.assertEqual("entry_analysis", task.current_stage)
-    self.assertEqual("worker-z", task.dispatcher_instance_id)
-    self.assertIsNotNone(task.dispatch_started_at)
-    self.assertIsNotNone(task.lease_expires_at)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+    self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, task.runtime_phase)
+    self.assertEqual("active", task.tail_reconcile_state)
     self.assertTrue(any(event.event_type == "streaming_parent_state_recovered" for event in db.events))
 
 

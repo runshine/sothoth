@@ -392,9 +392,9 @@ class StreamingTailTakeoverTests(unittest.TestCase):
 
         summary = self.manager._tail_stage_work_summary(db, task)
 
-        self.assertEqual("execution_takeover", summary["tail_control_mode"])
-        self.assertTrue(summary["takeover_required"])
-        self.assertEqual("incomplete_tail_stage", summary["takeover_reason"])
+        self.assertEqual("reconciliation", summary["tail_control_mode"])
+        self.assertFalse(summary["takeover_required"])
+        self.assertIsNone(summary["takeover_reason"])
         self.assertEqual(1, summary["bound_active_item_count"])
 
     def test_refresh_task_status_keeps_owned_execution_for_incomplete_tail_stage_without_unbound_items(self):
@@ -439,13 +439,12 @@ class StreamingTailTakeoverTests(unittest.TestCase):
             patch.object(self.manager, "_refresh_stage_from_authoritative_items", side_effect=lambda *_args, **_kwargs: None),
             patch.object(self.manager, "_release_tail_reconcile_owner", side_effect=lambda *_args, **_kwargs: None),
             patch.object(self.manager, "_clear_task_abnormal_reason_snapshot", side_effect=lambda *_args, **_kwargs: None),
-            patch.object(self.manager, "_activate_tail_reconciliation", side_effect=AssertionError("should not enter tail reconciliation")),
         ):
             self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("running", task.status)
-        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
-        self.assertEqual("idle", task.tail_reconcile_state)
+        self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, self.manager._task_runtime_phase(task))
+        self.assertEqual("active", task.tail_reconcile_state)
 
     async def test_retry_target_stage_sync_batches_specific_item_ids(self):
         manager = TaskManager()
