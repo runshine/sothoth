@@ -847,6 +847,7 @@ async def create_project_input_upload(
     project_id: str = Form(...),
     input_type: str = Form(...),
     keep_original: bool = Form(False),
+    upload_mode: str = Form(""),
     files: List[UploadFile] = File(...),
     current_user: TokenUser = Depends(get_current_user),
     authorization: Optional[str] = Header(None),
@@ -854,6 +855,7 @@ async def create_project_input_upload(
 ):
     await verify_project_access(project_id, authorization)
     validated_type = validate_project_input_type(input_type)
+    keep_original = normalize_project_input_keep_original(keep_original, upload_mode)
     if not files:
         raise ValidationError("至少上传一个文件")
     for file in files:
@@ -922,6 +924,7 @@ async def create_project_input_upload(
 async def append_project_input_upload(
     upload_id: str,
     keep_original: bool = Form(False),
+    upload_mode: str = Form(""),
     files: List[UploadFile] = File(...),
     current_user: TokenUser = Depends(get_current_user),
     authorization: Optional[str] = Header(None),
@@ -936,6 +939,7 @@ async def append_project_input_upload(
     await verify_project_access(record.project_id, authorization)
     if record.status in {"pending", "processing"}:
         raise ConflictError("当前上传记录仍在处理中，暂不支持追加")
+    keep_original = normalize_project_input_keep_original(keep_original, upload_mode)
     for file in files:
         if not keep_original:
             ensure_allowed_project_input_file(file.filename or "")
@@ -1038,6 +1042,15 @@ def validate_project_input_type(input_type: str) -> str:
     if value not in PROJECT_INPUT_ALLOWED_TYPES:
         raise ValidationError("input_type 仅支持 code/document/software/other")
     return value
+
+
+def normalize_project_input_keep_original(keep_original: bool, upload_mode: str) -> bool:
+    mode = (upload_mode or "").strip().lower()
+    if mode in {"raw", "raw_mode", "original", "keep_original", "keep-original"}:
+        return True
+    if mode in {"archive", "zip", "extract", "unzip"}:
+        return False
+    return bool(keep_original)
 
 
 def get_project_input_upload_record_or_404(db: Session, project_id: str, upload_id: str) -> ProjectInputUploadRecord:

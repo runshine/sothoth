@@ -172,3 +172,24 @@ def test_project_input_upload_allows_raw_file_when_keep_original_enabled(tmp_pat
         payload = upload_detail.json()
         assert payload["keep_original"] is True
         assert payload["stored_file_count"] == 1
+
+
+def test_project_input_upload_accepts_raw_mode_without_archive_suffix(tmp_path, monkeypatch):
+    with build_client(tmp_path, monkeypatch) as client:
+        headers = {"Authorization": "Bearer fake-token"}
+        response = client.post(
+            "/api/fileserver/project-input/uploads",
+            headers=headers,
+            data={
+                "project_id": "demo-project",
+                "input_type": "software",
+                "keep_original": "false",
+                "upload_mode": "raw",
+            },
+            files={"files": ("demo.bin", _raw_bytes(), "application/octet-stream")},
+        )
+        assert response.status_code == 200
+        upload_id = response.json()["upload_id"]
+        detail = _wait_upload_done(client, upload_id, headers)
+        assert detail["status"] == "succeeded"
+        assert detail["keep_original"] is True
