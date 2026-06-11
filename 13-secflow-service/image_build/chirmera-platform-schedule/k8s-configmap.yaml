@@ -23,6 +23,22 @@ data:
       base_url: "http://secflow-platform-project"
       get_project_path: "/api/project/projects"
 
+    aigw_service:
+      base_url: "http://gaiasec-llm-gateway"
+      llm_keys_path: "/api/aigw/llm-keys"
+      management_bearer_token: ""
+
+    user_task_dispatch_policy:
+      binary_firmware_e2e:
+        capacity_pool_ids: [1]
+        root_task_key_max_concurrency: 0
+      source_scan_e2e:
+        capacity_pool_ids: [1]
+        root_task_key_max_concurrency: 0
+      binary_module_e2e:
+        capacity_pool_ids: [1]
+        root_task_key_max_concurrency: 0
+
     registry:
       enabled: true
       service_id: "chirmera-platform-schedule"

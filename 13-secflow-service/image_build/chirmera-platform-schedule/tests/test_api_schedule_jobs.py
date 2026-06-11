@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 
@@ -27,16 +28,6 @@ def _resolved_input(target_path: str = "/data/files/proj1/user_input/software/up
         "latest_batch_id": "batch-001",
         "display_name": "/user_input/software/upload-001",
     })()
-
-
-def _task_key_payload():
-    return {
-        "parent_task_key_id": "tk-123",
-        "parent_task_key_name": "parent-task-key",
-        "parent_task_key_prefix": "tsk_parent",
-        "parent_task_key_secret": "tsk_secret_value",
-        "parent_task_capacity_pool_ids": [1, 2],
-    }
 
 
 def test_schedule_job_crud_and_trigger(client):
@@ -89,7 +80,6 @@ def test_user_task_create_requires_single_file_binding(client):
         },
         "policy": {},
         "dispatch_policy": {},
-        **_task_key_payload(),
     }
     with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
         auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
@@ -132,7 +122,6 @@ def test_user_task_rejects_directory_for_firmware_file_mode(client):
         },
         "policy": {},
         "dispatch_policy": {},
-        **_task_key_payload(),
     }
     with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
         auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
@@ -162,7 +151,6 @@ def test_user_task_rejects_file_for_source_directory_mode(client):
         },
         "policy": {},
         "dispatch_policy": {},
-        **_task_key_payload(),
     }
     with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
         auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
@@ -193,7 +181,6 @@ def test_user_task_requires_module_name_for_binary_module(client):
         },
         "policy": {},
         "dispatch_policy": {},
-        **_task_key_payload(),
     }
     with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
         auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
@@ -230,7 +217,6 @@ def test_user_task_dispatch_uses_persisted_module_name_and_selected_files(client
         },
         "policy": {},
         "dispatch_policy": {},
-        **_task_key_payload(),
     }
 
     def fake_path(value: str):
@@ -260,6 +246,7 @@ def test_user_task_dispatch_uses_persisted_module_name_and_selected_files(client
                      "name": "b.bin",
                  },
              ])), \
+             patch("app.service.user_task_manager.UserTaskManager._aigw_management_token", return_value="mgmt-token"), \
              patch("app.service.user_task_manager.AiGatewayTaskKeyClient.create_task_key", new=AsyncMock(return_value={"key": {"id": "tk-dispatch-1", "key_name": "dispatch-key", "key_prefix": "tsk_dispatch", "capacity_pool_ids": [1, 2]}, "secret": "tsk_dispatch_secret"})), \
              patch("app.service.user_task_manager.BinarySecurityDispatchClient.create_task", new=fake_create_task), \
              patch("app.service.user_task_manager.BinarySecurityDispatchClient.complete_uploads", new=AsyncMock(return_value={"ok": True})), \
@@ -290,9 +277,65 @@ def test_user_task_dispatch_uses_persisted_module_name_and_selected_files(client
             )
             assert dispatch_resp.status_code == 200, dispatch_resp.text
             dispatch_body = dispatch_resp.json()
+            assert dispatch_body["root_task_key_id"] == "tk-dispatch-1"
+            assert dispatch_body["root_task_key_prefix"] == "tsk_dispatch"
             assert dispatch_body["dispatched_task_key_id"] == "tk-dispatch-1"
             assert dispatch_body["dispatched_task_key_prefix"] == "tsk_dispatch"
 
     assert forwarded_payloads
     assert forwarded_payloads[0]["module_name"] == "libcrypto"
     assert [item["relative_path"] for item in forwarded_payloads[0]["input_files"]] == ["mods/a.bin", "mods/b.bin"]
+
+
+def test_user_task_dispatch_fails_without_capacity_pool_policy(client, tmp_path):
+    source_root = tmp_path / "upload-root"
+    source_root.mkdir(parents=True)
+    (source_root / "firmware.bin").write_bytes(b"firmware")
+    payload = {
+        "task_type": "binary_firmware_e2e",
+        "name": "firmware-task-policy-missing",
+        "description": "demo",
+        "input_upload_ids": ["upload-001"],
+        "input_binding": {
+            "upload_id": "upload-001",
+            "selection_type": "file",
+            "relative_path": "firmware.bin",
+        },
+        "policy": {},
+        "dispatch_policy": {},
+    }
+
+    broken_config = SimpleNamespace(
+        user_task_dispatch_policy=SimpleNamespace(
+            binary_firmware_e2e=SimpleNamespace(
+                capacity_pool_ids=[],
+                root_task_key_max_concurrency=0,
+                root_task_key_expires_at=None,
+            ),
+        ),
+        aigw_service=SimpleNamespace(management_bearer_token="mgmt-token"),
+        auth_service=SimpleNamespace(service_machine_token=""),
+    )
+
+    with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
+        auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
+        project_factory.return_value.require_access = AsyncMock(side_effect=_fake_require_access)
+        with patch("app.service.user_task_manager.ProjectInputResolver.resolve_single", new=AsyncMock(return_value=_resolved_input(str(source_root)))), \
+             patch("app.service.user_task_manager.ProjectInputResolver.resolve_path", new=AsyncMock(return_value={
+                 "relative_path": "firmware.bin",
+                 "absolute_path": str(source_root / "firmware.bin"),
+                 "node_type": "file",
+                 "name": "firmware.bin",
+             })), \
+             patch("app.service.user_task_manager.get_config", return_value=broken_config):
+            create_resp = client.post("/api/chirmera-platform-schedule/projects/proj1/user-tasks", json=payload, headers=_auth_headers())
+            assert create_resp.status_code == 200, create_resp.text
+            task_id = create_resp.json()["id"]
+            dispatch_resp = client.post(
+                f"/api/chirmera-platform-schedule/projects/proj1/user-tasks/{task_id}/dispatch",
+                json={"force": False},
+                headers=_auth_headers(),
+            )
+
+    assert dispatch_resp.status_code == 400
+    assert "capacity_pool_ids" in dispatch_resp.text

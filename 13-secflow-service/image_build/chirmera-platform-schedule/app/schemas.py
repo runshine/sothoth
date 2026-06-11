@@ -331,14 +331,9 @@ class UserTaskCreateRequest(BaseModel):
     input_binding: Optional[UserTaskInputBindingRequest] = None
     policy: dict[str, Any] = Field(default_factory=dict)
     dispatch_policy: dict[str, Any] = Field(default_factory=dict)
-    parent_task_key_id: str
-    parent_task_key_name: str
-    parent_task_key_prefix: str
-    parent_task_key_secret: str
-    parent_task_capacity_pool_ids: list[int] = Field(default_factory=list)
     module_name: Optional[str] = None
 
-    @field_validator("name", "parent_task_key_id", "parent_task_key_name", "parent_task_key_prefix", "parent_task_key_secret")
+    @field_validator("name")
     @classmethod
     def validate_non_empty(cls, value: str) -> str:
         value = str(value or "").strip()
@@ -356,6 +351,10 @@ class UserTaskDispatchResponse(BaseModel):
     user_task_id: str
     project_id: str
     dispatch_status: str
+    root_task_key_id: Optional[str] = None
+    root_task_key_name: Optional[str] = None
+    root_task_key_prefix: Optional[str] = None
+    root_task_capacity_pool_ids: list[int] = Field(default_factory=list)
     dispatched_task_key_id: Optional[str] = None
     dispatched_task_key_name: Optional[str] = None
     dispatched_task_key_prefix: Optional[str] = None
@@ -379,10 +378,14 @@ class UserTaskResponse(BaseModel):
     business_status: str
     input_upload_count: int = 0
     inputs: list[UserTaskInputBindingResponse] = Field(default_factory=list)
-    parent_task_key_id: str
-    parent_task_key_name: str
-    parent_task_key_prefix: str
+    parent_task_key_id: Optional[str] = None
+    parent_task_key_name: Optional[str] = None
+    parent_task_key_prefix: Optional[str] = None
     parent_task_capacity_pool_ids: list[int] = Field(default_factory=list)
+    root_task_key_id: Optional[str] = None
+    root_task_key_name: Optional[str] = None
+    root_task_key_prefix: Optional[str] = None
+    root_task_capacity_pool_ids: list[int] = Field(default_factory=list)
     dispatched_task_key_id: Optional[str] = None
     dispatched_task_key_name: Optional[str] = None
     dispatched_task_key_prefix: Optional[str] = None

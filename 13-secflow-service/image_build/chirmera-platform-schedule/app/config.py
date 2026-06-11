@@ -56,6 +56,7 @@ class FileserverServiceConfig(BaseModel):
 class AiGatewayServiceConfig(BaseModel):
     base_url: str = "http://gaiasec-llm-gateway"
     llm_keys_path: str = "/api/aigw/llm-keys"
+    management_bearer_token: Optional[str] = None
     timeout: int = 30
 
 
@@ -66,6 +67,18 @@ class SecurityConfig(BaseModel):
 class BinarySecurityServiceConfig(BaseModel):
     base_url: str = "http://secflow-app-binary-security"
     timeout: int = 120
+
+
+class RootTaskKeyPolicyConfig(BaseModel):
+    capacity_pool_ids: list[int] = Field(default_factory=list)
+    root_task_key_max_concurrency: int = 0
+    root_task_key_expires_at: Optional[str] = None
+
+
+class UserTaskDispatchPolicyConfig(BaseModel):
+    binary_firmware_e2e: RootTaskKeyPolicyConfig = Field(default_factory=RootTaskKeyPolicyConfig)
+    source_scan_e2e: RootTaskKeyPolicyConfig = Field(default_factory=RootTaskKeyPolicyConfig)
+    binary_module_e2e: RootTaskKeyPolicyConfig = Field(default_factory=RootTaskKeyPolicyConfig)
 
 
 class MenuLevelConfig(BaseModel):
@@ -182,6 +195,7 @@ class Config(BaseModel):
     aigw_service: AiGatewayServiceConfig = Field(default_factory=AiGatewayServiceConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     binary_security_service: BinarySecurityServiceConfig = Field(default_factory=BinarySecurityServiceConfig)
+    user_task_dispatch_policy: UserTaskDispatchPolicyConfig = Field(default_factory=UserTaskDispatchPolicyConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
     app: AppConfig = Field(default_factory=AppConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)

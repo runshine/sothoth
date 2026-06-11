@@ -43,6 +43,8 @@ TASK_TYPE_DETAIL_VIEW: dict[str, str] = {
     "binary_module_e2e": "binary-module-security-detail",
 }
 
+CREATE_TIME_PARENT_TASK_KEY_PLACEHOLDER = "__dispatch_managed__"
+
 
 @dataclass
 class ResolvedInputRecord:
@@ -145,35 +147,41 @@ class AiGatewayTaskKeyClient:
     async def create_task_key(
         self,
         *,
-        bearer_token: str,
+        management_token: str,
         task_id: str,
         dispatch_id: str,
         capacity_pool_ids: list[int],
+        max_concurrency: int = 0,
+        expires_at: Optional[str] = None,
     ) -> dict[str, Any]:
         if not capacity_pool_ids:
-            raise ValidationError("父 task key 缺少 capacity_pool_ids，无法派生 dispatch task key")
+            raise ValidationError("root task key 缺少 capacity_pool_ids，无法创建")
+        if not str(management_token or "").strip():
+            raise ValidationError("缺少 AI Gateway 管理凭证，无法创建 root task key")
         client = await get_shared_async_client("schedule-aigw", timeout=self.cfg.timeout)
         payload = {
             "key_name": f"dispatch-{task_id}-{dispatch_id}",
             "key_type": "task",
             "task_id": task_id,
-            "max_concurrency": 0,
+            "max_concurrency": max_concurrency,
             "enabled": True,
             "capacity_pool_ids": capacity_pool_ids,
-            "description": f"dispatch task key for {task_id}/{dispatch_id}",
+            "description": f"root task key for {task_id}/{dispatch_id}",
         }
+        if expires_at:
+            payload["expires_at"] = expires_at
         try:
             response = await client.post(
                 f"{self.cfg.base_url.rstrip('/')}{self.cfg.llm_keys_path}",
                 json=payload,
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {bearer_token}"},
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {management_token}"},
             )
         except httpx.TimeoutException as exc:
-            raise UpstreamError("申请 dispatch task key 超时") from exc
+            raise UpstreamError("创建 root task key 超时") from exc
         except httpx.RequestError as exc:
-            raise UpstreamError(f"申请 dispatch task key 失败: {exc}") from exc
+            raise UpstreamError(f"创建 root task key 失败: {exc}") from exc
         if response.status_code not in (200, 201):
-            raise UpstreamError(f"申请 dispatch task key 失败: {response.status_code}")
+            raise UpstreamError(f"创建 root task key 失败: {response.status_code}")
         return response.json()
 
 
@@ -226,6 +234,33 @@ class UserTaskManager:
         self.aigw = AiGatewayTaskKeyClient()
         self.binary_security = BinarySecurityDispatchClient()
 
+    def _dispatch_policy_for_task_type(self, task_type: str):
+        policies = get_config().user_task_dispatch_policy
+        policy = getattr(policies, task_type, None)
+        if policy is None:
+            raise ValidationError(f"任务类型缺少分发策略配置: {task_type}")
+        if not list(policy.capacity_pool_ids or []):
+            raise ValidationError(f"任务类型缺少 capacity_pool_ids 配置: {task_type}")
+        return policy
+
+    def _aigw_management_token(self) -> str:
+        config = get_config()
+        token = str(
+            config.aigw_service.management_bearer_token
+            or config.auth_service.service_machine_token
+            or ""
+        ).strip()
+        if not token:
+            raise ValidationError("缺少 AI Gateway 管理凭证配置，无法创建 root task key")
+        return token
+
+    @staticmethod
+    def _compat_parent_task_key_value(value: Optional[str]) -> Optional[str]:
+        raw = str(value or "").strip()
+        if not raw or raw == CREATE_TIME_PARENT_TASK_KEY_PLACEHOLDER:
+            return None
+        return raw
+
     def get_task_or_404(self, db: Session, project_id: str, task_id: str) -> ScheduleUserTask:
         task = db.query(ScheduleUserTask).filter(
             ScheduleUserTask.project_id == project_id,
@@ -277,10 +312,14 @@ class UserTaskManager:
                 }
                 for item in bindings
             ],
-            "parent_task_key_id": task.parent_task_key_id,
-            "parent_task_key_name": task.parent_task_key_name,
-            "parent_task_key_prefix": task.parent_task_key_prefix,
+            "parent_task_key_id": self._compat_parent_task_key_value(task.parent_task_key_id),
+            "parent_task_key_name": self._compat_parent_task_key_value(task.parent_task_key_name),
+            "parent_task_key_prefix": self._compat_parent_task_key_value(task.parent_task_key_prefix),
             "parent_task_capacity_pool_ids": list(task.parent_task_capacity_pool_ids or []),
+            "root_task_key_id": getattr(latest_dispatch, "dispatched_task_key_id", None),
+            "root_task_key_name": getattr(latest_dispatch, "dispatched_task_key_name", None),
+            "root_task_key_prefix": getattr(latest_dispatch, "dispatched_task_key_prefix", None),
+            "root_task_capacity_pool_ids": list(getattr(latest_dispatch, "dispatched_task_capacity_pool_ids", []) or []),
             "dispatched_task_key_id": getattr(latest_dispatch, "dispatched_task_key_id", None),
             "dispatched_task_key_name": getattr(latest_dispatch, "dispatched_task_key_name", None),
             "dispatched_task_key_prefix": getattr(latest_dispatch, "dispatched_task_key_prefix", None),
@@ -347,8 +386,6 @@ class UserTaskManager:
             raise ValidationError("所选任务输入尚未准备完成")
         if payload.task_type == "binary_module_e2e" and not str(payload.module_name or "").strip():
             raise ValidationError("二进制模块任务必须填写模块名")
-        if not payload.parent_task_capacity_pool_ids:
-            raise ValidationError("父 task key 必须提供至少一个 capacity pool")
 
         selection_type = self._task_selection_type(payload.task_type)
         input_binding_payload = payload.input_binding
@@ -398,8 +435,9 @@ class UserTaskManager:
             resolved_path = str(node.get("absolute_path") or "").strip()
             display_name = str(node.get("name") or resolved_relative_path or display_name)
 
+        compatibility_parent_secret = f"{CREATE_TIME_PARENT_TASK_KEY_PLACEHOLDER}:{payload.task_type}"
         parent_task_key_secret_cipher, parent_task_key_secret_nonce, parent_task_key_secret_version = self.task_key_cipher.encrypt(
-            payload.parent_task_key_secret
+            compatibility_parent_secret
         )
 
         task = ScheduleUserTask(
@@ -411,10 +449,10 @@ class UserTaskManager:
             create_status="created",
             dispatch_status="ready_for_dispatch",
             business_status="created",
-            parent_task_key_id=payload.parent_task_key_id,
-            parent_task_key_name=payload.parent_task_key_name,
-            parent_task_key_prefix=payload.parent_task_key_prefix,
-            parent_task_capacity_pool_ids=list(payload.parent_task_capacity_pool_ids or []),
+            parent_task_key_id=CREATE_TIME_PARENT_TASK_KEY_PLACEHOLDER,
+            parent_task_key_name=CREATE_TIME_PARENT_TASK_KEY_PLACEHOLDER,
+            parent_task_key_prefix=CREATE_TIME_PARENT_TASK_KEY_PLACEHOLDER,
+            parent_task_capacity_pool_ids=[],
             parent_task_key_secret_cipher=parent_task_key_secret_cipher,
             parent_task_key_secret_nonce=parent_task_key_secret_nonce,
             parent_task_key_secret_version=parent_task_key_secret_version,
@@ -463,21 +501,19 @@ class UserTaskManager:
         db.refresh(dispatch)
 
         try:
-            parent_task_key_secret = self.task_key_cipher.decrypt(
-                cipher_text=task.parent_task_key_secret_cipher,
-                nonce=task.parent_task_key_secret_nonce,
-                version=task.parent_task_key_secret_version,
-            )
+            dispatch_policy = self._dispatch_policy_for_task_type(task.task_type)
             dispatch_task_key_result = await self.aigw.create_task_key(
-                bearer_token=parent_task_key_secret,
+                management_token=self._aigw_management_token(),
                 task_id=task.id,
                 dispatch_id=dispatch.id,
-                capacity_pool_ids=list(task.parent_task_capacity_pool_ids or []),
+                capacity_pool_ids=list(dispatch_policy.capacity_pool_ids or []),
+                max_concurrency=int(dispatch_policy.root_task_key_max_concurrency or 0),
+                expires_at=dispatch_policy.root_task_key_expires_at,
             )
             key_payload = dispatch_task_key_result.get("key") or {}
             dispatch_secret = str(dispatch_task_key_result.get("secret") or "").strip()
             if not dispatch_secret:
-                raise UpstreamError("AI Gateway 未返回 dispatch task key secret")
+                raise UpstreamError("AI Gateway 未返回 root task key secret")
             (
                 dispatch.dispatched_task_key_secret_cipher,
                 dispatch.dispatched_task_key_secret_nonce,
@@ -486,7 +522,7 @@ class UserTaskManager:
             dispatch.dispatched_task_key_id = str(key_payload.get("id") or "")
             dispatch.dispatched_task_key_name = str(key_payload.get("key_name") or "")
             dispatch.dispatched_task_key_prefix = str(key_payload.get("key_prefix") or "")
-            dispatch.dispatched_task_capacity_pool_ids = list(key_payload.get("capacity_pool_ids") or task.parent_task_capacity_pool_ids or [])
+            dispatch.dispatched_task_capacity_pool_ids = list(key_payload.get("capacity_pool_ids") or dispatch_policy.capacity_pool_ids or [])
 
             input_binding = bindings[0]
             source_path = Path(input_binding.resolved_path or input_binding.target_path)
@@ -606,6 +642,10 @@ class UserTaskManager:
                 "user_task_id": row.user_task_id,
                 "project_id": row.project_id,
                 "dispatch_status": row.dispatch_status,
+                "root_task_key_id": row.dispatched_task_key_id,
+                "root_task_key_name": row.dispatched_task_key_name,
+                "root_task_key_prefix": row.dispatched_task_key_prefix,
+                "root_task_capacity_pool_ids": list(row.dispatched_task_capacity_pool_ids or []),
                 "dispatched_task_key_id": row.dispatched_task_key_id,
                 "dispatched_task_key_name": row.dispatched_task_key_name,
                 "dispatched_task_key_prefix": row.dispatched_task_key_prefix,
