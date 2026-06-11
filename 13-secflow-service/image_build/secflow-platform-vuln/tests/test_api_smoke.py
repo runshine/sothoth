@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 os.environ["SECFLOW_VULN_SKIP_STARTUP"] = "1"
 
 from app.main import app  # noqa: E402
-from app.api.dependencies import get_current_subject  # noqa: E402
+from app.api.dependencies import get_current_subject, get_optional_subject  # noqa: E402
 from app.api import cases as cases_api  # noqa: E402
 from app.api import actions as actions_api  # noqa: E402
 from app.api import public as public_api  # noqa: E402
@@ -185,6 +185,33 @@ def test_public_authenticated_submission_creates_case(client: TestClient):
     assert detail.json()["metadata"]["source"]["anonymous_submission"] is False
     assert detail.json()["files_root_path"] == f"/__vuln_cases__/{payload['id']}"
     assert detail.json()["fileserver_root"]["special_subproject_name"] == "__vuln_cases__"
+
+
+def test_public_anonymous_submission_creates_case(client: TestClient):
+    async def override_optional_subject_none():
+        return None
+
+    app.dependency_overrides[get_optional_subject] = override_optional_subject_none
+    try:
+        response = client.post(
+            "/api/vuln/public/intake/submissions",
+            json=make_suspicion_payload(
+                title="Anonymous submission",
+                reporter={"name": "manual-console", "version": "1.0.0", "type": "human"},
+            ),
+        )
+    finally:
+        app.dependency_overrides.pop(get_optional_subject, None)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["created_by_type"] == "human"
+    assert payload["created_by"] == "manual-console"
+
+    detail = client.get(f"/api/vuln/cases/{payload['id']}")
+    assert detail.status_code == 200
+    assert detail.json()["metadata"]["source"]["anonymous_submission"] is True
+    assert detail.json()["created_by"] == "manual-console"
 
 
 def test_draft_case_creation_returns_fileserver_root(client: TestClient):

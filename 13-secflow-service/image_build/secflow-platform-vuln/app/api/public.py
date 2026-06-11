@@ -227,6 +227,7 @@ async def submit_authenticated_submission(
     subject: dict | None = None
     token: str | None = None
     creator = request.reporter.name
+    created_by = creator
     created_by_type = "service" if getattr(request.reporter, "type", None) == "service" else "human"
 
     if requires_project_token_auth:
