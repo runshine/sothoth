@@ -465,14 +465,15 @@ class TaskManagerLeaseTests(unittest.TestCase):
         db = get_db_session()
         try:
             task = db.query(UnpackTask).filter(UnpackTask.id == "t-running-alive").first()
-            task.runner_pid = os.getpid()
+            task.runner_pid = 43210
             task.run_token = "token-current"
             task.started_at = now_local() - timedelta(seconds=300)
             db.commit()
         finally:
             db.close()
 
-        task_manager_module.recover_orphaned_tasks()
+        with patch("app.services.task_manager._is_process_alive", return_value=True):
+            task_manager_module.recover_orphaned_tasks()
 
         db = get_db_session()
         try:
