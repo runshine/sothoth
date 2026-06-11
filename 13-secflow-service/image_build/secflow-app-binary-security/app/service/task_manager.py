@@ -20382,13 +20382,13 @@ class TaskManager:
     ) -> bool:
         if self._task_runtime_phase(task) != TASK_RUNTIME_PHASE_OWNED_EXECUTION:
             return False
-        lease_owner, lease_expires_at, _lease_source, _lease_pod_uid, _lease_boot_id, _lease_generation = self._task_runtime_lease_view(db, task)
-        if lease_owner and ((_seconds_until(lease_expires_at) or 0) > 0):
+        lease_owner, lease_expires_at, lease_source, _lease_pod_uid, _lease_boot_id, _lease_generation = self._task_runtime_lease_view(db, task)
+        if lease_source == "runtime_lease" and lease_owner and ((_seconds_until(lease_expires_at) or 0) > 0):
             return True
-        dispatcher_instance_id = str(task.dispatcher_instance_id or "").strip()
-        if not dispatcher_instance_id or task.dispatch_started_at is None:
-            return False
-        return self._lease_is_active(task)
+        # Legacy task-row dispatch/lease fields can outlive the real worker that
+        # previously owned the task. For owned_execution takeover they are only
+        # diagnostic context, not sufficient proof of a live holder.
+        return False
 
     def _should_requeue_for_owned_execution(
         self,
@@ -23601,6 +23601,8 @@ class TaskManager:
         if status not in active_statuses:
             return False
         if not str(task.dispatcher_instance_id or "").strip():
+            return False
+        if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_OWNED_EXECUTION:
             return False
         return self._lease_is_active(task)
 

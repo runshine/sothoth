@@ -24836,11 +24836,69 @@ def _test_requeue_orphaned_owned_execution_locked_recovers_orphan(self):
     self.assertTrue(requeue_events)
 
 
+def _test_requeue_orphaned_owned_execution_ignores_legacy_row_lease_without_runtime_lease(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="binary-module",
+        status="running",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        current_stage="binary_to_source",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/tmp",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id="stale-worker-pod",
+        dispatch_started_at=datetime.fromisoformat("2026-06-11T20:26:44"),
+        lease_expires_at=datetime.fromisoformat("2026-06-11T20:29:43"),
+    )
+    stage_run = BinarySecurityStageRun(
+        id="sr1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="binary_to_source",
+        sequence_no=1,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_run_id="sr1",
+        stage_name="binary_to_source",
+        item_key="module1",
+        parent_key="module1",
+        status="running",
+        downstream_service="binary_to_source",
+        downstream_task_id="b2s1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], events=[])
+
+    original_enqueue = self.manager._enqueue_task
+    queued = []
+    self.manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
+    try:
+        reclaimed = self.manager._requeue_orphaned_owned_execution_locked(db)
+    finally:
+        self.manager._enqueue_task = original_enqueue
+
+    self.assertTrue(reclaimed)
+    self.assertEqual("pending", task.status)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+    self.assertEqual(["t1"], queued)
+    requeue_events = [event for event in db.events if event.event_type == "owned_execution_takeover_requeued"]
+    self.assertTrue(requeue_events)
+
+
 TaskManagerTests.test_self_healing_downstream_failure_observation_is_not_applied = _test_self_healing_downstream_failure_observation_is_not_applied
 TaskManagerTests.test_running_message_downstream_failure_observation_is_not_applied = _test_running_message_downstream_failure_observation_is_not_applied
 TaskManagerTests.test_sync_downstream_status_requeues_owned_execution_without_active_holder = _test_sync_downstream_status_requeues_owned_execution_without_active_holder
 TaskManagerTests.test_finalize_task_requeues_owned_execution_without_active_holder = _test_finalize_task_requeues_owned_execution_without_active_holder
 TaskManagerTests.test_requeue_orphaned_owned_execution_locked_recovers_orphan = _test_requeue_orphaned_owned_execution_locked_recovers_orphan
+TaskManagerTests.test_requeue_orphaned_owned_execution_ignores_legacy_row_lease_without_runtime_lease = _test_requeue_orphaned_owned_execution_ignores_legacy_row_lease_without_runtime_lease
 
 
 def _test_stage_item_response_falls_back_to_downstream_payload_status(self):
