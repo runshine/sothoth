@@ -26406,6 +26406,8 @@ class TaskManager:
         task.finished_at = None
         task.started_at = None
         task.current_stage = self._stage_sequence_for_task(task)[0]
+        self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+        task.tail_reconcile_state = "idle"
         self._invalidate_task_execution(task)
         task.summary = self._base_task_summary(task, input_files=input_files)
         task.metrics = self._base_task_metrics(task, input_files=input_files)

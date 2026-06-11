@@ -9167,6 +9167,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 output_root=str(workspace / "output"),
                 workspace_root=str(workspace),
                 execution_epoch=2,
+                runtime_phase=TASK_RUNTIME_PHASE_TERMINAL,
+                tail_reconcile_state="active",
             )
             task.summary = {
                 "input_files": [{"filename": "fw.bin", "size": 12}],
@@ -9229,6 +9231,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.manager._stage_sequence_for_task(task), stage_sequence)
             self.assertEqual(3, task.execution_epoch)
             self.assertEqual(task.current_stage, stage_sequence[0])
+            self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
+            self.assertEqual("idle", task.tail_reconcile_state)
             self.assertEqual([], db.stage_runs)
             self.assertEqual([], db.stage_items)
             self.assertEqual([], db.archive_jobs)
