@@ -69,6 +69,11 @@ class BinarySecurityServiceConfig(BaseModel):
     timeout: int = 120
 
 
+class Ai4RedServiceConfig(BaseModel):
+    base_url: str = "http://ai4red-platform-service:12345"
+    timeout: int = 120
+
+
 class RootTaskKeyPolicyConfig(BaseModel):
     capacity_pool_ids: list[int] = Field(default_factory=list)
     root_task_key_max_concurrency: int = 0
@@ -79,6 +84,7 @@ class UserTaskDispatchPolicyConfig(BaseModel):
     binary_firmware_e2e: RootTaskKeyPolicyConfig = Field(default_factory=RootTaskKeyPolicyConfig)
     source_scan_e2e: RootTaskKeyPolicyConfig = Field(default_factory=RootTaskKeyPolicyConfig)
     binary_module_e2e: RootTaskKeyPolicyConfig = Field(default_factory=RootTaskKeyPolicyConfig)
+    ai4red: RootTaskKeyPolicyConfig = Field(default_factory=RootTaskKeyPolicyConfig)
 
 
 class MenuLevelConfig(BaseModel):
@@ -195,6 +201,7 @@ class Config(BaseModel):
     aigw_service: AiGatewayServiceConfig = Field(default_factory=AiGatewayServiceConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     binary_security_service: BinarySecurityServiceConfig = Field(default_factory=BinarySecurityServiceConfig)
+    ai4red_service: Ai4RedServiceConfig = Field(default_factory=Ai4RedServiceConfig)
     user_task_dispatch_policy: UserTaskDispatchPolicyConfig = Field(default_factory=UserTaskDispatchPolicyConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
     app: AppConfig = Field(default_factory=AppConfig)

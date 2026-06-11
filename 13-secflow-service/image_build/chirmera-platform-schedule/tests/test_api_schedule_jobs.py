@@ -339,3 +339,112 @@ def test_user_task_dispatch_fails_without_capacity_pool_policy(client, tmp_path)
 
     assert dispatch_resp.status_code == 400
     assert "capacity_pool_ids" in dispatch_resp.text
+
+
+def test_ai4red_task_create_accepts_directory_binding_without_input_type_restriction(client, tmp_path):
+    deliver_dir = tmp_path / "deliver-dir"
+    deliver_dir.mkdir(parents=True)
+    payload = {
+        "task_type": "ai4red",
+        "name": "ai4red-task-a",
+        "description": "demo",
+        "input_upload_ids": ["upload-001"],
+        "input_binding": {
+            "upload_id": "upload-001",
+            "selection_type": "directory",
+            "relative_path": "deliver-dir",
+        },
+        "policy": {},
+        "dispatch_policy": {},
+    }
+    with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
+        auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
+        project_factory.return_value.require_access = AsyncMock(side_effect=_fake_require_access)
+        with patch("app.service.user_task_manager.ProjectInputResolver.resolve_single", new=AsyncMock(return_value=_resolved_input(str(tmp_path), "document"))), \
+             patch("app.service.user_task_manager.ProjectInputResolver.resolve_path", new=AsyncMock(return_value={
+                 "relative_path": "deliver-dir",
+                 "absolute_path": str(deliver_dir),
+                 "node_type": "directory",
+                 "name": "deliver-dir",
+             })):
+            response = client.post("/api/chirmera-platform-schedule/projects/proj1/user-tasks", json=payload, headers=_auth_headers())
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["task_type"] == "ai4red"
+    assert body["downstream_detail_view"] == "ai4red-detail"
+    assert body["inputs"][0]["selection_type"] == "directory"
+
+
+def test_ai4red_dispatch_passes_deliver_dir_and_does_not_copy_archive(client, tmp_path):
+    source_root = tmp_path / "upload-root"
+    deliver_dir = source_root / "deliver-dir"
+    deliver_dir.mkdir(parents=True)
+    (deliver_dir / "deliverable.zip").write_bytes(b"zip-content")
+
+    payload = {
+        "task_type": "ai4red",
+        "name": "ai4red-task-dispatch",
+        "description": "demo",
+        "input_upload_ids": ["upload-001"],
+        "input_binding": {
+            "upload_id": "upload-001",
+            "selection_type": "directory",
+            "relative_path": "deliver-dir",
+        },
+        "policy": {},
+        "dispatch_policy": {},
+    }
+
+    captured_calls: list[dict] = []
+
+    async def fake_create(self, *, project_id: str, task_id: str, deliver_dir: str, bearer_token: str, llm_key=None):
+        captured_calls.append({
+            "project_id": project_id,
+            "task_id": task_id,
+            "deliver_dir": deliver_dir,
+            "token": bearer_token,
+            "llm_key": llm_key,
+        })
+        return {"code": 200, "message": "success", "data": {"taskId": "ai4red-inner-1"}}
+
+    async def fake_get(self, *, downstream_task_id: str, bearer_token: str):
+        return {"code": 200, "message": "success", "data": {"taskId": downstream_task_id, "status": "EXECUTING", "errorMessage": None}}
+
+    with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
+        auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
+        project_factory.return_value.require_access = AsyncMock(side_effect=_fake_require_access)
+        with patch("app.service.user_task_manager.ProjectInputResolver.resolve_single", new=AsyncMock(return_value=_resolved_input(str(source_root), "document"))), \
+             patch("app.service.user_task_manager.ProjectInputResolver.resolve_path", new=AsyncMock(return_value={
+                 "relative_path": "deliver-dir",
+                 "absolute_path": str(deliver_dir),
+                 "node_type": "directory",
+                 "name": "deliver-dir",
+             })), \
+             patch("app.service.user_task_manager.Ai4RedDispatchClient.create_task", new=fake_create), \
+             patch("app.service.user_task_manager.Ai4RedDispatchClient.get_task", new=fake_get), \
+             patch("app.service.user_task_manager.get_config", return_value=SimpleNamespace(
+                 ai4red_service=SimpleNamespace(base_url="http://ai4red-platform-service:12345", timeout=30),
+                 user_task_dispatch_policy=SimpleNamespace(ai4red=SimpleNamespace(capacity_pool_ids=[], root_task_key_max_concurrency=0, root_task_key_expires_at=None)),
+                 aigw_service=SimpleNamespace(management_bearer_token=""),
+                 auth_service=SimpleNamespace(service_machine_token=""),
+                 fileserver_service=SimpleNamespace(base_url="", project_input_uploads_path="", timeout=30),
+                 security=SimpleNamespace(task_key_secret_master_key="test-key"),
+             )):
+            create_resp = client.post("/api/chirmera-platform-schedule/projects/proj1/user-tasks", json=payload, headers=_auth_headers())
+            assert create_resp.status_code == 200, create_resp.text
+            task_id = create_resp.json()["id"]
+            dispatch_resp = client.post(
+                f"/api/chirmera-platform-schedule/projects/proj1/user-tasks/{task_id}/dispatch",
+                json={"force": False},
+                headers=_auth_headers(),
+            )
+
+    assert dispatch_resp.status_code == 200, dispatch_resp.text
+    body = dispatch_resp.json()
+    assert body["downstream_task_id"] == "ai4red-inner-1"
+    assert body["downstream_detail_view"] == "ai4red-detail"
+    assert body["business_status"] == "running"
+    assert body["downstream_status_raw"] == "EXECUTING"
+    assert body["downstream_status_mapped"] == "running"
+    assert captured_calls and captured_calls[0]["project_id"] == "proj1"
+    assert captured_calls[0]["deliver_dir"] == str(deliver_dir)

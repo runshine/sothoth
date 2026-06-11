@@ -274,7 +274,7 @@ class VirtualKeyEventResponse(BaseModel):
     created_at: datetime
 
 
-UserTaskType = Literal["binary_firmware_e2e", "source_scan_e2e", "binary_module_e2e"]
+UserTaskType = Literal["binary_firmware_e2e", "source_scan_e2e", "binary_module_e2e", "ai4red"]
 InputSelectionType = Literal["file", "file_list", "directory"]
 
 
@@ -361,10 +361,15 @@ class UserTaskDispatchResponse(BaseModel):
     dispatched_task_capacity_pool_ids: list[int] = Field(default_factory=list)
     downstream_task_id: Optional[str] = None
     downstream_detail_view: Optional[str] = None
+    downstream_status_raw: Optional[str] = None
+    downstream_status_mapped: Optional[str] = None
+    downstream_report_ready: bool = False
     last_error: Optional[str] = None
     created_by: str
     created_at: datetime
     updated_at: datetime
+
+
 
 
 class UserTaskResponse(BaseModel):
@@ -392,6 +397,9 @@ class UserTaskResponse(BaseModel):
     module_name: Optional[str] = None
     downstream_task_id: Optional[str] = None
     downstream_detail_view: Optional[str] = None
+    downstream_status_raw: Optional[str] = None
+    downstream_status_mapped: Optional[str] = None
+    downstream_report_ready: bool = False
     last_error: Optional[str] = None
     created_by: str
     updated_at: datetime

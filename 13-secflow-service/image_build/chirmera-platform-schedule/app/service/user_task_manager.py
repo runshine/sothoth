@@ -41,9 +41,20 @@ TASK_TYPE_DETAIL_VIEW: dict[str, str] = {
     "binary_firmware_e2e": "binary-security-detail",
     "source_scan_e2e": "source-security-detail",
     "binary_module_e2e": "binary-module-security-detail",
+    "ai4red": "ai4red-detail",
 }
 
 CREATE_TIME_PARENT_TASK_KEY_PLACEHOLDER = "__dispatch_managed__"
+AI4RED_STATUS_MAP: dict[str, tuple[str, str, bool]] = {
+    "PARSE_PENDING": ("dispatching", "dispatching", False),
+    "PARSING": ("running", "running", False),
+    "PARSED": ("running", "running", False),
+    "EXECUTING": ("running", "running", False),
+    "COMPLETED": ("succeeded", "success", True),
+    "FAILED": ("failed", "failed", False),
+    "PAUSED": ("paused", "paused", False),
+    "DELETING": ("cancelling", "cancelling", False),
+}
 
 
 @dataclass
@@ -185,6 +196,7 @@ class AiGatewayTaskKeyClient:
         return response.json()
 
 
+
 class BinarySecurityDispatchClient:
     def __init__(self) -> None:
         self.cfg = get_config().binary_security_service
@@ -227,19 +239,71 @@ class BinarySecurityDispatchClient:
         return response.json()
 
 
+class Ai4RedDispatchClient:
+    def __init__(self) -> None:
+        self.cfg = get_config().ai4red_service
+
+    async def create_task(
+        self,
+        *,
+        project_id: str,
+        task_id: str,
+        deliver_dir: str,
+        bearer_token: str,
+        llm_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        client = await get_shared_async_client("schedule-ai4red", timeout=self.cfg.timeout)
+        payload: dict[str, Any] = {
+            "projectId": project_id,
+            "taskId": task_id,
+            "deliverDir": deliver_dir,
+        }
+        if str(llm_key or "").strip():
+            payload["llmKey"] = str(llm_key).strip()
+        try:
+            response = await client.post(
+                f"{self.cfg.base_url.rstrip('/')}/api/app/ai4red/chimera/tasks",
+                json=payload,
+                headers={"Authorization": f"Bearer {bearer_token}", "Content-Type": "application/json"},
+            )
+        except httpx.TimeoutException as exc:
+            raise UpstreamError("创建 ai4red 任务超时") from exc
+        except httpx.RequestError as exc:
+            raise UpstreamError(f"创建 ai4red 任务失败: {exc}") from exc
+        if response.status_code != 200:
+            raise UpstreamError(f"创建 ai4red 任务失败: {response.status_code}")
+        return response.json()
+
+    async def get_task(self, *, downstream_task_id: str, bearer_token: str) -> dict[str, Any]:
+        client = await get_shared_async_client("schedule-ai4red", timeout=self.cfg.timeout)
+        try:
+            response = await client.get(
+                f"{self.cfg.base_url.rstrip('/')}/api/app/ai4red/chimera/tasks/{downstream_task_id}",
+                headers={"Authorization": f"Bearer {bearer_token}"},
+            )
+        except httpx.TimeoutException as exc:
+            raise UpstreamError("查询 ai4red 任务超时") from exc
+        except httpx.RequestError as exc:
+            raise UpstreamError(f"查询 ai4red 任务失败: {exc}") from exc
+        if response.status_code != 200:
+            raise UpstreamError(f"查询 ai4red 任务失败: {response.status_code}")
+        return response.json()
+
+
 class UserTaskManager:
     def __init__(self) -> None:
         self.input_resolver = ProjectInputResolver()
         self.task_key_cipher = TaskKeySecretCipher()
         self.aigw = AiGatewayTaskKeyClient()
         self.binary_security = BinarySecurityDispatchClient()
+        self.ai4red = Ai4RedDispatchClient()
 
     def _dispatch_policy_for_task_type(self, task_type: str):
         policies = get_config().user_task_dispatch_policy
         policy = getattr(policies, task_type, None)
         if policy is None:
             raise ValidationError(f"任务类型缺少分发策略配置: {task_type}")
-        if not list(policy.capacity_pool_ids or []):
+        if task_type != "ai4red" and not list(policy.capacity_pool_ids or []):
             raise ValidationError(f"任务类型缺少 capacity_pool_ids 配置: {task_type}")
         return policy
 
@@ -253,6 +317,7 @@ class UserTaskManager:
         if not token:
             raise ValidationError("缺少 AI Gateway 管理凭证配置，无法创建 root task key")
         return token
+
 
     @staticmethod
     def _compat_parent_task_key_value(value: Optional[str]) -> Optional[str]:
@@ -326,6 +391,9 @@ class UserTaskManager:
             "module_name": task.module_name,
             "downstream_task_id": task.downstream_task_id,
             "downstream_detail_view": task.downstream_detail_view,
+            "downstream_status_raw": task.downstream_status_raw,
+            "downstream_status_mapped": task.downstream_status_mapped,
+            "downstream_report_ready": bool(task.downstream_report_ready),
             "last_error": task.last_error,
             "created_by": task.created_by,
             "updated_at": task.updated_at,
@@ -339,9 +407,51 @@ class UserTaskManager:
             return "file_list"
         if task_type == "source_scan_e2e":
             return "directory"
+        if task_type == "ai4red":
+            return "directory"
         raise ValidationError(f"不支持的任务类型: {task_type}")
 
-    def list_tasks(self, db: Session, project_id: str) -> tuple[int, list[dict[str, Any]], dict[str, int]]:
+    def _resolve_ai4red_directory(self, input_binding: ScheduleUserTaskInputBinding) -> str:
+        source_path = Path(str(input_binding.resolved_path or input_binding.target_path or "").strip())
+        if input_binding.selection_type != "directory":
+            raise ValidationError("AI4Red 仅支持 directory 输入模式")
+        if not source_path.is_dir():
+            raise ValidationError(f"AI4Red 输入目录不存在: {source_path}")
+        return str(source_path)
+
+    @staticmethod
+    def _extract_ai4red_data(payload: dict[str, Any]) -> dict[str, Any]:
+        data = payload.get("data")
+        return data if isinstance(data, dict) else {}
+
+    def _apply_ai4red_status(self, task: ScheduleUserTask, dispatch: Optional[ScheduleUserTaskDispatch], downstream_payload: dict[str, Any]) -> None:
+        status_raw = str(downstream_payload.get("status") or "").strip()
+        mapped_dispatch_status, mapped_business_status, report_ready = AI4RED_STATUS_MAP.get(
+            status_raw,
+            (task.dispatch_status or "running", task.business_status or "running", bool(task.downstream_report_ready)),
+        )
+        error_message = str(downstream_payload.get("errorMessage") or "").strip() or task.last_error
+        task.dispatch_status = mapped_dispatch_status
+        task.business_status = mapped_business_status
+        task.downstream_status_raw = status_raw or None
+        task.downstream_status_mapped = mapped_business_status
+        task.downstream_report_ready = report_ready
+        task.last_error = error_message or None
+        if dispatch is not None:
+            dispatch.dispatch_status = mapped_dispatch_status
+            dispatch.downstream_status_raw = status_raw or None
+            dispatch.downstream_status_mapped = mapped_business_status
+            dispatch.downstream_report_ready = report_ready
+            dispatch.last_error = error_message or None
+
+    async def _refresh_ai4red_state(self, db: Session, task: ScheduleUserTask, dispatch: Optional[ScheduleUserTaskDispatch], bearer_token: str) -> None:
+        if task.task_type != "ai4red" or not str(task.downstream_task_id or "").strip():
+            return
+        payload = await self.ai4red.get_task(downstream_task_id=task.downstream_task_id, bearer_token=bearer_token)
+        self._apply_ai4red_status(task, dispatch, self._extract_ai4red_data(payload))
+        db.commit()
+
+    async def list_tasks(self, db: Session, project_id: str, bearer_token: str) -> tuple[int, list[dict[str, Any]], dict[str, int]]:
         rows = db.query(ScheduleUserTask).filter(
             ScheduleUserTask.project_id == project_id
         ).order_by(ScheduleUserTask.created_at.desc()).all()
@@ -359,6 +469,13 @@ class UserTaskManager:
             bindings = self._bindings_for_task(db, task.id)
             dispatches = self._dispatches_for_task(db, task.id)
             latest_dispatch = dispatches[0] if dispatches else None
+            if task.task_type == "ai4red" and task.downstream_task_id:
+                try:
+                    await self._refresh_ai4red_state(db, task, latest_dispatch, bearer_token)
+                except Exception:
+                    db.rollback()
+                    task = self.get_task_or_404(db, project_id, task.id)
+                    latest_dispatch = self._dispatches_for_task(db, task.id)[0] if self._dispatches_for_task(db, task.id) else None
             stats[task.dispatch_status] = int(stats.get(task.dispatch_status, 0)) + 1
             items.append(self._serialize_task(task, bindings, latest_dispatch))
         return len(rows), items, stats
@@ -369,7 +486,7 @@ class UserTaskManager:
         if len(payload.input_upload_ids) != 1:
             raise ValidationError("当前版本仅支持单选一个任务输入记录")
         expected_input_type = TASK_TYPE_INPUT_TYPE.get(payload.task_type)
-        if not expected_input_type:
+        if payload.task_type != "ai4red" and not expected_input_type:
             raise ValidationError(f"不支持的任务类型: {payload.task_type}")
         duplicate = db.query(ScheduleUserTask).filter(
             ScheduleUserTask.project_id == project_id,
@@ -380,7 +497,7 @@ class UserTaskManager:
         resolved = await self.input_resolver.resolve_single(project_id, payload.input_upload_ids[0], bearer_token)
         if resolved.project_id != project_id:
             raise ValidationError("任务输入记录不属于当前项目")
-        if resolved.input_type != expected_input_type:
+        if expected_input_type and resolved.input_type != expected_input_type:
             raise ValidationError(f"{payload.task_type} 仅允许选择 {expected_input_type} 类型输入")
         if resolved.status not in {"succeeded", "partial_failed"}:
             raise ValidationError("所选任务输入尚未准备完成")
@@ -406,10 +523,10 @@ class UserTaskManager:
         display_name = resolved.display_name
         if selection_type == "file":
             if not relative_path:
-                raise ValidationError("盖亚-二进制固件必须选择一个文件")
+                raise ValidationError("当前任务类型必须选择一个文件")
             node = await self.input_resolver.resolve_path(project_id, resolved.upload_id, relative_path, bearer_token)
             if node.get("node_type") != "file":
-                raise ValidationError("盖亚-二进制固件只允许选择文件")
+                raise ValidationError("当前任务类型只允许选择文件")
             resolved_relative_path = str(node.get("relative_path") or "").strip()
             resolved_relative_paths = [resolved_relative_path]
             resolved_path = str(node.get("absolute_path") or "").strip()
@@ -426,14 +543,20 @@ class UserTaskManager:
             display_name = f"{len(resolved_relative_paths)} files"
         else:
             if not relative_path:
-                raise ValidationError("盖亚-源码必须显式选择一个文件夹")
+                raise ValidationError("当前任务类型必须显式选择一个文件夹")
             node = await self.input_resolver.resolve_path(project_id, resolved.upload_id, relative_path, bearer_token)
             if node.get("node_type") != "directory":
-                raise ValidationError("盖亚-源码只允许选择文件夹")
+                raise ValidationError("当前任务类型只允许选择文件夹")
             resolved_relative_path = str(node.get("relative_path") or "").strip()
             resolved_relative_paths = [resolved_relative_path] if resolved_relative_path else []
             resolved_path = str(node.get("absolute_path") or "").strip()
             display_name = str(node.get("name") or resolved_relative_path or display_name)
+            if payload.task_type == "ai4red":
+                if not resolved_path:
+                    raise ValidationError("AI4Red 输入目录解析失败")
+                directory_path = Path(resolved_path)
+                if not directory_path.is_dir():
+                    raise ValidationError(f"AI4Red 输入目录不存在: {directory_path}")
 
         compatibility_parent_secret = f"{CREATE_TIME_PARENT_TASK_KEY_PLACEHOLDER}:{payload.task_type}"
         parent_task_key_secret_cipher, parent_task_key_secret_nonce, parent_task_key_secret_version = self.task_key_cipher.encrypt(
@@ -501,6 +624,34 @@ class UserTaskManager:
         db.refresh(dispatch)
 
         try:
+            input_binding = bindings[0]
+            if task.task_type == "ai4red":
+                deliver_dir = self._resolve_ai4red_directory(input_binding)
+                create_result = await self.ai4red.create_task(
+                    project_id=project_id,
+                    task_id=task.id,
+                    deliver_dir=deliver_dir,
+                    bearer_token=bearer_token,
+                )
+                downstream_task_id = str(self._extract_ai4red_data(create_result).get("taskId") or "").strip() or task.id
+                dispatch.dispatch_status = "running"
+                dispatch.downstream_task_id = downstream_task_id
+                dispatch.downstream_detail_view = TASK_TYPE_DETAIL_VIEW.get(task.task_type)
+                dispatch.downstream_status_raw = "PARSE_PENDING"
+                dispatch.downstream_status_mapped = "dispatching"
+                dispatch.downstream_report_ready = False
+                task.dispatch_status = "running"
+                task.business_status = "running"
+                task.downstream_task_id = downstream_task_id
+                task.downstream_detail_view = dispatch.downstream_detail_view
+                task.downstream_status_raw = "PARSE_PENDING"
+                task.downstream_status_mapped = "dispatching"
+                task.downstream_report_ready = False
+                task.last_error = None
+                db.commit()
+                await self._refresh_ai4red_state(db, task, dispatch, bearer_token)
+                return self._serialize_task(task, bindings, dispatch)
+
             dispatch_policy = self._dispatch_policy_for_task_type(task.task_type)
             dispatch_task_key_result = await self.aigw.create_task_key(
                 management_token=self._aigw_management_token(),
@@ -524,7 +675,6 @@ class UserTaskManager:
             dispatch.dispatched_task_key_prefix = str(key_payload.get("key_prefix") or "")
             dispatch.dispatched_task_capacity_pool_ids = list(key_payload.get("capacity_pool_ids") or dispatch_policy.capacity_pool_ids or [])
 
-            input_binding = bindings[0]
             source_path = Path(input_binding.resolved_path or input_binding.target_path)
             if not source_path.exists():
                 raise ValidationError(f"任务输入路径不存在: {source_path}")
@@ -578,6 +728,11 @@ class UserTaskManager:
                 "description": task.description,
                 "input_files": copied_files,
                 "policy_overrides": {},
+                "root_task_key_id": dispatch.dispatched_task_key_id,
+                "root_task_key_name": dispatch.dispatched_task_key_name,
+                "root_task_key_prefix": dispatch.dispatched_task_key_prefix,
+                "root_task_key_secret": dispatch_secret,
+                "task_key_source": "schedule_dispatch",
             }
             if task.task_type == "binary_module_e2e":
                 create_payload["module_name"] = str(task.module_name or "").strip() or task.name or "module"
@@ -627,10 +782,18 @@ class UserTaskManager:
         latest_dispatch = dispatch
         return self._serialize_task(task, bindings, latest_dispatch)
 
-    def get_task_detail(self, db: Session, project_id: str, task_id: str) -> dict[str, Any]:
+    async def get_task_detail(self, db: Session, project_id: str, task_id: str, bearer_token: str) -> dict[str, Any]:
         task = self.get_task_or_404(db, project_id, task_id)
         dispatches = self._dispatches_for_task(db, task.id)
         latest_dispatch = dispatches[0] if dispatches else None
+        if task.task_type == "ai4red" and task.downstream_task_id:
+            try:
+                await self._refresh_ai4red_state(db, task, latest_dispatch, bearer_token)
+            except Exception:
+                db.rollback()
+                task = self.get_task_or_404(db, project_id, task_id)
+                dispatches = self._dispatches_for_task(db, task.id)
+                latest_dispatch = dispatches[0] if dispatches else None
         return self._serialize_task(task, self._bindings_for_task(db, task.id), latest_dispatch)
 
     def list_dispatches(self, db: Session, project_id: str, task_id: str) -> tuple[int, list[dict[str, Any]]]:
@@ -651,6 +814,9 @@ class UserTaskManager:
                 "dispatched_task_key_prefix": row.dispatched_task_key_prefix,
                 "downstream_task_id": row.downstream_task_id,
                 "downstream_detail_view": row.downstream_detail_view,
+                "downstream_status_raw": row.downstream_status_raw,
+                "downstream_status_mapped": row.downstream_status_mapped,
+                "downstream_report_ready": bool(row.downstream_report_ready),
                 "last_error": row.last_error,
                 "created_by": row.created_by,
                 "created_at": row.created_at,

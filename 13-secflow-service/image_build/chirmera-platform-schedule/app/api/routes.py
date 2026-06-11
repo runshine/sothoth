@@ -159,8 +159,9 @@ def job_runtime(project_id: str, job_id: str, _: TokenUser = Depends(get_current
 
 
 @router.get("/projects/{project_id}/user-tasks", response_model=UserTaskListResponse)
-def list_user_tasks(project_id: str, _: TokenUser = Depends(get_current_context), db: Session = Depends(get_db)):
-    total, items, stats = get_user_task_manager().list_tasks(db, project_id)
+async def list_user_tasks(project_id: str, _: TokenUser = Depends(get_current_context), authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    token = _token_from_header(authorization)
+    total, items, stats = await get_user_task_manager().list_tasks(db, project_id, token)
     return UserTaskListResponse(total=total, items=[UserTaskResponse.model_validate(item) for item in items], stats=stats)
 
 
@@ -179,8 +180,9 @@ async def create_user_task(
 
 
 @router.get("/projects/{project_id}/user-tasks/{task_id}", response_model=UserTaskResponse)
-def get_user_task(project_id: str, task_id: str, _: TokenUser = Depends(get_current_context), db: Session = Depends(get_db)):
-    task = get_user_task_manager().get_task_detail(db, project_id, task_id)
+async def get_user_task(project_id: str, task_id: str, _: TokenUser = Depends(get_current_context), authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    token = _token_from_header(authorization)
+    task = await get_user_task_manager().get_task_detail(db, project_id, task_id, token)
     return UserTaskResponse.model_validate(task)
 
 
