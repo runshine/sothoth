@@ -460,6 +460,8 @@ runs/{run_name}/workspace/vuln_scan_{task_id}/
 | **worker** | `secflow-app-dataflow-vuln-scanner-worker` (StatefulSet) | 2 | 任务消费 + 子进程执行 + Agent 调用 + 进度上报。**单槽执行**（同时最多 1 个任务），每个任务启动前执行 Agent 进程清理 |
 
 > **架构演进**：worker 角色已改为单槽模式——通过 `execution_service.py` 强制执行单任务约束，每个 worker Pod 同时只运行一个 `run_vuln_scan.py` 子进程。任务启动前自动清理残留的 pi Agent 进程，防止僵尸进程累积。多任务并发通过水平扩展 worker Pod 数量实现。
+>
+> **K8s 健康检查约束**：三类角色统一使用独立 probe 子进程提供 `18080` 端口探针，`startupProbe=/startupz`、`livenessProbe=/healthz`、`readinessProbe=/readyz`。该 probe 只检查主进程 PID 是否存在、是否仍存活，以及启动后是否已过 30 秒宽限；**不检查 DB、管理 API、worker heartbeat 或其他业务依赖**。主服务 `/api/dataflow-vuln-scanner/health`、`/ready` 保留给人工排障和业务观测，不再作为 kube 探针来源。
 
 **三角色职责边界**：
 
