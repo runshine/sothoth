@@ -331,10 +331,14 @@ class UserTaskCreateRequest(BaseModel):
     input_binding: Optional[UserTaskInputBindingRequest] = None
     policy: dict[str, Any] = Field(default_factory=dict)
     dispatch_policy: dict[str, Any] = Field(default_factory=dict)
-    task_key_ref: str
+    parent_task_key_id: str
+    parent_task_key_name: str
+    parent_task_key_prefix: str
+    parent_task_key_secret: str
+    parent_task_capacity_pool_ids: list[int] = Field(default_factory=list)
     module_name: Optional[str] = None
 
-    @field_validator("name", "task_key_ref")
+    @field_validator("name", "parent_task_key_id", "parent_task_key_name", "parent_task_key_prefix", "parent_task_key_secret")
     @classmethod
     def validate_non_empty(cls, value: str) -> str:
         value = str(value or "").strip()
@@ -352,9 +356,10 @@ class UserTaskDispatchResponse(BaseModel):
     user_task_id: str
     project_id: str
     dispatch_status: str
-    task_key_ref: str
-    work_key_id: Optional[str] = None
-    work_key_prefix: Optional[str] = None
+    dispatched_task_key_id: Optional[str] = None
+    dispatched_task_key_name: Optional[str] = None
+    dispatched_task_key_prefix: Optional[str] = None
+    dispatched_task_capacity_pool_ids: list[int] = Field(default_factory=list)
     downstream_task_id: Optional[str] = None
     downstream_detail_view: Optional[str] = None
     last_error: Optional[str] = None
@@ -374,9 +379,14 @@ class UserTaskResponse(BaseModel):
     business_status: str
     input_upload_count: int = 0
     inputs: list[UserTaskInputBindingResponse] = Field(default_factory=list)
-    task_key_ref: str
+    parent_task_key_id: str
+    parent_task_key_name: str
+    parent_task_key_prefix: str
+    parent_task_capacity_pool_ids: list[int] = Field(default_factory=list)
+    dispatched_task_key_id: Optional[str] = None
+    dispatched_task_key_name: Optional[str] = None
+    dispatched_task_key_prefix: Optional[str] = None
     module_name: Optional[str] = None
-    active_work_key_prefix: Optional[str] = None
     downstream_task_id: Optional[str] = None
     downstream_detail_view: Optional[str] = None
     last_error: Optional[str] = None

@@ -177,8 +177,13 @@ class ScheduleUserTask(Base):
     create_status = Column(String(32), nullable=False, default="created")
     dispatch_status = Column(String(32), nullable=False, default="ready_for_dispatch")
     business_status = Column(String(32), nullable=False, default="created")
-    task_key_ref = Column(String(255), nullable=False)
-    active_work_key_prefix = Column(String(128), nullable=True)
+    parent_task_key_id = Column(String(64), nullable=False)
+    parent_task_key_name = Column(String(255), nullable=False)
+    parent_task_key_prefix = Column(String(128), nullable=False)
+    parent_task_capacity_pool_ids = Column(JSON().with_variant(MySQLJSON, "mysql"), nullable=False, default=list)
+    parent_task_key_secret_cipher = Column(Text, nullable=False)
+    parent_task_key_secret_nonce = Column(String(128), nullable=False)
+    parent_task_key_secret_version = Column(String(32), nullable=False, default="aesgcm-v1")
     downstream_task_id = Column(String(128), nullable=True, index=True)
     downstream_detail_view = Column(String(128), nullable=True)
     last_error = Column(Text, nullable=True)
@@ -222,10 +227,13 @@ class ScheduleUserTaskDispatch(Base):
     user_task_id = Column(String(64), nullable=False, index=True)
     project_id = Column(String(128), nullable=False, index=True)
     dispatch_status = Column(String(32), nullable=False, default="pending")
-    task_key_ref = Column(String(255), nullable=False)
-    work_key_id = Column(String(64), nullable=True)
-    work_key_prefix = Column(String(128), nullable=True)
-    work_key_secret = Column(Text, nullable=True)
+    dispatched_task_key_id = Column(String(64), nullable=True)
+    dispatched_task_key_name = Column(String(255), nullable=True)
+    dispatched_task_key_prefix = Column(String(128), nullable=True)
+    dispatched_task_capacity_pool_ids = Column(JSON().with_variant(MySQLJSON, "mysql"), nullable=False, default=list)
+    dispatched_task_key_secret_cipher = Column(Text, nullable=True)
+    dispatched_task_key_secret_nonce = Column(String(128), nullable=True)
+    dispatched_task_key_secret_version = Column(String(32), nullable=True)
     downstream_task_id = Column(String(128), nullable=True)
     downstream_detail_view = Column(String(128), nullable=True)
     last_error = Column(Text, nullable=True)
@@ -262,7 +270,6 @@ def init_database():
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
     _ensure_schedule_execution_columns(engine)
-    _ensure_user_task_columns(engine)
 
 
 def _ensure_schedule_execution_columns(engine) -> None:
@@ -284,45 +291,6 @@ def _ensure_schedule_execution_columns(engine) -> None:
     with engine.begin() as connection:
         for statement in statements:
             connection.execute(text(statement))
-
-
-def _ensure_user_task_columns(engine) -> None:
-    inspector = inspect(engine)
-    for table_name, columns_to_add in {
-        ScheduleUserTask.__tablename__: {
-            "module_name": "VARCHAR(255) NULL",
-            "active_work_key_prefix": "VARCHAR(128) NULL",
-            "downstream_task_id": "VARCHAR(128) NULL",
-            "downstream_detail_view": "VARCHAR(128) NULL",
-            "last_error": "TEXT NULL",
-        },
-        ScheduleUserTaskDispatch.__tablename__: {
-            "work_key_id": "VARCHAR(64) NULL",
-            "work_key_prefix": "VARCHAR(128) NULL",
-            "work_key_secret": "TEXT NULL",
-            "downstream_task_id": "VARCHAR(128) NULL",
-            "downstream_detail_view": "VARCHAR(128) NULL",
-            "last_error": "TEXT NULL",
-        },
-        ScheduleUserTaskInputBinding.__tablename__: {
-            "selection_type": "VARCHAR(32) NULL",
-            "relative_path": "VARCHAR(1024) NULL",
-            "relative_paths": "JSON NULL",
-            "resolved_path": "VARCHAR(1024) NULL",
-            "display_name": "VARCHAR(255) NULL",
-        },
-    }.items():
-        if table_name not in inspector.get_table_names():
-            continue
-        existing = {column["name"] for column in inspector.get_columns(table_name)}
-        statements: list[str] = []
-        for column_name, definition in columns_to_add.items():
-            if column_name not in existing:
-                statements.append(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
-        if statements:
-            with engine.begin() as connection:
-                for statement in statements:
-                    connection.execute(text(statement))
 
 
 def get_db():

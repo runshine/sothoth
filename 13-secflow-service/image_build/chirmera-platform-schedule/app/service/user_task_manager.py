@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 import httpx
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from sqlalchemy.orm import Session
 
 from app.config import get_config
@@ -50,6 +54,32 @@ class ResolvedInputRecord:
     target_path: str
     latest_batch_id: Optional[str]
     display_name: str
+
+
+class TaskKeySecretCipher:
+    VERSION = "aesgcm-v1"
+
+    def __init__(self) -> None:
+        master_key = get_config().security.task_key_secret_master_key
+        self._key = hashlib.sha256(master_key.encode("utf-8")).digest()
+
+    def encrypt(self, secret: str) -> tuple[str, str, str]:
+        secret_bytes = str(secret or "").encode("utf-8")
+        nonce = hashlib.sha256((str(secret) + self.VERSION).encode("utf-8")).digest()[:12]
+        ciphertext = AESGCM(self._key).encrypt(nonce, secret_bytes, None)
+        return (
+            base64.b64encode(ciphertext).decode("utf-8"),
+            base64.b64encode(nonce).decode("utf-8"),
+            self.VERSION,
+        )
+
+    def decrypt(self, *, cipher_text: str, nonce: str, version: str) -> str:
+        if version != self.VERSION:
+            raise ValidationError(f"不支持的 task key secret 版本: {version}")
+        nonce_bytes = base64.b64decode(nonce.encode("utf-8"))
+        cipher_bytes = base64.b64decode(cipher_text.encode("utf-8"))
+        plain = AESGCM(self._key).decrypt(nonce_bytes, cipher_bytes, None)
+        return plain.decode("utf-8")
 
 
 class ProjectInputResolver:
@@ -108,33 +138,42 @@ class ProjectInputResolver:
         return response.json()
 
 
-class AiGatewayWorkKeyClient:
+class AiGatewayTaskKeyClient:
     def __init__(self) -> None:
         self.cfg = get_config().aigw_service
 
-    async def create_work_key(self, *, parent_key_id: int, task_id: str) -> dict[str, Any]:
+    async def create_task_key(
+        self,
+        *,
+        bearer_token: str,
+        task_id: str,
+        dispatch_id: str,
+        capacity_pool_ids: list[int],
+    ) -> dict[str, Any]:
+        if not capacity_pool_ids:
+            raise ValidationError("父 task key 缺少 capacity_pool_ids，无法派生 dispatch task key")
         client = await get_shared_async_client("schedule-aigw", timeout=self.cfg.timeout)
         payload = {
-            "key_name": f"work-{task_id}",
-            "key_type": "work",
-            "parent_key_id": parent_key_id,
+            "key_name": f"dispatch-{task_id}-{dispatch_id}",
+            "key_type": "task",
             "task_id": task_id,
-            "sub_task_id": task_id,
+            "max_concurrency": 0,
             "enabled": True,
-            "description": f"schedule user task {task_id}",
+            "capacity_pool_ids": capacity_pool_ids,
+            "description": f"dispatch task key for {task_id}/{dispatch_id}",
         }
         try:
             response = await client.post(
-                f"{self.cfg.base_url.rstrip('/')}/api/aigw/llm-keys",
+                f"{self.cfg.base_url.rstrip('/')}{self.cfg.llm_keys_path}",
                 json=payload,
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {bearer_token}"},
             )
         except httpx.TimeoutException as exc:
-            raise UpstreamError("申请 work key 超时") from exc
+            raise UpstreamError("申请 dispatch task key 超时") from exc
         except httpx.RequestError as exc:
-            raise UpstreamError(f"申请 work key 失败: {exc}") from exc
+            raise UpstreamError(f"申请 dispatch task key 失败: {exc}") from exc
         if response.status_code not in (200, 201):
-            raise UpstreamError(f"申请 work key 失败: {response.status_code}")
+            raise UpstreamError(f"申请 dispatch task key 失败: {response.status_code}")
         return response.json()
 
 
@@ -183,7 +222,8 @@ class BinarySecurityDispatchClient:
 class UserTaskManager:
     def __init__(self) -> None:
         self.input_resolver = ProjectInputResolver()
-        self.aigw = AiGatewayWorkKeyClient()
+        self.task_key_cipher = TaskKeySecretCipher()
+        self.aigw = AiGatewayTaskKeyClient()
         self.binary_security = BinarySecurityDispatchClient()
 
     def get_task_or_404(self, db: Session, project_id: str, task_id: str) -> ScheduleUserTask:
@@ -205,7 +245,12 @@ class UserTaskManager:
             ScheduleUserTaskDispatch.user_task_id == task_id
         ).order_by(ScheduleUserTaskDispatch.created_at.desc()).all()
 
-    def _serialize_task(self, task: ScheduleUserTask, bindings: list[ScheduleUserTaskInputBinding]) -> dict[str, Any]:
+    def _serialize_task(
+        self,
+        task: ScheduleUserTask,
+        bindings: list[ScheduleUserTaskInputBinding],
+        latest_dispatch: Optional[ScheduleUserTaskDispatch] = None,
+    ) -> dict[str, Any]:
         return {
             "id": task.id,
             "project_id": task.project_id,
@@ -232,9 +277,14 @@ class UserTaskManager:
                 }
                 for item in bindings
             ],
-            "task_key_ref": task.task_key_ref,
+            "parent_task_key_id": task.parent_task_key_id,
+            "parent_task_key_name": task.parent_task_key_name,
+            "parent_task_key_prefix": task.parent_task_key_prefix,
+            "parent_task_capacity_pool_ids": list(task.parent_task_capacity_pool_ids or []),
+            "dispatched_task_key_id": getattr(latest_dispatch, "dispatched_task_key_id", None),
+            "dispatched_task_key_name": getattr(latest_dispatch, "dispatched_task_key_name", None),
+            "dispatched_task_key_prefix": getattr(latest_dispatch, "dispatched_task_key_prefix", None),
             "module_name": task.module_name,
-            "active_work_key_prefix": task.active_work_key_prefix,
             "downstream_task_id": task.downstream_task_id,
             "downstream_detail_view": task.downstream_detail_view,
             "last_error": task.last_error,
@@ -268,8 +318,10 @@ class UserTaskManager:
         items: list[dict[str, Any]] = []
         for task in rows:
             bindings = self._bindings_for_task(db, task.id)
+            dispatches = self._dispatches_for_task(db, task.id)
+            latest_dispatch = dispatches[0] if dispatches else None
             stats[task.dispatch_status] = int(stats.get(task.dispatch_status, 0)) + 1
-            items.append(self._serialize_task(task, bindings))
+            items.append(self._serialize_task(task, bindings, latest_dispatch))
         return len(rows), items, stats
 
     async def create_task(self, db: Session, *, project_id: str, payload, actor: str, bearer_token: str) -> dict[str, Any]:
@@ -295,6 +347,8 @@ class UserTaskManager:
             raise ValidationError("所选任务输入尚未准备完成")
         if payload.task_type == "binary_module_e2e" and not str(payload.module_name or "").strip():
             raise ValidationError("二进制模块任务必须填写模块名")
+        if not payload.parent_task_capacity_pool_ids:
+            raise ValidationError("父 task key 必须提供至少一个 capacity pool")
 
         selection_type = self._task_selection_type(payload.task_type)
         input_binding_payload = payload.input_binding
@@ -344,6 +398,10 @@ class UserTaskManager:
             resolved_path = str(node.get("absolute_path") or "").strip()
             display_name = str(node.get("name") or resolved_relative_path or display_name)
 
+        parent_task_key_secret_cipher, parent_task_key_secret_nonce, parent_task_key_secret_version = self.task_key_cipher.encrypt(
+            payload.parent_task_key_secret
+        )
+
         task = ScheduleUserTask(
             project_id=project_id,
             task_type=payload.task_type,
@@ -353,7 +411,13 @@ class UserTaskManager:
             create_status="created",
             dispatch_status="ready_for_dispatch",
             business_status="created",
-            task_key_ref=payload.task_key_ref,
+            parent_task_key_id=payload.parent_task_key_id,
+            parent_task_key_name=payload.parent_task_key_name,
+            parent_task_key_prefix=payload.parent_task_key_prefix,
+            parent_task_capacity_pool_ids=list(payload.parent_task_capacity_pool_ids or []),
+            parent_task_key_secret_cipher=parent_task_key_secret_cipher,
+            parent_task_key_secret_nonce=parent_task_key_secret_nonce,
+            parent_task_key_secret_version=parent_task_key_secret_version,
             downstream_detail_view=TASK_TYPE_DETAIL_VIEW.get(payload.task_type),
             created_by=actor,
             updated_by=actor,
@@ -392,7 +456,6 @@ class UserTaskManager:
             user_task_id=task.id,
             project_id=project_id,
             dispatch_status="dispatching",
-            task_key_ref=task.task_key_ref,
             created_by=actor,
         )
         db.add(dispatch)
@@ -400,16 +463,30 @@ class UserTaskManager:
         db.refresh(dispatch)
 
         try:
-            try:
-                parent_key_id = int(str(task.task_key_ref).strip())
-            except ValueError as exc:
-                raise ValidationError("task_key_ref 必须是 AI Gateway task key ID") from exc
-            work_key_result = await self.aigw.create_work_key(parent_key_id=parent_key_id, task_id=task.id)
-            key_payload = work_key_result.get("key") or {}
-            dispatch.work_key_id = str(key_payload.get("id") or "")
-            dispatch.work_key_prefix = str(key_payload.get("key_prefix") or "")
-            dispatch.work_key_secret = str(work_key_result.get("secret") or "")
-            task.active_work_key_prefix = dispatch.work_key_prefix or None
+            parent_task_key_secret = self.task_key_cipher.decrypt(
+                cipher_text=task.parent_task_key_secret_cipher,
+                nonce=task.parent_task_key_secret_nonce,
+                version=task.parent_task_key_secret_version,
+            )
+            dispatch_task_key_result = await self.aigw.create_task_key(
+                bearer_token=parent_task_key_secret,
+                task_id=task.id,
+                dispatch_id=dispatch.id,
+                capacity_pool_ids=list(task.parent_task_capacity_pool_ids or []),
+            )
+            key_payload = dispatch_task_key_result.get("key") or {}
+            dispatch_secret = str(dispatch_task_key_result.get("secret") or "").strip()
+            if not dispatch_secret:
+                raise UpstreamError("AI Gateway 未返回 dispatch task key secret")
+            (
+                dispatch.dispatched_task_key_secret_cipher,
+                dispatch.dispatched_task_key_secret_nonce,
+                dispatch.dispatched_task_key_secret_version,
+            ) = self.task_key_cipher.encrypt(dispatch_secret)
+            dispatch.dispatched_task_key_id = str(key_payload.get("id") or "")
+            dispatch.dispatched_task_key_name = str(key_payload.get("key_name") or "")
+            dispatch.dispatched_task_key_prefix = str(key_payload.get("key_prefix") or "")
+            dispatch.dispatched_task_capacity_pool_ids = list(key_payload.get("capacity_pool_ids") or task.parent_task_capacity_pool_ids or [])
 
             input_binding = bindings[0]
             source_path = Path(input_binding.resolved_path or input_binding.target_path)
@@ -472,18 +549,18 @@ class UserTaskManager:
                 project_id=project_id,
                 task_id=task.id,
                 payload=create_payload,
-                bearer_token=bearer_token,
+                bearer_token=dispatch_secret,
             )
             await self.binary_security.complete_uploads(
                 project_id=project_id,
                 task_id=task.id,
                 files=copied_files,
-                bearer_token=bearer_token,
+                bearer_token=dispatch_secret,
             )
             await self.binary_security.start_task(
                 project_id=project_id,
                 task_id=task.id,
-                bearer_token=bearer_token,
+                bearer_token=dispatch_secret,
             )
 
             dispatch.dispatch_status = "succeeded"
@@ -511,11 +588,14 @@ class UserTaskManager:
                 dispatch.last_error = message
             db.commit()
             raise
-        return self._serialize_task(task, bindings)
+        latest_dispatch = dispatch
+        return self._serialize_task(task, bindings, latest_dispatch)
 
     def get_task_detail(self, db: Session, project_id: str, task_id: str) -> dict[str, Any]:
         task = self.get_task_or_404(db, project_id, task_id)
-        return self._serialize_task(task, self._bindings_for_task(db, task.id))
+        dispatches = self._dispatches_for_task(db, task.id)
+        latest_dispatch = dispatches[0] if dispatches else None
+        return self._serialize_task(task, self._bindings_for_task(db, task.id), latest_dispatch)
 
     def list_dispatches(self, db: Session, project_id: str, task_id: str) -> tuple[int, list[dict[str, Any]]]:
         self.get_task_or_404(db, project_id, task_id)
@@ -526,9 +606,9 @@ class UserTaskManager:
                 "user_task_id": row.user_task_id,
                 "project_id": row.project_id,
                 "dispatch_status": row.dispatch_status,
-                "task_key_ref": row.task_key_ref,
-                "work_key_id": row.work_key_id,
-                "work_key_prefix": row.work_key_prefix,
+                "dispatched_task_key_id": row.dispatched_task_key_id,
+                "dispatched_task_key_name": row.dispatched_task_key_name,
+                "dispatched_task_key_prefix": row.dispatched_task_key_prefix,
                 "downstream_task_id": row.downstream_task_id,
                 "downstream_detail_view": row.downstream_detail_view,
                 "last_error": row.last_error,

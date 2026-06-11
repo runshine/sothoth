@@ -29,6 +29,16 @@ def _resolved_input(target_path: str = "/data/files/proj1/user_input/software/up
     })()
 
 
+def _task_key_payload():
+    return {
+        "parent_task_key_id": "tk-123",
+        "parent_task_key_name": "parent-task-key",
+        "parent_task_key_prefix": "tsk_parent",
+        "parent_task_key_secret": "tsk_secret_value",
+        "parent_task_capacity_pool_ids": [1, 2],
+    }
+
+
 def test_schedule_job_crud_and_trigger(client):
     payload = {
         "name": "job-a",
@@ -79,7 +89,7 @@ def test_user_task_create_requires_single_file_binding(client):
         },
         "policy": {},
         "dispatch_policy": {},
-        "task_key_ref": "123",
+        **_task_key_payload(),
     }
     with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
         auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
@@ -122,7 +132,7 @@ def test_user_task_rejects_directory_for_firmware_file_mode(client):
         },
         "policy": {},
         "dispatch_policy": {},
-        "task_key_ref": "123",
+        **_task_key_payload(),
     }
     with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
         auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
@@ -152,7 +162,7 @@ def test_user_task_rejects_file_for_source_directory_mode(client):
         },
         "policy": {},
         "dispatch_policy": {},
-        "task_key_ref": "123",
+        **_task_key_payload(),
     }
     with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
         auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
@@ -183,7 +193,7 @@ def test_user_task_requires_module_name_for_binary_module(client):
         },
         "policy": {},
         "dispatch_policy": {},
-        "task_key_ref": "123",
+        **_task_key_payload(),
     }
     with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
         auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
@@ -220,7 +230,7 @@ def test_user_task_dispatch_uses_persisted_module_name_and_selected_files(client
         },
         "policy": {},
         "dispatch_policy": {},
-        "task_key_ref": "123",
+        **_task_key_payload(),
     }
 
     def fake_path(value: str):
@@ -250,7 +260,7 @@ def test_user_task_dispatch_uses_persisted_module_name_and_selected_files(client
                      "name": "b.bin",
                  },
              ])), \
-             patch("app.service.user_task_manager.AiGatewayWorkKeyClient.create_work_key", new=AsyncMock(return_value={"key": {"id": "wk-1", "key_prefix": "wk"}, "secret": "secret"})), \
+             patch("app.service.user_task_manager.AiGatewayTaskKeyClient.create_task_key", new=AsyncMock(return_value={"key": {"id": "tk-dispatch-1", "key_name": "dispatch-key", "key_prefix": "tsk_dispatch", "capacity_pool_ids": [1, 2]}, "secret": "tsk_dispatch_secret"})), \
              patch("app.service.user_task_manager.BinarySecurityDispatchClient.create_task", new=fake_create_task), \
              patch("app.service.user_task_manager.BinarySecurityDispatchClient.complete_uploads", new=AsyncMock(return_value={"ok": True})), \
              patch("app.service.user_task_manager.BinarySecurityDispatchClient.start_task", new=AsyncMock(return_value={"ok": True})), \
@@ -279,6 +289,9 @@ def test_user_task_dispatch_uses_persisted_module_name_and_selected_files(client
                 headers=_auth_headers(),
             )
             assert dispatch_resp.status_code == 200, dispatch_resp.text
+            dispatch_body = dispatch_resp.json()
+            assert dispatch_body["dispatched_task_key_id"] == "tk-dispatch-1"
+            assert dispatch_body["dispatched_task_key_prefix"] == "tsk_dispatch"
 
     assert forwarded_payloads
     assert forwarded_payloads[0]["module_name"] == "libcrypto"

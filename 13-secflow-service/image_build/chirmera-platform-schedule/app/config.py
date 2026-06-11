@@ -55,8 +55,12 @@ class FileserverServiceConfig(BaseModel):
 
 class AiGatewayServiceConfig(BaseModel):
     base_url: str = "http://gaiasec-llm-gateway"
-    work_keys_path: str = "/api/aigw/work-keys"
+    llm_keys_path: str = "/api/aigw/llm-keys"
     timeout: int = 30
+
+
+class SecurityConfig(BaseModel):
+    task_key_secret_master_key: str = "chirmera-platform-schedule-task-key-master"
 
 
 class BinarySecurityServiceConfig(BaseModel):
@@ -176,6 +180,7 @@ class Config(BaseModel):
     project_service: ProjectServiceConfig = Field(default_factory=ProjectServiceConfig)
     fileserver_service: FileserverServiceConfig = Field(default_factory=FileserverServiceConfig)
     aigw_service: AiGatewayServiceConfig = Field(default_factory=AiGatewayServiceConfig)
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
     binary_security_service: BinarySecurityServiceConfig = Field(default_factory=BinarySecurityServiceConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
     app: AppConfig = Field(default_factory=AppConfig)
