@@ -1085,8 +1085,6 @@ class TaskManager:
     ) -> bool:
         normalized_type = str(error_type or "").strip().lower()
         normalized_message = str(error_message or "").strip().lower()
-        if normalized_type == "staletaskexecution":
-            return True
         control_tokens = (
             "tail 收敛 owner 已变更",
             "tail 收敛 lease 已失效",
@@ -1095,7 +1093,27 @@ class TaskManager:
             "tail reconciliation owner changed",
             "tail reconciliation lease expired",
         )
+        if normalized_type == "staletaskexecution":
+            return any(token.lower() in normalized_message for token in control_tokens)
         return any(token.lower() in normalized_message for token in control_tokens)
+
+    def _is_owned_execution_stale_error(
+        self,
+        *,
+        error_message: str | None,
+        error_type: str | None,
+    ) -> bool:
+        normalized_type = str(error_type or "").strip().lower()
+        normalized_message = str(error_message or "").strip().lower()
+        if normalized_type != "staletaskexecution":
+            return False
+        owned_execution_tokens = (
+            "当前执行 token 已失效",
+            "缺少当前执行 token",
+            "current execution token expired",
+            "missing current execution token",
+        )
+        return any(token.lower() in normalized_message for token in owned_execution_tokens)
 
     def _task_is_waiting_for_manual_confirmation(
         self,
@@ -12801,6 +12819,37 @@ class TaskManager:
                 )
                 session.commit()
                 return
+            if self._is_owned_execution_stale_error(error_message=error_message, error_type=error_type):
+                event_message = f"当前执行 owner 已丢失，等待 worker 重新接管: {error_message}"
+                event_payload = {
+                    "error_type": error_type,
+                    "error_message": error_message,
+                    "http_status": http_status,
+                }
+                if self._has_recent_matching_task_event(
+                    session,
+                    task,
+                    event_type="owned_execution_owner_lost",
+                    stage_name=item.stage_name,
+                    message=event_message,
+                    payload_keys={
+                        "error_type": error_type,
+                        "error_message": error_message,
+                    },
+                    within_seconds=max(60, self._stage_item_sync_reconcile_interval_seconds() * 2),
+                ):
+                    session.commit()
+                    return
+                self._record_event(
+                    session,
+                    task,
+                    "owned_execution_owner_lost",
+                    event_message,
+                    level="warning",
+                    stage_name=item.stage_name,
+                    item=item,
+                    payload=event_payload,
+                )
             state = self._build_next_downstream_sync_failure_state(item)
             self._persist_child_sync_observation(
                 session,
