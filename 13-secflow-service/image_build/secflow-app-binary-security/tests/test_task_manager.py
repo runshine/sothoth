@@ -25293,6 +25293,84 @@ def _test_tail_control_plane_stale_error_does_not_pollute_sync_error(self):
     self.assertIsNone(observation.get("error_type"))
 
 
+def _test_record_polled_child_sync_failure_marks_owned_execution_owner_lost(self):
+    task = BinarySecurityTask(
+        id="task-owned-stale",
+        project_id="p1",
+        name="n",
+        status="dispatching",
+        current_stage="binary_to_source",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = BinarySecurityStageItem(
+        id="item-owned-stale",
+        task_id="task-owned-stale",
+        project_id="p1",
+        stage_name="binary_to_source",
+        item_key="module-1",
+        status="dispatching",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[item])
+
+    with patch.object(task_manager_module, "get_session_factory", return_value=lambda: db):
+        self.manager._record_polled_child_sync_failure(
+            task_id="task-owned-stale",
+            item_id="item-owned-stale",
+            error_message="任务 task-owned-stale 当前执行 token 已失效",
+            error_type="StaleTaskExecution",
+            http_status=500,
+        )
+
+    events = [event for event in db.added if isinstance(event, BinarySecurityEvent)]
+    self.assertEqual(2, len(events))
+    self.assertEqual("owned_execution_owner_lost", events[0].event_type)
+    self.assertIn("当前执行 owner 已丢失，等待 worker 重新接管", events[0].message)
+    self.assertEqual("downstream_poll_attempt_failed", events[1].event_type)
+
+
+def _test_record_polled_child_sync_failure_keeps_tail_owner_lost_for_tail_stale(self):
+    task = BinarySecurityTask(
+        id="task-tail-stale",
+        project_id="p1",
+        name="n",
+        status="running",
+        current_stage="dataflow_vuln_scan",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/o",
+        workspace_root="/w",
+        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+    )
+    item = BinarySecurityStageItem(
+        id="item-tail-stale",
+        task_id="task-tail-stale",
+        project_id="p1",
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-1",
+        status="running",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[item])
+
+    with patch.object(task_manager_module, "get_session_factory", return_value=lambda: db):
+        self.manager._record_polled_child_sync_failure(
+            task_id="task-tail-stale",
+            item_id="item-tail-stale",
+            error_message="任务 task-tail-stale 当前 tail 收敛 owner 已变更",
+            error_type="StaleTaskExecution",
+            http_status=500,
+        )
+
+    events = [event for event in db.added if isinstance(event, BinarySecurityEvent)]
+    self.assertEqual(1, len(events))
+    self.assertEqual("tail_reconcile_owner_lost", events[0].event_type)
+    self.assertIn("等待新的 reducer 接管", events[0].message)
+
+
 def _test_worker_skips_tail_tasks_in_downstream_reconcile_candidates(self):
     manager = TaskManager()
     tail_task = BinarySecurityTask(
@@ -26792,6 +26870,8 @@ TaskManagerTests.test_worker_recovers_dispatching_streaming_parent_to_pending_wi
 TaskManagerTests.test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_task = _test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_task
 TaskManagerTests.test_start_reducer_role_runs_reconcile_loops = _test_start_reducer_role_runs_reconcile_loops
 TaskManagerTests.test_tail_control_plane_stale_error_does_not_pollute_sync_error = _test_tail_control_plane_stale_error_does_not_pollute_sync_error
+TaskManagerTests.test_record_polled_child_sync_failure_marks_owned_execution_owner_lost = _test_record_polled_child_sync_failure_marks_owned_execution_owner_lost
+TaskManagerTests.test_record_polled_child_sync_failure_keeps_tail_owner_lost_for_tail_stale = _test_record_polled_child_sync_failure_keeps_tail_owner_lost_for_tail_stale
 TaskManagerTests.test_worker_skips_tail_tasks_in_downstream_reconcile_candidates = _test_worker_skips_tail_tasks_in_downstream_reconcile_candidates
 TaskManagerTests.test_get_timeline_compresses_repeated_tail_owner_lost_events = _test_get_timeline_compresses_repeated_tail_owner_lost_events
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_locally_owned_running_task = _test_task_needs_downstream_reconcile_skips_locally_owned_running_task
