@@ -70,14 +70,14 @@ class SystemAnalyseClient(JsonHttpClient):
     async def get_task_result(self, task_id: str) -> dict:
         return await self.get(f"{self.API_PREFIX}/tasks/{task_id}/result")
 
-    async def cancel_task(self, task_id: str) -> dict:
-        return await self.post(f"{self.API_PREFIX}/tasks/{task_id}/cancel")
+    async def cancel_task(self, task_id: str, token: str | None = None) -> dict:
+        return await self.post(f"{self.API_PREFIX}/tasks/{task_id}/cancel", token=token)
 
-    async def restart_task(self, task_id: str) -> dict:
-        return await self.post(f"{self.API_PREFIX}/tasks/{task_id}/restart")
+    async def restart_task(self, task_id: str, token: str | None = None) -> dict:
+        return await self.post(f"{self.API_PREFIX}/tasks/{task_id}/restart", token=token)
 
-    async def delete_task(self, task_id: str) -> dict:
-        return await self.delete(f"{self.API_PREFIX}/tasks/{task_id}")
+    async def delete_task(self, task_id: str, token: str | None = None) -> dict:
+        return await self.delete(f"{self.API_PREFIX}/tasks/{task_id}", token=token)
 
 
 _client: Optional[SystemAnalyseClient] = None

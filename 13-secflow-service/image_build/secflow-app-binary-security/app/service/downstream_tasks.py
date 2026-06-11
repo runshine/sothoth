@@ -268,7 +268,7 @@ class DownstreamTaskGateway:
         if stage_name == "firmware_unpack" and normalized == "firmware_unpacker":
             return await self._firmware_unpacker_client().retry_task(task_id, token or "")
         if stage_name == "system_analysis" and normalized == "system_analyse":
-            return await self._system_analyse_client().restart_task(task_id)
+            return await self._system_analyse_client().restart_task(task_id, token or "")
         if stage_name == "binary_to_source" and normalized == "binary_to_source":
             return await self._binary_to_source_client().rerun_task(
                 project_id,
@@ -289,7 +289,7 @@ class DownstreamTaskGateway:
         if normalized == "firmware_unpacker":
             return await self._firmware_unpacker_client().cancel_task(task_id, token or "")
         if normalized == "system_analyse":
-            return await self._system_analyse_client().cancel_task(task_id)
+            return await self._system_analyse_client().cancel_task(task_id, token or "")
         if normalized == "binary_to_source":
             return await self._binary_to_source_client().cancel_task(project_id or "", task_id, token or "")
         if normalized == "entry_analyse":
@@ -305,7 +305,7 @@ class DownstreamTaskGateway:
         if normalized == "firmware_unpacker":
             return await self._firmware_unpacker_client().delete_task(task_id, token or "")
         if normalized == "system_analyse":
-            return await self._system_analyse_client().delete_task(task_id)
+            return await self._system_analyse_client().delete_task(task_id, token or "")
         if normalized == "binary_to_source":
             return await self._binary_to_source_client().delete_task(project_id or "", task_id, token or "")
         if normalized == "entry_analyse":
