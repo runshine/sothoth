@@ -276,6 +276,8 @@ def init_database():
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
     _ensure_schedule_execution_columns(engine)
+    _ensure_user_task_columns(engine)
+    _ensure_user_task_dispatch_columns(engine)
 
 
 def _ensure_schedule_execution_columns(engine) -> None:
@@ -292,6 +294,48 @@ def _ensure_schedule_execution_columns(engine) -> None:
         statements.append(f"ALTER TABLE {ScheduleExecution.__tablename__} ADD COLUMN capacity_reject_reason VARCHAR(128) NULL")
     if "capacity_reject_at" not in columns:
         statements.append(f"ALTER TABLE {ScheduleExecution.__tablename__} ADD COLUMN capacity_reject_at DATETIME NULL")
+    if not statements:
+        return
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+
+
+def _ensure_user_task_columns(engine) -> None:
+    inspector = inspect(engine)
+    if ScheduleUserTask.__tablename__ not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns(ScheduleUserTask.__tablename__)}
+    statements: list[str] = []
+    if "downstream_status_raw" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN downstream_status_raw VARCHAR(64) NULL")
+    if "downstream_status_mapped" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN downstream_status_mapped VARCHAR(64) NULL")
+    if "downstream_report_ready" not in columns:
+        statements.append(
+            f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN downstream_report_ready BOOLEAN NOT NULL DEFAULT 0"
+        )
+    if not statements:
+        return
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+
+
+def _ensure_user_task_dispatch_columns(engine) -> None:
+    inspector = inspect(engine)
+    if ScheduleUserTaskDispatch.__tablename__ not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns(ScheduleUserTaskDispatch.__tablename__)}
+    statements: list[str] = []
+    if "downstream_status_raw" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTaskDispatch.__tablename__} ADD COLUMN downstream_status_raw VARCHAR(64) NULL")
+    if "downstream_status_mapped" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTaskDispatch.__tablename__} ADD COLUMN downstream_status_mapped VARCHAR(64) NULL")
+    if "downstream_report_ready" not in columns:
+        statements.append(
+            f"ALTER TABLE {ScheduleUserTaskDispatch.__tablename__} ADD COLUMN downstream_report_ready BOOLEAN NOT NULL DEFAULT 0"
+        )
     if not statements:
         return
     with engine.begin() as connection:

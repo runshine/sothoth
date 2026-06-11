@@ -594,9 +594,6 @@ class UserTaskManager:
             raise ValidationError("必须选择任务输入记录")
         if len(payload.input_upload_ids) != 1:
             raise ValidationError("当前版本仅支持单选一个任务输入记录")
-        expected_input_type = TASK_TYPE_INPUT_TYPE.get(payload.task_type)
-        if payload.task_type not in {"ai4red", "ai4apk"} and not expected_input_type:
-            raise ValidationError(f"不支持的任务类型: {payload.task_type}")
         duplicate = db.query(ScheduleUserTask).filter(
             ScheduleUserTask.project_id == project_id,
             ScheduleUserTask.name == payload.name,
@@ -606,8 +603,6 @@ class UserTaskManager:
         resolved = await self.input_resolver.resolve_single(project_id, payload.input_upload_ids[0], bearer_token)
         if resolved.project_id != project_id:
             raise ValidationError("任务输入记录不属于当前项目")
-        if expected_input_type and resolved.input_type != expected_input_type:
-            raise ValidationError(f"{payload.task_type} 仅允许选择 {expected_input_type} 类型输入")
         if resolved.status not in {"succeeded", "partial_failed"}:
             raise ValidationError("所选任务输入尚未准备完成")
         if payload.task_type == "binary_module_e2e" and not str(payload.module_name or "").strip():
