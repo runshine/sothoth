@@ -601,6 +601,8 @@ class BinarySecurityTaskEventResponse(BaseModel):
     event_type: str
     message: str
     payload: dict[str, Any] = Field(default_factory=dict)
+    compressed: bool = False
+    repeat_count: int = 1
     created_at: datetime
 
 

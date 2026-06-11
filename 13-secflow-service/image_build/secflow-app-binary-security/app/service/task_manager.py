@@ -4949,6 +4949,7 @@ class TaskManager:
     def get_timeline(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTimelineResponse:
         task = self._task_or_404(db, project_id, task_id)
         events = db.query(BinarySecurityEvent).filter(BinarySecurityEvent.task_id == task.id).order_by(BinarySecurityEvent.created_at.asc()).all()
+        timeline_events = self._compress_timeline_events(events)
         return BinarySecurityTimelineResponse(
             task_id=task.id,
             events=[
@@ -4959,12 +4960,72 @@ class TaskManager:
                     item_key=event.item_key,
                     level=event.level,
                     event_type=event.event_type,
-                    message=event.message,
-                    payload=event.payload,
+                    message=self._timeline_event_display_message(event),
+                    payload=getattr(event, "_timeline_payload", event.payload),
+                    compressed=bool(getattr(event, "_timeline_compressed", False)),
+                    repeat_count=int(getattr(event, "_timeline_repeat_count", 1) or 1),
                     created_at=event.created_at,
                 )
-                for event in events
+                for event in timeline_events
             ],
+        )
+
+    def _compress_timeline_events(self, events: list[BinarySecurityEvent]) -> list[BinarySecurityEvent]:
+        compressed: list[BinarySecurityEvent] = []
+        index = 0
+        total = len(events)
+        while index < total:
+            event = events[index]
+            if not self._should_compress_timeline_event(event):
+                compressed.append(event)
+                index += 1
+                continue
+            grouped = [event]
+            next_index = index + 1
+            while next_index < total and self._same_timeline_compression_bucket(grouped[-1], events[next_index]):
+                grouped.append(events[next_index])
+                next_index += 1
+            if len(grouped) == 1:
+                compressed.append(event)
+            else:
+                first_event = grouped[0]
+                last_event = grouped[-1]
+                payload = dict(first_event.payload or {})
+                payload["compressed_event_ids"] = [item.id for item in grouped]
+                payload["compressed_repeat_count"] = len(grouped)
+                payload["compressed_first_created_at"] = first_event.created_at.isoformat() if first_event.created_at else None
+                payload["compressed_last_created_at"] = last_event.created_at.isoformat() if last_event.created_at else None
+                payload["compressed_event_type"] = first_event.event_type
+                first_event._timeline_payload = payload
+                first_event._timeline_compressed = True
+                first_event._timeline_repeat_count = len(grouped)
+                compressed.append(first_event)
+            index = next_index
+        return compressed
+
+    def _timeline_event_display_message(self, event: BinarySecurityEvent) -> str:
+        message = str(getattr(event, "message", "") or "系统事件")
+        repeat_count = int(getattr(event, "_timeline_repeat_count", 1) or 1)
+        compressed = bool(getattr(event, "_timeline_compressed", False))
+        if compressed and repeat_count > 1:
+            return f"{message} · 已压缩 {repeat_count} 次"
+        return message
+
+    def _should_compress_timeline_event(self, event: BinarySecurityEvent) -> bool:
+        return str(getattr(event, "event_type", "") or "").strip() == "tail_reconcile_owner_lost"
+
+    def _same_timeline_compression_bucket(self, left: BinarySecurityEvent, right: BinarySecurityEvent) -> bool:
+        if not self._should_compress_timeline_event(left) or not self._should_compress_timeline_event(right):
+            return False
+        left_payload = left.payload or {}
+        right_payload = right.payload or {}
+        return (
+            str(left.stage_name or "") == str(right.stage_name or "")
+            and str(left.item_id or "") == str(right.item_id or "")
+            and str(left.item_key or "") == str(right.item_key or "")
+            and str(left.message or "") == str(right.message or "")
+            and str(left_payload.get("error_type") or "") == str(right_payload.get("error_type") or "")
+            and str(left_payload.get("error_message") or "") == str(right_payload.get("error_message") or "")
         )
 
     def get_operations(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskOperationPageResponse:

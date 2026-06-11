@@ -19407,6 +19407,49 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
 
         self.assertEqual(1, len(db.events))
 
+    def test_get_timeline_compresses_repeated_tail_owner_lost_events(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        event1 = BinarySecurityEvent(
+            id="evt1",
+            task_id="task1",
+            project_id="p1",
+            event_type="tail_reconcile_owner_lost",
+            stage_name="system_analysis",
+            message="tail 收口 owner 已丢失，等待新的 reducer 接管",
+            payload={"error_type": "StaleTaskExecution", "error_message": "owner lost"},
+        )
+        event1.created_at = _now()
+        event2 = BinarySecurityEvent(
+            id="evt2",
+            task_id="task1",
+            project_id="p1",
+            event_type="tail_reconcile_owner_lost",
+            stage_name="system_analysis",
+            message="tail 收口 owner 已丢失，等待新的 reducer 接管",
+            payload={"error_type": "StaleTaskExecution", "error_message": "owner lost"},
+        )
+        event2.created_at = _now()
+        db = _ModelAwareDb(tasks=[task], events=[event1, event2])
+
+        with patch.object(task_manager_module, "get_session_factory", return_value=lambda: db):
+            timeline = self.manager.get_timeline(db, project_id="p1", task_id="task1")
+
+        self.assertEqual(1, len(timeline.events))
+        self.assertTrue(timeline.events[0].compressed)
+        self.assertEqual(2, timeline.events[0].repeat_count)
+        self.assertIn("已压缩 2 次", timeline.events[0].message)
+
     def test_touch_task_heartbeat_skips_when_local_worker_is_not_active(self):
         manager = TaskManager()
         manager._workers = {}
@@ -26841,6 +26884,7 @@ TaskManagerTests.test_archive_job_payload_uses_compact_downstream_payload = _tes
 TaskManagerTests.test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payload_changes = _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payload_changes
 TaskManagerTests.test_stage_entry_analysis_manual_confirm_sets_pending_entry_confirmation = _test_stage_entry_analysis_manual_confirm_sets_pending_entry_confirmation
 TaskManagerTests.test_stage_dataflow_vuln_scan_uses_selected_entry_inputs_in_manual_mode = _test_stage_dataflow_vuln_scan_uses_selected_entry_inputs_in_manual_mode
+TaskManagerTests.test_get_timeline_compresses_repeated_tail_owner_lost_events = TaskManagerTests.test_get_timeline_compresses_repeated_tail_owner_lost_events
 
 
 if __name__ == "__main__":
