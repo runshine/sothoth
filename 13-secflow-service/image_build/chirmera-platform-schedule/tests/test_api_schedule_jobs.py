@@ -4,6 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 
 def _auth_headers():
     return {"Authorization": "Bearer test-token"}
@@ -448,3 +450,216 @@ def test_ai4red_dispatch_passes_deliver_dir_and_does_not_copy_archive(client, tm
     assert body["downstream_status_mapped"] == "running"
     assert captured_calls and captured_calls[0]["project_id"] == "proj1"
     assert captured_calls[0]["deliver_dir"] == str(deliver_dir)
+
+
+def test_ai4apk_task_create_accepts_file_binding_without_input_type_restriction(client, tmp_path):
+    apk_file = tmp_path / "sample.bin"
+    apk_file.write_bytes(b"apk")
+    payload = {
+        "task_type": "ai4apk",
+        "name": "ai4apk-task-a",
+        "description": "demo",
+        "input_upload_ids": ["upload-001"],
+        "input_binding": {
+            "upload_id": "upload-001",
+            "selection_type": "file",
+            "relative_path": "sample.bin",
+        },
+        "policy": {},
+        "dispatch_policy": {},
+    }
+    with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
+        auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
+        project_factory.return_value.require_access = AsyncMock(side_effect=_fake_require_access)
+        with patch("app.service.user_task_manager.ProjectInputResolver.resolve_single", new=AsyncMock(return_value=_resolved_input(str(tmp_path), "document"))), \
+             patch("app.service.user_task_manager.ProjectInputResolver.resolve_path", new=AsyncMock(return_value={
+                 "relative_path": "sample.bin",
+                 "absolute_path": str(apk_file),
+                 "node_type": "file",
+                 "name": "sample.bin",
+             })):
+            response = client.post("/api/chirmera-platform-schedule/projects/proj1/user-tasks", json=payload, headers=_auth_headers())
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["task_type"] == "ai4apk"
+    assert body["downstream_detail_view"] is None
+    assert body["inputs"][0]["selection_type"] == "file"
+
+
+def test_ai4apk_task_create_rejects_directory_binding(client, tmp_path):
+    apk_dir = tmp_path / "apk-dir"
+    apk_dir.mkdir(parents=True)
+    payload = {
+        "task_type": "ai4apk",
+        "name": "ai4apk-task-dir",
+        "description": "demo",
+        "input_upload_ids": ["upload-001"],
+        "input_binding": {
+            "upload_id": "upload-001",
+            "selection_type": "directory",
+            "relative_path": "apk-dir",
+        },
+        "policy": {},
+        "dispatch_policy": {},
+    }
+    with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
+        auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
+        project_factory.return_value.require_access = AsyncMock(side_effect=_fake_require_access)
+        with patch("app.service.user_task_manager.ProjectInputResolver.resolve_single", new=AsyncMock(return_value=_resolved_input(str(tmp_path), "other"))):
+            response = client.post("/api/chirmera-platform-schedule/projects/proj1/user-tasks", json=payload, headers=_auth_headers())
+    assert response.status_code == 400
+    assert "输入模式与任务类型不匹配" in response.text
+
+
+def test_ai4apk_dispatch_passes_file_path_without_aigw(client, tmp_path):
+    apk_file = tmp_path / "sample.apk"
+    apk_file.write_bytes(b"apk-content")
+    payload = {
+        "task_type": "ai4apk",
+        "name": "ai4apk-task-dispatch",
+        "description": "demo",
+        "input_upload_ids": ["upload-001"],
+        "input_binding": {
+            "upload_id": "upload-001",
+            "selection_type": "file",
+            "relative_path": "sample.apk",
+        },
+        "policy": {},
+        "dispatch_policy": {},
+    }
+
+    captured_calls: list[dict] = []
+
+    async def fake_create(self, *, project_id: str, task_id: str, file_path: str, task_type: str = "APK"):
+        captured_calls.append({
+            "project_id": project_id,
+            "task_id": task_id,
+            "file_path": file_path,
+            "task_type": task_type,
+        })
+        return {
+            "tool_task_id": "TuringAppSecurity-ab123-1718012345678",
+            "project_id": "inner-proj",
+            "job_id": "job-1",
+            "status": "pending",
+        }
+
+    async def fake_get(self, *, downstream_task_id: str):
+        return {
+            "tool_task_id": downstream_task_id,
+            "status": "running",
+            "progress": {"phases": {}},
+            "token_usage": {"input": 1, "cache_read": 0, "output": 2, "cost": 0.01},
+            "created_at": 1718012345,
+            "started_at": 1718012350,
+            "completed_at": None,
+            "error": None,
+        }
+
+    with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
+        auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
+        project_factory.return_value.require_access = AsyncMock(side_effect=_fake_require_access)
+        with patch("app.service.user_task_manager.ProjectInputResolver.resolve_single", new=AsyncMock(return_value=_resolved_input(str(tmp_path), "other"))), \
+             patch("app.service.user_task_manager.ProjectInputResolver.resolve_path", new=AsyncMock(return_value={
+                 "relative_path": "sample.apk",
+                 "absolute_path": str(apk_file),
+                 "node_type": "file",
+                 "name": "sample.apk",
+             })), \
+             patch("app.service.user_task_manager.TuringAppSecurityClient.create_task", new=fake_create), \
+             patch("app.service.user_task_manager.TuringAppSecurityClient.get_task", new=fake_get), \
+             patch("app.service.user_task_manager.AiGatewayTaskKeyClient.create_task_key", new=AsyncMock(side_effect=AssertionError("should not call aigw"))), \
+             patch("app.service.user_task_manager.get_config", return_value=SimpleNamespace(
+                 ai4red_service=SimpleNamespace(base_url="http://ai4red-platform-service:12345", timeout=30),
+                 turing_app_security_service=SimpleNamespace(base_url="http://turing-app-security", timeout=30),
+                 user_task_dispatch_policy=SimpleNamespace(
+                     ai4red=SimpleNamespace(capacity_pool_ids=[], root_task_key_max_concurrency=0, root_task_key_expires_at=None),
+                     ai4apk=SimpleNamespace(capacity_pool_ids=[], root_task_key_max_concurrency=0, root_task_key_expires_at=None),
+                 ),
+                 aigw_service=SimpleNamespace(management_bearer_token=""),
+                 auth_service=SimpleNamespace(service_machine_token=""),
+                 fileserver_service=SimpleNamespace(base_url="", project_input_uploads_path="", timeout=30),
+                 security=SimpleNamespace(task_key_secret_master_key="test-key"),
+             )):
+            create_resp = client.post("/api/chirmera-platform-schedule/projects/proj1/user-tasks", json=payload, headers=_auth_headers())
+            assert create_resp.status_code == 200, create_resp.text
+            task_id = create_resp.json()["id"]
+            dispatch_resp = client.post(
+                f"/api/chirmera-platform-schedule/projects/proj1/user-tasks/{task_id}/dispatch",
+                json={"force": False},
+                headers=_auth_headers(),
+            )
+
+    assert dispatch_resp.status_code == 200, dispatch_resp.text
+    body = dispatch_resp.json()
+    assert body["downstream_task_id"] == "TuringAppSecurity-ab123-1718012345678"
+    assert body["downstream_detail_view"] is None
+    assert body["business_status"] == "running"
+    assert body["downstream_status_raw"] == "running"
+    assert body["downstream_status_mapped"] == "running"
+    assert captured_calls and captured_calls[0]["project_id"] == "proj1"
+    assert captured_calls[0]["file_path"] == str(apk_file)
+    assert captured_calls[0]["task_type"] == "APK"
+
+
+def test_ai4apk_dispatch_propagates_422_error_message(client, tmp_path):
+    apk_file = tmp_path / "missing.apk"
+    apk_file.write_bytes(b"x")
+    payload = {
+        "task_type": "ai4apk",
+        "name": "ai4apk-task-error",
+        "description": "demo",
+        "input_upload_ids": ["upload-001"],
+        "input_binding": {
+            "upload_id": "upload-001",
+            "selection_type": "file",
+            "relative_path": "missing.apk",
+        },
+        "policy": {},
+        "dispatch_policy": {},
+    }
+
+    async def fake_create(self, *, project_id: str, task_id: str, file_path: str, task_type: str = "APK"):
+        raise Exception("创建 ai4apk 任务失败: 422: file not found")
+
+    with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
+        auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
+        project_factory.return_value.require_access = AsyncMock(side_effect=_fake_require_access)
+        with patch("app.service.user_task_manager.ProjectInputResolver.resolve_single", new=AsyncMock(return_value=_resolved_input(str(tmp_path), "document"))), \
+             patch("app.service.user_task_manager.ProjectInputResolver.resolve_path", new=AsyncMock(return_value={
+                 "relative_path": "missing.apk",
+                 "absolute_path": str(apk_file),
+                 "node_type": "file",
+                 "name": "missing.apk",
+             })), \
+             patch("app.service.user_task_manager.TuringAppSecurityClient.create_task", new=fake_create), \
+             patch("app.service.user_task_manager.get_config", return_value=SimpleNamespace(
+                 ai4red_service=SimpleNamespace(base_url="http://ai4red-platform-service:12345", timeout=30),
+                 turing_app_security_service=SimpleNamespace(base_url="http://turing-app-security", timeout=30),
+                 user_task_dispatch_policy=SimpleNamespace(
+                     ai4red=SimpleNamespace(capacity_pool_ids=[], root_task_key_max_concurrency=0, root_task_key_expires_at=None),
+                     ai4apk=SimpleNamespace(capacity_pool_ids=[], root_task_key_max_concurrency=0, root_task_key_expires_at=None),
+                 ),
+                 aigw_service=SimpleNamespace(management_bearer_token=""),
+                 auth_service=SimpleNamespace(service_machine_token=""),
+                 fileserver_service=SimpleNamespace(base_url="", project_input_uploads_path="", timeout=30),
+                 security=SimpleNamespace(task_key_secret_master_key="test-key"),
+             )):
+            create_resp = client.post("/api/chirmera-platform-schedule/projects/proj1/user-tasks", json=payload, headers=_auth_headers())
+            assert create_resp.status_code == 200, create_resp.text
+            task_id = create_resp.json()["id"]
+            with pytest.raises(Exception, match="422: file not found"):
+                client.post(
+                    f"/api/chirmera-platform-schedule/projects/proj1/user-tasks/{task_id}/dispatch",
+                    json={"force": False},
+                    headers=_auth_headers(),
+                )
+            detail_resp = client.get(
+                f"/api/chirmera-platform-schedule/projects/proj1/user-tasks/{task_id}",
+                headers=_auth_headers(),
+            )
+            assert detail_resp.status_code == 200, detail_resp.text
+            detail_body = detail_resp.json()
+            assert detail_body["dispatch_status"] == "dispatch_failed"
+            assert detail_body["business_status"] == "failed"
+            assert "422" in str(detail_body["last_error"] or "")

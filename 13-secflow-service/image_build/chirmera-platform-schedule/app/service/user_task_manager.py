@@ -55,6 +55,14 @@ AI4RED_STATUS_MAP: dict[str, tuple[str, str, bool]] = {
     "PAUSED": ("paused", "paused", False),
     "DELETING": ("cancelling", "cancelling", False),
 }
+AI4APK_STATUS_MAP: dict[str, tuple[str, str, bool]] = {
+    "pending": ("dispatching", "dispatching", False),
+    "decompiling": ("running", "running", False),
+    "running": ("running", "running", False),
+    "paused": ("paused", "paused", False),
+    "completed": ("succeeded", "success", True),
+    "failed": ("failed", "failed", False),
+}
 
 
 @dataclass
@@ -290,6 +298,66 @@ class Ai4RedDispatchClient:
         return response.json()
 
 
+class TuringAppSecurityClient:
+    def __init__(self) -> None:
+        self.cfg = get_config().turing_app_security_service
+
+    async def create_task(
+        self,
+        *,
+        project_id: str,
+        task_id: str,
+        file_path: str,
+        task_type: str = "APK",
+    ) -> dict[str, Any]:
+        client = await get_shared_async_client("schedule-ai4apk", timeout=self.cfg.timeout)
+        payload = {
+            "project_id": project_id,
+            "task_id": task_id,
+            "file_path": file_path,
+            "task_type": task_type,
+        }
+        try:
+            response = await client.post(
+                f"{self.cfg.base_url.rstrip('/')}/api/v1/tasks",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+        except httpx.TimeoutException as exc:
+            raise UpstreamError("创建 ai4apk 任务超时") from exc
+        except httpx.RequestError as exc:
+            raise UpstreamError(f"创建 ai4apk 任务失败: {exc}") from exc
+        if response.status_code not in (200, 201):
+            message = ""
+            try:
+                message = str((response.json() or {}).get("message") or (response.json() or {}).get("detail") or "").strip()
+            except Exception:
+                message = str(response.text or "").strip()
+            suffix = f": {message}" if message else ""
+            raise UpstreamError(f"创建 ai4apk 任务失败: {response.status_code}{suffix}")
+        return response.json()
+
+    async def get_task(self, *, downstream_task_id: str) -> dict[str, Any]:
+        client = await get_shared_async_client("schedule-ai4apk", timeout=self.cfg.timeout)
+        try:
+            response = await client.get(
+                f"{self.cfg.base_url.rstrip('/')}/api/v1/tasks/{downstream_task_id}",
+            )
+        except httpx.TimeoutException as exc:
+            raise UpstreamError("查询 ai4apk 任务超时") from exc
+        except httpx.RequestError as exc:
+            raise UpstreamError(f"查询 ai4apk 任务失败: {exc}") from exc
+        if response.status_code != 200:
+            message = ""
+            try:
+                message = str((response.json() or {}).get("message") or (response.json() or {}).get("detail") or "").strip()
+            except Exception:
+                message = str(response.text or "").strip()
+            suffix = f": {message}" if message else ""
+            raise UpstreamError(f"查询 ai4apk 任务失败: {response.status_code}{suffix}")
+        return response.json()
+
+
 class UserTaskManager:
     def __init__(self) -> None:
         self.input_resolver = ProjectInputResolver()
@@ -297,13 +365,14 @@ class UserTaskManager:
         self.aigw = AiGatewayTaskKeyClient()
         self.binary_security = BinarySecurityDispatchClient()
         self.ai4red = Ai4RedDispatchClient()
+        self.ai4apk = TuringAppSecurityClient()
 
     def _dispatch_policy_for_task_type(self, task_type: str):
         policies = get_config().user_task_dispatch_policy
         policy = getattr(policies, task_type, None)
         if policy is None:
             raise ValidationError(f"任务类型缺少分发策略配置: {task_type}")
-        if task_type != "ai4red" and not list(policy.capacity_pool_ids or []):
+        if task_type not in {"ai4red", "ai4apk"} and not list(policy.capacity_pool_ids or []):
             raise ValidationError(f"任务类型缺少 capacity_pool_ids 配置: {task_type}")
         return policy
 
@@ -409,6 +478,8 @@ class UserTaskManager:
             return "directory"
         if task_type == "ai4red":
             return "directory"
+        if task_type == "ai4apk":
+            return "file"
         raise ValidationError(f"不支持的任务类型: {task_type}")
 
     def _resolve_ai4red_directory(self, input_binding: ScheduleUserTaskInputBinding) -> str:
@@ -423,6 +494,10 @@ class UserTaskManager:
     def _extract_ai4red_data(payload: dict[str, Any]) -> dict[str, Any]:
         data = payload.get("data")
         return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _extract_ai4apk_data(payload: dict[str, Any]) -> dict[str, Any]:
+        return payload if isinstance(payload, dict) else {}
 
     def _apply_ai4red_status(self, task: ScheduleUserTask, dispatch: Optional[ScheduleUserTaskDispatch], downstream_payload: dict[str, Any]) -> None:
         status_raw = str(downstream_payload.get("status") or "").strip()
@@ -451,6 +526,33 @@ class UserTaskManager:
         self._apply_ai4red_status(task, dispatch, self._extract_ai4red_data(payload))
         db.commit()
 
+    def _apply_ai4apk_status(self, task: ScheduleUserTask, dispatch: Optional[ScheduleUserTaskDispatch], downstream_payload: dict[str, Any]) -> None:
+        status_raw = str(downstream_payload.get("status") or "").strip()
+        mapped_dispatch_status, mapped_business_status, report_ready = AI4APK_STATUS_MAP.get(
+            status_raw,
+            (task.dispatch_status or "running", task.business_status or "running", bool(task.downstream_report_ready)),
+        )
+        error_message = str(downstream_payload.get("error") or "").strip() or task.last_error
+        task.dispatch_status = mapped_dispatch_status
+        task.business_status = mapped_business_status
+        task.downstream_status_raw = status_raw or None
+        task.downstream_status_mapped = mapped_business_status
+        task.downstream_report_ready = report_ready
+        task.last_error = error_message or None
+        if dispatch is not None:
+            dispatch.dispatch_status = mapped_dispatch_status
+            dispatch.downstream_status_raw = status_raw or None
+            dispatch.downstream_status_mapped = mapped_business_status
+            dispatch.downstream_report_ready = report_ready
+            dispatch.last_error = error_message or None
+
+    async def _refresh_ai4apk_state(self, db: Session, task: ScheduleUserTask, dispatch: Optional[ScheduleUserTaskDispatch]) -> None:
+        if task.task_type != "ai4apk" or not str(task.downstream_task_id or "").strip():
+            return
+        payload = await self.ai4apk.get_task(downstream_task_id=task.downstream_task_id)
+        self._apply_ai4apk_status(task, dispatch, self._extract_ai4apk_data(payload))
+        db.commit()
+
     async def list_tasks(self, db: Session, project_id: str, bearer_token: str) -> tuple[int, list[dict[str, Any]], dict[str, int]]:
         rows = db.query(ScheduleUserTask).filter(
             ScheduleUserTask.project_id == project_id
@@ -476,6 +578,13 @@ class UserTaskManager:
                     db.rollback()
                     task = self.get_task_or_404(db, project_id, task.id)
                     latest_dispatch = self._dispatches_for_task(db, task.id)[0] if self._dispatches_for_task(db, task.id) else None
+            if task.task_type == "ai4apk" and task.downstream_task_id:
+                try:
+                    await self._refresh_ai4apk_state(db, task, latest_dispatch)
+                except Exception:
+                    db.rollback()
+                    task = self.get_task_or_404(db, project_id, task.id)
+                    latest_dispatch = self._dispatches_for_task(db, task.id)[0] if self._dispatches_for_task(db, task.id) else None
             stats[task.dispatch_status] = int(stats.get(task.dispatch_status, 0)) + 1
             items.append(self._serialize_task(task, bindings, latest_dispatch))
         return len(rows), items, stats
@@ -486,7 +595,7 @@ class UserTaskManager:
         if len(payload.input_upload_ids) != 1:
             raise ValidationError("当前版本仅支持单选一个任务输入记录")
         expected_input_type = TASK_TYPE_INPUT_TYPE.get(payload.task_type)
-        if payload.task_type != "ai4red" and not expected_input_type:
+        if payload.task_type not in {"ai4red", "ai4apk"} and not expected_input_type:
             raise ValidationError(f"不支持的任务类型: {payload.task_type}")
         duplicate = db.query(ScheduleUserTask).filter(
             ScheduleUserTask.project_id == project_id,
@@ -531,6 +640,12 @@ class UserTaskManager:
             resolved_relative_paths = [resolved_relative_path]
             resolved_path = str(node.get("absolute_path") or "").strip()
             display_name = str(node.get("name") or resolved_relative_path or display_name)
+            if payload.task_type == "ai4apk":
+                if not resolved_path:
+                    raise ValidationError("AI4APK 输入文件解析失败")
+                file_path = Path(resolved_path)
+                if not file_path.is_file():
+                    raise ValidationError(f"AI4APK 输入文件不存在: {file_path}")
         elif selection_type == "file_list":
             if not relative_paths:
                 raise ValidationError("盖亚-二进制模块必须至少选择一个文件")
@@ -650,6 +765,38 @@ class UserTaskManager:
                 task.last_error = None
                 db.commit()
                 await self._refresh_ai4red_state(db, task, dispatch, bearer_token)
+                return self._serialize_task(task, bindings, dispatch)
+            if task.task_type == "ai4apk":
+                file_path = Path(str(input_binding.resolved_path or input_binding.target_path or "").strip())
+                if input_binding.selection_type != "file":
+                    raise ValidationError("AI4APK 仅支持 file 输入模式")
+                if not file_path.is_file():
+                    raise ValidationError(f"AI4APK 输入文件不存在: {file_path}")
+                create_result = await self.ai4apk.create_task(
+                    project_id=project_id,
+                    task_id=task.id,
+                    file_path=str(file_path),
+                    task_type="APK",
+                )
+                downstream_task_id = str(self._extract_ai4apk_data(create_result).get("tool_task_id") or "").strip()
+                if not downstream_task_id:
+                    raise UpstreamError("创建 ai4apk 任务失败: 下游未返回 tool_task_id")
+                dispatch.dispatch_status = "running"
+                dispatch.downstream_task_id = downstream_task_id
+                dispatch.downstream_detail_view = None
+                dispatch.downstream_status_raw = "pending"
+                dispatch.downstream_status_mapped = "dispatching"
+                dispatch.downstream_report_ready = False
+                task.dispatch_status = "running"
+                task.business_status = "running"
+                task.downstream_task_id = downstream_task_id
+                task.downstream_detail_view = None
+                task.downstream_status_raw = "pending"
+                task.downstream_status_mapped = "dispatching"
+                task.downstream_report_ready = False
+                task.last_error = None
+                db.commit()
+                await self._refresh_ai4apk_state(db, task, dispatch)
                 return self._serialize_task(task, bindings, dispatch)
 
             dispatch_policy = self._dispatch_policy_for_task_type(task.task_type)
@@ -789,6 +936,14 @@ class UserTaskManager:
         if task.task_type == "ai4red" and task.downstream_task_id:
             try:
                 await self._refresh_ai4red_state(db, task, latest_dispatch, bearer_token)
+            except Exception:
+                db.rollback()
+                task = self.get_task_or_404(db, project_id, task_id)
+                dispatches = self._dispatches_for_task(db, task.id)
+                latest_dispatch = dispatches[0] if dispatches else None
+        if task.task_type == "ai4apk" and task.downstream_task_id:
+            try:
+                await self._refresh_ai4apk_state(db, task, latest_dispatch)
             except Exception:
                 db.rollback()
                 task = self.get_task_or_404(db, project_id, task_id)

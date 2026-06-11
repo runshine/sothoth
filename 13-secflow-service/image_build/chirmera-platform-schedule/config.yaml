@@ -29,6 +29,9 @@ user_task_dispatch_policy:
   ai4red:
     capacity_pool_ids: []
     root_task_key_max_concurrency: 0
+  ai4apk:
+    capacity_pool_ids: []
+    root_task_key_max_concurrency: 0
 
 aigw_service:
   base_url: "http://gaiasec-llm-gateway"
@@ -37,6 +40,9 @@ aigw_service:
 
 ai4red_service:
   base_url: "http://ai4red-platform-service:12345"
+
+turing_app_security_service:
+  base_url: "http://turing-app-security"
 
 registry:
   enabled: true

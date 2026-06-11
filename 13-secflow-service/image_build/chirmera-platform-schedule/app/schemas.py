@@ -274,7 +274,7 @@ class VirtualKeyEventResponse(BaseModel):
     created_at: datetime
 
 
-UserTaskType = Literal["binary_firmware_e2e", "source_scan_e2e", "binary_module_e2e", "ai4red"]
+UserTaskType = Literal["binary_firmware_e2e", "source_scan_e2e", "binary_module_e2e", "ai4red", "ai4apk"]
 InputSelectionType = Literal["file", "file_list", "directory"]
 
 
