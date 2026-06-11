@@ -21,7 +21,7 @@ data:
 
     project_service:
       base_url: "http://secflow-platform-project"
-      get_project_path: "/api/project/projects"
+      get_project_path: "/api/project"
 
     aigw_service:
       base_url: "http://gaiasec-llm-gateway"

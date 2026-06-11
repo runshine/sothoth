@@ -14,7 +14,7 @@ auth_service:
 
 project_service:
   base_url: "http://secflow-platform-project"
-  get_project_path: "/api/project/projects"
+  get_project_path: "/api/project"
 
 user_task_dispatch_policy:
   binary_firmware_e2e:

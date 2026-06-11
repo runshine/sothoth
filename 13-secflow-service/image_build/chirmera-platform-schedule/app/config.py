@@ -43,7 +43,7 @@ class AuthServiceConfig(BaseModel):
 
 class ProjectServiceConfig(BaseModel):
     base_url: str = "http://secflow-platform-project"
-    get_project_path: str = "/api/project/projects"
+    get_project_path: str = "/api/project"
     timeout: int = 10
 
 
