@@ -7592,6 +7592,7 @@ class TaskManager:
         self._last_queue_reconcile_at = now
         (
             stale_dispatching_reclaimed,
+            orphaned_owned_execution_requeued,
             stale_stage_item_reclaimed,
             stale_running_reclaimed,
             released_running_requeued,
@@ -7600,6 +7601,7 @@ class TaskManager:
         idle_tail_recovered = self._recover_idle_tail_reconciliation_tasks_locked(db)
         if (
             stale_dispatching_reclaimed
+            or orphaned_owned_execution_requeued
             or stale_stage_item_reclaimed
             or stale_running_reclaimed
             or released_running_requeued
@@ -7666,19 +7668,21 @@ class TaskManager:
             else:
                 await get_task_queue().push_operation(operation_id)
 
-    def _run_parent_reclaim_pass(self, db: Session) -> tuple[bool, bool, bool, bool, bool]:
+    def _run_parent_reclaim_pass(self, db: Session) -> tuple[bool, bool, bool, bool, bool, bool]:
         if not isinstance(db, Session):
             return (
                 self._reclaim_stale_dispatching_locked(db),
+                self._requeue_orphaned_owned_execution_locked(db),
                 self._reclaim_stale_streaming_stage_items_locked(db),
                 self._reclaim_stale_running_locked(db),
                 self._requeue_released_running_locked(db),
                 self._recover_missing_stage_terminal_events_locked(db),
             )
         if not self._acquire_coordinator_lease(PARENT_RECLAIM_COORDINATOR_LEASE):
-            return False, False, False, False, False
+            return False, False, False, False, False, False
         return (
             self._reclaim_stale_dispatching_locked(db),
+            self._requeue_orphaned_owned_execution_locked(db),
             self._reclaim_stale_streaming_stage_items_locked(db),
             self._reclaim_stale_running_locked(db),
             self._requeue_released_running_locked(db),
@@ -14324,6 +14328,7 @@ class TaskManager:
     def _dispatch_once(self, db: Session) -> list[str]:
         (
             stale_reclaimed,
+            orphaned_owned_execution_requeued,
             stale_stage_item_reclaimed,
             stale_running_reclaimed,
             released_running_requeued,
@@ -14333,7 +14338,7 @@ class TaskManager:
         active_count = self._active_dispatch_count(db)
         slots = max(0, service_config.max_concurrent_tasks - active_count)
         claimed_ids = self._claim_pending_tasks(db, slots)
-        if stale_reclaimed or stale_stage_item_reclaimed or stale_running_reclaimed or released_running_requeued or recovered_missing_terminal_events or claimed_ids:
+        if stale_reclaimed or orphaned_owned_execution_requeued or stale_stage_item_reclaimed or stale_running_reclaimed or released_running_requeued or recovered_missing_terminal_events or claimed_ids:
             db.commit()
         return claimed_ids
 
@@ -15867,6 +15872,43 @@ class TaskManager:
             db.flush()
         return reclaimed
 
+    def _requeue_orphaned_owned_execution_locked(self, db: Session) -> bool:
+        candidate_rows = (
+            db.query(BinarySecurityTask)
+            .filter(
+                BinarySecurityTask.status.in_(["running", "dispatching"]),
+                BinarySecurityTask.runtime_phase == TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            )
+            .all()
+        )
+        if not candidate_rows:
+            return False
+        reclaimed = False
+        for task in candidate_rows:
+            if self._task_has_active_cancel_operation(db, task) or str(task.status or "").strip() == TASK_STATUS_CANCELLING:
+                continue
+            if self._should_skip_readless_reconcile_for_active_task(task):
+                continue
+            if not self._should_requeue_for_owned_execution(
+                db,
+                task,
+                next_stage=str(task.current_stage or "").strip() or None,
+            ):
+                continue
+            self._requeue_owned_execution_takeover(
+                db,
+                task,
+                stage_name=str(task.current_stage or "").strip() or None,
+                reason="readless_owned_execution_orphan",
+                event_type="owned_execution_takeover_requeued",
+                message="检测到执行接管悬空，已重新排队等待 worker 接管",
+                event_payload={"previous_status": str(task.status or "").strip() or None},
+            )
+            reclaimed = True
+        if reclaimed:
+            db.flush()
+        return reclaimed
+
     def _reclaim_stale_streaming_stage_items_locked(self, db: Session) -> bool:
         service_config = self._load_service_config(db)
         stale_rows = (
@@ -16411,6 +16453,21 @@ class TaskManager:
                 payload={"stage_status": active_streaming_status},
             )
             self._sync_task_abnormal_reason_snapshot(db, task, None)
+            if self._should_requeue_for_owned_execution(
+                db,
+                task,
+                next_stage=active_streaming_stage,
+                next_stage_status=str(active_streaming_status or "").strip(),
+            ):
+                self._requeue_owned_execution_takeover(
+                    db,
+                    task,
+                    stage_name=active_streaming_stage,
+                    reason="finalize_streaming_upstream_no_active_owner",
+                    event_type="owned_execution_takeover_requeued",
+                    message=f"检测到执行接管悬空，已重新排队等待 worker 接管: {active_streaming_stage}",
+                    event_payload={"stage_status": active_streaming_status, "source": "finalize_streaming_upstream"},
+                )
             return
         has_active_incomplete_stage, active_stage_name, active_stage_status = self._has_any_active_incomplete_stage(task, stage_runs)
         if has_active_incomplete_stage:
@@ -16439,6 +16496,21 @@ class TaskManager:
                 payload={"stage_status": active_stage_status},
             )
             self._sync_task_abnormal_reason_snapshot(db, task, None)
+            if self._should_requeue_for_owned_execution(
+                db,
+                task,
+                next_stage=active_stage_name,
+                next_stage_status=str(active_stage_status or "").strip(),
+            ):
+                self._requeue_owned_execution_takeover(
+                    db,
+                    task,
+                    stage_name=active_stage_name,
+                    reason="finalize_active_stage_no_active_owner",
+                    event_type="owned_execution_takeover_requeued",
+                    message=f"检测到执行接管悬空，已重新排队等待 worker 接管: {active_stage_name}",
+                    event_payload={"stage_status": active_stage_status, "source": "finalize_active_stage"},
+                )
             return
         next_stage = self._next_incomplete_stage(db, task)
         if next_stage:
@@ -16482,18 +16554,34 @@ class TaskManager:
                 task.tail_reconcile_state = "idle"
                 self._release_tail_reconcile_owner(task.id)
                 self._last_task_heartbeat_at.pop(task.id, None)
-                self._record_event(
+                if self._should_requeue_for_owned_execution(
                     db,
                     task,
-                    "task_finalize_deferred_for_incomplete_stage",
-                    f"任务仍有未完成阶段，保持活跃状态等待继续推进: {next_stage}",
-                    level="warning",
-                    stage_name=next_stage,
-                    payload={"stage_status": next_stage_status},
-                )
-                self._sync_task_abnormal_reason_snapshot(db, task, None)
-                if next_stage_status in {"pending", "queued"} or next_stage_run is None:
-                    self._enqueue_task(task.id)
+                    next_stage=next_stage,
+                    next_stage_status=str(next_stage_status or "").strip(),
+                ):
+                    self._requeue_owned_execution_takeover(
+                        db,
+                        task,
+                        stage_name=next_stage,
+                        reason="finalize_deferred_no_active_owner",
+                        event_type="owned_execution_takeover_requeued",
+                        message=f"检测到执行接管悬空，已重新排队等待 worker 接管: {next_stage}",
+                        event_payload={"stage_status": next_stage_status},
+                    )
+                else:
+                    self._record_event(
+                        db,
+                        task,
+                        "task_finalize_deferred_for_incomplete_stage",
+                        f"任务仍有未完成阶段，保持活跃状态等待继续推进: {next_stage}",
+                        level="warning",
+                        stage_name=next_stage,
+                        payload={"stage_status": next_stage_status},
+                    )
+                    self._sync_task_abnormal_reason_snapshot(db, task, None)
+                    if next_stage_status in {"pending", "queued"} or next_stage_run is None:
+                        self._enqueue_task(task.id)
                 return
         else:
             runs_by_stage = {str(run.stage_name or "").strip(): run for run in stage_runs}
@@ -20287,6 +20375,83 @@ class TaskManager:
             None,
         )
 
+    def _has_active_owned_execution_holder(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> bool:
+        if self._task_runtime_phase(task) != TASK_RUNTIME_PHASE_OWNED_EXECUTION:
+            return False
+        lease_owner, lease_expires_at, _lease_source, _lease_pod_uid, _lease_boot_id, _lease_generation = self._task_runtime_lease_view(db, task)
+        if lease_owner and ((_seconds_until(lease_expires_at) or 0) > 0):
+            return True
+        dispatcher_instance_id = str(task.dispatcher_instance_id or "").strip()
+        if not dispatcher_instance_id or task.dispatch_started_at is None:
+            return False
+        return self._lease_is_active(task)
+
+    def _should_requeue_for_owned_execution(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        next_stage: str | None = None,
+        next_stage_status: str | None = None,
+    ) -> bool:
+        if self._task_runtime_phase(task) != TASK_RUNTIME_PHASE_OWNED_EXECUTION:
+            return False
+        if self._has_active_owned_execution_holder(db, task):
+            return False
+        if str(task.status or "").strip() not in {"running", "dispatching", "pending"}:
+            return False
+        stage_name = str(next_stage or task.current_stage or "").strip()
+        if not stage_name:
+            return False
+        normalized_stage_status = str(next_stage_status or "").strip()
+        if normalized_stage_status and normalized_stage_status not in {"pending", "queued", "running", "dispatching", "applying"}:
+            return False
+        return self._stage_has_real_runnable_work(db, task, stage_name)
+
+    def _requeue_owned_execution_takeover(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_name: str | None,
+        reason: str,
+        event_type: str,
+        message: str,
+        event_level: str = "warning",
+        event_payload: dict[str, Any] | None = None,
+    ) -> None:
+        task.current_stage = stage_name or task.current_stage
+        task.status = "pending"
+        self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+        task.tail_reconcile_state = "idle"
+        task.dispatcher_instance_id = None
+        task.dispatch_started_at = None
+        task.lease_expires_at = None
+        task.finished_at = None
+        task.last_error = None
+        self._clear_runtime_lease(db, task.id)
+        self._release_tail_reconcile_owner(task.id)
+        self._last_task_heartbeat_at.pop(task.id, None)
+        self._record_event(
+            db,
+            task,
+            event_type,
+            message,
+            level=event_level,
+            stage_name=stage_name,
+            payload={
+                "takeover_reason": reason,
+                "takeover_action": "requeue_owned_execution",
+                **(event_payload or {}),
+            },
+        )
+        self._sync_task_abnormal_reason_snapshot(db, task, None)
+        self._enqueue_task(task.id)
+
     def _reconcile_lease_view(
         self,
         db: Session,
@@ -23183,6 +23348,22 @@ class TaskManager:
                     task.dispatch_started_at = None
                     task.lease_expires_at = None
                     self._release_tail_reconcile_owner(task.id)
+                    if self._should_requeue_for_owned_execution(
+                        db,
+                        task,
+                        next_stage=str(task.current_stage or "").strip() or None,
+                        next_stage_status="running",
+                    ):
+                        self._requeue_owned_execution_takeover(
+                            db,
+                            task,
+                            stage_name=str(task.current_stage or "").strip() or None,
+                            reason="refresh_task_status_no_active_owner",
+                            event_type="owned_execution_takeover_requeued",
+                            message="检测到执行接管悬空，已重新排队等待 worker 接管",
+                            event_payload={"source": "refresh_task_status_after_sync"},
+                        )
+                        return
             task.finished_at = None
             self._clear_task_failure_state(task)
             self._clear_task_abnormal_reason_snapshot(db, task)
@@ -23349,7 +23530,22 @@ class TaskManager:
                 summary["stale_from_stage"] = None
                 task.summary = summary
             self._clear_task_abnormal_reason_snapshot(db, task)
-            if str(next_stage_status or "").strip() in {"pending", "queued"}:
+            if self._should_requeue_for_owned_execution(
+                db,
+                task,
+                next_stage=next_stage,
+                next_stage_status=str(next_stage_status or "").strip(),
+            ):
+                self._requeue_owned_execution_takeover(
+                    db,
+                    task,
+                    stage_name=next_stage,
+                    reason="downstream_sync_no_active_owner",
+                    event_type="task_requeued_after_downstream_sync",
+                    message=f"下游状态同步完成，任务继续进入阶段并重新排队等待 worker 接管: {next_stage}",
+                    event_payload={"stage_status": str(next_stage_status or "").strip() or None},
+                )
+            elif str(next_stage_status or "").strip() in {"pending", "queued"}:
                 self._record_event(
                     db,
                     task,

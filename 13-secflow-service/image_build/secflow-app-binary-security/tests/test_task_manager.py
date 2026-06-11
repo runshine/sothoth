@@ -24645,8 +24645,202 @@ def _test_running_message_downstream_failure_observation_is_not_applied(self):
     self.assertFalse(bool(item.result.get("sync_observation", {}).get("state_applied")))
 
 
+def _test_sync_downstream_status_requeues_owned_execution_without_active_holder(self):
+    task = BinarySecurityTask(
+        id="s1",
+        project_id="p1",
+        name="binary",
+        status="running",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/tmp",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    )
+    current_run = BinarySecurityStageRun(
+        id="sr1",
+        task_id="s1",
+        project_id="p1",
+        stage_name="system_analysis",
+        sequence_no=2,
+        status="success",
+    )
+    next_run = BinarySecurityStageRun(
+        id="sr2",
+        task_id="s1",
+        project_id="p1",
+        stage_name="binary_to_source",
+        sequence_no=3,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="s1",
+        project_id="p1",
+        stage_run_id="sr1",
+        stage_name="system_analysis",
+        item_key="fw1",
+        parent_key="fw1",
+        status="running",
+        downstream_service="system_analyse",
+        downstream_task_id="sat1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[current_run, next_run], stage_items=[item], events=[])
+
+    original_fetch = self.manager._fetch_downstream_task_payload
+    original_write = self.manager._write_task_metadata_async
+    original_enqueue = self.manager._enqueue_task
+    queued = []
+
+    async def _fetch(*_args, **_kwargs):
+        return {"task_id": "sat1", "status": "passed"}
+
+    async def _noop_write(*_args, **_kwargs):
+        return None
+
+    self.manager._fetch_downstream_task_payload = _fetch
+    self.manager._write_task_metadata_async = _noop_write
+    self.manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
+    try:
+        asyncio.run(
+            self.manager.sync_downstream_status(
+                db,
+                project_id="p1",
+                task_id="s1",
+                stage_name="system_analysis",
+                apply_state=True,
+            )
+        )
+    finally:
+        self.manager._fetch_downstream_task_payload = original_fetch
+        self.manager._write_task_metadata_async = original_write
+        self.manager._enqueue_task = original_enqueue
+
+    self.assertEqual("pending", task.status)
+    self.assertEqual(["s1"], queued)
+    requeue_events = [event for event in db.events if event.event_type == "owned_execution_takeover_requeued"]
+    self.assertTrue(requeue_events)
+    self.assertEqual("requeue_owned_execution", requeue_events[-1].payload.get("takeover_action"))
+    self.assertEqual("system_analysis", requeue_events[-1].stage_name)
+
+
+def _test_finalize_task_requeues_owned_execution_without_active_holder(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="binary",
+        status="running",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/tmp",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    )
+    current_run = BinarySecurityStageRun(
+        id="sr1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="system_analysis",
+        sequence_no=2,
+        status="success",
+    )
+    next_run = BinarySecurityStageRun(
+        id="sr2",
+        task_id="t1",
+        project_id="p1",
+        stage_name="binary_to_source",
+        sequence_no=3,
+        status="running",
+    )
+    next_item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_run_id="sr2",
+        stage_name="binary_to_source",
+        item_key="fw1",
+        parent_key="fw1",
+        status="running",
+        downstream_service="binary_to_source",
+        downstream_task_id="b2s1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[current_run, next_run], stage_items=[next_item], events=[])
+
+    original_enqueue = self.manager._enqueue_task
+    queued = []
+    self.manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
+    try:
+        self.manager._finalize_task(db, task)
+    finally:
+        self.manager._enqueue_task = original_enqueue
+
+    self.assertEqual("pending", task.status)
+    self.assertEqual("binary_to_source", task.current_stage)
+    self.assertEqual(["t1"], queued)
+    requeue_events = [event for event in db.events if event.event_type == "owned_execution_takeover_requeued"]
+    self.assertTrue(requeue_events)
+
+
+def _test_requeue_orphaned_owned_execution_locked_recovers_orphan(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="binary-module",
+        status="running",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        current_stage="binary_to_source",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/tmp",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    )
+    stage_run = BinarySecurityStageRun(
+        id="sr1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="binary_to_source",
+        sequence_no=1,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_run_id="sr1",
+        stage_name="binary_to_source",
+        item_key="module1",
+        parent_key="module1",
+        status="running",
+        downstream_service="binary_to_source",
+        downstream_task_id="b2s1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], events=[])
+
+    original_enqueue = self.manager._enqueue_task
+    queued = []
+    self.manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
+    try:
+        reclaimed = self.manager._requeue_orphaned_owned_execution_locked(db)
+    finally:
+        self.manager._enqueue_task = original_enqueue
+
+    self.assertTrue(reclaimed)
+    self.assertEqual("pending", task.status)
+    self.assertEqual(["t1"], queued)
+    requeue_events = [event for event in db.events if event.event_type == "owned_execution_takeover_requeued"]
+    self.assertTrue(requeue_events)
+
+
 TaskManagerTests.test_self_healing_downstream_failure_observation_is_not_applied = _test_self_healing_downstream_failure_observation_is_not_applied
 TaskManagerTests.test_running_message_downstream_failure_observation_is_not_applied = _test_running_message_downstream_failure_observation_is_not_applied
+TaskManagerTests.test_sync_downstream_status_requeues_owned_execution_without_active_holder = _test_sync_downstream_status_requeues_owned_execution_without_active_holder
+TaskManagerTests.test_finalize_task_requeues_owned_execution_without_active_holder = _test_finalize_task_requeues_owned_execution_without_active_holder
+TaskManagerTests.test_requeue_orphaned_owned_execution_locked_recovers_orphan = _test_requeue_orphaned_owned_execution_locked_recovers_orphan
 
 
 def _test_stage_item_response_falls_back_to_downstream_payload_status(self):
