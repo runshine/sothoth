@@ -164,7 +164,6 @@ class LiteLLMKeyEvent(Base):
 class ScheduleUserTask(Base):
     __tablename__ = f"{TABLE_PREFIX}user_task"
     __table_args__ = (
-        UniqueConstraint("project_id", "name", name=f"uk_{TABLE_PREFIX}user_task_project_name"),
         Index(f"idx_{TABLE_PREFIX}user_task_project_status", "project_id", "create_status", "dispatch_status"),
     )
 
@@ -276,6 +275,7 @@ def init_database():
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
     _ensure_schedule_execution_columns(engine)
+    _ensure_user_task_constraints(engine)
     _ensure_user_task_columns(engine)
     _ensure_user_task_dispatch_columns(engine)
 
@@ -294,6 +294,27 @@ def _ensure_schedule_execution_columns(engine) -> None:
         statements.append(f"ALTER TABLE {ScheduleExecution.__tablename__} ADD COLUMN capacity_reject_reason VARCHAR(128) NULL")
     if "capacity_reject_at" not in columns:
         statements.append(f"ALTER TABLE {ScheduleExecution.__tablename__} ADD COLUMN capacity_reject_at DATETIME NULL")
+    if not statements:
+        return
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+
+
+def _ensure_user_task_constraints(engine) -> None:
+    inspector = inspect(engine)
+    if ScheduleUserTask.__tablename__ not in inspector.get_table_names():
+        return
+    indexes = {index["name"] for index in inspector.get_indexes(ScheduleUserTask.__tablename__)}
+    unique_constraints = {
+        constraint["name"]
+        for constraint in inspector.get_unique_constraints(ScheduleUserTask.__tablename__)
+        if constraint.get("name")
+    }
+    legacy_unique_name = f"uk_{TABLE_PREFIX}user_task_project_name"
+    statements: list[str] = []
+    if legacy_unique_name in unique_constraints or legacy_unique_name in indexes:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} DROP INDEX {legacy_unique_name}")
     if not statements:
         return
     with engine.begin() as connection:

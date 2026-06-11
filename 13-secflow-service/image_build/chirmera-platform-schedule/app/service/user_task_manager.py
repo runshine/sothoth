@@ -594,12 +594,6 @@ class UserTaskManager:
             raise ValidationError("必须选择任务输入记录")
         if len(payload.input_upload_ids) != 1:
             raise ValidationError("当前版本仅支持单选一个任务输入记录")
-        duplicate = db.query(ScheduleUserTask).filter(
-            ScheduleUserTask.project_id == project_id,
-            ScheduleUserTask.name == payload.name,
-        ).first()
-        if duplicate is not None:
-            raise ConflictError(f"任务已存在: {payload.name}")
         resolved = await self.input_resolver.resolve_single(project_id, payload.input_upload_ids[0], bearer_token)
         if resolved.project_id != project_id:
             raise ValidationError("任务输入记录不属于当前项目")
