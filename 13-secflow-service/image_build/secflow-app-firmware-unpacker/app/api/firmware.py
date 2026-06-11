@@ -123,6 +123,27 @@ def _normalize_project_id(project_id: Optional[str]) -> Optional[str]:
     return value or None
 
 
+def _agent_runtime_payload_from_snapshot(snapshot: dict | None) -> dict[str, Any]:
+    payload = {
+        "has_agent_task_key": False,
+        "agent_task_key_id": None,
+        "agent_task_key_prefix": None,
+        "agent_runtime_mode": None,
+    }
+    if not isinstance(snapshot, dict):
+        return payload
+    agent_task_key = snapshot.get("agent_task_key")
+    if not isinstance(agent_task_key, dict):
+        return payload
+    agent_task_key_id = str(agent_task_key.get("id") or "").strip() or None
+    agent_task_key_prefix = str(agent_task_key.get("prefix") or "").strip() or None
+    payload["has_agent_task_key"] = bool(agent_task_key_id or agent_task_key_prefix)
+    payload["agent_task_key_id"] = agent_task_key_id
+    payload["agent_task_key_prefix"] = agent_task_key_prefix
+    payload["agent_runtime_mode"] = str(agent_task_key.get("source") or "").strip() or None
+    return payload
+
+
 def _normalize_runtime_path(path: str) -> str:
     value = str(path or "").strip()
     legacy_prefix = "/data/fileserver/files"

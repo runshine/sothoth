@@ -23880,6 +23880,58 @@ def _test_downstream_controller_delete_treats_dfa_delete_500_with_absent_task_as
 TaskManagerTests.test_downstream_controller_delete_treats_dfa_delete_500_with_absent_task_as_success = _test_downstream_controller_delete_treats_dfa_delete_500_with_absent_task_as_success
 
 
+def _test_find_reusable_system_analysis_payload_uses_service_token_fallback(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="binary",
+        status="failed",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/tmp/out",
+        workspace_root="/tmp/ws",
+    )
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="system_analysis",
+        item_key="fw-a",
+        item_name="fw-a",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-old",
+    )
+
+    recorded: dict[str, object] = {}
+
+    async def fake_list(service, *, project_id, token, **kwargs):
+        recorded["service"] = service
+        recorded["project_id"] = project_id
+        recorded["token"] = token
+        recorded["kwargs"] = dict(kwargs)
+        return {
+            "items": [
+                {
+                    "task_id": "sat-new",
+                    "parent_stage_item_id": "si1",
+                    "status": "running",
+                }
+            ]
+        }
+
+    with patch.object(self.manager, "_downstream_list_tasks", side_effect=fake_list):
+        payload = asyncio.run(self.manager._find_reusable_system_analysis_payload(task, item, None))
+
+    self.assertEqual("sat-new", payload["task_id"])
+    self.assertEqual(self.manager._service_token(), recorded["token"])
+    self.assertEqual("sat-new", item.downstream_task_id)
+
+
+TaskManagerTests.test_find_reusable_system_analysis_payload_uses_service_token_fallback = _test_find_reusable_system_analysis_payload_uses_service_token_fallback
+
+
 def _test_stage_item_response_exposes_downstream_status_from_sync_observation(self):
     item = BinarySecurityStageItem(
         id="si-entry",

@@ -4217,6 +4217,8 @@ class TaskManager:
             .order_by(BinarySecurityEvent.created_at.desc())
             .first()
         )
+        summary_payload = task.summary if isinstance(task.summary, dict) else {}
+        runtime_task_keys = summary_payload.get("runtime_task_keys") if isinstance(summary_payload.get("runtime_task_keys"), dict) else {}
         return {
             "state_events": {
                 "status_counts": status_counts,
@@ -4250,11 +4252,11 @@ class TaskManager:
                 "metadata_path": str(Path(task.workspace_root) / "input" / "task-metadata.json") if task.workspace_root else None,
             },
             "runtime_task_keys": {
-                "root_task_key_secret": str(payload.root_task_key_secret or "").strip() or None,
-                "root_task_key_id": str(payload.root_task_key_id or "").strip() or None,
-                "root_task_key_name": str(payload.root_task_key_name or "").strip() or None,
-                "root_task_key_prefix": str(payload.root_task_key_prefix or "").strip() or None,
-                "task_key_source": str(payload.task_key_source or "").strip() or None,
+                "root_task_key_secret": str(runtime_task_keys.get("root_task_key_secret") or "").strip() or None,
+                "root_task_key_id": str(runtime_task_keys.get("root_task_key_id") or "").strip() or None,
+                "root_task_key_name": str(runtime_task_keys.get("root_task_key_name") or "").strip() or None,
+                "root_task_key_prefix": str(runtime_task_keys.get("root_task_key_prefix") or "").strip() or None,
+                "task_key_source": str(runtime_task_keys.get("task_key_source") or "").strip() or None,
             },
         }
 
@@ -11288,11 +11290,11 @@ class TaskManager:
         item: BinarySecurityStageItem,
     ) -> dict[str, Any] | None:
         service = str(item.downstream_service or "").strip()
-        token = self._service_token() if service != "system_analyse" else None
+        token = self._resolve_downstream_token()
         if service == "firmware_unpacker":
             return await self._find_reusable_firmware_unpack_payload(task, item, token)
         if service == "system_analyse":
-            return await self._find_reusable_system_analysis_payload(task, item)
+            return await self._find_reusable_system_analysis_payload(task, item, token)
         if service == "binary_to_source":
             return await self._find_reusable_b2s_payload(task, item, token)
         if service == "entry_analyse":
@@ -11346,7 +11348,7 @@ class TaskManager:
                 stage_name=item.stage_name,
                 task=task,
                 item=item,
-                token=self._service_token() if item.downstream_service != "system_analyse" else None,
+                token=self._resolve_downstream_token(),
             )
             payload = dict(control.get("payload") or {})
             outcome = str(control.get("outcome") or "").strip()
@@ -17052,6 +17054,13 @@ class TaskManager:
 
     def _service_token(self) -> str | None:
         return self.cfg.auth_service.service_machine_token
+
+    def _resolve_downstream_token(self, preferred_token: str | None = None) -> str | None:
+        token = str(preferred_token or "").strip()
+        if token:
+            return token
+        service_token = str(self._service_token() or "").strip()
+        return service_token or None
 
     def _root_task_key_secret(self, task: BinarySecurityTask) -> str | None:
         summary = task.summary if isinstance(task.summary, dict) else {}
@@ -25273,7 +25282,7 @@ class TaskManager:
             listed = await self._downstream_list_tasks(
                 service="dataflow_vuln_scan",
                 project_id=task.project_id,
-                token=None,
+                token=self._resolve_downstream_token(),
                 parent_task_id=task.id,
                 parent_stage_item_id=item_id,
                 per_page=100,
@@ -25486,6 +25495,7 @@ class TaskManager:
         self,
         task: BinarySecurityTask,
         item: BinarySecurityStageItem,
+        token: str | None = None,
     ) -> dict[str, Any] | None:
         item_key = str(item.item_key or "").strip()
         if not item_key:
@@ -25494,7 +25504,7 @@ class TaskManager:
             listed = await self._downstream_list_tasks(
                 service="system_analyse",
                 project_id=task.project_id,
-                token=None,
+                token=self._resolve_downstream_token(token),
                 parent_task_id=task.id,
                 per_page=100,
                 sort_by="updated_at",
@@ -25592,7 +25602,7 @@ class TaskManager:
                 listed = await self._downstream_list_tasks(
                     service="system_analyse",
                     project_id=task.project_id,
-                    token=None,
+                    token=self._resolve_downstream_token(token),
                     parent_task_id=task.id,
                     per_page=100,
                     sort_by="updated_at",
@@ -27356,7 +27366,7 @@ class TaskManager:
                     item,
                     strategy=retry_strategy,
                     observed_status=retry_strategy_status,
-                    token=None,
+                    token=self._resolve_downstream_token(),
                 )
                 self._store_retry_item_action(task, action_snapshot)
                 session.commit()
@@ -27376,7 +27386,11 @@ class TaskManager:
                     item=item,
                 )
             else:
-                reusable_payload = None if retrying else await self._find_reusable_system_analysis_payload(task, item)
+                reusable_payload = None if retrying else await self._find_reusable_system_analysis_payload(
+                    task,
+                    item,
+                    self._resolve_downstream_token(),
+                )
                 if reusable_payload is not None:
                     downstream_status = str(reusable_payload.get("status") or "").lower()
                     mapped_reusable_status = self._map_downstream_status(downstream_status)
@@ -27408,7 +27422,7 @@ class TaskManager:
                         stage_name=stage_run.stage_name,
                         task=task,
                         item=item,
-                        token=None,
+                        token=self._resolve_downstream_token(),
                     )
                     outcome = str(control.get("outcome") or "")
                     if outcome == "accepted":
@@ -27467,7 +27481,7 @@ class TaskManager:
                         task,
                         item,
                         service="system_analyse",
-                        token=None,
+                        token=self._resolve_downstream_token(),
                         payload={
                             "task_name": f"{task.name}-{firmware['firmware_name']}-system-analysis",
                             "input_path": firmware["unpacked_root"],
@@ -30027,7 +30041,7 @@ class TaskManager:
                     item,
                     strategy=retry_strategy,
                     observed_status=retry_strategy_status,
-                    token=None,
+                    token=self._resolve_downstream_token(token),
                 )
                 self._store_retry_item_action(task, action_snapshot)
                 session.commit()
@@ -30194,7 +30208,7 @@ class TaskManager:
                         stage_name=stage_run.stage_name,
                         task=task,
                         item=item,
-                        token=None,
+                        token=self._resolve_downstream_token(token),
                     )
                     outcome = str(control.get("outcome") or "")
                     if outcome == "accepted":
@@ -30249,7 +30263,7 @@ class TaskManager:
                         task,
                         item,
                         service="dataflow_vuln_scan",
-                        token=None,
+                        token=self._resolve_downstream_token(token),
                         payload={
                             "task_name": f"{task.name}-{entry['function_name']}-scan",
                             "module_input_path": module_input_path,

@@ -13,7 +13,7 @@ from app.model import TaskStatus, UnpackTask, UnpackTaskEvent, WorkerInstance, W
 import app.model as model_module
 import app.unpacker_engine as unpacker_engine_module
 import app.services.task_manager as task_manager_module
-from app.api.firmware import _submit_task
+from app.api.firmware import _agent_runtime_payload_from_snapshot, _submit_task
 from app.exception import ValidationError
 from app.model import ServiceConfig
 from app.schemas import UnpackRequest
@@ -64,6 +64,35 @@ class _StubProc:
 
 
 class TaskManagerWorkspaceTests(unittest.TestCase):
+    def test_agent_runtime_payload_from_snapshot_handles_missing_and_valid_task_key(self):
+        self.assertEqual(
+            {
+                "has_agent_task_key": False,
+                "agent_task_key_id": None,
+                "agent_task_key_prefix": None,
+                "agent_runtime_mode": None,
+            },
+            _agent_runtime_payload_from_snapshot(None),
+        )
+        self.assertEqual(
+            {
+                "has_agent_task_key": True,
+                "agent_task_key_id": "tk-1",
+                "agent_task_key_prefix": "tsk_x",
+                "agent_runtime_mode": "schedule_dispatch",
+            },
+            _agent_runtime_payload_from_snapshot(
+                {
+                    "agent_task_key": {
+                        "id": "tk-1",
+                        "prefix": "tsk_x",
+                        "secret": "hidden",
+                        "source": "schedule_dispatch",
+                    }
+                }
+            ),
+        )
+
     def test_prepare_task_workspace_writes_manifest_without_copying_firmware(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -84,7 +113,9 @@ class TaskManagerWorkspaceTests(unittest.TestCase):
                 {
                     "input_path": str(firmware),
                     "output_path": prepared["output_path"],
-                    "log_path": prepared["run_path"],
+                    "run_path": prepared["run_path"],
+                    "log_path": str(Path(prepared["run_path"]) / "tool.log"),
+                    "log_file_path": str(Path(prepared["run_path"]) / "tool.log"),
                 },
                 json.loads(manifest_path.read_text(encoding="utf-8")),
             )
@@ -151,12 +182,24 @@ class TaskManagerLeaseTests(unittest.TestCase):
         init_database()
 
     def tearDown(self):
+        task_manager_module.shutdown()
         model_module._engine = None
         model_module._SessionFactory = None
         model_module._OWNER_ID = None
         self._tmp.cleanup()
 
-    def _add_task(self, task_id: str, *, status: str, owner_id: str | None = None, cancel_requested_at=None, lease_expires_at=None, last_progress_at=None):
+    def _add_task(
+        self,
+        task_id: str,
+        *,
+        status: str,
+        owner_id: str | None = None,
+        assigned_worker_id: str | None = None,
+        dispatch_token: str | None = None,
+        cancel_requested_at=None,
+        lease_expires_at=None,
+        last_progress_at=None,
+    ):
         db = get_db_session()
         try:
             db.add(
@@ -167,6 +210,8 @@ class TaskManagerLeaseTests(unittest.TestCase):
                     output_path="/tmp/output",
                     status=status,
                     owner_id=owner_id,
+                    assigned_worker_id=assigned_worker_id,
+                    dispatch_token=dispatch_token,
                     current_stage="llm_unpack",
                     cancel_requested_at=cancel_requested_at,
                     lease_expires_at=lease_expires_at,
@@ -216,7 +261,13 @@ class TaskManagerLeaseTests(unittest.TestCase):
             db.close()
 
     def test_schedule_pending_task_starts_subprocess_runner(self):
-        self._add_task("t-spawn", status=TaskStatus.PENDING.value)
+        self._add_task(
+            "t-spawn",
+            status=TaskStatus.ASSIGNED.value,
+            owner_id="pod-a:123:owner",
+            assigned_worker_id="pod-a:123:owner",
+            dispatch_token="dispatch-token-1",
+        )
 
         class _FakePopen:
             def __init__(self, args, **kwargs):
@@ -232,7 +283,7 @@ class TaskManagerLeaseTests(unittest.TestCase):
             return proc
 
         with patch("app.services.task_manager.subprocess.Popen", side_effect=_fake_popen):
-            task_manager_module._schedule_pending_tasks()
+            task_manager_module._dispatcher_start_assigned_task()
 
         self.assertEqual(1, len(launched))
         self.assertIn("-m", launched[0].args)
@@ -756,6 +807,7 @@ class TaskManagerLlmSnapshotTests(unittest.TestCase):
             "llm_config_file_key_cleaner": "provider-cleaner-v1",
             "llm_config_file_key_skill_author": "provider-author-v1",
             "llm_config_file_key_skill_executor": "provider-skill-v1",
+            "llm_config_file_key_evolution_improver": "provider-evolution-v1",
         }
         provider_payloads = {
             provider_key: {
@@ -839,6 +891,7 @@ class TaskManagerLlmSnapshotTests(unittest.TestCase):
             "llm_config_file_key_cleaner": "provider-cleaner-v1",
             "llm_config_file_key_skill_author": "provider-author-v1",
             "llm_config_file_key_skill_executor": "provider-skill-v1",
+            "llm_config_file_key_evolution_improver": "provider-evolution-v1",
         }
 
         class _FakeClient:

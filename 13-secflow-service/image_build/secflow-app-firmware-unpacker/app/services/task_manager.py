@@ -2169,6 +2169,15 @@ def cancel_task(task_id: str) -> tuple[bool, str]:
         elif task.status == TaskStatus.CANCELLED.value:
             return True, "任务已取消"
         else:
+            if task.status in (TaskStatus.SUCCESS.value, TaskStatus.FAILED.value):
+                error_text = " ".join(
+                    str(value or "").strip()
+                    for value in (task.result_message, task.error_message)
+                    if str(value or "").strip()
+                ).lower()
+                if "task owner pod lost" in error_text or "owner pod lost" in error_text:
+                    return False, "任务已因 owner pod lost 被回收，当前不存在可取消的运行实例"
+                return False, f"任务已处于终态 {task.status}，不能再取消"
             return False, "仅支持取消排队中、已认领或运行中的任务"
         db.commit()
         _record_task_event_from_row(
