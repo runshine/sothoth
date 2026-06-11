@@ -146,9 +146,10 @@ PICONF
 COPY app/ /app/app/
 COPY config.yaml /app/config.yaml
 COPY start.sh /app/start.sh
+COPY scripts/ /app/scripts/
 
 RUN mkdir -p /app/data \
-    && chmod +x /app/start.sh
+    && chmod +x /app/start.sh /app/scripts/start-with-probe.sh
 
 ARG SECFLOW_BUILD_VERSION=""
 RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
@@ -156,6 +157,6 @@ RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD python3 -c "from urllib.request import urlopen; urlopen('http://localhost:8080/api/app/firmware-unpacker/health', timeout=5)" || exit 1
+    CMD python3 -c "from urllib.request import urlopen; urlopen('http://localhost:18080/healthz', timeout=5)" || exit 1
 
 CMD ["/app/start.sh"]

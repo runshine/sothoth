@@ -37,6 +37,10 @@ logger = logging.getLogger(__name__)
 _probe_server: ThreadedProbeServer | None = None
 
 
+def _external_probe_process_enabled() -> bool:
+    return str(os.environ.get("SECFLOW_EXTERNAL_PROBE_PROCESS", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _probe_payload() -> dict[str, object]:
     runtime = runtime_snapshot()
     running = bool(runtime.get("running"))
@@ -72,7 +76,12 @@ def _ensure_probe_server_started() -> None:
         _probe_server.start()
         return
     config = get_config()
-    port = int(os.environ.get("SECFLOW_FIRMWARE_UNPACKER_PROBE_PORT", str(int(config.app.port) + 1000)))
+    port = int(
+        os.environ.get(
+            "SECFLOW_FIRMWARE_UNPACKER_PROBE_PORT",
+            os.environ.get("SECFLOW_PROBE_PORT", str(int(config.app.port) + 1000)),
+        )
+    )
     _probe_server = ThreadedProbeServer(
         host=config.app.host,
         port=port,
@@ -143,7 +152,8 @@ async def lifespan(app: FastAPI):
         logging.getLogger().setLevel(
             getattr(logging, config.logging.level.upper(), logging.INFO)
         )
-        _ensure_probe_server_started()
+        if not _external_probe_process_enabled():
+            _ensure_probe_server_started()
         await start_runtime()
         logger.info("secflow-app-firmware-unpacker started")
     except Exception as exc:
@@ -157,7 +167,8 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("service shutdown warning: %s", exc)
     finally:
-        _stop_probe_server()
+        if not _external_probe_process_enabled():
+            _stop_probe_server()
 
 
 app = FastAPI(

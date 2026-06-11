@@ -46,8 +46,16 @@ spec:
               value: /app/config.yaml
             - name: FIRMWARE_UNPACKER_CONFIG
               value: /app/config.yaml
-            - name: SECFLOW_FIRMWARE_UNPACKER_PROBE_PORT
+            - name: SECFLOW_PROBE_PORT
               value: "18080"
+            - name: SECFLOW_MAIN_PID_FILE
+              value: /tmp/secflow-main.pid
+            - name: SECFLOW_MAIN_STARTED_AT_FILE
+              value: /tmp/secflow-main.started_at
+            - name: SECFLOW_PROBE_STARTUP_GRACE_SECONDS
+              value: "30"
+            - name: SECFLOW_PROBE_SERVICE_NAME
+              value: secflow-app-firmware-unpacker
             - name: FIRMWARE_UNPACKER_RUNTIME_ROLE
               value: api
             - name: UNPACKER_AGENT_DIR
@@ -101,20 +109,25 @@ spec:
             limits:
               memory: "4Gi"
               cpu: "2"
+          startupProbe:
+            httpGet:
+              path: /startupz
+              port: 18080
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 24
           livenessProbe:
             httpGet:
-              path: /api/app/firmware-unpacker/health
+              path: /healthz
               port: 18080
-            initialDelaySeconds: 30
             periodSeconds: 10
-            timeoutSeconds: 3
-            failureThreshold: 6
+            timeoutSeconds: 2
+            failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /api/app/firmware-unpacker/ready
+              path: /readyz
               port: 18080
-            initialDelaySeconds: 15
-            periodSeconds: 5
+            periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 3
       volumes:
@@ -173,8 +186,16 @@ spec:
               value: /app/config.yaml
             - name: FIRMWARE_UNPACKER_CONFIG
               value: /app/config.yaml
-            - name: SECFLOW_FIRMWARE_UNPACKER_PROBE_PORT
+            - name: SECFLOW_PROBE_PORT
               value: "18080"
+            - name: SECFLOW_MAIN_PID_FILE
+              value: /tmp/secflow-main.pid
+            - name: SECFLOW_MAIN_STARTED_AT_FILE
+              value: /tmp/secflow-main.started_at
+            - name: SECFLOW_PROBE_STARTUP_GRACE_SECONDS
+              value: "30"
+            - name: SECFLOW_PROBE_SERVICE_NAME
+              value: secflow-app-firmware-unpacker
             - name: FIRMWARE_UNPACKER_RUNTIME_ROLE
               value: dispatcher,worker
             - name: UNPACKER_AGENT_DIR
@@ -228,20 +249,25 @@ spec:
             limits:
               memory: "16Gi"
               cpu: "8"
+          startupProbe:
+            httpGet:
+              path: /startupz
+              port: 18080
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 24
           livenessProbe:
             httpGet:
-              path: /api/app/firmware-unpacker/health
+              path: /healthz
               port: 18080
-            initialDelaySeconds: 30
             periodSeconds: 10
-            timeoutSeconds: 3
-            failureThreshold: 6
+            timeoutSeconds: 2
+            failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /api/app/firmware-unpacker/ready
+              path: /readyz
               port: 18080
-            initialDelaySeconds: 15
-            periodSeconds: 5
+            periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 3
       volumes:
@@ -300,8 +326,16 @@ spec:
               value: /app/config.yaml
             - name: FIRMWARE_UNPACKER_CONFIG
               value: /app/config.yaml
-            - name: SECFLOW_FIRMWARE_UNPACKER_PROBE_PORT
+            - name: SECFLOW_PROBE_PORT
               value: "18080"
+            - name: SECFLOW_MAIN_PID_FILE
+              value: /tmp/secflow-main.pid
+            - name: SECFLOW_MAIN_STARTED_AT_FILE
+              value: /tmp/secflow-main.started_at
+            - name: SECFLOW_PROBE_STARTUP_GRACE_SECONDS
+              value: "30"
+            - name: SECFLOW_PROBE_SERVICE_NAME
+              value: secflow-app-firmware-unpacker
             - name: FIRMWARE_UNPACKER_RUNTIME_ROLE
               value: cleanup-worker
             - name: UNPACKER_AGENT_DIR
@@ -355,20 +389,25 @@ spec:
             limits:
               memory: "8Gi"
               cpu: "4"
+          startupProbe:
+            httpGet:
+              path: /startupz
+              port: 18080
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 24
           livenessProbe:
             httpGet:
-              path: /api/app/firmware-unpacker/health
+              path: /healthz
               port: 18080
-            initialDelaySeconds: 30
             periodSeconds: 10
-            timeoutSeconds: 3
-            failureThreshold: 6
+            timeoutSeconds: 2
+            failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /api/app/firmware-unpacker/ready
+              path: /readyz
               port: 18080
-            initialDelaySeconds: 15
-            periodSeconds: 5
+            periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 3
       volumes:

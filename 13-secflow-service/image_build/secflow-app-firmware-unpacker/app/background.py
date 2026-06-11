@@ -54,6 +54,10 @@ _STATE = _RuntimeState()
 _PROBE_SERVER: ThreadedProbeServer | None = None
 
 
+def _external_probe_process_enabled() -> bool:
+    return str(os.environ.get("SECFLOW_EXTERNAL_PROBE_PROCESS", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _probe_payload() -> dict[str, object]:
     runtime = runtime_snapshot()
     ready = _STATE.ready.is_set() and bool(runtime.get("running")) and not _STATE.stopping.is_set() and not str(runtime.get("startup_error") or "").strip()
@@ -87,7 +91,12 @@ def _start_probe_server() -> None:
         _PROBE_SERVER.start()
         return
     config = get_config()
-    port = int(os.environ.get("SECFLOW_FIRMWARE_UNPACKER_PROBE_PORT", str(int(config.app.port) + 1000)))
+    port = int(
+        os.environ.get(
+            "SECFLOW_FIRMWARE_UNPACKER_PROBE_PORT",
+            os.environ.get("SECFLOW_PROBE_PORT", str(int(config.app.port) + 1000)),
+        )
+    )
     _PROBE_SERVER = ThreadedProbeServer(
         host=config.app.host,
         port=port,
@@ -125,7 +134,8 @@ def main() -> int:
         logging.getLogger().setLevel(
             getattr(logging, config.logging.level.upper(), logging.INFO)
         )
-        _start_probe_server()
+        if not _external_probe_process_enabled():
+            _start_probe_server()
         asyncio.run(start_runtime())
         _STATE.ready.set()
         _STATE.set_error(None)
@@ -144,4 +154,5 @@ def main() -> int:
         _STATE.stopping.set()
         with suppress(Exception):
             asyncio.run(stop_runtime())
-        _stop_probe_server()
+        if not _external_probe_process_enabled():
+            _stop_probe_server()

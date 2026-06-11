@@ -23,4 +23,5 @@ mkdir -p /app/data
 mkdir -p "${UNPACKER_TOOLS_DIR}"
 
 cd /app
-exec python3 /app/app/entrypoint.py
+export SECFLOW_EXTERNAL_PROBE_PROCESS="${SECFLOW_EXTERNAL_PROBE_PROCESS:-1}"
+exec /app/scripts/start-with-probe.sh python3 /app/app/entrypoint.py
