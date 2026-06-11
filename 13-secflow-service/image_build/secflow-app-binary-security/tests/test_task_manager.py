@@ -19360,49 +19360,6 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
 
         self.assertEqual([], [event for event in db.added if isinstance(event, BinarySecurityEvent)])
 
-    def test_get_timeline_compresses_repeated_tail_owner_lost_events(self):
-        task = BinarySecurityTask(
-            id="task1",
-            project_id="p1",
-            name="n",
-            status="running",
-            current_stage="system_analysis",
-            task_type=TASK_TYPE_BINARY,
-            firmware_source="project_filesystem",
-            firmware_path="/fw",
-            output_root="/o",
-            workspace_root="/w",
-        )
-        event1 = BinarySecurityEvent(
-            id="evt1",
-            task_id="task1",
-            project_id="p1",
-            event_type="tail_reconcile_owner_lost",
-            stage_name="system_analysis",
-            message="tail 收口 owner 已丢失，等待新的 reducer 接管",
-            payload={"error_type": "StaleTaskExecution", "error_message": "owner lost"},
-        )
-        event1.created_at = _now()
-        event2 = BinarySecurityEvent(
-            id="evt2",
-            task_id="task1",
-            project_id="p1",
-            event_type="tail_reconcile_owner_lost",
-            stage_name="system_analysis",
-            message="tail 收口 owner 已丢失，等待新的 reducer 接管",
-            payload={"error_type": "StaleTaskExecution", "error_message": "owner lost"},
-        )
-        event2.created_at = _now()
-        db = _ModelAwareDb(tasks=[task], events=[event1, event2])
-
-        with patch.object(task_manager_module, "get_session_factory", return_value=lambda: db):
-            timeline = self.manager.get_timeline(db, project_id="p1", task_id="task1")
-
-        self.assertEqual(1, len(timeline.events))
-        self.assertTrue(timeline.events[0].compressed)
-        self.assertEqual(2, timeline.events[0].repeat_count)
-        self.assertIn("已压缩 2 次", timeline.events[0].message)
-
     def test_touch_task_heartbeat_skips_when_local_worker_is_not_active(self):
         manager = TaskManager()
         manager._workers = {}
@@ -25367,6 +25324,52 @@ def _test_worker_skips_tail_tasks_in_downstream_reconcile_candidates(self):
     self.assertEqual([], refs)
 
 
+def _test_get_timeline_compresses_repeated_tail_owner_lost_events(self):
+    task = BinarySecurityTask(
+        id="task1",
+        project_id="p1",
+        name="n",
+        status="running",
+        current_stage="system_analysis",
+        task_type=TASK_TYPE_BINARY,
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    event1 = BinarySecurityEvent(
+        id="evt1",
+        task_id="task1",
+        project_id="p1",
+        level="warning",
+        event_type="tail_reconcile_owner_lost",
+        stage_name="system_analysis",
+        message="tail 收口 owner 已丢失，等待新的 reducer 接管",
+        payload={"error_type": "StaleTaskExecution", "error_message": "owner lost"},
+    )
+    event1.created_at = _now()
+    event2 = BinarySecurityEvent(
+        id="evt2",
+        task_id="task1",
+        project_id="p1",
+        level="warning",
+        event_type="tail_reconcile_owner_lost",
+        stage_name="system_analysis",
+        message="tail 收口 owner 已丢失，等待新的 reducer 接管",
+        payload={"error_type": "StaleTaskExecution", "error_message": "owner lost"},
+    )
+    event2.created_at = _now()
+    db = _ModelAwareDb(tasks=[task], events=[event1, event2])
+
+    with patch.object(task_manager_module, "get_session_factory", return_value=lambda: db):
+        timeline = TaskManager().get_timeline(db, project_id="p1", task_id="task1")
+
+    self.assertEqual(1, len(timeline.events))
+    self.assertTrue(timeline.events[0].compressed)
+    self.assertEqual(2, timeline.events[0].repeat_count)
+    self.assertIn("已压缩 2 次", timeline.events[0].message)
+
+
 def _test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged(self):
     manager = TaskManager()
     item = BinarySecurityStageItem(
@@ -26790,6 +26793,7 @@ TaskManagerTests.test_reducer_sync_downstream_status_reclaims_pending_tail_recon
 TaskManagerTests.test_start_reducer_role_runs_reconcile_loops = _test_start_reducer_role_runs_reconcile_loops
 TaskManagerTests.test_tail_control_plane_stale_error_does_not_pollute_sync_error = _test_tail_control_plane_stale_error_does_not_pollute_sync_error
 TaskManagerTests.test_worker_skips_tail_tasks_in_downstream_reconcile_candidates = _test_worker_skips_tail_tasks_in_downstream_reconcile_candidates
+TaskManagerTests.test_get_timeline_compresses_repeated_tail_owner_lost_events = _test_get_timeline_compresses_repeated_tail_owner_lost_events
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_locally_owned_running_task = _test_task_needs_downstream_reconcile_skips_locally_owned_running_task
 TaskManagerTests.test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items = _test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_failed_task_with_terminal_child = _test_task_needs_downstream_reconcile_skips_failed_task_with_terminal_child

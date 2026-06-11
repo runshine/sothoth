@@ -855,9 +855,10 @@ async def create_project_input_upload(
     await verify_project_access(project_id, authorization)
     validated_type = validate_project_input_type(input_type)
     if not files:
-        raise ValidationError("至少上传一个压缩包")
+        raise ValidationError("至少上传一个文件")
     for file in files:
-        ensure_allowed_project_input_file(file.filename or "")
+        if not keep_original:
+            ensure_allowed_project_input_file(file.filename or "")
 
     upload_id = uuid4().hex
     batch_id = uuid4().hex
@@ -866,6 +867,8 @@ async def create_project_input_upload(
 
     temp_items: list[dict[str, Any]] = []
     for file in files:
+        if not keep_original:
+            ensure_allowed_project_input_file(file.filename or "")
         temp_path, sha256, total_size = await persist_upload(file, project_input_temp_root())
         temp_items.append({
             "temp_path": temp_path,
@@ -926,7 +929,7 @@ async def append_project_input_upload(
 ):
     del current_user
     if not files:
-        raise ValidationError("至少上传一个压缩包")
+        raise ValidationError("至少上传一个文件")
     record = db.query(ProjectInputUploadRecord).filter(ProjectInputUploadRecord.upload_id == upload_id).first()
     if record is None:
         raise NotFoundError("上传记录", upload_id)
@@ -934,7 +937,8 @@ async def append_project_input_upload(
     if record.status in {"pending", "processing"}:
         raise ConflictError("当前上传记录仍在处理中，暂不支持追加")
     for file in files:
-        ensure_allowed_project_input_file(file.filename or "")
+        if not keep_original:
+            ensure_allowed_project_input_file(file.filename or "")
 
     batch_id = uuid4().hex
     temp_items: list[dict[str, Any]] = []

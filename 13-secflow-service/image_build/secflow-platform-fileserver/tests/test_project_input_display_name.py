@@ -96,6 +96,10 @@ def _zip_bytes() -> io.BytesIO:
     return buffer
 
 
+def _raw_bytes() -> io.BytesIO:
+    return io.BytesIO(b"raw-input-data")
+
+
 def test_update_project_input_upload_display_name(tmp_path, monkeypatch):
     with build_client(tmp_path, monkeypatch) as client:
         headers = {"Authorization": "Bearer fake-token"}
@@ -147,3 +151,24 @@ def test_update_project_input_upload_display_name_rejects_blank(tmp_path, monkey
         assert renamed.status_code == 400
         payload = renamed.json()
         assert "上传记录名称不能为空" in str(payload.get("detail") or payload.get("message") or payload)
+
+
+def test_project_input_upload_allows_raw_file_when_keep_original_enabled(tmp_path, monkeypatch):
+    with build_client(tmp_path, monkeypatch) as client:
+        headers = {"Authorization": "Bearer fake-token"}
+        response = client.post(
+            "/api/fileserver/project-input/uploads",
+            headers=headers,
+            data={"project_id": "demo-project", "input_type": "software", "keep_original": "true"},
+            files={"files": ("demo.bin", _raw_bytes(), "application/octet-stream")},
+        )
+        assert response.status_code == 200
+        upload_id = response.json()["upload_id"]
+        detail = _wait_upload_done(client, upload_id, headers)
+        assert detail["status"] == "succeeded"
+
+        upload_detail = client.get(f"/api/fileserver/project-input/uploads/{upload_id}", headers=headers)
+        assert upload_detail.status_code == 200
+        payload = upload_detail.json()
+        assert payload["keep_original"] is True
+        assert payload["stored_file_count"] == 1

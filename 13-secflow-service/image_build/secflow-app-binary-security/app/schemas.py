@@ -608,6 +608,10 @@ class BinarySecurityTaskEventResponse(BaseModel):
 
 class BinarySecurityTimelineResponse(BaseModel):
     task_id: str
+    total: int = 0
+    page: int = 1
+    page_size: int = 200
+    has_more: bool = False
     events: list[BinarySecurityTaskEventResponse] = Field(default_factory=list)
 
 

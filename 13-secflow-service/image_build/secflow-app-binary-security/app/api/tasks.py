@@ -329,10 +329,18 @@ def update_task_runtime_policy(
 def get_timeline(
     project_id: str,
     task_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(200, ge=10, le=1000),
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    return get_task_manager().get_timeline(db, project_id=project_id, task_id=task_id)
+    return get_task_manager().get_timeline(
+        db,
+        project_id=project_id,
+        task_id=task_id,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/operations", response_model=BinarySecurityTaskOperationPageResponse)

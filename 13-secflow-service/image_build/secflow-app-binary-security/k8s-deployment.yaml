@@ -52,11 +52,11 @@ spec:
               mountPath: /data
           resources:
             requests:
-              memory: "256Mi"
-              cpu: "200m"
+              memory: "4Gi"
+              cpu: "4"
             limits:
-              memory: "1Gi"
-              cpu: "1000m"
+              memory: "12Gi"
+              cpu: "8"
           livenessProbe:
             httpGet:
               path: /api/app/binary-security/health

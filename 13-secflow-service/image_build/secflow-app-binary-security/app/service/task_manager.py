@@ -4946,12 +4946,29 @@ class TaskManager:
         self._enqueue_task(task.id)
         return self.get_task_detail(db, project_id=project_id, task_id=task_id)
 
-    def get_timeline(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTimelineResponse:
+    def get_timeline(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        page: int = 1,
+        page_size: int = 200,
+    ) -> BinarySecurityTimelineResponse:
         task = self._task_or_404(db, project_id, task_id)
-        events = db.query(BinarySecurityEvent).filter(BinarySecurityEvent.task_id == task.id).order_by(BinarySecurityEvent.created_at.asc()).all()
+        query = db.query(BinarySecurityEvent).filter(BinarySecurityEvent.task_id == task.id)
+        total = query.count()
+        page = max(1, int(page or 1))
+        page_size = min(1000, max(10, int(page_size or 200)))
+        offset = (page - 1) * page_size
+        events = query.order_by(BinarySecurityEvent.created_at.asc()).offset(offset).limit(page_size).all()
         timeline_events = self._compress_timeline_events(events)
         return BinarySecurityTimelineResponse(
             task_id=task.id,
+            total=total,
+            page=page,
+            page_size=page_size,
+            has_more=offset + len(events) < total,
             events=[
                 BinarySecurityTaskEventResponse(
                     id=event.id,
