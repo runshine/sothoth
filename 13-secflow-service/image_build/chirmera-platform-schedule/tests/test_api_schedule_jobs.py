@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -109,6 +110,57 @@ def test_user_task_create_requires_single_file_binding(client):
     assert body["inputs"][0]["selection_type"] == "file"
     assert body["inputs"][0]["relative_path"] == "firmware.bin"
     assert body["inputs"][0]["resolved_path"].endswith("firmware.bin")
+
+
+def test_auto_dispatch_ready_tasks_runs_in_scheduler_loop(db_session, tmp_path):
+    from app.service.user_task_manager import UserTaskManager
+
+    source_root = tmp_path / "upload-root"
+    source_root.mkdir(parents=True)
+    (source_root / "firmware.bin").write_bytes(b"firmware")
+
+    manager = UserTaskManager()
+    payload = SimpleNamespace(
+        task_type="binary_firmware_e2e",
+        name="firmware-auto-dispatch",
+        description="demo",
+        module_name=None,
+        input_upload_ids=["upload-001"],
+        input_binding=SimpleNamespace(
+            upload_id="upload-001",
+            selection_type="file",
+            relative_path="firmware.bin",
+            relative_paths=None,
+        ),
+    )
+
+    with patch("app.service.user_task_manager.ProjectInputResolver.resolve_single", new=AsyncMock(return_value=_resolved_input(str(source_root)))), \
+         patch("app.service.user_task_manager.ProjectInputResolver.resolve_path", new=AsyncMock(return_value={
+             "relative_path": "firmware.bin",
+             "absolute_path": str(source_root / "firmware.bin"),
+             "node_type": "file",
+             "name": "firmware.bin",
+         })), \
+         patch.object(manager, "auto_dispatch_token", return_value="machine-token"), \
+         patch("app.service.user_task_manager.UserTaskManager._aigw_management_token", return_value="mgmt-token"), \
+         patch("app.service.user_task_manager.AiGatewayTaskKeyClient.create_task_key", new=AsyncMock(return_value={"key": {"id": "tk-dispatch-1", "key_name": "dispatch-key", "key_prefix": "tsk_dispatch", "capacity_pool_ids": [1]}, "secret": "tsk_dispatch_secret"})), \
+         patch("app.service.user_task_manager.BinarySecurityDispatchClient.create_task", new=AsyncMock(return_value={"task_id": "child-1"})), \
+         patch("app.service.user_task_manager.BinarySecurityDispatchClient.complete_uploads", new=AsyncMock(return_value={"ok": True})), \
+         patch("app.service.user_task_manager.BinarySecurityDispatchClient.start_task", new=AsyncMock(return_value={"ok": True})):
+        created = asyncio.run(manager.create_task(
+            db_session,
+            project_id="proj1",
+            payload=payload,
+            actor="alice",
+            bearer_token="user-token",
+        ))
+        assert created["dispatch_status"] == "ready_for_dispatch"
+        dispatched = asyncio.run(manager.auto_dispatch_ready_tasks(batch_size=1, actor="schedule-auto-dispatcher"))
+        assert dispatched == 1
+        detail = asyncio.run(manager.get_task_detail(db_session, "proj1", created["id"], "user-token"))
+        assert detail["dispatch_status"] == "running"
+        assert detail["business_status"] == "running"
+        assert detail["root_task_key_id"] == "tk-dispatch-1"
 
 
 def test_user_task_rejects_directory_for_firmware_file_mode(client):
@@ -341,6 +393,63 @@ def test_user_task_dispatch_fails_without_capacity_pool_policy(client, tmp_path)
 
     assert dispatch_resp.status_code == 400
     assert "capacity_pool_ids" in dispatch_resp.text
+
+
+def test_auto_dispatch_keeps_failed_task_visible_for_retry(db_session, tmp_path):
+    from app.service.user_task_manager import UserTaskManager
+
+    source_root = tmp_path / "upload-root"
+    source_root.mkdir(parents=True)
+    (source_root / "firmware.bin").write_bytes(b"firmware")
+
+    manager = UserTaskManager()
+    payload = SimpleNamespace(
+        task_type="binary_firmware_e2e",
+        name="firmware-auto-fail",
+        description="demo",
+        module_name=None,
+        input_upload_ids=["upload-001"],
+        input_binding=SimpleNamespace(
+            upload_id="upload-001",
+            selection_type="file",
+            relative_path="firmware.bin",
+            relative_paths=None,
+        ),
+    )
+
+    with patch("app.service.user_task_manager.ProjectInputResolver.resolve_single", new=AsyncMock(return_value=_resolved_input(str(source_root)))), \
+         patch("app.service.user_task_manager.ProjectInputResolver.resolve_path", new=AsyncMock(return_value={
+             "relative_path": "firmware.bin",
+             "absolute_path": str(source_root / "firmware.bin"),
+             "node_type": "file",
+             "name": "firmware.bin",
+         })), \
+         patch.object(manager, "auto_dispatch_token", return_value="machine-token"), \
+         patch("app.service.user_task_manager.get_config", return_value=SimpleNamespace(
+             user_task_dispatch_policy=SimpleNamespace(
+                 binary_firmware_e2e=SimpleNamespace(capacity_pool_ids=[], root_task_key_max_concurrency=0, root_task_key_expires_at=None),
+             ),
+             aigw_service=SimpleNamespace(management_bearer_token="mgmt-token"),
+             auth_service=SimpleNamespace(service_machine_token="machine-token"),
+             fileserver_service=SimpleNamespace(base_url="", project_input_uploads_path="", timeout=30),
+             security=SimpleNamespace(task_key_secret_master_key="test-key"),
+             binary_security_service=SimpleNamespace(base_url="", timeout=30),
+             ai4red_service=SimpleNamespace(base_url="", timeout=30),
+             turing_app_security_service=SimpleNamespace(base_url="", timeout=30),
+         )):
+        created = asyncio.run(manager.create_task(
+            db_session,
+            project_id="proj1",
+            payload=payload,
+            actor="alice",
+            bearer_token="user-token",
+        ))
+        assert created["dispatch_status"] == "ready_for_dispatch"
+        with pytest.raises(Exception, match="capacity_pool_ids"):
+            asyncio.run(manager.auto_dispatch_ready_tasks(batch_size=1, actor="schedule-auto-dispatcher"))
+        detail = asyncio.run(manager.get_task_detail(db_session, "proj1", created["id"], "user-token"))
+        assert detail["dispatch_status"] == "dispatch_failed"
+        assert "capacity_pool_ids" in str(detail["last_error"] or "")
 
 
 def test_ai4red_task_create_accepts_directory_binding_without_input_type_restriction(client, tmp_path):

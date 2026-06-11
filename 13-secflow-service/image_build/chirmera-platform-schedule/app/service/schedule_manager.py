@@ -21,6 +21,7 @@ from app.exception import ConflictError, NotFoundError, UpstreamError, Validatio
 from app.model import ScheduleExecution, ScheduleExecutionEvent, ScheduleJob, get_db_session
 from app.service.http_client import get_shared_async_client
 from app.service.redis_runtime import get_redis_runtime
+from app.service.user_task_manager import get_user_task_manager
 
 
 def utcnow() -> datetime:
@@ -864,6 +865,10 @@ class SchedulerRuntime:
             await self.manager.process_due_jobs()
             await self.manager.promote_delay_queue()
             await self.manager.requeue_pending_executions()
+            await get_user_task_manager().auto_dispatch_ready_tasks(
+                batch_size=max(1, int(self._root_config.scheduler.ready_backfill_batch_size)),
+                actor="schedule-auto-dispatcher",
+            )
             now_monotonic = time.monotonic()
             if now_monotonic - last_reclaim >= max(1, int(self.config.reclaim_interval_seconds)):
                 await self.manager.reclaim_stale_executions()

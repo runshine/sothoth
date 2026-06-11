@@ -376,6 +376,12 @@ class UserTaskManager:
             raise ValidationError(f"任务类型缺少 capacity_pool_ids 配置: {task_type}")
         return policy
 
+    def auto_dispatch_token(self) -> str:
+        token = str(get_config().auth_service.service_machine_token or "").strip()
+        if not token:
+            raise ValidationError("缺少调度中心服务凭证，无法自动分发任务")
+        return token
+
     def _aigw_management_token(self) -> str:
         config = get_config()
         token = str(
@@ -413,6 +419,57 @@ class UserTaskManager:
         return db.query(ScheduleUserTaskDispatch).filter(
             ScheduleUserTaskDispatch.user_task_id == task_id
         ).order_by(ScheduleUserTaskDispatch.created_at.desc()).all()
+
+    def claim_ready_task(self, db: Session, *, actor: str) -> Optional[ScheduleUserTask]:
+        task = db.query(ScheduleUserTask).filter(
+            ScheduleUserTask.dispatch_status == "ready_for_dispatch",
+            ScheduleUserTask.create_status == "created",
+        ).order_by(ScheduleUserTask.created_at.asc()).first()
+        if task is None:
+            return None
+        updated = db.query(ScheduleUserTask).filter(
+            ScheduleUserTask.id == task.id,
+            ScheduleUserTask.dispatch_status == "ready_for_dispatch",
+        ).update(
+            {
+                ScheduleUserTask.dispatch_status: "dispatch_queued",
+                ScheduleUserTask.updated_by: actor,
+            },
+            synchronize_session=False,
+        )
+        if updated != 1:
+            db.rollback()
+            return None
+        db.commit()
+        return self.get_task_or_404(db, task.project_id, task.id)
+
+    async def auto_dispatch_ready_tasks(self, *, batch_size: int, actor: str) -> int:
+        dispatched = 0
+        for _ in range(max(1, int(batch_size))):
+            db = None
+            try:
+                from app.model import get_db_session
+
+                db = get_db_session()
+                task = self.claim_ready_task(db, actor=actor)
+                if task is None:
+                    return dispatched
+                await self.dispatch_task(
+                    db,
+                    project_id=task.project_id,
+                    task_id=task.id,
+                    actor=actor,
+                    bearer_token=self.auto_dispatch_token(),
+                )
+                dispatched += 1
+            except Exception as exc:
+                if dispatched == 0:
+                    raise exc
+                continue
+            finally:
+                if db is not None:
+                    db.close()
+        return dispatched
 
     def _serialize_task(
         self,
@@ -714,6 +771,8 @@ class UserTaskManager:
         bindings = self._bindings_for_task(db, task.id)
         if not bindings:
             raise ValidationError("任务缺少输入绑定，无法分发")
+        if task.dispatch_status not in {"ready_for_dispatch", "dispatch_queued", "dispatch_failed"}:
+            raise ConflictError(f"任务当前状态不允许分发: {task.dispatch_status}")
         task.dispatch_status = "dispatching"
         task.business_status = "dispatching"
         task.updated_by = actor
