@@ -85,7 +85,8 @@ class RedisRuntime:
             try:
                 await self._client.ping()
             except Exception:
-                self._force_local = True
+                await self._client.aclose()
+                self._client = None
                 return None
             return self._client
 
