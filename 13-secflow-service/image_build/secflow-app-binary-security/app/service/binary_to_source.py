@@ -23,6 +23,7 @@ class BinaryToSourceClient(JsonHttpClient):
         elf_tasks: list[dict[str, Any]],
         token: str,
         origin: dict[str, Any] | None = None,
+        agent_task_key: dict[str, Any] | None = None,
         *,
         mode: str | None = None,
         engine: str | None = None,
@@ -34,6 +35,7 @@ class BinaryToSourceClient(JsonHttpClient):
             "priority": 5,
             "tags": ["binary-security", "b2s"],
             **(origin or {}),
+            **(agent_task_key or {}),
             "elf_tasks": elf_tasks,
         }
         if mode:

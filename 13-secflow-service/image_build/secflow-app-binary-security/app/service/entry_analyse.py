@@ -25,6 +25,7 @@ class EntryAnalyseClient(JsonHttpClient):
         token: str | None = None,
         source_path: str | None = None,
         origin: dict[str, Any] | None = None,
+        agent_task_key: dict[str, Any] | None = None,
     ) -> dict:
         return await self.post(
             f"{self.API_PREFIX}/tasks",
@@ -37,6 +38,7 @@ class EntryAnalyseClient(JsonHttpClient):
                 "source_path": source_path,
                 "task_description": "由 binary security 编排器触发的入口分析任务",
                 **(origin or {}),
+                **(agent_task_key or {}),
             },
         )
 

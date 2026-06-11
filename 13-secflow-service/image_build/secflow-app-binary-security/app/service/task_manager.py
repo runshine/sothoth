@@ -159,9 +159,12 @@ from app.service.security import app_task_root, ensure_dir, validate_task_id
 from app.service.reducer_metrics_snapshot import get_reducer_metrics_snapshot_store
 from app.service.readless_sync import ReadlessSyncStats, run_readless_sync_loop
 from app.service.task_queue import get_task_queue
+from app.service.http_client import get_shared_async_client
 from app.time_utils import now_local
 
 logger = logging.getLogger(__name__)
+
+
 
 TAIL_RECONCILE_OWNER = "tail_reconcile_worker"
 
@@ -1377,13 +1380,71 @@ class TaskManager:
         payload: dict[str, Any],
         event_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        has_root_task_key = bool(self._root_task_key_secret(task))
+        if has_root_task_key:
+            self._record_event(
+                db,
+                task,
+                "downstream_work_key_requested",
+                f"为下游任务申请 work key: {service}",
+                payload={
+                    "stage_item_id": str(getattr(item, "id", "") or ""),
+                    "stage_name": str(getattr(item, "stage_name", "") or ""),
+                    "service": str(service or ""),
+                    "has_root_task_key": True,
+                },
+            )
+        work_key_payload = await self._derive_downstream_work_key(task=task, item=item, service=service)
+        effective_token = token
+        effective_payload = dict(payload or {})
+        if work_key_payload:
+            effective_token = work_key_payload.get("agent_task_key_secret") or token
+            effective_payload.update(work_key_payload)
+            item_payload = dict(item.payload or {})
+            item_payload.update(
+                {
+                    "downstream_agent_task_key_id": work_key_payload.get("agent_task_key_id"),
+                    "downstream_agent_task_key_name": work_key_payload.get("agent_task_key_name"),
+                    "downstream_agent_task_key_prefix": work_key_payload.get("agent_task_key_prefix"),
+                    "downstream_key_source": work_key_payload.get("agent_task_key_source"),
+                }
+            )
+            item.payload = item_payload
+            self._record_event(
+                db,
+                task,
+                "downstream_work_key_created",
+                f"已为下游任务创建 work key: {service}",
+                payload={
+                    "stage_item_id": str(getattr(item, "id", "") or ""),
+                    "stage_name": str(getattr(item, "stage_name", "") or ""),
+                    "service": str(service or ""),
+                    "agent_task_key_id": work_key_payload.get("agent_task_key_id"),
+                    "agent_task_key_prefix": work_key_payload.get("agent_task_key_prefix"),
+                    "agent_task_key_source": work_key_payload.get("agent_task_key_source"),
+                },
+            )
+            self._record_event(
+                db,
+                task,
+                "downstream_create_with_agent_task_key",
+                f"创建下游任务时附带 agent task key: {service}",
+                payload={
+                    "stage_item_id": str(getattr(item, "id", "") or ""),
+                    "stage_name": str(getattr(item, "stage_name", "") or ""),
+                    "service": str(service or ""),
+                    "agent_task_key_id": work_key_payload.get("agent_task_key_id"),
+                    "agent_task_key_prefix": work_key_payload.get("agent_task_key_prefix"),
+                    "agent_task_key_source": work_key_payload.get("agent_task_key_source"),
+                },
+            )
         return await self._downstream_tasks().create_child_task(
             db,
             task,
             item,
             service=service,
-            token=token,
-            payload=payload,
+            token=effective_token,
+            payload=effective_payload,
             event_payload=event_payload,
         )
 
@@ -2359,6 +2420,10 @@ class TaskManager:
             firmware_path=str(input_dir),
             output_root=str(output_root),
             workspace_root=str(workspace_root),
+            task_key_source=str(payload.task_key_source or "").strip() or None,
+            root_task_key_id=str(payload.root_task_key_id or "").strip() or None,
+            root_task_key_name=str(payload.root_task_key_name or "").strip() or None,
+            root_task_key_prefix=str(payload.root_task_key_prefix or "").strip() or None,
             execution_epoch=0,
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         )
@@ -2822,6 +2887,10 @@ class TaskManager:
                 output_root=ctx.task.output_root,
                 workspace_root=ctx.task.workspace_root,
                 fileserver_subproject_name=ctx.task.fileserver_subproject_name,
+                task_key_source=str(getattr(ctx.task, "task_key_source", "") or "").strip() or None,
+                root_task_key_id=str(getattr(ctx.task, "root_task_key_id", "") or "").strip() or None,
+                root_task_key_prefix=str(getattr(ctx.task, "root_task_key_prefix", "") or "").strip() or None,
+                has_root_task_key=bool(self._root_task_key_secret(ctx.task)),
                 policy=self._effective_runtime_policy(ctx.task),
                 summary=ctx.task.summary,
                 metrics=ctx.task.metrics,
@@ -4179,6 +4248,13 @@ class TaskManager:
             "files": {
                 "summary_path": str(Path(task.workspace_root) / BinarySecurityTask.SUMMARY_FILENAME) if task.workspace_root else None,
                 "metadata_path": str(Path(task.workspace_root) / "input" / "task-metadata.json") if task.workspace_root else None,
+            },
+            "runtime_task_keys": {
+                "root_task_key_secret": str(payload.root_task_key_secret or "").strip() or None,
+                "root_task_key_id": str(payload.root_task_key_id or "").strip() or None,
+                "root_task_key_name": str(payload.root_task_key_name or "").strip() or None,
+                "root_task_key_prefix": str(payload.root_task_key_prefix or "").strip() or None,
+                "task_key_source": str(payload.task_key_source or "").strip() or None,
             },
         }
 
@@ -16977,6 +17053,62 @@ class TaskManager:
     def _service_token(self) -> str | None:
         return self.cfg.auth_service.service_machine_token
 
+    def _root_task_key_secret(self, task: BinarySecurityTask) -> str | None:
+        summary = task.summary if isinstance(task.summary, dict) else {}
+        runtime_keys = summary.get("runtime_task_keys") if isinstance(summary.get("runtime_task_keys"), dict) else {}
+        secret = str(runtime_keys.get("root_task_key_secret") or "").strip()
+        return secret or None
+
+    async def _derive_downstream_work_key(
+        self,
+        *,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        service: str,
+    ) -> dict[str, str] | None:
+        root_secret = self._root_task_key_secret(task)
+        if not root_secret:
+            return None
+        aigw_base = os.environ.get("SECFLOW_AIGW_BASE_URL") or os.environ.get("AIGW_BASE_URL") or "http://gaiasec-llm-gateway"
+        client = await get_shared_async_client("binary-security-aigw-work-key", timeout=30)
+        child_correlation_id = str(getattr(item, "downstream_task_id", "") or getattr(item, "id", "") or getattr(item, "item_key", "") or "").strip()
+        payload = {
+            "key_name": f"{str(service or '').strip()}-{child_correlation_id}",
+            "sub_task_id": child_correlation_id,
+            "max_concurrency": 0,
+            "enabled": True,
+            "description": f"work key for {task.id}/{str(service or '').strip()}/{str(getattr(item, 'stage_name', '') or '').strip()}",
+        }
+        try:
+            response = await client.post(
+                f"{aigw_base.rstrip('/')}/api/aigw/work-keys",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {root_secret}",
+                    "Content-Type": "application/json",
+                },
+            )
+        except httpx.TimeoutException as exc:
+            raise UpstreamError("向 AI Gateway 派生 work key 超时") from exc
+        except httpx.RequestError as exc:
+            raise UpstreamError(f"向 AI Gateway 派生 work key 失败: {exc}") from exc
+        if response.status_code not in (200, 201):
+            raise UpstreamError(f"向 AI Gateway 派生 work key 失败: {response.status_code}")
+        data = response.json() if response.content else {}
+        if not isinstance(data, dict):
+            raise UpstreamError("AI Gateway work key 响应格式错误")
+        key_payload = data.get("key") if isinstance(data.get("key"), dict) else {}
+        secret = str(data.get("secret") or "").strip()
+        if not secret:
+            raise UpstreamError("AI Gateway work key 响应缺少 secret")
+        return {
+            "agent_task_key_id": str(key_payload.get("id") or "").strip(),
+            "agent_task_key_name": str(key_payload.get("key_name") or "").strip(),
+            "agent_task_key_prefix": str(key_payload.get("key_prefix") or "").strip(),
+            "agent_task_key_secret": secret,
+            "agent_task_key_source": "schedule_dispatch",
+        }
+
     def _task_runtime_phase(self, task: BinarySecurityTask) -> str:
         value = str(getattr(task, "runtime_phase", "") or "").strip()
         if value in {
@@ -21763,6 +21895,9 @@ class TaskManager:
         for stage_name in self._stage_sequence_for_task(task):
             if not self._stage_enabled(task, stage_name):
                 continue
+            upstream_retried, _ = self._upstream_stage_retried(db, task, stage_name)
+            if upstream_retried:
+                continue
             run = runs_by_stage.get(stage_name)
             if run is None:
                 if self._should_finalize_without_entries(db, task, stage_name):
@@ -22421,6 +22556,9 @@ class TaskManager:
         task: BinarySecurityTask,
         stage_name: str,
     ) -> bool:
+        upstream_retried, _ = self._upstream_stage_retried(db, task, stage_name)
+        if upstream_retried:
+            return False
         items = self._stage_items(db, task.id, stage_name)
         if items:
             if self._is_streaming_tail_stage(task, stage_name):

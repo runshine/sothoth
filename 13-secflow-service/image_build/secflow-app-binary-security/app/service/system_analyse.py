@@ -21,13 +21,16 @@ class SystemAnalyseClient(JsonHttpClient):
         project_id: str,
         task_name: str,
         input_path: str,
+        token: str | None = None,
         origin: dict[str, Any] | None = None,
         analysis_mode: str = "binary",
+        agent_task_key: dict[str, Any] | None = None,
     ) -> dict:
         mode = "source" if str(analysis_mode or "").strip().lower() == "source" else "binary"
         subject = "源码项目" if mode == "source" else "解包系统"
         return await self.post(
             f"{self.API_PREFIX}/tasks",
+            token=token,
             json_body={
                 "project_id": project_id,
                 "task_name": task_name,
@@ -36,6 +39,7 @@ class SystemAnalyseClient(JsonHttpClient):
                 "task_description": "由 binary security 编排器触发的系统分析任务",
                 "prompt_content": f"对路径 `{input_path}` 下的{subject}进行系统模块分类和安全威胁分析，输出风险模块列表。",
                 **(origin or {}),
+                **(agent_task_key or {}),
             },
         )
 

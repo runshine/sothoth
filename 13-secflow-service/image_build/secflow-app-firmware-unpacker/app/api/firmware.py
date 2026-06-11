@@ -2337,6 +2337,23 @@ def _submit_task(project_id: Optional[str], request: UnpackRequest) -> dict:
         result = submit_unpack_task(
             firmware_path=request.firmware_path,
             project_id=project_id,
+            llm_binding_snapshot={
+                "agent_task_key": {
+                    "id": request.agent_task_key_id,
+                    "name": request.agent_task_key_name,
+                    "prefix": request.agent_task_key_prefix,
+                    "secret": request.agent_task_key_secret,
+                    "source": request.agent_task_key_source,
+                }
+            } if any(
+                value is not None for value in (
+                    request.agent_task_key_id,
+                    request.agent_task_key_name,
+                    request.agent_task_key_prefix,
+                    request.agent_task_key_secret,
+                    request.agent_task_key_source,
+                )
+            ) else None,
             task_origin_type=request.task_origin_type,
             parent_project_id=request.parent_project_id,
             parent_task_id=request.parent_task_id,
@@ -2909,7 +2926,16 @@ async def get_project_task(
     task = _get_task_or_404(task_id)
     if _normalize_project_id(task.get("project_id")) != project_id:
         raise NotFoundError("任务", task_id)
-    return task
+    snapshot = task.get("llm_binding_snapshot")
+    if isinstance(snapshot, str):
+        try:
+            snapshot = json.loads(snapshot)
+        except Exception:
+            snapshot = None
+    return {
+        **task,
+        **_agent_runtime_payload_from_snapshot(snapshot if isinstance(snapshot, dict) else None),
+    }
 
 
 @router.get(

@@ -128,6 +128,10 @@ class BinarySecurityTask(Base, JsonMixin):
     summary_json = Column(Text, nullable=True)
     metrics_json = Column(Text, nullable=True)
     stage_summary_json = Column(Text, nullable=True)
+    task_key_source = Column(String(32), nullable=True, index=True)
+    root_task_key_id = Column(String(64), nullable=True, index=True)
+    root_task_key_name = Column(String(255), nullable=True)
+    root_task_key_prefix = Column(String(128), nullable=True)
     execution_epoch = Column(Integer, nullable=False, default=0)
     execution_mode = Column(String(32), nullable=True, index=True)
     target_stage_name = Column(String(64), nullable=True, index=True)
@@ -694,6 +698,22 @@ def _ensure_compat_columns(engine) -> None:
         if "runtime_override_version" not in columns:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN runtime_override_version INTEGER NOT NULL DEFAULT 0"
+            )
+        if "task_key_source" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN task_key_source VARCHAR(32) NULL"
+            )
+        if "root_task_key_id" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN root_task_key_id VARCHAR(64) NULL"
+            )
+        if "root_task_key_name" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN root_task_key_name VARCHAR(255) NULL"
+            )
+        if "root_task_key_prefix" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN root_task_key_prefix VARCHAR(128) NULL"
             )
         if "runtime_override_updated_at" not in columns:
             statements.append(

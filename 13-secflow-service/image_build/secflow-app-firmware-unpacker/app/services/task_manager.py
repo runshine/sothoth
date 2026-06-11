@@ -1261,6 +1261,17 @@ def _parse_llm_binding_snapshot(snapshot_raw: str | None) -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _agent_runtime_payload_from_snapshot(snapshot: dict | None) -> dict[str, Any]:
+    agent_task_key = snapshot.get("agent_task_key") if isinstance(snapshot, dict) and isinstance(snapshot.get("agent_task_key"), dict) else {}
+    secret = str(agent_task_key.get("secret") or "").strip()
+    return {
+        "has_agent_task_key": bool(secret),
+        "agent_task_key_id": str(agent_task_key.get("id") or "").strip() or None,
+        "agent_task_key_prefix": str(agent_task_key.get("prefix") or "").strip() or None,
+        "agent_runtime_mode": "task_scoped" if secret else "global",
+    }
+
+
 def _build_llm_binding_snapshot(db) -> dict:
     from app.services.configcenter import get_configcenter_client
     from app.unpacker_engine import (
@@ -2030,7 +2041,12 @@ def submit_unpack_task(
     prepared = prepare_task_workspace(normalized_project_id, task_id, firmware_path)
     db = get_db_session()
     try:
-        effective_snapshot = llm_binding_snapshot or _build_llm_binding_snapshot(db)
+        effective_snapshot = _build_llm_binding_snapshot(db)
+        if isinstance(llm_binding_snapshot, dict) and llm_binding_snapshot:
+            effective_snapshot = {
+                **effective_snapshot,
+                **llm_binding_snapshot,
+            }
         db.add(
             UnpackTask(
                 id=task_id,

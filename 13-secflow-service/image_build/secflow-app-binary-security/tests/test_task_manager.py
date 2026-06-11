@@ -4344,6 +4344,57 @@ class TaskManagerTests(unittest.TestCase):
         self.assertTrue(upstream_retried)
         self.assertEqual("system_analysis", upstream_stage)
 
+    def test_stage_has_real_runnable_work_ignores_stale_descendant_items_after_upstream_retry(self):
+        upstream_finished_at = datetime(2026, 5, 15, 19, 3, 33)
+        task = BinarySecurityTask(
+            id="retry-jump-2",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/in",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="pending",
+            current_stage="firmware_unpack",
+        )
+        stage_runs = [
+            BinarySecurityStageRun(
+                id="sr1",
+                task_id="retry-jump-2",
+                project_id="p1",
+                stage_name="firmware_unpack",
+                sequence_no=1,
+                status="failed",
+                retry_count=1,
+                finished_at=upstream_finished_at,
+            ),
+            BinarySecurityStageRun(
+                id="sr2",
+                task_id="retry-jump-2",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=4,
+                status="dispatching",
+            ),
+        ]
+        stage_items = [
+            BinarySecurityStageItem(
+                id="i-entry-old",
+                task_id="retry-jump-2",
+                project_id="p1",
+                stage_run_id="sr2",
+                stage_name="entry_analysis",
+                item_key="entry-1",
+                parent_key="module-1",
+                status="dispatching",
+                created_at=upstream_finished_at - timedelta(minutes=5),
+            ),
+        ]
+        db = _ModelAwareDb(tasks=[task], stage_runs=stage_runs, stage_items=stage_items)
+
+        self.assertFalse(self.manager._stage_has_real_runnable_work(db, task, "entry_analysis"))
+
     def test_prepare_stage_items_for_execution_only_requeues_selected_failed_items(self):
         task = BinarySecurityTask(
             id="t1",
@@ -6017,6 +6068,57 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual("binary_to_source", self.manager._next_incomplete_stage(db, task))
+
+    def test_next_incomplete_stage_skips_stale_descendant_stage_after_upstream_retry(self):
+        upstream_finished_at = datetime(2026, 5, 15, 19, 3, 33)
+        task = BinarySecurityTask(
+            id="retry-jump-1",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/in",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="pending",
+            current_stage="firmware_unpack",
+        )
+        stage_runs = [
+            BinarySecurityStageRun(
+                id="sr1",
+                task_id="retry-jump-1",
+                project_id="p1",
+                stage_name="firmware_unpack",
+                sequence_no=1,
+                status="failed",
+                retry_count=1,
+                finished_at=upstream_finished_at,
+            ),
+            BinarySecurityStageRun(
+                id="sr2",
+                task_id="retry-jump-1",
+                project_id="p1",
+                stage_name="binary_to_source",
+                sequence_no=3,
+                status="queued",
+            ),
+        ]
+        stage_items = [
+            BinarySecurityStageItem(
+                id="i-b2s-old",
+                task_id="retry-jump-1",
+                project_id="p1",
+                stage_run_id="sr2",
+                stage_name="binary_to_source",
+                item_key="module-1",
+                parent_key="fw-1",
+                status="queued",
+                created_at=upstream_finished_at - timedelta(minutes=5),
+            ),
+        ]
+        db = _ModelAwareDb(tasks=[task], stage_runs=stage_runs, stage_items=stage_items)
+
+        self.assertIsNone(self.manager._next_incomplete_stage(db, task))
 
     def test_next_incomplete_stage_skips_empty_streaming_tail_stage(self):
         task = BinarySecurityTask(

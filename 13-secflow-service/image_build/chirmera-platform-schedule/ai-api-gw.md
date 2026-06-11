@@ -19,7 +19,7 @@
 - 调度中心只负责登记业务任务与输入绑定，任务创建阶段不访问 AI Gateway。
 - 用户点击“分发”后，调度中心使用服务端管理凭证调用 `POST /api/aigw/llm-keys` 创建一个新的 **root task key**。
 - 这个 root task key 会直接传给下游微服务，用作本次任务的父级运行凭证。
-- 下游如果需要更细粒度的 worker / sub-task 凭证，由下游自己基于 root task key 调用 `POST /api/aigw/work-keys`。
+- 下游如果需要更细粒度的 worker / sub-task 凭证，由实际编排方直接基于 root task key 调用 `POST /api/aigw/work-keys`。
 - 调度中心本期不创建 work key，也不保存下游派生出的 work key。
 
 推荐调度流程：
@@ -28,7 +28,8 @@
 2. `POST /api/chirmera-platform-schedule/projects/{project_id}/user-tasks/{task_id}/dispatch`
 3. 调度中心在 dispatch 内部调用 `POST /api/aigw/llm-keys`
 4. 调度中心把返回的 root task key secret 直接用于 downstream create / upload complete / start
-5. downstream 自行决定是否继续调用 `POST /api/aigw/work-keys`
+5. `binary-security` 这类编排方在创建下游子任务前，可直接调用 `POST /api/aigw/work-keys`
+6. 更下游执行方如需继续细分凭证，可再自行调用 `POST /api/aigw/work-keys`
 
 ### Base URL
 

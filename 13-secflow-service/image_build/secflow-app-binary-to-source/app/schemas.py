@@ -42,6 +42,11 @@ class TaskCreate(BaseModel):
     parent_stage_name: Optional[str] = None
     parent_stage_item_id: Optional[str] = None
     parent_stage_item_key: Optional[str] = None
+    agent_task_key_id: Optional[str] = None
+    agent_task_key_name: Optional[str] = None
+    agent_task_key_prefix: Optional[str] = None
+    agent_task_key_secret: Optional[str] = None
+    agent_task_key_source: Optional[str] = None
     elf_tasks: list[ElfTaskInput]
 
 
@@ -555,6 +560,9 @@ class TaskResponse(BaseModel):
     abnormal_reason_code: Optional[str] = None
     abnormal_reason_category: Optional[str] = None
     abnormal_reason: Optional[B2SAbnormalReason] = None
+    has_agent_task_key: bool = False
+    agent_task_key_id: Optional[str] = None
+    agent_task_key_prefix: Optional[str] = None
 
 
 class TaskDetailResponse(TaskResponse):

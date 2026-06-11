@@ -167,20 +167,34 @@ class DownstreamTaskGateway:
 
     async def create_task(self, service: str, *, project_id: str, token: str | None, **kwargs: Any) -> dict[str, Any]:
         normalized = self._normalize_service(service)
+        agent_task_key = {
+            key: kwargs.get(key)
+            for key in (
+                "agent_task_key_id",
+                "agent_task_key_name",
+                "agent_task_key_prefix",
+                "agent_task_key_secret",
+                "agent_task_key_source",
+            )
+            if kwargs.get(key) is not None
+        }
         if normalized == "firmware_unpacker":
             return await self._firmware_unpacker_client().create_task(
                 project_id,
                 str(kwargs["firmware_path"]),
                 token or "",
                 kwargs.get("origin"),
+                agent_task_key=agent_task_key or None,
             )
         if normalized == "system_analyse":
             return await self._system_analyse_client().create_task(
                 project_id,
                 str(kwargs["task_name"]),
                 str(kwargs["input_path"]),
+                token or "",
                 kwargs.get("origin"),
                 analysis_mode=str(kwargs.get("analysis_mode") or "binary"),
+                agent_task_key=agent_task_key or None,
             )
         if normalized == "binary_to_source":
             return await self._binary_to_source_client().create_task(
@@ -189,6 +203,7 @@ class DownstreamTaskGateway:
                 list(kwargs["elf_tasks"]),
                 token or "",
                 kwargs.get("origin"),
+                agent_task_key=agent_task_key or None,
                 mode=kwargs.get("mode"),
                 engine=kwargs.get("engine"),
                 reuse_cache=kwargs.get("reuse_cache"),
@@ -202,6 +217,7 @@ class DownstreamTaskGateway:
                 token or "",
                 kwargs.get("source_path"),
                 kwargs.get("origin"),
+                agent_task_key=agent_task_key or None,
             )
         if normalized in LEGACY_UNSUPPORTED_DOWNSTREAM_SERVICES:
             self._reject_legacy_service(normalized)
@@ -213,6 +229,8 @@ class DownstreamTaskGateway:
                 str(kwargs["source_root_path"]),
                 str(kwargs["prompt_content"]),
                 kwargs.get("origin"),
+                token=token or "",
+                agent_task_key=agent_task_key or None,
                 source_file=kwargs.get("source_file"),
                 function_name=kwargs.get("function_name"),
                 line_hint=kwargs.get("line_hint"),
@@ -232,6 +250,8 @@ class DownstreamTaskGateway:
                 str(kwargs["source_dir"]),
                 str(kwargs.get("prompt_content") or ""),
                 kwargs.get("origin"),
+                token=token or "",
+                agent_task_key=agent_task_key or None,
             )
         raise ValidationError(f"未知下游服务: {normalized}")
 

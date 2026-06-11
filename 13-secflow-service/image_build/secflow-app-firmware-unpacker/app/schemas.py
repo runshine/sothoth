@@ -18,6 +18,11 @@ class UnpackRequest(BaseModel):
     parent_stage_name: Optional[str] = None
     parent_stage_item_id: Optional[str] = None
     parent_stage_item_key: Optional[str] = None
+    agent_task_key_id: Optional[str] = None
+    agent_task_key_name: Optional[str] = None
+    agent_task_key_prefix: Optional[str] = None
+    agent_task_key_secret: Optional[str] = None
+    agent_task_key_source: Optional[str] = None
 
 
 class TaskSubmitResponse(BaseModel):
@@ -88,6 +93,10 @@ class TaskResponse(BaseModel):
     cancel_requested_at: Optional[str] = None
     last_progress_at: Optional[str] = None
     runner_pid: Optional[int] = None
+    has_agent_task_key: bool = False
+    agent_task_key_id: Optional[str] = None
+    agent_task_key_prefix: Optional[str] = None
+    agent_runtime_mode: Optional[str] = None
     runner_started_at: Optional[str] = None
     runner_heartbeat_at: Optional[str] = None
     cancel_grace_deadline: Optional[str] = None

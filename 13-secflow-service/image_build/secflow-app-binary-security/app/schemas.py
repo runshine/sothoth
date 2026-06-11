@@ -52,6 +52,11 @@ class BinarySecurityTaskCreate(BaseModel):
     output_root: Optional[str] = None
     stage_options: dict[str, StageOptions] = Field(default_factory=dict)
     policy_overrides: TaskPolicyOverrides = Field(default_factory=TaskPolicyOverrides)
+    root_task_key_id: Optional[str] = None
+    root_task_key_name: Optional[str] = None
+    root_task_key_prefix: Optional[str] = None
+    root_task_key_secret: Optional[str] = None
+    task_key_source: Optional[str] = None
 
 
 class BinarySecurityUploadCompletePayload(BaseModel):
@@ -562,6 +567,10 @@ class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
     cleanup_snapshot: dict[str, Any] = Field(default_factory=dict)
     runtime_health: BinarySecurityRuntimeHealthResponse = Field(default_factory=BinarySecurityRuntimeHealthResponse)
     abnormal_reason_history: list[BinarySecurityAbnormalReasonEventSummary] = Field(default_factory=list)
+    task_key_source: Optional[str] = None
+    root_task_key_id: Optional[str] = None
+    root_task_key_prefix: Optional[str] = None
+    has_root_task_key: bool = False
 
 
 class BinarySecurityStageItemPageResponse(BaseModel):

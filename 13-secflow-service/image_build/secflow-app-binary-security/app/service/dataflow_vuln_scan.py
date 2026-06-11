@@ -41,6 +41,8 @@ class DataflowVulnScanClient(JsonHttpClient):
         source_root_path: str,
         prompt_content: str,
         origin: dict[str, Any] | None = None,
+        token: str | None = None,
+        agent_task_key: dict[str, Any] | None = None,
         *,
         source_file: str | None = None,
         function_name: str | None = None,
@@ -55,6 +57,7 @@ class DataflowVulnScanClient(JsonHttpClient):
     ) -> dict:
         return await self.post(
             f"{self.API_PREFIX}/tasks",
+            token=token,
             json_body={
                 "project_id": project_id,
                 "task_name": task_name,
@@ -74,6 +77,7 @@ class DataflowVulnScanClient(JsonHttpClient):
                 "entry_reason_source": entry_reason_source or "",
                 "taint_details": taint_details or [],
                 **(origin or {}),
+                **(agent_task_key or {}),
             },
         )
 

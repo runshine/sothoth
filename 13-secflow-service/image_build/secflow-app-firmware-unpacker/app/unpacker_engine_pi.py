@@ -226,7 +226,24 @@ class PiRpcClient:
             json.dumps(runtime["settings_json"], ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        (agent_dir / "auth.json").write_text("{}", encoding="utf-8")
+        task_agent_key = None
+        if isinstance(self._llm_binding_snapshot, dict):
+            task_agent_key = self._llm_binding_snapshot.get("agent_task_key")
+        auth_payload = (
+            {
+                "agent_task_key_id": str(task_agent_key.get("id") or "").strip() or None,
+                "agent_task_key_name": str(task_agent_key.get("name") or "").strip() or None,
+                "agent_task_key_prefix": str(task_agent_key.get("prefix") or "").strip() or None,
+                "agent_task_key_secret": str(task_agent_key.get("secret") or "").strip() or None,
+                "agent_task_key_source": str(task_agent_key.get("source") or "").strip() or None,
+            }
+            if isinstance(task_agent_key, dict)
+            else {}
+        )
+        (agent_dir / "auth.json").write_text(
+            json.dumps(auth_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         self._agent_tmp_root = agent_dir.parent
         self._agent_dir = agent_dir
         return agent_dir, dict(runtime["env"])

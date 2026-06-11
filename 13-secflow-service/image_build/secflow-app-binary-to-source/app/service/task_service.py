@@ -1971,6 +1971,11 @@ def _pi_job_payload(
         "clean": clean,
         "engine": normalized_engine,
         "concurrency": concurrency,
+        "agent_task_key_id": str(((item.extra_metadata or {}).get("agent_task_key_id") or "")).strip() or None,
+        "agent_task_key_name": str(((item.extra_metadata or {}).get("agent_task_key_name") or "")).strip() or None,
+        "agent_task_key_prefix": str(((item.extra_metadata or {}).get("agent_task_key_prefix") or "")).strip() or None,
+        "agent_task_key_secret": str(((item.extra_metadata or {}).get("agent_task_key_secret") or "")).strip() or None,
+        "agent_task_key_source": str(((item.extra_metadata or {}).get("agent_task_key_source") or "")).strip() or None,
     }
 
 
@@ -2468,6 +2473,11 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, operator: T
             "reuse_cache": reuse_cache,
             "pi_idempotency_key": _pi_idempotency_key(task.id, item),
             "dispatch_clean": False,
+            "agent_task_key_id": str(req.agent_task_key_id or "").strip() or None,
+            "agent_task_key_name": str(req.agent_task_key_name or "").strip() or None,
+            "agent_task_key_prefix": str(req.agent_task_key_prefix or "").strip() or None,
+            "agent_task_key_secret": str(req.agent_task_key_secret or "").strip() or None,
+            "agent_task_key_source": str(req.agent_task_key_source or "").strip() or None,
         }
         cache_service = get_cache_service()
         cache_result = None
@@ -3807,6 +3817,17 @@ def build_task_response(db: Session, task: B2STask) -> TaskResponse:
             abnormal_reason = None
     if abnormal_reason is None:
         abnormal_reason = current_reason
+    key_metadata = {}
+    for item in items:
+        metadata = item.extra_metadata if isinstance(item.extra_metadata, dict) else {}
+        secret = str(metadata.get("agent_task_key_secret") or "").strip()
+        if secret:
+            key_metadata = {
+                "has_agent_task_key": True,
+                "agent_task_key_id": str(metadata.get("agent_task_key_id") or "").strip() or None,
+                "agent_task_key_prefix": str(metadata.get("agent_task_key_prefix") or "").strip() or None,
+            }
+            break
     return TaskResponse(
         id=task.id,
         project_id=task.project_id,
@@ -3830,6 +3851,9 @@ def build_task_response(db: Session, task: B2STask) -> TaskResponse:
         abnormal_reason_code=abnormal_reason.code if abnormal_reason else None,
         abnormal_reason_category=abnormal_reason.category if abnormal_reason else None,
         abnormal_reason=abnormal_reason,
+        has_agent_task_key=bool(key_metadata.get("has_agent_task_key")),
+        agent_task_key_id=key_metadata.get("agent_task_key_id"),
+        agent_task_key_prefix=key_metadata.get("agent_task_key_prefix"),
         **counts,
     )
 
