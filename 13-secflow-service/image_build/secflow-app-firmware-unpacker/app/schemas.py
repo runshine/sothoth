@@ -385,6 +385,16 @@ class TaskListResponse(BaseModel):
     items: List[TaskResponse]
 
 
+class FirmwareTaskConfigSnapshotResponse(BaseModel):
+    task_id: str
+    project_id: Optional[str] = None
+    available: bool
+    message: Optional[str] = None
+    agent_auth_json: Optional[dict[str, Any]] = None
+    provider_runtime_summary: Optional[dict[str, Any]] = None
+    llm_binding_snapshot: Optional[dict[str, Any]] = None
+
+
 class EvolutionRoundResponse(BaseModel):
     id: str
     job_id: str

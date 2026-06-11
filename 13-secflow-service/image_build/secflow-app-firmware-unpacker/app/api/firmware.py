@@ -35,6 +35,7 @@ from app.schemas import (
     EvolutionJobSubmitResponse,
     EvolutionRoundResponse,
     EvolutionSessionIndexResponse,
+    FirmwareTaskConfigSnapshotResponse,
     LlmConfigFileSummaryListResponse,
     LlmProviderSummaryListResponse,
     ReadyResponse,
@@ -142,6 +143,75 @@ def _agent_runtime_payload_from_snapshot(snapshot: dict | None) -> dict[str, Any
     payload["agent_task_key_prefix"] = agent_task_key_prefix
     payload["agent_runtime_mode"] = str(agent_task_key.get("source") or "").strip() or None
     return payload
+
+
+def _build_task_config_snapshot(task: dict[str, Any]) -> dict[str, Any]:
+    def _unavailable(message: str) -> dict[str, Any]:
+        return {
+            "task_id": str(task.get("id") or ""),
+            "project_id": _normalize_project_id(task.get("project_id")),
+            "available": False,
+            "message": message,
+            "agent_auth_json": None,
+            "provider_runtime_summary": None,
+            "llm_binding_snapshot": None,
+        }
+
+    raw_snapshot = task.get("llm_binding_snapshot")
+    if raw_snapshot is None:
+        return _unavailable("当前任务没有冻结的智能体配置快照。")
+
+    snapshot: dict[str, Any] | None = None
+    if isinstance(raw_snapshot, dict):
+        snapshot = raw_snapshot
+    elif isinstance(raw_snapshot, str):
+        try:
+            parsed = json.loads(raw_snapshot)
+        except Exception:
+            return _unavailable("任务冻结快照不是合法 JSON。")
+        if not isinstance(parsed, dict):
+            return _unavailable("任务冻结快照不是对象结构。")
+        snapshot = parsed
+    else:
+        return _unavailable("任务冻结快照格式不受支持。")
+
+    agent_auth_json = None
+    agent_task_key = snapshot.get("agent_task_key")
+    if isinstance(agent_task_key, dict):
+        agent_auth_json = {
+            "agent_task_key_id": agent_task_key.get("id"),
+            "agent_task_key_name": agent_task_key.get("name"),
+            "agent_task_key_prefix": agent_task_key.get("prefix"),
+            "agent_task_key_secret": agent_task_key.get("secret"),
+            "agent_task_key_source": agent_task_key.get("source"),
+        }
+
+    provider_runtime_summary = None
+    roles = snapshot.get("roles")
+    if isinstance(roles, dict):
+        provider_runtime_summary = {}
+        for role_name, role_payload in roles.items():
+            if not isinstance(role_payload, dict):
+                provider_runtime_summary[role_name] = None
+                continue
+            provider_runtime_summary[role_name] = {
+                "config_file_key": role_payload.get("config_file_key"),
+                "provider_key": role_payload.get("provider_key"),
+                "model": role_payload.get("model"),
+                "model_selector": role_payload.get("model_selector"),
+                "models_json": role_payload.get("models_json"),
+                "settings_json": role_payload.get("settings_json"),
+            }
+
+    return {
+        "task_id": str(task.get("id") or ""),
+        "project_id": _normalize_project_id(task.get("project_id")),
+        "available": True,
+        "message": None,
+        "agent_auth_json": agent_auth_json,
+        "provider_runtime_summary": provider_runtime_summary,
+        "llm_binding_snapshot": snapshot,
+    }
 
 
 def _normalize_runtime_path(path: str) -> str:
@@ -2957,6 +3027,23 @@ async def get_project_task(
         **task,
         **_agent_runtime_payload_from_snapshot(snapshot if isinstance(snapshot, dict) else None),
     }
+
+
+@router.get(
+    "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}/task-config",
+    response_model=FirmwareTaskConfigSnapshotResponse,
+)
+async def get_project_task_config(
+    project_id: str,
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    task = _get_task_or_404(task_id)
+    if _normalize_project_id(task.get("project_id")) != project_id:
+        raise NotFoundError("任务", task_id)
+    return _build_task_config_snapshot(task)
 
 
 @router.get(

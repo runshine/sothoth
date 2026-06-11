@@ -15,7 +15,7 @@ for candidate in (PROJECT_ROOT, APP_ROOT):
     if candidate_text not in sys.path:
         sys.path.insert(0, candidate_text)
 
-from app.api.firmware import _get_task_metrics, _get_task_result
+from app.api.firmware import _build_task_config_snapshot, _get_task_metrics, _get_task_result
 from app.config import reload_config
 from app.model import UnpackTask, UnpackTaskEvent, generate_id, get_db_session, init_database
 import app.model as model_module
@@ -429,3 +429,64 @@ class TaskResultApiTests(unittest.TestCase):
         self.assertTrue(rounds["items"][0]["reviewer"]["passed"])
         self.assertTrue(any("round_002/results.json" in warning for warning in rounds["warnings"]))
         self.assertTrue(any("round_002/results.json" in warning for warning in metrics["health"]["warnings"]))
+
+    def test_build_task_config_snapshot_returns_frozen_auth_and_provider_summary(self):
+        snapshot = _build_task_config_snapshot(
+            {
+                "id": "task-1",
+                "project_id": "p1",
+                "llm_binding_snapshot": json.dumps(
+                    {
+                        "agent_task_key": {
+                            "id": "atk-1",
+                            "name": "agent-key",
+                            "prefix": "sk-task",
+                            "secret": "secret-plaintext",
+                            "source": "schedule_dispatch",
+                        },
+                        "roles": {
+                            "executor": {
+                                "config_file_key": "executor-config",
+                                "provider_key": "provider-executor",
+                                "model": "gpt-test",
+                                "model_selector": "default",
+                                "models_json": {
+                                    "providers": {
+                                        "executor-config": {
+                                            "baseURL": "https://api.example.test/v1",
+                                        }
+                                    }
+                                },
+                                "settings_json": {"temperature": 0.1},
+                            }
+                        },
+                        "frozen_at": "2026-06-11T00:00:00Z",
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        )
+
+        self.assertTrue(snapshot["available"])
+        self.assertEqual("secret-plaintext", snapshot["agent_auth_json"]["agent_task_key_secret"])
+        self.assertEqual("schedule_dispatch", snapshot["agent_auth_json"]["agent_task_key_source"])
+        self.assertEqual("executor-config", snapshot["provider_runtime_summary"]["executor"]["config_file_key"])
+        self.assertEqual(
+            "https://api.example.test/v1",
+            snapshot["provider_runtime_summary"]["executor"]["models_json"]["providers"]["executor-config"]["baseURL"],
+        )
+
+    def test_build_task_config_snapshot_marks_invalid_json_unavailable(self):
+        snapshot = _build_task_config_snapshot(
+            {
+                "id": "task-2",
+                "project_id": "p1",
+                "llm_binding_snapshot": "{bad json",
+            }
+        )
+
+        self.assertFalse(snapshot["available"])
+        self.assertIsNone(snapshot["agent_auth_json"])
+        self.assertIsNone(snapshot["provider_runtime_summary"])
+        self.assertIsNone(snapshot["llm_binding_snapshot"])
+        self.assertIn("合法 JSON", snapshot["message"])
