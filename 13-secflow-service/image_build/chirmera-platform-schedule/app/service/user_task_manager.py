@@ -262,8 +262,6 @@ class AiGatewayTaskKeyClient:
             raise UpstreamError("创建 root task key 失败: 上游未返回 key.id")
         if not str(key_payload.get("key_name") or "").strip():
             raise UpstreamError("创建 root task key 失败: 上游未返回 key.key_name")
-        if not str(key_payload.get("key_prefix") or "").strip():
-            raise UpstreamError("创建 root task key 失败: 上游未返回 key.key_prefix")
         if not secret:
             raise UpstreamError("创建 root task key 失败: 上游未返回 secret")
         return body

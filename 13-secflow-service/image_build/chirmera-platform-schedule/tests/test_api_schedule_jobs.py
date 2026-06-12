@@ -266,9 +266,8 @@ def test_aigw_create_task_key_rejects_missing_secret():
         asyncio.run(_run())
 
 
-def test_aigw_create_task_key_rejects_missing_key_prefix():
+def test_aigw_create_task_key_allows_missing_key_prefix():
     from app.service.user_task_manager import AiGatewayTaskKeyClient
-    from app.exception import UpstreamError
 
     class _Resp:
         status_code = 200
@@ -287,15 +286,16 @@ def test_aigw_create_task_key_rejects_missing_key_prefix():
     async def _run():
         client = AiGatewayTaskKeyClient()
         with patch("app.service.user_task_manager.get_shared_async_client", new=AsyncMock(return_value=SimpleNamespace(post=AsyncMock(return_value=_Resp())))):
-            await client.create_task_key(
+            return await client.create_task_key(
                 management_token="mgmt-token",
                 task_id="task-a",
                 dispatch_id="dispatch-a",
                 capacity_pool_ids=[1],
             )
 
-    with pytest.raises(UpstreamError, match="未返回 key.key_prefix"):
-        asyncio.run(_run())
+    payload = asyncio.run(_run())
+    assert payload["secret"] == "tsk_secret_value"
+    assert payload["key"]["key_name"] == "dispatch-task-dispatch"
 
 
 def test_user_task_rejects_directory_for_firmware_file_mode(client):
