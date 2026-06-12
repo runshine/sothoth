@@ -39,11 +39,11 @@ class VulnVerifyWorker:
 
     async def stop(self) -> None:
         self._stopping.set()
-        if not self._task:
-            return
-        self._task.cancel()
-        with suppress(asyncio.CancelledError):
-            await self._task
+        if self._task:
+            self._task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._task
+        await asyncio.to_thread(self._requeue_running_tasks_on_stop)
 
     async def _run(self) -> None:
         cfg = get_config().worker
@@ -91,6 +91,9 @@ class VulnVerifyWorker:
         try:
             await self._run_one(task_id)
         except Exception as exc:
+            if self._stopping.is_set():
+                logger.warning("task stopped during worker shutdown: %s: %s", task_id, exc)
+                return
             logger.exception("task failed unexpectedly: %s", task_id)
             db = get_db_session()
             try:
@@ -112,7 +115,7 @@ class VulnVerifyWorker:
         db = get_db_session()
         try:
             task = db.query(VulnVerifyTask).filter(VulnVerifyTask.id == task_id).first()
-            if not task:
+            if not task or task.status != "running" or task.worker_id != self.owner_id or self._stopping.is_set():
                 return
             output_dir = Path(task.output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -146,13 +149,16 @@ class VulnVerifyWorker:
         finally:
             db.close()
 
+        if self._stopping.is_set():
+            return
+
         with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
             process = subprocess.Popen(cmd, cwd=str(output_dir), stdout=stdout, stderr=stderr, start_new_session=True)
 
         db = get_db_session()
         try:
             task = db.query(VulnVerifyTask).filter(VulnVerifyTask.id == task_id).first()
-            if not task:
+            if not task or task.status != "running" or task.worker_id != self.owner_id or self._stopping.is_set():
                 _kill_process_group(process.pid)
                 return
             task.pid = process.pid
@@ -170,13 +176,16 @@ class VulnVerifyWorker:
             db = get_db_session()
             try:
                 task = db.query(VulnVerifyTask).filter(VulnVerifyTask.id == task_id).first()
-                if not task:
+                if not task or task.worker_id != self.owner_id:
                     _kill_process_group(process.pid)
                     return
                 if task.status == "cancelling":
                     _kill_process_group(process.pid)
                     task.progress = {"message": "正在取消进程组", "percent": 90, "pid": process.pid}
                     db.commit()
+                elif task.status != "running" or self._stopping.is_set():
+                    _kill_process_group(process.pid)
+                    return
                 elif timeout > 0 and time.monotonic() - started > timeout:
                     _kill_process_group(process.pid)
                     task.status = "cancelling"
@@ -198,7 +207,7 @@ class VulnVerifyWorker:
         db = get_db_session()
         try:
             task = db.query(VulnVerifyTask).filter(VulnVerifyTask.id == task_id).first()
-            if not task:
+            if not task or task.worker_id != self.owner_id or self._stopping.is_set():
                 return
             task.return_code = int(return_code)
             task.pid = None
@@ -223,6 +232,64 @@ class VulnVerifyWorker:
             db.commit()
         finally:
             db.close()
+
+    def _requeue_running_tasks_on_stop(self) -> None:
+        reason = f"worker {self.owner_id} is stopping; task requeued"
+        running_ids = set(self._running)
+        task_ids = set(running_ids)
+        db = get_db_session()
+        try:
+            owned_tasks = (
+                db.query(VulnVerifyTask.id)
+                .filter(VulnVerifyTask.worker_id == self.owner_id, VulnVerifyTask.status == "running")
+                .all()
+            )
+            task_ids.update(task_id for (task_id,) in owned_tasks)
+        except Exception as exc:
+            logger.warning("failed to list running tasks for worker shutdown: %s", exc, exc_info=True)
+        finally:
+            db.close()
+
+        for task_id in task_ids:
+            db = get_db_session()
+            try:
+                task = db.query(VulnVerifyTask).filter(VulnVerifyTask.id == task_id).first()
+                if not task or task.status != "running" or task.worker_id != self.owner_id:
+                    continue
+                previous_worker_id = task.worker_id
+                previous_pid = task.pid
+                if previous_pid:
+                    try:
+                        _kill_process_group(int(previous_pid))
+                    except ProcessLookupError:
+                        pass
+                    except Exception as exc:
+                        logger.warning("failed to kill task process during requeue: %s: %s", task.id, exc)
+                task.status = "pending"
+                task.pid = None
+                task.worker_id = None
+                task.lease_until = None
+                task.heartbeat_at = None
+                task.finished_at = None
+                task.return_code = None
+                task.started_at = None
+                task.error_reason = reason
+                task.progress = {"message": reason, "percent": 0}
+                create_event(
+                    db,
+                    task,
+                    "task_requeued",
+                    reason,
+                    level="warning",
+                    payload={"previous_worker_id": previous_worker_id, "previous_pid": previous_pid, "reason": reason},
+                )
+                db.commit()
+            except Exception as exc:
+                db.rollback()
+                logger.warning("failed to requeue task during worker shutdown: %s: %s", task_id, exc, exc_info=True)
+            finally:
+                db.close()
+        self._running.difference_update(task_ids)
 
     def _reap_cancelling_processes(self) -> None:
         db = get_db_session()
