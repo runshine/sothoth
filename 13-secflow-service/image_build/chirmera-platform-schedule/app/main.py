@@ -20,7 +20,7 @@ from app.service.http_client import close_all_async_clients
 from app.service.redis_runtime import close_redis_runtime, get_redis_runtime
 from app.service.registry import get_registry_service
 from app.service.runtime_state import mark_state
-from app.service.schedule_manager import get_scheduler_runtime, get_worker_runtime
+from app.service.schedule_manager import get_delete_worker_runtime, get_scheduler_runtime, get_user_task_sync_worker_runtime, get_worker_runtime
 
 
 logging.basicConfig(
@@ -110,6 +110,8 @@ async def lifespan(_: FastAPI):
             mark_state(scheduler_ready=True)
         if _role_enabled(role, "worker"):
             await get_worker_runtime().start()
+            await get_delete_worker_runtime().start()
+            await get_user_task_sync_worker_runtime().start()
             mark_state(worker_ready=True)
         else:
             mark_state(worker_ready=True)
@@ -127,6 +129,8 @@ async def lifespan(_: FastAPI):
         if get_config().scheduler.enabled and _role_enabled(get_config().runtime.role, "scheduler"):
             await get_scheduler_runtime().stop()
         if _role_enabled(get_config().runtime.role, "worker"):
+            await get_user_task_sync_worker_runtime().stop()
+            await get_delete_worker_runtime().stop()
             await get_worker_runtime().stop()
         await get_registry_service().stop()
         await close_all_async_clients()

@@ -165,6 +165,11 @@ class ScheduleUserTask(Base):
     __tablename__ = f"{TABLE_PREFIX}user_task"
     __table_args__ = (
         Index(f"idx_{TABLE_PREFIX}user_task_project_status", "project_id", "create_status", "dispatch_status"),
+        Index(f"idx_{TABLE_PREFIX}user_task_project_display", "project_id", "display_status", "updated_at"),
+        Index(f"idx_{TABLE_PREFIX}user_task_sync_status_next", "sync_required", "sync_status", "next_sync_at"),
+        Index(f"idx_{TABLE_PREFIX}user_task_sync_queue_next", "sync_queue", "sync_status", "next_sync_at"),
+        Index(f"idx_{TABLE_PREFIX}user_task_sync_lease", "sync_status", "sync_lease_expires_at"),
+        Index(f"idx_{TABLE_PREFIX}user_task_task_type_sync", "task_type", "sync_required", "next_sync_at"),
     )
 
     id = Column(String(64), primary_key=True, default=generate_id)
@@ -188,6 +193,30 @@ class ScheduleUserTask(Base):
     downstream_status_raw = Column(String(64), nullable=True)
     downstream_status_mapped = Column(String(64), nullable=True)
     downstream_report_ready = Column(Boolean, nullable=False, default=False)
+    display_status = Column(String(32), nullable=False, default="queued", index=True)
+    sync_status = Column(String(32), nullable=False, default="none", index=True)
+    sync_queue = Column(String(32), nullable=True, index=True)
+    sync_required = Column(Boolean, nullable=False, default=False, index=True)
+    sync_policy_key = Column(String(64), nullable=True)
+    last_synced_at = Column(DateTime, nullable=True)
+    last_sync_started_at = Column(DateTime, nullable=True)
+    next_sync_at = Column(DateTime, nullable=True, index=True)
+    sync_attempt_count = Column(Integer, nullable=False, default=0)
+    sync_consecutive_error_count = Column(Integer, nullable=False, default=0)
+    sync_worker_id = Column(String(128), nullable=True, index=True)
+    sync_lease_token = Column(String(255), nullable=True, index=True)
+    sync_lease_expires_at = Column(DateTime, nullable=True, index=True)
+    last_sync_error = Column(Text, nullable=True)
+    last_sync_http_status = Column(Integer, nullable=True)
+    sync_priority = Column(Integer, nullable=False, default=100)
+    delete_status = Column(String(32), nullable=False, default="none", index=True)
+    delete_error = Column(Text, nullable=True)
+    delete_requested_at = Column(DateTime, nullable=True)
+    delete_started_at = Column(DateTime, nullable=True)
+    delete_finished_at = Column(DateTime, nullable=True)
+    delete_attempt_count = Column(Integer, nullable=False, default=0)
+    delete_worker_id = Column(String(128), nullable=True)
+    delete_lease_expires_at = Column(DateTime, nullable=True)
     last_error = Column(Text, nullable=True)
     created_by = Column(String(128), nullable=False)
     updated_by = Column(String(128), nullable=False)
@@ -355,6 +384,70 @@ def _ensure_user_task_columns(engine) -> None:
         statements.append(
             f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN downstream_report_ready BOOLEAN NOT NULL DEFAULT 0"
         )
+    if "display_status" not in columns:
+        statements.append(
+            f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN display_status VARCHAR(32) NOT NULL DEFAULT 'queued'"
+        )
+    if "sync_status" not in columns:
+        statements.append(
+            f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN sync_status VARCHAR(32) NOT NULL DEFAULT 'none'"
+        )
+    if "sync_queue" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN sync_queue VARCHAR(32) NULL")
+    if "sync_required" not in columns:
+        statements.append(
+            f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN sync_required BOOLEAN NOT NULL DEFAULT 0"
+        )
+    if "sync_policy_key" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN sync_policy_key VARCHAR(64) NULL")
+    if "last_synced_at" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN last_synced_at DATETIME NULL")
+    if "last_sync_started_at" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN last_sync_started_at DATETIME NULL")
+    if "next_sync_at" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN next_sync_at DATETIME NULL")
+    if "sync_attempt_count" not in columns:
+        statements.append(
+            f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN sync_attempt_count INTEGER NOT NULL DEFAULT 0"
+        )
+    if "sync_consecutive_error_count" not in columns:
+        statements.append(
+            f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN sync_consecutive_error_count INTEGER NOT NULL DEFAULT 0"
+        )
+    if "sync_worker_id" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN sync_worker_id VARCHAR(128) NULL")
+    if "sync_lease_token" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN sync_lease_token VARCHAR(255) NULL")
+    if "sync_lease_expires_at" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN sync_lease_expires_at DATETIME NULL")
+    if "last_sync_error" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN last_sync_error TEXT NULL")
+    if "last_sync_http_status" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN last_sync_http_status INTEGER NULL")
+    if "sync_priority" not in columns:
+        statements.append(
+            f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN sync_priority INTEGER NOT NULL DEFAULT 100"
+        )
+    if "delete_status" not in columns:
+        statements.append(
+            f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN delete_status VARCHAR(32) NOT NULL DEFAULT 'none'"
+        )
+    if "delete_error" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN delete_error TEXT NULL")
+    if "delete_requested_at" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN delete_requested_at DATETIME NULL")
+    if "delete_started_at" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN delete_started_at DATETIME NULL")
+    if "delete_finished_at" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN delete_finished_at DATETIME NULL")
+    if "delete_attempt_count" not in columns:
+        statements.append(
+            f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN delete_attempt_count INTEGER NOT NULL DEFAULT 0"
+        )
+    if "delete_worker_id" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN delete_worker_id VARCHAR(128) NULL")
+    if "delete_lease_expires_at" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTask.__tablename__} ADD COLUMN delete_lease_expires_at DATETIME NULL")
     if not statements:
         return
     with engine.begin() as connection:

@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_config
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
-from app.model import ScheduleExecution, ScheduleExecutionEvent, ScheduleJob, get_db_session
+from app.model import ScheduleExecution, ScheduleExecutionEvent, ScheduleJob, ScheduleUserTask, get_db_session
 from app.service.http_client import get_shared_async_client
 from app.service.redis_runtime import get_redis_runtime
 from app.service.runtime_config import get_runtime_config_service
@@ -778,12 +778,27 @@ class ScheduleManager:
             runtime_snapshot = self._runtime_snapshot(db)
             scheduler_policy = runtime_snapshot.scheduler_policy
             queue_snapshot = await self.redis.metrics_snapshot()
+            sync_queue_names = ["dispatching", "running", "paused", "retry_wait", "terminal_verify"]
+            sync_queue_stats = await self.redis.user_task_sync_queue_stats(sync_queue_names)
             inflight = db.query(ScheduleExecution).filter(ScheduleExecution.status.in_(["queued", "reserved", "running", "retry_wait"])).count()
             queued = db.query(ScheduleExecution).filter(ScheduleExecution.status == "queued").count()
             reserved = db.query(ScheduleExecution).filter(ScheduleExecution.status == "reserved").count()
             running = db.query(ScheduleExecution).filter(ScheduleExecution.status == "running").count()
             succeeded = db.query(ScheduleExecution).filter(ScheduleExecution.status == "succeeded").count()
             failed = db.query(ScheduleExecution).filter(ScheduleExecution.status.in_(["failed", "timeout"])).count()
+            queued_sync_total = db.query(ScheduleUserTask).filter(
+                ScheduleUserTask.sync_required.is_(True),
+                ScheduleUserTask.sync_status == "queued",
+            ).count()
+            syncing_total = db.query(ScheduleUserTask).filter(
+                ScheduleUserTask.sync_status == "syncing",
+            ).count()
+            retry_wait_total = db.query(ScheduleUserTask).filter(
+                ScheduleUserTask.sync_status == "retry_wait",
+            ).count()
+            stale_total = db.query(ScheduleUserTask).filter(
+                ScheduleUserTask.sync_status == "stale",
+            ).count()
             jobs_total = db.query(ScheduleJob).filter(ScheduleJob.deleted.is_(False)).count()
             active_jobs = db.query(ScheduleJob).filter(ScheduleJob.deleted.is_(False), ScheduleJob.enabled.is_(True)).count()
             return {
@@ -810,6 +825,13 @@ class ScheduleManager:
                     "active_jobs": active_jobs,
                     "succeeded_total": succeeded,
                     "failed_total": failed,
+                },
+                "user_task_sync": {
+                    "queued_total": queued_sync_total,
+                    "syncing_total": syncing_total,
+                    "retry_wait_total": retry_wait_total,
+                    "stale_total": stale_total,
+                    "queue_depths": sync_queue_stats,
                 },
                 "redis_available": queue_snapshot["redis_available"],
                 "active_runtime_config_source": runtime_snapshot.source,
@@ -861,7 +883,27 @@ class ScheduleManager:
             "# HELP chirmera_schedule_running_executions Current running executions",
             "# TYPE chirmera_schedule_running_executions gauge",
             f"chirmera_schedule_running_executions {overview['workers']['running_executions']}",
+            "# HELP chirmera_user_task_sync_queued_total User task sync queued total",
+            "# TYPE chirmera_user_task_sync_queued_total gauge",
+            f"chirmera_user_task_sync_queued_total {overview['user_task_sync']['queued_total']}",
+            "# HELP chirmera_user_task_sync_syncing_total User task sync syncing total",
+            "# TYPE chirmera_user_task_sync_syncing_total gauge",
+            f"chirmera_user_task_sync_syncing_total {overview['user_task_sync']['syncing_total']}",
+            "# HELP chirmera_user_task_sync_retry_wait_total User task sync retry wait total",
+            "# TYPE chirmera_user_task_sync_retry_wait_total gauge",
+            f"chirmera_user_task_sync_retry_wait_total {overview['user_task_sync']['retry_wait_total']}",
+            "# HELP chirmera_user_task_sync_stale_total User task sync stale total",
+            "# TYPE chirmera_user_task_sync_stale_total gauge",
+            f"chirmera_user_task_sync_stale_total {overview['user_task_sync']['stale_total']}",
         ]
+        for queue_name, payload in overview["user_task_sync"]["queue_depths"].items():
+            lines.extend(
+                [
+                    "# HELP chirmera_user_task_sync_queue_depth User task sync queue depth",
+                    "# TYPE chirmera_user_task_sync_queue_depth gauge",
+                    f'chirmera_user_task_sync_queue_depth{{queue="{queue_name}"}} {payload["length"]}',
+                ]
+            )
         return "\n".join(lines) + "\n"
 
 
@@ -899,6 +941,21 @@ class SchedulerRuntime:
             now_monotonic = time.monotonic()
             if now_monotonic - last_reclaim >= max(1, int(self.config.reclaim_interval_seconds)):
                 await self.manager.reclaim_stale_executions()
+                sync_db = get_db_session()
+                try:
+                    reclaimed = get_user_task_manager().reclaim_stale_sync_tasks(sync_db, limit=max(10, int(self.config.delay_promote_batch_size)))
+                finally:
+                    sync_db.close()
+                for task_id in reclaimed:
+                    retry_db = get_db_session()
+                    try:
+                        task = retry_db.query(ScheduleUserTask).filter(ScheduleUserTask.id == task_id).first()
+                        if task.sync_required and str(task.sync_queue or "").strip():
+                            await self.manager.redis.enqueue_user_task_sync_ready(str(task.sync_queue), task_id)
+                    except Exception:
+                        pass
+                    finally:
+                        retry_db.close()
                 last_reclaim = now_monotonic
             await asyncio.sleep(max(1, min(int(self.config.poll_interval_seconds), renew_every)))
 
@@ -974,9 +1031,128 @@ class WorkerRuntime:
         self._workers.clear()
 
 
+class DeleteWorkerRuntime:
+    def __init__(self) -> None:
+        self.redis = get_redis_runtime()
+        self._running = False
+        self._workers: set[asyncio.Task] = set()
+        self._task: Optional[asyncio.Task] = None
+        self._worker_id = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or "chirmera-platform-schedule-delete-worker"
+
+    async def _worker_loop(self) -> None:
+        manager = get_user_task_manager()
+        while self._running:
+            task_id = await self.redis.pop_delete_ready(timeout_seconds=1)
+            if not task_id:
+                await asyncio.sleep(max(0.1, float(get_config().worker.idle_sleep_seconds)))
+                continue
+            try:
+                await manager.process_delete_task(task_id, worker_id=self._worker_id)
+            except Exception:
+                pass
+
+    async def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        concurrency = max(1, min(4, int(get_config().worker.prefetch or 1)))
+        for _ in range(concurrency):
+            task = asyncio.create_task(self._worker_loop())
+            self._workers.add(task)
+            task.add_done_callback(self._workers.discard)
+        async def _wait_all() -> None:
+            if self._workers:
+                await asyncio.gather(*self._workers, return_exceptions=True)
+        self._task = asyncio.create_task(_wait_all())
+
+    async def stop(self) -> None:
+        if not self._running:
+            return
+        self._running = False
+        for task in list(self._workers):
+            task.cancel()
+        for task in list(self._workers):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._workers.clear()
+
+
+class UserTaskSyncWorkerRuntime:
+    def __init__(self) -> None:
+        self.redis = get_redis_runtime()
+        self._running = False
+        self._workers: set[asyncio.Task] = set()
+        self._task: Optional[asyncio.Task] = None
+        self._bearer_token = get_user_task_manager().auto_dispatch_token()
+
+    async def _pop_next_task_id(self) -> Optional[str]:
+        for queue_name in ["terminal_verify", "dispatching", "running", "paused", "retry_wait"]:
+            task_id = await self.redis.pop_user_task_sync_ready(queue_name, timeout_seconds=1)
+            if task_id:
+                return task_id
+        return None
+
+    async def _worker_loop(self) -> None:
+        manager = get_user_task_manager()
+        while self._running:
+            task_id = await self._pop_next_task_id()
+            if not task_id:
+                fallback_db = get_db_session()
+                try:
+                    claimed = manager.claim_due_sync_task(fallback_db)
+                    if claimed is None:
+                        await asyncio.sleep(max(0.1, float(get_config().worker.idle_sleep_seconds)))
+                        continue
+                    task, lease_token = claimed
+                    await manager._process_claimed_sync_task(
+                        project_id=str(task.project_id),
+                        task_id=str(task.id),
+                        lease_token=lease_token,
+                        bearer_token=self._bearer_token,
+                    )
+                    continue
+                finally:
+                    fallback_db.close()
+            try:
+                await manager.process_sync_task(task_id, bearer_token=self._bearer_token)
+            except Exception:
+                pass
+
+    async def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        concurrency = max(1, min(8, int(get_config().worker.prefetch or 1)))
+        for _ in range(concurrency):
+            task = asyncio.create_task(self._worker_loop())
+            self._workers.add(task)
+            task.add_done_callback(self._workers.discard)
+        async def _wait_all() -> None:
+            if self._workers:
+                await asyncio.gather(*self._workers, return_exceptions=True)
+        self._task = asyncio.create_task(_wait_all())
+
+    async def stop(self) -> None:
+        if not self._running:
+            return
+        self._running = False
+        for task in list(self._workers):
+            task.cancel()
+        for task in list(self._workers):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._workers.clear()
+
+
 _schedule_manager: Optional[ScheduleManager] = None
 _scheduler_runtime: Optional[SchedulerRuntime] = None
 _worker_runtime: Optional[WorkerRuntime] = None
+_delete_worker_runtime: Optional[DeleteWorkerRuntime] = None
+_user_task_sync_worker_runtime: Optional[UserTaskSyncWorkerRuntime] = None
 
 
 def get_schedule_manager() -> ScheduleManager:
@@ -998,3 +1174,17 @@ def get_worker_runtime() -> WorkerRuntime:
     if _worker_runtime is None:
         _worker_runtime = WorkerRuntime(get_schedule_manager())
     return _worker_runtime
+
+
+def get_delete_worker_runtime() -> DeleteWorkerRuntime:
+    global _delete_worker_runtime
+    if _delete_worker_runtime is None:
+        _delete_worker_runtime = DeleteWorkerRuntime()
+    return _delete_worker_runtime
+
+
+def get_user_task_sync_worker_runtime() -> UserTaskSyncWorkerRuntime:
+    global _user_task_sync_worker_runtime
+    if _user_task_sync_worker_runtime is None:
+        _user_task_sync_worker_runtime = UserTaskSyncWorkerRuntime()
+    return _user_task_sync_worker_runtime

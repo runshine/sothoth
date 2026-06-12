@@ -34,6 +34,7 @@ from app.schemas import (
     UserTaskBulkDeleteResponse,
     UserTaskDispatchListResponse,
     UserTaskDispatchRequest,
+    UserTaskSyncRequest,
     UserTaskListResponse,
     UserTaskResponse,
 )
@@ -254,6 +255,25 @@ async def create_user_task(
 async def get_user_task(project_id: str, task_id: str, _: TokenUser = Depends(get_current_context), authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
     token = _token_from_header(authorization)
     task = await get_user_task_manager().get_task_detail(db, project_id, task_id, token)
+    return UserTaskResponse.model_validate(task)
+
+
+@router.post("/projects/{project_id}/user-tasks/{task_id}/sync", response_model=UserTaskResponse)
+async def sync_user_task(
+    project_id: str,
+    task_id: str,
+    payload: UserTaskSyncRequest,
+    user: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    actor = user.username or user.user_id or "unknown"
+    task = await get_user_task_manager().request_task_sync(
+        db,
+        project_id=project_id,
+        task_id=task_id,
+        actor=actor,
+        force=bool(payload.force),
+    )
     return UserTaskResponse.model_validate(task)
 
 

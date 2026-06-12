@@ -8,8 +8,11 @@ import hashlib
 import json
 import shutil
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
+import os
+import uuid
 
 import httpx
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -22,8 +25,10 @@ from app.model import (
     ScheduleUserTask,
     ScheduleUserTaskDispatch,
     ScheduleUserTaskInputBinding,
+    get_db_session,
 )
 from app.service.http_client import get_shared_async_client
+from app.service.redis_runtime import get_redis_runtime
 from app.service.runtime_config import get_runtime_config_service
 
 
@@ -66,6 +71,18 @@ AI4APK_STATUS_MAP: dict[str, tuple[str, str, bool]] = {
     "failed": ("failed", "failed", False),
 }
 
+SYNC_QUEUE_PRIORITY = ["terminal_verify", "dispatching", "running", "paused", "retry_wait"]
+SYNC_QUEUE_INTERVAL_SECONDS: dict[str, int] = {
+    "dispatching": 5,
+    "running": 15,
+    "paused": 60,
+    "retry_wait": 30,
+    "terminal_verify": 10,
+}
+SYNC_TERMINAL_STATES = {"success", "failed", "cancelled"}
+SYNC_ACTIVE_STATUSES = {"queued", "retry_wait", "stale", "syncing"}
+SYNC_FORCE_ALLOWED_TASK_TYPES = {"ai4red", "ai4apk"}
+
 USER_TASK_SORT_FIELDS: dict[str, Any] = {
     "created_at": ScheduleUserTask.created_at,
     "updated_at": ScheduleUserTask.updated_at,
@@ -75,9 +92,19 @@ USER_TASK_SORT_FIELDS: dict[str, Any] = {
     "dispatch_status": ScheduleUserTask.dispatch_status,
     "business_status": ScheduleUserTask.business_status,
     "downstream_status_mapped": ScheduleUserTask.downstream_status_mapped,
+    "display_status": ScheduleUserTask.display_status,
+    "sync_status": ScheduleUserTask.sync_status,
     "created_by": ScheduleUserTask.created_by,
     "downstream_task_id": ScheduleUserTask.downstream_task_id,
+    "delete_status": ScheduleUserTask.delete_status,
 }
+
+
+DELETE_QUEUE_RETRYABLE_STATUSES = {"queued", "running"}
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 @dataclass
@@ -419,6 +446,7 @@ class UserTaskManager:
         self.binary_security = BinarySecurityDispatchClient()
         self.ai4red = Ai4RedDispatchClient()
         self.ai4apk = TuringAppSecurityClient()
+        self.pod_name = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or "chirmera-platform-schedule-sync-worker"
 
     @staticmethod
     def _task_type_supports_downstream_delete(task_type: str) -> bool:
@@ -439,7 +467,14 @@ class UserTaskManager:
         is_retrying = bool(filters.get("is_retrying"))
         filtered: list[ScheduleUserTask] = []
         for task in rows:
-            if status and status not in {task.create_status, task.dispatch_status, task.business_status, str(task.downstream_status_mapped or "")}:
+            if status and status not in {
+                task.create_status,
+                task.dispatch_status,
+                task.business_status,
+                str(task.downstream_status_mapped or ""),
+                str(task.display_status or ""),
+                str(task.sync_status or ""),
+            }:
                 continue
             if task_type and str(task.task_type or "") != task_type:
                 continue
@@ -460,6 +495,124 @@ class UserTaskManager:
             filtered.append(task)
         return filtered
 
+    @staticmethod
+    def _display_status_from_task(task: ScheduleUserTask) -> str:
+        business_status = str(task.business_status or "").strip()
+        dispatch_status = str(task.dispatch_status or "").strip()
+        downstream_status = str(task.downstream_status_mapped or "").strip()
+        if business_status in {"success", "failed", "paused", "cancelling", "cancelled"}:
+            return business_status
+        if downstream_status in {"success", "failed", "paused", "cancelling", "cancelled"}:
+            return downstream_status
+        if business_status == "running" or downstream_status == "running":
+            return "running"
+        if dispatch_status in {"dispatch_queued", "dispatching"}:
+            return "dispatching"
+        if task.create_status == "created" and dispatch_status == "ready_for_dispatch":
+            return "queued"
+        if dispatch_status == "dispatch_failed":
+            return "failed"
+        if business_status == "dispatching":
+            return "dispatching"
+        if business_status == "created":
+            return "created"
+        return "unknown"
+
+    @staticmethod
+    def _sync_policy_key_for_task(task: ScheduleUserTask) -> str | None:
+        task_type = str(task.task_type or "").strip()
+        if task_type in {"ai4red", "ai4apk"}:
+            return f"{task_type}:default"
+        return None
+
+    def _should_sync_task(self, task: ScheduleUserTask) -> bool:
+        return bool(self._sync_policy_key_for_task(task) and str(task.downstream_task_id or "").strip())
+
+    def _sync_queue_for_display_status(self, display_status: str) -> str | None:
+        normalized = str(display_status or "").strip()
+        if normalized == "dispatching":
+            return "dispatching"
+        if normalized == "running":
+            return "running"
+        if normalized == "paused":
+            return "paused"
+        if normalized in SYNC_TERMINAL_STATES:
+            return "terminal_verify"
+        return None
+
+    def _schedule_next_sync_at(self, queue_name: str, *, consecutive_error_count: int = 0, now: Optional[datetime] = None) -> datetime:
+        base_now = now or utcnow()
+        base_delay = int(SYNC_QUEUE_INTERVAL_SECONDS.get(queue_name, 15))
+        if queue_name == "retry_wait":
+            multiplier = max(1, min(6, int(consecutive_error_count or 1)))
+            delay_seconds = min(300, base_delay * (2 ** (multiplier - 1)))
+        else:
+            delay_seconds = base_delay
+        return base_now + timedelta(seconds=delay_seconds)
+
+    def _initialize_sync_fields(self, task: ScheduleUserTask, *, force: bool = False) -> None:
+        task.display_status = self._display_status_from_task(task)
+        task.sync_policy_key = self._sync_policy_key_for_task(task)
+        if not self._should_sync_task(task):
+            if force:
+                task.sync_required = False
+                task.sync_status = "none"
+                task.sync_queue = None
+                task.next_sync_at = None
+            return
+        queue_name = self._sync_queue_for_display_status(task.display_status) or "running"
+        task.sync_required = True
+        task.sync_queue = queue_name
+        task.sync_status = "queued"
+        task.next_sync_at = utcnow()
+        task.last_sync_error = None
+        task.last_sync_http_status = None
+
+    async def _enqueue_sync_task_if_needed(self, task: ScheduleUserTask) -> None:
+        if not bool(task.sync_required) or not str(task.sync_queue or "").strip():
+            return
+        await get_redis_runtime().enqueue_user_task_sync_ready(str(task.sync_queue), str(task.id))
+
+    def _apply_sync_state(
+        self,
+        task: ScheduleUserTask,
+        dispatch: Optional[ScheduleUserTaskDispatch],
+        *,
+        mapped_dispatch_status: str,
+        mapped_business_status: str,
+        status_raw: Optional[str],
+        report_ready: bool,
+        error_message: Optional[str],
+    ) -> None:
+        task.dispatch_status = mapped_dispatch_status
+        task.business_status = mapped_business_status
+        task.downstream_status_raw = status_raw or None
+        task.downstream_status_mapped = mapped_business_status
+        task.downstream_report_ready = report_ready
+        task.last_error = error_message or None
+        task.display_status = self._display_status_from_task(task)
+        if self._should_sync_task(task):
+            queue_name = self._sync_queue_for_display_status(task.display_status)
+            if queue_name is None:
+                task.sync_required = False
+                task.sync_status = "idle"
+                task.sync_queue = None
+                task.next_sync_at = None
+            else:
+                task.sync_required = True
+                task.sync_queue = queue_name
+        else:
+            task.sync_required = False
+            task.sync_status = "none"
+            task.sync_queue = None
+            task.next_sync_at = None
+        if dispatch is not None:
+            dispatch.dispatch_status = mapped_dispatch_status
+            dispatch.downstream_status_raw = status_raw or None
+            dispatch.downstream_status_mapped = mapped_business_status
+            dispatch.downstream_report_ready = report_ready
+            dispatch.last_error = error_message or None
+
     async def _delete_downstream_task(self, task: ScheduleUserTask, bearer_token: str) -> None:
         downstream_task_id = str(task.downstream_task_id or "").strip()
         if not downstream_task_id:
@@ -473,6 +626,217 @@ class UserTaskManager:
             await self.ai4apk.delete_task(downstream_task_id=downstream_task_id)
             return
         raise ValidationError("该任务类型暂不支持同步删除下游任务")
+
+    async def _fetch_downstream_status(self, task: ScheduleUserTask, bearer_token: str) -> dict[str, Any]:
+        if task.task_type == "ai4red":
+            payload = await self.ai4red.get_task(downstream_task_id=str(task.downstream_task_id), bearer_token=bearer_token)
+            return {"provider": "ai4red", "payload": self._extract_ai4red_data(payload)}
+        if task.task_type == "ai4apk":
+            payload = await self.ai4apk.get_task(downstream_task_id=str(task.downstream_task_id))
+            return {"provider": "ai4apk", "payload": self._extract_ai4apk_data(payload)}
+        raise ValidationError(f"任务类型暂不支持下游状态同步: {task.task_type}")
+
+    def _apply_downstream_status_payload(
+        self,
+        task: ScheduleUserTask,
+        dispatch: Optional[ScheduleUserTaskDispatch],
+        *,
+        provider: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if provider == "ai4red":
+            self._apply_ai4red_status(task, dispatch, payload)
+            return
+        if provider == "ai4apk":
+            self._apply_ai4apk_status(task, dispatch, payload)
+            return
+        raise ValidationError(f"未知的下游状态提供方: {provider}")
+
+    def _claim_sync_task(self, db: Session, task_id: str) -> Optional[tuple[ScheduleUserTask, str]]:
+        task = db.query(ScheduleUserTask).filter(ScheduleUserTask.id == task_id).first()
+        if task is None:
+            return None
+        now = utcnow()
+        if not bool(task.sync_required):
+            return None
+        if str(task.sync_status or "none") not in {"queued", "retry_wait", "stale"}:
+            return None
+        if task.next_sync_at is not None and task.next_sync_at > now:
+            return None
+        if task.sync_lease_expires_at is not None and task.sync_lease_expires_at > now:
+            return None
+        lease_token = uuid.uuid4().hex
+        updated = db.query(ScheduleUserTask).filter(
+            ScheduleUserTask.id == task.id,
+            ScheduleUserTask.sync_required.is_(True),
+            ScheduleUserTask.sync_status.in_(["queued", "retry_wait", "stale"]),
+            or_(ScheduleUserTask.sync_lease_expires_at.is_(None), ScheduleUserTask.sync_lease_expires_at <= now),
+        ).update(
+            {
+                ScheduleUserTask.sync_status: "syncing",
+                ScheduleUserTask.sync_worker_id: self.pod_name,
+                ScheduleUserTask.sync_lease_token: lease_token,
+                ScheduleUserTask.sync_lease_expires_at: now + timedelta(seconds=int(get_config().worker.lease_seconds)),
+                ScheduleUserTask.last_sync_started_at: now,
+                ScheduleUserTask.sync_attempt_count: int(task.sync_attempt_count or 0) + 1,
+            },
+            synchronize_session=False,
+        )
+        if updated != 1:
+            db.rollback()
+            return None
+        db.commit()
+        return self.get_task_or_404(db, task.project_id, task.id), lease_token
+
+    def claim_due_sync_task(self, db: Session, *, queue_name: Optional[str] = None) -> Optional[tuple[ScheduleUserTask, str]]:
+        now = utcnow()
+        query = db.query(ScheduleUserTask).filter(
+            ScheduleUserTask.sync_required.is_(True),
+            ScheduleUserTask.sync_status.in_(["queued", "retry_wait", "stale"]),
+            or_(ScheduleUserTask.next_sync_at.is_(None), ScheduleUserTask.next_sync_at <= now),
+        )
+        if str(queue_name or "").strip():
+            query = query.filter(ScheduleUserTask.sync_queue == str(queue_name).strip())
+        task = query.order_by(
+            ScheduleUserTask.sync_priority.asc(),
+            ScheduleUserTask.next_sync_at.asc().nullsfirst(),
+            ScheduleUserTask.updated_at.asc(),
+        ).first()
+        if task is None:
+            return None
+        return self._claim_sync_task(db, str(task.id))
+
+    def renew_sync_lease(self, db: Session, *, task_id: str, lease_token: str) -> bool:
+        updated = db.query(ScheduleUserTask).filter(
+            ScheduleUserTask.id == task_id,
+            ScheduleUserTask.sync_lease_token == lease_token,
+            ScheduleUserTask.sync_status == "syncing",
+        ).update(
+            {
+                ScheduleUserTask.sync_lease_expires_at: utcnow() + timedelta(seconds=int(get_config().worker.lease_seconds)),
+            },
+            synchronize_session=False,
+        )
+        if updated == 1:
+            db.commit()
+            return True
+        db.rollback()
+        return False
+
+    async def _process_claimed_sync_task(self, *, project_id: str, task_id: str, lease_token: str, bearer_token: str) -> bool:
+        db = get_db_session()
+        try:
+            task = self.get_task_or_404(db, project_id, task_id)
+            if str(task.sync_status or "") != "syncing" or str(task.sync_lease_token or "") != str(lease_token):
+                return False
+            dispatches = self._dispatches_for_task(db, task.id)
+            latest_dispatch = dispatches[0] if dispatches else None
+            now = utcnow()
+            try:
+                result = await self._fetch_downstream_status(task, bearer_token)
+                latest = self.get_task_or_404(db, task.project_id, task.id)
+                latest_dispatch = self._dispatches_for_task(db, latest.id)[0] if self._dispatches_for_task(db, latest.id) else None
+                self._apply_downstream_status_payload(latest, latest_dispatch, provider=result["provider"], payload=result["payload"])
+                latest.last_synced_at = now
+                latest.last_sync_error = None
+                latest.last_sync_http_status = None
+                latest.sync_consecutive_error_count = 0
+                latest.sync_worker_id = None
+                latest.sync_lease_token = None
+                latest.sync_lease_expires_at = None
+                if latest.sync_required and str(latest.sync_queue or "").strip():
+                    latest.sync_status = "queued"
+                    latest.next_sync_at = self._schedule_next_sync_at(str(latest.sync_queue), now=now)
+                else:
+                    latest.sync_status = "idle"
+                    latest.next_sync_at = None
+                db.commit()
+                if latest.sync_required and str(latest.sync_queue or "").strip():
+                    await self._enqueue_sync_task_if_needed(latest)
+                return True
+            except Exception as exc:
+                db.rollback()
+                latest = self.get_task_or_404(db, project_id, task_id)
+                latest.sync_status = "retry_wait"
+                latest.sync_queue = "retry_wait"
+                latest.sync_required = True
+                latest.last_sync_error = str(exc)
+                latest.last_sync_http_status = getattr(getattr(exc, "response", None), "status_code", None)
+                latest.sync_consecutive_error_count = int(latest.sync_consecutive_error_count or 0) + 1
+                latest.sync_worker_id = None
+                latest.sync_lease_token = None
+                latest.sync_lease_expires_at = None
+                latest.next_sync_at = self._schedule_next_sync_at(
+                    "retry_wait",
+                    consecutive_error_count=int(latest.sync_consecutive_error_count or 1),
+                    now=utcnow(),
+                )
+                if int(latest.sync_consecutive_error_count or 0) >= 5:
+                    latest.sync_status = "failed"
+                db.commit()
+                await self._enqueue_sync_task_if_needed(latest)
+                return False
+        finally:
+            db.close()
+
+    async def process_sync_task(self, task_id: str, *, bearer_token: str) -> bool:
+        db = get_db_session()
+        try:
+            claimed = self._claim_sync_task(db, task_id)
+            if claimed is None:
+                return False
+            task, lease_token = claimed
+            return await self._process_claimed_sync_task(
+                project_id=str(task.project_id),
+                task_id=str(task.id),
+                lease_token=lease_token,
+                bearer_token=bearer_token,
+            )
+        finally:
+            db.close()
+
+    async def request_task_sync(self, db: Session, *, project_id: str, task_id: str, actor: str, force: bool) -> dict[str, Any]:
+        task = self.get_task_or_404(db, project_id, task_id)
+        if not self._should_sync_task(task):
+            if force and task.task_type in SYNC_FORCE_ALLOWED_TASK_TYPES:
+                self._initialize_sync_fields(task, force=True)
+            else:
+                raise ValidationError("当前任务类型不支持后台下游状态同步")
+        else:
+            self._initialize_sync_fields(task, force=True)
+        task.sync_status = "queued"
+        task.next_sync_at = utcnow()
+        task.updated_by = actor
+        db.commit()
+        await self._enqueue_sync_task_if_needed(task)
+        latest_dispatch = self._dispatches_for_task(db, task.id)[0] if self._dispatches_for_task(db, task.id) else None
+        return self._serialize_task(task, self._bindings_for_task(db, task.id), latest_dispatch)
+
+    def reclaim_stale_sync_tasks(self, db: Session, *, limit: int = 100) -> list[str]:
+        now = utcnow()
+        rows = db.query(ScheduleUserTask).filter(
+            ScheduleUserTask.sync_status == "syncing",
+            ScheduleUserTask.sync_lease_expires_at.is_not(None),
+            ScheduleUserTask.sync_lease_expires_at < now,
+        ).order_by(ScheduleUserTask.sync_lease_expires_at.asc()).limit(max(1, int(limit))).all()
+        reclaimed: list[str] = []
+        for task in rows:
+            task.sync_status = "retry_wait"
+            task.sync_queue = "retry_wait"
+            task.sync_worker_id = None
+            task.sync_lease_token = None
+            task.sync_lease_expires_at = None
+            task.sync_consecutive_error_count = int(task.sync_consecutive_error_count or 0) + 1
+            task.last_sync_error = task.last_sync_error or "sync lease expired"
+            task.next_sync_at = self._schedule_next_sync_at(
+                "retry_wait",
+                consecutive_error_count=int(task.sync_consecutive_error_count or 1),
+                now=now,
+            )
+            reclaimed.append(str(task.id))
+        if reclaimed:
+            db.commit()
+        return reclaimed
 
     def _delete_parent_task_rows(self, db: Session, task_id: str) -> None:
         db.query(ScheduleUserTaskDispatch).filter(ScheduleUserTaskDispatch.user_task_id == task_id).delete(synchronize_session=False)
@@ -511,6 +875,89 @@ class UserTaskManager:
                 "status": "unsupported" if isinstance(exc, ValidationError) else "failed",
                 "message": str(exc),
             }
+
+    async def _enqueue_delete_task(
+        self,
+        db: Session,
+        *,
+        task: ScheduleUserTask,
+    ) -> dict[str, Any]:
+        task_id = str(task.id)
+        task_type = str(task.task_type or "") or None
+        downstream_task_id = str(task.downstream_task_id or "").strip() or None
+        status = str(task.delete_status or "none").strip() or "none"
+        if status in DELETE_QUEUE_RETRYABLE_STATUSES:
+            return {
+                "task_id": task_id,
+                "task_type": task_type,
+                "downstream_task_id": downstream_task_id,
+                "status": "already_queued",
+                "message": "任务已在删除队列中",
+            }
+        task.delete_status = "queued"
+        task.delete_error = None
+        task.delete_requested_at = utcnow()
+        task.delete_started_at = None
+        task.delete_finished_at = None
+        task.delete_worker_id = None
+        task.delete_lease_expires_at = None
+        db.commit()
+        await get_redis_runtime().enqueue_delete_ready(task_id)
+        return {
+            "task_id": task_id,
+            "task_type": task_type,
+            "downstream_task_id": downstream_task_id,
+            "status": "queued",
+            "message": "任务已加入删除队列",
+        }
+
+    def _format_delete_error(self, *, task: ScheduleUserTask, exc: Exception) -> str:
+        service_name = "parent"
+        if str(task.downstream_task_id or "").strip():
+            if task.task_type in {"binary_firmware_e2e", "binary_module_e2e", "source_scan_e2e"}:
+                service_name = "binary-security"
+            elif task.task_type == "ai4apk":
+                service_name = "ai4apk"
+        return f"service={service_name}; task_id={task.id}; downstream_task_id={task.downstream_task_id or '-'}; error={exc}"
+
+    async def process_delete_task(self, task_id: str, *, worker_id: str) -> bool:
+        db = get_db_session()
+        try:
+            task = db.query(ScheduleUserTask).filter(ScheduleUserTask.id == task_id).first()
+            if task is None:
+                return True
+            status = str(task.delete_status or "none").strip() or "none"
+            if status not in {"queued", "failed", "running"}:
+                return True
+            lease_expires_at = utcnow() + timedelta(seconds=60)
+            task.delete_status = "running"
+            task.delete_error = None
+            task.delete_started_at = utcnow()
+            task.delete_finished_at = None
+            task.delete_attempt_count = int(task.delete_attempt_count or 0) + 1
+            task.delete_worker_id = worker_id
+            task.delete_lease_expires_at = lease_expires_at
+            db.commit()
+            try:
+                if str(task.downstream_task_id or "").strip():
+                    service_token = self.auto_dispatch_token()
+                    await self._delete_downstream_task(task, service_token)
+                self._delete_parent_task_rows(db, task.id)
+                db.commit()
+                return True
+            except Exception as exc:
+                db.rollback()
+                latest = db.query(ScheduleUserTask).filter(ScheduleUserTask.id == task_id).first()
+                if latest is not None:
+                    latest.delete_status = "failed"
+                    latest.delete_error = self._format_delete_error(task=latest, exc=exc)
+                    latest.delete_finished_at = utcnow()
+                    latest.delete_worker_id = worker_id
+                    latest.delete_lease_expires_at = None
+                    db.commit()
+                return False
+        finally:
+            db.close()
 
     def _dispatch_policy_for_task_type(self, task_type: str):
         runtime_db = None
@@ -636,6 +1083,11 @@ class UserTaskManager:
         bindings: list[ScheduleUserTaskInputBinding],
         latest_dispatch: Optional[ScheduleUserTaskDispatch] = None,
     ) -> dict[str, Any]:
+        if not str(task.display_status or "").strip():
+            task.display_status = self._display_status_from_task(task)
+        sync_delay_seconds: Optional[int] = None
+        if task.next_sync_at is not None:
+            sync_delay_seconds = max(0, int((task.next_sync_at - utcnow()).total_seconds()))
         return {
             "id": task.id,
             "project_id": task.project_id,
@@ -679,6 +1131,26 @@ class UserTaskManager:
             "downstream_status_raw": task.downstream_status_raw,
             "downstream_status_mapped": task.downstream_status_mapped,
             "downstream_report_ready": bool(task.downstream_report_ready),
+            "display_status": str(task.display_status or self._display_status_from_task(task)),
+            "sync_status": str(task.sync_status or "none"),
+            "sync_queue": task.sync_queue,
+            "sync_required": bool(task.sync_required),
+            "sync_policy_key": task.sync_policy_key,
+            "last_synced_at": task.last_synced_at,
+            "last_sync_started_at": task.last_sync_started_at,
+            "next_sync_at": task.next_sync_at,
+            "sync_delay_seconds": sync_delay_seconds,
+            "sync_attempt_count": int(task.sync_attempt_count or 0),
+            "sync_consecutive_error_count": int(task.sync_consecutive_error_count or 0),
+            "sync_worker_id": task.sync_worker_id,
+            "sync_lease_expires_at": task.sync_lease_expires_at,
+            "last_sync_error": task.last_sync_error,
+            "last_sync_http_status": task.last_sync_http_status,
+            "delete_status": str(task.delete_status or "none"),
+            "delete_error": task.delete_error,
+            "delete_requested_at": task.delete_requested_at,
+            "delete_started_at": task.delete_started_at,
+            "delete_finished_at": task.delete_finished_at,
             "last_error": task.last_error,
             "created_by": task.created_by,
             "updated_at": task.updated_at,
@@ -722,18 +1194,15 @@ class UserTaskManager:
             (task.dispatch_status or "running", task.business_status or "running", bool(task.downstream_report_ready)),
         )
         error_message = str(downstream_payload.get("errorMessage") or "").strip() or task.last_error
-        task.dispatch_status = mapped_dispatch_status
-        task.business_status = mapped_business_status
-        task.downstream_status_raw = status_raw or None
-        task.downstream_status_mapped = mapped_business_status
-        task.downstream_report_ready = report_ready
-        task.last_error = error_message or None
-        if dispatch is not None:
-            dispatch.dispatch_status = mapped_dispatch_status
-            dispatch.downstream_status_raw = status_raw or None
-            dispatch.downstream_status_mapped = mapped_business_status
-            dispatch.downstream_report_ready = report_ready
-            dispatch.last_error = error_message or None
+        self._apply_sync_state(
+            task,
+            dispatch,
+            mapped_dispatch_status=mapped_dispatch_status,
+            mapped_business_status=mapped_business_status,
+            status_raw=status_raw or None,
+            report_ready=report_ready,
+            error_message=error_message or None,
+        )
 
     async def _refresh_ai4red_state(self, db: Session, task: ScheduleUserTask, dispatch: Optional[ScheduleUserTaskDispatch], bearer_token: str) -> None:
         if task.task_type != "ai4red" or not str(task.downstream_task_id or "").strip():
@@ -749,18 +1218,15 @@ class UserTaskManager:
             (task.dispatch_status or "running", task.business_status or "running", bool(task.downstream_report_ready)),
         )
         error_message = str(downstream_payload.get("error") or "").strip() or task.last_error
-        task.dispatch_status = mapped_dispatch_status
-        task.business_status = mapped_business_status
-        task.downstream_status_raw = status_raw or None
-        task.downstream_status_mapped = mapped_business_status
-        task.downstream_report_ready = report_ready
-        task.last_error = error_message or None
-        if dispatch is not None:
-            dispatch.dispatch_status = mapped_dispatch_status
-            dispatch.downstream_status_raw = status_raw or None
-            dispatch.downstream_status_mapped = mapped_business_status
-            dispatch.downstream_report_ready = report_ready
-            dispatch.last_error = error_message or None
+        self._apply_sync_state(
+            task,
+            dispatch,
+            mapped_dispatch_status=mapped_dispatch_status,
+            mapped_business_status=mapped_business_status,
+            status_raw=status_raw or None,
+            report_ready=report_ready,
+            error_message=error_message or None,
+        )
 
     async def _refresh_ai4apk_state(self, db: Session, task: ScheduleUserTask, dispatch: Optional[ScheduleUserTaskDispatch]) -> None:
         if task.task_type != "ai4apk" or not str(task.downstream_task_id or "").strip():
@@ -801,6 +1267,8 @@ class UserTaskManager:
                     ScheduleUserTask.dispatch_status == normalized_status,
                     ScheduleUserTask.business_status == normalized_status,
                     ScheduleUserTask.downstream_status_mapped == normalized_status,
+                    ScheduleUserTask.display_status == normalized_status,
+                    ScheduleUserTask.sync_status == normalized_status,
                 )
             )
         if normalized_task_type:
@@ -813,6 +1281,7 @@ class UserTaskManager:
                     ScheduleUserTask.dispatch_status == "retry_wait",
                     ScheduleUserTask.business_status == "retry_wait",
                     ScheduleUserTask.downstream_status_mapped == "retry_wait",
+                    ScheduleUserTask.sync_status == "retry_wait",
                 )
             )
         if normalized_search:
@@ -841,33 +1310,21 @@ class UserTaskManager:
         stats = {
             "total": total,
             "created": 0,
-            "ready_for_dispatch": 0,
+            "queued": 0,
             "dispatching": 0,
             "running": 0,
+            "paused": 0,
             "success": 0,
             "failed": 0,
         }
         for task in stats_rows:
-            stats[task.dispatch_status] = int(stats.get(task.dispatch_status, 0)) + 1
+            display_status = str(task.display_status or self._display_status_from_task(task))
+            stats[display_status] = int(stats.get(display_status, 0)) + 1
         items: list[dict[str, Any]] = []
         for task in rows:
             bindings = self._bindings_for_task(db, task.id)
             dispatches = self._dispatches_for_task(db, task.id)
             latest_dispatch = dispatches[0] if dispatches else None
-            if task.task_type == "ai4red" and task.downstream_task_id:
-                try:
-                    await self._refresh_ai4red_state(db, task, latest_dispatch, bearer_token)
-                except Exception:
-                    db.rollback()
-                    task = self.get_task_or_404(db, project_id, task.id)
-                    latest_dispatch = self._dispatches_for_task(db, task.id)[0] if self._dispatches_for_task(db, task.id) else None
-            if task.task_type == "ai4apk" and task.downstream_task_id:
-                try:
-                    await self._refresh_ai4apk_state(db, task, latest_dispatch)
-                except Exception:
-                    db.rollback()
-                    task = self.get_task_or_404(db, project_id, task.id)
-                    latest_dispatch = self._dispatches_for_task(db, task.id)[0] if self._dispatches_for_task(db, task.id) else None
             items.append(self._serialize_task(task, bindings, latest_dispatch))
         return total, items, stats
 
@@ -966,6 +1423,9 @@ class UserTaskManager:
             parent_task_key_secret_nonce=parent_task_key_secret_nonce,
             parent_task_key_secret_version=parent_task_key_secret_version,
             downstream_detail_view=TASK_TYPE_DETAIL_VIEW.get(payload.task_type),
+            display_status="queued",
+            sync_status="none",
+            sync_required=False,
             created_by=actor,
             updated_by=actor,
         )
@@ -1036,8 +1496,17 @@ class UserTaskManager:
                 task.downstream_status_mapped = "dispatching"
                 task.downstream_report_ready = False
                 task.last_error = None
+                self._initialize_sync_fields(task, force=True)
                 db.commit()
-                await self._refresh_ai4red_state(db, task, dispatch, bearer_token)
+                try:
+                    await self._refresh_ai4red_state(db, task, dispatch, bearer_token)
+                except Exception:
+                    db.rollback()
+                    task = self.get_task_or_404(db, project_id, task_id)
+                    dispatch = db.query(ScheduleUserTaskDispatch).filter(
+                        ScheduleUserTaskDispatch.id == dispatch.id
+                    ).first()
+                await self._enqueue_sync_task_if_needed(task)
                 return self._serialize_task(task, bindings, dispatch)
             if task.task_type == "ai4apk":
                 file_path = Path(str(input_binding.resolved_path or input_binding.target_path or "").strip())
@@ -1068,8 +1537,17 @@ class UserTaskManager:
                 task.downstream_status_mapped = "dispatching"
                 task.downstream_report_ready = False
                 task.last_error = None
+                self._initialize_sync_fields(task, force=True)
                 db.commit()
-                await self._refresh_ai4apk_state(db, task, dispatch)
+                try:
+                    await self._refresh_ai4apk_state(db, task, dispatch)
+                except Exception:
+                    db.rollback()
+                    task = self.get_task_or_404(db, project_id, task_id)
+                    dispatch = db.query(ScheduleUserTaskDispatch).filter(
+                        ScheduleUserTaskDispatch.id == dispatch.id
+                    ).first()
+                await self._enqueue_sync_task_if_needed(task)
                 return self._serialize_task(task, bindings, dispatch)
 
             dispatch_policy = self._dispatch_policy_for_task_type(task.task_type)
@@ -1178,6 +1656,11 @@ class UserTaskManager:
             task.downstream_task_id = task.id
             task.downstream_detail_view = dispatch.downstream_detail_view
             task.last_error = None
+            task.display_status = self._display_status_from_task(task)
+            task.sync_required = False
+            task.sync_status = "none"
+            task.sync_queue = None
+            task.next_sync_at = None
             db.commit()
         except Exception as exc:
             db.rollback()
@@ -1189,6 +1672,10 @@ class UserTaskManager:
             task.dispatch_status = "dispatch_failed"
             task.business_status = "failed"
             task.last_error = message
+            task.display_status = self._display_status_from_task(task)
+            task.sync_required = False
+            task.sync_status = "failed"
+            task.last_sync_error = message
             task.updated_by = actor
             if dispatch is not None:
                 dispatch.dispatch_status = "failed"
@@ -1239,12 +1726,14 @@ class UserTaskManager:
                 filters=filters,
             )
             for task in tasks:
-                results.append(await self._delete_single_task(db, project_id=project_id, task=task, bearer_token=bearer_token))
-            deleted_count = sum(1 for item in results if item["status"] == "deleted")
+                results.append(await self._enqueue_delete_task(db, task=task))
+            queued_count = sum(1 for item in results if item["status"] == "queued")
+            already_queued_count = sum(1 for item in results if item["status"] == "already_queued")
             return {
                 "total_requested": len(tasks),
-                "deleted_count": deleted_count,
-                "failed_count": len(results) - deleted_count,
+                "queued_count": queued_count,
+                "already_queued_count": already_queued_count,
+                "failed_count": len(results) - queued_count - already_queued_count,
                 "results": results,
             }
 
@@ -1252,7 +1741,8 @@ class UserTaskManager:
         if not normalized_ids:
             return {
                 "total_requested": 0,
-                "deleted_count": 0,
+                "queued_count": 0,
+                "already_queued_count": 0,
                 "failed_count": 0,
                 "results": [],
             }
@@ -1265,16 +1755,18 @@ class UserTaskManager:
                     "task_id": task_id,
                     "task_type": None,
                     "downstream_task_id": None,
-                    "status": "deleted",
+                    "status": "already_deleted",
                     "message": "任务已不存在",
                 })
                 continue
-            results.append(await self._delete_single_task(db, project_id=project_id, task=task, bearer_token=bearer_token))
-        deleted_count = sum(1 for item in results if item["status"] == "deleted")
+            results.append(await self._enqueue_delete_task(db, task=task))
+        queued_count = sum(1 for item in results if item["status"] == "queued")
+        already_queued_count = sum(1 for item in results if item["status"] == "already_queued")
         return {
             "total_requested": len(normalized_ids),
-            "deleted_count": deleted_count,
-            "failed_count": len(results) - deleted_count,
+            "queued_count": queued_count,
+            "already_queued_count": already_queued_count,
+            "failed_count": len(results) - queued_count - already_queued_count,
             "results": results,
         }
 

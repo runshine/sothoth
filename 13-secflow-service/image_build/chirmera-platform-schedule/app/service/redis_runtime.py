@@ -16,11 +16,17 @@ from app.config import get_config
 class _LocalQueue:
     def __init__(self) -> None:
         self.ready = deque()
+        self.delete_ready = deque()
+        self.sync_ready: dict[str, deque[str]] = {}
+        self.sync_ready_dedupe: dict[str, set[str]] = {}
+        self.sync_enqueued_at: dict[str, dict[str, float]] = {}
         self.delay: dict[str, float] = {}
         self.enqueued_at: dict[str, float] = {}
+        self.delete_enqueued_at: dict[str, float] = {}
         self.leases: dict[str, tuple[str, float]] = {}
         self.locks: dict[str, asyncio.Lock] = {}
         self.ready_dedupe: set[str] = set()
+        self.delete_ready_dedupe: set[str] = set()
         self.bucket_counts: dict[str, tuple[int, float]] = {}
         self._cond = asyncio.Condition()
 
@@ -47,6 +53,60 @@ class _LocalQueue:
             self.ready_dedupe.discard(execution_id)
             self.enqueued_at.pop(execution_id, None)
             return execution_id
+
+    async def push_delete_ready(self, task_id: str) -> None:
+        async with self._cond:
+            if task_id not in self.delete_ready_dedupe:
+                self.delete_ready.append(task_id)
+                self.delete_ready_dedupe.add(task_id)
+                self.delete_enqueued_at[task_id] = time.time()
+                self._cond.notify_all()
+
+    async def pop_delete_ready(self, timeout_seconds: int) -> Optional[str]:
+        end = time.time() + max(1, int(timeout_seconds))
+        async with self._cond:
+            while not self.delete_ready:
+                remaining = end - time.time()
+                if remaining <= 0:
+                    return None
+                try:
+                    await asyncio.wait_for(self._cond.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return None
+            task_id = self.delete_ready.popleft()
+            self.delete_ready_dedupe.discard(task_id)
+            self.delete_enqueued_at.pop(task_id, None)
+            return task_id
+
+    async def push_sync_ready(self, queue_name: str, task_id: str) -> None:
+        async with self._cond:
+            queue = self.sync_ready.setdefault(queue_name, deque())
+            dedupe = self.sync_ready_dedupe.setdefault(queue_name, set())
+            enqueued = self.sync_enqueued_at.setdefault(queue_name, {})
+            if task_id not in dedupe:
+                queue.append(task_id)
+                dedupe.add(task_id)
+                enqueued[task_id] = time.time()
+                self._cond.notify_all()
+
+    async def pop_sync_ready(self, queue_name: str, timeout_seconds: int) -> Optional[str]:
+        end = time.time() + max(1, int(timeout_seconds))
+        async with self._cond:
+            queue = self.sync_ready.setdefault(queue_name, deque())
+            dedupe = self.sync_ready_dedupe.setdefault(queue_name, set())
+            enqueued = self.sync_enqueued_at.setdefault(queue_name, {})
+            while not queue:
+                remaining = end - time.time()
+                if remaining <= 0:
+                    return None
+                try:
+                    await asyncio.wait_for(self._cond.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return None
+            task_id = queue.popleft()
+            dedupe.discard(task_id)
+            enqueued.pop(task_id, None)
+            return task_id
 
 
 class RedisRuntime:
@@ -165,6 +225,78 @@ class RedisRuntime:
         await client.srem(self.key("ready:dedupe"), execution_id)
         await client.zrem(self.key("ready:enqueued_at"), execution_id)
         return execution_id
+
+    async def enqueue_delete_ready(self, task_id: str) -> None:
+        client = await self._get_client()
+        if client is None:
+            await self._local.push_delete_ready(task_id)
+            return
+        dedupe_key = self.key("delete:ready:dedupe")
+        ready_key = self.key("delete:ready")
+        if await client.sadd(dedupe_key, task_id):
+            await client.rpush(ready_key, task_id)
+        await client.zadd(self.key("delete:ready:enqueued_at"), {task_id: time.time()})
+
+    async def pop_delete_ready(self, timeout_seconds: int = 1) -> Optional[str]:
+        client = await self._get_client()
+        if client is None:
+            return await self._local.pop_delete_ready(timeout_seconds)
+        result = await client.blpop(self.key("delete:ready"), timeout=max(1, int(timeout_seconds)))
+        if not result:
+            return None
+        _, task_id = result
+        await client.srem(self.key("delete:ready:dedupe"), task_id)
+        await client.zrem(self.key("delete:ready:enqueued_at"), task_id)
+        return task_id
+
+    async def enqueue_user_task_sync_ready(self, queue_name: str, task_id: str) -> None:
+        normalized = str(queue_name or "").strip() or "running"
+        client = await self._get_client()
+        if client is None:
+            await self._local.push_sync_ready(normalized, task_id)
+            return
+        dedupe_key = self.key(f"user-task-sync:{normalized}:ready:dedupe")
+        ready_key = self.key(f"user-task-sync:{normalized}:ready")
+        if await client.sadd(dedupe_key, task_id):
+            await client.rpush(ready_key, task_id)
+        await client.zadd(self.key(f"user-task-sync:{normalized}:enqueued_at"), {task_id: time.time()})
+
+    async def pop_user_task_sync_ready(self, queue_name: str, timeout_seconds: int = 1) -> Optional[str]:
+        normalized = str(queue_name or "").strip() or "running"
+        client = await self._get_client()
+        if client is None:
+            return await self._local.pop_sync_ready(normalized, timeout_seconds)
+        result = await client.blpop(self.key(f"user-task-sync:{normalized}:ready"), timeout=max(1, int(timeout_seconds)))
+        if not result:
+            return None
+        _, task_id = result
+        await client.srem(self.key(f"user-task-sync:{normalized}:ready:dedupe"), task_id)
+        await client.zrem(self.key(f"user-task-sync:{normalized}:enqueued_at"), task_id)
+        return task_id
+
+    async def user_task_sync_queue_stats(self, queue_names: list[str]) -> dict[str, dict[str, float | int]]:
+        client = await self._get_client()
+        stats: dict[str, dict[str, float | int]] = {}
+        for queue_name in queue_names:
+            normalized = str(queue_name or "").strip()
+            if not normalized:
+                continue
+            if client is None:
+                queue = self._local.sync_ready.setdefault(normalized, deque())
+                enqueued = self._local.sync_enqueued_at.setdefault(normalized, {})
+                oldest = min(enqueued.values()) if enqueued else None
+                stats[normalized] = {
+                    "length": len(queue),
+                    "oldest_age_seconds": max(0.0, time.time() - oldest) if oldest else 0.0,
+                }
+                continue
+            length = int(await client.llen(self.key(f"user-task-sync:{normalized}:ready")) or 0)
+            oldest = await client.zrange(self.key(f"user-task-sync:{normalized}:enqueued_at"), 0, 0, withscores=True)
+            oldest_age = 0.0
+            if oldest:
+                oldest_age = max(0.0, time.time() - float(oldest[0][1]))
+            stats[normalized] = {"length": length, "oldest_age_seconds": oldest_age}
+        return stats
 
     async def schedule_delay(self, execution_id: str, execute_at_epoch: float) -> None:
         client = await self._get_client()

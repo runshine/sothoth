@@ -456,6 +456,10 @@ class UserTaskDispatchRequest(BaseModel):
     force: bool = False
 
 
+class UserTaskSyncRequest(BaseModel):
+    force: bool = False
+
+
 class UserTaskBulkDeleteFilters(BaseModel):
     status: Optional[str] = None
     task_type: Optional[str] = None
@@ -480,7 +484,8 @@ class UserTaskDeleteResult(BaseModel):
 
 class UserTaskBulkDeleteResponse(BaseModel):
     total_requested: int
-    deleted_count: int
+    queued_count: int
+    already_queued_count: int
     failed_count: int
     results: list[UserTaskDeleteResult] = Field(default_factory=list)
 
@@ -539,6 +544,26 @@ class UserTaskResponse(BaseModel):
     downstream_status_raw: Optional[str] = None
     downstream_status_mapped: Optional[str] = None
     downstream_report_ready: bool = False
+    display_status: str = "unknown"
+    sync_status: str = "none"
+    sync_queue: Optional[str] = None
+    sync_required: bool = False
+    sync_policy_key: Optional[str] = None
+    last_synced_at: Optional[datetime] = None
+    last_sync_started_at: Optional[datetime] = None
+    next_sync_at: Optional[datetime] = None
+    sync_delay_seconds: Optional[int] = None
+    sync_attempt_count: int = 0
+    sync_consecutive_error_count: int = 0
+    sync_worker_id: Optional[str] = None
+    sync_lease_expires_at: Optional[datetime] = None
+    last_sync_error: Optional[str] = None
+    last_sync_http_status: Optional[int] = None
+    delete_status: str = "none"
+    delete_error: Optional[str] = None
+    delete_requested_at: Optional[datetime] = None
+    delete_started_at: Optional[datetime] = None
+    delete_finished_at: Optional[datetime] = None
     last_error: Optional[str] = None
     created_by: str
     updated_at: datetime

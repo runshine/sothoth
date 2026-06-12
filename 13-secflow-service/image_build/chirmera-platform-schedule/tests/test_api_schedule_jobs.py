@@ -812,9 +812,13 @@ def test_delete_user_task_deletes_binary_security_parent_after_downstream_succes
             delete_resp = client.delete(f"/api/chirmera-platform-schedule/projects/proj1/user-tasks/{task_id}", headers=_auth_headers())
             assert delete_resp.status_code == 200, delete_resp.text
             body = delete_resp.json()
-            assert body["deleted_count"] == 1
+            assert body["queued_count"] == 1
+            assert body["already_queued_count"] == 0
             assert body["failed_count"] == 0
-            assert body["results"][0]["status"] == "deleted"
+            assert body["results"][0]["status"] == "queued"
+            from app.service.user_task_manager import get_user_task_manager
+            import asyncio
+            assert asyncio.run(get_user_task_manager().process_delete_task(task_id, worker_id="test-worker")) is True
             detail_resp = client.get(f"/api/chirmera-platform-schedule/projects/proj1/user-tasks/{task_id}", headers=_auth_headers())
             assert detail_resp.status_code == 404
 
@@ -862,8 +866,18 @@ def test_delete_user_task_rejects_unsupported_ai4red(client, tmp_path):
             )
             assert bulk_resp.status_code == 200, bulk_resp.text
             body = bulk_resp.json()
-            assert body["failed_count"] == 1
-            assert body["results"][0]["status"] == "unsupported"
+            assert body["queued_count"] == 1
+            assert body["results"][0]["status"] == "queued"
+            from app.service.user_task_manager import get_user_task_manager
+            import asyncio
+            assert asyncio.run(get_user_task_manager().process_delete_task(task_id, worker_id="test-worker")) is False
+            detail_resp = client.get(
+                f"/api/chirmera-platform-schedule/projects/proj1/user-tasks/{task_id}",
+                headers=_auth_headers(),
+            )
+            assert detail_resp.status_code == 200, detail_resp.text
+            detail_body = detail_resp.json()
+            assert detail_body["delete_status"] == "failed"
 
 
 def test_bulk_delete_user_tasks_select_all_matching_filters_by_status(client):
@@ -919,5 +933,7 @@ def test_bulk_delete_user_tasks_select_all_matching_filters_by_status(client):
             assert bulk_resp.status_code == 200, bulk_resp.text
             body = bulk_resp.json()
             assert body["total_requested"] == 1
-            assert body["deleted_count"] == 1
+            assert body["queued_count"] == 1
+            assert body["already_queued_count"] == 0
             assert body["results"][0]["task_id"] == failed_task_id
+            assert body["results"][0]["status"] == "queued"
