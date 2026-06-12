@@ -148,6 +148,12 @@ async def runtime_overview():
     return RuntimeOverviewResponse.model_validate(await get_schedule_manager().runtime_overview())
 
 
+@router.get("/runtime/task-overview", response_model=RuntimeOverviewResponse)
+async def runtime_task_overview():
+    # Backward-compatible alias for frontend builds that still call task-overview.
+    return RuntimeOverviewResponse.model_validate(await get_schedule_manager().runtime_overview())
+
+
 @router.get("/metrics")
 async def metrics():
     return PlainTextResponse(await get_schedule_manager().metrics_text())
