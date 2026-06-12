@@ -20223,7 +20223,7 @@ class TaskManager:
                     finished_at=summary.finished_at,
                     updated_at=summary.finished_at or summary.started_at,
                     last_error=summary.last_error,
-                    abnormal_reason=summary.abnormal_reason or self._stage_abnormal_reason(stage_name, summary, current_stage_items),
+                    abnormal_reason=summary.abnormal_reason or self._stage_abnormal_reason(task, stage_name, summary, current_stage_items),
                     retry_supported=summary.retry_supported,
                     retry_reason=summary.retry_reason,
                     retry_failed_supported=summary.retry_failed_supported,

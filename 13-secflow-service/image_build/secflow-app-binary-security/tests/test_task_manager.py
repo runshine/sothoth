@@ -4951,6 +4951,61 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual("pending", by_node_id["archive:entry_analysis"].status)
 
+    def test_build_stage_overview_nodes_uses_task_context_for_owner_lost_abnormal_reason(self):
+        task = BinarySecurityTask(
+            id="t-owner-lost",
+            project_id="p1",
+            name="source",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming", "max_retries_per_item": 2}),
+        )
+        task.policy = {"pipeline_mode": "mixed_streaming", "max_retries_per_item": 2}
+        stage_run = BinarySecurityStageRun(
+            id="sr-owner-lost",
+            task_id=task.id,
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="failed",
+            last_error="Task owner pod lost",
+        )
+        stage_item = BinarySecurityStageItem(
+            id="si-owner-lost",
+            task_id=task.id,
+            project_id="p1",
+            stage_run_id=stage_run.id,
+            stage_name="system_analysis",
+            item_key="fw.bin",
+            item_name="fw.bin",
+            item_identity_key="fw.bin::",
+            status="failed",
+            retry_count=1,
+            downstream_service="system_analyse",
+            downstream_task_id="sat-owner-lost",
+            error_message="Task owner pod lost",
+            result={
+                "sync_observation": {
+                    "sync_status": "transport_error",
+                    "error_type": "StaleTaskExecution",
+                    "error_message": "任务 t-owner-lost 当前执行 token 已失效",
+                }
+            },
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[stage_item])
+        summaries = self.manager._build_stage_summaries(db, task, ["system_analysis"], [stage_run], [stage_item])
+
+        nodes = self.manager._build_stage_overview_nodes(db, task, summaries, [], [stage_item])
+
+        business_node = next(node for node in nodes if node.node_type == "business" and node.stage_name == "system_analysis")
+        self.assertEqual("owner_lost_recoverable", business_node.abnormal_reason.code)
+        self.assertEqual("下游 owner 丢失，等待自动恢复", business_node.abnormal_reason.title)
+
     def test_choose_module_binary_handles_relative_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
