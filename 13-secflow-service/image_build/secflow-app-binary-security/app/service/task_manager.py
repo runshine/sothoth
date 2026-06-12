@@ -195,6 +195,7 @@ class _TaskDetailContext:
 DB_ENTRY_PREVIEW_LIMIT = 50
 DB_ARTIFACT_PREVIEW_LIMIT = 50
 DB_EVENT_PAYLOAD_LIMIT_BYTES = 32768
+DB_TIMELINE_EVENT_LIMIT = 10_000
 DETAIL_STAGE_ITEMS_LIMIT = 100
 READONLY_TASK_PROJECTION_CACHE_TTL_SECONDS = 1.0
 MODULE_TASK_INPUT_KEY = "module-input"
@@ -1576,6 +1577,7 @@ class TaskManager:
                 self._stage_item_dispatch_loop(),
                 name="binary-security-stage-item-dispatcher",
             )
+        if run_worker_loops or run_reducer_loop:
             self._task_heartbeat_loop_task = asyncio.create_task(
                 self._task_heartbeat_loop(),
                 name="binary-security-task-heartbeat",
@@ -2128,19 +2130,30 @@ class TaskManager:
             return lease
         self._release_tail_reconcile_owner(task.id)
         self._tail_reconcile_handoff_reason[task.id] = "owner_conflict"
-        self._record_event(
+        conflict_payload = {
+            "lease_owner": lease_owner or None,
+            "lease_generation": int(getattr(lease, "generation", 0) or 0) if lease is not None else None,
+            "owner_pod_uid": getattr(lease, "owner_pod_uid", None) if lease is not None else None,
+            "owner_boot_id": getattr(lease, "owner_boot_id", None) if lease is not None else None,
+        }
+        conflict_message = f"tail 收口 owner 冲突: {task.id}"
+        if not self._has_recent_matching_task_event(
             db,
             task,
-            "tail_reconcile_owner_conflict",
-            f"tail 收口 owner 冲突: {task.id}",
-            level="warning",
-            payload={
-                "lease_owner": lease_owner or None,
-                "lease_generation": int(getattr(lease, "generation", 0) or 0) if lease is not None else None,
-                "owner_pod_uid": getattr(lease, "owner_pod_uid", None) if lease is not None else None,
-                "owner_boot_id": getattr(lease, "owner_boot_id", None) if lease is not None else None,
-            },
-        )
+            event_type="tail_reconcile_owner_conflict",
+            stage_name=task.current_stage,
+            message=conflict_message,
+            payload_keys=conflict_payload,
+            within_seconds=60,
+        ):
+            self._record_event(
+                db,
+                task,
+                "tail_reconcile_owner_conflict",
+                conflict_message,
+                level="warning",
+                payload=conflict_payload,
+            )
         if fallback_status is not None:
             if self._is_streaming_tail_stage(task, task.current_stage):
                 task.status = "running"
@@ -2149,19 +2162,24 @@ class TaskManager:
         task.tail_reconcile_state = "handoff_waiting"
         observe_tail_reconcile_heartbeat("handoff")
         observe_tail_reconcile_owner("handoff_started")
-        self._record_event(
+        handoff_message = f"tail 收口 handoff 开始: {task.id}"
+        if not self._has_recent_matching_task_event(
             db,
             task,
-            "tail_reconcile_handoff_started",
-            f"tail 收口 handoff 开始: {task.id}",
-            level="info",
-            payload={
-                "lease_owner": lease_owner or None,
-                "lease_generation": int(getattr(lease, "generation", 0) or 0) if lease is not None else None,
-                "owner_pod_uid": getattr(lease, "owner_pod_uid", None) if lease is not None else None,
-                "owner_boot_id": getattr(lease, "owner_boot_id", None) if lease is not None else None,
-            },
-        )
+            event_type="tail_reconcile_handoff_started",
+            stage_name=task.current_stage,
+            message=handoff_message,
+            payload_keys=conflict_payload,
+            within_seconds=60,
+        ):
+            self._record_event(
+                db,
+                task,
+                "tail_reconcile_handoff_started",
+                handoff_message,
+                level="info",
+                payload=conflict_payload,
+            )
         if takeover_result:
             observe_tail_reconcile_takeover("conflict")
         return lease
@@ -4469,7 +4487,26 @@ class TaskManager:
         status = str(event.status or "pending").strip()
         return "success" if status == "processed" else status
 
+    def _is_lock_busy_state_event(self, event: BinarySecurityStateEvent | None) -> bool:
+        if event is None:
+            return False
+        processing_result = str(getattr(event, "processing_result", None) or "").strip()
+        if processing_result == "lock_busy_backoff":
+            return True
+        last_error = str(getattr(event, "last_error_message", None) or event.error_message or "").strip()
+        return last_error == "task state lease busy"
+
+    def _lock_busy_backoff_seconds(self, event: BinarySecurityStateEvent | None) -> int:
+        attempts = max(1, int(getattr(event, "attempts", 0) or 0))
+        if attempts <= 1:
+            return 2
+        if attempts == 2:
+            return 5
+        return 10
+
     def _event_failure_kind(self, event: BinarySecurityStateEvent) -> str:
+        if self._is_lock_busy_state_event(event):
+            return "lock_busy"
         status = str(event.status or "").strip()
         if status == "retryable":
             return "retryable"
@@ -8270,27 +8307,54 @@ class TaskManager:
                             ):
                                 failed_count += 1
                                 continue
-                            touched_stages.add(item.stage_name)
+                            downstream_stage_runs = [
+                                run
+                                for run in db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+                                if str(run.stage_name or "").strip() != "system_analysis"
+                            ]
+                            active_downstream_stage = next(
+                                (
+                                    run
+                                    for run in downstream_stage_runs
+                                    if str(run.status or "").strip() in {"running", "dispatching", "pending", "queued"}
+                                ),
+                                None,
+                            )
+                            if (
+                                active_downstream_stage is not None
+                                and self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_OWNED_EXECUTION
+                                and not self._has_active_owned_execution_holder(db, task)
+                            ):
+                                self._requeue_owned_execution_takeover(
+                                    db,
+                                    task,
+                                    stage_name=str(active_downstream_stage.stage_name or "").strip() or None,
+                                    reason="system_analysis_sync_next_stage_active_without_owner",
+                                    event_type="owned_execution_takeover_requeued",
+                                    message="系统分析同步完成，检测到后续阶段已处于活跃态，任务已重新排队等待 worker 接管",
+                                    event_payload={
+                                        "source": "system_analysis_sync_success",
+                                        "next_stage_status": str(active_downstream_stage.status or "").strip() or None,
+                                    },
+                                )
+                            else:
+                                touched_stages.add(item.stage_name)
                             synced_count += 1
                             if current_item_status in {"pending", "queued", "dispatching", "running"}:
                                 revived_count += 1
                         else:
-                            if not self._persist_child_sync_observation(
-                                db,
-                                task=task,
-                                item=item,
-                                change_source="downstream_sync",
+                            self._mark_stage_item_sync_observation(
+                                item,
                                 sync_status="skipped",
                                 synced_at=sync_observed_at,
+                                error_message=error_message,
                                 status_raw=downstream_status,
                                 mapped_status=mapped_status,
                                 downstream_status=downstream_status,
                                 state_applied=False,
-                            ):
-                                failed_count += 1
-                                continue
+                            )
                             skipped_count += 1
-                        if force or mapped_status != before_status or record_noop_events or not apply_state:
+                        if should_apply and (force or mapped_status != before_status or record_noop_events or not apply_state):
                             self._record_event(
                                 db,
                                 task,
@@ -8376,21 +8440,6 @@ class TaskManager:
                             touched_stages.add(item.stage_name)
                             synced_count += 1
                         else:
-                            if not self._persist_child_sync_observation(
-                                db,
-                                task=task,
-                                item=item,
-                                change_source="downstream_sync",
-                                sync_status="skipped",
-                                synced_at=sync_observed_at,
-                                error_message=error_message,
-                                status_raw=downstream_status,
-                                mapped_status=mapped_status,
-                                downstream_status=downstream_status,
-                                state_applied=False,
-                            ):
-                                failed_count += 1
-                                continue
                             skipped_count += 1
                         if recovered_after_errors:
                             self._record_event(
@@ -8406,7 +8455,7 @@ class TaskManager:
                                     "consecutive_error_count_before_recovery": sync_supervisor_state.consecutive_error_count,
                                 },
                             )
-                        if force or mapped_status != before_status or record_noop_events or not apply_state:
+                        if should_apply or force or mapped_status != before_status or record_noop_events or not apply_state:
                             self._record_event(
                                 db,
                                 task,
@@ -8427,6 +8476,135 @@ class TaskManager:
                                     "downstream_status": downstream_status,
                                     "after_status": mapped_status,
                                     "archive_skipped": True,
+                                },
+                            )
+                        continue
+                    if mapped_status == "success" and item.stage_name == "system_analysis" and item.downstream_service == "system_analyse":
+                        should_apply = observed_apply_state and (mapped_status != before_status or force)
+                        if should_apply:
+                            setattr(task, "_preferred_requeue_event_stage_name", item.stage_name)
+                            with suppress(Exception):
+                                await self._refresh_terminal_item_result_from_downstream(
+                                    task,
+                                    item,
+                                    payload,
+                                    mapped_status=mapped_status,
+                                    archived_dir=None,
+                                )
+                            if not self._apply_child_state_with_savepoint(
+                                db,
+                                task=task,
+                                item=item,
+                                change_source="downstream_sync",
+                                target_status=mapped_status,
+                                sync_status="synced",
+                                downstream_status_raw=downstream_status,
+                                downstream_status_mapped=mapped_status,
+                                downstream_status=downstream_status,
+                                error_message=None,
+                                http_status=None,
+                                error_type=None,
+                                apply_fn=lambda: (
+                                    self._enqueue_downstream_terminal_event(
+                                        db,
+                                        task=task,
+                                        item=item,
+                                        mapped_status=mapped_status,
+                                        before_status=before_status,
+                                        downstream_status=downstream_status,
+                                        payload=payload,
+                                        error_message=None,
+                                        http_status=None,
+                                        error_type=None,
+                                        status_raw=downstream_status,
+                                        force=force,
+                                    ),
+                                    self._apply_downstream_status_inline(
+                                        item,
+                                        mapped_status=mapped_status,
+                                        downstream_payload=payload,
+                                        error_message=None,
+                                        synced_at=sync_observed_at,
+                                    ),
+                                    self._reconcile_stage_and_task_state_after_item_update(db, task, item.stage_name),
+                                    self._mark_stage_item_sync_observation(
+                                        item,
+                                        sync_status="synced",
+                                        synced_at=sync_observed_at,
+                                        status_raw=downstream_status,
+                                        mapped_status=mapped_status,
+                                        downstream_status=downstream_status,
+                                        state_applied=True,
+                                    ),
+                                ),
+                            ):
+                                failed_count += 1
+                                continue
+                            downstream_stage_runs = [
+                                run
+                                for run in db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+                                if str(run.stage_name or "").strip() != "system_analysis"
+                            ]
+                            active_downstream_stage = next(
+                                (
+                                    run
+                                    for run in downstream_stage_runs
+                                    if str(run.status or "").strip() in {"running", "dispatching", "pending", "queued"}
+                                ),
+                                None,
+                            )
+                            if (
+                                active_downstream_stage is not None
+                                and self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_OWNED_EXECUTION
+                                and not self._has_active_owned_execution_holder(db, task)
+                            ):
+                                self._requeue_owned_execution_takeover(
+                                    db,
+                                    task,
+                                    stage_name=str(active_downstream_stage.stage_name or "").strip() or None,
+                                    reason="system_analysis_sync_next_stage_active_without_owner",
+                                    event_type="owned_execution_takeover_requeued",
+                                    message="系统分析同步完成，检测到后续阶段已处于活跃态，任务已重新排队等待 worker 接管",
+                                    event_payload={
+                                        "source": "system_analysis_sync_success",
+                                        "next_stage_status": str(active_downstream_stage.status or "").strip() or None,
+                                    },
+                                )
+                            else:
+                                touched_stages.add(item.stage_name)
+                            synced_count += 1
+                        else:
+                            self._mark_stage_item_sync_observation(
+                                item,
+                                sync_status="skipped",
+                                synced_at=sync_observed_at,
+                                status_raw=downstream_status,
+                                mapped_status=mapped_status,
+                                downstream_status=downstream_status,
+                                state_applied=False,
+                            )
+                            skipped_count += 1
+                        if should_apply or force or mapped_status != before_status or record_noop_events or not apply_state:
+                            self._record_event(
+                                db,
+                                task,
+                                "downstream_status_synced" if should_apply else "downstream_status_sync_skipped",
+                                "系统分析下游终态已同步" if should_apply else "系统分析下游终态已观测，本次未写回",
+                                stage_name=item.stage_name,
+                                item=item,
+                                payload={
+                                    "downstream_service": item.downstream_service,
+                                    "downstream_task_id": item.downstream_task_id,
+                                    "http_status": None,
+                                    "error_type": None,
+                                    "status_raw": downstream_status,
+                                    "mapped_status": mapped_status,
+                                    "state_applied": bool(should_apply),
+                                    "before_status": before_status,
+                                    "downstream_status": downstream_status,
+                                    "after_status": mapped_status,
+                                    "archive_skipped": True,
+                                    "result_refreshed_inline": True,
                                 },
                             )
                         continue
@@ -8609,22 +8787,17 @@ class TaskManager:
                     touched_stages.add(item.stage_name)
                     synced_count += 1
                 else:
-                    if not self._persist_child_sync_observation(
-                        db,
-                        task=task,
-                        item=item,
-                        change_source="downstream_sync",
+                    self._mark_stage_item_sync_observation(
+                        item,
                         sync_status="skipped",
                         synced_at=sync_observed_at,
                         status_raw=downstream_status,
                         mapped_status=mapped_status,
                         downstream_status=downstream_status,
                         state_applied=False,
-                    ):
-                        failed_count += 1
-                        continue
+                    )
                     skipped_count += 1
-                if force or mapped_status != before_status or record_noop_events or not apply_state:
+                if should_apply or force or mapped_status != before_status or record_noop_events or not apply_state:
                     self._record_event(
                         db,
                         task,
@@ -8754,44 +8927,29 @@ class TaskManager:
                     touched_stages.add(item.stage_name)
                     synced_count += 1
                 else:
-                    if not self._persist_child_sync_observation(
-                        db,
-                        task=task,
-                        item=item,
-                        change_source="downstream_sync",
-                        sync_status="skipped",
-                        error_message="下游子任务不存在",
-                        http_status=404,
-                        error_type="not_found",
-                        status_raw="downstream_missing",
-                        mapped_status="downstream_missing",
-                        downstream_status="downstream_missing",
-                        state_applied=False,
-                    ):
-                        failed_count += 1
-                        continue
                     skipped_count += 1
-                self._record_event(
-                    db,
-                    task,
-                    "downstream_status_synced" if notfound_apply_state else "downstream_status_sync_skipped",
-                    "下游子任务不存在，已投递 reducer 串行更新事件" if notfound_apply_state else "下游子任务不存在，本次仅观测未写回状态",
-                    level="warning",
-                    stage_name=item_stage_name,
-                    item=item,
-                    payload={
-                        "downstream_service": item_downstream_service,
-                        "downstream_task_id": item_downstream_task_id,
-                        "http_status": 404,
-                        "error_type": "not_found",
-                        "status_raw": "downstream_missing",
-                        "mapped_status": "downstream_missing",
-                        "state_applied": bool(notfound_apply_state),
-                        "before_status": before_status,
-                        "downstream_status": "downstream_missing",
-                        "after_status": "downstream_missing",
-                    },
-                )
+                if notfound_apply_state:
+                    self._record_event(
+                        db,
+                        task,
+                        "downstream_status_synced",
+                        "下游子任务不存在，已投递 reducer 串行更新事件",
+                        level="warning",
+                        stage_name=item_stage_name,
+                        item=item,
+                        payload={
+                            "downstream_service": item_downstream_service,
+                            "downstream_task_id": item_downstream_task_id,
+                            "http_status": 404,
+                            "error_type": "not_found",
+                            "status_raw": "downstream_missing",
+                            "mapped_status": "downstream_missing",
+                            "state_applied": True,
+                            "before_status": before_status,
+                            "downstream_status": "downstream_missing",
+                            "after_status": "downstream_missing",
+                        },
+                    )
             except Exception as exc:
                 # Keep previously synchronized item updates intact; this branch
                 # only records the current item's fetch failure.
@@ -11638,6 +11796,49 @@ class TaskManager:
                 continue
             if not self._is_streaming_tail_stage(task, item.stage_name):
                 continue
+            if self._task_runtime_phase(task) != TASK_RUNTIME_PHASE_OWNED_EXECUTION:
+                continue
+            if str(task.dispatcher_instance_id or "").strip() != str(self.instance_id or "").strip():
+                event_message = f"流式阶段子任务 claim 被非 owner pod 拦截，等待当前执行实例消费: {item.stage_name}:{item.item_key}"
+                if not self._has_recent_matching_task_event(
+                    db,
+                    task,
+                    event_type="streaming_stage_item_claim_skipped_non_owner",
+                    stage_name=item.stage_name,
+                    message=event_message,
+                    payload_keys={
+                        "item_id": item.id,
+                        "task_owner": str(task.dispatcher_instance_id or "").strip() or None,
+                        "local_owner": str(self.instance_id or "").strip() or None,
+                    },
+                    within_seconds=60,
+                ):
+                    self._record_event(
+                        db,
+                        task,
+                        "streaming_stage_item_claim_skipped_non_owner",
+                        event_message,
+                        level="warning",
+                        stage_name=item.stage_name,
+                        item=item,
+                        payload={
+                            "item_id": item.id,
+                            "task_owner": str(task.dispatcher_instance_id or "").strip() or None,
+                            "local_owner": str(self.instance_id or "").strip() or None,
+                            "task_execution_token": self._dispatch_token(task),
+                        },
+                    )
+                logger.info(
+                    "binary-security streaming stage item claim skipped for non-owner pod: task_id=%s item_id=%s stage=%s task_owner=%s local_owner=%s",
+                    task.id,
+                    item.id,
+                    item.stage_name,
+                    task.dispatcher_instance_id,
+                    self.instance_id,
+                )
+                continue
+            if not task.dispatch_started_at or not self._lease_is_active(task):
+                continue
             if self._stage_item_orchestration_in_retry_backoff(item):
                 continue
             dispatch_throttle = self._effective_runtime_policy(task).get("dispatch_throttle") or {}
@@ -11679,6 +11880,9 @@ class TaskManager:
                     .update(
                         {
                             BinarySecurityStageItem.status: "dispatching",
+                            BinarySecurityStageItem.claim_owner_instance_id: str(self.instance_id or "").strip() or None,
+                            BinarySecurityStageItem.claim_execution_token: self._dispatch_token(task),
+                            BinarySecurityStageItem.claim_started_at: _now(),
                             BinarySecurityStageItem.started_at: _now(),
                             BinarySecurityStageItem.updated_at: _now(),
                         },
@@ -11716,6 +11920,8 @@ class TaskManager:
         db = get_session_factory()()
         owner_task_id: str | None = None
         owner_kind = f"streaming_stage_item:{item_id}"
+        expected_claim_owner_instance_id: str | None = None
+        expected_claim_execution_token: str | None = None
         try:
             item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == item_id).first()
             if item is None:
@@ -11725,8 +11931,32 @@ class TaskManager:
                 return
             if task.status in TASK_TERMINAL_STATUSES or task.status == "cancelled":
                 return
+            current_task_owner = str(task.dispatcher_instance_id or "").strip()
+            current_task_token = self._dispatch_token(task)
+            current_claim_owner = str(item.claim_owner_instance_id or "").strip()
+            current_claim_token = self._stage_item_claim_token(item)
+            if not current_claim_owner and not current_claim_token and current_task_owner == str(self.instance_id or "").strip() and current_task_token:
+                expected_claim_execution_token = self._bind_stage_item_claim(item, task=task, owner_instance_id=self.instance_id)
+                expected_claim_owner_instance_id = str(item.claim_owner_instance_id or "").strip() or None
+                db.commit()
+            else:
+                expected_claim_owner_instance_id = current_claim_owner or None
+                expected_claim_execution_token = current_claim_token
+            if (
+                not expected_claim_owner_instance_id
+                or not expected_claim_execution_token
+                or expected_claim_owner_instance_id != str(self.instance_id or "").strip()
+                or current_task_owner != str(self.instance_id or "").strip()
+                or expected_claim_execution_token != current_task_token
+            ):
+                raise StaleTaskExecution(
+                    f"任务 {task.id} 当前 streaming stage item claim 已切换: "
+                    f"item_owner={expected_claim_owner_instance_id or '-'} task_owner={current_task_owner or '-'} "
+                    f"item_token={expected_claim_execution_token or '-'} task_token={current_task_token or '-'}"
+                )
             owner_task_id = task.id
             self._register_task_execution_owner(owner_task_id, owner_kind)
+            await self._ensure_task_execution_current_async(task)
             stage_run = self._ensure_stage_run(db, task, item.stage_name)
             db.commit()
             payload = dict(item.input_ref or {})
@@ -11741,10 +11971,36 @@ class TaskManager:
         except StaleTaskExecution as exc:
             item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == item_id).first()
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == item.task_id).first() if item is not None else None
-            if item is not None and str(item.status or "").strip().lower() == "dispatching":
-                item.status = "pending"
-                item.error_message = str(exc)
-                item.finished_at = None
+            requeued = False
+            if (
+                item is not None
+                and str(item.status or "").strip().lower() == "dispatching"
+                and expected_claim_owner_instance_id
+                and expected_claim_execution_token
+            ):
+                requeued = bool(
+                    db.query(BinarySecurityStageItem)
+                    .filter(
+                        BinarySecurityStageItem.id == item.id,
+                        BinarySecurityStageItem.status == "dispatching",
+                        BinarySecurityStageItem.claim_owner_instance_id == expected_claim_owner_instance_id,
+                        BinarySecurityStageItem.claim_execution_token == expected_claim_execution_token,
+                    )
+                    .update(
+                        {
+                            BinarySecurityStageItem.status: "pending",
+                            BinarySecurityStageItem.error_message: str(exc),
+                            BinarySecurityStageItem.finished_at: None,
+                            BinarySecurityStageItem.claim_owner_instance_id: None,
+                            BinarySecurityStageItem.claim_execution_token: None,
+                            BinarySecurityStageItem.claim_started_at: None,
+                            BinarySecurityStageItem.updated_at: _now(),
+                        },
+                        synchronize_session=False,
+                    )
+                )
+                item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == item_id).first()
+            if requeued and item is not None:
                 if task is not None and self._should_hold_task_on_stage_after_requeue(db, task, item.stage_name):
                     task.status = "running"
                     task.current_stage = item.stage_name
@@ -11766,10 +12022,44 @@ class TaskManager:
                         payload={
                             "error": str(exc),
                             "requeued_status": item.status,
+                            "claim_owner_instance_id": expected_claim_owner_instance_id,
+                            "claim_execution_token": expected_claim_execution_token,
+                            "task_dispatcher_instance_id": str(getattr(task, 'dispatcher_instance_id', '') or '').strip() or None if task is not None else None,
+                            "task_execution_token": self._dispatch_token(task) if task is not None else None,
+                            "stale_action": "requeued",
                         },
                     )
                     db.commit()
-            logger.warning("binary-security streaming stage item stale execution: item_id=%s error=%s", item_id, exc)
+            elif task is not None and item is not None:
+                self._record_event(
+                    db,
+                    task,
+                    "streaming_stage_item_stale_requeue_ignored",
+                    f"流式阶段子任务 stale 回退已忽略，claim 已被新执行代接管: {item.stage_name}:{item.item_key}",
+                    level="warning",
+                    stage_name=item.stage_name,
+                    item=item,
+                    payload={
+                        "error": str(exc),
+                        "expected_claim_owner_instance_id": expected_claim_owner_instance_id,
+                        "expected_claim_execution_token": expected_claim_execution_token,
+                        "current_claim_owner_instance_id": str(item.claim_owner_instance_id or "").strip() or None,
+                        "current_claim_execution_token": self._stage_item_claim_token(item),
+                        "task_dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                        "task_execution_token": self._dispatch_token(task),
+                        "stale_action": "ignored_claim_mismatch",
+                    },
+                )
+                db.commit()
+            logger.warning(
+                "binary-security streaming stage item stale execution: item_id=%s task_id=%s claim_owner=%s claim_token=%s stale_action=%s error=%s",
+                item_id,
+                task.id if task is not None else None,
+                expected_claim_owner_instance_id,
+                expected_claim_execution_token,
+                "requeued" if requeued else "ignored_claim_mismatch",
+                exc,
+            )
         except Exception as exc:
             item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == item_id).first()
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == item.task_id).first() if item is not None else None
@@ -12560,11 +12850,11 @@ class TaskManager:
             lease_token = self._acquire_task_state_lease(db, event.task_id)
             if not lease_token:
                 event.status = "retryable"
-                event.available_at = _now() + timedelta(seconds=5)
+                event.available_at = _now() + timedelta(seconds=self._lock_busy_backoff_seconds(event))
                 event.leased_by = None
                 event.lease_expires_at = None
                 event.processing_finished_at = _now()
-                event.processing_result = "retryable"
+                event.processing_result = "lock_busy_backoff"
                 event.last_error_message = "task state lease busy"
                 event.updated_at = _now()
                 db.commit()
@@ -13880,6 +14170,10 @@ class TaskManager:
         for event in events:
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == event.task_id).first()
             if task is None:
+                continue
+            if self._is_lock_busy_state_event(event):
+                continue
+            if str(task.status or "").strip() in TASK_TERMINAL_STATUSES:
                 continue
             event.status = "pending"
             event.available_at = _now()
@@ -16014,10 +16308,30 @@ class TaskManager:
                         previous_status="dispatching",
                     )
                 else:
-                    task.status = "pending"
-                    task.dispatcher_instance_id = None
-                    task.dispatch_started_at = None
-                    task.lease_expires_at = None
+                    failed_stage_run = next(
+                        (run for run in db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all() if str(run.status or "").strip() == "failed"),
+                        None,
+                    )
+                    if failed_stage_run is not None:
+                        failure_snapshot = self._stage_failure_snapshot(task, failed_stage_run)
+                        self._finalize_task_after_authoritative_failure(
+                            db,
+                            task,
+                            failure_ctx={
+                                "stage_name": failed_stage_run.stage_name or task.current_stage,
+                                "stage_run": failed_stage_run,
+                                "failure_code": failure_snapshot.get("failure_code"),
+                                "failure_category": failure_snapshot.get("failure_category"),
+                                "failure_message": failed_stage_run.last_error or failure_snapshot.get("failure_message") or failure_snapshot.get("error"),
+                                "reason": "failed_stage_run_present_after_dispatching_reclaim",
+                            },
+                            previous_status="dispatching",
+                        )
+                    else:
+                        task.status = "pending"
+                        task.dispatcher_instance_id = None
+                        task.dispatch_started_at = None
+                        task.lease_expires_at = None
                 reclaimed = True
                 continue
             lease, runtime_lease_owner, runtime_lease_expires_at = self._runtime_lease_context(db, task)
@@ -16153,15 +16467,26 @@ class TaskManager:
                 # still-pending child can be recreated repeatedly while the
                 # downstream task remains valid.
                 continue
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == item.task_id).first()
+            claim_owner = str(item.claim_owner_instance_id or "").strip() or None
+            claim_token = self._stage_item_claim_token(item)
+            if task is not None and claim_token:
+                task_token = self._dispatch_token(task)
+                if (
+                    self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_OWNED_EXECUTION
+                    and task_token == claim_token
+                    and self._lease_is_active(task)
+                ):
+                    continue
             reference_time = item.updated_at or item.started_at or item.created_at
             elapsed_seconds = _elapsed_seconds_since(reference_time)
             if elapsed_seconds is None or elapsed_seconds < timeout_seconds:
                 continue
             previous_status = str(item.status or "").strip()
             item.status = "pending"
+            self._clear_stage_item_claim(item)
             item.error_message = None
             item.finished_at = None
-            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == item.task_id).first()
             if task is not None:
                 self._merge_stage_item_result_fields(
                     task,
@@ -16188,6 +16513,9 @@ class TaskManager:
                         "requeued_status": item.status,
                         "downstream_task_id": item.downstream_task_id,
                         "elapsed_seconds": elapsed_seconds,
+                        "previous_claim_owner_instance_id": claim_owner,
+                        "previous_claim_execution_token": claim_token,
+                        "reclaim_reason": "stale_claim_owner_or_execution",
                     },
                 )
             reclaimed = True
@@ -17476,6 +17804,36 @@ class TaskManager:
     def _dispatch_token(self, task: BinarySecurityTask) -> str | None:
         return task.dispatch_started_at.isoformat() if task.dispatch_started_at else None
 
+    def _stage_item_claim_token(self, item: BinarySecurityStageItem | None) -> str | None:
+        token = str(getattr(item, "claim_execution_token", "") or "").strip()
+        return token or None
+
+    def _bind_stage_item_claim(self, item: BinarySecurityStageItem, *, task: BinarySecurityTask, owner_instance_id: str | None = None) -> str | None:
+        token = self._dispatch_token(task)
+        item.claim_owner_instance_id = str(owner_instance_id or self.instance_id or "").strip() or None
+        item.claim_execution_token = token
+        item.claim_started_at = _now()
+        return token
+
+    def _clear_stage_item_claim(self, item: BinarySecurityStageItem) -> None:
+        item.claim_owner_instance_id = None
+        item.claim_execution_token = None
+        item.claim_started_at = None
+
+    def _stage_item_claim_matches_task_execution(self, item: BinarySecurityStageItem, task: BinarySecurityTask) -> bool:
+        claim_owner = str(getattr(item, "claim_owner_instance_id", "") or "").strip()
+        claim_token = self._stage_item_claim_token(item)
+        task_owner = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+        task_token = self._dispatch_token(task)
+        if not claim_owner or not claim_token or not task_owner or not task_token:
+            return False
+        return (
+            claim_owner == task_owner
+            and claim_token == task_token
+            and self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_OWNED_EXECUTION
+            and self._lease_is_active(task)
+        )
+
     def _bind_execution_token(self, task: BinarySecurityTask) -> None:
         setattr(task, "_execution_dispatcher_id", task.dispatcher_instance_id)
         setattr(task, "_execution_token", self._dispatch_token(task))
@@ -18451,6 +18809,30 @@ class TaskManager:
             state_event=False,
         )
         db.add(event)
+        self._trim_task_timeline_events(db, task_id=task.id)
+
+    def _trim_task_timeline_events(self, db: Session, *, task_id: str, keep_limit: int = DB_TIMELINE_EVENT_LIMIT) -> None:
+        if keep_limit <= 0:
+            return
+        if not hasattr(db, "query") or not hasattr(db, "delete"):
+            return
+        overflow = (
+            db.query(BinarySecurityEvent)
+            .filter(BinarySecurityEvent.task_id == task_id)
+            .count()
+            - int(keep_limit)
+        )
+        if overflow <= 0:
+            return
+        stale_events = (
+            db.query(BinarySecurityEvent)
+            .filter(BinarySecurityEvent.task_id == task_id)
+            .order_by(BinarySecurityEvent.created_at.asc(), BinarySecurityEvent.id.asc())
+            .limit(overflow)
+            .all()
+        )
+        for stale_event in stale_events:
+            db.delete(stale_event)
 
     @staticmethod
     def _preserved_child_result_keys() -> tuple[str, ...]:
@@ -20735,6 +21117,12 @@ class TaskManager:
         event_level: str = "warning",
         event_payload: dict[str, Any] | None = None,
     ) -> None:
+        if bool(getattr(task, "_owned_execution_requeue_emitted", False)):
+            return
+        setattr(task, "_owned_execution_requeue_emitted", True)
+        event_stage_name = str(getattr(task, "_preferred_requeue_event_stage_name", "") or "").strip() or (stage_name or task.current_stage)
+        if hasattr(task, "_preferred_requeue_event_stage_name"):
+            setattr(task, "_preferred_requeue_event_stage_name", None)
         task.current_stage = stage_name or task.current_stage
         task.status = "pending"
         self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
@@ -20753,7 +21141,7 @@ class TaskManager:
             event_type,
             message,
             level=event_level,
-            stage_name=stage_name,
+            stage_name=event_stage_name,
             payload={
                 "takeover_reason": reason,
                 "takeover_action": "requeue_owned_execution",
@@ -21659,11 +22047,21 @@ class TaskManager:
 
     def _stage_item_response(
         self,
-        task: BinarySecurityTask,
-        item: BinarySecurityStageItem,
+        task: BinarySecurityTask | BinarySecurityStageItem,
+        item: BinarySecurityStageItem | None = None,
         *,
         archive_jobs: list[BinarySecurityArchiveJob] | None = None,
     ) -> BinarySecurityStageItemResponse:
+        if item is None:
+            if not isinstance(task, BinarySecurityStageItem):
+                raise TypeError("item is required when the first argument is not a BinarySecurityStageItem")
+            item = task
+            task = BinarySecurityTask(
+                id=str(item.task_id or ""),
+                project_id=str(item.project_id or ""),
+                current_stage=str(item.stage_name or "") or None,
+                status="running",
+            )
         result = self._load_stage_item_result_payload(item)
         output_ref = dict(item.output_ref or {})
         resolved_archive_refs = self._resolved_stage_item_archive_refs(item, archive_jobs=archive_jobs)
@@ -23715,7 +24113,18 @@ class TaskManager:
                     stage_name="system_analysis",
                     payload={"candidate_module_count": len(candidate_modules)},
                 )
-        no_candidate_modules_failure = status == "success" and not failed and not candidate_modules
+        downstream_stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+        stage_sequence = self._stage_sequence_for_task(task)
+        has_active_downstream_stage = False
+        if "system_analysis" in stage_sequence:
+            current_index = stage_sequence.index("system_analysis")
+            downstream_stage_names = set(stage_sequence[current_index + 1 :])
+            has_active_downstream_stage = any(
+                str(run.stage_name or "").strip() in downstream_stage_names
+                and str(run.status or "").strip() in {"running", "dispatching", "pending", "queued", "applying", "success", "partial_success"}
+                for run in downstream_stage_runs
+            )
+        no_candidate_modules_failure = status == "success" and not failed and not candidate_modules and not has_active_downstream_stage
         if no_candidate_modules_failure:
             failure = _no_candidate_modules_failure()
             status = "failed"
@@ -23800,6 +24209,14 @@ class TaskManager:
 
     def _refresh_task_status_after_sync(self, db: Session, task: BinarySecurityTask) -> None:
         current_status = str(task.status or "").strip()
+        if bool(getattr(task, "_owned_execution_requeue_emitted", False)):
+            task.status = "pending"
+            task.finished_at = None
+            self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.lease_expires_at = None
+            return
         active_cancel_operation = self._active_cancel_operation(db, task.id)
         if self._ensure_task_remains_cancelling(db, task, active_cancel_operation=active_cancel_operation) is not None:
             return
@@ -23950,11 +24367,17 @@ class TaskManager:
                     task.dispatch_started_at = None
                     task.lease_expires_at = None
                     self._release_tail_reconcile_owner(task.id)
-                    if self._should_requeue_for_owned_execution(
-                        db,
-                        task,
-                        next_stage=str(task.current_stage or "").strip() or None,
-                        next_stage_status="running",
+                    current_stage_items = self._stage_items(db, task.id, str(task.current_stage or "").strip())
+                    has_live_downstream_children = self._stage_has_live_downstream_children(current_stage_items)
+                    if (
+                        not has_live_downstream_children
+                        and str(current_status or "").strip() in {"running", "dispatching", "pending"}
+                        and self._should_requeue_for_owned_execution(
+                            db,
+                            task,
+                            next_stage=str(task.current_stage or "").strip() or None,
+                            next_stage_status="running",
+                        )
                     ):
                         self._requeue_owned_execution_takeover(
                             db,
@@ -24155,6 +24578,7 @@ class TaskManager:
                 or self._stage_has_real_runnable_work(db, task, next_stage)
             )
         ):
+            previous_stage_name = str(task.current_stage or "").strip()
             task.status = "running" if str(next_stage_status or "").strip() in {"running", "dispatching"} else "pending"
             task.current_stage = next_stage
             task.finished_at = None
@@ -24191,11 +24615,20 @@ class TaskManager:
                 summary["stale_from_stage"] = None
                 task.summary = summary
             self._clear_task_abnormal_reason_snapshot(db, task)
-            if self._should_requeue_for_owned_execution(
-                db,
-                task,
-                next_stage=next_stage,
-                next_stage_status=str(next_stage_status or "").strip(),
+            next_stage_items = self._stage_items(db, task.id, next_stage)
+            has_live_downstream_children = (
+                next_stage == previous_stage_name
+                and self._stage_has_live_downstream_children(next_stage_items)
+            )
+            if (
+                not has_live_downstream_children
+                and str(current_status or "").strip() in {"running", "dispatching", "pending"}
+                and self._should_requeue_for_owned_execution(
+                    db,
+                    task,
+                    next_stage=next_stage,
+                    next_stage_status=str(next_stage_status or "").strip(),
+                )
             ):
                 self._requeue_owned_execution_takeover(
                     db,
@@ -24359,6 +24792,7 @@ class TaskManager:
             self._ensure_stage_item_first_started_at(item)
             item.retry_count = int(item.retry_count or 0)
             item.rerun_count = int(item.rerun_count or 0)
+            self._clear_stage_item_claim(item)
             if retrying:
                 item.rerun_count = 1
             if auto_retrying:
@@ -24370,6 +24804,8 @@ class TaskManager:
             item.item_identity_key = identity_key
             keep_existing_active = preserve_active_status and self._should_preserve_streaming_item_status(item)
             item.status = item.status if keep_existing_active else running_status
+            if not keep_existing_active:
+                self._clear_stage_item_claim(item)
             item.downstream_service = downstream_service
             self._reset_child_runtime_payload(
                 item,
@@ -24411,6 +24847,8 @@ class TaskManager:
                 existing.item_identity_key = identity_key
                 keep_existing_active = preserve_active_status and self._should_preserve_streaming_item_status(existing)
                 existing.status = existing.status if keep_existing_active else running_status
+                if not keep_existing_active:
+                    self._clear_stage_item_claim(existing)
                 existing.downstream_service = downstream_service
                 self._reset_child_runtime_payload(
                     existing,
@@ -24849,6 +25287,7 @@ class TaskManager:
                                 status="queued",
                                 downstream_service=downstream_service,
                             )
+                            self._clear_stage_item_claim(item)
                             db.add(item)
                             if hasattr(db, "stage_items") and isinstance(getattr(db, "stage_items"), list):
                                 stage_items_list = getattr(db, "stage_items")
@@ -24862,6 +25301,7 @@ class TaskManager:
                             item.parent_key = parent_key
                             item.item_identity_key = identity_key
                             item.status = "queued"
+                            self._clear_stage_item_claim(item)
                             item.downstream_service = downstream_service
                             self._reset_child_runtime_payload(
                                 item,
@@ -27867,8 +28307,9 @@ class TaskManager:
             observe_heartbeat_update("fallback_skipped")
             return
         has_owner = self._has_local_task_execution_owner(task_id)
+        has_tail_owner = self._has_tail_reconcile_owner(task_id)
         has_streaming_worker = self._task_has_active_streaming_stage_workers(task_id)
-        if not has_owner and not has_streaming_worker:
+        if not has_owner and not has_tail_owner and not has_streaming_worker:
             observe_heartbeat_update("fallback_skipped")
             return
         session = get_session_factory()()

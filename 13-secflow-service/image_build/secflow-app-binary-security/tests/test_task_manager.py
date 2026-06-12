@@ -265,6 +265,20 @@ class _ModelAwareDb:
     def close(self):
         pass
 
+    def delete(self, obj):
+        if obj in self.events:
+            self.events.remove(obj)
+        if obj in self.state_events:
+            self.state_events.remove(obj)
+        if obj in self.archive_jobs:
+            self.archive_jobs.remove(obj)
+        if obj in self.stage_items:
+            self.stage_items.remove(obj)
+        if obj in self.stage_runs:
+            self.stage_runs.remove(obj)
+        if obj in self.tasks:
+            self.tasks.remove(obj)
+
 
 class StatusMappingTests(unittest.TestCase):
     def test_status_from_downstream_payload_preserves_non_terminal_pending_statuses(self):
@@ -1502,6 +1516,9 @@ class TaskManagerTests(unittest.TestCase):
             status="running",
             task_type=TASK_TYPE_BINARY,
             current_stage="dataflow_vuln_scan",
+            dispatcher_instance_id="worker-a",
+            dispatch_started_at=_now(),
+            lease_expires_at=_now() - timedelta(seconds=1),
             firmware_source="project_filesystem",
             firmware_path="/fw",
             output_root="/o",
@@ -1520,6 +1537,9 @@ class TaskManagerTests(unittest.TestCase):
             item_identity_key="entry-1::module-1",
             status="dispatching",
             downstream_service="dataflow_vuln_scan",
+            claim_owner_instance_id="worker-a",
+            claim_execution_token="stale-token",
+            claim_started_at=_now() - timedelta(seconds=180),
             started_at=_now() - timedelta(seconds=180),
             updated_at=_now() - timedelta(seconds=180),
         )
@@ -1529,7 +1549,55 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertTrue(reclaimed)
         self.assertEqual("pending", item.status)
+        self.assertIsNone(item.claim_owner_instance_id)
+        self.assertIsNone(item.claim_execution_token)
         self.assertTrue(any(event.event_type == "streaming_stage_item_dispatch_reclaimed" for event in db.events))
+
+    def test_reclaim_stale_streaming_stage_items_skips_item_claimed_by_active_owner(self):
+        self.manager._load_service_config = lambda db: SimpleNamespace(dispatch_timeout_seconds=60)
+        now = _now()
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="dataflow_vuln_scan",
+            dispatcher_instance_id="worker-a",
+            dispatch_started_at=now,
+            lease_expires_at=now + timedelta(seconds=300),
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        item = BinarySecurityStageItem(
+            id="si-vuln",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-vuln",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="dispatching",
+            downstream_service="dataflow_vuln_scan",
+            claim_owner_instance_id="worker-a",
+            claim_execution_token=now.isoformat(),
+            claim_started_at=now - timedelta(seconds=180),
+            started_at=now - timedelta(seconds=180),
+            updated_at=now - timedelta(seconds=180),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+        reclaimed = self.manager._reclaim_stale_streaming_stage_items_locked(db)
+
+        self.assertFalse(reclaimed)
+        self.assertEqual("dispatching", item.status)
+        self.assertEqual("worker-a", item.claim_owner_instance_id)
+        self.assertEqual(now.isoformat(), item.claim_execution_token)
 
     def test_reclaim_stale_streaming_stage_items_skips_item_with_downstream_task(self):
         self.manager._load_service_config = lambda db: SimpleNamespace(dispatch_timeout_seconds=60)
@@ -1591,6 +1659,7 @@ class TaskManagerTests(unittest.TestCase):
 
     def test_claim_streaming_stage_items_marks_pending_item_dispatching(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        now = _now()
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -1598,6 +1667,10 @@ class TaskManagerTests(unittest.TestCase):
             status="running",
             task_type=TASK_TYPE_BINARY,
             current_stage="entry_analysis",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            dispatcher_instance_id=self.manager.instance_id,
+            dispatch_started_at=now,
+            lease_expires_at=now + timedelta(seconds=300),
             firmware_source="project_filesystem",
             firmware_path="/fw",
             output_root="/o",
@@ -1624,9 +1697,13 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(["si-entry"], claimed)
         self.assertEqual("dispatching", item.status)
         self.assertIsNotNone(item.started_at)
+        self.assertEqual(self.manager.instance_id, item.claim_owner_instance_id)
+        self.assertEqual(now.isoformat(), item.claim_execution_token)
+        self.assertIsNotNone(item.claim_started_at)
 
     def test_claim_streaming_stage_items_marks_queued_item_dispatching(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        now = _now()
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -1634,6 +1711,10 @@ class TaskManagerTests(unittest.TestCase):
             status="running",
             task_type=TASK_TYPE_BINARY,
             current_stage="dataflow_vuln_scan",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            dispatcher_instance_id=self.manager.instance_id,
+            dispatch_started_at=now,
+            lease_expires_at=now + timedelta(seconds=300),
             firmware_source="project_filesystem",
             firmware_path="/fw",
             output_root="/o",
@@ -1660,9 +1741,12 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(["si-vuln"], claimed)
         self.assertEqual("dispatching", item.status)
         self.assertIsNotNone(item.started_at)
+        self.assertEqual(self.manager.instance_id, item.claim_owner_instance_id)
+        self.assertEqual(now.isoformat(), item.claim_execution_token)
 
-    def test_claim_streaming_stage_items_returns_empty_on_retryable_lock_conflict(self):
+    def test_claim_streaming_stage_items_skips_non_owner_task_items(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        now = _now()
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -1670,6 +1754,51 @@ class TaskManagerTests(unittest.TestCase):
             status="running",
             task_type=TASK_TYPE_BINARY,
             current_stage="entry_analysis",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            dispatcher_instance_id="worker-b",
+            dispatch_started_at=now,
+            lease_expires_at=now + timedelta(seconds=300),
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming", "stage_parallelism": {"entry_analysis": 1}}),
+        )
+        item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="mod.so",
+            parent_key="fw-1",
+            item_identity_key="module-1::fw-1",
+            status="pending",
+            downstream_service="entry_analyse",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+        claimed = self.manager._claim_streaming_stage_items(db)
+
+        self.assertEqual([], claimed)
+        self.assertEqual("pending", item.status)
+        self.assertTrue(any(event.event_type == "streaming_stage_item_claim_skipped_non_owner" for event in db.events))
+
+    def test_claim_streaming_stage_items_returns_empty_on_retryable_lock_conflict(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        now = _now()
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            dispatcher_instance_id=self.manager.instance_id,
+            dispatch_started_at=now,
+            lease_expires_at=now + timedelta(seconds=300),
             firmware_source="project_filesystem",
             firmware_path="/fw",
             output_root="/o",
@@ -3474,6 +3603,127 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(1, failed_only_page.total)
         self.assertEqual("sev-retry", failed_only_page.items[0].event_id)
 
+    def test_list_reducer_event_records_reports_lock_busy_as_non_failure_retryable_noise(self):
+        created_at = _now() - timedelta(minutes=2)
+        started_at = created_at + timedelta(seconds=1)
+        finished_at = started_at + timedelta(seconds=1)
+        lock_busy = BinarySecurityStateEvent(
+            id="sev-lock-busy",
+            task_id="t-lock",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            event_type="downstream_status_observed",
+            idempotency_key="sev-lock-busy",
+            status="retryable",
+            attempts=2,
+            leased_by=None,
+            processed_by="reducer-a",
+            available_at=created_at,
+            processing_started_at=started_at,
+            processing_finished_at=finished_at,
+            processing_result="lock_busy_backoff",
+            last_error_message="task state lease busy",
+            error_message="task state lease busy",
+            created_at=created_at,
+            updated_at=finished_at,
+        )
+        db = _AppendingModelAwareDb(state_events=[lock_busy])
+
+        page = self.manager.list_reducer_event_records(
+            db,
+            page=1,
+            page_size=10,
+            sort_by="processed_at",
+            sort_order="desc",
+            statuses=[],
+            event_type=None,
+            handler_pod=None,
+            task_id=None,
+            failed_only=False,
+            slow_only=False,
+        )
+
+        self.assertEqual(1, page.total)
+        self.assertEqual("lock_busy_backoff", page.items[0].result)
+        self.assertEqual("lock_busy", page.items[0].failure_kind)
+
+    def test_repair_retryable_state_events_skips_lock_busy_and_terminal_tasks(self):
+        active_task = BinarySecurityTask(
+            id="t-active",
+            project_id="p1",
+            name="active",
+            status="running",
+            created_at=_now(),
+            updated_at=_now(),
+        )
+        terminal_task = BinarySecurityTask(
+            id="t-terminal",
+            project_id="p1",
+            name="terminal",
+            status="failed",
+            created_at=_now(),
+            updated_at=_now(),
+        )
+        lock_busy_event = BinarySecurityStateEvent(
+            id="se-lock-busy",
+            task_id="t-active",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            event_type="downstream_status_observed",
+            status="retryable",
+            attempts=3,
+            processing_result="lock_busy_backoff",
+            last_error_message="task state lease busy",
+            available_at=_now(),
+            created_at=_now(),
+            updated_at=_now(),
+        )
+        terminal_retryable_event = BinarySecurityStateEvent(
+            id="se-terminal",
+            task_id="t-terminal",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            event_type="downstream_status_observed",
+            status="retryable",
+            attempts=2,
+            processing_result="retryable",
+            last_error_message="downstream timeout",
+            available_at=_now(),
+            created_at=_now(),
+            updated_at=_now(),
+        )
+        real_retryable_event = BinarySecurityStateEvent(
+            id="se-real",
+            task_id="t-active",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            event_type="downstream_status_observed",
+            status="retryable",
+            attempts=2,
+            processing_result="retryable",
+            last_error_message="downstream timeout",
+            available_at=_now(),
+            created_at=_now(),
+            updated_at=_now(),
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[active_task, terminal_task],
+            state_events=[lock_busy_event, terminal_retryable_event, real_retryable_event],
+            events=[],
+        )
+
+        repaired = self.manager._repair_retryable_state_events(db)
+
+        self.assertEqual(1, repaired)
+        self.assertEqual("retryable", lock_busy_event.status)
+        self.assertEqual("lock_busy_backoff", lock_busy_event.processing_result)
+        self.assertEqual("retryable", terminal_retryable_event.status)
+        self.assertEqual("pending", real_retryable_event.status)
+        self.assertEqual(
+            1,
+            len({id(event) for event in db.events if event.event_type == "task_state_repair_reconcile_triggered"}),
+        )
+
     def test_build_project_stats_sql_aggregates_counts_from_database(self):
         task1 = BinarySecurityTask(
             id="t1",
@@ -5275,16 +5525,17 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager.start_task = _fake_start_task
             self.manager._build_queue_info = lambda *_args, **_kwargs: {"pending_positions": {}, "running_count": 0, "queued_count": 0, "max_concurrent_tasks": 0}
             try:
-                detail = await self.manager.complete_uploads(
-                    db,
-                    project_id="p1",
-                    task_id="bm1",
-                    payload=BinarySecurityUploadCompletePayload(
-                        files=[BinarySecurityInputFile(filename="libipsec.so", relative_path=elf_rel)]
-                    ),
-                    updated_by="tester",
-                    authorization_token="token",
-                )
+                with patch.object(self.manager, "_check_storage_free_space", return_value=None):
+                    detail = await self.manager.complete_uploads(
+                        db,
+                        project_id="p1",
+                        task_id="bm1",
+                        payload=BinarySecurityUploadCompletePayload(
+                            files=[BinarySecurityInputFile(filename="libipsec.so", relative_path=elf_rel)]
+                        ),
+                        updated_by="tester",
+                        authorization_token="token",
+                    )
             finally:
                 self.manager.start_task = original_start_task
                 self.manager._build_queue_info = original_build_queue_info
@@ -7491,6 +7742,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
     def test_claim_streaming_stage_items_respects_runtime_dispatch_throttle(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        now = _now()
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -7498,12 +7750,15 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             status="running",
             task_type=TASK_TYPE_BINARY_MODULE,
             current_stage="dataflow_vuln_scan",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            dispatcher_instance_id=self.manager.instance_id,
+            dispatch_started_at=now,
+            lease_expires_at=now + timedelta(seconds=300),
             firmware_source="project_filesystem",
             firmware_path="/fw",
             output_root="/o",
             workspace_root="/tmp/ws",
             policy_json=json.dumps({"pipeline_mode": "mixed_streaming", "stage_parallelism": {"dataflow_vuln_scan": 4}}),
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
         )
         task.runtime_override = {
             "dispatch_throttle": {
@@ -17947,12 +18202,13 @@ def _test_materialize_source_archives_extracts_into_input_and_cleans_temp_file(s
             "temp_upload_dir": "/app/secflow-app-binary-security/s1/run/upload-tmp",
         }
 
-        files, total_bytes, extracted_count = asyncio.run(
-            self.manager._materialize_source_archives(
-                task,
-                [{"filename": "source.zip", "relative_path": "source.zip"}],
+        with patch.object(self.manager, "_check_storage_free_space", return_value=None):
+            files, total_bytes, extracted_count = asyncio.run(
+                self.manager._materialize_source_archives(
+                    task,
+                    [{"filename": "source.zip", "relative_path": "source.zip"}],
+                )
             )
-        )
 
         self.assertEqual(1, len(files))
         self.assertGreater(total_bytes, 0)
@@ -20167,6 +20423,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             self.manager._is_task_cancelled = original_is_cancelled
 
     def test_run_stage_item_by_id_stale_execution_keeps_parent_on_current_stage(self):
+        now = _now()
         task = BinarySecurityTask(
             id="task1",
             project_id="p1",
@@ -20174,6 +20431,9 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             status="running",
             current_stage="entry_analysis",
             task_type=TASK_TYPE_SOURCE,
+            dispatcher_instance_id=self.manager.instance_id,
+            dispatch_started_at=now,
+            lease_expires_at=now + timedelta(seconds=300),
             firmware_source="project_filesystem",
             firmware_path="/src",
             output_root="/o",
@@ -20203,6 +20463,9 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             status="dispatching",
             downstream_service="entry_analyse",
             downstream_task_id="eat-1",
+            claim_owner_instance_id=self.manager.instance_id,
+            claim_execution_token=now.isoformat(),
+            claim_started_at=now,
             input_ref={"module_key": "module-1"},
         )
         fake_session = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], events=[])
@@ -20214,15 +20477,149 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
             patch.object(self.manager, "_ensure_stage_run", return_value=stage_run),
+            patch.object(self.manager, "_ensure_task_execution_current_async", return_value=None),
             patch.object(self.manager, "_run_entry_item", side_effect=_raise_stale),
         ):
             asyncio.run(self.manager._run_stage_item_by_id("si1"))
 
         self.assertEqual("pending", item.status)
+        self.assertIsNone(item.claim_owner_instance_id)
+        self.assertIsNone(item.claim_execution_token)
         self.assertEqual("running", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertIsNone(task.finished_at)
         self.assertTrue(any(event.event_type == "streaming_stage_item_requeued_after_stale_execution" for event in fake_session.events))
+
+    def test_run_stage_item_by_id_stale_execution_ignores_claim_mismatch_after_takeover(self):
+        now = _now()
+        manager = self.manager
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            dispatcher_instance_id="worker-b",
+            dispatch_started_at=now + timedelta(seconds=30),
+            lease_expires_at=now + timedelta(seconds=330),
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="module-1",
+            parent_key="source_project",
+            item_identity_key="module-1::source_project",
+            status="dispatching",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-1",
+            claim_owner_instance_id="worker-b",
+            claim_execution_token=(now + timedelta(seconds=30)).isoformat(),
+            claim_started_at=now + timedelta(seconds=30),
+            input_ref={"module_key": "module-1"},
+        )
+        events: list[BinarySecurityEvent] = []
+
+        class _FilterQuery:
+            def __init__(self, rows):
+                self._rows = rows
+                self._criteria = []
+
+            def filter(self, *criteria):
+                self._criteria.extend(criteria)
+                return self
+
+            def _matches(self, row):
+                for criterion in self._criteria:
+                    left = getattr(getattr(criterion, "left", None), "name", None)
+                    right = getattr(getattr(criterion, "right", None), "value", None)
+                    if left is None:
+                        continue
+                    if getattr(row, left, None) != right:
+                        return False
+                return True
+
+            def first(self):
+                rows = self.all()
+                return rows[0] if rows else None
+
+            def all(self):
+                return [row for row in self._rows if self._matches(row)]
+
+            def update(self, values, synchronize_session=False):
+                del synchronize_session
+                rows = self.all()
+                for row in rows:
+                    for key, value in (values or {}).items():
+                        name = getattr(key, "name", None)
+                        if name:
+                            setattr(row, name, value)
+                return len(rows)
+
+        class _Session:
+            def query(self, model, *args, **kwargs):
+                del args, kwargs
+                model_name = getattr(model, "__name__", "")
+                if model_name == "BinarySecurityTask":
+                    return _FilterQuery([task])
+                if model_name == "BinarySecurityStageItem":
+                    return _FilterQuery([item])
+                if model_name == "BinarySecurityStageRun":
+                    return _FilterQuery([stage_run])
+                if model_name == "BinarySecurityEvent":
+                    return _FilterQuery(events)
+                return _FilterQuery([])
+
+            def add(self, obj):
+                if isinstance(obj, BinarySecurityEvent):
+                    events.append(obj)
+
+            def commit(self):
+                return None
+
+            def rollback(self):
+                return None
+
+            def close(self):
+                return None
+
+            def flush(self):
+                return None
+
+        async def _raise_stale(*args, **kwargs):
+            del args, kwargs
+            raise task_manager_module.StaleTaskExecution("任务 task1 当前 owned_execution runtime lease owner 已变更")
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: _Session()),
+            patch.object(manager, "_ensure_stage_run", return_value=stage_run),
+            patch.object(manager, "_ensure_task_execution_current_async", return_value=None),
+            patch.object(manager, "_run_entry_item", side_effect=_raise_stale),
+        ):
+            asyncio.run(manager._run_stage_item_by_id("si1"))
+
+        self.assertEqual("dispatching", item.status)
+        self.assertEqual("worker-b", item.claim_owner_instance_id)
+        self.assertEqual((now + timedelta(seconds=30)).isoformat(), item.claim_execution_token)
+        self.assertTrue(any(event.event_type == "streaming_stage_item_stale_requeue_ignored" for event in events))
 
     def test_run_stage_pool_respects_concurrency_limit_for_retry_mode(self):
         active = 0
@@ -26243,6 +26640,7 @@ def _test_start_reducer_role_runs_reconcile_loops(self):
             self.assertIsNotNone(manager._state_repair_reconcile_task)
             self.assertIsNotNone(manager._state_reducer_loop_task)
             self.assertIsNotNone(manager._reducer_metrics_snapshot_loop_task)
+            self.assertIsNotNone(manager._task_heartbeat_loop_task)
             self.assertIsNone(manager._loop_task)
         asyncio.run(manager.stop())
     finally:
@@ -26533,6 +26931,48 @@ def _test_get_timeline_compresses_repeated_tail_owner_lost_events(self):
     self.assertTrue(timeline.events[0].compressed)
     self.assertEqual(2, timeline.events[0].repeat_count)
     self.assertIn("已压缩 2 次", timeline.events[0].message)
+
+
+def _test_record_event_trims_task_timeline_to_10000_events(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-timeline-cap",
+        project_id="p1",
+        name="timeline-cap",
+        status="running",
+        current_stage="system_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/out",
+        workspace_root="/ws",
+    )
+    events = []
+    base_time = _now() - timedelta(seconds=10001)
+    for index in range(10_000):
+        event = BinarySecurityEvent(
+            id=f"evt-{index:05d}",
+            task_id=task.id,
+            project_id=task.project_id,
+            level="info",
+            event_type="seed",
+            message=f"seed-{index}",
+        )
+        event.created_at = base_time + timedelta(seconds=index)
+        events.append(event)
+    db = _ModelAwareDb(tasks=[task], events=events)
+
+    manager._record_event(
+        db,
+        task,
+        "overflow",
+        "overflow-event",
+        stage_name="system_analysis",
+    )
+
+    self.assertEqual(10_000, len(db.events))
+    self.assertFalse(any(event.id == "evt-00000" for event in db.events))
+    self.assertTrue(any(event.event_type == "overflow" for event in db.events))
 
 
 def _test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged(self):
@@ -27749,6 +28189,164 @@ def _test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task(self):
     self.assertGreaterEqual(task.updated_at, lease.heartbeat_at)
 
 
+def _test_touch_task_heartbeat_keeps_lease_alive_for_tail_reconcile_owner(self):
+    manager = TaskManager()
+    started_at = _now() - timedelta(seconds=20)
+    original_expiry = _now() + timedelta(seconds=5)
+    task = BinarySecurityTask(
+        id="task-tail-touch-heartbeat",
+        project_id="p1",
+        status="running",
+        current_stage="entry_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        lease_expires_at=original_expiry,
+        updated_at=started_at,
+    )
+    item = BinarySecurityStageItem(
+        id="si-tail-touch-heartbeat",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        item_key="module-a",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        execution_epoch=0,
+        owner_instance_id=manager.instance_id,
+        heartbeat_at=_now() - timedelta(seconds=20),
+        lease_expires_at=original_expiry,
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], runtime_leases=[lease])
+    original_factory = task_manager_module.get_session_factory
+    original_interval = manager.cfg.scheduler.heartbeat_update_interval_seconds
+    try:
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+        manager.cfg.scheduler.heartbeat_update_interval_seconds = 0
+        manager._acquire_tail_reconcile_owner(task.id)
+        manager._touch_task_heartbeat(task.id)
+    finally:
+        task_manager_module.get_session_factory = original_factory
+        manager.cfg.scheduler.heartbeat_update_interval_seconds = original_interval
+
+    self.assertGreater(task.lease_expires_at, original_expiry)
+    self.assertGreater(task.updated_at, started_at)
+
+
+def _test_activate_tail_reconciliation_deduplicates_owner_conflict_events(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-tail-conflict-dedupe",
+        project_id="p1",
+        name="source",
+        status="running",
+        current_stage="dataflow_vuln_scan",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    now_value = _now()
+    payload = {
+        "lease_owner": "reducer-b",
+        "lease_generation": 7,
+        "owner_pod_uid": "pod-b",
+        "owner_boot_id": "boot-b",
+    }
+    existing = BinarySecurityEvent(
+        id="evt-tail-conflict-existing",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name=task.current_stage,
+        event_type="tail_reconcile_owner_conflict",
+        level="warning",
+        message=f"tail 收口 owner 冲突: {task.id}",
+        payload=payload,
+        created_at=now_value - timedelta(seconds=5),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], events=[existing])
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        execution_epoch=0,
+        owner_instance_id="reducer-b",
+        owner_pod_uid="pod-b",
+        owner_boot_id="boot-b",
+        generation=7,
+        heartbeat_at=now_value,
+        lease_expires_at=now_value + timedelta(minutes=2),
+    )
+
+    with patch.object(manager, "_should_enter_tail_reconciliation", return_value=True), patch.object(
+        manager, "_maybe_upsert_runtime_lease", return_value=lease
+    ):
+        manager._activate_tail_reconciliation(db, task, now_value=now_value, fallback_status="running")
+
+    self.assertEqual(1, len([event for event in db.events if event.event_type == "tail_reconcile_owner_conflict"]))
+
+
+def _test_activate_tail_reconciliation_deduplicates_handoff_started_events(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-tail-handoff-dedupe",
+        project_id="p1",
+        name="source",
+        status="running",
+        current_stage="dataflow_vuln_scan",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    now_value = _now()
+    payload = {
+        "lease_owner": "reducer-b",
+        "lease_generation": 7,
+        "owner_pod_uid": "pod-b",
+        "owner_boot_id": "boot-b",
+    }
+    existing = BinarySecurityEvent(
+        id="evt-tail-handoff-existing",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name=task.current_stage,
+        event_type="tail_reconcile_handoff_started",
+        level="info",
+        message=f"tail 收口 handoff 开始: {task.id}",
+        payload=payload,
+        created_at=now_value - timedelta(seconds=5),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], events=[existing])
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        execution_epoch=0,
+        owner_instance_id="reducer-b",
+        owner_pod_uid="pod-b",
+        owner_boot_id="boot-b",
+        generation=7,
+        heartbeat_at=now_value,
+        lease_expires_at=now_value + timedelta(minutes=2),
+    )
+
+    with patch.object(manager, "_should_enter_tail_reconciliation", return_value=True), patch.object(
+        manager, "_maybe_upsert_runtime_lease", return_value=lease
+    ):
+        manager._activate_tail_reconciliation(db, task, now_value=now_value, fallback_status="running")
+
+    self.assertEqual(1, len([event for event in db.events if event.event_type == "tail_reconcile_handoff_started"]))
+
+
 def _test_run_task_finally_preserves_tail_runtime_lease(self):
     manager = TaskManager()
     manager.instance_id = "worker-a"
@@ -28211,6 +28809,7 @@ TaskManagerTests.test_record_polled_child_sync_failure_marks_owner_lost_exhauste
 TaskManagerTests.test_record_polled_child_sync_failure_keeps_tail_owner_lost_for_tail_stale = _test_record_polled_child_sync_failure_keeps_tail_owner_lost_for_tail_stale
 TaskManagerTests.test_worker_skips_tail_tasks_in_downstream_reconcile_candidates = _test_worker_skips_tail_tasks_in_downstream_reconcile_candidates
 TaskManagerTests.test_get_timeline_compresses_repeated_tail_owner_lost_events = _test_get_timeline_compresses_repeated_tail_owner_lost_events
+TaskManagerTests.test_record_event_trims_task_timeline_to_10000_events = _test_record_event_trims_task_timeline_to_10000_events
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_locally_owned_running_task = _test_task_needs_downstream_reconcile_skips_locally_owned_running_task
 TaskManagerTests.test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items = _test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_failed_task_with_terminal_child = _test_task_needs_downstream_reconcile_skips_failed_task_with_terminal_child
@@ -28230,7 +28829,10 @@ TaskManagerTests.test_requeue_released_running_locked_skips_locally_owned_tail_l
 TaskManagerTests.test_reclaim_stale_running_streaming_tail_requeues_for_takeover = _test_reclaim_stale_running_streaming_tail_requeues_for_takeover
 TaskManagerTests.test_run_task_records_takeover_resume_event_for_streaming_tail = _test_run_task_records_takeover_resume_event_for_streaming_tail
 TaskManagerTests.test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task = _test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task
+TaskManagerTests.test_touch_task_heartbeat_keeps_lease_alive_for_tail_reconcile_owner = _test_touch_task_heartbeat_keeps_lease_alive_for_tail_reconcile_owner
 TaskManagerTests.test_run_task_finally_preserves_tail_runtime_lease = _test_run_task_finally_preserves_tail_runtime_lease
+TaskManagerTests.test_activate_tail_reconciliation_deduplicates_owner_conflict_events = _test_activate_tail_reconciliation_deduplicates_owner_conflict_events
+TaskManagerTests.test_activate_tail_reconciliation_deduplicates_handoff_started_events = _test_activate_tail_reconciliation_deduplicates_handoff_started_events
 TaskManagerTests.test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_failed = _test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_failed
 TaskManagerTests.test_refresh_task_status_after_sync_keeps_owner_lost_child_recoverable = _test_refresh_task_status_after_sync_keeps_owner_lost_child_recoverable
 TaskManagerTests.test_refresh_task_status_after_sync_fails_owner_lost_child_after_retry_budget_exhausted = _test_refresh_task_status_after_sync_fails_owner_lost_child_after_retry_budget_exhausted

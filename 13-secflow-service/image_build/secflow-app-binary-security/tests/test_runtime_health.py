@@ -11,10 +11,12 @@ class RuntimeHealthTests(unittest.TestCase):
             "loops": {
                 "state_reducer": True,
                 "reducer_metrics_snapshot": False,
+                "task_heartbeat": True,
             },
             "loop_details": {
                 "state_reducer": {"alive": True, "stale": False},
                 "reducer_metrics_snapshot": {"alive": False, "stale": False},
+                "task_heartbeat": {"alive": True, "stale": False},
             },
             "tail_reconcile_active": True,
         }
@@ -33,10 +35,12 @@ class RuntimeHealthTests(unittest.TestCase):
             "loops": {
                 "state_reducer": True,
                 "reducer_metrics_snapshot": True,
+                "task_heartbeat": True,
             },
             "loop_details": {
                 "state_reducer": {"alive": True, "stale": False},
                 "reducer_metrics_snapshot": {"alive": True, "stale": False},
+                "task_heartbeat": {"alive": True, "stale": False},
             },
             "tail_reconcile_active": True,
         }
@@ -55,10 +59,12 @@ class RuntimeHealthTests(unittest.TestCase):
             "loops": {
                 "state_reducer": True,
                 "reducer_metrics_snapshot": True,
+                "task_heartbeat": True,
             },
             "loop_details": {
                 "state_reducer": {"alive": True, "stale": False},
                 "reducer_metrics_snapshot": {"alive": True, "stale": False},
+                "task_heartbeat": {"alive": True, "stale": False},
             },
             "tail_reconcile_active": False,
         }
@@ -70,6 +76,30 @@ class RuntimeHealthTests(unittest.TestCase):
             ok, detail = runtime_health._reducer_readiness()
         self.assertFalse(ok)
         self.assertFalse(detail["tail_reconcile_active"])
+
+    def test_reducer_readiness_requires_task_heartbeat_loop(self):
+        fake_runtime = {
+            "running": True,
+            "loops": {
+                "state_reducer": True,
+                "reducer_metrics_snapshot": True,
+                "task_heartbeat": False,
+            },
+            "loop_details": {
+                "state_reducer": {"alive": True, "stale": False},
+                "reducer_metrics_snapshot": {"alive": True, "stale": False},
+                "task_heartbeat": {"alive": False, "stale": False},
+            },
+            "tail_reconcile_active": True,
+        }
+        with patch("app.runtime_health.get_config") as mock_get_config, patch(
+            "app.runtime_health.get_task_manager"
+        ) as mock_get_task_manager:
+            mock_get_config.return_value.scheduler.enabled = True
+            mock_get_task_manager.return_value.runtime_status.return_value = fake_runtime
+            ok, detail = runtime_health._reducer_readiness()
+        self.assertFalse(ok)
+        self.assertEqual(["task_heartbeat"], detail["missing_loops"])
 
     def test_scheduler_readiness_rejects_stale_loop(self):
         fake_runtime = {
