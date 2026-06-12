@@ -159,21 +159,34 @@ class TaskManagerWorkspaceTests(unittest.TestCase):
             finally:
                 db.close()
 
+            run_unpack_side_effects = [
+                RuntimeError("429 No deployments available for selected model, Try again in 5 seconds."),
+                {"status": "success"},
+            ]
             with patch.object(task_manager_module.logger, "warning") as warning_mock, \
                  patch.object(task_manager_module.logger, "exception") as exception_mock, \
                  patch.object(task_manager_module, "_update_task_error") as update_error_mock, \
+                 patch.object(task_manager_module, "_update_task_result") as update_result_mock, \
                  patch.object(task_manager_module, "_record_task_event") as record_event_mock, \
                  patch.object(task_manager_module, "_register_cancel_hook"), \
                  patch.object(task_manager_module, "_update_task_progress_for_owner"), \
+                 patch.object(task_manager_module, "_should_cancel_run", return_value=False), \
                  patch.object(task_manager_module, "_freeze_task_llm_binding_snapshot", return_value={}), \
                  patch.object(task_manager_module, "resolve_task_runtime_paths", return_value={"input_path": "/tmp/in", "output_path": "/tmp/out"}), \
-                 patch.object(unpacker_engine_module, "run_unpack", side_effect=RuntimeError("429 No deployments available for selected model, Try again in 5 seconds.")):
+                 patch.object(task_manager_module.time, "sleep", return_value=None), \
+                 patch.object(unpacker_engine_module, "run_unpack", side_effect=run_unpack_side_effects):
                 task_manager_module.run_claimed_task_process("task-429", owner_id="owner-1", run_token="rt")
 
             warning_mock.assert_called()
             exception_mock.assert_not_called()
-            update_error_mock.assert_called_once()
-            record_event_mock.assert_called()
+            update_error_mock.assert_not_called()
+            update_result_mock.assert_called_once()
+            self.assertTrue(
+                any(
+                    kwargs.get("event_type") == "task_rate_limited_retrying"
+                    for _, kwargs in record_event_mock.call_args_list
+                )
+            )
 
     def test_resolve_task_runtime_paths_refreshes_manifest_and_uses_original_input(self):
         with tempfile.TemporaryDirectory() as tmp:

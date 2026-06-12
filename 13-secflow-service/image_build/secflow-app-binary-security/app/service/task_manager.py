@@ -18267,11 +18267,12 @@ class TaskManager:
         return min(self._stage_downstream_sync_backoff_max_seconds(), max(1, int(backoff)))
 
     def _next_http_429_retry_backoff_seconds(self, consecutive_error_count: int) -> int:
-        sequence = (5, 10, 15, 20, 25, 30)
-        index = max(0, int(consecutive_error_count) - 1)
-        if index >= len(sequence):
-            return sequence[-1]
-        return sequence[index]
+        del consecutive_error_count
+        return 30
+
+    def _should_emit_http_429_timeline_event(self, consecutive_error_count: int) -> bool:
+        streak = max(0, int(consecutive_error_count or 0))
+        return streak == 1 or (streak > 0 and streak % 10 == 0)
 
     def _read_stage_item_sync_supervisor_state(self, item: BinarySecurityStageItem) -> DownstreamSyncSupervisorState:
         result = self._load_stage_item_result_payload(item)
@@ -19093,6 +19094,12 @@ class TaskManager:
         stage_status_after_reconcile: str | None = None,
         extra_payload: dict[str, Any] | None = None,
     ) -> None:
+        if event_type == "downstream_http_429_retry_scheduled":
+            streak = 0
+            if isinstance(extra_payload, dict):
+                streak = int(extra_payload.get("retry_attempt_count") or 0)
+            if not self._should_emit_http_429_timeline_event(streak):
+                return
         level = "warning" if event_type in {"child_sync_failed", "child_transport_failed", "child_observation_persist_failed", "child_state_apply_failed", "child_archive_status_changed", "downstream_http_429_retry_scheduled"} or str(after_status or "") in {"failed", "cancelled", "downstream_missing"} else "info"
         self._record_event(
             db,

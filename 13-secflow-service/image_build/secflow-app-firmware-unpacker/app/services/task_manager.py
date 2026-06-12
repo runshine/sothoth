@@ -698,6 +698,23 @@ def _is_http_429_error(error: str) -> bool:
     return _extract_http_status_from_error(error) == 429
 
 
+_RATE_LIMIT_RETRY_DELAY_SECONDS = 30
+
+
+def _should_emit_rate_limit_timeline_event(streak: int) -> bool:
+    streak = max(0, int(streak or 0))
+    return streak == 1 or (streak > 0 and streak % 10 == 0)
+
+
+def _sleep_with_cancel_check(task_id: str, run_token: str, seconds: int) -> bool:
+    deadline = time.monotonic() + max(0, int(seconds))
+    while time.monotonic() < deadline:
+        if _should_cancel_run(task_id, run_token):
+            return True
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+    return _should_cancel_run(task_id, run_token)
+
+
 def _trigger_cancel_hook(task_id: str) -> None:
     with _active_cancel_hooks_lock:
         hook = _active_cancel_hooks.get(task_id)
@@ -4856,6 +4873,7 @@ def run_claimed_task_process(task_id: str, *, owner_id: str, run_token: str) -> 
         stage="queued",
     )
 
+    rate_limit_streak = 0
     try:
         if _should_cancel_run(task_id, run_token):
             _mark_task_cancelled(task_id, reason="cancel requested before execution")
@@ -4875,50 +4893,70 @@ def run_claimed_task_process(task_id: str, *, owner_id: str, run_token: str) -> 
         )
 
         os.makedirs(runtime_paths["output_path"], exist_ok=True)
-        result = run_unpack(
-            task_id=task_id,
-            firmware_path=runtime_paths["input_path"],
-            output_path=runtime_paths["output_path"],
-            llm_binding_snapshot=llm_binding_snapshot,
-            cancel_check=lambda: _should_cancel_run(task_id, run_token),
-            register_cancel_hook=lambda hook: _register_cancel_hook(task_id, hook),
-            progress_callback=lambda stage: _update_task_progress_for_owner(
-                task_id,
-                owner_id=owner_id,
-                run_token=run_token,
-                stage=stage,
-            ),
-            event_callback=lambda event_type, summary, **kwargs: _record_task_event(
-                task_id,
-                project_id=task.project_id,
-                event_type=event_type,
-                summary=summary,
-                stage_key=kwargs.pop("stage_key", None),
-                status=kwargs.pop("status", None),
-                detail=kwargs.pop("detail", None),
-                owner_id=kwargs.pop("owner_id", owner_id),
-                created_by=kwargs.pop("created_by", "unpacker_engine"),
-            ),
-        )
-        _update_task_result(task_id, result, run_token=run_token)
-    except Exception as exc:
-        error_text = str(exc)
-        if _is_http_429_error(error_text):
-            logger.warning("task %s rate limited by downstream model pool: %s", task_id, error_text)
-            _record_task_event(
-                task_id,
-                project_id=task.project_id,
-                event_type="task_rate_limited",
-                summary="下游返回 429，等待上游按退让策略重试",
-                stage_key=task.current_stage,
-                status=getattr(task, "status", None),
-                detail={"http_status": 429, "reason": error_text},
-                owner_id=owner_id,
-                created_by="task_manager",
-            )
-        else:
-            logger.exception("task %s failed with exception: %s", task_id, exc)
-        _update_task_error(task_id, error_text, run_token=run_token)
+        while True:
+            try:
+                result = run_unpack(
+                    task_id=task_id,
+                    firmware_path=runtime_paths["input_path"],
+                    output_path=runtime_paths["output_path"],
+                    llm_binding_snapshot=llm_binding_snapshot,
+                    cancel_check=lambda: _should_cancel_run(task_id, run_token),
+                    register_cancel_hook=lambda hook: _register_cancel_hook(task_id, hook),
+                    progress_callback=lambda stage: _update_task_progress_for_owner(
+                        task_id,
+                        owner_id=owner_id,
+                        run_token=run_token,
+                        stage=stage,
+                    ),
+                    event_callback=lambda event_type, summary, **kwargs: _record_task_event(
+                        task_id,
+                        project_id=task.project_id,
+                        event_type=event_type,
+                        summary=summary,
+                        stage_key=kwargs.pop("stage_key", None),
+                        status=kwargs.pop("status", None),
+                        detail=kwargs.pop("detail", None),
+                        owner_id=kwargs.pop("owner_id", owner_id),
+                        created_by=kwargs.pop("created_by", "unpacker_engine"),
+                    ),
+                )
+                rate_limit_streak = 0
+                _update_task_result(task_id, result, run_token=run_token)
+                break
+            except Exception as exc:
+                error_text = str(exc)
+                if not _is_http_429_error(error_text):
+                    logger.exception("task %s failed with exception: %s", task_id, exc)
+                    _update_task_error(task_id, error_text, run_token=run_token)
+                    break
+                rate_limit_streak += 1
+                logger.warning("task %s rate limited by downstream model pool streak=%s: %s", task_id, rate_limit_streak, error_text)
+                if _should_emit_rate_limit_timeline_event(rate_limit_streak):
+                    _record_task_event(
+                        task_id,
+                        project_id=task.project_id,
+                        event_type="task_rate_limited_retrying",
+                        summary=f"下游返回 429，30 秒后重试（连续第 {rate_limit_streak} 次）",
+                        stage_key=task.current_stage,
+                        status=getattr(task, "status", None),
+                        detail={
+                            "http_status": 429,
+                            "reason": error_text,
+                            "retry_delay_seconds": _RATE_LIMIT_RETRY_DELAY_SECONDS,
+                            "consecutive_rate_limit_count": rate_limit_streak,
+                        },
+                        owner_id=owner_id,
+                        created_by="task_manager",
+                    )
+                _update_task_progress_for_owner(
+                    task_id,
+                    owner_id=owner_id,
+                    run_token=run_token,
+                    stage=f"rate_limited_retrying:{rate_limit_streak}",
+                )
+                if _sleep_with_cancel_check(task_id, run_token, _RATE_LIMIT_RETRY_DELAY_SECONDS):
+                    _mark_task_cancelled(task_id, reason="cancel requested during rate limit backoff")
+                    break
     finally:
         _register_cancel_hook(task_id, None)
 

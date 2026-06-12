@@ -25192,7 +25192,7 @@ def _test_http_429_uses_fixed_rate_limit_backoff(self):
     scheduled_events = [event for event in db.events if event.event_type == "downstream_http_429_retry_scheduled"]
     self.assertTrue(scheduled_events)
     self.assertEqual(1, scheduled_events[-1].payload.get("retry_attempt_count"))
-    self.assertEqual(5, scheduled_events[-1].payload.get("retry_delay_seconds"))
+    self.assertEqual(30, scheduled_events[-1].payload.get("retry_delay_seconds"))
 
 
 def _test_http_429_timeline_events_are_compressed(self):

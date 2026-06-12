@@ -155,6 +155,27 @@ class TestLaunch:
             with pytest.raises(RuntimeError, match="verifier failed"):
                 launch(mock_assembled_dir, threat_file)
 
+    def test_rate_limited_failure_retries_until_success(self, mock_assembled_dir, threat_file):
+        with patch("vuln_verify.launcher.load_prompt", return_value="prompt"):
+            with patch("vuln_verify.launcher.time.sleep") as mock_sleep:
+                call_index = {"count": 0}
+
+                def fake_popen(*args, **kwargs):
+                    proc = MagicMock()
+                    if call_index["count"] == 0:
+                        kwargs["stderr"].write("429 too many requests\n")
+                        proc.wait.return_value = 1
+                    else:
+                        proc.wait.return_value = 0
+                    call_index["count"] += 1
+                    return proc
+
+                with patch.object(subprocess, "Popen", side_effect=fake_popen) as mock_popen:
+                    launch(mock_assembled_dir, threat_file)
+
+        assert mock_popen.call_count == 3
+        mock_sleep.assert_called_once_with(30)
+
     def test_cleans_up_temp_files(self, mock_assembled_dir, threat_file, mock_popen_success):
         orig_unlink = Path.unlink
         removed: list[str] = []

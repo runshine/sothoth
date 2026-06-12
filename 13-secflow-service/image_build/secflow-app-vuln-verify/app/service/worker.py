@@ -20,6 +20,17 @@ from app.time_utils import now_local
 
 logger = logging.getLogger(__name__)
 TERMINAL = {"success", "failed", "cancelled"}
+RATE_LIMIT_RETRY_DELAY_SECONDS = 30
+
+
+def _is_rate_limited_text(text: str | None) -> bool:
+    lowered = str(text or "").lower()
+    return "429" in lowered or "rate limit" in lowered or "too many requests" in lowered
+
+
+def _should_emit_rate_limit_event(streak: int) -> bool:
+    streak = max(0, int(streak or 0))
+    return streak == 1 or (streak > 0 and streak % 10 == 0)
 
 
 class VulnVerifyWorker:
@@ -112,98 +123,142 @@ class VulnVerifyWorker:
             self._running.discard(task_id)
 
     async def _run_one(self, task_id: str) -> None:
-        db = get_db_session()
-        try:
-            task = db.query(VulnVerifyTask).filter(VulnVerifyTask.id == task_id).first()
-            if not task or task.status != "running" or task.worker_id != self.owner_id or self._stopping.is_set():
-                return
-            output_dir = Path(task.output_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            stdout_path = output_dir / "service.stdout"
-            stderr_path = output_dir / "service.stderr"
-            cmd = [
-                sys.executable,
-                "-m",
-                "vuln_verify.cli",
-                "--reports",
-                task.reports_dir,
-                "--source-root",
-                task.source_root,
-                "--binary-root",
-                task.binary_root,
-                "--threat",
-                task.threat_path,
-                "--output",
-                task.output_dir,
-                "-j",
-                str(int(task.concurrency or 1)),
-                "-v",
-            ]
-            if task.model:
-                cmd.extend(["--model", task.model])
-            if task.resume:
-                cmd.append("--resume")
-            task.progress = {"message": "正在启动 vuln-verify", "percent": 10, "cmd": _redact_cmd(cmd)}
-            create_event(db, task, "process_starting", "正在启动 vuln-verify CLI", payload={"cmd": _redact_cmd(cmd)})
-            db.commit()
-        finally:
-            db.close()
-
-        if self._stopping.is_set():
-            return
-
-        with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
-            process = subprocess.Popen(cmd, cwd=str(output_dir), stdout=stdout, stderr=stderr, start_new_session=True)
-
-        db = get_db_session()
-        try:
-            task = db.query(VulnVerifyTask).filter(VulnVerifyTask.id == task_id).first()
-            if not task or task.status != "running" or task.worker_id != self.owner_id or self._stopping.is_set():
-                _kill_process_group(process.pid)
-                return
-            task.pid = process.pid
-            task.progress = {"message": "vuln-verify 执行中", "percent": 30, "pid": process.pid}
-            create_event(db, task, "process_started", f"vuln-verify 进程已启动 pid={process.pid}", payload={"pid": process.pid})
-            db.commit()
-        finally:
-            db.close()
-
-        started = time.monotonic()
-        timeout = int(get_config().worker.task_timeout_seconds or 0)
-        return_code: int | None = None
-        while return_code is None:
-            return_code = process.poll()
+        rate_limit_streak = 0
+        while not self._stopping.is_set():
             db = get_db_session()
             try:
                 task = db.query(VulnVerifyTask).filter(VulnVerifyTask.id == task_id).first()
-                if not task or task.worker_id != self.owner_id:
-                    _kill_process_group(process.pid)
+                if not task or task.status != "running" or task.worker_id != self.owner_id or self._stopping.is_set():
                     return
-                if task.status == "cancelling":
-                    _kill_process_group(process.pid)
-                    task.progress = {"message": "正在取消进程组", "percent": 90, "pid": process.pid}
-                    db.commit()
-                elif task.status != "running" or self._stopping.is_set():
-                    _kill_process_group(process.pid)
-                    return
-                elif timeout > 0 and time.monotonic() - started > timeout:
-                    _kill_process_group(process.pid)
-                    task.status = "cancelling"
-                    task.error_reason = f"任务超过超时时间 {timeout}s，已终止"
-                    task.progress = {"message": task.error_reason, "percent": 90, "pid": process.pid}
-                    create_event(db, task, "task_timeout", task.error_reason, level="warning")
-                    db.commit()
-                else:
-                    task.heartbeat_at = now_local()
-                    task.lease_until = now_local() + timedelta(seconds=max(30, get_config().worker.lease_seconds))
-                    db.commit()
+                output_dir = Path(task.output_dir)
+                output_dir.mkdir(parents=True, exist_ok=True)
+                stdout_path = output_dir / "service.stdout"
+                stderr_path = output_dir / "service.stderr"
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "vuln_verify.cli",
+                    "--reports",
+                    task.reports_dir,
+                    "--source-root",
+                    task.source_root,
+                    "--binary-root",
+                    task.binary_root,
+                    "--threat",
+                    task.threat_path,
+                    "--output",
+                    task.output_dir,
+                    "-j",
+                    str(int(task.concurrency or 1)),
+                    "-v",
+                ]
+                if task.model:
+                    cmd.extend(["--model", task.model])
+                if task.resume:
+                    cmd.append("--resume")
+                task.progress = {"message": "正在启动 vuln-verify", "percent": 10, "cmd": _redact_cmd(cmd)}
+                create_event(db, task, "process_starting", "正在启动 vuln-verify CLI", payload={"cmd": _redact_cmd(cmd)})
+                db.commit()
             finally:
                 db.close()
-            if return_code is None:
-                await asyncio.sleep(max(2, get_config().worker.heartbeat_interval_seconds))
-        if return_code is None:
-            return_code = await asyncio.to_thread(process.wait)
 
+            if self._stopping.is_set():
+                return
+
+            with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
+                process = subprocess.Popen(cmd, cwd=str(output_dir), stdout=stdout, stderr=stderr, start_new_session=True)
+
+            db = get_db_session()
+            try:
+                task = db.query(VulnVerifyTask).filter(VulnVerifyTask.id == task_id).first()
+                if not task or task.status != "running" or task.worker_id != self.owner_id or self._stopping.is_set():
+                    _kill_process_group(process.pid)
+                    return
+                task.pid = process.pid
+                task.progress = {"message": "vuln-verify 执行中", "percent": 30, "pid": process.pid}
+                create_event(db, task, "process_started", f"vuln-verify 进程已启动 pid={process.pid}", payload={"pid": process.pid})
+                db.commit()
+            finally:
+                db.close()
+
+            started = time.monotonic()
+            timeout = int(get_config().worker.task_timeout_seconds or 0)
+            return_code: int | None = None
+            while return_code is None:
+                return_code = process.poll()
+                db = get_db_session()
+                try:
+                    task = db.query(VulnVerifyTask).filter(VulnVerifyTask.id == task_id).first()
+                    if not task or task.worker_id != self.owner_id:
+                        _kill_process_group(process.pid)
+                        return
+                    if task.status == "cancelling":
+                        _kill_process_group(process.pid)
+                        task.progress = {"message": "正在取消进程组", "percent": 90, "pid": process.pid}
+                        db.commit()
+                    elif task.status != "running" or self._stopping.is_set():
+                        _kill_process_group(process.pid)
+                        return
+                    elif timeout > 0 and time.monotonic() - started > timeout:
+                        _kill_process_group(process.pid)
+                        task.status = "cancelling"
+                        task.error_reason = f"任务超过超时时间 {timeout}s，已终止"
+                        task.progress = {"message": task.error_reason, "percent": 90, "pid": process.pid}
+                        create_event(db, task, "task_timeout", task.error_reason, level="warning")
+                        db.commit()
+                    else:
+                        task.heartbeat_at = now_local()
+                        task.lease_until = now_local() + timedelta(seconds=max(30, get_config().worker.lease_seconds))
+                        db.commit()
+                finally:
+                    db.close()
+                if return_code is None:
+                    await asyncio.sleep(max(2, get_config().worker.heartbeat_interval_seconds))
+            if return_code is None:
+                return_code = await asyncio.to_thread(process.wait)
+
+            stderr_text = stderr_path.read_text(encoding="utf-8", errors="ignore") if stderr_path.exists() else ""
+            stdout_text = stdout_path.read_text(encoding="utf-8", errors="ignore") if stdout_path.exists() else ""
+            combined_output = f"{stderr_text}\n{stdout_text}"
+            if int(return_code or 0) != 0 and _is_rate_limited_text(combined_output):
+                rate_limit_streak += 1
+                db = get_db_session()
+                try:
+                    task = db.query(VulnVerifyTask).filter(VulnVerifyTask.id == task_id).first()
+                    if not task or task.worker_id != self.owner_id or self._stopping.is_set():
+                        return
+                    task.pid = None
+                    task.return_code = int(return_code)
+                    task.finished_at = None
+                    task.lease_until = now_local() + timedelta(seconds=max(30, get_config().worker.lease_seconds))
+                    task.heartbeat_at = now_local()
+                    task.error_reason = None
+                    task.progress = {
+                        "message": f"下游返回 429，{RATE_LIMIT_RETRY_DELAY_SECONDS}s 后自动重试",
+                        "percent": 30,
+                        "consecutive_rate_limit_count": rate_limit_streak,
+                        "next_retry_delay_seconds": RATE_LIMIT_RETRY_DELAY_SECONDS,
+                    }
+                    if _should_emit_rate_limit_event(rate_limit_streak):
+                        create_event(
+                            db,
+                            task,
+                            "task_rate_limited_retrying",
+                            f"下游返回 429，{RATE_LIMIT_RETRY_DELAY_SECONDS}s 后重试（连续第 {rate_limit_streak} 次）",
+                            level="warning",
+                            payload={
+                                "http_status": 429,
+                                "retry_delay_seconds": RATE_LIMIT_RETRY_DELAY_SECONDS,
+                                "consecutive_rate_limit_count": rate_limit_streak,
+                            },
+                        )
+                    db.commit()
+                finally:
+                    db.close()
+                await asyncio.sleep(RATE_LIMIT_RETRY_DELAY_SECONDS)
+                continue
+            rate_limit_streak = 0
+            break
         db = get_db_session()
         try:
             task = db.query(VulnVerifyTask).filter(VulnVerifyTask.id == task_id).first()

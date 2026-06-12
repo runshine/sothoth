@@ -4,9 +4,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 
 from vuln_dispatch.log import get_logger
 from vuln_verify.prompt import load_prompt
+
+RATE_LIMIT_RETRY_DELAY_SECONDS = 30
+
+
+def _is_rate_limited_output(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return "429" in lowered or "rate limit" in lowered or "too many requests" in lowered
 
 
 def _verify_one(
@@ -39,14 +47,31 @@ def _verify_one(
     if model:
         pi_cmd.extend(["--model", model])
 
-    with open(stdout_file, "w") as f_out, open(stderr_file, "w") as f_err:
-        process = subprocess.Popen(
-            pi_cmd,
-            cwd=str(group_dir),
-            stdout=f_out,
-            stderr=f_err,
+    consecutive_rate_limit_count = 0
+    while True:
+        with open(stdout_file, "w") as f_out, open(stderr_file, "w") as f_err:
+            process = subprocess.Popen(
+                pi_cmd,
+                cwd=str(group_dir),
+                stdout=f_out,
+                stderr=f_err,
+            )
+            returncode = process.wait()
+        if returncode == 0:
+            break
+        stderr_text = stderr_file.read_text(encoding="utf-8", errors="ignore") if stderr_file.exists() else ""
+        stdout_text = stdout_file.read_text(encoding="utf-8", errors="ignore") if stdout_file.exists() else ""
+        combined = f"{stderr_text}\n{stdout_text}"
+        if not _is_rate_limited_output(combined):
+            break
+        consecutive_rate_limit_count += 1
+        log.warning(
+            "verifier_rate_limited",
+            group_id=group_dir.name,
+            consecutive_rate_limit_count=consecutive_rate_limit_count,
+            retry_delay_seconds=RATE_LIMIT_RETRY_DELAY_SECONDS,
         )
-        returncode = process.wait()
+        time.sleep(RATE_LIMIT_RETRY_DELAY_SECONDS)
 
     if returncode == 0:
         log.info("verifier_ok", group_id=group_dir.name)
