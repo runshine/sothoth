@@ -1398,7 +1398,6 @@ class TaskManager:
         effective_token = token
         effective_payload = dict(payload or {})
         if work_key_payload:
-            effective_token = work_key_payload.get("agent_task_key_secret") or token
             effective_payload.update(work_key_payload)
             item_payload = dict(item.payload or {})
             item_payload.update(
@@ -13270,6 +13269,12 @@ class TaskManager:
             task.last_error = summary.get("error") or "总任务产物归档失败"
             self._invalidate_task_execution(task)
             task.finished_at = _now()
+            blocked_item_ids = self._suppress_later_stage_items_after_archive_blocked(
+                db,
+                task,
+                stage_name=stage_name,
+                error_message=task.last_error,
+            )
             observe_task_error("downstream_error", stage=stage_name, result="archive_blocked")
             observe_task_lifecycle("finished", status=task.status, task_type=self._task_type(task))
             observe_task_duration(
@@ -13291,7 +13296,12 @@ class TaskManager:
                 f"阶段业务执行已完成，但总任务产物归档失败，停止后续推进: {stage_name}",
                 level="error",
                 stage_name=stage_name,
-                payload={"stage_status": status, "error": task.last_error, "state_event_id": event.id},
+                payload={
+                    "stage_status": status,
+                    "error": task.last_error,
+                    "state_event_id": event.id,
+                    "blocked_item_ids": blocked_item_ids,
+                },
             )
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
             return
@@ -14221,6 +14231,35 @@ class TaskManager:
             )
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
             return
+        failure_ctx = self._current_stage_authoritative_failure_context(db, task)
+        if (
+            failure_ctx is not None
+            and str(failure_ctx.get("failure_category") or "").strip() == "archive_blocked"
+            and str(failure_ctx.get("stage_name") or "").strip() == str(item.stage_name or "").strip()
+        ):
+            job.archive_status = "success"
+            job.error_message = None
+            job.completed_at = job.completed_at or _now()
+            job.updated_at = _now()
+            self._record_event(
+                db,
+                task,
+                "downstream_archive_apply_blocked_by_authoritative_failure",
+                "归档结果到达时当前阶段已被归档失败阻断，已拒绝晚到回写推进",
+                level="warning",
+                stage_name=item.stage_name,
+                item=item,
+                payload={
+                    "archive_job_id": job.id,
+                    "state_event_id": state_event_id,
+                    "archive_root": archived_root or job.archive_root,
+                    "failure_code": self._string_or_none(failure_ctx.get("failure_code")),
+                    "failure_message": self._string_or_none(failure_ctx.get("failure_message")),
+                    "archive_bound_downstream_task_id": job_bound_downstream_task_id or None,
+                },
+            )
+            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+            return
         try:
             payload = dict(job.payload or {})
             mapped_status = str(payload.get("mapped_status") or "").strip()
@@ -14688,6 +14727,12 @@ class TaskManager:
                     task.dispatch_started_at = None
                     task.lease_expires_at = None
                     task.finished_at = _now()
+                    blocked_item_ids = self._suppress_later_stage_items_after_archive_blocked(
+                        db,
+                        task,
+                        stage_name=stage_name,
+                        error_message=task.last_error,
+                    )
                     observe_task_error("downstream_error", stage=stage_name, result="archive_blocked")
                     observe_task_lifecycle("finished", status=task.status, task_type=self._task_type(task))
                     observe_task_duration(
@@ -14709,7 +14754,11 @@ class TaskManager:
                         f"阶段业务执行已完成，但总任务产物归档失败，停止后续推进: {stage_name}",
                         level="error",
                         stage_name=stage_name,
-                        payload={"stage_status": status, "error": task.last_error},
+                        payload={
+                            "stage_status": status,
+                            "error": task.last_error,
+                            "blocked_item_ids": blocked_item_ids,
+                        },
                     )
                     db.commit()
                     break
@@ -22423,6 +22472,17 @@ class TaskManager:
         if stage_runs is None:
             stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
         stage_run = next((run for run in stage_runs if str(run.stage_name or "").strip() == stage_name), None)
+        if str(task.status or "").strip() == "failed":
+            failure_message = str(task.last_error or "").strip()
+            if failure_message and ("总任务产物归档失败" in failure_message or "archive" in failure_message.lower()):
+                return {
+                    "stage_name": stage_name,
+                    "stage_run": stage_run,
+                    "failure_code": "stage_archive_blocked",
+                    "failure_category": "archive_blocked",
+                    "failure_message": failure_message,
+                    "reason": "authoritative_archive_blocked",
+                }
         if stage_run is not None and self._should_terminalize_parent_for_failed_stage(task, stage_run):
             snapshot = self._stage_failure_snapshot(task, stage_run)
             return {
@@ -22455,6 +22515,77 @@ class TaskManager:
             "failure_message": snapshot.get("failure_message") or snapshot.get("error") or failure_message or getattr(stage_run, "last_error", None),
             "reason": "authoritative_stage_items_terminal",
         }
+
+    def _later_stage_names(self, task: BinarySecurityTask, stage_name: str | None) -> list[str]:
+        current_stage = str(stage_name or "").strip()
+        if not current_stage:
+            return []
+        sequence = [str(name or "").strip() for name in self._stage_sequence_for_task(task) if str(name or "").strip()]
+        try:
+            current_index = sequence.index(current_stage)
+        except ValueError:
+            return []
+        return sequence[current_index + 1 :]
+
+    def _suppress_later_stage_items_after_archive_blocked(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_name: str,
+        error_message: str,
+        archive_job_id: str | None = None,
+        downstream_task_id: str | None = None,
+    ) -> list[str]:
+        blocked_item_ids: list[str] = []
+        blocked_stages = self._later_stage_names(task, stage_name)
+        if not blocked_stages:
+            return blocked_item_ids
+        blocked_at = _now()
+        for blocked_stage_name in blocked_stages:
+            touched_stage = False
+            for item in self._stage_items(db, task.id, blocked_stage_name):
+                if not self._is_active_item_status(item.status):
+                    continue
+                touched_stage = True
+                item.status = "skipped"
+                item.error_message = error_message
+                item.finished_at = blocked_at
+                result_payload = self._merge_stage_item_result(
+                    item,
+                    {
+                        "blocked_by_upstream_archive_failure": True,
+                        "blocked_from_stage": stage_name,
+                        "blocked_reason": error_message,
+                        "blocked_at": _isoformat_or_none(blocked_at),
+                        "blocking_archive_job_id": archive_job_id,
+                        "blocking_downstream_task_id": downstream_task_id,
+                    },
+                )
+                self._clear_stage_item_sync_observation_errors(
+                    item,
+                    result_payload=result_payload,
+                    touched=False,
+                )
+                blocked_item_ids.append(str(item.id or ""))
+                self._record_event(
+                    db,
+                    task,
+                    "downstream_stage_item_blocked_after_archive_failure",
+                    f"上游阶段归档失败，已阻断后续阶段项: {blocked_stage_name}:{item.item_key}",
+                    level="warning",
+                    stage_name=blocked_stage_name,
+                    item=item,
+                    payload={
+                        "blocked_from_stage": stage_name,
+                        "blocking_archive_job_id": archive_job_id,
+                        "blocking_downstream_task_id": downstream_task_id,
+                        "blocked_reason": error_message,
+                    },
+                )
+            if touched_stage:
+                self._refresh_stage_from_authoritative_items(db, task, blocked_stage_name)
+        return blocked_item_ids
 
     def _finalize_task_after_authoritative_failure(
         self,
@@ -27870,26 +28001,83 @@ class TaskManager:
         return {key: payload.get(key) for key in keys if payload.get(key) is not None}
 
     def _archive_job_downstream_payload(self, payload: dict[str, Any] | None) -> dict[str, Any]:
-        compact = self._lightweight_downstream_payload(payload)
-        compact.pop("output_path", None)
+        def _compact_payload_dict(source: dict[str, Any] | None) -> dict[str, Any]:
+            data = source or {}
+            compact = {
+                key: data.get(key)
+                for key in (
+                    "id",
+                    "task_id",
+                    "status",
+                    "result_status",
+                    "message",
+                    "error",
+                    "error_message",
+                    "output_root",
+                    "work_dir",
+                    "task_root",
+                )
+                if data.get(key) not in (None, "", [], {})
+            }
+            return compact
+
+        compact = _compact_payload_dict(payload)
         payload = payload or {}
-        for key in ("output_root", "work_dir", "task_root"):
-            value = payload.get(key)
-            if value is not None:
-                compact[key] = value
         for key in ("result", "artifacts", "artifact", "data"):
             nested = payload.get(key)
             if not isinstance(nested, dict):
                 continue
-            nested_compact = self._lightweight_downstream_payload(nested)
-            nested_compact.pop("output_path", None)
-            for nested_key in ("output_root", "work_dir", "task_root"):
-                value = nested.get(nested_key)
-                if value is not None:
-                    nested_compact[nested_key] = value
+            nested_compact = _compact_payload_dict(nested)
             if nested_compact:
                 compact[key] = nested_compact
         return compact
+
+    @staticmethod
+    def _archive_job_payload_size(payload: dict[str, Any] | None) -> int:
+        try:
+            return len(json.dumps(payload or {}, ensure_ascii=False))
+        except Exception:
+            return 0
+
+    def _trim_archive_job_payload_for_storage(
+        self,
+        payload: dict[str, Any] | None,
+        *,
+        max_bytes: int = 16 * 1024,
+    ) -> dict[str, Any]:
+        compact = dict(payload or {})
+        if self._archive_job_payload_size(compact) <= max_bytes:
+            return compact
+        downstream_payload = dict(compact.get("downstream_payload") or {})
+        if downstream_payload:
+            trimmed_downstream = {
+                key: downstream_payload.get(key)
+                for key in ("status", "error", "error_message", "task_id", "id", "output_root")
+                if downstream_payload.get(key) not in (None, "", [], {})
+            }
+            compact["downstream_payload"] = trimmed_downstream
+        if self._archive_job_payload_size(compact) <= max_bytes:
+            return compact
+        for key in ("extra_paths", "archive_source_paths"):
+            values = compact.get(key)
+            if isinstance(values, list) and len(values) > 3:
+                compact[key] = values[:3]
+        if self._archive_job_payload_size(compact) <= max_bytes:
+            return compact
+        fallback = {
+            key: compact.get(key)
+            for key in (
+                "mapped_status",
+                "before_status",
+                "force",
+                "bound_downstream_task_id",
+                "archive_source_primary_path",
+            )
+            if compact.get(key) not in (None, "", [], {})
+        }
+        if compact.get("downstream_payload"):
+            fallback["downstream_payload"] = compact.get("downstream_payload")
+        return fallback
 
     def _build_archive_job_payload(
         self,
@@ -27904,7 +28092,7 @@ class TaskManager:
     ) -> dict[str, Any]:
         preserved = dict(previous_payload or {})
         preserved.pop("archive_copy_stats", None)
-        return {
+        payload_for_storage = {
             **preserved,
             "mapped_status": mapped_status,
             "before_status": before_status,
@@ -27913,6 +28101,7 @@ class TaskManager:
             "downstream_payload": self._archive_job_downstream_payload(payload),
             "extra_paths": [str(path) for path in (extra_paths or [])],
         }
+        return self._trim_archive_job_payload_for_storage(payload_for_storage)
 
     def _with_archive_source_payload(
         self,

@@ -14700,6 +14700,94 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("latest_binding_mismatch", self.manager._load_stage_item_result_payload(item))
         self.assertIn("archive_binding_mismatch_detected", [event.event_type for event in db.events])
 
+    def test_apply_archive_job_status_blocks_late_apply_after_archive_blocked_failure(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="firmware_unpack",
+            firmware_source="project_filesystem",
+            firmware_path="/fw.bin",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        task.last_error = "总任务产物归档失败: payload too large"
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="firmware_unpack",
+            item_key="fw-1",
+            status="success",
+            downstream_service="firmware_unpacker",
+            downstream_task_id="child1",
+        )
+        later_item = BinarySecurityStageItem(
+            id="si2",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr2",
+            stage_name="system_analysis",
+            item_key="fw-1",
+            status="running",
+            downstream_service="system_analyse",
+            downstream_task_id="sat1",
+        )
+        job = BinarySecurityArchiveJob(
+            id="job1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            item_id="si1",
+            item_key="fw-1",
+            downstream_service="firmware_unpacker",
+            downstream_task_id="child1",
+            archive_status="archived",
+        )
+        job.payload = {
+            "mapped_status": "success",
+            "bound_downstream_task_id": "child1",
+            "downstream_payload": {"task_id": "child1", "status": "success"},
+        }
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item, later_item], archive_jobs=[job])
+
+        original_reconcile = self.manager._reconcile_stage_and_task_state_after_item_update
+        original_refresh_terminal = self.manager._refresh_terminal_item_result_from_downstream
+        original_write = self.manager._write_task_metadata_async
+        reconciled = []
+
+        def _capture_reconcile(_db, current_task, current_stage):
+            reconciled.append((current_task.id, current_stage))
+
+        async def _noop_refresh_terminal(*_args, **_kwargs):
+            return None
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._reconcile_stage_and_task_state_after_item_update = _capture_reconcile
+        self.manager._refresh_terminal_item_result_from_downstream = _noop_refresh_terminal
+        self.manager._write_task_metadata_async = _noop_write
+        try:
+            asyncio.run(self.manager._apply_archive_job_status_locked(db, "job1", "/tmp/archive"))
+        finally:
+            self.manager._reconcile_stage_and_task_state_after_item_update = original_reconcile
+            self.manager._refresh_terminal_item_result_from_downstream = original_refresh_terminal
+            self.manager._write_task_metadata_async = original_write
+
+        self.assertEqual("success", job.archive_status)
+        self.assertEqual("success", item.status)
+        self.assertEqual("failed", task.status)
+        self.assertEqual("firmware_unpack", task.current_stage)
+        self.assertFalse(reconciled)
+        self.assertIn(
+            "downstream_archive_apply_blocked_by_authoritative_failure",
+            [event.event_type for event in db.events],
+        )
+
     def test_archive_downstream_output_records_copy_stats_only_in_output_ref(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             task = BinarySecurityTask(
@@ -17986,7 +18074,7 @@ def _test_archive_job_payload_uses_compact_downstream_payload(self):
     payload = job.payload
     downstream_payload = payload["downstream_payload"]
     self.assertEqual("sat1", downstream_payload["task_id"])
-    self.assertEqual("/tmp/system-analysis/sat1", downstream_payload["workspace_root"])
+    self.assertNotIn("workspace_root", downstream_payload)
     self.assertEqual("/tmp/system-analysis/sat1/output", downstream_payload["result"]["output_root"])
     self.assertNotIn("modules", downstream_payload)
     self.assertNotIn("modules", downstream_payload["result"])
@@ -18033,6 +18121,70 @@ def _test_archive_job_payload_does_not_persist_bound_output_path(self):
     self.assertNotIn("bound_output_path", payload)
     self.assertEqual(long_output_path, payload["downstream_payload"]["output_path"])
     self.assertLess(len(job.payload_json or ""), len(long_output_path))
+
+def _test_suppress_later_stage_items_after_archive_blocked_marks_future_items_skipped(self):
+    task = BinarySecurityTask(
+        id="task1",
+        project_id="p1",
+        name="n",
+        status="running",
+        current_stage="firmware_unpack",
+        task_type=TASK_TYPE_BINARY,
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    stage_run = BinarySecurityStageRun(
+        id="sr1",
+        task_id="task1",
+        project_id="p1",
+        stage_name="system_analysis",
+        sequence_no=2,
+        status="running",
+    )
+    running_item = BinarySecurityStageItem(
+        id="si1",
+        task_id="task1",
+        project_id="p1",
+        stage_run_id="sr1",
+        stage_name="system_analysis",
+        item_key="fw1",
+        item_name="fw1",
+        status="running",
+        downstream_service="system_analyse",
+        downstream_task_id="sat1",
+    )
+    queued_item = BinarySecurityStageItem(
+        id="si2",
+        task_id="task1",
+        project_id="p1",
+        stage_run_id="sr1",
+        stage_name="entry_analysis",
+        item_key="mod1",
+        item_name="mod1",
+        parent_key="fw1",
+        status="queued",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[running_item, queued_item], events=[])
+
+    blocked = self.manager._suppress_later_stage_items_after_archive_blocked(
+        db,
+        task,
+        stage_name="firmware_unpack",
+        error_message="总任务产物归档失败",
+        archive_job_id="aj1",
+        downstream_task_id="child1",
+    )
+
+    self.assertEqual({"si1", "si2"}, set(blocked))
+    self.assertEqual("skipped", running_item.status)
+    self.assertEqual("skipped", queued_item.status)
+    self.assertEqual("总任务产物归档失败", running_item.error_message)
+    self.assertTrue(self.manager._load_stage_item_result_payload(running_item).get("blocked_by_upstream_archive_failure"))
+    self.assertTrue(any(event.event_type == "downstream_stage_item_blocked_after_archive_failure" for event in db.events))
 
 def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payload_changes(self):
     task = BinarySecurityTask(
