@@ -4057,7 +4057,7 @@ class TaskManager:
             ("binary_to_source", "secflow_b2s_task", "id", "parent_task_id", "parent_stage_name"),
             ("system_analyse", "secflow_app_sa_tasks", "task_id", "parent_task_id", "parent_stage_name"),
             ("entry_analyse", "secflow_app_ea_tasks", "task_id", "parent_task_id", "parent_stage_name"),
-            ("dataflow_vuln_scan", "secflow_dataflow_vuln_scan_run_index", "id", "linked_task_id", None),
+            ("dataflow_vuln_scan", "secflow_dataflow_vuln_scanner_run_index", "id", "linked_task_id", None),
         ]
 
     def _discover_parent_linked_downstream_refs_detailed(
