@@ -1,0 +1,35 @@
+name: tag-release-images
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (v1 or v2)'
+        required: true
+        type: choice
+        options:
+          - v1
+          - v2
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
+      - name: Tag v1
+        if: inputs.version == 'v1'
+        run: |
+          docker pull ghcr.io/runshine/secflow-app-system-analyse:20260611-074409-9343771
+          docker tag ghcr.io/runshine/secflow-app-system-analyse:20260611-074409-9343771 ghcr.io/runshine/secflow-app-system-analyse:v1
+          docker push ghcr.io/runshine/secflow-app-system-analyse:v1
+
+      - name: Tag v2
+        if: inputs.version == 'v2'
+        run: |
+          docker pull ghcr.io/runshine/secflow-app-system-analyse:20260612-160414-caff02c3
+          docker tag ghcr.io/runshine/secflow-app-system-analyse:20260612-160414-caff02c3 ghcr.io/runshine/secflow-app-system-analyse:v2
+          docker push ghcr.io/runshine/secflow-app-system-analyse:v2
