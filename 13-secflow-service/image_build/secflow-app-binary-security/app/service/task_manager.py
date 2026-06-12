@@ -2453,6 +2453,13 @@ class TaskManager:
             "system_analysis_modules": [],
             "candidate_modules": [],
             "selected_modules": [],
+            "runtime_task_keys": {
+                "root_task_key_secret": str(payload.root_task_key_secret or "").strip() or None,
+                "root_task_key_id": str(payload.root_task_key_id or "").strip() or None,
+                "root_task_key_name": str(payload.root_task_key_name or "").strip() or None,
+                "root_task_key_prefix": str(payload.root_task_key_prefix or "").strip() or None,
+                "task_key_source": str(payload.task_key_source or "").strip() or None,
+            },
         }
         task.metrics = {
             "high_risk_module_count": 0,
