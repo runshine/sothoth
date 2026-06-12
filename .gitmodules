@@ -15,3 +15,7 @@
 	path = 101-Chimera-deploy
 	url = https://github.com/GaiaSecHW/Chimera-deploy.git
 	branch = main
+[submodule "13-secflow-service/image_build/chirmera-platform-schedule"]
+	path = 13-secflow-service/image_build/chirmera-platform-schedule
+	url = https://github.com/GaiaSecHW/chirmera-platform-schedule.git
+	branch = main
