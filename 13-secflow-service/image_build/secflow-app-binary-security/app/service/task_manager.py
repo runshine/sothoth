@@ -2876,7 +2876,7 @@ class TaskManager:
             archive_jobs_by_item = self._archive_jobs_by_item_id(ctx.archive_jobs)
             archive_job_responses = self._archive_job_responses(db, ctx.task, ctx.archive_jobs)
             stage_item_responses = [
-                self._stage_item_response(item, archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []))
+                self._stage_item_response(ctx.task, item, archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []))
                 for item in ctx.stage_items[:DETAIL_STAGE_ITEMS_LIMIT]
             ]
             overview_nodes = self._build_stage_overview_nodes(
@@ -2966,7 +2966,7 @@ class TaskManager:
             total=total,
             page=page,
             per_page=per_page,
-            items=[self._stage_item_response(item, archive_jobs=archive_jobs_by_item.get(str(item.id or ""), [])) for item in rows],
+            items=[self._stage_item_response(task, item, archive_jobs=archive_jobs_by_item.get(str(item.id or ""), [])) for item in rows],
         )
 
     def get_orchestration_observability(self, db: Session, *, project_id: str, task_id: str) -> dict[str, Any]:
@@ -19566,7 +19566,12 @@ class TaskManager:
             related_event_ids=list(related_event_ids or []),
         )
 
-    def _stage_item_abnormal_reason(self, item: BinarySecurityStageItem) -> BinarySecurityAbnormalReason | None:
+    def _stage_item_abnormal_reason(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        task: BinarySecurityTask | None = None,
+    ) -> BinarySecurityAbnormalReason | None:
         status = self._normalize_downstream_status(item.status) or str(item.status or "")
         if status not in {"failed", "cancelled", "downstream_missing", "partial_success"}:
             return None
@@ -19592,7 +19597,7 @@ class TaskManager:
                 error_type=self._stage_item_sync_error_type_value(item),
                 item=item,
             ):
-                exhausted = self._owner_lost_retry_exhausted(task, item)
+                exhausted = bool(task is not None and self._owner_lost_retry_exhausted(task, item))
                 code = "owner_lost_retry_exhausted" if exhausted else "owner_lost_recoverable"
                 title = "下游 owner 丢失自动恢复失败" if exhausted else "下游 owner 丢失，等待自动恢复"
                 category = "infrastructure"
@@ -19716,13 +19721,21 @@ class TaskManager:
 
     def _stage_abnormal_reason(
         self,
+        task: BinarySecurityTask,
         stage_name: str,
         summary: BinarySecurityStageSummary,
         stage_items: list[BinarySecurityStageItem],
     ) -> BinarySecurityAbnormalReason | None:
         if summary.status not in {"failed", "cancelled", "partial_success", "downstream_missing"}:
             return None
-        item_reason = next((self._stage_item_abnormal_reason(item) for item in reversed(stage_items) if self._stage_item_abnormal_reason(item)), None)
+        item_reason = next(
+            (
+                self._stage_item_abnormal_reason(item, task=task)
+                for item in reversed(stage_items)
+                if self._stage_item_abnormal_reason(item, task=task)
+            ),
+            None,
+        )
         if item_reason is not None:
             return item_reason.model_copy(update={"source_layer": "stage", "service": "binary-security", "stage_name": stage_name})
         message = self._abnormal_reason_message(summary.last_error, f"阶段 {stage_name} 异常结束")
@@ -19784,12 +19797,17 @@ class TaskManager:
                 return archive_reason.model_copy(update={"source_layer": "task", "status": status})
         failed_item = next((item for item in reversed(items) if (self._normalize_downstream_status(item.status) or item.status) in {"failed", "cancelled", "downstream_missing"}), None)
         if failed_item is not None:
-            item_reason = self._stage_item_abnormal_reason(failed_item)
+            item_reason = self._stage_item_abnormal_reason(failed_item, task=task)
             if item_reason is not None:
                 return item_reason.model_copy(update={"source_layer": "task", "status": status})
         failed_stage = next((summary for summary in reversed(stage_summaries) if summary.status in {"failed", "partial_success", "downstream_missing", "cancelled"}), None)
         if failed_stage is not None:
-            stage_reason = self._stage_abnormal_reason(failed_stage.stage_name, failed_stage, [item for item in items if item.stage_name == failed_stage.stage_name])
+            stage_reason = self._stage_abnormal_reason(
+                task,
+                failed_stage.stage_name,
+                failed_stage,
+                [item for item in items if item.stage_name == failed_stage.stage_name],
+            )
             if stage_reason is not None:
                 return stage_reason.model_copy(update={"source_layer": "task", "status": status})
         next_stage = None
@@ -19986,7 +20004,7 @@ class TaskManager:
                     )
                 ),
             )
-            stage_summary.abnormal_reason = self._stage_abnormal_reason(stage_name, stage_summary, stage_items)
+            stage_summary.abnormal_reason = self._stage_abnormal_reason(task, stage_name, stage_summary, stage_items)
             summaries.append(stage_summary)
         return summaries
 
@@ -21633,6 +21651,7 @@ class TaskManager:
 
     def _stage_item_response(
         self,
+        task: BinarySecurityTask,
         item: BinarySecurityStageItem,
         *,
         archive_jobs: list[BinarySecurityArchiveJob] | None = None,
@@ -21737,7 +21756,7 @@ class TaskManager:
             output_ref=output_ref,
             result=result,
             error_message=item.error_message,
-            abnormal_reason=self._stage_item_abnormal_reason(item),
+            abnormal_reason=self._stage_item_abnormal_reason(item, task=task),
             sync_status=str(sync_status) if sync_status is not None else None,
             last_synced_at=parsed_last_synced_at,
             last_sync_attempt_at=parsed_last_attempt_at if isinstance(parsed_last_attempt_at, datetime) else None,

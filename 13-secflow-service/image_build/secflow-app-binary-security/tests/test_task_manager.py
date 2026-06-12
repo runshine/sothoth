@@ -3796,6 +3796,61 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("任务运行中", response.items[0].abnormal_reason_title)
         self.assertEqual("blocked", response.items[0].manual_operation_state["overall"])
 
+    def test_list_tasks_owner_lost_stage_summary_uses_task_context_without_name_error(self):
+        task = BinarySecurityTask(
+            id="t-owner-lost",
+            project_id="p1",
+            name="source",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming", "max_retries_per_item": 2}),
+        )
+        task.policy = {"pipeline_mode": "mixed_streaming", "max_retries_per_item": 2}
+        run = BinarySecurityStageRun(
+            id="sr-owner-lost",
+            task_id=task.id,
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="failed",
+            last_error="Task owner pod lost",
+        )
+        item = BinarySecurityStageItem(
+            id="si-owner-lost",
+            task_id=task.id,
+            project_id="p1",
+            stage_run_id=run.id,
+            stage_name="system_analysis",
+            item_key="fw.bin",
+            item_name="fw.bin",
+            item_identity_key="fw.bin::",
+            status="failed",
+            retry_count=1,
+            downstream_service="system_analyse",
+            downstream_task_id="sat-owner-lost",
+            error_message="Task owner pod lost",
+            result={
+                "sync_observation": {
+                    "sync_status": "transport_error",
+                    "error_type": "StaleTaskExecution",
+                    "error_message": "任务 t-owner-lost 当前执行 token 已失效",
+                }
+            },
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item])
+
+        response = self.manager.list_tasks(db, project_id="p1", task_type="source")
+
+        self.assertEqual(1, response.total)
+        summary_by_stage = {summary.stage_name: summary for summary in response.items[0].stage_summaries}
+        self.assertEqual("owner_lost_recoverable", summary_by_stage["system_analysis"].abnormal_reason.code)
+        self.assertEqual("下游 owner 丢失，等待自动恢复", summary_by_stage["system_analysis"].abnormal_reason.title)
+
     def test_stage_run_output_summary_db_payload_is_hard_capped(self):
         task = BinarySecurityTask(
             id="t1",
