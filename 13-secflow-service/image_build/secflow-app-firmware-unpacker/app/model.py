@@ -193,6 +193,7 @@ class UnpackTask(Base):
             "pre_cleanup_scan_id": self.pre_cleanup_scan_id,
             "post_cleanup_scan_id": self.post_cleanup_scan_id,
             "last_cleanup_residual_count": self.last_cleanup_residual_count,
+            "llm_binding_snapshot": self.llm_binding_snapshot,
             "created_at": isoformat_local(self.created_at),
             "started_at": isoformat_local(self.started_at),
             "completed_at": isoformat_local(self.completed_at),
