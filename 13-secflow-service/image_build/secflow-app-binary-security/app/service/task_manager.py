@@ -1108,14 +1108,22 @@ class TaskManager:
     ) -> bool:
         normalized_type = str(error_type or "").strip().lower()
         normalized_message = str(error_message or "").strip().lower()
-        if normalized_type != "staletaskexecution":
-            return False
         owned_execution_tokens = (
             "当前执行 token 已失效",
             "缺少当前执行 token",
+            "当前 owned_execution runtime lease owner 已变更",
+            "当前 owned_execution runtime lease 已失效",
+            "当前执行 owner 已变更",
+            "当前执行 lease 已失效",
             "current execution token expired",
             "missing current execution token",
+            "owned_execution runtime lease owner changed",
+            "owned_execution runtime lease expired",
+            "current execution owner changed",
+            "current execution lease expired",
         )
+        if normalized_type == "staletaskexecution":
+            return any(token.lower() in normalized_message for token in owned_execution_tokens)
         return any(token.lower() in normalized_message for token in owned_execution_tokens)
 
     def _task_is_waiting_for_manual_confirmation(
@@ -27825,9 +27833,16 @@ class TaskManager:
                         await self._cancel_downstream(item, self._service_token())
                     return "cancelled", payload
                 await asyncio.sleep(self.cfg.scheduler.stage_poll_interval_seconds)
+            except StaleTaskExecution:
+                raise
             except NotFoundError:
                 return "downstream_missing", {"status": "downstream_missing", "error": "下游子任务不存在"}
             except Exception as exc:
+                if self._is_owned_execution_stale_error(
+                    error_message=str(exc),
+                    error_type=getattr(type(exc), "__name__", None),
+                ):
+                    raise StaleTaskExecution(str(exc)) from exc
                 if item is not None:
                     await asyncio.to_thread(
                         self._record_polled_child_sync_failure,

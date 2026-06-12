@@ -26335,6 +26335,47 @@ def _test_record_polled_child_sync_failure_marks_owned_execution_owner_lost(self
     self.assertEqual(1, int(item.retry_count or 0))
 
 
+def _test_record_polled_child_sync_failure_marks_owned_execution_runtime_owner_change_as_owner_lost(self):
+    task = BinarySecurityTask(
+        id="task-owned-runtime-stale",
+        project_id="p1",
+        name="n",
+        status="dispatching",
+        current_stage="dataflow_vuln_scan",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = BinarySecurityStageItem(
+        id="item-owned-runtime-stale",
+        task_id="task-owned-runtime-stale",
+        project_id="p1",
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-1",
+        status="running",
+        downstream_task_id="dfa-1",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[item])
+
+    with patch.object(task_manager_module, "get_session_factory", return_value=lambda: db):
+        self.manager._record_polled_child_sync_failure(
+            task_id="task-owned-runtime-stale",
+            item_id="item-owned-runtime-stale",
+            error_message="任务 task-owned-runtime-stale 当前 owned_execution runtime lease owner 已变更",
+            error_type="RuntimeError",
+            http_status=None,
+        )
+
+    events = [event for event in db.added if isinstance(event, BinarySecurityEvent)]
+    self.assertEqual(3, len(events))
+    self.assertEqual("owned_execution_owner_lost", events[0].event_type)
+    self.assertEqual("child_owner_lost_detected", events[1].event_type)
+    self.assertEqual("child_owner_lost_requeue_scheduled", events[2].event_type)
+    self.assertEqual(1, int(item.retry_count or 0))
+
+
 def _test_record_polled_child_sync_failure_marks_owner_lost_exhausted_after_retry_budget(self):
     task = BinarySecurityTask(
         id="task-owned-stale-exhausted",
@@ -28165,6 +28206,7 @@ TaskManagerTests.test_reducer_sync_downstream_status_reclaims_pending_tail_recon
 TaskManagerTests.test_start_reducer_role_runs_reconcile_loops = _test_start_reducer_role_runs_reconcile_loops
 TaskManagerTests.test_tail_control_plane_stale_error_does_not_pollute_sync_error = _test_tail_control_plane_stale_error_does_not_pollute_sync_error
 TaskManagerTests.test_record_polled_child_sync_failure_marks_owned_execution_owner_lost = _test_record_polled_child_sync_failure_marks_owned_execution_owner_lost
+TaskManagerTests.test_record_polled_child_sync_failure_marks_owned_execution_runtime_owner_change_as_owner_lost = _test_record_polled_child_sync_failure_marks_owned_execution_runtime_owner_change_as_owner_lost
 TaskManagerTests.test_record_polled_child_sync_failure_marks_owner_lost_exhausted_after_retry_budget = _test_record_polled_child_sync_failure_marks_owner_lost_exhausted_after_retry_budget
 TaskManagerTests.test_record_polled_child_sync_failure_keeps_tail_owner_lost_for_tail_stale = _test_record_polled_child_sync_failure_keeps_tail_owner_lost_for_tail_stale
 TaskManagerTests.test_worker_skips_tail_tasks_in_downstream_reconcile_candidates = _test_worker_skips_tail_tasks_in_downstream_reconcile_candidates

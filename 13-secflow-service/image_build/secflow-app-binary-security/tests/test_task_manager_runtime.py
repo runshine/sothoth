@@ -1017,6 +1017,39 @@ class StreamingTailTakeoverTests(unittest.TestCase):
         self.assertEqual(1, len(failures))
         self.assertEqual("db_connection_refused", failures[0]["error_type"])
 
+    async def test_poll_until_terminal_raises_immediately_when_owned_execution_owner_changes(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(id="task-1", project_id="project-1")
+        item = type("Item", (), {"id": "item-1", "downstream_task_id": "child-1"})()
+        failures = []
+
+        async def _ensure(_task):
+            return None
+
+        async def _touch(_task_id):
+            return None
+
+        def _record_failure(**kwargs):
+            failures.append(kwargs)
+
+        async def _fetch():
+            raise RuntimeError("任务 task-1 当前 owned_execution runtime lease owner 已变更")
+
+        manager._ensure_task_execution_current_async = _ensure
+        manager._touch_task_heartbeat_async = _touch
+        manager._record_polled_child_sync_failure = _record_failure
+
+        with self.assertRaises(StaleTaskExecution):
+            await manager._poll_until_terminal(
+                _fetch,
+                success_statuses={"success"},
+                failure_statuses={"failed", "cancelled"},
+                task=task,
+                item=item,
+            )
+
+        self.assertEqual([], failures)
+
     async def test_ensure_task_execution_current_async_uses_tail_runtime_lease(self):
         manager = TaskManager()
         manager.instance_id = "worker-a"
