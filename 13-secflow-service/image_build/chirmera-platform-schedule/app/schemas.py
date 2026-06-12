@@ -346,6 +346,35 @@ class UserTaskDispatchRequest(BaseModel):
     force: bool = False
 
 
+class UserTaskBulkDeleteFilters(BaseModel):
+    status: Optional[str] = None
+    task_type: Optional[str] = None
+    search: Optional[str] = None
+    has_error: bool = False
+    is_retrying: bool = False
+
+
+class UserTaskBulkDeleteRequest(BaseModel):
+    task_ids: list[str] = Field(default_factory=list)
+    filters: Optional[UserTaskBulkDeleteFilters] = None
+    select_all_matching: bool = False
+
+
+class UserTaskDeleteResult(BaseModel):
+    task_id: str
+    task_type: Optional[str] = None
+    downstream_task_id: Optional[str] = None
+    status: str
+    message: str
+
+
+class UserTaskBulkDeleteResponse(BaseModel):
+    total_requested: int
+    deleted_count: int
+    failed_count: int
+    results: list[UserTaskDeleteResult] = Field(default_factory=list)
+
+
 class UserTaskDispatchResponse(BaseModel):
     id: str
     user_task_id: str

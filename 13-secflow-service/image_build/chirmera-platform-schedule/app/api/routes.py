@@ -28,6 +28,8 @@ from app.schemas import (
     VirtualKeyListResponse,
     VirtualKeyResponse,
     UserTaskCreateRequest,
+    UserTaskBulkDeleteRequest,
+    UserTaskBulkDeleteResponse,
     UserTaskDispatchListResponse,
     UserTaskDispatchRequest,
     UserTaskListResponse,
@@ -190,6 +192,44 @@ async def get_user_task(project_id: str, task_id: str, _: TokenUser = Depends(ge
     token = _token_from_header(authorization)
     task = await get_user_task_manager().get_task_detail(db, project_id, task_id, token)
     return UserTaskResponse.model_validate(task)
+
+
+@router.delete("/projects/{project_id}/user-tasks/{task_id}", response_model=UserTaskBulkDeleteResponse)
+async def delete_user_task(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    token = _token_from_header(authorization)
+    return await get_user_task_manager().delete_tasks(
+        db,
+        project_id=project_id,
+        bearer_token=token,
+        task_ids=[task_id],
+        select_all_matching=False,
+        filters=None,
+    )
+
+
+@router.post("/projects/{project_id}/user-tasks/bulk-delete", response_model=UserTaskBulkDeleteResponse)
+async def bulk_delete_user_tasks(
+    project_id: str,
+    payload: UserTaskBulkDeleteRequest,
+    _: TokenUser = Depends(get_current_context),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    token = _token_from_header(authorization)
+    return await get_user_task_manager().delete_tasks(
+        db,
+        project_id=project_id,
+        bearer_token=token,
+        task_ids=payload.task_ids,
+        select_all_matching=payload.select_all_matching,
+        filters=payload.filters.model_dump() if payload.filters else None,
+    )
 
 
 @router.post("/projects/{project_id}/user-tasks/{task_id}/dispatch", response_model=UserTaskResponse)

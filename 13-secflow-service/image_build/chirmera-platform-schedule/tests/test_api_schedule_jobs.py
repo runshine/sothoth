@@ -772,3 +772,152 @@ def test_ai4apk_dispatch_propagates_422_error_message(client, tmp_path):
             assert detail_body["dispatch_status"] == "dispatch_failed"
             assert detail_body["business_status"] == "failed"
             assert "422" in str(detail_body["last_error"] or "")
+
+
+def test_delete_user_task_deletes_binary_security_parent_after_downstream_success(client):
+    payload = {
+        "task_type": "binary_firmware_e2e",
+        "name": "delete-me",
+        "description": "demo",
+        "input_upload_ids": ["upload-001"],
+        "input_binding": {
+            "upload_id": "upload-001",
+            "selection_type": "file",
+            "relative_path": "firmware.bin",
+        },
+        "policy": {},
+        "dispatch_policy": {},
+    }
+    with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
+        auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
+        project_factory.return_value.require_access = AsyncMock(side_effect=_fake_require_access)
+        with patch("app.service.user_task_manager.ProjectInputResolver.resolve_single", new=AsyncMock(return_value=_resolved_input())), \
+             patch("app.service.user_task_manager.ProjectInputResolver.resolve_path", new=AsyncMock(return_value={
+                 "relative_path": "firmware.bin",
+                 "absolute_path": "/data/files/proj1/user_input/software/upload-001/firmware.bin",
+                 "node_type": "file",
+                 "name": "firmware.bin",
+             })), \
+             patch("app.service.user_task_manager.BinarySecurityDispatchClient.delete_task", new=AsyncMock(return_value=None)):
+            create_resp = client.post("/api/chirmera-platform-schedule/projects/proj1/user-tasks", json=payload, headers=_auth_headers())
+            task_id = create_resp.json()["id"]
+            from app.model import get_db_session, ScheduleUserTask
+            db = get_db_session()
+            try:
+                task = db.query(ScheduleUserTask).filter(ScheduleUserTask.id == task_id).first()
+                task.downstream_task_id = task_id
+                db.commit()
+            finally:
+                db.close()
+            delete_resp = client.delete(f"/api/chirmera-platform-schedule/projects/proj1/user-tasks/{task_id}", headers=_auth_headers())
+            assert delete_resp.status_code == 200, delete_resp.text
+            body = delete_resp.json()
+            assert body["deleted_count"] == 1
+            assert body["failed_count"] == 0
+            assert body["results"][0]["status"] == "deleted"
+            detail_resp = client.get(f"/api/chirmera-platform-schedule/projects/proj1/user-tasks/{task_id}", headers=_auth_headers())
+            assert detail_resp.status_code == 404
+
+
+def test_delete_user_task_rejects_unsupported_ai4red(client, tmp_path):
+    deliver_dir = tmp_path / "deliver-dir"
+    deliver_dir.mkdir(parents=True)
+    payload = {
+        "task_type": "ai4red",
+        "name": "ai4red-delete",
+        "description": "demo",
+        "input_upload_ids": ["upload-001"],
+        "input_binding": {
+            "upload_id": "upload-001",
+            "selection_type": "directory",
+            "relative_path": "deliver-dir",
+        },
+        "policy": {},
+        "dispatch_policy": {},
+    }
+    with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
+        auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
+        project_factory.return_value.require_access = AsyncMock(side_effect=_fake_require_access)
+        with patch("app.service.user_task_manager.ProjectInputResolver.resolve_single", new=AsyncMock(return_value=_resolved_input(str(tmp_path), "document"))), \
+             patch("app.service.user_task_manager.ProjectInputResolver.resolve_path", new=AsyncMock(return_value={
+                 "relative_path": "deliver-dir",
+                 "absolute_path": str(deliver_dir),
+                 "node_type": "directory",
+                 "name": "deliver-dir",
+             })):
+            create_resp = client.post("/api/chirmera-platform-schedule/projects/proj1/user-tasks", json=payload, headers=_auth_headers())
+            task_id = create_resp.json()["id"]
+            from app.model import get_db_session, ScheduleUserTask
+            db = get_db_session()
+            try:
+                task = db.query(ScheduleUserTask).filter(ScheduleUserTask.id == task_id).first()
+                task.downstream_task_id = "ai4red-task-1"
+                db.commit()
+            finally:
+                db.close()
+            bulk_resp = client.post(
+                "/api/chirmera-platform-schedule/projects/proj1/user-tasks/bulk-delete",
+                json={"task_ids": [task_id], "select_all_matching": False},
+                headers=_auth_headers(),
+            )
+            assert bulk_resp.status_code == 200, bulk_resp.text
+            body = bulk_resp.json()
+            assert body["failed_count"] == 1
+            assert body["results"][0]["status"] == "unsupported"
+
+
+def test_bulk_delete_user_tasks_select_all_matching_filters_by_status(client):
+    base_payload = {
+        "description": "demo",
+        "input_upload_ids": ["upload-001"],
+        "input_binding": {
+            "upload_id": "upload-001",
+            "selection_type": "file",
+            "relative_path": "firmware.bin",
+        },
+        "policy": {},
+        "dispatch_policy": {},
+    }
+    with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
+        auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
+        project_factory.return_value.require_access = AsyncMock(side_effect=_fake_require_access)
+        with patch("app.service.user_task_manager.ProjectInputResolver.resolve_single", new=AsyncMock(return_value=_resolved_input())), \
+             patch("app.service.user_task_manager.ProjectInputResolver.resolve_path", new=AsyncMock(return_value={
+                 "relative_path": "firmware.bin",
+                 "absolute_path": "/data/files/proj1/user_input/software/upload-001/firmware.bin",
+                 "node_type": "file",
+                 "name": "firmware.bin",
+             })), \
+             patch("app.service.user_task_manager.BinarySecurityDispatchClient.delete_task", new=AsyncMock(return_value=None)):
+            ready_resp = client.post(
+                "/api/chirmera-platform-schedule/projects/proj1/user-tasks",
+                json={**base_payload, "task_type": "binary_firmware_e2e", "name": "ready-task"},
+                headers=_auth_headers(),
+            )
+            failed_resp = client.post(
+                "/api/chirmera-platform-schedule/projects/proj1/user-tasks",
+                json={**base_payload, "task_type": "binary_firmware_e2e", "name": "failed-task"},
+                headers=_auth_headers(),
+            )
+            failed_task_id = failed_resp.json()["id"]
+            from app.model import get_db_session, ScheduleUserTask
+            db = get_db_session()
+            try:
+                failed_task = db.query(ScheduleUserTask).filter(ScheduleUserTask.id == failed_task_id).first()
+                failed_task.dispatch_status = "dispatch_failed"
+                failed_task.business_status = "failed"
+                failed_task.downstream_task_id = failed_task_id
+                db.commit()
+            finally:
+                db.close()
+
+            bulk_resp = client.post(
+                "/api/chirmera-platform-schedule/projects/proj1/user-tasks/bulk-delete",
+                json={"select_all_matching": True, "filters": {"status": "dispatch_failed"}},
+                headers=_auth_headers(),
+            )
+            assert bulk_resp.status_code == 200, bulk_resp.text
+            body = bulk_resp.json()
+            assert body["total_requested"] == 1
+            assert body["deleted_count"] == 1
+            assert body["results"][0]["task_id"] == failed_task_id

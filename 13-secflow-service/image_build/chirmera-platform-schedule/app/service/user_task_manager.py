@@ -246,6 +246,21 @@ class BinarySecurityDispatchClient:
             raise UpstreamError(f"启动 binary-security 任务失败: {response.status_code}")
         return response.json()
 
+    async def delete_task(self, *, project_id: str, task_id: str, bearer_token: str) -> None:
+        client = await get_shared_async_client("schedule-binary-security", timeout=self.cfg.timeout)
+        try:
+            response = await client.delete(
+                f"{self.cfg.base_url.rstrip('/')}/api/app/binary-security/projects/{project_id}/tasks/{task_id}",
+                headers={"Authorization": f"Bearer {bearer_token}"},
+            )
+        except httpx.TimeoutException as exc:
+            raise UpstreamError("删除 binary-security 任务超时") from exc
+        except httpx.RequestError as exc:
+            raise UpstreamError(f"删除 binary-security 任务失败: {exc}") from exc
+        if response.status_code in (200, 202, 204, 404):
+            return
+        raise UpstreamError(f"删除 binary-security 任务失败: {response.status_code}")
+
 
 class Ai4RedDispatchClient:
     def __init__(self) -> None:
@@ -296,6 +311,9 @@ class Ai4RedDispatchClient:
         if response.status_code != 200:
             raise UpstreamError(f"查询 ai4red 任务失败: {response.status_code}")
         return response.json()
+
+    async def delete_task(self, *, downstream_task_id: str, bearer_token: str) -> None:
+        raise ValidationError("该任务类型暂不支持同步删除下游任务")
 
 
 class TuringAppSecurityClient:
@@ -357,6 +375,26 @@ class TuringAppSecurityClient:
             raise UpstreamError(f"查询 ai4apk 任务失败: {response.status_code}{suffix}")
         return response.json()
 
+    async def delete_task(self, *, downstream_task_id: str) -> None:
+        client = await get_shared_async_client("schedule-ai4apk", timeout=self.cfg.timeout)
+        try:
+            response = await client.delete(
+                f"{self.cfg.base_url.rstrip('/')}/api/v1/tasks/{downstream_task_id}",
+            )
+        except httpx.TimeoutException as exc:
+            raise UpstreamError("删除 ai4apk 任务超时") from exc
+        except httpx.RequestError as exc:
+            raise UpstreamError(f"删除 ai4apk 任务失败: {exc}") from exc
+        if response.status_code in (200, 202, 204, 404):
+            return
+        message = ""
+        try:
+            message = str((response.json() or {}).get("message") or (response.json() or {}).get("detail") or "").strip()
+        except Exception:
+            message = str(response.text or "").strip()
+        suffix = f": {message}" if message else ""
+        raise UpstreamError(f"删除 ai4apk 任务失败: {response.status_code}{suffix}")
+
 
 class UserTaskManager:
     def __init__(self) -> None:
@@ -366,6 +404,98 @@ class UserTaskManager:
         self.binary_security = BinarySecurityDispatchClient()
         self.ai4red = Ai4RedDispatchClient()
         self.ai4apk = TuringAppSecurityClient()
+
+    @staticmethod
+    def _task_type_supports_downstream_delete(task_type: str) -> bool:
+        return task_type in {"binary_firmware_e2e", "binary_module_e2e", "source_scan_e2e", "ai4apk"}
+
+    def _filter_tasks_for_bulk_delete(
+        self,
+        rows: list[ScheduleUserTask],
+        *,
+        filters: Optional[dict[str, Any]],
+    ) -> list[ScheduleUserTask]:
+        if not filters:
+            return rows
+        status = str(filters.get("status") or "").strip()
+        task_type = str(filters.get("task_type") or "").strip()
+        search = str(filters.get("search") or "").strip().lower()
+        has_error = bool(filters.get("has_error"))
+        is_retrying = bool(filters.get("is_retrying"))
+        filtered: list[ScheduleUserTask] = []
+        for task in rows:
+            if status and status not in {task.create_status, task.dispatch_status, task.business_status, str(task.downstream_status_mapped or "")}:
+                continue
+            if task_type and str(task.task_type or "") != task_type:
+                continue
+            if has_error and not str(task.last_error or "").strip():
+                continue
+            if is_retrying:
+                continue
+            if search:
+                haystack = " ".join([
+                    str(task.id or ""),
+                    str(task.name or ""),
+                    str(task.description or ""),
+                    str(task.downstream_task_id or ""),
+                    str(task.last_error or ""),
+                ]).lower()
+                if search not in haystack:
+                    continue
+            filtered.append(task)
+        return filtered
+
+    async def _delete_downstream_task(self, task: ScheduleUserTask, bearer_token: str) -> None:
+        downstream_task_id = str(task.downstream_task_id or "").strip()
+        if not downstream_task_id:
+            return
+        if not self._task_type_supports_downstream_delete(task.task_type):
+            raise ValidationError("该任务类型暂不支持同步删除下游任务")
+        if task.task_type in {"binary_firmware_e2e", "binary_module_e2e", "source_scan_e2e"}:
+            await self.binary_security.delete_task(project_id=task.project_id, task_id=downstream_task_id, bearer_token=bearer_token)
+            return
+        if task.task_type == "ai4apk":
+            await self.ai4apk.delete_task(downstream_task_id=downstream_task_id)
+            return
+        raise ValidationError("该任务类型暂不支持同步删除下游任务")
+
+    def _delete_parent_task_rows(self, db: Session, task_id: str) -> None:
+        db.query(ScheduleUserTaskDispatch).filter(ScheduleUserTaskDispatch.user_task_id == task_id).delete(synchronize_session=False)
+        db.query(ScheduleUserTaskInputBinding).filter(ScheduleUserTaskInputBinding.user_task_id == task_id).delete(synchronize_session=False)
+        db.query(ScheduleUserTask).filter(ScheduleUserTask.id == task_id).delete(synchronize_session=False)
+
+    async def _delete_single_task(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        task: ScheduleUserTask,
+        bearer_token: str,
+    ) -> dict[str, Any]:
+        downstream_task_id = str(task.downstream_task_id or "").strip() or None
+        task_id = str(task.id)
+        task_type = str(task.task_type or "")
+        try:
+            if downstream_task_id:
+                await self._delete_downstream_task(task, bearer_token)
+            self._delete_parent_task_rows(db, task.id)
+            db.commit()
+            return {
+                "task_id": task_id,
+                "task_type": task_type,
+                "downstream_task_id": downstream_task_id,
+                "status": "deleted",
+                "message": "任务及下游任务已删除" if downstream_task_id else "任务已删除",
+            }
+        except Exception as exc:
+            db.rollback()
+            return {
+                "task_id": task_id,
+                "task_type": task_type,
+                "downstream_task_id": downstream_task_id,
+                "status": "unsupported" if isinstance(exc, ValidationError) else "failed",
+                "message": str(exc),
+            }
 
     def _dispatch_policy_for_task_type(self, task_type: str):
         policies = get_config().user_task_dispatch_policy
@@ -994,6 +1124,64 @@ class UserTaskManager:
                 dispatches = self._dispatches_for_task(db, task.id)
                 latest_dispatch = dispatches[0] if dispatches else None
         return self._serialize_task(task, self._bindings_for_task(db, task.id), latest_dispatch)
+
+    async def delete_tasks(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        bearer_token: str,
+        task_ids: list[str],
+        select_all_matching: bool,
+        filters: Optional[dict[str, Any]],
+    ) -> dict[str, Any]:
+        base_query = db.query(ScheduleUserTask).filter(ScheduleUserTask.project_id == project_id)
+        results: list[dict[str, Any]] = []
+
+        if select_all_matching:
+            tasks = self._filter_tasks_for_bulk_delete(
+                base_query.order_by(ScheduleUserTask.created_at.desc()).all(),
+                filters=filters,
+            )
+            for task in tasks:
+                results.append(await self._delete_single_task(db, project_id=project_id, task=task, bearer_token=bearer_token))
+            deleted_count = sum(1 for item in results if item["status"] == "deleted")
+            return {
+                "total_requested": len(tasks),
+                "deleted_count": deleted_count,
+                "failed_count": len(results) - deleted_count,
+                "results": results,
+            }
+
+        normalized_ids = [str(task_id or "").strip() for task_id in task_ids if str(task_id or "").strip()]
+        if not normalized_ids:
+            return {
+                "total_requested": 0,
+                "deleted_count": 0,
+                "failed_count": 0,
+                "results": [],
+            }
+        rows = base_query.filter(ScheduleUserTask.id.in_(normalized_ids)).all()
+        row_map = {row.id: row for row in rows}
+        for task_id in normalized_ids:
+            task = row_map.get(task_id)
+            if task is None:
+                results.append({
+                    "task_id": task_id,
+                    "task_type": None,
+                    "downstream_task_id": None,
+                    "status": "deleted",
+                    "message": "任务已不存在",
+                })
+                continue
+            results.append(await self._delete_single_task(db, project_id=project_id, task=task, bearer_token=bearer_token))
+        deleted_count = sum(1 for item in results if item["status"] == "deleted")
+        return {
+            "total_requested": len(normalized_ids),
+            "deleted_count": deleted_count,
+            "failed_count": len(results) - deleted_count,
+            "results": results,
+        }
 
     def list_dispatches(self, db: Session, project_id: str, task_id: str) -> tuple[int, list[dict[str, Any]]]:
         self.get_task_or_404(db, project_id, task_id)
