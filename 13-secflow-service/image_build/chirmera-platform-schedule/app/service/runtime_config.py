@@ -20,6 +20,7 @@ from app.schemas import (
     ScheduleRuntimeSchedulerPolicy,
     ScheduleRuntimeTimeWindow,
     ScheduleRuntimeToolDefault,
+    ScheduleRuntimeUserTaskSyncPolicy,
 )
 
 
@@ -39,6 +40,7 @@ class RuntimeConfigSnapshot:
     source: str
     timezone: str
     scheduler_policy: ScheduleRuntimeSchedulerPolicy
+    user_task_sync_policy: ScheduleRuntimeUserTaskSyncPolicy
     tool_defaults: list[ScheduleRuntimeToolDefault]
     time_windows: list[ScheduleRuntimeTimeWindow]
     active_time_window_name: str | None
@@ -86,6 +88,24 @@ class ScheduleRuntimeConfigService:
             db_fallback_batch_size=int(self._cfg.worker.db_fallback_batch_size),
         )
 
+    def default_user_task_sync_policy(self) -> ScheduleRuntimeUserTaskSyncPolicy:
+        cfg = self._cfg.user_task_sync
+        return ScheduleRuntimeUserTaskSyncPolicy(
+            enabled=bool(cfg.enabled),
+            lease_seconds=int(cfg.lease_seconds),
+            heartbeat_interval_seconds=int(cfg.heartbeat_interval_seconds),
+            db_fallback_batch_size=int(cfg.db_fallback_batch_size),
+            queue_pop_timeout_seconds=int(cfg.queue_pop_timeout_seconds),
+            reclaim_batch_size=int(cfg.reclaim_batch_size),
+            dispatching_seconds=int(cfg.dispatching_seconds),
+            running_seconds=int(cfg.running_seconds),
+            paused_seconds=int(cfg.paused_seconds),
+            terminal_verify_seconds=int(cfg.terminal_verify_seconds),
+            retry_initial_seconds=int(cfg.retry_initial_seconds),
+            retry_max_seconds=int(cfg.retry_max_seconds),
+            failure_threshold=int(cfg.failure_threshold),
+        )
+
     def default_tool_defaults(self) -> list[ScheduleRuntimeToolDefault]:
         policies = get_config().user_task_dispatch_policy
         rows: list[ScheduleRuntimeToolDefault] = []
@@ -111,6 +131,7 @@ class ScheduleRuntimeConfigService:
             source="default",
             timezone=CONFIG_TIMEZONE,
             scheduler_policy=self.default_scheduler_policy(),
+            user_task_sync_policy=self.default_user_task_sync_policy(),
             tool_defaults=self.default_tool_defaults(),
             time_windows=[],
             active_time_window_name=None,
@@ -161,7 +182,10 @@ class ScheduleRuntimeConfigService:
     def _serialize_row(self, row: ScheduleRuntimeConfig | None) -> RuntimeConfigSnapshot:
         if row is None:
             return self.default_snapshot()
-        scheduler_policy = ScheduleRuntimeSchedulerPolicy.model_validate(dict(row.scheduler_policy_json or {}))
+        scheduler_payload = dict(row.scheduler_policy_json or {})
+        sync_policy_payload = dict(scheduler_payload.pop("user_task_sync_policy", None) or self.default_user_task_sync_policy().model_dump())
+        scheduler_policy = ScheduleRuntimeSchedulerPolicy.model_validate(scheduler_payload)
+        user_task_sync_policy = ScheduleRuntimeUserTaskSyncPolicy.model_validate(sync_policy_payload)
         tool_defaults = [
             ScheduleRuntimeToolDefault.model_validate(item)
             for item in list(row.tool_defaults_json or [])
@@ -176,6 +200,7 @@ class ScheduleRuntimeConfigService:
             source="database",
             timezone=str(row.timezone or CONFIG_TIMEZONE),
             scheduler_policy=scheduler_policy,
+            user_task_sync_policy=user_task_sync_policy,
             tool_defaults=tool_defaults or self.default_tool_defaults(),
             time_windows=time_windows,
             active_time_window_name=None,
@@ -200,11 +225,19 @@ class ScheduleRuntimeConfigService:
         if active_window is None:
             return snapshot
         scheduler_policy = snapshot.scheduler_policy
+        user_task_sync_policy = snapshot.user_task_sync_policy
         if active_window.scheduler_policy is not None:
             scheduler_policy = ScheduleRuntimeSchedulerPolicy.model_validate(
                 {
                     **scheduler_policy.model_dump(),
                     **active_window.scheduler_policy.model_dump(),
+                }
+            )
+        if active_window.user_task_sync_policy is not None:
+            user_task_sync_policy = ScheduleRuntimeUserTaskSyncPolicy.model_validate(
+                {
+                    **user_task_sync_policy.model_dump(),
+                    **active_window.user_task_sync_policy.model_dump(),
                 }
             )
         tool_defaults = snapshot.tool_defaults
@@ -223,6 +256,7 @@ class ScheduleRuntimeConfigService:
             source=snapshot.source,
             timezone=snapshot.timezone,
             scheduler_policy=scheduler_policy,
+            user_task_sync_policy=user_task_sync_policy,
             tool_defaults=tool_defaults,
             time_windows=snapshot.time_windows,
             active_time_window_name=active_window.name,
@@ -255,7 +289,12 @@ class ScheduleRuntimeConfigService:
         base = self.default_snapshot() if row is None else RuntimeConfigSnapshot(
             source="database",
             timezone=str(row.timezone or CONFIG_TIMEZONE),
-            scheduler_policy=ScheduleRuntimeSchedulerPolicy.model_validate(dict(row.scheduler_policy_json or {})),
+            scheduler_policy=ScheduleRuntimeSchedulerPolicy.model_validate(
+                {key: value for key, value in dict(row.scheduler_policy_json or {}).items() if key != "user_task_sync_policy"}
+            ),
+            user_task_sync_policy=ScheduleRuntimeUserTaskSyncPolicy.model_validate(
+                dict((row.scheduler_policy_json or {}).get("user_task_sync_policy") or self.default_user_task_sync_policy().model_dump())
+            ),
             tool_defaults=[
                 ScheduleRuntimeToolDefault.model_validate(item)
                 for item in list(row.tool_defaults_json or [])
@@ -275,6 +314,7 @@ class ScheduleRuntimeConfigService:
             config_key=CONFIG_KEY_GLOBAL_DEFAULT,
             timezone=base.timezone,
             scheduler_policy=base.scheduler_policy,
+            user_task_sync_policy=base.user_task_sync_policy,
             tool_defaults=base.tool_defaults,
             time_windows=base.time_windows,
             version=base.version,
@@ -286,6 +326,7 @@ class ScheduleRuntimeConfigService:
                 active_time_window_name=snapshot.active_time_window_name,
                 timezone=snapshot.timezone,
                 scheduler_policy=snapshot.scheduler_policy,
+                user_task_sync_policy=snapshot.user_task_sync_policy,
                 tool_defaults=snapshot.tool_defaults,
             ),
         )
@@ -298,6 +339,7 @@ class ScheduleRuntimeConfigService:
             db.add(row)
         row.timezone = normalized.timezone
         row.scheduler_policy_json = normalized.scheduler_policy.model_dump()
+        row.scheduler_policy_json["user_task_sync_policy"] = normalized.user_task_sync_policy.model_dump()
         row.tool_defaults_json = [item.model_dump() for item in normalized.tool_defaults]
         row.time_windows_json = [item.model_dump() for item in normalized.time_windows]
         row.updated_by = actor

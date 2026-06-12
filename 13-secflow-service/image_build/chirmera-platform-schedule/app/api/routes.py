@@ -35,6 +35,8 @@ from app.schemas import (
     UserTaskDispatchListResponse,
     UserTaskDispatchRequest,
     UserTaskSyncRequest,
+    UserTaskEventListResponse,
+    UserTaskEventResponse,
     UserTaskListResponse,
     UserTaskResponse,
 )
@@ -253,9 +255,148 @@ async def create_user_task(
 
 @router.get("/projects/{project_id}/user-tasks/{task_id}", response_model=UserTaskResponse)
 async def get_user_task(project_id: str, task_id: str, _: TokenUser = Depends(get_current_context), authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
-    token = _token_from_header(authorization)
-    task = await get_user_task_manager().get_task_detail(db, project_id, task_id, token)
+    task = await get_user_task_manager().get_task_detail(
+        db,
+        project_id=project_id,
+        task_id=task_id,
+        bearer_token=_token_from_header(authorization),
+    )
     return UserTaskResponse.model_validate(task)
+
+
+@router.get("/projects/{project_id}/user-tasks/{task_id}/events", response_model=UserTaskEventListResponse)
+async def list_user_task_events(
+    project_id: str,
+    task_id: str,
+    page: int = 1,
+    page_size: int = 50,
+    only_failed: bool = False,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    total, items = get_user_task_manager().list_task_events(
+        db,
+        project_id=project_id,
+        task_id=task_id,
+        page=page,
+        page_size=page_size,
+        only_failed=only_failed,
+    )
+    return UserTaskEventListResponse(
+        total=total,
+        items=[UserTaskEventResponse.model_validate(item) for item in items],
+        page=max(1, int(page or 1)),
+        page_size=max(1, min(1000, int(page_size or 50))),
+    )
+
+
+@router.get("/projects/{project_id}/user-task-events", response_model=UserTaskEventListResponse)
+async def list_project_user_task_events(
+    project_id: str,
+    task_id: Optional[str] = None,
+    task_type: Optional[str] = None,
+    event_category: Optional[str] = None,
+    event_type: Optional[str] = None,
+    result_status: Optional[str] = None,
+    event_source: Optional[str] = None,
+    actor: Optional[str] = None,
+    downstream_task_id: Optional[str] = None,
+    search: Optional[str] = None,
+    from_time: Optional[str] = None,
+    to_time: Optional[str] = None,
+    only_failed: bool = False,
+    page: int = 1,
+    page_size: int = 50,
+    sort_by: str = "created_at",
+    sort_direction: str = "desc",
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    total, items = get_user_task_manager().list_user_task_events(
+        db,
+        project_id=project_id,
+        filters={
+            "task_id": task_id,
+            "task_type": task_type,
+            "event_category": event_category,
+            "event_type": event_type,
+            "result_status": result_status,
+            "event_source": event_source,
+            "actor": actor,
+            "downstream_task_id": downstream_task_id,
+            "search": search,
+            "from_time": from_time,
+            "to_time": to_time,
+            "only_failed": only_failed,
+        },
+        page=page,
+        page_size=page_size,
+        sort_by=sort_by,
+        sort_direction=sort_direction,
+    )
+    return UserTaskEventListResponse(
+        total=total,
+        items=[UserTaskEventResponse.model_validate(item) for item in items],
+        page=max(1, int(page or 1)),
+        page_size=max(1, min(1000, int(page_size or 50))),
+    )
+
+
+@router.get("/user-task-events", response_model=UserTaskEventListResponse)
+async def list_global_user_task_events(
+    project_id: Optional[str] = None,
+    project_ids: Optional[str] = None,
+    task_id: Optional[str] = None,
+    task_type: Optional[str] = None,
+    event_category: Optional[str] = None,
+    event_type: Optional[str] = None,
+    result_status: Optional[str] = None,
+    event_source: Optional[str] = None,
+    actor: Optional[str] = None,
+    downstream_task_id: Optional[str] = None,
+    search: Optional[str] = None,
+    from_time: Optional[str] = None,
+    to_time: Optional[str] = None,
+    only_failed: bool = False,
+    page: int = 1,
+    page_size: int = 50,
+    sort_by: str = "created_at",
+    sort_direction: str = "desc",
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    token = _token_from_header(authorization)
+    await get_auth_service().validate_token(token)
+    normalized_project_ids = [item.strip() for item in str(project_ids or "").split(",") if item.strip()]
+    total, items = get_user_task_manager().list_user_task_events(
+        db,
+        project_id=project_id,
+        project_ids=normalized_project_ids or None,
+        filters={
+            "task_id": task_id,
+            "task_type": task_type,
+            "event_category": event_category,
+            "event_type": event_type,
+            "result_status": result_status,
+            "event_source": event_source,
+            "actor": actor,
+            "downstream_task_id": downstream_task_id,
+            "search": search,
+            "from_time": from_time,
+            "to_time": to_time,
+            "only_failed": only_failed,
+        },
+        page=page,
+        page_size=page_size,
+        sort_by=sort_by,
+        sort_direction=sort_direction,
+    )
+    return UserTaskEventListResponse(
+        total=total,
+        items=[UserTaskEventResponse.model_validate(item) for item in items],
+        page=max(1, int(page or 1)),
+        page_size=max(1, min(1000, int(page_size or 50))),
+    )
 
 
 @router.post("/projects/{project_id}/user-tasks/{task_id}/sync", response_model=UserTaskResponse)

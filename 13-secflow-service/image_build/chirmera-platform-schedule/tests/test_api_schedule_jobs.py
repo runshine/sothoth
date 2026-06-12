@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+
+
+def _utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _auth_headers():
@@ -157,10 +162,140 @@ def test_auto_dispatch_ready_tasks_runs_in_scheduler_loop(db_session, tmp_path):
         assert created["dispatch_status"] == "ready_for_dispatch"
         dispatched = asyncio.run(manager.auto_dispatch_ready_tasks(batch_size=1, actor="schedule-auto-dispatcher"))
         assert dispatched == 1
-        detail = asyncio.run(manager.get_task_detail(db_session, "proj1", created["id"], "user-token"))
+        detail = asyncio.run(
+            manager.get_task_detail(
+                db_session,
+                project_id="proj1",
+                task_id=created["id"],
+                bearer_token="user-token",
+            )
+        )
         assert detail["dispatch_status"] == "running"
         assert detail["business_status"] == "running"
         assert detail["root_task_key_id"] == "tk-dispatch-1"
+
+
+def test_aigw_create_task_key_accepts_201_and_requires_task_fields():
+    from app.service.user_task_manager import AiGatewayTaskKeyClient
+
+    class _Resp:
+        status_code = 201
+        text = ""
+
+        def json(self):
+            return {
+                "key": {
+                    "id": 1,
+                    "key_name": "dispatch-task-dispatch",
+                    "key_prefix": "tsk_test",
+                    "capacity_pool_ids": [1, 2],
+                },
+                "secret": "tsk_secret_value",
+            }
+
+    async def _run():
+        client = AiGatewayTaskKeyClient()
+        with patch("app.service.user_task_manager.get_shared_async_client", new=AsyncMock(return_value=SimpleNamespace(post=AsyncMock(return_value=_Resp())))):
+            return await client.create_task_key(
+                management_token="mgmt-token",
+                task_id="task-a",
+                dispatch_id="dispatch-a",
+                capacity_pool_ids=[1, 2],
+                max_concurrency=5,
+            )
+
+    payload = asyncio.run(_run())
+    assert payload["key"]["id"] == 1
+    assert payload["secret"] == "tsk_secret_value"
+
+
+def test_aigw_create_task_key_propagates_text_error_message():
+    from app.service.user_task_manager import AiGatewayTaskKeyClient
+    from app.exception import UpstreamError
+
+    class _Resp:
+        status_code = 403
+        text = "forbidden by gateway"
+
+        def json(self):
+            return {}
+
+    async def _run():
+        client = AiGatewayTaskKeyClient()
+        with patch("app.service.user_task_manager.get_shared_async_client", new=AsyncMock(return_value=SimpleNamespace(post=AsyncMock(return_value=_Resp())))):
+            await client.create_task_key(
+                management_token="mgmt-token",
+                task_id="task-a",
+                dispatch_id="dispatch-a",
+                capacity_pool_ids=[1],
+            )
+
+    with pytest.raises(UpstreamError, match="403: forbidden by gateway"):
+        asyncio.run(_run())
+
+
+def test_aigw_create_task_key_rejects_missing_secret():
+    from app.service.user_task_manager import AiGatewayTaskKeyClient
+    from app.exception import UpstreamError
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "key": {
+                    "id": 1,
+                    "key_name": "dispatch-task-dispatch",
+                    "key_prefix": "tsk_test",
+                    "capacity_pool_ids": [1],
+                }
+            }
+
+    async def _run():
+        client = AiGatewayTaskKeyClient()
+        with patch("app.service.user_task_manager.get_shared_async_client", new=AsyncMock(return_value=SimpleNamespace(post=AsyncMock(return_value=_Resp())))):
+            await client.create_task_key(
+                management_token="mgmt-token",
+                task_id="task-a",
+                dispatch_id="dispatch-a",
+                capacity_pool_ids=[1],
+            )
+
+    with pytest.raises(UpstreamError, match="未返回 secret"):
+        asyncio.run(_run())
+
+
+def test_aigw_create_task_key_rejects_missing_key_prefix():
+    from app.service.user_task_manager import AiGatewayTaskKeyClient
+    from app.exception import UpstreamError
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "key": {
+                    "id": 1,
+                    "key_name": "dispatch-task-dispatch",
+                    "capacity_pool_ids": [1],
+                },
+                "secret": "tsk_secret_value",
+            }
+
+    async def _run():
+        client = AiGatewayTaskKeyClient()
+        with patch("app.service.user_task_manager.get_shared_async_client", new=AsyncMock(return_value=SimpleNamespace(post=AsyncMock(return_value=_Resp())))):
+            await client.create_task_key(
+                management_token="mgmt-token",
+                task_id="task-a",
+                dispatch_id="dispatch-a",
+                capacity_pool_ids=[1],
+            )
+
+    with pytest.raises(UpstreamError, match="未返回 key.key_prefix"):
+        asyncio.run(_run())
 
 
 def test_user_task_rejects_directory_for_firmware_file_mode(client):
@@ -447,7 +582,14 @@ def test_auto_dispatch_keeps_failed_task_visible_for_retry(db_session, tmp_path)
         assert created["dispatch_status"] == "ready_for_dispatch"
         with pytest.raises(Exception, match="capacity_pool_ids"):
             asyncio.run(manager.auto_dispatch_ready_tasks(batch_size=1, actor="schedule-auto-dispatcher"))
-        detail = asyncio.run(manager.get_task_detail(db_session, "proj1", created["id"], "user-token"))
+        detail = asyncio.run(
+            manager.get_task_detail(
+                db_session,
+                project_id="proj1",
+                task_id=created["id"],
+                bearer_token="user-token",
+            )
+        )
         assert detail["dispatch_status"] == "dispatch_failed"
         assert "capacity_pool_ids" in str(detail["last_error"] or "")
 
@@ -561,7 +703,7 @@ def test_ai4red_dispatch_passes_deliver_dir_and_does_not_copy_archive(client, tm
     assert captured_calls[0]["deliver_dir"] == str(deliver_dir)
 
 
-def test_ai4apk_task_create_accepts_file_binding_without_input_type_restriction(client, tmp_path):
+def test_ai4apk_task_create_rejects_file_binding_without_directory_mode(client, tmp_path):
     apk_file = tmp_path / "sample.bin"
     apk_file.write_bytes(b"apk")
     payload = {
@@ -588,19 +730,16 @@ def test_ai4apk_task_create_accepts_file_binding_without_input_type_restriction(
                  "name": "sample.bin",
              })):
             response = client.post("/api/chirmera-platform-schedule/projects/proj1/user-tasks", json=payload, headers=_auth_headers())
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["task_type"] == "ai4apk"
-    assert body["downstream_detail_view"] is None
-    assert body["inputs"][0]["selection_type"] == "file"
+    assert response.status_code == 400, response.text
+    assert "所选输入模式与任务类型不匹配" in response.text
 
 
-def test_ai4apk_task_create_rejects_directory_binding(client, tmp_path):
+def test_ai4apk_task_create_accepts_directory_binding(client, tmp_path):
     apk_dir = tmp_path / "apk-dir"
     apk_dir.mkdir(parents=True)
     payload = {
         "task_type": "ai4apk",
-        "name": "ai4apk-task-dir",
+        "name": "ai4apk-task-directory",
         "description": "demo",
         "input_upload_ids": ["upload-001"],
         "input_binding": {
@@ -614,15 +753,25 @@ def test_ai4apk_task_create_rejects_directory_binding(client, tmp_path):
     with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
         auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
         project_factory.return_value.require_access = AsyncMock(side_effect=_fake_require_access)
-        with patch("app.service.user_task_manager.ProjectInputResolver.resolve_single", new=AsyncMock(return_value=_resolved_input(str(tmp_path), "other"))):
+        with patch("app.service.user_task_manager.ProjectInputResolver.resolve_single", new=AsyncMock(return_value=_resolved_input(str(tmp_path), "document"))), \
+             patch("app.service.user_task_manager.ProjectInputResolver.resolve_path", new=AsyncMock(return_value={
+                 "relative_path": "apk-dir",
+                 "absolute_path": str(apk_dir),
+                 "node_type": "directory",
+                 "name": "apk-dir",
+             })):
             response = client.post("/api/chirmera-platform-schedule/projects/proj1/user-tasks", json=payload, headers=_auth_headers())
-    assert response.status_code == 400
-    assert "输入模式与任务类型不匹配" in response.text
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["task_type"] == "ai4apk"
+    assert body["inputs"][0]["selection_type"] == "directory"
+    assert body["inputs"][0]["relative_path"] == "apk-dir"
 
 
 def test_ai4apk_dispatch_passes_file_path_without_aigw(client, tmp_path):
-    apk_file = tmp_path / "sample.apk"
-    apk_file.write_bytes(b"apk-content")
+    apk_dir = tmp_path / "apk-dir"
+    apk_dir.mkdir(parents=True)
+    (apk_dir / "sample.apk").write_bytes(b"apk-content")
     payload = {
         "task_type": "ai4apk",
         "name": "ai4apk-task-dispatch",
@@ -630,8 +779,8 @@ def test_ai4apk_dispatch_passes_file_path_without_aigw(client, tmp_path):
         "input_upload_ids": ["upload-001"],
         "input_binding": {
             "upload_id": "upload-001",
-            "selection_type": "file",
-            "relative_path": "sample.apk",
+            "selection_type": "directory",
+            "relative_path": "apk-dir",
         },
         "policy": {},
         "dispatch_policy": {},
@@ -670,10 +819,10 @@ def test_ai4apk_dispatch_passes_file_path_without_aigw(client, tmp_path):
         project_factory.return_value.require_access = AsyncMock(side_effect=_fake_require_access)
         with patch("app.service.user_task_manager.ProjectInputResolver.resolve_single", new=AsyncMock(return_value=_resolved_input(str(tmp_path), "other"))), \
              patch("app.service.user_task_manager.ProjectInputResolver.resolve_path", new=AsyncMock(return_value={
-                 "relative_path": "sample.apk",
-                 "absolute_path": str(apk_file),
-                 "node_type": "file",
-                 "name": "sample.apk",
+                 "relative_path": "apk-dir",
+                 "absolute_path": str(apk_dir),
+                 "node_type": "directory",
+                 "name": "apk-dir",
              })), \
              patch("app.service.user_task_manager.TuringAppSecurityClient.create_task", new=fake_create), \
              patch("app.service.user_task_manager.TuringAppSecurityClient.get_task", new=fake_get), \
@@ -707,13 +856,14 @@ def test_ai4apk_dispatch_passes_file_path_without_aigw(client, tmp_path):
     assert body["downstream_status_raw"] == "running"
     assert body["downstream_status_mapped"] == "running"
     assert captured_calls and captured_calls[0]["project_id"] == "proj1"
-    assert captured_calls[0]["file_path"] == str(apk_file)
+    assert captured_calls[0]["file_path"] == str(apk_dir)
     assert captured_calls[0]["task_type"] == "APK"
 
 
 def test_ai4apk_dispatch_propagates_422_error_message(client, tmp_path):
-    apk_file = tmp_path / "missing.apk"
-    apk_file.write_bytes(b"x")
+    apk_dir = tmp_path / "missing-apk-dir"
+    apk_dir.mkdir(parents=True)
+    (apk_dir / "missing.apk").write_bytes(b"x")
     payload = {
         "task_type": "ai4apk",
         "name": "ai4apk-task-error",
@@ -721,8 +871,8 @@ def test_ai4apk_dispatch_propagates_422_error_message(client, tmp_path):
         "input_upload_ids": ["upload-001"],
         "input_binding": {
             "upload_id": "upload-001",
-            "selection_type": "file",
-            "relative_path": "missing.apk",
+            "selection_type": "directory",
+            "relative_path": "missing-apk-dir",
         },
         "policy": {},
         "dispatch_policy": {},
@@ -736,10 +886,10 @@ def test_ai4apk_dispatch_propagates_422_error_message(client, tmp_path):
         project_factory.return_value.require_access = AsyncMock(side_effect=_fake_require_access)
         with patch("app.service.user_task_manager.ProjectInputResolver.resolve_single", new=AsyncMock(return_value=_resolved_input(str(tmp_path), "document"))), \
              patch("app.service.user_task_manager.ProjectInputResolver.resolve_path", new=AsyncMock(return_value={
-                 "relative_path": "missing.apk",
-                 "absolute_path": str(apk_file),
-                 "node_type": "file",
-                 "name": "missing.apk",
+                 "relative_path": "missing-apk-dir",
+                 "absolute_path": str(apk_dir),
+                 "node_type": "directory",
+                 "name": "missing-apk-dir",
              })), \
              patch("app.service.user_task_manager.TuringAppSecurityClient.create_task", new=fake_create), \
              patch("app.service.user_task_manager.get_config", return_value=SimpleNamespace(
@@ -937,3 +1087,165 @@ def test_bulk_delete_user_tasks_select_all_matching_filters_by_status(client):
             assert body["already_queued_count"] == 0
             assert body["results"][0]["task_id"] == failed_task_id
             assert body["results"][0]["status"] == "queued"
+
+
+def test_get_user_task_detail_does_not_refresh_downstream_inline(client, tmp_path):
+    deliver_dir = tmp_path / "deliver-dir"
+    deliver_dir.mkdir(parents=True)
+    payload = {
+        "task_type": "ai4red",
+        "name": "ai4red-detail-no-inline-refresh",
+        "description": "demo",
+        "input_upload_ids": ["upload-001"],
+        "input_binding": {
+            "upload_id": "upload-001",
+            "selection_type": "directory",
+            "relative_path": "deliver-dir",
+        },
+        "policy": {},
+        "dispatch_policy": {},
+    }
+    with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
+        auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
+        project_factory.return_value.require_access = AsyncMock(side_effect=_fake_require_access)
+        with patch("app.service.user_task_manager.ProjectInputResolver.resolve_single", new=AsyncMock(return_value=_resolved_input(str(tmp_path), "document"))), \
+             patch("app.service.user_task_manager.ProjectInputResolver.resolve_path", new=AsyncMock(return_value={
+                 "relative_path": "deliver-dir",
+                 "absolute_path": str(deliver_dir),
+                 "node_type": "directory",
+                 "name": "deliver-dir",
+             })):
+            create_resp = client.post("/api/chirmera-platform-schedule/projects/proj1/user-tasks", json=payload, headers=_auth_headers())
+            task_id = create_resp.json()["id"]
+            from app.model import get_db_session, ScheduleUserTask
+            db = get_db_session()
+            try:
+                task = db.query(ScheduleUserTask).filter(ScheduleUserTask.id == task_id).first()
+                task.downstream_task_id = "ai4red-task-1"
+                task.display_status = "running"
+                task.sync_required = True
+                task.sync_status = "queued"
+                task.sync_queue = "running"
+                db.commit()
+            finally:
+                db.close()
+            with patch("app.service.user_task_manager.Ai4RedDispatchClient.get_task", new=AsyncMock(side_effect=AssertionError("should not refresh inline"))):
+                detail_resp = client.get(f"/api/chirmera-platform-schedule/projects/proj1/user-tasks/{task_id}", headers=_auth_headers())
+    assert detail_resp.status_code == 200, detail_resp.text
+    assert detail_resp.json()["sync_status"] == "queued"
+
+
+def test_sync_user_task_endpoint_only_enqueues(client, tmp_path):
+    apk_dir = tmp_path / "sample-apk-dir"
+    apk_dir.mkdir(parents=True)
+    (apk_dir / "sample.apk").write_bytes(b"apk")
+    payload = {
+        "task_type": "ai4apk",
+        "name": "ai4apk-sync-enqueue",
+        "description": "demo",
+        "input_upload_ids": ["upload-001"],
+        "input_binding": {
+            "upload_id": "upload-001",
+            "selection_type": "directory",
+            "relative_path": "sample-apk-dir",
+        },
+        "policy": {},
+        "dispatch_policy": {},
+    }
+    with patch("app.api.routes.get_auth_service") as auth_factory, patch("app.api.routes.get_project_service") as project_factory:
+        auth_factory.return_value.validate_token = AsyncMock(side_effect=_fake_validate_token)
+        project_factory.return_value.require_access = AsyncMock(side_effect=_fake_require_access)
+        with patch("app.service.user_task_manager.ProjectInputResolver.resolve_single", new=AsyncMock(return_value=_resolved_input(str(tmp_path), "other"))), \
+             patch("app.service.user_task_manager.ProjectInputResolver.resolve_path", new=AsyncMock(return_value={
+                 "relative_path": "sample-apk-dir",
+                 "absolute_path": str(apk_dir),
+                 "node_type": "directory",
+                 "name": "sample-apk-dir",
+             })):
+            create_resp = client.post("/api/chirmera-platform-schedule/projects/proj1/user-tasks", json=payload, headers=_auth_headers())
+            task_id = create_resp.json()["id"]
+            from app.model import get_db_session, ScheduleUserTask
+            db = get_db_session()
+            try:
+                task = db.query(ScheduleUserTask).filter(ScheduleUserTask.id == task_id).first()
+                task.downstream_task_id = "apk-task-1"
+                task.display_status = "running"
+                task.sync_required = True
+                task.sync_status = "idle"
+                task.sync_queue = "running"
+                db.commit()
+            finally:
+                db.close()
+            with patch("app.service.user_task_manager.TuringAppSecurityClient.get_task", new=AsyncMock(side_effect=AssertionError("should not call downstream in sync endpoint"))):
+                sync_resp = client.post(
+                    f"/api/chirmera-platform-schedule/projects/proj1/user-tasks/{task_id}/sync",
+                    json={"force": True},
+                    headers=_auth_headers(),
+                )
+    assert sync_resp.status_code == 200, sync_resp.text
+    body = sync_resp.json()
+    assert body["sync_status"] == "queued"
+    assert body["sync_required"] is True
+    assert body["sync_queue"] == "running"
+
+
+def test_user_task_sync_state_machine_helpers(db_session):
+    from app.model import ScheduleUserTask
+    from app.service.user_task_manager import get_user_task_manager
+
+    task = ScheduleUserTask(
+        project_id="proj1",
+        task_type="ai4apk",
+        name="sync-helper-task",
+        description="demo",
+        create_status="created",
+        dispatch_status="running",
+        business_status="running",
+        parent_task_key_id="__dispatch_managed__",
+        parent_task_key_name="__dispatch_managed__",
+        parent_task_key_prefix="__dispatch_managed__",
+        parent_task_capacity_pool_ids=[],
+        parent_task_key_secret_cipher="cipher",
+        parent_task_key_secret_nonce="nonce",
+        parent_task_key_secret_version="aesgcm-v1",
+        downstream_task_id="apk-task-helper",
+        created_by="tester",
+        updated_by="tester",
+    )
+    db_session.add(task)
+    db_session.commit()
+    db_session.refresh(task)
+
+    manager = get_user_task_manager()
+    task.display_status = "running"
+    task.sync_required = True
+    task.sync_status = "idle"
+    task.sync_queue = "running"
+    db_session.commit()
+
+    result = asyncio.run(
+        manager.request_task_sync(
+            db_session,
+            project_id="proj1",
+            task_id=task.id,
+            actor="tester",
+            force=True,
+        )
+    )
+    assert result["sync_status"] == "queued"
+
+    latest = db_session.query(ScheduleUserTask).filter(ScheduleUserTask.id == task.id).first()
+    latest.sync_status = "syncing"
+    latest.sync_queue = "running"
+    latest.sync_required = True
+    latest.sync_lease_token = "lease-1"
+    latest.sync_worker_id = "worker-a"
+    latest.sync_lease_expires_at = _utcnow() - timedelta(seconds=5)
+    db_session.commit()
+
+    reclaimed = manager.reclaim_stale_sync_tasks(db_session, limit=10)
+    assert task.id in reclaimed
+    latest = db_session.query(ScheduleUserTask).filter(ScheduleUserTask.id == task.id).first()
+    assert latest.sync_status == "retry_wait"
+    assert latest.sync_queue == "retry_wait"
+    assert latest.sync_lease_token is None

@@ -941,9 +941,14 @@ class SchedulerRuntime:
             now_monotonic = time.monotonic()
             if now_monotonic - last_reclaim >= max(1, int(self.config.reclaim_interval_seconds)):
                 await self.manager.reclaim_stale_executions()
+                sync_runtime_db = get_db_session()
+                try:
+                    sync_runtime_policy = get_runtime_config_service().get_snapshot(sync_runtime_db).user_task_sync_policy
+                finally:
+                    sync_runtime_db.close()
                 sync_db = get_db_session()
                 try:
-                    reclaimed = get_user_task_manager().reclaim_stale_sync_tasks(sync_db, limit=max(10, int(self.config.delay_promote_batch_size)))
+                    reclaimed = get_user_task_manager().reclaim_stale_sync_tasks(sync_db, limit=max(1, int(sync_runtime_policy.reclaim_batch_size)))
                 finally:
                     sync_db.close()
                 for task_id in reclaimed:
@@ -1088,8 +1093,13 @@ class UserTaskSyncWorkerRuntime:
         self._bearer_token = get_user_task_manager().auto_dispatch_token()
 
     async def _pop_next_task_id(self) -> Optional[str]:
+        runtime_db = get_db_session()
+        try:
+            sync_policy = get_runtime_config_service().get_snapshot(runtime_db).user_task_sync_policy
+        finally:
+            runtime_db.close()
         for queue_name in ["terminal_verify", "dispatching", "running", "paused", "retry_wait"]:
-            task_id = await self.redis.pop_user_task_sync_ready(queue_name, timeout_seconds=1)
+            task_id = await self.redis.pop_user_task_sync_ready(queue_name, timeout_seconds=max(1, int(sync_policy.queue_pop_timeout_seconds)))
             if task_id:
                 return task_id
         return None
@@ -1101,6 +1111,10 @@ class UserTaskSyncWorkerRuntime:
             if not task_id:
                 fallback_db = get_db_session()
                 try:
+                    runtime_snapshot = get_runtime_config_service().get_snapshot(fallback_db)
+                    if not bool(runtime_snapshot.user_task_sync_policy.enabled):
+                        await asyncio.sleep(max(0.1, float(get_config().worker.idle_sleep_seconds)))
+                        continue
                     claimed = manager.claim_due_sync_task(fallback_db)
                     if claimed is None:
                         await asyncio.sleep(max(0.1, float(get_config().worker.idle_sleep_seconds)))
@@ -1124,7 +1138,12 @@ class UserTaskSyncWorkerRuntime:
         if self._running:
             return
         self._running = True
-        concurrency = max(1, min(8, int(get_config().worker.prefetch or 1)))
+        runtime_db = get_db_session()
+        try:
+            runtime_snapshot = get_runtime_config_service().get_snapshot(runtime_db)
+        finally:
+            runtime_db.close()
+        concurrency = max(1, min(8, int(runtime_snapshot.user_task_sync_policy.db_fallback_batch_size)))
         for _ in range(concurrency):
             task = asyncio.create_task(self._worker_loop())
             self._workers.add(task)

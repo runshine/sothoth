@@ -125,6 +125,34 @@ class ScheduleExecutionEvent(Base):
     created_at = Column(DateTime, default=utcnow, nullable=False)
 
 
+class ScheduleUserTaskEvent(Base):
+    __tablename__ = f"{TABLE_PREFIX}user_task_event"
+    __table_args__ = (
+        Index(f"idx_{TABLE_PREFIX}user_task_event_project_time", "project_id", "created_at"),
+        Index(f"idx_{TABLE_PREFIX}user_task_event_task_time", "user_task_id", "created_at"),
+        Index(f"idx_{TABLE_PREFIX}user_task_event_type_time", "event_type", "created_at"),
+        Index(f"idx_{TABLE_PREFIX}user_task_event_result_time", "result_status", "created_at"),
+    )
+
+    id = Column(String(64), primary_key=True, default=generate_id)
+    project_id = Column(String(128), nullable=False, index=True)
+    user_task_id = Column(String(64), nullable=False, index=True)
+    task_type = Column(String(32), nullable=False, index=True)
+    event_scope = Column(String(32), nullable=False, default="user_task")
+    event_category = Column(String(32), nullable=False, index=True)
+    event_type = Column(String(64), nullable=False, index=True)
+    result_status = Column(String(32), nullable=False, default="info", index=True)
+    event_source = Column(String(32), nullable=False, default="system", index=True)
+    actor = Column(String(128), nullable=True)
+    message = Column(Text, nullable=False)
+    payload_json = Column(JSON().with_variant(MySQLJSON, "mysql"), nullable=False, default=dict)
+    downstream_task_id = Column(String(128), nullable=True, index=True)
+    dispatch_id = Column(String(64), nullable=True, index=True)
+    sync_queue = Column(String(32), nullable=True, index=True)
+    error_code = Column(String(64), nullable=True, index=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False, index=True)
+
+
 class LiteLLMVirtualKey(Base):
     __tablename__ = f"{TABLE_PREFIX}litellm_virtual_key"
 
@@ -325,6 +353,7 @@ def init_database():
     _ensure_user_task_constraints(engine)
     _ensure_user_task_columns(engine)
     _ensure_user_task_dispatch_columns(engine)
+    _ensure_user_task_event_columns(engine)
     _ensure_runtime_config_columns(engine)
 
 
@@ -469,6 +498,25 @@ def _ensure_user_task_dispatch_columns(engine) -> None:
         statements.append(
             f"ALTER TABLE {ScheduleUserTaskDispatch.__tablename__} ADD COLUMN downstream_report_ready BOOLEAN NOT NULL DEFAULT 0"
         )
+    if not statements:
+        return
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+
+
+def _ensure_user_task_event_columns(engine) -> None:
+    inspector = inspect(engine)
+    if ScheduleUserTaskEvent.__tablename__ not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns(ScheduleUserTaskEvent.__tablename__)}
+    statements: list[str] = []
+    if "dispatch_id" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTaskEvent.__tablename__} ADD COLUMN dispatch_id VARCHAR(64) NULL")
+    if "sync_queue" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTaskEvent.__tablename__} ADD COLUMN sync_queue VARCHAR(32) NULL")
+    if "error_code" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleUserTaskEvent.__tablename__} ADD COLUMN error_code VARCHAR(64) NULL")
     if not statements:
         return
     with engine.begin() as connection:

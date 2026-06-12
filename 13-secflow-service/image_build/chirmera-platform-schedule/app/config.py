@@ -55,7 +55,9 @@ class FileserverServiceConfig(BaseModel):
 
 class AiGatewayServiceConfig(BaseModel):
     base_url: str = "http://gaiasec-llm-gateway"
+    # Management-side task key creation endpoint.
     llm_keys_path: str = "/api/aigw/llm-keys"
+    # Bearer token used for AI Gateway management-side APIs, not task/work key auth.
     management_bearer_token: Optional[str] = None
     timeout: int = 30
 
@@ -175,6 +177,22 @@ class WorkerConfig(BaseModel):
     db_fallback_batch_size: int = 20
 
 
+class UserTaskSyncConfig(BaseModel):
+    enabled: bool = True
+    lease_seconds: int = 45
+    heartbeat_interval_seconds: int = 10
+    db_fallback_batch_size: int = 20
+    queue_pop_timeout_seconds: int = 1
+    reclaim_batch_size: int = 50
+    dispatching_seconds: int = 5
+    running_seconds: int = 15
+    paused_seconds: int = 60
+    terminal_verify_seconds: int = 10
+    retry_initial_seconds: int = 30
+    retry_max_seconds: int = 300
+    failure_threshold: int = 5
+
+
 class LimitsConfig(BaseModel):
     project_default_concurrency: int = 16
     target_default_concurrency: int = 8
@@ -218,6 +236,7 @@ class Config(BaseModel):
     redis: RedisConfig = Field(default_factory=RedisConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
+    user_task_sync: UserTaskSyncConfig = Field(default_factory=UserTaskSyncConfig)
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     retry: RetryConfig = Field(default_factory=RetryConfig)
     litellm: LiteLLMConfig = Field(default_factory=LiteLLMConfig)

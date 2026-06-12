@@ -179,7 +179,11 @@ class RuntimeOverviewResponse(BaseModel):
     leader: dict[str, Any]
     workers: dict[str, Any]
     stats: dict[str, Any]
+    user_task_sync: dict[str, Any] = Field(default_factory=dict)
     redis_available: bool
+    active_runtime_config_source: Optional[str] = None
+    active_time_window_name: Optional[str] = None
+    effective_limits: dict[str, Any] = Field(default_factory=dict)
 
 
 class JobRuntimeResponse(BaseModel):
@@ -311,6 +315,42 @@ class ScheduleRuntimeSchedulerPolicy(BaseModel):
         return int(value)
 
 
+class ScheduleRuntimeUserTaskSyncPolicy(BaseModel):
+    enabled: bool = True
+    lease_seconds: int = 45
+    heartbeat_interval_seconds: int = 10
+    db_fallback_batch_size: int = 20
+    queue_pop_timeout_seconds: int = 1
+    reclaim_batch_size: int = 50
+    dispatching_seconds: int = 5
+    running_seconds: int = 15
+    paused_seconds: int = 60
+    terminal_verify_seconds: int = 10
+    retry_initial_seconds: int = 30
+    retry_max_seconds: int = 300
+    failure_threshold: int = 5
+
+    @field_validator(
+        "lease_seconds",
+        "heartbeat_interval_seconds",
+        "db_fallback_batch_size",
+        "queue_pop_timeout_seconds",
+        "reclaim_batch_size",
+        "dispatching_seconds",
+        "running_seconds",
+        "paused_seconds",
+        "terminal_verify_seconds",
+        "retry_initial_seconds",
+        "retry_max_seconds",
+        "failure_threshold",
+    )
+    @classmethod
+    def validate_positive_sync_values(cls, value: int) -> int:
+        if int(value) <= 0:
+            raise ValueError("同步配置必须大于 0")
+        return int(value)
+
+
 class ScheduleRuntimeToolDefault(BaseModel):
     task_type: UserTaskType
     label: str
@@ -340,6 +380,7 @@ class ScheduleRuntimeTimeWindow(BaseModel):
     start_time: str
     end_time: str
     scheduler_policy: Optional[ScheduleRuntimeSchedulerPolicy] = None
+    user_task_sync_policy: Optional[ScheduleRuntimeUserTaskSyncPolicy] = None
     tool_defaults: list[ScheduleRuntimeToolDefault] = Field(default_factory=list)
 
     @field_validator("name")
@@ -361,12 +402,14 @@ class ScheduleRuntimeEffectiveConfig(BaseModel):
     active_time_window_name: Optional[str] = None
     timezone: str = "Asia/Shanghai"
     scheduler_policy: ScheduleRuntimeSchedulerPolicy
+    user_task_sync_policy: ScheduleRuntimeUserTaskSyncPolicy
     tool_defaults: list[ScheduleRuntimeToolDefault] = Field(default_factory=list)
 
 
 class ScheduleRuntimeConfigUpdate(BaseModel):
     timezone: str = "Asia/Shanghai"
     scheduler_policy: ScheduleRuntimeSchedulerPolicy
+    user_task_sync_policy: ScheduleRuntimeUserTaskSyncPolicy
     tool_defaults: list[ScheduleRuntimeToolDefault] = Field(default_factory=list)
     time_windows: list[ScheduleRuntimeTimeWindow] = Field(default_factory=list)
 
@@ -579,3 +622,29 @@ class UserTaskListResponse(BaseModel):
 class UserTaskDispatchListResponse(BaseModel):
     total: int
     items: list[UserTaskDispatchResponse]
+
+
+class UserTaskEventResponse(BaseModel):
+    id: str
+    project_id: str
+    user_task_id: str
+    task_type: str
+    event_category: str
+    event_type: str
+    result_status: str
+    event_source: str
+    actor: Optional[str] = None
+    message: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    downstream_task_id: Optional[str] = None
+    dispatch_id: Optional[str] = None
+    sync_queue: Optional[str] = None
+    error_code: Optional[str] = None
+    created_at: datetime
+
+
+class UserTaskEventListResponse(BaseModel):
+    total: int
+    items: list[UserTaskEventResponse] = Field(default_factory=list)
+    page: int = 1
+    page_size: int = 50

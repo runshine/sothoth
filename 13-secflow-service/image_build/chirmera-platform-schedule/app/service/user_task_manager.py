@@ -23,6 +23,7 @@ from app.config import get_config
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
 from app.model import (
     ScheduleUserTask,
+    ScheduleUserTaskEvent,
     ScheduleUserTaskDispatch,
     ScheduleUserTaskInputBinding,
     get_db_session,
@@ -72,13 +73,6 @@ AI4APK_STATUS_MAP: dict[str, tuple[str, str, bool]] = {
 }
 
 SYNC_QUEUE_PRIORITY = ["terminal_verify", "dispatching", "running", "paused", "retry_wait"]
-SYNC_QUEUE_INTERVAL_SECONDS: dict[str, int] = {
-    "dispatching": 5,
-    "running": 15,
-    "paused": 60,
-    "retry_wait": 30,
-    "terminal_verify": 10,
-}
 SYNC_TERMINAL_STATES = {"success", "failed", "cancelled"}
 SYNC_ACTIVE_STATUSES = {"queued", "retry_wait", "stale", "syncing"}
 SYNC_FORCE_ALLOWED_TASK_TYPES = {"ai4red", "ai4apk"}
@@ -101,6 +95,9 @@ USER_TASK_SORT_FIELDS: dict[str, Any] = {
 
 
 DELETE_QUEUE_RETRYABLE_STATUSES = {"queued", "running"}
+USER_TASK_EVENT_SORT_FIELDS: dict[str, Any] = {
+    "created_at": ScheduleUserTaskEvent.created_at,
+}
 
 
 def utcnow() -> datetime:
@@ -215,10 +212,12 @@ class AiGatewayTaskKeyClient:
         max_concurrency: int = 0,
         expires_at: Optional[str] = None,
     ) -> dict[str, Any]:
+        if not str(task_id or "").strip():
+            raise ValidationError("root task key 缺少 task_id，无法创建")
         if not capacity_pool_ids:
             raise ValidationError("root task key 缺少 capacity_pool_ids，无法创建")
         if not str(management_token or "").strip():
-            raise ValidationError("缺少 AI Gateway 管理凭证，无法创建 root task key")
+            raise ValidationError("缺少 AI Gateway 管理侧凭证，无法创建 root task key")
         client = await get_shared_async_client("schedule-aigw", timeout=self.cfg.timeout)
         payload = {
             "key_name": f"dispatch-{task_id}-{dispatch_id}",
@@ -242,8 +241,32 @@ class AiGatewayTaskKeyClient:
         except httpx.RequestError as exc:
             raise UpstreamError(f"创建 root task key 失败: {exc}") from exc
         if response.status_code not in (200, 201):
-            raise UpstreamError(f"创建 root task key 失败: {response.status_code}")
-        return response.json()
+            message = str(response.text or "").strip()
+            if not message:
+                try:
+                    body = response.json() or {}
+                    message = str(body.get("message") or body.get("detail") or body.get("error") or "").strip()
+                except Exception:
+                    message = ""
+            suffix = f": {message}" if message else ""
+            raise UpstreamError(f"创建 root task key 失败: {response.status_code}{suffix}")
+        try:
+            body = response.json()
+        except Exception as exc:
+            raise UpstreamError("创建 root task key 失败: 上游返回非 JSON 响应") from exc
+        key_payload = body.get("key") if isinstance(body, dict) else None
+        secret = str((body or {}).get("secret") or "").strip() if isinstance(body, dict) else ""
+        if not isinstance(key_payload, dict):
+            raise UpstreamError("创建 root task key 失败: 上游未返回 key 对象")
+        if not str(key_payload.get("id") or "").strip():
+            raise UpstreamError("创建 root task key 失败: 上游未返回 key.id")
+        if not str(key_payload.get("key_name") or "").strip():
+            raise UpstreamError("创建 root task key 失败: 上游未返回 key.key_name")
+        if not str(key_payload.get("key_prefix") or "").strip():
+            raise UpstreamError("创建 root task key 失败: 上游未返回 key.key_prefix")
+        if not secret:
+            raise UpstreamError("创建 root task key 失败: 上游未返回 secret")
+        return body
 
 
 
@@ -446,7 +469,85 @@ class UserTaskManager:
         self.binary_security = BinarySecurityDispatchClient()
         self.ai4red = Ai4RedDispatchClient()
         self.ai4apk = TuringAppSecurityClient()
+
+    def _append_user_task_event(
+        self,
+        db: Session,
+        *,
+        task: ScheduleUserTask,
+        event_category: str,
+        event_type: str,
+        result_status: str,
+        message: str,
+        event_source: str,
+        actor: Optional[str] = None,
+        payload: Optional[dict[str, Any]] = None,
+        dispatch_id: Optional[str] = None,
+        sync_queue: Optional[str] = None,
+        error_code: Optional[str] = None,
+    ) -> None:
+        sanitized_payload = dict(payload or {})
+        for secret_key in (
+            "secret",
+            "root_task_key_secret",
+            "agent_task_key_secret",
+            "dispatched_task_key_secret",
+            "parent_task_key_secret",
+        ):
+            sanitized_payload.pop(secret_key, None)
+        db.add(
+            ScheduleUserTaskEvent(
+                project_id=str(task.project_id),
+                user_task_id=str(task.id),
+                task_type=str(task.task_type or ""),
+                event_scope="user_task",
+                event_category=event_category,
+                event_type=event_type,
+                result_status=result_status,
+                event_source=event_source,
+                actor=actor,
+                message=message,
+                payload_json=sanitized_payload,
+                downstream_task_id=str(task.downstream_task_id or "").strip() or None,
+                dispatch_id=dispatch_id,
+                sync_queue=sync_queue,
+                error_code=error_code,
+            )
+        )
+
+    def _task_status_payload(self, task: ScheduleUserTask) -> dict[str, Any]:
+        return {
+            "create_status": task.create_status,
+            "dispatch_status": task.dispatch_status,
+            "business_status": task.business_status,
+            "display_status": str(task.display_status or self._display_status_from_task(task)),
+            "sync_status": str(task.sync_status or "none"),
+            "delete_status": str(task.delete_status or "none"),
+            "downstream_status_raw": task.downstream_status_raw,
+            "downstream_status_mapped": task.downstream_status_mapped,
+            "downstream_task_id": str(task.downstream_task_id or "").strip() or None,
+        }
+
+    def _parse_event_time(self, value: Optional[str]) -> Optional[datetime]:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            normalized = raw.replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            return parsed
+        except Exception:
+            return None
         self.pod_name = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or "chirmera-platform-schedule-sync-worker"
+
+    def _sync_runtime_policy(self):
+        runtime_db = get_db_session()
+        try:
+            return get_runtime_config_service().get_snapshot(runtime_db).user_task_sync_policy
+        finally:
+            runtime_db.close()
 
     @staticmethod
     def _task_type_supports_downstream_delete(task_type: str) -> bool:
@@ -542,10 +643,18 @@ class UserTaskManager:
 
     def _schedule_next_sync_at(self, queue_name: str, *, consecutive_error_count: int = 0, now: Optional[datetime] = None) -> datetime:
         base_now = now or utcnow()
-        base_delay = int(SYNC_QUEUE_INTERVAL_SECONDS.get(queue_name, 15))
+        policy = self._sync_runtime_policy()
+        queue_delays = {
+            "dispatching": int(policy.dispatching_seconds),
+            "running": int(policy.running_seconds),
+            "paused": int(policy.paused_seconds),
+            "retry_wait": int(policy.retry_initial_seconds),
+            "terminal_verify": int(policy.terminal_verify_seconds),
+        }
+        base_delay = int(queue_delays.get(queue_name, int(policy.running_seconds)))
         if queue_name == "retry_wait":
             multiplier = max(1, min(6, int(consecutive_error_count or 1)))
-            delay_seconds = min(300, base_delay * (2 ** (multiplier - 1)))
+            delay_seconds = min(int(policy.retry_max_seconds), base_delay * (2 ** (multiplier - 1)))
         else:
             delay_seconds = base_delay
         return base_now + timedelta(seconds=delay_seconds)
@@ -676,7 +785,7 @@ class UserTaskManager:
                 ScheduleUserTask.sync_status: "syncing",
                 ScheduleUserTask.sync_worker_id: self.pod_name,
                 ScheduleUserTask.sync_lease_token: lease_token,
-                ScheduleUserTask.sync_lease_expires_at: now + timedelta(seconds=int(get_config().worker.lease_seconds)),
+                ScheduleUserTask.sync_lease_expires_at: now + timedelta(seconds=int(self._sync_runtime_policy().lease_seconds)),
                 ScheduleUserTask.last_sync_started_at: now,
                 ScheduleUserTask.sync_attempt_count: int(task.sync_attempt_count or 0) + 1,
             },
@@ -713,7 +822,7 @@ class UserTaskManager:
             ScheduleUserTask.sync_status == "syncing",
         ).update(
             {
-                ScheduleUserTask.sync_lease_expires_at: utcnow() + timedelta(seconds=int(get_config().worker.lease_seconds)),
+                ScheduleUserTask.sync_lease_expires_at: utcnow() + timedelta(seconds=int(self._sync_runtime_policy().lease_seconds)),
             },
             synchronize_session=False,
         )
@@ -750,6 +859,19 @@ class UserTaskManager:
                 else:
                     latest.sync_status = "idle"
                     latest.next_sync_at = None
+                self._append_user_task_event(
+                    db,
+                    task=latest,
+                    event_category="sync",
+                    event_type="task_sync_succeeded",
+                    result_status="succeeded",
+                    message="任务同步执行成功",
+                    event_source="sync_worker",
+                    actor=self.pod_name,
+                    payload=self._task_status_payload(latest) | {"provider": result["provider"]},
+                    dispatch_id=getattr(latest_dispatch, "id", None),
+                    sync_queue=latest.sync_queue,
+                )
                 db.commit()
                 if latest.sync_required and str(latest.sync_queue or "").strip():
                     await self._enqueue_sync_task_if_needed(latest)
@@ -771,8 +893,21 @@ class UserTaskManager:
                     consecutive_error_count=int(latest.sync_consecutive_error_count or 1),
                     now=utcnow(),
                 )
-                if int(latest.sync_consecutive_error_count or 0) >= 5:
+                if int(latest.sync_consecutive_error_count or 0) >= int(self._sync_runtime_policy().failure_threshold):
                     latest.sync_status = "failed"
+                self._append_user_task_event(
+                    db,
+                    task=latest,
+                    event_category="sync",
+                    event_type="task_sync_failed",
+                    result_status="failed",
+                    message="任务同步执行失败",
+                    event_source="sync_worker",
+                    actor=self.pod_name,
+                    payload=self._task_status_payload(latest) | {"error": str(exc)},
+                    sync_queue=latest.sync_queue,
+                    error_code="sync_failed",
+                )
                 db.commit()
                 await self._enqueue_sync_task_if_needed(latest)
                 return False
@@ -786,6 +921,19 @@ class UserTaskManager:
             if claimed is None:
                 return False
             task, lease_token = claimed
+            self._append_user_task_event(
+                db,
+                task=task,
+                event_category="sync",
+                event_type="task_sync_started",
+                result_status="running",
+                message="任务同步开始执行",
+                event_source="sync_worker",
+                actor=self.pod_name,
+                payload=self._task_status_payload(task),
+                sync_queue=task.sync_queue,
+            )
+            db.commit()
             return await self._process_claimed_sync_task(
                 project_id=str(task.project_id),
                 task_id=str(task.id),
@@ -797,6 +945,17 @@ class UserTaskManager:
 
     async def request_task_sync(self, db: Session, *, project_id: str, task_id: str, actor: str, force: bool) -> dict[str, Any]:
         task = self.get_task_or_404(db, project_id, task_id)
+        self._append_user_task_event(
+            db,
+            task=task,
+            event_category="sync",
+            event_type="task_sync_requested",
+            result_status="info",
+            message="任务同步请求已提交",
+            event_source="api",
+            actor=actor,
+            payload={"force": bool(force)} | self._task_status_payload(task),
+        )
         if not self._should_sync_task(task):
             if force and task.task_type in SYNC_FORCE_ALLOWED_TASK_TYPES:
                 self._initialize_sync_fields(task, force=True)
@@ -807,6 +966,18 @@ class UserTaskManager:
         task.sync_status = "queued"
         task.next_sync_at = utcnow()
         task.updated_by = actor
+        self._append_user_task_event(
+            db,
+            task=task,
+            event_category="sync",
+            event_type="task_sync_enqueued",
+            result_status="queued",
+            message="任务已加入同步队列",
+            event_source="api",
+            actor=actor,
+            payload=self._task_status_payload(task),
+            sync_queue=task.sync_queue,
+        )
         db.commit()
         await self._enqueue_sync_task_if_needed(task)
         latest_dispatch = self._dispatches_for_task(db, task.id)[0] if self._dispatches_for_task(db, task.id) else None
@@ -901,6 +1072,16 @@ class UserTaskManager:
         task.delete_finished_at = None
         task.delete_worker_id = None
         task.delete_lease_expires_at = None
+        self._append_user_task_event(
+            db,
+            task=task,
+            event_category="delete",
+            event_type="task_delete_enqueued",
+            result_status="queued",
+            message="任务已加入删除队列",
+            event_source="api",
+            payload=self._task_status_payload(task),
+        )
         db.commit()
         await get_redis_runtime().enqueue_delete_ready(task_id)
         return {
@@ -937,11 +1118,57 @@ class UserTaskManager:
             task.delete_attempt_count = int(task.delete_attempt_count or 0) + 1
             task.delete_worker_id = worker_id
             task.delete_lease_expires_at = lease_expires_at
+            self._append_user_task_event(
+                db,
+                task=task,
+                event_category="delete",
+                event_type="task_delete_started",
+                result_status="running",
+                message="任务删除开始执行",
+                event_source="delete_worker",
+                actor=worker_id,
+                payload=self._task_status_payload(task),
+            )
             db.commit()
             try:
                 if str(task.downstream_task_id or "").strip():
                     service_token = self.auto_dispatch_token()
+                    self._append_user_task_event(
+                        db,
+                        task=task,
+                        event_category="delete",
+                        event_type="task_downstream_delete_requested",
+                        result_status="running",
+                        message="开始删除下游任务",
+                        event_source="delete_worker",
+                        actor=worker_id,
+                        payload=self._task_status_payload(task),
+                    )
+                    db.commit()
                     await self._delete_downstream_task(task, service_token)
+                    self._append_user_task_event(
+                        db,
+                        task=task,
+                        event_category="delete",
+                        event_type="task_downstream_delete_succeeded",
+                        result_status="succeeded",
+                        message="下游任务删除成功",
+                        event_source="delete_worker",
+                        actor=worker_id,
+                        payload=self._task_status_payload(task),
+                    )
+                    db.commit()
+                self._append_user_task_event(
+                    db,
+                    task=task,
+                    event_category="delete",
+                    event_type="task_delete_succeeded",
+                    result_status="succeeded",
+                    message="父任务删除成功",
+                    event_source="delete_worker",
+                    actor=worker_id,
+                    payload=self._task_status_payload(task),
+                )
                 self._delete_parent_task_rows(db, task.id)
                 db.commit()
                 return True
@@ -954,6 +1181,18 @@ class UserTaskManager:
                     latest.delete_finished_at = utcnow()
                     latest.delete_worker_id = worker_id
                     latest.delete_lease_expires_at = None
+                    self._append_user_task_event(
+                        db,
+                        task=latest,
+                        event_category="delete",
+                        event_type="task_delete_failed",
+                        result_status="failed",
+                        message="任务删除失败",
+                        event_source="delete_worker",
+                        actor=worker_id,
+                        payload=self._task_status_payload(latest) | {"error": str(exc)},
+                        error_code="delete_failed",
+                    )
                     db.commit()
                 return False
         finally:
@@ -1047,7 +1286,20 @@ class UserTaskManager:
             db.rollback()
             return None
         db.commit()
-        return self.get_task_or_404(db, task.project_id, task.id)
+        claimed = self.get_task_or_404(db, task.project_id, task.id)
+        self._append_user_task_event(
+            db,
+            task=claimed,
+            event_category="dispatch",
+            event_type="task_auto_dispatch_enqueued",
+            result_status="queued",
+            message="任务已加入自动分发队列",
+            event_source="scheduler",
+            actor=actor,
+            payload=self._task_status_payload(claimed),
+        )
+        db.commit()
+        return claimed
 
     async def auto_dispatch_ready_tasks(self, *, batch_size: int, actor: str) -> int:
         dispatched = 0
@@ -1167,7 +1419,7 @@ class UserTaskManager:
         if task_type == "ai4red":
             return "directory"
         if task_type == "ai4apk":
-            return "file"
+            return "directory"
         raise ValidationError(f"不支持的任务类型: {task_type}")
 
     def _resolve_ai4red_directory(self, input_binding: ScheduleUserTaskInputBinding) -> str:
@@ -1176,6 +1428,14 @@ class UserTaskManager:
             raise ValidationError("AI4Red 仅支持 directory 输入模式")
         if not source_path.is_dir():
             raise ValidationError(f"AI4Red 输入目录不存在: {source_path}")
+        return str(source_path)
+
+    def _resolve_ai4apk_directory(self, input_binding: ScheduleUserTaskInputBinding) -> str:
+        source_path = Path(str(input_binding.resolved_path or input_binding.target_path or "").strip())
+        if input_binding.selection_type != "directory":
+            raise ValidationError("AI4APK 任务要求选择目录")
+        if not source_path.is_dir():
+            raise ValidationError(f"AI4APK 输入目录不存在: {source_path}")
         return str(source_path)
 
     @staticmethod
@@ -1209,6 +1469,18 @@ class UserTaskManager:
             return
         payload = await self.ai4red.get_task(downstream_task_id=task.downstream_task_id, bearer_token=bearer_token)
         self._apply_ai4red_status(task, dispatch, self._extract_ai4red_data(payload))
+        self._append_user_task_event(
+            db,
+            task=task,
+            event_category="status_refresh",
+            event_type="task_downstream_status_refreshed",
+            result_status="succeeded",
+            message="AI4Red 下游状态已刷新",
+            event_source="sync_worker",
+            payload=self._task_status_payload(task) | {"provider": "ai4red"},
+            dispatch_id=getattr(dispatch, "id", None),
+            sync_queue=task.sync_queue,
+        )
         db.commit()
 
     def _apply_ai4apk_status(self, task: ScheduleUserTask, dispatch: Optional[ScheduleUserTaskDispatch], downstream_payload: dict[str, Any]) -> None:
@@ -1233,6 +1505,18 @@ class UserTaskManager:
             return
         payload = await self.ai4apk.get_task(downstream_task_id=task.downstream_task_id)
         self._apply_ai4apk_status(task, dispatch, self._extract_ai4apk_data(payload))
+        self._append_user_task_event(
+            db,
+            task=task,
+            event_category="status_refresh",
+            event_type="task_downstream_status_refreshed",
+            result_status="succeeded",
+            message="AI4APK 下游状态已刷新",
+            event_source="sync_worker",
+            payload=self._task_status_payload(task) | {"provider": "ai4apk"},
+            dispatch_id=getattr(dispatch, "id", None),
+            sync_queue=task.sync_queue,
+        )
         db.commit()
 
     async def list_tasks(
@@ -1368,12 +1652,6 @@ class UserTaskManager:
             resolved_relative_paths = [resolved_relative_path]
             resolved_path = str(node.get("absolute_path") or "").strip()
             display_name = str(node.get("name") or resolved_relative_path or display_name)
-            if payload.task_type == "ai4apk":
-                if not resolved_path:
-                    raise ValidationError("AI4APK 输入文件解析失败")
-                file_path = Path(resolved_path)
-                if not file_path.is_file():
-                    raise ValidationError(f"AI4APK 输入文件不存在: {file_path}")
         elif selection_type == "file_list":
             if not relative_paths:
                 raise ValidationError("盖亚-二进制模块必须至少选择一个文件")
@@ -1400,6 +1678,12 @@ class UserTaskManager:
                 directory_path = Path(resolved_path)
                 if not directory_path.is_dir():
                     raise ValidationError(f"AI4Red 输入目录不存在: {directory_path}")
+            if payload.task_type == "ai4apk":
+                if not resolved_path:
+                    raise ValidationError("AI4APK 输入目录解析失败")
+                directory_path = Path(resolved_path)
+                if not directory_path.is_dir():
+                    raise ValidationError(f"AI4APK 输入目录不存在: {directory_path}")
 
         compatibility_parent_secret = f"{CREATE_TIME_PARENT_TASK_KEY_PLACEHOLDER}:{payload.task_type}"
         parent_task_key_secret_cipher, parent_task_key_secret_nonce, parent_task_key_secret_version = self.task_key_cipher.encrypt(
@@ -1431,6 +1715,17 @@ class UserTaskManager:
         )
         db.add(task)
         db.flush()
+        self._append_user_task_event(
+            db,
+            task=task,
+            event_category="create",
+            event_type="task_created",
+            result_status="info",
+            message="任务创建成功",
+            event_source="api",
+            actor=actor,
+            payload={"selection_type": selection_type} | self._task_status_payload(task),
+        )
         binding = ScheduleUserTaskInputBinding(
             user_task_id=task.id,
             project_id=project_id,
@@ -1456,6 +1751,17 @@ class UserTaskManager:
         bindings = self._bindings_for_task(db, task.id)
         if not bindings:
             raise ValidationError("任务缺少输入绑定，无法分发")
+        self._append_user_task_event(
+            db,
+            task=task,
+            event_category="dispatch",
+            event_type="task_dispatch_requested",
+            result_status="info",
+            message="任务分发请求已提交",
+            event_source="api",
+            actor=actor,
+            payload=self._task_status_payload(task),
+        )
         if task.dispatch_status not in {"ready_for_dispatch", "dispatch_queued", "dispatch_failed"}:
             raise ConflictError(f"任务当前状态不允许分发: {task.dispatch_status}")
         task.dispatch_status = "dispatching"
@@ -1468,6 +1774,18 @@ class UserTaskManager:
             created_by=actor,
         )
         db.add(dispatch)
+        self._append_user_task_event(
+            db,
+            task=task,
+            event_category="dispatch",
+            event_type="task_dispatch_started",
+            result_status="running",
+            message="任务开始分发",
+            event_source="worker",
+            actor=actor,
+            payload=self._task_status_payload(task),
+            dispatch_id=dispatch.id,
+        )
         db.commit()
         db.refresh(dispatch)
 
@@ -1497,6 +1815,18 @@ class UserTaskManager:
                 task.downstream_report_ready = False
                 task.last_error = None
                 self._initialize_sync_fields(task, force=True)
+                self._append_user_task_event(
+                    db,
+                    task=task,
+                    event_category="dispatch",
+                    event_type="task_downstream_create_succeeded",
+                    result_status="succeeded",
+                    message="AI4Red 下游任务创建成功",
+                    event_source="worker",
+                    actor=actor,
+                    payload=self._task_status_payload(task),
+                    dispatch_id=dispatch.id,
+                )
                 db.commit()
                 try:
                     await self._refresh_ai4red_state(db, task, dispatch, bearer_token)
@@ -1509,15 +1839,11 @@ class UserTaskManager:
                 await self._enqueue_sync_task_if_needed(task)
                 return self._serialize_task(task, bindings, dispatch)
             if task.task_type == "ai4apk":
-                file_path = Path(str(input_binding.resolved_path or input_binding.target_path or "").strip())
-                if input_binding.selection_type != "file":
-                    raise ValidationError("AI4APK 仅支持 file 输入模式")
-                if not file_path.is_file():
-                    raise ValidationError(f"AI4APK 输入文件不存在: {file_path}")
+                directory_path = self._resolve_ai4apk_directory(input_binding)
                 create_result = await self.ai4apk.create_task(
                     project_id=project_id,
                     task_id=task.id,
-                    file_path=str(file_path),
+                    file_path=directory_path,
                     task_type="APK",
                 )
                 downstream_task_id = str(self._extract_ai4apk_data(create_result).get("tool_task_id") or "").strip()
@@ -1538,6 +1864,18 @@ class UserTaskManager:
                 task.downstream_report_ready = False
                 task.last_error = None
                 self._initialize_sync_fields(task, force=True)
+                self._append_user_task_event(
+                    db,
+                    task=task,
+                    event_category="dispatch",
+                    event_type="task_downstream_create_succeeded",
+                    result_status="succeeded",
+                    message="AI4APK 下游任务创建成功",
+                    event_source="worker",
+                    actor=actor,
+                    payload=self._task_status_payload(task),
+                    dispatch_id=dispatch.id,
+                )
                 db.commit()
                 try:
                     await self._refresh_ai4apk_state(db, task, dispatch)
@@ -1573,6 +1911,21 @@ class UserTaskManager:
             dispatch.dispatched_task_key_name = str(key_payload.get("key_name") or "")
             dispatch.dispatched_task_key_prefix = str(key_payload.get("key_prefix") or "")
             dispatch.dispatched_task_capacity_pool_ids = list(key_payload.get("capacity_pool_ids") or dispatch_policy.capacity_pool_ids or [])
+            self._append_user_task_event(
+                db,
+                task=task,
+                event_category="dispatch",
+                event_type="task_root_key_created",
+                result_status="succeeded",
+                message="调度 root key 已创建",
+                event_source="worker",
+                actor=actor,
+                payload=self._task_status_payload(task) | {
+                    "root_task_key_id": dispatch.dispatched_task_key_id,
+                    "root_task_key_prefix": dispatch.dispatched_task_key_prefix,
+                },
+                dispatch_id=dispatch.id,
+            )
 
             source_path = Path(input_binding.resolved_path or input_binding.target_path)
             if not source_path.exists():
@@ -1635,17 +1988,53 @@ class UserTaskManager:
             }
             if task.task_type == "binary_module_e2e":
                 create_payload["module_name"] = str(task.module_name or "").strip() or task.name or "module"
+            self._append_user_task_event(
+                db,
+                task=task,
+                event_category="dispatch",
+                event_type="task_downstream_create_requested",
+                result_status="running",
+                message="开始创建 binary-security 下游任务",
+                event_source="worker",
+                actor=actor,
+                payload=self._task_status_payload(task),
+                dispatch_id=dispatch.id,
+            )
             await self.binary_security.create_task(
                 project_id=project_id,
                 task_id=task.id,
                 payload=create_payload,
                 bearer_token=dispatch_auth_token,
             )
+            self._append_user_task_event(
+                db,
+                task=task,
+                event_category="dispatch",
+                event_type="task_downstream_create_succeeded",
+                result_status="succeeded",
+                message="binary-security 下游任务创建成功",
+                event_source="worker",
+                actor=actor,
+                payload=self._task_status_payload(task),
+                dispatch_id=dispatch.id,
+            )
             await self.binary_security.complete_uploads(
                 project_id=project_id,
                 task_id=task.id,
                 files=copied_files,
                 bearer_token=dispatch_auth_token,
+            )
+            self._append_user_task_event(
+                db,
+                task=task,
+                event_category="dispatch",
+                event_type="task_downstream_upload_completed",
+                result_status="succeeded",
+                message="下游输入上传确认完成",
+                event_source="worker",
+                actor=actor,
+                payload=self._task_status_payload(task),
+                dispatch_id=dispatch.id,
             )
 
             dispatch.dispatch_status = "succeeded"
@@ -1661,6 +2050,18 @@ class UserTaskManager:
             task.sync_status = "none"
             task.sync_queue = None
             task.next_sync_at = None
+            self._append_user_task_event(
+                db,
+                task=task,
+                event_category="dispatch",
+                event_type="task_dispatch_succeeded",
+                result_status="succeeded",
+                message="任务分发成功",
+                event_source="worker",
+                actor=actor,
+                payload=self._task_status_payload(task),
+                dispatch_id=dispatch.id,
+            )
             db.commit()
         except Exception as exc:
             db.rollback()
@@ -1680,32 +2081,150 @@ class UserTaskManager:
             if dispatch is not None:
                 dispatch.dispatch_status = "failed"
                 dispatch.last_error = message
+            self._append_user_task_event(
+                db,
+                task=task,
+                event_category="dispatch",
+                event_type="task_dispatch_failed",
+                result_status="failed",
+                message="任务分发失败",
+                event_source="worker",
+                actor=actor,
+                payload=self._task_status_payload(task) | {"error": message},
+                dispatch_id=getattr(dispatch, "id", None),
+                error_code="dispatch_failed",
+            )
             db.commit()
             raise
         latest_dispatch = dispatch
         return self._serialize_task(task, bindings, latest_dispatch)
 
-    async def get_task_detail(self, db: Session, project_id: str, task_id: str, bearer_token: str) -> dict[str, Any]:
+    async def get_task_detail(
+        self,
+        db: Session,
+        project_id: str,
+        task_id: str,
+        bearer_token: str | None = None,
+    ) -> dict[str, Any]:
         task = self.get_task_or_404(db, project_id, task_id)
         dispatches = self._dispatches_for_task(db, task.id)
         latest_dispatch = dispatches[0] if dispatches else None
-        if task.task_type == "ai4red" and task.downstream_task_id:
-            try:
-                await self._refresh_ai4red_state(db, task, latest_dispatch, bearer_token)
-            except Exception:
-                db.rollback()
-                task = self.get_task_or_404(db, project_id, task_id)
-                dispatches = self._dispatches_for_task(db, task.id)
-                latest_dispatch = dispatches[0] if dispatches else None
-        if task.task_type == "ai4apk" and task.downstream_task_id:
-            try:
-                await self._refresh_ai4apk_state(db, task, latest_dispatch)
-            except Exception:
-                db.rollback()
-                task = self.get_task_or_404(db, project_id, task_id)
-                dispatches = self._dispatches_for_task(db, task.id)
-                latest_dispatch = dispatches[0] if dispatches else None
         return self._serialize_task(task, self._bindings_for_task(db, task.id), latest_dispatch)
+
+    def _serialize_task_event(self, row: ScheduleUserTaskEvent, *, task_name: Optional[str] = None) -> dict[str, Any]:
+        payload = dict(row.payload_json or {})
+        if task_name:
+            payload.setdefault("task_name", task_name)
+        return {
+            "id": row.id,
+            "project_id": row.project_id,
+            "user_task_id": row.user_task_id,
+            "task_type": row.task_type,
+            "event_category": row.event_category,
+            "event_type": row.event_type,
+            "result_status": row.result_status,
+            "event_source": row.event_source,
+            "actor": row.actor,
+            "message": row.message,
+            "payload": payload,
+            "downstream_task_id": row.downstream_task_id,
+            "dispatch_id": row.dispatch_id,
+            "sync_queue": row.sync_queue,
+            "error_code": row.error_code,
+            "created_at": row.created_at,
+        }
+
+    def list_task_events(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        page: int = 1,
+        page_size: int = 50,
+        only_failed: bool = False,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        self.get_task_or_404(db, project_id, task_id)
+        normalized_page = max(1, int(page or 1))
+        normalized_page_size = max(1, min(1000, int(page_size or 50)))
+        query = db.query(ScheduleUserTaskEvent).filter(
+            ScheduleUserTaskEvent.project_id == project_id,
+            ScheduleUserTaskEvent.user_task_id == task_id,
+        )
+        if only_failed:
+            query = query.filter(ScheduleUserTaskEvent.result_status == "failed")
+        total = query.count()
+        rows = query.order_by(ScheduleUserTaskEvent.created_at.desc(), ScheduleUserTaskEvent.id.desc()).offset(
+            (normalized_page - 1) * normalized_page_size
+        ).limit(normalized_page_size).all()
+        return total, [self._serialize_task_event(row) for row in rows]
+
+    def list_user_task_events(
+        self,
+        db: Session,
+        *,
+        project_id: Optional[str] = None,
+        project_ids: Optional[list[str]] = None,
+        filters: Optional[dict[str, Any]] = None,
+        page: int = 1,
+        page_size: int = 50,
+        sort_by: str = "created_at",
+        sort_direction: str = "desc",
+    ) -> tuple[int, list[dict[str, Any]]]:
+        normalized_page = max(1, int(page or 1))
+        normalized_page_size = max(1, min(1000, int(page_size or 50)))
+        normalized_filters = dict(filters or {})
+        query = db.query(ScheduleUserTaskEvent, ScheduleUserTask.name.label("task_name")).outerjoin(
+            ScheduleUserTask,
+            ScheduleUserTask.id == ScheduleUserTaskEvent.user_task_id,
+        )
+        if str(project_id or "").strip():
+            query = query.filter(ScheduleUserTaskEvent.project_id == str(project_id).strip())
+        if project_ids:
+            query = query.filter(ScheduleUserTaskEvent.project_id.in_(project_ids))
+        if str(normalized_filters.get("task_id") or "").strip():
+            query = query.filter(ScheduleUserTaskEvent.user_task_id == str(normalized_filters["task_id"]).strip())
+        if str(normalized_filters.get("task_type") or "").strip():
+            query = query.filter(ScheduleUserTaskEvent.task_type == str(normalized_filters["task_type"]).strip())
+        if str(normalized_filters.get("event_category") or "").strip():
+            query = query.filter(ScheduleUserTaskEvent.event_category == str(normalized_filters["event_category"]).strip())
+        if str(normalized_filters.get("event_type") or "").strip():
+            query = query.filter(ScheduleUserTaskEvent.event_type == str(normalized_filters["event_type"]).strip())
+        if str(normalized_filters.get("result_status") or "").strip():
+            query = query.filter(ScheduleUserTaskEvent.result_status == str(normalized_filters["result_status"]).strip())
+        if str(normalized_filters.get("event_source") or "").strip():
+            query = query.filter(ScheduleUserTaskEvent.event_source == str(normalized_filters["event_source"]).strip())
+        if str(normalized_filters.get("actor") or "").strip():
+            query = query.filter(ScheduleUserTaskEvent.actor == str(normalized_filters["actor"]).strip())
+        if str(normalized_filters.get("downstream_task_id") or "").strip():
+            query = query.filter(ScheduleUserTaskEvent.downstream_task_id == str(normalized_filters["downstream_task_id"]).strip())
+        if bool(normalized_filters.get("only_failed")):
+            query = query.filter(ScheduleUserTaskEvent.result_status == "failed")
+        from_time = self._parse_event_time(normalized_filters.get("from_time"))
+        to_time = self._parse_event_time(normalized_filters.get("to_time"))
+        if from_time is not None:
+            query = query.filter(ScheduleUserTaskEvent.created_at >= from_time)
+        if to_time is not None:
+            query = query.filter(ScheduleUserTaskEvent.created_at <= to_time)
+        search = str(normalized_filters.get("search") or "").strip().lower()
+        if search:
+            search_value = f"%{search}%"
+            query = query.filter(
+                or_(
+                    func.lower(ScheduleUserTaskEvent.user_task_id).like(search_value),
+                    func.lower(func.coalesce(ScheduleUserTaskEvent.message, "")).like(search_value),
+                    func.lower(func.coalesce(ScheduleUserTaskEvent.downstream_task_id, "")).like(search_value),
+                    func.lower(func.coalesce(ScheduleUserTaskEvent.actor, "")).like(search_value),
+                    func.lower(func.coalesce(ScheduleUserTask.name, "")).like(search_value),
+                )
+            )
+        order_column = USER_TASK_EVENT_SORT_FIELDS.get(str(sort_by or "created_at").strip(), ScheduleUserTaskEvent.created_at)
+        order_clause = order_column.asc() if str(sort_direction or "").strip().lower() == "asc" else order_column.desc()
+        total = query.count()
+        rows = query.order_by(order_clause, ScheduleUserTaskEvent.id.desc()).offset(
+            (normalized_page - 1) * normalized_page_size
+        ).limit(normalized_page_size).all()
+        return total, [self._serialize_task_event(row, task_name=task_name) for row, task_name in rows]
 
     async def delete_tasks(
         self,
