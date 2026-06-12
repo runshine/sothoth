@@ -5131,7 +5131,12 @@ class TaskManager:
         return message
 
     def _should_compress_timeline_event(self, event: BinarySecurityEvent) -> bool:
-        return str(getattr(event, "event_type", "") or "").strip() == "tail_reconcile_owner_lost"
+        return str(getattr(event, "event_type", "") or "").strip() in {
+            "tail_reconcile_owner_lost",
+            "downstream_http_429_retry_scheduled",
+            "downstream_http_429_retry_attempted",
+            "downstream_http_429_retry_recovered",
+        }
 
     def _same_timeline_compression_bucket(self, left: BinarySecurityEvent, right: BinarySecurityEvent) -> bool:
         if not self._should_compress_timeline_event(left) or not self._should_compress_timeline_event(right):
@@ -5143,6 +5148,9 @@ class TaskManager:
             and str(left.item_id or "") == str(right.item_id or "")
             and str(left.item_key or "") == str(right.item_key or "")
             and str(left.message or "") == str(right.message or "")
+            and str(left_payload.get("downstream_service") or "") == str(right_payload.get("downstream_service") or "")
+            and str(left_payload.get("downstream_task_id") or "") == str(right_payload.get("downstream_task_id") or "")
+            and str(left_payload.get("http_status") or "") == str(right_payload.get("http_status") or "")
             and str(left_payload.get("error_type") or "") == str(right_payload.get("error_type") or "")
             and str(left_payload.get("error_message") or "") == str(right_payload.get("error_message") or "")
         )
@@ -8887,16 +8895,19 @@ class TaskManager:
     ) -> bool:
         error_type = self._classify_downstream_sync_error(error)
         observed_at = _now()
-        state = self._build_next_downstream_sync_failure_state(item, observed_at=observed_at)
+        http_status = self._extract_http_status_from_exception(error)
+        is_http_429 = http_status == 429
+        state = self._build_next_http_429_failure_state(item, observed_at=observed_at) if is_http_429 else self._build_next_downstream_sync_failure_state(item, observed_at=observed_at)
+        sync_status = "rate_limited" if is_http_429 else "transport_error"
         persisted = self._persist_child_sync_observation(
             db,
             task=task,
             item=item,
             change_source=change_source,
-            sync_status="transport_error",
+            sync_status=sync_status,
             synced_at=observed_at,
             error_message=str(error),
-            http_status=self._extract_http_status_from_exception(error),
+            http_status=http_status,
             error_type=error_type,
             state_applied=False,
             extra_payload={"operation": operation, **self._downstream_sync_failure_payload(item, error_type=error_type, error_message=str(error), state=state)},
@@ -8917,21 +8928,30 @@ class TaskManager:
             db,
             task=task,
             item=item,
-            event_type="child_transport_failed",
+            event_type="downstream_http_429_retry_scheduled" if is_http_429 else "child_transport_failed",
             change_source=change_source,
             before_status=before_status or (str(item.status or "").strip().lower() or None),
             after_status=str(item.status or "").strip().lower() or before_status,
-            sync_status="transport_error",
+            sync_status=sync_status,
             downstream_status_raw=None,
             downstream_status_mapped=None,
             downstream_status=None,
             state_applied=False,
             error_message=str(error),
             error_type=error_type,
-            http_status=self._extract_http_status_from_exception(error),
-            extra_payload={"operation": operation, **failure_payload},
+            http_status=http_status,
+            extra_payload={
+                "operation": operation,
+                "retry_attempt_count": state.consecutive_error_count,
+                "retry_delay_seconds": self._next_http_429_retry_backoff_seconds(state.consecutive_error_count) if is_http_429 else None,
+                **failure_payload,
+            },
         )
-        event_type = "downstream_sync_error_budget_exhausted" if state.budget_exhausted else "downstream_poll_retry_scheduled"
+        event_type = (
+            "downstream_http_429_retry_scheduled"
+            if is_http_429
+            else "downstream_sync_error_budget_exhausted" if state.budget_exhausted else "downstream_poll_retry_scheduled"
+        )
         self._log_child_status_event(
             db,
             task=task,
@@ -8940,15 +8960,20 @@ class TaskManager:
             change_source=change_source,
             before_status=before_status or (str(item.status or "").strip().lower() or None),
             after_status=str(item.status or "").strip().lower() or before_status,
-            sync_status="transport_error",
+            sync_status=sync_status,
             downstream_status_raw=None,
             downstream_status_mapped=None,
             downstream_status=None,
             state_applied=False,
             error_message=str(error),
             error_type=error_type,
-            http_status=self._extract_http_status_from_exception(error),
-            extra_payload={"operation": operation, **failure_payload},
+            http_status=http_status,
+            extra_payload={
+                "operation": operation,
+                "retry_attempt_count": state.consecutive_error_count,
+                "retry_delay_seconds": self._next_http_429_retry_backoff_seconds(state.consecutive_error_count) if is_http_429 else None,
+                **failure_payload,
+            },
         )
         return True
 
@@ -15759,6 +15784,12 @@ class TaskManager:
         message = str(exc or "")
         if not message:
             return None
+        leading = re.match(r"^\s*(?:http\s+)?(\d{3})\b", message, re.IGNORECASE)
+        if leading:
+            try:
+                return int(leading.group(1))
+            except Exception:
+                return None
         match = re.search(r"(?:状态码|status(?:_code)?)[:= ]+(\d{3})", message, re.IGNORECASE)
         if match:
             try:
@@ -15766,6 +15797,9 @@ class TaskManager:
             except Exception:
                 return None
         return None
+
+    def _is_http_429_exception(self, exc: Exception) -> bool:
+        return self._extract_http_status_from_exception(exc) == 429
 
     def _classify_downstream_sync_error(self, exc: Exception) -> str:
         if isinstance(exc, SATimeoutError):
@@ -15782,6 +15816,8 @@ class TaskManager:
         detail = str(getattr(exc, "error_type_detail", "") or getattr(exc, "transport_error_kind", "")).strip().lower()
         if detail == "connection_reused_stale":
             return "connection_reused_stale"
+        if http_status == 429:
+            return "http_429_rate_limited"
         if http_status is not None and http_status >= 500:
             return "http_5xx"
         if "timeout" in lowered or "超时" in lowered:
@@ -15843,13 +15879,15 @@ class TaskManager:
         }
 
     def _is_retryable_downstream_transport_error(self, exc: Exception) -> bool:
+        if self._is_http_429_exception(exc):
+            return True
         if isinstance(exc, UpstreamError):
             return True
         if isinstance(exc, (NotFoundError, ValidationError, ConflictError)):
             return False
         if isinstance(exc, httpx.RequestError):
             return True
-        return self._classify_downstream_sync_error(exc) in {"timeout", "connection_error", "http_5xx"}
+        return self._classify_downstream_sync_error(exc) in {"timeout", "connection_error", "http_5xx", "http_429_rate_limited"}
 
     def _active_dispatch_count(self, db: Session) -> int:
         now_value = _now()
@@ -17862,6 +17900,13 @@ class TaskManager:
         backoff = self._stage_downstream_sync_backoff_base_seconds() * (2 ** exponent)
         return min(self._stage_downstream_sync_backoff_max_seconds(), max(1, int(backoff)))
 
+    def _next_http_429_retry_backoff_seconds(self, consecutive_error_count: int) -> int:
+        sequence = (5, 10, 15, 20, 25, 30)
+        index = max(0, int(consecutive_error_count) - 1)
+        if index >= len(sequence):
+            return sequence[-1]
+        return sequence[index]
+
     def _read_stage_item_sync_supervisor_state(self, item: BinarySecurityStageItem) -> DownstreamSyncSupervisorState:
         result = self._load_stage_item_result_payload(item)
         sync_observation = self._stage_item_sync_observation(item)
@@ -17911,6 +17956,22 @@ class TaskManager:
         return DownstreamSyncSupervisorState(
             consecutive_error_count=consecutive,
             budget_exhausted=budget_exhausted,
+            next_retry_at=retry_at,
+            last_result="error",
+        )
+
+    def _build_next_http_429_failure_state(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        observed_at: datetime | None = None,
+    ) -> DownstreamSyncSupervisorState:
+        previous = self._read_stage_item_sync_supervisor_state(item)
+        consecutive = previous.consecutive_error_count + 1
+        retry_at = (observed_at or _now()) + timedelta(seconds=self._next_http_429_retry_backoff_seconds(consecutive))
+        return DownstreamSyncSupervisorState(
+            consecutive_error_count=consecutive,
+            budget_exhausted=False,
             next_retry_at=retry_at,
             last_result="error",
         )
@@ -18642,7 +18703,7 @@ class TaskManager:
         stage_status_after_reconcile: str | None = None,
         extra_payload: dict[str, Any] | None = None,
     ) -> None:
-        level = "warning" if event_type in {"child_sync_failed", "child_transport_failed", "child_observation_persist_failed", "child_state_apply_failed", "child_archive_status_changed"} or str(after_status or "") in {"failed", "cancelled", "downstream_missing"} else "info"
+        level = "warning" if event_type in {"child_sync_failed", "child_transport_failed", "child_observation_persist_failed", "child_state_apply_failed", "child_archive_status_changed", "downstream_http_429_retry_scheduled"} or str(after_status or "") in {"failed", "cancelled", "downstream_missing"} else "info"
         self._record_event(
             db,
             task,
@@ -25085,34 +25146,53 @@ class TaskManager:
             deferred_status = "queued"
         else:
             deferred_status = "running" if has_downstream_ref else "queued"
+        http_status = self._extract_http_status_from_exception(exc)
+        is_http_429 = http_status == 429
+        error_type = self._classify_downstream_sync_error(exc)
+        state = self._build_next_http_429_failure_state(item) if is_http_429 else self._build_next_downstream_sync_failure_state(item)
+        sync_status = "rate_limited" if is_http_429 else "transport_error"
+        child_event_type = "downstream_http_429_retry_scheduled" if is_http_429 else "child_transport_failed"
+        child_change_source = "rate_limited" if is_http_429 else "transport_error"
+        disposition_event_type = "downstream_http_429_retry_scheduled" if is_http_429 else "downstream_transport_deferred"
+        disposition_message = (
+            f"下游返回 429，智能体将在 {self._next_http_429_retry_backoff_seconds(state.consecutive_error_count)} 秒后重试"
+            if is_http_429
+            else (
+                "下游通信异常，保留当前子任务等待后续自动对账"
+                if has_downstream_ref
+                else "下游通信异常，保留当前子任务等待重新调度创建"
+            )
+        )
         self._apply_child_task_status_change(
             session,
             task=task,
             item=item,
-            change_source="transport_error",
+            change_source=child_change_source,
             after_status=deferred_status,
-            sync_status="transport_error",
+            sync_status=sync_status,
             downstream_status_raw=None,
             downstream_status_mapped=deferred_status,
             downstream_status=None,
             state_applied=False,
             error_message=str(exc),
-            error_type=self._classify_downstream_sync_error(exc),
-            http_status=self._extract_http_status_from_exception(exc),
-            event_type="child_transport_failed",
+            error_type=error_type,
+            http_status=http_status,
+            event_type=child_event_type,
             extra_payload={
                 "operation": operation,
                 "deferred_mode": deferred_mode,
+                "retry_attempt_count": state.consecutive_error_count,
+                "retry_delay_seconds": None if state.next_retry_at is None else self._next_http_429_retry_backoff_seconds(state.consecutive_error_count) if is_http_429 else None,
+                "rate_limited": is_http_429,
             },
         )
-        state = self._build_next_downstream_sync_failure_state(item)
         self._mark_stage_item_sync_observation(
             item,
-            sync_status="transport_error",
+            sync_status=sync_status,
             synced_at=_now(),
             error_message=str(exc),
-            http_status=self._extract_http_status_from_exception(exc),
-            error_type=self._classify_downstream_sync_error(exc),
+            http_status=http_status,
+            error_type=error_type,
             state_applied=False,
             consecutive_error_count=state.consecutive_error_count,
             budget_exhausted=state.budget_exhausted,
@@ -25131,18 +25211,14 @@ class TaskManager:
             session,
             task,
             item,
-            event_type="downstream_transport_deferred",
-            message=(
-                "下游通信异常，保留当前子任务等待后续自动对账"
-                if has_downstream_ref
-                else "下游通信异常，保留当前子任务等待重新调度创建"
-            ),
+            event_type=disposition_event_type,
+            message=disposition_message,
             level="warning",
             payload={
                 "operation": operation,
                 "error": str(exc),
-                "http_status": self._extract_http_status_from_exception(exc),
-                "error_type": self._classify_downstream_sync_error(exc),
+                "http_status": http_status,
+                "error_type": error_type,
                 "error_type_detail": getattr(exc, "error_type_detail", None) or getattr(exc, "transport_error_kind", None),
                 "transport_error_kind": getattr(exc, "transport_error_kind", None) or getattr(exc, "error_type_detail", None),
                 "retry_attempted": bool(getattr(exc, "retry_attempted", False)),
@@ -25153,6 +25229,8 @@ class TaskManager:
                 "consecutive_sync_error_count": state.consecutive_error_count,
                 "next_sync_retry_at": _isoformat_or_none(state.next_retry_at),
                 "sync_error_budget_exhausted": state.budget_exhausted,
+                "retry_attempt_count": state.consecutive_error_count,
+                "retry_delay_seconds": self._next_http_429_retry_backoff_seconds(state.consecutive_error_count) if is_http_429 else None,
                 "binding_state": self._downstream_binding_state(item),
                 "binding_attempts": self._downstream_binding_attempts(item),
                 "binding_next_retry_at": _isoformat_or_none(self._downstream_binding_time(item, "next_retry_at")),

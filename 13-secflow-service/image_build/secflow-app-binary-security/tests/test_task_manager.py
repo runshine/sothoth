@@ -24645,6 +24645,99 @@ def _test_defer_item_after_downstream_transport_error_records_child_transport_fa
     self.assertTrue(deferred_events[-1].payload.get("client_recreated"))
 
 
+def _test_extract_http_status_from_exception_supports_leading_status_code(self):
+    self.assertEqual(429, self.manager._extract_http_status_from_exception(UpstreamError("429 No deployments available for selected model")))
+    self.assertEqual(429, self.manager._extract_http_status_from_exception(UpstreamError("HTTP 429 capacity exhausted")))
+
+
+def _test_http_429_uses_fixed_rate_limit_backoff(self):
+    task = BinarySecurityTask(id="t1", project_id="p1", name="demo", status="running")
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="firmware_unpack",
+        item_key="fw.bin",
+        status="running",
+        downstream_service="firmware_unpacker",
+        downstream_task_id="fu-1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+    exc = UpstreamError("429 No deployments available for selected model, Try again in 5 seconds.")
+    result = self.manager._defer_item_after_downstream_transport_error(
+        db,
+        task,
+        item,
+        operation="firmware_unpack",
+        exc=exc,
+        response_item={"path": "fw.bin"},
+    )
+
+    self.assertEqual("running", item.status)
+    self.assertEqual("rate_limited", item.result.get("sync_status"))
+    sync_observation = dict(item.result.get("sync_observation") or {})
+    self.assertEqual("http_429_rate_limited", sync_observation.get("error_type"))
+    self.assertEqual(429, sync_observation.get("http_status"))
+    self.assertEqual(1, sync_observation.get("consecutive_error_count"))
+    self.assertFalse(bool(sync_observation.get("budget_exhausted")))
+    self.assertEqual("running", result["status"])
+    scheduled_events = [event for event in db.events if event.event_type == "downstream_http_429_retry_scheduled"]
+    self.assertTrue(scheduled_events)
+    self.assertEqual(1, scheduled_events[-1].payload.get("retry_attempt_count"))
+    self.assertEqual(5, scheduled_events[-1].payload.get("retry_delay_seconds"))
+
+
+def _test_http_429_timeline_events_are_compressed(self):
+    task = BinarySecurityTask(
+        id="task429",
+        project_id="p1",
+        name="n",
+        status="running",
+        current_stage="firmware_unpack",
+        task_type=TASK_TYPE_BINARY,
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    event1 = BinarySecurityEvent(
+        id="evt429-1",
+        task_id="task429",
+        project_id="p1",
+        level="warning",
+        event_type="downstream_http_429_retry_scheduled",
+        stage_name="firmware_unpack",
+        item_id="si1",
+        item_key="fw.bin",
+        message="下游返回 429，智能体继续退让重试中",
+        payload={"http_status": 429, "error_type": "http_429_rate_limited", "downstream_service": "firmware_unpacker", "downstream_task_id": "fu-1"},
+    )
+    event1.created_at = _now()
+    event2 = BinarySecurityEvent(
+        id="evt429-2",
+        task_id="task429",
+        project_id="p1",
+        level="warning",
+        event_type="downstream_http_429_retry_scheduled",
+        stage_name="firmware_unpack",
+        item_id="si1",
+        item_key="fw.bin",
+        message="下游返回 429，智能体继续退让重试中",
+        payload={"http_status": 429, "error_type": "http_429_rate_limited", "downstream_service": "firmware_unpacker", "downstream_task_id": "fu-1"},
+    )
+    event2.created_at = _now()
+    db = _ModelAwareDb(tasks=[task], events=[event1, event2])
+
+    with patch.object(task_manager_module, "get_session_factory", return_value=lambda: db):
+        timeline = TaskManager().get_timeline(db, project_id="p1", task_id="task429")
+
+    self.assertEqual(1, len(timeline.events))
+    self.assertTrue(timeline.events[0].compressed)
+    self.assertEqual(2, timeline.events[0].repeat_count)
+    self.assertIn("已压缩 2 次", timeline.events[0].message)
+
+
 def _test_defer_item_after_downstream_transport_error_preserves_vuln_replacement_marker(self):
     task = BinarySecurityTask(id="t1", project_id="p1", name="demo", status="running")
     item = BinarySecurityStageItem(
@@ -24883,6 +24976,9 @@ def _test_upsert_stage_item_preserves_sync_metadata_on_refresh(self):
 
 TaskManagerTests.test_apply_child_task_status_change_records_timeline_and_sync_metadata = _test_apply_child_task_status_change_records_timeline_and_sync_metadata
 TaskManagerTests.test_defer_item_after_downstream_transport_error_records_child_transport_failed = _test_defer_item_after_downstream_transport_error_records_child_transport_failed
+TaskManagerTests.test_extract_http_status_from_exception_supports_leading_status_code = _test_extract_http_status_from_exception_supports_leading_status_code
+TaskManagerTests.test_http_429_uses_fixed_rate_limit_backoff = _test_http_429_uses_fixed_rate_limit_backoff
+TaskManagerTests.test_http_429_timeline_events_are_compressed = _test_http_429_timeline_events_are_compressed
 TaskManagerTests.test_upsert_stage_item_preserves_sync_metadata_on_refresh = _test_upsert_stage_item_preserves_sync_metadata_on_refresh
 
 
