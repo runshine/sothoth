@@ -7990,6 +7990,7 @@ class TaskManager:
                         skipped_count += 1
                         continue
                 if not self._payload_matches_current_child(item, payload):
+                    replacement_state = self._replacement_in_progress_state(item)
                     if not self._persist_child_sync_observation(
                         db,
                         task=task,
@@ -8010,8 +8011,8 @@ class TaskManager:
                         db,
                         task,
                         item,
-                        event_type="downstream_binding_mismatch_skipped",
-                        message="下游状态来自旧 child，已跳过当前阶段项状态回写",
+                        event_type="stale_downstream_payload_ignored",
+                        message="旧 child 的下游状态已忽略，不再回写当前阶段项",
                         payload=self._binding_mismatch_payload(
                             source="downstream_sync",
                             expected_downstream_task_id=self._current_downstream_task_id(item),
@@ -8019,6 +8020,22 @@ class TaskManager:
                             payload_downstream_task_id=self._payload_downstream_task_id(payload),
                         ),
                     )
+                    if replacement_state["replacement_in_progress"] or replacement_state["binding_cleared"]:
+                        self._record_event(
+                            db,
+                            task,
+                            "stale_downstream_terminal_ignored",
+                            "旧 child 终态在重建切换期间晚到，已忽略",
+                            stage_name=item.stage_name,
+                            item=item,
+                            level="warning",
+                            payload={
+                                "downstream_service": item.downstream_service,
+                                "current_downstream_task_id": self._current_downstream_task_id(item),
+                                "payload_downstream_task_id": self._payload_downstream_task_id(payload),
+                                "superseded": True,
+                            },
+                        )
                     continue
                 downstream_status = str(payload.get("status") or "").lower()
                 mapped_status = self._map_downstream_status(downstream_status)
@@ -10109,9 +10126,33 @@ class TaskManager:
         mapped_status: str,
         before_status: str | None,
         extra_paths: list[str | Path] | None = None,
-    ) -> BinarySecurityArchiveJob:
+    ) -> BinarySecurityArchiveJob | None:
         if mapped_status not in ARCHIVE_SUCCESS_MAPPED_STATUSES:
             raise ValidationError(f"当前状态不生成归档任务: {mapped_status}")
+        allowed, ignored_reason = self._may_queue_archive_for_current_binding(
+            item,
+            payload=payload,
+            mapped_status=mapped_status,
+        )
+        if not allowed:
+            self._record_event(
+                db,
+                task,
+                "stale_archive_trigger_ignored",
+                "旧 child 的终态归档触发已忽略",
+                stage_name=item.stage_name,
+                item=item,
+                level="warning",
+                payload={
+                    "downstream_service": item.downstream_service,
+                    "downstream_task_id": item.downstream_task_id,
+                    "payload_downstream_task_id": self._payload_downstream_task_id(payload),
+                    "mapped_status": mapped_status,
+                    "ignored_reason": ignored_reason,
+                    "superseded": True,
+                },
+            )
+            return None
         job = self._ensure_downstream_archive_job(
             db,
             task,
@@ -10161,6 +10202,8 @@ class TaskManager:
             before_status=before_status,
             extra_paths=extra_paths,
         )
+        if job is None:
+            return None, None
         db.commit()
         completed = await self._wait_archive_job_completion(job.id, task.id)
         try:
@@ -14193,23 +14236,28 @@ class TaskManager:
                 db,
                 task,
                 item,
-                event_type="archive_binding_mismatch_detected",
-                message="归档作业绑定的 child 已过期，已阻止旧归档结果回写当前阶段项",
+                event_type="archive_job_superseded_late_result",
+                message="旧 child 归档结果晚到，已忽略并废弃旧归档作业",
                 payload=mismatch_payload,
             )
-            job.archive_status = "failed"
-            job.error_message = "archive job bound downstream task does not match current stage item binding"
+            job.archive_status = "superseded"
+            job.error_message = None
             job.completed_at = _now()
             job.updated_at = _now()
-            observe_archive_action("apply", "failed")
+            payload = dict(job.payload or {})
+            payload["superseded"] = True
+            payload["superseded_reason"] = "late_archive_apply_binding_mismatch"
+            payload["superseded_downstream_task_id"] = job_bound_downstream_task_id or None
+            job.payload = payload
+            observe_archive_action("apply", "superseded")
             observe_archive_duration(
                 action="apply",
-                result="failed",
+                result="superseded",
                 duration_seconds=_elapsed_seconds_since(job.started_at),
             )
             return
         if str(task.status or "").strip() in {TASK_STATUS_CANCELLING, "cancelled"}:
-            job.archive_status = "success"
+            job.archive_status = "ignored"
             job.error_message = None
             job.completed_at = job.completed_at or _now()
             job.updated_at = _now()
@@ -14237,7 +14285,7 @@ class TaskManager:
             and str(failure_ctx.get("failure_category") or "").strip() == "archive_blocked"
             and str(failure_ctx.get("stage_name") or "").strip() == str(item.stage_name or "").strip()
         ):
-            job.archive_status = "success"
+            job.archive_status = "ignored"
             job.error_message = None
             job.completed_at = job.completed_at or _now()
             job.updated_at = _now()
@@ -15620,7 +15668,14 @@ class TaskManager:
             db.commit()
             return False, "create_failed"
 
-        item.downstream_task_id = created.get("task_id") or created.get("id") or item.downstream_task_id
+        old_downstream_task_id = await self._replace_active_child_binding(
+            db,
+            task,
+            item,
+            new_downstream_task_id=created.get("task_id") or created.get("id"),
+            token=token,
+            reason="binding_recovery_create",
+        )
         item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
         item.started_at = item.started_at or _now()
         item.finished_at = None
@@ -15636,6 +15691,7 @@ class TaskManager:
                 "binding_state": self._downstream_binding_state(item),
                 "downstream_task_id": item.downstream_task_id,
                 "attempts": self._downstream_binding_attempts(item),
+                "old_downstream_task_id": old_downstream_task_id,
             },
         )
         db.commit()
@@ -22516,6 +22572,63 @@ class TaskManager:
             "reason": "authoritative_stage_items_terminal",
         }
 
+    def _earlier_stage_authoritative_failure_context(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_runs: list[BinarySecurityStageRun] | None = None,
+    ) -> dict[str, Any] | None:
+        current_stage = str(task.current_stage or "").strip()
+        if not current_stage:
+            return None
+        if stage_runs is None:
+            stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+        ordered_stage_names = [
+            str(name or "").strip()
+            for name in self._stage_sequence_for_task(task)
+            if str(name or "").strip()
+        ]
+        try:
+            current_index = ordered_stage_names.index(current_stage)
+        except ValueError:
+            return None
+        for stage_name in reversed(ordered_stage_names[:current_index]):
+            stage_run = next((run for run in stage_runs if str(run.stage_name or "").strip() == stage_name), None)
+            if stage_run is not None and self._should_terminalize_parent_for_failed_stage(task, stage_run):
+                snapshot = self._stage_failure_snapshot(task, stage_run)
+                return {
+                    "stage_name": stage_name,
+                    "stage_run": stage_run,
+                    "failure_code": snapshot.get("failure_code"),
+                    "failure_category": snapshot.get("failure_category"),
+                    "failure_message": snapshot.get("failure_message") or snapshot.get("error") or stage_run.last_error,
+                    "reason": "earlier_stage_run_failed",
+                }
+            items = self._stage_items(db, task.id, stage_name)
+            if not items:
+                continue
+            normalized_statuses = [
+                self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()
+                for item in items
+            ]
+            if any(status in {"pending", "queued", "running", "dispatching"} for status in normalized_statuses):
+                continue
+            aggregate_status = self._aggregate_item_statuses(normalized_statuses)
+            if aggregate_status not in {"failed", "cancelled", "downstream_missing", "partial_success"}:
+                continue
+            snapshot = self._stage_failure_snapshot(task, stage_run)
+            failure_message = next((str(item.error_message or "").strip() for item in items if str(item.error_message or "").strip()), None)
+            return {
+                "stage_name": stage_name,
+                "stage_run": stage_run,
+                "failure_code": snapshot.get("failure_code"),
+                "failure_category": snapshot.get("failure_category"),
+                "failure_message": snapshot.get("failure_message") or snapshot.get("error") or failure_message or getattr(stage_run, "last_error", None),
+                "reason": "earlier_stage_items_terminal",
+            }
+        return None
+
     def _later_stage_names(self, task: BinarySecurityTask, stage_name: str | None) -> list[str]:
         current_stage = str(stage_name or "").strip()
         if not current_stage:
@@ -23404,6 +23517,8 @@ class TaskManager:
         vuln_run = next((run for run in stage_runs if normalize_stage_name(run.stage_name) == "dataflow_vuln_scan"), None)
         if any(status in {"running", "dispatching"} for status in statuses):
             authoritative_failure_ctx = self._current_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
+            if authoritative_failure_ctx is None:
+                authoritative_failure_ctx = self._earlier_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
             if authoritative_failure_ctx is not None:
                 self._finalize_task_after_authoritative_failure(
                     db,
@@ -24876,6 +24991,38 @@ class TaskManager:
             result.pop(key, None)
         item.result = result
 
+    def _mark_superseded_downstream_state(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        old_downstream_task_id: str | None,
+        message: str | None = None,
+    ) -> None:
+        result = dict(item.result or {})
+        sync_observation = dict(result.get("sync_observation") or {})
+        sync_observation["superseded_downstream_task_id"] = str(old_downstream_task_id or "").strip() or None
+        for key in (
+            "next_retry_at",
+            "last_error_at",
+            "consecutive_error_count",
+            "budget_exhausted",
+            "last_attempt_at",
+            "sync_status",
+            "error_message",
+            "error_type",
+            "http_status",
+            "last_result",
+            "verification_status",
+            "replacement_in_progress",
+            "binding_cleared",
+            "old_downstream_task_id",
+        ):
+            sync_observation.pop(key, None)
+        if message:
+            sync_observation["message"] = message
+        result["sync_observation"] = sync_observation
+        item.result = result
+
     def _mark_replacement_in_progress(
         self,
         item: BinarySecurityStageItem,
@@ -24914,6 +25061,208 @@ class TaskManager:
         if changed:
             result["sync_observation"] = sync_observation
             item.result = result
+
+    def _archive_job_is_active(self, archive_status: str | None) -> bool:
+        return str(archive_status or "").strip() in {"pending", "running", "archived", "applying", "success"}
+
+    def _supersede_archive_jobs_for_downstream_task(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        old_downstream_task_id: str | None,
+        reason: str,
+    ) -> list[BinarySecurityArchiveJob]:
+        old_task_id = str(old_downstream_task_id or "").strip()
+        if not old_task_id:
+            return []
+        jobs = (
+            db.query(BinarySecurityArchiveJob)
+            .filter(
+                BinarySecurityArchiveJob.item_id == item.id,
+                BinarySecurityArchiveJob.archive_status.in_(["pending", "running", "archived", "applying"]),
+            )
+            .order_by(BinarySecurityArchiveJob.created_at.asc(), BinarySecurityArchiveJob.id.asc())
+            .all()
+        )
+        superseded: list[BinarySecurityArchiveJob] = []
+        now = _now()
+        for job in jobs:
+            if self._archive_job_bound_downstream_task_id(job) != old_task_id:
+                continue
+            job.archive_status = "superseded"
+            job.error_message = None
+            job.owner_id = None
+            job.completed_at = job.completed_at or now
+            job.updated_at = now
+            payload = dict(job.payload or {})
+            payload["superseded"] = True
+            payload["superseded_reason"] = reason
+            payload["superseded_downstream_task_id"] = old_task_id
+            payload["superseded_at"] = now.isoformat()
+            job.payload = payload
+            superseded.append(job)
+        if superseded:
+            logger.warning(
+                "binary-security superseded archive jobs: task_id=%s stage=%s item_id=%s old_downstream_task_id=%s archive_job_ids=%s reason=%s",
+                task.id,
+                item.stage_name,
+                item.id,
+                old_task_id,
+                ",".join(str(job.id) for job in superseded),
+                reason,
+            )
+            self._record_event(
+                db,
+                task,
+                "superseded_archive_jobs_cancelled",
+                "旧 child 绑定的归档任务已废弃",
+                stage_name=item.stage_name,
+                item=item,
+                level="warning",
+                payload={
+                    "old_downstream_task_id": old_task_id,
+                    "archive_job_ids": [job.id for job in superseded],
+                    "reason": reason,
+                    "superseded": True,
+                },
+            )
+        return superseded
+
+    async def _replace_active_child_binding(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        new_downstream_task_id: str | None,
+        token: str | None,
+        reason: str,
+    ) -> str | None:
+        new_task_id = str(new_downstream_task_id or "").strip() or None
+        old_task_id = str(item.downstream_task_id or "").strip() or None
+        if not old_task_id:
+            item.downstream_task_id = new_task_id or item.downstream_task_id
+            self._clear_replacement_in_progress(item)
+            return None
+        if new_task_id and new_task_id == old_task_id:
+            self._clear_replacement_in_progress(item)
+            return old_task_id
+
+        logger.warning(
+            "binary-security child binding replace requested: task_id=%s stage=%s item_id=%s item_key=%s old_downstream_task_id=%s new_downstream_task_id=%s reason=%s",
+            task.id,
+            item.stage_name,
+            item.id,
+            item.item_key,
+            old_task_id,
+            new_task_id,
+            reason,
+        )
+
+        self._mark_replacement_in_progress(
+            item,
+            old_downstream_task_id=old_task_id,
+            binding_cleared=False,
+            verification_status="pending",
+        )
+        self._supersede_archive_jobs_for_downstream_task(
+            db,
+            task,
+            item,
+            old_downstream_task_id=old_task_id,
+            reason=reason,
+        )
+        self._mark_superseded_downstream_state(
+            item,
+            old_downstream_task_id=old_task_id,
+            message="旧 child 已失效，等待新 child 接管",
+        )
+
+        refs = [{
+            "service": item.downstream_service,
+            "task_id": old_task_id,
+            "project_id": task.project_id,
+            "stage_name": item.stage_name,
+            "item_id": item.id,
+            "item_key": item.item_key,
+        }]
+        try:
+            await self._downstream_cancel_refs(db, task, refs, token)
+        except NotFoundError:
+            pass
+        except Exception:
+            self._clear_replacement_in_progress(item)
+            raise
+        try:
+            await self._delete_downstream_refs(db, task, refs, token, cleanup_scope="binding_replace")
+        except NotFoundError:
+            pass
+        except Exception:
+            self._clear_replacement_in_progress(item)
+            raise
+
+        item.downstream_task_id = new_task_id
+        self._clear_replacement_in_progress(item)
+        logger.info(
+            "binary-security child binding replaced: task_id=%s stage=%s item_id=%s item_key=%s old_downstream_task_id=%s new_downstream_task_id=%s reason=%s",
+            task.id,
+            item.stage_name,
+            item.id,
+            item.item_key,
+            old_task_id,
+            new_task_id,
+            reason,
+        )
+        self._record_event(
+            db,
+            task,
+            "child_binding_replaced",
+            "阶段项已切换到新的 authoritative child",
+            stage_name=item.stage_name,
+            item=item,
+            level="warning",
+            payload={
+                "old_downstream_task_id": old_task_id,
+                "new_downstream_task_id": new_task_id,
+                "reason": reason,
+            },
+        )
+        self._record_event(
+            db,
+            task,
+            "superseded_downstream_sync_ignored",
+            "旧 child 的后续同步与归档触发将被忽略",
+            stage_name=item.stage_name,
+            item=item,
+            level="warning",
+            payload={
+                "old_downstream_task_id": old_task_id,
+                "new_downstream_task_id": new_task_id,
+                "reason": reason,
+                "superseded": True,
+            },
+        )
+        return old_task_id
+
+    def _may_queue_archive_for_current_binding(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        payload: dict[str, Any],
+        mapped_status: str,
+    ) -> tuple[bool, str | None]:
+        if mapped_status not in ARCHIVE_SUCCESS_MAPPED_STATUSES:
+            return False, "non_success_status"
+        replacement_state = self._replacement_in_progress_state(item)
+        if replacement_state["replacement_in_progress"] or replacement_state["binding_cleared"]:
+            return False, "replacement_in_progress"
+        current_downstream_task_id = self._current_downstream_task_id(item)
+        payload_downstream_task_id = self._payload_downstream_task_id(payload)
+        if current_downstream_task_id and payload_downstream_task_id and payload_downstream_task_id != current_downstream_task_id:
+            return False, "stale_child_payload"
+        return True, None
 
     def _should_preserve_terminal_status(
         self,
@@ -27330,7 +27679,14 @@ class TaskManager:
                     )
             if created is not None:
                 item.status = "running"
-                item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+                old_downstream_task_id = await self._replace_active_child_binding(
+                    session,
+                    task,
+                    item,
+                    new_downstream_task_id=created.get("task_id") or created.get("id"),
+                    token=token,
+                    reason="firmware_unpack_child_create",
+                )
                 item.started_at = _now()
                 self._merge_stage_item_result_fields(
                     task,
@@ -27348,7 +27704,7 @@ class TaskManager:
                         "stage_name": item.stage_name,
                         "item_id": item.id,
                         "item_key": item.item_key,
-                        "old_downstream_task_id": None,
+                        "old_downstream_task_id": old_downstream_task_id,
                         "new_downstream_task_id": item.downstream_task_id,
                         "strategy": retry_strategy if retrying else None,
                         "old_downstream_status": retry_strategy_status if retrying else None,
@@ -27827,7 +28183,14 @@ class TaskManager:
                             "analysis_mode": self._task_type(task),
                         },
                     )
-                    item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+                    old_downstream_task_id = await self._replace_active_child_binding(
+                        session,
+                        task,
+                        item,
+                        new_downstream_task_id=created.get("task_id") or created.get("id"),
+                        token=self._resolve_downstream_token(),
+                        reason="system_analysis_child_create",
+                    )
                     item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
                     item.started_at = item.started_at or _now()
                     item.error_message = None
@@ -27841,7 +28204,7 @@ class TaskManager:
                             "stage_name": item.stage_name,
                             "item_id": item.id,
                             "item_key": item.item_key,
-                            "old_downstream_task_id": None,
+                            "old_downstream_task_id": old_downstream_task_id,
                             "new_downstream_task_id": item.downstream_task_id,
                             "strategy": retry_strategy if retrying else None,
                             "old_downstream_status": retry_strategy_status if retrying else None,
@@ -29219,7 +29582,14 @@ class TaskManager:
                             "engine": b2s_engine,
                         },
                     )
-                    item.downstream_task_id = created.get("id") or item.downstream_task_id
+                    old_downstream_task_id = await self._replace_active_child_binding(
+                        session,
+                        task,
+                        item,
+                        new_downstream_task_id=created.get("task_id") or created.get("id"),
+                        token=token,
+                        reason="binary_to_source_child_create",
+                    )
                     self._merge_stage_item_result_fields(
                         task,
                         item,
@@ -29239,7 +29609,7 @@ class TaskManager:
                             "stage_name": item.stage_name,
                             "item_id": item.id,
                             "item_key": item.item_key,
-                            "old_downstream_task_id": None,
+                            "old_downstream_task_id": old_downstream_task_id,
                             "new_downstream_task_id": item.downstream_task_id,
                             "strategy": retry_strategy if retrying else None,
                             "old_downstream_status": retry_strategy_status if retrying else None,
@@ -30678,7 +31048,14 @@ class TaskManager:
                             "taint_details": [dict(detail) for detail in (entry.get("taint_details") or []) if isinstance(detail, dict)],
                         },
                     )
-                    item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+                    old_downstream_task_id = await self._replace_active_child_binding(
+                        session,
+                        task,
+                        item,
+                        new_downstream_task_id=created.get("task_id") or created.get("id"),
+                        token=self._resolve_downstream_token(token),
+                        reason="dataflow_vuln_scan_child_create",
+                    )
                     self._record_downstream_item_disposition(
                         session,
                         task,
@@ -30689,7 +31066,7 @@ class TaskManager:
                             "stage_name": item.stage_name,
                             "item_id": item.id,
                             "item_key": item.item_key,
-                            "old_downstream_task_id": None,
+                            "old_downstream_task_id": old_downstream_task_id,
                             "new_downstream_task_id": item.downstream_task_id,
                             "strategy": retry_strategy if retrying else None,
                             "old_downstream_status": retry_strategy_status if retrying else None,
@@ -30891,7 +31268,14 @@ class TaskManager:
                         },
                     )
                     if created is not None:
-                        item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+                        old_downstream_task_id = await self._replace_active_child_binding(
+                            session,
+                            task,
+                            item,
+                            new_downstream_task_id=created.get("task_id") or created.get("id"),
+                            token=token,
+                            reason="dataflow_vuln_scan_recreate_child_create",
+                        )
                         item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
                         self._mark_downstream_binding_created(item, message="下游已创建，状态待同步")
                         self._record_downstream_item_disposition(
@@ -30904,7 +31288,7 @@ class TaskManager:
                                 "stage_name": item.stage_name,
                                 "item_id": item.id,
                                 "item_key": item.item_key,
-                                "old_downstream_task_id": None,
+                                "old_downstream_task_id": old_downstream_task_id,
                                 "new_downstream_task_id": item.downstream_task_id,
                                 "strategy": retry_strategy,
                                 "old_downstream_status": retry_strategy_status,
@@ -31109,7 +31493,14 @@ class TaskManager:
                         },
                     )
             if created is not None:
-                item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+                old_downstream_task_id = await self._replace_active_child_binding(
+                    session,
+                    task,
+                    item,
+                    new_downstream_task_id=created.get("task_id") or created.get("id"),
+                    token=token,
+                    reason=f"{stage_run.stage_name}_child_create",
+                )
                 item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
                 self._mark_downstream_binding_created(item, message="下游已创建，状态待同步")
                 self._record_downstream_item_disposition(
@@ -31122,7 +31513,7 @@ class TaskManager:
                         "stage_name": item.stage_name,
                         "item_id": item.id,
                         "item_key": item.item_key,
-                        "old_downstream_task_id": None,
+                        "old_downstream_task_id": old_downstream_task_id,
                         "new_downstream_task_id": item.downstream_task_id,
                         "strategy": retry_strategy if retrying else None,
                         "old_downstream_status": retry_strategy_status if retrying else None,

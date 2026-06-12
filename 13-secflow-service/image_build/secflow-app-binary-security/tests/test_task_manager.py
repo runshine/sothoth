@@ -503,6 +503,83 @@ class ArchiveReclaimTests(unittest.TestCase):
         self.assertEqual("pending", delayed_job.archive_status)
         self.assertEqual("running", ready_job.archive_status)
 
+    def test_replace_active_child_binding_supersedes_old_archive_jobs(self):
+        task = self._task()
+        item = self._item(status="running")
+        item.id = "item-fw"
+        item.stage_name = "firmware_unpack"
+        item.downstream_service = "firmware_unpacker"
+        item.downstream_task_id = "child-old"
+        archive_job = BinarySecurityArchiveJob(
+            id="aj-old",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name=item.stage_name,
+            item_id=item.id,
+            item_key=item.item_key,
+            downstream_service=item.downstream_service,
+            downstream_task_id="child-old",
+            archive_status="running",
+            payload={"bound_downstream_task_id": "child-old", "mapped_status": "success"},
+            created_at=_now(),
+            updated_at=_now(),
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[archive_job], events=[])
+
+        async def _noop_cancel(*_args, **_kwargs):
+            return 1
+
+        async def _noop_delete(*_args, **_kwargs):
+            return 1
+
+        original_cancel = self.manager._downstream_cancel_refs
+        original_delete = self.manager._delete_downstream_refs
+        try:
+            self.manager._downstream_cancel_refs = _noop_cancel
+            self.manager._delete_downstream_refs = _noop_delete
+            old_downstream_task_id = asyncio.run(
+                self.manager._replace_active_child_binding(
+                    db,
+                    task,
+                    item,
+                    new_downstream_task_id="child-new",
+                    token="token",
+                    reason="test_binding_replace",
+                )
+            )
+        finally:
+            self.manager._downstream_cancel_refs = original_cancel
+            self.manager._delete_downstream_refs = original_delete
+
+        self.assertEqual("child-old", old_downstream_task_id)
+        self.assertEqual("child-new", item.downstream_task_id)
+        self.assertEqual("superseded", archive_job.archive_status)
+        self.assertTrue(bool((archive_job.payload or {}).get("superseded")))
+        event_types = [event.event_type for event in db.events]
+        self.assertIn("superseded_archive_jobs_cancelled", event_types)
+        self.assertIn("child_binding_replaced", event_types)
+
+    def test_queue_downstream_archive_job_ignores_stale_child_payload(self):
+        task = self._task()
+        item = self._item(status="success")
+        item.stage_name = "firmware_unpack"
+        item.downstream_service = "firmware_unpacker"
+        item.downstream_task_id = "child-new"
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[], events=[])
+
+        job = self.manager._queue_downstream_archive_job(
+            db,
+            task,
+            item,
+            payload={"task_id": "child-old", "status": "success"},
+            mapped_status="success",
+            before_status="running",
+        )
+
+        self.assertIsNone(job)
+        self.assertEqual([], db.archive_jobs)
+        self.assertIn("stale_archive_trigger_ignored", [event.event_type for event in db.events])
+
 
 class _ScalarResult:
     def __init__(self, value):
@@ -14696,9 +14773,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._write_task_metadata_async = original_write
 
         self.assertEqual("running", item.status)
-        self.assertEqual("failed", job.archive_status)
+        self.assertEqual("superseded", job.archive_status)
         self.assertIn("latest_binding_mismatch", self.manager._load_stage_item_result_payload(item))
-        self.assertIn("archive_binding_mismatch_detected", [event.event_type for event in db.events])
+        self.assertIn("archive_job_superseded_late_result", [event.event_type for event in db.events])
 
     def test_apply_archive_job_status_blocks_late_apply_after_archive_blocked_failure(self):
         task = BinarySecurityTask(
@@ -14778,7 +14855,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._refresh_terminal_item_result_from_downstream = original_refresh_terminal
             self.manager._write_task_metadata_async = original_write
 
-        self.assertEqual("success", job.archive_status)
+        self.assertEqual("ignored", job.archive_status)
         self.assertEqual("success", item.status)
         self.assertEqual("failed", task.status)
         self.assertEqual("firmware_unpack", task.current_stage)
@@ -26675,6 +26752,81 @@ def _test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_fai
     self.assertIn("task_finalized_after_child_failure", event_types)
 
 
+def _test_refresh_task_status_after_sync_converts_dispatching_task_with_earlier_cancelled_stage_to_failed(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-earlier-cancelled-stage",
+        project_id="p1",
+        name="binary-firmware",
+        status="dispatching",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="binary_to_source",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-z",
+        dispatch_started_at=_now() - timedelta(minutes=3),
+        lease_expires_at=_now() - timedelta(seconds=10),
+    )
+    firmware_run = BinarySecurityStageRun(
+        id="sr-fw-ok",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="firmware_unpack",
+        sequence_no=1,
+        status="success",
+    )
+    system_run = BinarySecurityStageRun(
+        id="sr-sys-cancelled",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="system_analysis",
+        sequence_no=2,
+        status="cancelled",
+        last_error="下游系统分析任务已取消",
+    )
+    b2s_run = BinarySecurityStageRun(
+        id="sr-b2s-dispatching",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="binary_to_source",
+        sequence_no=3,
+        status="dispatching",
+    )
+    system_item = BinarySecurityStageItem(
+        id="si-sys-cancelled",
+        task_id=task.id,
+        project_id="p1",
+        stage_run_id=system_run.id,
+        stage_name="system_analysis",
+        item_key="fw-a",
+        item_name="fw-a",
+        status="cancelled",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-cancelled",
+        error_message="阶段子任务异常结束",
+    )
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[firmware_run, system_run, b2s_run],
+        stage_items=[system_item],
+        events=[],
+    )
+
+    manager._refresh_task_status_after_sync(db, task)
+
+    self.assertEqual("failed", task.status)
+    self.assertEqual("system_analysis", task.current_stage)
+    self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("dispatching_state_force_terminalized", event_types)
+    self.assertIn("task_finalized_after_child_failure", event_types)
+
+
 def _test_reclaim_stale_dispatching_skips_failed_streaming_task(self):
     manager = TaskManager()
     task = BinarySecurityTask(
@@ -27455,6 +27607,7 @@ TaskManagerTests.test_sync_downstream_status_rewinds_running_entry_item_to_pendi
 TaskManagerTests.test_sync_downstream_status_keeps_dispatching_pending_for_entry_item = _test_sync_downstream_status_keeps_dispatching_pending_for_entry_item
 TaskManagerTests.test_task_list_response_exposes_runtime_lease_and_sync_view = _test_task_list_response_exposes_runtime_lease_and_sync_view
 TaskManagerTests.test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent = _test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent
+TaskManagerTests.test_refresh_task_status_after_sync_converts_dispatching_task_with_earlier_cancelled_stage_to_failed = _test_refresh_task_status_after_sync_converts_dispatching_task_with_earlier_cancelled_stage_to_failed
 TaskManagerTests.test_requeue_released_running_locked_requeues_streaming_tail_with_active_items = _test_requeue_released_running_locked_requeues_streaming_tail_with_active_items
 TaskManagerTests.test_requeue_released_running_locked_skips_locally_owned_tail_lease = _test_requeue_released_running_locked_skips_locally_owned_tail_lease
 TaskManagerTests.test_reclaim_stale_running_streaming_tail_requeues_for_takeover = _test_reclaim_stale_running_streaming_tail_requeues_for_takeover
