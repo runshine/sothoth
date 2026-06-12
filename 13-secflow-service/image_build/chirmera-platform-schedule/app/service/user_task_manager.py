@@ -944,11 +944,6 @@ class UserTaskManager:
                 files=copied_files,
                 bearer_token=dispatch_auth_token,
             )
-            await self.binary_security.start_task(
-                project_id=project_id,
-                task_id=task.id,
-                bearer_token=dispatch_auth_token,
-            )
 
             dispatch.dispatch_status = "succeeded"
             dispatch.downstream_task_id = task.id
