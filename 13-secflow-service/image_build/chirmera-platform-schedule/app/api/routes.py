@@ -16,6 +16,8 @@ from app.schemas import (
     MessageResponse,
     JobRuntimeResponse,
     RuntimeOverviewResponse,
+    ScheduleRuntimeConfigResponse,
+    ScheduleRuntimeConfigUpdate,
     ScheduleExecutionListResponse,
     ScheduleExecutionResponse,
     ScheduleJobCreate,
@@ -39,6 +41,7 @@ from app.service.auth import get_auth_service
 from app.service.litellm import get_virtual_key_manager
 from app.service.project import get_project_service
 from app.service.runtime_state import collect_liveness, collect_readiness
+from app.service.runtime_config import get_runtime_config_service
 from app.service.schedule_manager import get_schedule_manager
 from app.service.security import validate_project_id
 from app.service.user_task_manager import get_user_task_manager
@@ -156,6 +159,39 @@ async def runtime_task_overview():
     return RuntimeOverviewResponse.model_validate(await get_schedule_manager().runtime_overview())
 
 
+@router.get("/config/runtime", response_model=ScheduleRuntimeConfigResponse)
+async def get_runtime_config(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    token = _token_from_header(authorization)
+    await get_auth_service().validate_token(token)
+    return get_runtime_config_service().get_config_response(db)
+
+
+@router.put("/config/runtime", response_model=ScheduleRuntimeConfigResponse)
+async def save_runtime_config(
+    payload: ScheduleRuntimeConfigUpdate,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    token = _token_from_header(authorization)
+    user = await get_auth_service().validate_token(token)
+    actor = str(user.get("username") or user.get("name") or user.get("user_id") or user.get("id") or "unknown")
+    return get_runtime_config_service().save_config(db, payload, actor=actor)
+
+
+@router.post("/config/runtime/reset", response_model=ScheduleRuntimeConfigResponse)
+async def reset_runtime_config(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    token = _token_from_header(authorization)
+    user = await get_auth_service().validate_token(token)
+    actor = str(user.get("username") or user.get("name") or user.get("user_id") or user.get("id") or "unknown")
+    return get_runtime_config_service().reset_config(db, actor=actor)
+
+
 @router.get("/metrics")
 async def metrics():
     return PlainTextResponse(await get_schedule_manager().metrics_text())
@@ -167,9 +203,36 @@ def job_runtime(project_id: str, job_id: str, _: TokenUser = Depends(get_current
 
 
 @router.get("/projects/{project_id}/user-tasks", response_model=UserTaskListResponse)
-async def list_user_tasks(project_id: str, _: TokenUser = Depends(get_current_context), authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+async def list_user_tasks(
+    project_id: str,
+    search: Optional[str] = None,
+    status: Optional[str] = None,
+    task_type: Optional[str] = None,
+    has_error: bool = False,
+    is_retrying: bool = False,
+    page: int = 1,
+    page_size: int = 20,
+    sort_by: str = "updated_at",
+    sort_direction: str = "desc",
+    _: TokenUser = Depends(get_current_context),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
     token = _token_from_header(authorization)
-    total, items, stats = await get_user_task_manager().list_tasks(db, project_id, token)
+    total, items, stats = await get_user_task_manager().list_tasks(
+        db,
+        project_id,
+        token,
+        search=search,
+        status=status,
+        task_type=task_type,
+        has_error=has_error,
+        is_retrying=is_retrying,
+        page=page,
+        page_size=page_size,
+        sort_by=sort_by,
+        sort_direction=sort_direction,
+    )
     return UserTaskListResponse(total=total, items=[UserTaskResponse.model_validate(item) for item in items], stats=stats)
 
 

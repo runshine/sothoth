@@ -247,6 +247,24 @@ class ScheduleUserTaskDispatch(Base):
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
 
 
+class ScheduleRuntimeConfig(Base):
+    __tablename__ = f"{TABLE_PREFIX}runtime_config"
+    __table_args__ = (
+        UniqueConstraint("config_key", name=f"uk_{TABLE_PREFIX}runtime_config_key"),
+    )
+
+    id = Column(String(64), primary_key=True, default=generate_id)
+    config_key = Column(String(64), nullable=False, default="global_default")
+    scheduler_policy_json = Column(JSON().with_variant(MySQLJSON, "mysql"), nullable=False, default=dict)
+    tool_defaults_json = Column(JSON().with_variant(MySQLJSON, "mysql"), nullable=False, default=dict)
+    time_windows_json = Column(JSON().with_variant(MySQLJSON, "mysql"), nullable=False, default=list)
+    timezone = Column(String(64), nullable=False, default="Asia/Shanghai")
+    version = Column(Integer, nullable=False, default=1)
+    updated_by = Column(String(128), nullable=False, default="system")
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+
+
 _engine = None
 _SessionFactory = None
 
@@ -278,6 +296,7 @@ def init_database():
     _ensure_user_task_constraints(engine)
     _ensure_user_task_columns(engine)
     _ensure_user_task_dispatch_columns(engine)
+    _ensure_runtime_config_columns(engine)
 
 
 def _ensure_schedule_execution_columns(engine) -> None:
@@ -357,6 +376,25 @@ def _ensure_user_task_dispatch_columns(engine) -> None:
         statements.append(
             f"ALTER TABLE {ScheduleUserTaskDispatch.__tablename__} ADD COLUMN downstream_report_ready BOOLEAN NOT NULL DEFAULT 0"
         )
+    if not statements:
+        return
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+
+
+def _ensure_runtime_config_columns(engine) -> None:
+    inspector = inspect(engine)
+    if ScheduleRuntimeConfig.__tablename__ not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns(ScheduleRuntimeConfig.__tablename__)}
+    statements: list[str] = []
+    if "timezone" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleRuntimeConfig.__tablename__} ADD COLUMN timezone VARCHAR(64) NOT NULL DEFAULT 'Asia/Shanghai'")
+    if "version" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleRuntimeConfig.__tablename__} ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+    if "updated_by" not in columns:
+        statements.append(f"ALTER TABLE {ScheduleRuntimeConfig.__tablename__} ADD COLUMN updated_by VARCHAR(128) NOT NULL DEFAULT 'system'")
     if not statements:
         return
     with engine.begin() as connection:

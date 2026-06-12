@@ -21,6 +21,7 @@ from app.exception import ConflictError, NotFoundError, UpstreamError, Validatio
 from app.model import ScheduleExecution, ScheduleExecutionEvent, ScheduleJob, get_db_session
 from app.service.http_client import get_shared_async_client
 from app.service.redis_runtime import get_redis_runtime
+from app.service.runtime_config import get_runtime_config_service
 from app.service.user_task_manager import get_user_task_manager
 
 
@@ -96,6 +97,9 @@ class ScheduleManager:
         self.cfg = get_config()
         self.redis = get_redis_runtime()
         self.pod_name = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or "chirmera-platform-schedule"
+
+    def _runtime_snapshot(self, db: Session):
+        return get_runtime_config_service().get_snapshot(db)
 
     def get_job_or_404(self, db: Session, project_id: str, job_id: str) -> ScheduleJob:
         job = db.query(ScheduleJob).filter(
@@ -320,11 +324,17 @@ class ScheduleManager:
         )
 
     def _job_limits(self, job: ScheduleJob) -> tuple[int, int, int]:
-        return (
-            max(1, int(job.max_concurrency or 1)),
-            max(1, int(self.cfg.limits.project_default_concurrency)),
-            max(1, int(self.cfg.limits.target_default_concurrency)),
-        )
+        db = get_db_session()
+        try:
+            snapshot = self._runtime_snapshot(db)
+            scheduler_policy = snapshot.scheduler_policy
+            return (
+                max(1, int(job.max_concurrency or 1)),
+                max(1, int(scheduler_policy.project_default_concurrency)),
+                max(1, int(scheduler_policy.target_default_concurrency)),
+            )
+        finally:
+            db.close()
 
     def _working_count_for_job(self, db: Session, job_id: str) -> int:
         return self._working_status_query(db).filter(
@@ -344,10 +354,12 @@ class ScheduleManager:
 
     def _capacity_snapshot(self, db: Session, job: ScheduleJob, execution: ScheduleExecution) -> dict[str, int]:
         target_bucket = execution.target_bucket or self._job_bucket_key(job)
+        runtime_snapshot = self._runtime_snapshot(db)
+        scheduler_policy = runtime_snapshot.scheduler_policy
         return {
             "job_limit": max(1, int(job.max_concurrency or 1)),
-            "project_limit": max(1, int(self.cfg.limits.project_default_concurrency)),
-            "target_limit": max(1, int(self.cfg.limits.target_default_concurrency)),
+            "project_limit": max(1, int(scheduler_policy.project_default_concurrency)),
+            "target_limit": max(1, int(scheduler_policy.target_default_concurrency)),
             "job_working": self._working_count_for_job(db, job.id),
             "project_working": self._working_count_for_project(db, execution.project_id),
             "target_working": self._working_count_for_target(db, execution.project_id, target_bucket),
@@ -763,6 +775,8 @@ class ScheduleManager:
     async def runtime_overview(self) -> dict[str, Any]:
         db = get_db_session()
         try:
+            runtime_snapshot = self._runtime_snapshot(db)
+            scheduler_policy = runtime_snapshot.scheduler_policy
             queue_snapshot = await self.redis.metrics_snapshot()
             inflight = db.query(ScheduleExecution).filter(ScheduleExecution.status.in_(["queued", "reserved", "running", "retry_wait"])).count()
             queued = db.query(ScheduleExecution).filter(ScheduleExecution.status == "queued").count()
@@ -785,7 +799,7 @@ class ScheduleManager:
                 },
                 "workers": {
                     "local_pod": self.pod_name,
-                    "concurrency": self.cfg.worker.concurrency,
+                    "concurrency": int(scheduler_policy.worker_concurrency),
                     "inflight_executions": inflight,
                     "queued_executions": queued,
                     "reserved_executions": reserved,
@@ -798,6 +812,15 @@ class ScheduleManager:
                     "failed_total": failed,
                 },
                 "redis_available": queue_snapshot["redis_available"],
+                "active_runtime_config_source": runtime_snapshot.source,
+                "active_time_window_name": runtime_snapshot.active_time_window_name,
+                "effective_limits": {
+                    "project_default_concurrency": int(scheduler_policy.project_default_concurrency),
+                    "target_default_concurrency": int(scheduler_policy.target_default_concurrency),
+                    "worker_concurrency": int(scheduler_policy.worker_concurrency),
+                    "ready_backfill_batch_size": int(scheduler_policy.ready_backfill_batch_size),
+                    "db_fallback_batch_size": int(scheduler_policy.db_fallback_batch_size),
+                },
             }
         finally:
             db.close()
@@ -846,7 +869,6 @@ class SchedulerRuntime:
     def __init__(self, manager: ScheduleManager):
         self.manager = manager
         self.config = get_config().scheduler
-        self._root_config = get_config()
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._leader_token = manager.pod_name
@@ -865,8 +887,13 @@ class SchedulerRuntime:
             await self.manager.process_due_jobs()
             await self.manager.promote_delay_queue()
             await self.manager.requeue_pending_executions()
+            runtime_db = get_db_session()
+            try:
+                runtime_snapshot = get_runtime_config_service().get_snapshot(runtime_db)
+            finally:
+                runtime_db.close()
             await get_user_task_manager().auto_dispatch_ready_tasks(
-                batch_size=max(1, int(self._root_config.scheduler.ready_backfill_batch_size)),
+                batch_size=max(1, int(runtime_snapshot.scheduler_policy.ready_backfill_batch_size)),
                 actor="schedule-auto-dispatcher",
             )
             now_monotonic = time.monotonic()
@@ -907,7 +934,7 @@ class WorkerRuntime:
         while self._running and not self._draining:
             execution_id = await self.manager.redis.pop_ready(timeout_seconds=1)
             if not execution_id:
-                await asyncio.sleep(max(0.1, float(self.config.worker.idle_sleep_seconds)))
+                await asyncio.sleep(max(0.1, float(get_config().worker.idle_sleep_seconds)))
                 continue
             try:
                 await self.manager.dispatch_execution(execution_id)
@@ -918,7 +945,12 @@ class WorkerRuntime:
         if self._running:
             return
         self._running = True
-        for _ in range(max(1, int(self.config.worker.concurrency))):
+        runtime_db = get_db_session()
+        try:
+            runtime_snapshot = get_runtime_config_service().get_snapshot(runtime_db)
+        finally:
+            runtime_db.close()
+        for _ in range(max(1, int(runtime_snapshot.scheduler_policy.worker_concurrency))):
             task = asyncio.create_task(self._worker_loop())
             self._workers.add(task)
             task.add_done_callback(self._workers.discard)

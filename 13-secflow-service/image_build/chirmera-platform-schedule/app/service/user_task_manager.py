@@ -13,6 +13,7 @@ from typing import Any, Optional
 
 import httpx
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app.config import get_config
@@ -23,6 +24,7 @@ from app.model import (
     ScheduleUserTaskInputBinding,
 )
 from app.service.http_client import get_shared_async_client
+from app.service.runtime_config import get_runtime_config_service
 
 
 TASK_TYPE_INPUT_TYPE: dict[str, str] = {
@@ -62,6 +64,19 @@ AI4APK_STATUS_MAP: dict[str, tuple[str, str, bool]] = {
     "paused": ("paused", "paused", False),
     "completed": ("succeeded", "success", True),
     "failed": ("failed", "failed", False),
+}
+
+USER_TASK_SORT_FIELDS: dict[str, Any] = {
+    "created_at": ScheduleUserTask.created_at,
+    "updated_at": ScheduleUserTask.updated_at,
+    "name": ScheduleUserTask.name,
+    "task_type": ScheduleUserTask.task_type,
+    "create_status": ScheduleUserTask.create_status,
+    "dispatch_status": ScheduleUserTask.dispatch_status,
+    "business_status": ScheduleUserTask.business_status,
+    "downstream_status_mapped": ScheduleUserTask.downstream_status_mapped,
+    "created_by": ScheduleUserTask.created_by,
+    "downstream_task_id": ScheduleUserTask.downstream_task_id,
 }
 
 
@@ -498,8 +513,22 @@ class UserTaskManager:
             }
 
     def _dispatch_policy_for_task_type(self, task_type: str):
-        policies = get_config().user_task_dispatch_policy
-        policy = getattr(policies, task_type, None)
+        runtime_db = None
+        try:
+            from app.model import get_db_session
+            runtime_db = get_db_session()
+            runtime_service = get_runtime_config_service()
+            if runtime_service.has_database_config(runtime_db):
+                snapshot = runtime_service.get_snapshot(runtime_db)
+                policy = next((item for item in snapshot.tool_defaults if str(item.task_type) == str(task_type)), None)
+            else:
+                policy = None
+        finally:
+            if runtime_db is not None:
+                runtime_db.close()
+        if policy is None:
+            policies = get_config().user_task_dispatch_policy
+            policy = getattr(policies, task_type, None)
         if policy is None:
             raise ValidationError(f"任务类型缺少分发策略配置: {task_type}")
         if task_type not in {"ai4red", "ai4apk"} and not list(policy.capacity_pool_ids or []):
@@ -740,12 +769,77 @@ class UserTaskManager:
         self._apply_ai4apk_status(task, dispatch, self._extract_ai4apk_data(payload))
         db.commit()
 
-    async def list_tasks(self, db: Session, project_id: str, bearer_token: str) -> tuple[int, list[dict[str, Any]], dict[str, int]]:
-        rows = db.query(ScheduleUserTask).filter(
-            ScheduleUserTask.project_id == project_id
-        ).order_by(ScheduleUserTask.created_at.desc()).all()
+    async def list_tasks(
+        self,
+        db: Session,
+        project_id: str,
+        bearer_token: str,
+        *,
+        search: str | None = None,
+        status: str | None = None,
+        task_type: str | None = None,
+        has_error: bool = False,
+        is_retrying: bool = False,
+        page: int = 1,
+        page_size: int = 20,
+        sort_by: str = "updated_at",
+        sort_direction: str = "desc",
+    ) -> tuple[int, list[dict[str, Any]], dict[str, int]]:
+        normalized_page = max(1, int(page or 1))
+        normalized_page_size = max(1, min(200, int(page_size or 20)))
+        normalized_status = str(status or "").strip()
+        normalized_task_type = str(task_type or "").strip()
+        normalized_search = str(search or "").strip()
+        normalized_sort_by = str(sort_by or "updated_at").strip()
+        normalized_sort_direction = "asc" if str(sort_direction or "").strip().lower() == "asc" else "desc"
+
+        query = db.query(ScheduleUserTask).filter(ScheduleUserTask.project_id == project_id)
+        if normalized_status:
+            query = query.filter(
+                or_(
+                    ScheduleUserTask.create_status == normalized_status,
+                    ScheduleUserTask.dispatch_status == normalized_status,
+                    ScheduleUserTask.business_status == normalized_status,
+                    ScheduleUserTask.downstream_status_mapped == normalized_status,
+                )
+            )
+        if normalized_task_type:
+            query = query.filter(ScheduleUserTask.task_type == normalized_task_type)
+        if has_error:
+            query = query.filter(and_(ScheduleUserTask.last_error.isnot(None), ScheduleUserTask.last_error != ""))
+        if is_retrying:
+            query = query.filter(
+                or_(
+                    ScheduleUserTask.dispatch_status == "retry_wait",
+                    ScheduleUserTask.business_status == "retry_wait",
+                    ScheduleUserTask.downstream_status_mapped == "retry_wait",
+                )
+            )
+        if normalized_search:
+            search_value = f"%{normalized_search.lower()}%"
+            query = query.filter(
+                or_(
+                    func.lower(ScheduleUserTask.id).like(search_value),
+                    func.lower(ScheduleUserTask.name).like(search_value),
+                    func.lower(ScheduleUserTask.created_by).like(search_value),
+                    func.lower(func.coalesce(ScheduleUserTask.downstream_task_id, "")).like(search_value),
+                    func.lower(func.coalesce(ScheduleUserTask.last_error, "")).like(search_value),
+                    func.lower(func.coalesce(ScheduleUserTask.module_name, "")).like(search_value),
+                )
+            )
+
+        stats_rows = query.all()
+        total = len(stats_rows)
+        sort_column = USER_TASK_SORT_FIELDS.get(normalized_sort_by, ScheduleUserTask.updated_at)
+        order_clause = sort_column.asc() if normalized_sort_direction == "asc" else sort_column.desc()
+        rows = (
+            query.order_by(order_clause, ScheduleUserTask.created_at.desc(), ScheduleUserTask.id.desc())
+            .offset((normalized_page - 1) * normalized_page_size)
+            .limit(normalized_page_size)
+            .all()
+        )
         stats = {
-            "total": len(rows),
+            "total": total,
             "created": 0,
             "ready_for_dispatch": 0,
             "dispatching": 0,
@@ -753,6 +847,8 @@ class UserTaskManager:
             "success": 0,
             "failed": 0,
         }
+        for task in stats_rows:
+            stats[task.dispatch_status] = int(stats.get(task.dispatch_status, 0)) + 1
         items: list[dict[str, Any]] = []
         for task in rows:
             bindings = self._bindings_for_task(db, task.id)
@@ -772,9 +868,8 @@ class UserTaskManager:
                     db.rollback()
                     task = self.get_task_or_404(db, project_id, task.id)
                     latest_dispatch = self._dispatches_for_task(db, task.id)[0] if self._dispatches_for_task(db, task.id) else None
-            stats[task.dispatch_status] = int(stats.get(task.dispatch_status, 0)) + 1
             items.append(self._serialize_task(task, bindings, latest_dispatch))
-        return len(rows), items, stats
+        return total, items, stats
 
     async def create_task(self, db: Session, *, project_id: str, payload, actor: str, bearer_token: str) -> dict[str, Any]:
         if not payload.input_upload_ids:

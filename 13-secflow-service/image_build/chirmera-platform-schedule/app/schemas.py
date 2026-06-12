@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -276,6 +277,115 @@ class VirtualKeyEventResponse(BaseModel):
 
 UserTaskType = Literal["binary_firmware_e2e", "source_scan_e2e", "binary_module_e2e", "ai4red", "ai4apk"]
 InputSelectionType = Literal["file", "file_list", "directory"]
+ScheduleDispatchMode = Literal["balanced", "fifo", "priority_first"]
+ScheduleQueueStrategy = Literal["strict_fifo", "capacity_aware"]
+
+
+def _validate_hhmm(value: str) -> str:
+    normalized = str(value or "").strip()
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", normalized):
+        raise ValueError("时间格式必须为 HH:mm")
+    return normalized
+
+
+class ScheduleRuntimeSchedulerPolicy(BaseModel):
+    dispatch_mode: ScheduleDispatchMode = "balanced"
+    queue_strategy: ScheduleQueueStrategy = "capacity_aware"
+    project_default_concurrency: int = 16
+    target_default_concurrency: int = 8
+    worker_concurrency: int = 32
+    ready_backfill_batch_size: int = 100
+    db_fallback_batch_size: int = 20
+
+    @field_validator(
+        "project_default_concurrency",
+        "target_default_concurrency",
+        "worker_concurrency",
+        "ready_backfill_batch_size",
+        "db_fallback_batch_size",
+    )
+    @classmethod
+    def validate_positive_int(cls, value: int) -> int:
+        if int(value) <= 0:
+            raise ValueError("并发与批量参数必须大于 0")
+        return int(value)
+
+
+class ScheduleRuntimeToolDefault(BaseModel):
+    task_type: UserTaskType
+    label: str
+    default_concurrency: int = 1
+    root_task_key_max_concurrency: int = 0
+    capacity_pool_ids: list[int] = Field(default_factory=list)
+    root_task_key_expires_at: Optional[str] = None
+
+    @field_validator("default_concurrency")
+    @classmethod
+    def validate_default_concurrency(cls, value: int) -> int:
+        if int(value) <= 0:
+            raise ValueError("default_concurrency 必须大于 0")
+        return int(value)
+
+    @field_validator("root_task_key_max_concurrency")
+    @classmethod
+    def validate_root_task_key_max_concurrency(cls, value: int) -> int:
+        if int(value) < 0:
+            raise ValueError("root_task_key_max_concurrency 不能小于 0")
+        return int(value)
+
+
+class ScheduleRuntimeTimeWindow(BaseModel):
+    name: str
+    enabled: bool = True
+    start_time: str
+    end_time: str
+    scheduler_policy: Optional[ScheduleRuntimeSchedulerPolicy] = None
+    tool_defaults: list[ScheduleRuntimeToolDefault] = Field(default_factory=list)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        normalized = str(value or "").strip()
+        if not normalized:
+            raise ValueError("name 不能为空")
+        return normalized
+
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def validate_time_fields(cls, value: str) -> str:
+        return _validate_hhmm(value)
+
+
+class ScheduleRuntimeEffectiveConfig(BaseModel):
+    source: Literal["default", "database"] = "default"
+    active_time_window_name: Optional[str] = None
+    timezone: str = "Asia/Shanghai"
+    scheduler_policy: ScheduleRuntimeSchedulerPolicy
+    tool_defaults: list[ScheduleRuntimeToolDefault] = Field(default_factory=list)
+
+
+class ScheduleRuntimeConfigUpdate(BaseModel):
+    timezone: str = "Asia/Shanghai"
+    scheduler_policy: ScheduleRuntimeSchedulerPolicy
+    tool_defaults: list[ScheduleRuntimeToolDefault] = Field(default_factory=list)
+    time_windows: list[ScheduleRuntimeTimeWindow] = Field(default_factory=list)
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        normalized = str(value or "").strip()
+        if normalized != "Asia/Shanghai":
+            raise ValueError("timezone 本期仅支持 Asia/Shanghai")
+        return normalized
+
+
+class ScheduleRuntimeConfigResponse(ScheduleRuntimeConfigUpdate):
+    config_key: str = "global_default"
+    version: int = 1
+    updated_by: Optional[str] = None
+    updated_at: Optional[datetime] = None
+    source: Literal["default", "database"] = "default"
+    effective_now: ScheduleRuntimeEffectiveConfig
 
 
 class UserTaskInputBindingResponse(BaseModel):
