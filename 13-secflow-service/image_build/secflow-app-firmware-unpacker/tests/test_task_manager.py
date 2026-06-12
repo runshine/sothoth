@@ -120,6 +120,61 @@ class TaskManagerWorkspaceTests(unittest.TestCase):
                 json.loads(manifest_path.read_text(encoding="utf-8")),
             )
 
+    def test_http_429_error_is_logged_as_rate_limited_without_exception_stack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.yaml"
+            db_path = root / "tasks.db"
+            config_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "database": {
+                            "type": "sqlite",
+                            "path": str(db_path),
+                            "table_prefix": "secflow_app_firmware_unpacker_",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            reload_config(str(config_path))
+            model_module._engine = None
+            model_module._SessionFactory = None
+            init_database()
+            db = get_db_session()
+            try:
+                db.add(
+                    UnpackTask(
+                        id="task-429",
+                        project_id="p1",
+                        firmware_path="/tmp/in",
+                        output_path="/tmp/out",
+                        status=TaskStatus.RUNNING.value,
+                        owner_id="owner-1",
+                        current_stage="llm_unpack",
+                        run_token="rt",
+                    )
+                )
+                db.commit()
+            finally:
+                db.close()
+
+            with patch.object(task_manager_module.logger, "warning") as warning_mock, \
+                 patch.object(task_manager_module.logger, "exception") as exception_mock, \
+                 patch.object(task_manager_module, "_update_task_error") as update_error_mock, \
+                 patch.object(task_manager_module, "_record_task_event") as record_event_mock, \
+                 patch.object(task_manager_module, "_register_cancel_hook"), \
+                 patch.object(task_manager_module, "_update_task_progress_for_owner"), \
+                 patch.object(task_manager_module, "_freeze_task_llm_binding_snapshot", return_value={}), \
+                 patch.object(task_manager_module, "resolve_task_runtime_paths", return_value={"input_path": "/tmp/in", "output_path": "/tmp/out"}), \
+                 patch.object(unpacker_engine_module, "run_unpack", side_effect=RuntimeError("429 No deployments available for selected model, Try again in 5 seconds.")):
+                task_manager_module.run_claimed_task_process("task-429", owner_id="owner-1", run_token="rt")
+
+            warning_mock.assert_called()
+            exception_mock.assert_not_called()
+            update_error_mock.assert_called_once()
+            record_event_mock.assert_called()
+
     def test_resolve_task_runtime_paths_refreshes_manifest_and_uses_original_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

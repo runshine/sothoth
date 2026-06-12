@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -681,6 +682,20 @@ def _record_task_event_from_row(
         owner_id=owner_id or getattr(task, "owner_id", None),
         created_by=created_by,
     )
+
+
+def _extract_http_status_from_error(error: str) -> Optional[int]:
+    match = re.match(r"^\s*(?:HTTP\s+)?(\d{3})\b", str(error or "").strip(), re.IGNORECASE)
+    if match:
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def _is_http_429_error(error: str) -> bool:
+    return _extract_http_status_from_error(error) == 429
 
 
 def _trigger_cancel_hook(task_id: str) -> None:
@@ -4887,8 +4902,23 @@ def run_claimed_task_process(task_id: str, *, owner_id: str, run_token: str) -> 
         )
         _update_task_result(task_id, result, run_token=run_token)
     except Exception as exc:
-        logger.exception("task %s failed with exception: %s", task_id, exc)
-        _update_task_error(task_id, str(exc), run_token=run_token)
+        error_text = str(exc)
+        if _is_http_429_error(error_text):
+            logger.warning("task %s rate limited by downstream model pool: %s", task_id, error_text)
+            _record_task_event(
+                task_id,
+                project_id=task.project_id,
+                event_type="task_rate_limited",
+                summary="下游返回 429，等待上游按退让策略重试",
+                stage_key=task.current_stage,
+                status=getattr(task, "status", None),
+                detail={"http_status": 429, "reason": error_text},
+                owner_id=owner_id,
+                created_by="task_manager",
+            )
+        else:
+            logger.exception("task %s failed with exception: %s", task_id, exc)
+        _update_task_error(task_id, error_text, run_token=run_token)
     finally:
         _register_cancel_hook(task_id, None)
 
