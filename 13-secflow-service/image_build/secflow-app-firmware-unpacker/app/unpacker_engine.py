@@ -10,6 +10,7 @@ import sys
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -92,6 +93,7 @@ RECURSIVE_ARCHIVE_FORMATS = {
 REDUNDANT_ZLIB_BASENAME_RE = re.compile(r"^[0-9A-Fa-f]{6,}\.zlib$")
 REDUNDANT_ZLIB_MIN_BYTES = 1024 * 1024
 REDUNDANT_ARTIFACT_SOURCE_RE = re.compile(r"^[0-9A-Fa-f]{6,}\.(gz|7z|lzma|zlib)$")
+PROGRESS_KEEPALIVE_INTERVAL_SECONDS = 8.0
 
 
 def _safe_relpath(path: Path, root: Path) -> str:
@@ -175,21 +177,63 @@ def _cleanup_known_artifact_sources(output_path: str) -> dict[str, Any]:
     }
 
 
+class _ProgressKeepalive:
+    def __init__(
+        self,
+        *,
+        stage: str,
+        activity_callback: Optional[Callable[[str], None]] = None,
+        interval_seconds: float = PROGRESS_KEEPALIVE_INTERVAL_SECONDS,
+    ) -> None:
+        self._stage = stage
+        self._activity_callback = activity_callback
+        self._interval_seconds = max(float(interval_seconds), 1.0)
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "_ProgressKeepalive":
+        if self._activity_callback is None:
+            return self
+
+        def _run() -> None:
+            while not self._stop_event.wait(self._interval_seconds):
+                try:
+                    self._activity_callback(self._stage)
+                except Exception:
+                    pass
+
+        self._thread = threading.Thread(
+            target=_run,
+            name=f"unpacker-keepalive-{self._stage}",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.2)
+
+
 def _run_recursive_expand_command(
     command: list[str],
     *,
     cancel_check: Optional[Callable[[], bool]] = None,
     register_cancel_hook: Optional[Callable[[Callable[[], None] | None], None]] = None,
+    activity_callback: Optional[Callable[[str], None]] = None,
+    activity_stage: str = "recursive_expand",
 ) -> subprocess.CompletedProcess[str]:
-    result = run_streaming_process(
-        command,
-        cancel_check=cancel_check,
-        register_cancel_hook=register_cancel_hook,
-        kill_process_tree=_kill_process_tree,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    with _ProgressKeepalive(stage=activity_stage, activity_callback=activity_callback):
+        result = run_streaming_process(
+            command,
+            cancel_check=cancel_check,
+            register_cancel_hook=register_cancel_hook,
+            kill_process_tree=_kill_process_tree,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
     return subprocess.CompletedProcess(command, result.returncode, result.stdout, result.stderr)
 
 
@@ -199,6 +243,7 @@ def _expand_one_recursive_file(
     *,
     cancel_check: Optional[Callable[[], bool]] = None,
     register_cancel_hook: Optional[Callable[[Callable[[], None] | None], None]] = None,
+    activity_callback: Optional[Callable[[str], None]] = None,
 ) -> dict[str, Any]:
     if fmt == "7zip":
         try:
@@ -220,6 +265,7 @@ def _expand_one_recursive_file(
             ["tar", "-xf", str(source_path), "-C", str(output_dir)],
             cancel_check=cancel_check,
             register_cancel_hook=register_cancel_hook,
+            activity_callback=activity_callback,
         )
         return {"handler": "tar", "success": proc.returncode == 0, "output_dir": str(output_dir), "error": proc.stderr.strip() or None}
     if fmt == "zip":
@@ -227,6 +273,7 @@ def _expand_one_recursive_file(
             ["7z", "x", str(source_path), f"-o{output_dir}", "-y"],
             cancel_check=cancel_check,
             register_cancel_hook=register_cancel_hook,
+            activity_callback=activity_callback,
         )
         return {"handler": "7z x", "success": proc.returncode == 0, "output_dir": str(output_dir), "error": proc.stderr.strip() or None}
     if fmt in {"gzip", "bzip2", "xz", "zstd", "lzop", "lzma"}:
@@ -240,15 +287,16 @@ def _expand_one_recursive_file(
             "lzma": ["lzma", "-dc", str(source_path)],
         }
         with target_file.open("wb") as handle:
-            result = run_streaming_process(
-                command_map[fmt],
-                cancel_check=cancel_check,
-                register_cancel_hook=register_cancel_hook,
-                kill_process_tree=_kill_process_tree,
-                stdout_file=handle,
-                stderr=subprocess.PIPE,
-                text=False,
-            )
+            with _ProgressKeepalive(stage="recursive_expand", activity_callback=activity_callback):
+                result = run_streaming_process(
+                    command_map[fmt],
+                    cancel_check=cancel_check,
+                    register_cancel_hook=register_cancel_hook,
+                    kill_process_tree=_kill_process_tree,
+                    stdout_file=handle,
+                    stderr=subprocess.PIPE,
+                    text=False,
+                )
         stderr_text = (result.stderr or b"").decode("utf-8", errors="replace").strip()
         trailing_garbage_ignored = fmt == "gzip" and "trailing garbage ignored" in stderr_text.lower()
         success = result.returncode == 0 or (trailing_garbage_ignored and target_file.exists() and target_file.stat().st_size > 0)
@@ -265,6 +313,7 @@ def _expand_one_recursive_file(
             ["7z", "x", str(source_path), f"-o{output_dir}", "-y"],
             cancel_check=cancel_check,
             register_cancel_hook=register_cancel_hook,
+            activity_callback=activity_callback,
         )
         return {"handler": "7z x", "success": proc.returncode == 0, "output_dir": str(output_dir), "error": proc.stderr.strip() or None}
     return {"handler": fmt, "success": False, "output_dir": str(output_dir), "error": f"unsupported recursive format: {fmt}"}
@@ -357,6 +406,7 @@ def _run_recursive_expand(
                     fmt,
                     cancel_check=cancel_check,
                     register_cancel_hook=register_cancel_hook,
+                    activity_callback=activity_callback,
                 )
                 new_paths_count = _count_tree_entries(Path(str(result.get("output_dir") or ""))) if result.get("success") else 0
                 retained_source = True
@@ -628,10 +678,11 @@ def _run_reviewer(
                 "\n\nRecursive expansion context:\n"
                 f"- You must read `{recursive_manifest_path}` before judging completeness for tool-stage review.\n"
             )
-        verify_result = validator.prompt(
-            review_prompt,
-            stream_callback=_stream_review_event,
-        )
+        with _ProgressKeepalive(stage="review", activity_callback=activity_callback):
+            verify_result = validator.prompt(
+                review_prompt,
+                stream_callback=_stream_review_event,
+            )
         token_stats = _save_agent_log(validator, log, round_dir, "reviewer")
         completed_at = datetime.utcnow().isoformat()
         return _is_review_success(verify_result), verify_result, {
@@ -706,10 +757,11 @@ def _run_skill_unpack(
             if activity_callback is not None:
                 activity_callback("tool_match")
 
-        exec_result = executor.prompt(
-            render_prompt(EXEC_FIRST_TMPL, firmware_path, output_path),
-            stream_callback=_stream_skill_event,
-        )
+        with _ProgressKeepalive(stage="tool_match", activity_callback=activity_callback):
+            exec_result = executor.prompt(
+                render_prompt(EXEC_FIRST_TMPL, firmware_path, output_path),
+                stream_callback=_stream_skill_event,
+            )
         _save_agent_log(executor, log, global_round_dir, "skill_executor")
         passed, review_result, _review_meta = _run_reviewer(
             task_id,
@@ -774,6 +826,7 @@ def _run_python_tool_unpack(
     log_dir: Path | None,
     cancel_check: Optional[Callable[[], bool]] = None,
     register_cancel_hook: Optional[Callable[[Callable[[], None] | None], None]] = None,
+    activity_callback: Optional[Callable[[str], None]] = None,
 ) -> dict[str, Any]:
     global_round_dir = _get_round_dir(log_dir, 0)
     tool_path = Path(str(tool_meta.get("path") or "")).resolve()
@@ -811,17 +864,18 @@ def _run_python_tool_unpack(
         )
     )
     try:
-        result = run_streaming_process(
-            [sys.executable, str(tool_path), str(manifest_path)],
-            cancel_check=cancel_check,
-            register_cancel_hook=register_cancel_hook,
-            kill_process_tree=_kill_process_tree,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=env,
-            text=True,
-            stdout_callback=line_sink.feed,
-        )
+        with _ProgressKeepalive(stage="tool_match", activity_callback=activity_callback):
+            result = run_streaming_process(
+                [sys.executable, str(tool_path), str(manifest_path)],
+                cancel_check=cancel_check,
+                register_cancel_hook=register_cancel_hook,
+                kill_process_tree=_kill_process_tree,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                text=True,
+                stdout_callback=line_sink.feed,
+            )
         line_sink.flush()
         return_code = result.returncode
     finally:
@@ -978,10 +1032,11 @@ def _run_generic_unpack(
 
             executor_started_at = datetime.utcnow().isoformat()
             executor_started_monotonic = time.perf_counter()
-            exec_result = executor.prompt(
-                exec_msg,
-                stream_callback=_stream_unpack_event,
-            )
+            with _ProgressKeepalive(stage="llm_unpack", activity_callback=activity_callback):
+                exec_result = executor.prompt(
+                    exec_msg,
+                    stream_callback=_stream_unpack_event,
+                )
             executor_token_stats = _save_agent_log(executor, log, round_dir, "executor")
             executor_completed_at = datetime.utcnow().isoformat()
             executor_duration_seconds = round(time.perf_counter() - executor_started_monotonic, 3)
@@ -1279,10 +1334,11 @@ def _generate_candidate_skill(
                 if activity_callback is not None:
                     activity_callback("skill_author")
 
-            raw_doc = author.prompt(
-                prompt,
-                stream_callback=_stream_skill_author_event,
-            )
+            with _ProgressKeepalive(stage="skill_author", activity_callback=activity_callback):
+                raw_doc = author.prompt(
+                    prompt,
+                    stream_callback=_stream_skill_author_event,
+                )
             _save_agent_log(author, log, log_dir, "skill_author")
         finally:
             if bind_cancel_client:
@@ -1424,7 +1480,8 @@ def _run_cleaner(
             if activity_callback is not None:
                 activity_callback("cleanup")
 
-        result = cleaner.prompt(clean_msg, stream_callback=_stream_cleanup_event)
+        with _ProgressKeepalive(stage="cleanup", activity_callback=activity_callback):
+            result = cleaner.prompt(clean_msg, stream_callback=_stream_cleanup_event)
         log_event(
             log,
             logging.INFO,
@@ -1679,6 +1736,7 @@ def run_unpack(
                 log_dir,
                 cancel_check=cancel_check,
                 register_cancel_hook=register_cancel_hook,
+                activity_callback=_report_activity,
             )
             review_result = ""
             if skill_result.get("success"):
