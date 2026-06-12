@@ -12981,6 +12981,51 @@ class TaskManager:
                     item=item,
                     payload=event_payload,
                 )
+                item.retry_count = int(item.retry_count or 0) + 1
+                self._record_event(
+                    session,
+                    task,
+                    "child_owner_lost_detected",
+                    "检测到下游 owner 丢失，已转入自动恢复",
+                    level="warning",
+                    stage_name=item.stage_name,
+                    item=item,
+                    payload={
+                        **event_payload,
+                        "service": item.downstream_service,
+                        "stage_name": item.stage_name,
+                        "item_id": item.id,
+                        "item_key": item.item_key,
+                        "downstream_task_id": item.downstream_task_id,
+                        "auto_retry_count": int(item.retry_count or 0),
+                        "max_retries_per_item": self._max_retries_per_item(task),
+                        "recovery_action": "reconcile",
+                    },
+                )
+                if int(item.retry_count or 0) > self._max_retries_per_item(task):
+                    item.status = "failed"
+                    item.finished_at = _now()
+                    item.error_message = "owner_lost_retry_exhausted"
+                    self._record_event(
+                        session,
+                        task,
+                        "child_owner_lost_retry_exhausted",
+                        "下游 owner 丢失自动恢复次数耗尽，子任务收口为失败",
+                        level="warning",
+                        stage_name=item.stage_name,
+                        item=item,
+                        payload={
+                            **event_payload,
+                            "service": item.downstream_service,
+                            "stage_name": item.stage_name,
+                            "item_id": item.id,
+                            "item_key": item.item_key,
+                            "downstream_task_id": item.downstream_task_id,
+                            "auto_retry_count": int(item.retry_count or 0),
+                            "max_retries_per_item": self._max_retries_per_item(task),
+                            "recovery_action": "terminal_failed",
+                        },
+                    )
             state = self._build_next_downstream_sync_failure_state(item)
             self._persist_child_sync_observation(
                 session,
@@ -13005,8 +13050,8 @@ class TaskManager:
             self._record_event(
                 session,
                 task,
-                "downstream_poll_attempt_failed",
-                f"下游轮询失败，将在退避后重试: {error_message}",
+                "child_owner_lost_requeue_scheduled" if self._is_owned_execution_stale_error(error_message=error_message, error_type=error_type) else "downstream_poll_attempt_failed",
+                "下游 owner 丢失，已安排自动恢复重试" if self._is_owned_execution_stale_error(error_message=error_message, error_type=error_type) else f"下游轮询失败，将在退避后重试: {error_message}",
                 level="warning",
                 stage_name=item.stage_name,
                 item=item,
@@ -13014,6 +13059,9 @@ class TaskManager:
                     "error_type": error_type,
                     "error_message": error_message,
                     "http_status": http_status,
+                    "auto_retry_count": int(item.retry_count or 0),
+                    "max_retries_per_item": self._max_retries_per_item(task),
+                    "recovery_action": "reconcile" if self._is_owned_execution_stale_error(error_message=error_message, error_type=error_type) else "backoff",
                     **self._downstream_sync_failure_payload(item, error_type=error_type, error_message=error_message, state=state),
                 },
             )
@@ -15230,6 +15278,16 @@ class TaskManager:
             raw = result.get("sync_error_budget_exhausted")
         return bool(raw)
 
+    def _stage_item_sync_error_type_value(self, item: BinarySecurityStageItem) -> str | None:
+        result = self._load_stage_item_result_payload(item)
+        sync_observation = self._stage_item_sync_observation(item)
+        return self._string_or_none(sync_observation.get("error_type")) or self._string_or_none(result.get("last_sync_error_type"))
+
+    def _stage_item_sync_error_message_value(self, item: BinarySecurityStageItem) -> str | None:
+        result = self._load_stage_item_result_payload(item)
+        sync_observation = self._stage_item_sync_observation(item)
+        return self._string_or_none(sync_observation.get("error_message")) or self._string_or_none(result.get("last_sync_error_message"))
+
     def _stage_item_next_sync_retry_at_value(self, item: BinarySecurityStageItem) -> datetime | None:
         result = self._load_stage_item_result_payload(item)
         sync_observation = self._stage_item_sync_observation(item)
@@ -16590,6 +16648,27 @@ class TaskManager:
             task.lease_expires_at = None
             task.finished_at = None
             task.last_error = None
+            if (
+                self._is_streaming_tail_stage(task, active_stage_name)
+                and self._tail_requires_execution_takeover(db, task)
+                and str(active_stage_status or "").strip() in {"running", "dispatching", "applying"}
+            ):
+                task.status = "running"
+                self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+                task.tail_reconcile_state = None
+                self._release_tail_reconcile_owner(task.id)
+                self._last_task_heartbeat_at.pop(task.id, None)
+                self._record_event(
+                    db,
+                    task,
+                    "task_finalize_deferred_for_active_stage",
+                    f"仍有活跃未完成阶段，转回 worker 接管继续执行: {active_stage_name}",
+                    level="info",
+                    stage_name=active_stage_name,
+                    payload={"stage_status": active_stage_status},
+                )
+                self._sync_task_abnormal_reason_snapshot(db, task, None)
+                return
             if self._is_streaming_tail_stage(task, active_stage_name) and self._should_enter_tail_reconciliation(db, task):
                 task.status = "running"
                 self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TAIL_RECONCILIATION)
@@ -17127,6 +17206,12 @@ class TaskManager:
         base["entry_selection_mode"] = entry_selection_mode
         base["module_risk_levels"] = _normalize_module_risk_levels(overrides.get("module_risk_levels") or base.get("module_risk_levels"))
         return base
+
+    def _max_retries_per_item(self, task: BinarySecurityTask) -> int:
+        policy = dict(task.policy or {})
+        if policy.get("max_retries_per_item") is not None:
+            return max(0, int(policy.get("max_retries_per_item") or 0))
+        return max(0, int(getattr(self.cfg.runtime_policy, "max_retries_per_item", 0) or 0))
 
     def _partial_success_advancement_stages_for_task(self, task: BinarySecurityTask | str | None) -> list[str]:
         stage_sequence = set(self._stage_sequence_for_task(task))
@@ -17991,6 +18076,11 @@ class TaskManager:
     ) -> tuple[bool, str | None, str | None]:
         active_statuses = {"pending", "queued", "running", "dispatching", "applying"}
         runs_by_stage = {run.stage_name: run for run in stage_runs}
+        task_retry_target_stage = (
+            str(task.target_stage_name or "").strip()
+            if task.execution_mode in {"task_retry", "task_retry_failed_items"} and str(task.target_stage_name or "").strip()
+            else None
+        )
         active_candidates: list[tuple[str, str]] = []
         for stage_name in self._stage_sequence_for_task(task):
             if not self._stage_enabled(task, stage_name):
@@ -17999,6 +18089,8 @@ class TaskManager:
             if run is None:
                 continue
             normalized_status = self._normalize_downstream_status(run.status) or str(run.status or "").strip()
+            if task_retry_target_stage and stage_name == task_retry_target_stage and normalized_status == "success":
+                continue
             if normalized_status in active_statuses:
                 active_candidates.append((stage_name, normalized_status))
         if active_candidates:
@@ -19290,6 +19382,15 @@ class TaskManager:
         statuses = [self._normalize_downstream_status(item.status) or item.status for item in items]
         aggregated_item_status = self._aggregate_item_statuses(statuses) if statuses else None
         archive_gated = self._stage_archive_success_blocked(task, stage_name, items, db=db)
+        if (
+            not items
+            and stage_run is not None
+            and self._stage_requires_materialized_inputs(task, stage_name)
+            and not self._is_streaming_tail_stage(task, stage_name)
+        ):
+            normalized_run_status = self._normalize_downstream_status(stage_run.status) or str(stage_run.status or "")
+            if normalized_run_status in {"failed", "downstream_missing", "cancelled", "partial_success"}:
+                return "pending"
         if self._is_streaming_tail_stage(task, stage_name) and any(
             self._is_streaming_active_item_status(item.status)
             for item in items
@@ -19425,10 +19526,21 @@ class TaskManager:
             category = "orchestration"
             recommended_action = "结合时间线和下游详情检查未收敛的失败项。"
         else:
-            code = "downstream_failed"
-            title = "下游任务失败"
-            category = "downstream"
-            recommended_action = "优先查看下游任务详情与原始错误信息。"
+            if self._is_owner_lost_recoverable_failure(
+                failure_message=error_message,
+                error_type=self._stage_item_sync_error_type_value(item),
+                item=item,
+            ):
+                exhausted = self._owner_lost_retry_exhausted(task, item)
+                code = "owner_lost_retry_exhausted" if exhausted else "owner_lost_recoverable"
+                title = "下游 owner 丢失自动恢复失败" if exhausted else "下游 owner 丢失，等待自动恢复"
+                category = "infrastructure"
+                recommended_action = "检查 rollout、worker 与 lease 变更，并手工重试或排查下游恢复能力。" if exhausted else "优先等待系统自动接管；若多次恢复后仍失败，再检查 rollout、worker 与 lease 变更。"
+            else:
+                code = "downstream_failed"
+                title = "下游任务失败"
+                category = "downstream"
+                recommended_action = "优先查看下游任务详情与原始错误信息。"
         return self._build_abnormal_reason(
             category=category,
             code=code,
@@ -22510,8 +22622,13 @@ class TaskManager:
                 getattr(stage_run, "reason", None),
             )
             if str(part or "").strip()
-        ).lower()
-        if "task owner pod lost" in error_text or "owner pod lost" in error_text:
+        )
+        if self._is_owner_lost_recoverable_failure(
+            failure_message=error_text,
+            failure_category=self._stage_failure_snapshot(task, stage_run).get("failure_category"),
+        ):
+            return False
+        if "task owner pod lost" in error_text.lower() or "owner pod lost" in error_text.lower():
             return True
         return self._is_terminal_business_stage_failure(task, stage_run)
 
@@ -22562,6 +22679,26 @@ class TaskManager:
         if aggregate_status not in {"failed", "cancelled", "downstream_missing", "partial_success"}:
             return None
         snapshot = self._stage_failure_snapshot(task, stage_run)
+        if aggregate_status == "failed":
+            exhausted_owner_lost_items = [item for item in items if self._owner_lost_retry_exhausted(task, item)]
+            if exhausted_owner_lost_items:
+                exhausted_item = exhausted_owner_lost_items[0]
+                return {
+                    "stage_name": stage_name,
+                    "stage_run": stage_run,
+                    "failure_code": "owner_lost_retry_exhausted",
+                    "failure_category": "infrastructure",
+                    "failure_message": str(exhausted_item.error_message or "").strip() or "owner_lost_retry_exhausted",
+                    "reason": "owner_lost_retry_exhausted",
+                }
+            for item in items:
+                if self._is_owner_lost_recoverable_failure(
+                    failure_message=str(item.error_message or "").strip() or None,
+                    failure_category=snapshot.get("failure_category"),
+                    error_type=self._stage_item_sync_error_type_value(item),
+                    item=item,
+                ):
+                    return None
         failure_message = next((str(item.error_message or "").strip() for item in items if str(item.error_message or "").strip()), None)
         return {
             "stage_name": stage_name,
@@ -22617,6 +22754,30 @@ class TaskManager:
             aggregate_status = self._aggregate_item_statuses(normalized_statuses)
             if aggregate_status not in {"failed", "cancelled", "downstream_missing", "partial_success"}:
                 continue
+            if aggregate_status == "failed":
+                snapshot = self._stage_failure_snapshot(task, stage_run)
+                exhausted_owner_lost_items = [item for item in items if self._owner_lost_retry_exhausted(task, item)]
+                if exhausted_owner_lost_items:
+                    exhausted_item = exhausted_owner_lost_items[0]
+                    return {
+                        "stage_name": stage_name,
+                        "stage_run": stage_run,
+                        "failure_code": "owner_lost_retry_exhausted",
+                        "failure_category": "infrastructure",
+                        "failure_message": str(exhausted_item.error_message or "").strip() or "owner_lost_retry_exhausted",
+                        "reason": "owner_lost_retry_exhausted",
+                    }
+                recoverable_items = [
+                    item for item in items
+                    if self._is_owner_lost_recoverable_failure(
+                        failure_message=str(item.error_message or "").strip() or None,
+                        failure_category=snapshot.get("failure_category"),
+                        error_type=self._stage_item_sync_error_type_value(item),
+                        item=item,
+                    )
+                ]
+                if recoverable_items:
+                    continue
             snapshot = self._stage_failure_snapshot(task, stage_run)
             failure_message = next((str(item.error_message or "").strip() for item in items if str(item.error_message or "").strip()), None)
             return {
@@ -22757,7 +22918,29 @@ class TaskManager:
                     "requeue_suppressed": True,
                 },
             )
-        self._clear_task_abnormal_reason_snapshot(db, task)
+        if failure_code == "owner_lost_retry_exhausted":
+            self._sync_task_abnormal_reason_snapshot(
+                db,
+                task,
+                self._build_abnormal_reason(
+                    category="infrastructure",
+                    code="owner_lost_retry_exhausted",
+                    title="下游 owner 丢失自动恢复失败",
+                    message=failure_message or "下游 owner 丢失自动恢复次数耗尽",
+                    source_layer="task",
+                    status="failed",
+                    service="binary-security",
+                    stage_name=stage_name,
+                    evidence=[
+                        self._abnormal_reason_evidence("current_stage", "当前阶段", stage_name),
+                        self._abnormal_reason_evidence("last_error", "原始错误", failure_message),
+                    ],
+                    recommended_action="检查 rollout、worker 与 lease 变更，并手工重试或排查下游恢复能力。",
+                    terminal=True,
+                ),
+            )
+        else:
+            self._clear_task_abnormal_reason_snapshot(db, task)
 
     def _retry_snapshot_for_item(self, task: BinarySecurityTask, stage_name: str, item_key: str) -> dict[str, Any] | None:
         summary = task.summary or {}
@@ -22890,7 +23073,7 @@ class TaskManager:
         normalized = (status or "").lower()
         if normalized in {"downstream_missing", "not_found", "missing", "task_not_found"}:
             return "downstream_missing"
-        if normalized in {"pending", "queued", "created", "ready", "ready_to_start"}:
+        if normalized in {"pending", "queued", "created", "ready", "ready_to_start", "awaiting_takeover", "retry_preparing"}:
             return "pending"
         if normalized == "dispatching":
             return "dispatching"
@@ -22909,6 +23092,59 @@ class TaskManager:
         if normalized in {"cancelled", "canceled"}:
             return "cancelled"
         return None
+
+    @staticmethod
+    def _is_owner_lost_recoverable_message(message: str | None) -> bool:
+        normalized = str(message or "").strip().lower()
+        if not normalized:
+            return False
+        if "owner_lost_retry_exhausted" in normalized:
+            return False
+        tokens = (
+            "task owner pod lost",
+            "owner pod lost",
+            "owner lost",
+            "staletaskexecution",
+            "当前执行 token 已失效",
+            "runtime lease owner 已变更",
+            "lease owner 已变更",
+            "token 已失效",
+            "awaiting_takeover",
+            "retry_preparing",
+        )
+        return any(token.lower() in normalized for token in tokens)
+
+    def _is_owner_lost_recoverable_failure(
+        self,
+        *,
+        failure_message: str | None,
+        failure_category: str | None = None,
+        error_type: str | None = None,
+        item: BinarySecurityStageItem | None = None,
+    ) -> bool:
+        if str(failure_category or "").strip().lower() == "business":
+            return False
+        if self._is_owner_lost_recoverable_message(failure_message):
+            return True
+        if self._is_owner_lost_recoverable_message(error_type):
+            return True
+        if item is not None:
+            if self._is_owner_lost_recoverable_message(item.error_message):
+                return True
+            observed_error_type = self._stage_item_sync_error_type_value(item)
+            if self._is_owner_lost_recoverable_message(observed_error_type):
+                return True
+            observed_error_message = self._stage_item_sync_error_message_value(item)
+            if self._is_owner_lost_recoverable_message(observed_error_message):
+                return True
+        return False
+
+    def _owner_lost_retry_exhausted(self, task: BinarySecurityTask, item: BinarySecurityStageItem) -> bool:
+        return self._is_owner_lost_recoverable_failure(
+            failure_message=str(item.error_message or "").strip() or None,
+            error_type=self._stage_item_sync_error_type_value(item),
+            item=item,
+        ) and int(item.retry_count or 0) > self._max_retries_per_item(task)
 
     def _aggregate_item_statuses(self, statuses: list[str]) -> str:
         if not statuses:
@@ -22993,7 +23229,32 @@ class TaskManager:
                     for item in items
                 ) or any(self._is_streaming_active_item_status(item.status) for item in items)
             return True
-        return not self._is_streaming_tail_stage(task, stage_name)
+        if self._is_streaming_tail_stage(task, stage_name):
+            return False
+        return self._stage_has_materialized_inputs(db, task, stage_name)
+
+    def _stage_requires_materialized_inputs(self, task: BinarySecurityTask, stage_name: str) -> bool:
+        normalized_stage = normalize_stage_name(stage_name)
+        return normalized_stage in {"binary_to_source", "entry_analysis", "dataflow_vuln_scan"}
+
+    def _stage_has_materialized_inputs(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> bool:
+        self._ensure_stage_inputs_available(db, task, stage_name)
+        summary = dict(task.summary or {})
+        normalized_stage = normalize_stage_name(stage_name)
+        if normalized_stage == "system_analysis":
+            return bool(self._system_analysis_inputs(task, db=db))
+        if normalized_stage == "binary_to_source":
+            return bool(list(summary.get("selected_modules") or []))
+        if normalized_stage == "entry_analysis":
+            return bool(self._entry_analysis_inputs(db, task))
+        if normalized_stage == "dataflow_vuln_scan":
+            return bool(self._effective_entry_inputs(task))
+        return True
 
     def _should_hold_task_on_stage_after_requeue(
         self,
@@ -23623,19 +23884,22 @@ class TaskManager:
             return
         stage_retry_mode = task.execution_mode in {"stage_retry", "stage_retry_failed_items", "stage_retry_full"} and bool(task.target_stage_name)
         task_retry_mode = task.execution_mode in {"task_retry", "task_retry_failed_items"} and bool(task.target_stage_name)
+        had_stage_retry_mode = stage_retry_mode
+        had_task_retry_mode = task_retry_mode
+        original_target_stage_name = str(task.target_stage_name or "").strip() or None
         summary_before_retry_clear = dict(task.summary or {})
         preferred_retry_next_stage = None
-        if stage_retry_mode:
+        if had_stage_retry_mode:
             stale_stages = [str(stage).strip() for stage in (summary_before_retry_clear.get("stale_stages") or []) if str(stage).strip()]
             preferred_retry_next_stage = stale_stages[0] if stale_stages else None
-        if stage_retry_mode:
+        if had_stage_retry_mode:
             self._clear_retry_execution_context(
                 db,
                 task,
                 stage_name=task.current_stage,
                 payload={"status": task.status, "stage_retry_mode": True},
             )
-        if task_retry_mode:
+        if had_task_retry_mode:
             self._clear_retry_execution_context(
                 db,
                 task,
@@ -23661,8 +23925,8 @@ class TaskManager:
             failed_stage_run is not None
             and self._streaming_mode_enabled(task)
             and normalize_stage_name(str(failed_stage_run.stage_name or "").strip()) == "dataflow_vuln_scan"
-            and not stage_retry_mode
-            and not task_retry_mode
+            and not had_stage_retry_mode
+            and not had_task_retry_mode
         ):
             task.status = "running"
             task.current_stage = failed_stage_run.stage_name or task.current_stage
@@ -23690,7 +23954,15 @@ class TaskManager:
                     )
             return
         next_stage = self._next_incomplete_stage(db, task)
-        if stage_retry_mode and preferred_retry_next_stage:
+        if had_task_retry_mode and not next_stage and original_target_stage_name:
+            stage_sequence = self._stage_sequence_for_task(task)
+            if original_target_stage_name in stage_sequence:
+                target_index = stage_sequence.index(original_target_stage_name)
+                for candidate_stage in stage_sequence[target_index + 1 :]:
+                    if self._stage_enabled(task, candidate_stage):
+                        next_stage = candidate_stage
+                        break
+        if had_stage_retry_mode and preferred_retry_next_stage:
             next_stage = preferred_retry_next_stage
         if failed_stage_run is not None and self._should_terminalize_parent_for_failed_stage(task, failed_stage_run):
             failure_snapshot = self._stage_failure_snapshot(task, failed_stage_run)
@@ -23709,7 +23981,54 @@ class TaskManager:
                 event_type="task_finalized_after_stage_failure",
             )
             return
-        if failed_stage_run is not None and not stage_retry_mode and not task_retry_mode:
+        if failed_stage_run is not None and not had_stage_retry_mode and not had_task_retry_mode:
+            failed_items = self._stage_items(db, task.id, str(failed_stage_run.stage_name or ""))
+            exhausted_owner_lost_items = [item for item in failed_items if self._owner_lost_retry_exhausted(task, item)]
+            if exhausted_owner_lost_items:
+                exhausted_item = exhausted_owner_lost_items[0]
+                self._finalize_task_after_authoritative_failure(
+                    db,
+                    task,
+                    failure_ctx={
+                        "stage_name": failed_stage_run.stage_name or task.current_stage,
+                        "stage_run": failed_stage_run,
+                        "failure_code": "owner_lost_retry_exhausted",
+                        "failure_category": "infrastructure",
+                        "failure_message": str(exhausted_item.error_message or "").strip() or "owner_lost_retry_exhausted",
+                        "reason": "owner_lost_retry_exhausted_after_sync",
+                    },
+                    previous_status=current_status,
+                    event_type="task_owner_lost_final_failed",
+                )
+                return
+            if not failed_items:
+                failed_stage_error = " ".join(
+                    str(part or "").strip()
+                    for part in (
+                        failed_stage_run.last_error,
+                        getattr(failed_stage_run, "error_message", None),
+                        getattr(failed_stage_run, "reason", None),
+                    )
+                    if str(part or "").strip()
+                )
+                if "task owner pod lost" in failed_stage_error.lower() or "owner pod lost" in failed_stage_error.lower():
+                    failure_snapshot = self._stage_failure_snapshot(task, failed_stage_run)
+                    self._finalize_task_after_authoritative_failure(
+                        db,
+                        task,
+                        failure_ctx={
+                            "stage_name": failed_stage_run.stage_name or task.current_stage,
+                            "stage_run": failed_stage_run,
+                            "failure_code": failure_snapshot.get("failure_code"),
+                            "failure_category": failure_snapshot.get("failure_category"),
+                            "failure_message": failed_stage_run.last_error or failure_snapshot.get("failure_message") or failure_snapshot.get("error"),
+                            "reason": "failed_stage_run_owner_lost_without_child_items",
+                        },
+                        previous_status=current_status,
+                        event_type="task_finalized_after_stage_failure",
+                    )
+                    return
+        if failed_stage_run is not None and not had_stage_retry_mode and not had_task_retry_mode:
             task.status = "pending"
             task.current_stage = failed_stage_run.stage_name or task.current_stage
             task.finished_at = None
@@ -23743,7 +24062,8 @@ class TaskManager:
             next_stage
             and str(next_stage_status or "").strip() in {"pending", "queued", "running", "dispatching"}
             and (
-                (stage_retry_mode and preferred_retry_next_stage == next_stage)
+                (had_stage_retry_mode and preferred_retry_next_stage == next_stage)
+                or had_task_retry_mode
                 or self._stage_has_real_runnable_work(db, task, next_stage)
             )
         ):
@@ -23823,7 +24143,7 @@ class TaskManager:
                 stage_name=str(vuln_run.stage_name or "").strip() or task.current_stage,
             )
             return
-        if failed_stage_run is not None and not stage_retry_mode and not task_retry_mode and not next_stage:
+        if failed_stage_run is not None and not had_stage_retry_mode and not had_task_retry_mode and not next_stage:
             task.status = "failed"
             self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TERMINAL)
             task.current_stage = failed_stage_run.stage_name or task.current_stage
@@ -23832,7 +24152,7 @@ class TaskManager:
             task.lease_expires_at = None
             task.finished_at = task.finished_at or _now()
             return
-        if failed_stage_run is not None and not stage_retry_mode and not task_retry_mode:
+        if failed_stage_run is not None and not had_stage_retry_mode and not had_task_retry_mode:
             failed_items = self._stage_items(db, task.id, str(failed_stage_run.stage_name or ""))
             if failed_items and not self._stage_has_nonterminal_items(failed_items):
                 task.status = "failed"
@@ -27372,6 +27692,11 @@ class TaskManager:
             cleanup_status = "partial_failed"
         if workspace_root.exists():
             cleanup_status = "partial_failed"
+            for _attempt in range(5):
+                await asyncio.sleep(5)
+                if not workspace_root.exists():
+                    cleanup_status = "deleted" if cleanup_status != "fallback" else "fallback"
+                    break
         return cleanup_status
 
     async def _poll_until_terminal(self, fetcher, *, success_statuses: set[str], failure_statuses: set[str], task: BinarySecurityTask, item: BinarySecurityStageItem | None = None):

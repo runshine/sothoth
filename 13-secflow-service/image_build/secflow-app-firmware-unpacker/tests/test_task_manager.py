@@ -196,6 +196,7 @@ class TaskManagerLeaseTests(unittest.TestCase):
         owner_id: str | None = None,
         assigned_worker_id: str | None = None,
         dispatch_token: str | None = None,
+        takeover_count: int = 0,
         cancel_requested_at=None,
         lease_expires_at=None,
         last_progress_at=None,
@@ -212,6 +213,7 @@ class TaskManagerLeaseTests(unittest.TestCase):
                     owner_id=owner_id,
                     assigned_worker_id=assigned_worker_id,
                     dispatch_token=dispatch_token,
+                    takeover_count=takeover_count,
                     current_stage="llm_unpack",
                     cancel_requested_at=cancel_requested_at,
                     lease_expires_at=lease_expires_at,
@@ -366,6 +368,69 @@ class TaskManagerLeaseTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_finalize_orphaned_running_task_owner_lost_moves_to_awaiting_takeover(self):
+        self._add_task(
+            "t-owner-lost",
+            status=TaskStatus.RUNNING.value,
+            owner_id="pod-a:123:owner",
+            assigned_worker_id="pod-a:123:owner",
+            dispatch_token="dispatch-token-1",
+        )
+
+        task_manager_module._finalize_orphaned_task("t-owner-lost", reason="Task owner pod lost", owner_lost=True)
+
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == "t-owner-lost").first()
+            self.assertEqual(TaskStatus.AWAITING_TAKEOVER.value, task.status)
+            self.assertEqual("awaiting_takeover", task.current_stage)
+            self.assertIsNone(task.result_status)
+            self.assertIsNone(task.result_message)
+            self.assertIsNone(task.error_message)
+            self.assertEqual(1, int(task.takeover_count or 0))
+            events = db.query(UnpackTaskEvent).filter(UnpackTaskEvent.task_id == "t-owner-lost").all()
+            event_types = [event.event_type for event in events]
+            self.assertIn("owner_lost", event_types)
+            self.assertIn("owner_lost_detected", event_types)
+            self.assertIn("owner_lost_requeue_scheduled", event_types)
+            self.assertIn("orphan_recovered", event_types)
+            self.assertNotIn("task_failed", event_types)
+        finally:
+            db.close()
+
+    def test_finalize_orphaned_running_task_owner_lost_fails_after_retry_budget_exhausted(self):
+        self._add_task(
+            "t-owner-lost-exhausted",
+            status=TaskStatus.RUNNING.value,
+            owner_id="pod-a:123:owner",
+            assigned_worker_id="pod-a:123:owner",
+            dispatch_token="dispatch-token-2",
+            takeover_count=3,
+        )
+
+        with patch("app.services.task_manager.get_max_retries", return_value=3):
+            task_manager_module._finalize_orphaned_task(
+                "t-owner-lost-exhausted",
+                reason="Task owner pod lost",
+                owner_lost=True,
+            )
+
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == "t-owner-lost-exhausted").first()
+            self.assertEqual(TaskStatus.FAILED.value, task.status)
+            self.assertEqual("awaiting_takeover", task.current_stage)
+            self.assertEqual("failed", task.result_status)
+            self.assertEqual("owner_lost_retry_exhausted", task.error_message)
+            self.assertEqual(4, int(task.takeover_count or 0))
+            events = db.query(UnpackTaskEvent).filter(UnpackTaskEvent.task_id == "t-owner-lost-exhausted").all()
+            event_types = [event.event_type for event in events]
+            self.assertIn("owner_lost_detected", event_types)
+            self.assertIn("owner_lost_retry_exhausted", event_types)
+            self.assertIn("task_failed", event_types)
+        finally:
+            db.close()
+
     def test_stale_run_token_cannot_overwrite_current_task(self):
         db = get_db_session()
         try:
@@ -400,7 +465,7 @@ class TaskManagerLeaseTests(unittest.TestCase):
         finally:
             db.close()
 
-    def test_recover_orphaned_running_task_marks_failed(self):
+    def test_recover_orphaned_running_task_moves_to_awaiting_takeover(self):
         from datetime import datetime, timedelta
 
         self._add_task(
@@ -416,9 +481,9 @@ class TaskManagerLeaseTests(unittest.TestCase):
         db = get_db_session()
         try:
             task = db.query(UnpackTask).filter(UnpackTask.id == "t-orphan").first()
-            self.assertEqual(TaskStatus.FAILED.value, task.status)
+            self.assertEqual(TaskStatus.AWAITING_TAKEOVER.value, task.status)
             self.assertIsNone(task.owner_id)
-            self.assertIn("owner pod lost", (task.result_message or "") + (task.error_message or ""))
+            self.assertIsNone(task.error_message)
         finally:
             db.close()
 

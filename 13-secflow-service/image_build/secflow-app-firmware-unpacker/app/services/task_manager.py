@@ -36,7 +36,7 @@ from app.services.observability import (
     record_task_stage_transition,
 )
 from app.time_utils import isoformat_local, now_local
-from app.unpacker_engine_config import DISPATCHER_RULES_PATH, TOOLS_ACTIVE_DIR, TOOLS_STORE_DIR, get_max_retries_reached_action
+from app.unpacker_engine_config import DISPATCHER_RULES_PATH, TOOLS_ACTIVE_DIR, TOOLS_STORE_DIR, get_max_retries, get_max_retries_reached_action
 from app.unpacker_engine_logs import TASK_RESULT_CACHE_FILENAME, atomic_write_json, scan_output_tree
 from app.preprocess import detect_format
 from app.tool_dispatcher import activate_tool_version, dispatch_tool_by_magic, find_dispatcher_rule, upsert_dispatcher_rule
@@ -1411,6 +1411,26 @@ def _finalize_orphaned_task(task_id: str, reason: str, *, owner_lost: bool = Fal
             task.error_message = None
             terminal_event = None
             terminal_summary = None
+        elif owner_lost and task.status == TaskStatus.RUNNING.value:
+            task.takeover_count = int(task.takeover_count or 0) + 1
+            max_retries = max(0, int(get_max_retries() or 0))
+            budget_exhausted = max_retries >= 0 and int(task.takeover_count or 0) > max_retries
+            if budget_exhausted:
+                task.status = TaskStatus.FAILED.value
+                task.current_stage = "awaiting_takeover"
+                task.result_status = "failed"
+                task.error_message = "owner_lost_retry_exhausted"
+                task.result_message = f"Task failed: owner lost recovery exhausted after {task.takeover_count} attempts"
+                terminal_event = "task_failed"
+                terminal_summary = "任务因 owner 丢失恢复次数耗尽而失败"
+            else:
+                task.status = TaskStatus.AWAITING_TAKEOVER.value
+                task.current_stage = "awaiting_takeover"
+                task.result_status = None
+                task.result_message = None
+                task.error_message = None
+                terminal_event = None
+                terminal_summary = None
         elif task.status == TaskStatus.CANCELLING.value:
             task.status = TaskStatus.CANCELLED.value
             task.result_status = "cancelled"
@@ -1451,7 +1471,44 @@ def _finalize_orphaned_task(task_id: str, reason: str, *, owner_lost: bool = Fal
                 summary="任务 owner 已失活",
                 stage_key=task.current_stage,
                 status=task.status,
-                detail={"reason": reason, "owner_id": previous_owner_id},
+                detail={
+                    "reason": reason,
+                    "owner_id": previous_owner_id,
+                    "max_retries": max(0, int(get_max_retries() or 0)),
+                    "recovery_action": "awaiting_takeover" if task.status == TaskStatus.AWAITING_TAKEOVER.value else "terminalized",
+                    "takeover_count": int(task.takeover_count or 0),
+                },
+                owner_id=previous_owner_id,
+                created_by="task_manager",
+            )
+            _record_task_event_from_row(
+                task,
+                event_type="owner_lost_detected",
+                summary="检测到任务 owner 丢失",
+                stage_key=task.current_stage,
+                status=task.status,
+                detail={
+                    "reason": reason,
+                    "owner_id": previous_owner_id,
+                    "takeover_count": int(task.takeover_count or 0),
+                    "max_retries": max(0, int(get_max_retries() or 0)),
+                },
+                owner_id=previous_owner_id,
+                created_by="task_manager",
+            )
+            _record_task_event_from_row(
+                task,
+                event_type="owner_lost_requeue_scheduled" if task.status == TaskStatus.AWAITING_TAKEOVER.value else "owner_lost_retry_exhausted",
+                summary="任务 owner 丢失后已安排自动恢复" if task.status == TaskStatus.AWAITING_TAKEOVER.value else "任务 owner 丢失自动恢复次数耗尽",
+                stage_key=task.current_stage,
+                status=task.status,
+                detail={
+                    "reason": reason,
+                    "owner_id": previous_owner_id,
+                    "takeover_count": int(task.takeover_count or 0),
+                    "max_retries": max(0, int(get_max_retries() or 0)),
+                    "recovery_action": "awaiting_takeover" if task.status == TaskStatus.AWAITING_TAKEOVER.value else "terminal_failed",
+                },
                 owner_id=previous_owner_id,
                 created_by="task_manager",
             )
@@ -2847,6 +2904,23 @@ def _assign_task_to_worker(task_id: str, worker_id: str, pod_name: str) -> bool:
             )
         )
         db.commit()
+        if updated:
+            task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+            if task is not None and task.status == TaskStatus.ASSIGNED.value:
+                _record_task_event_from_row(
+                    task,
+                    event_type="task_owner_lost_recovered",
+                    summary="任务已重新分配 owner 并恢复执行",
+                    stage_key=task.current_stage,
+                    status=task.status,
+                    detail={
+                        "owner_id": worker_id,
+                        "assigned_pod_name": pod_name,
+                        "takeover_count": int(task.takeover_count or 0),
+                    },
+                    owner_id=worker_id,
+                    created_by="task_manager",
+                )
         return bool(updated)
     finally:
         db.close()

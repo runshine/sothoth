@@ -3141,6 +3141,94 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertFalse(any(row.event_type == "task_requeued_after_downstream_sync" and row.stage_name == "dataflow_vuln_scan" for row in db.events))
 
+    def test_refresh_task_status_after_sync_does_not_advance_past_cancelled_system_stage_without_followup_inputs(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="binary_to_source",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {
+            "selected_modules": [],
+            "system_analysis_results": [],
+            "b2s_results": [],
+            "entry_results": [],
+        }
+        firmware_run = BinarySecurityStageRun(
+            id="sr-fw",
+            task_id="t1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            sequence_no=1,
+            status="success",
+        )
+        system_run = BinarySecurityStageRun(
+            id="sr-sys",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=2,
+            status="cancelled",
+        )
+        b2s_run = BinarySecurityStageRun(
+            id="sr-b2s",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            sequence_no=3,
+            status="failed",
+        )
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=4,
+            status="pending",
+        )
+        system_item = BinarySecurityStageItem(
+            id="si-sys",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-sys",
+            stage_name="system_analysis",
+            item_key="fw-a",
+            item_name="fw-a",
+            status="cancelled",
+            downstream_service="system_analyse",
+            downstream_task_id="sat-cancelled",
+            error_message="阶段子任务异常结束",
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[firmware_run, system_run, b2s_run, entry_run],
+            stage_items=[system_item],
+            events=[],
+        )
+
+        self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual("pending", task.status)
+        self.assertEqual("system_analysis", task.current_stage)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
+        stage_summaries = self.manager._build_stage_summaries(
+            db,
+            task,
+            ["firmware_unpack", "system_analysis", "binary_to_source", "entry_analysis"],
+            db.stage_runs,
+            db.stage_items,
+        )
+        by_stage = {summary.stage_name: summary for summary in stage_summaries}
+        self.assertEqual("cancelled", by_stage["system_analysis"].status)
+        self.assertEqual("pending", by_stage["binary_to_source"].status)
+        self.assertEqual("pending", by_stage["entry_analysis"].status)
+
     def test_finalize_task_defers_incomplete_stage_instead_of_failed_terminal(self):
         task = BinarySecurityTask(
             id="t1",
@@ -4470,6 +4558,29 @@ class TaskManagerTests(unittest.TestCase):
         ]
         db = _ModelAwareDb(tasks=[task], stage_runs=stage_runs, stage_items=stage_items)
 
+        self.assertFalse(self.manager._stage_has_real_runnable_work(db, task, "entry_analysis"))
+
+    def test_stage_has_real_runnable_work_requires_materialized_inputs_for_following_stages(self):
+        task = BinarySecurityTask(
+            id="no-materialized-inputs",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/in",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="pending",
+            current_stage="system_analysis",
+        )
+        task.summary = {
+            "selected_modules": [],
+            "b2s_results": [],
+            "entry_results": [],
+        }
+        db = _ModelAwareDb(tasks=[task], stage_runs=[], stage_items=[])
+
+        self.assertFalse(self.manager._stage_has_real_runnable_work(db, task, "binary_to_source"))
         self.assertFalse(self.manager._stage_has_real_runnable_work(db, task, "entry_analysis"))
 
     def test_prepare_stage_items_for_execution_only_requeues_selected_failed_items(self):
@@ -23262,6 +23373,51 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         failed_events = [row for row in db.added if isinstance(row, BinarySecurityEvent) and row.event_type == "task_delete_failed"]
         self.assertTrue(failed_events)
 
+    def test_cleanup_task_workspace_retries_transient_residual_directory(self):
+        task = BinarySecurityTask(
+            id="t-cleanup-retry",
+            project_id="p1",
+            name="cleanup-retry",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/out",
+            workspace_root="/tmp/ws-cleanup-retry",
+        )
+
+        class _FakeClient:
+            async def delete_project_path(self, project_id, path, token, recursive=True):
+                return None
+
+        class _FakeWorkspace:
+            def __init__(self):
+                self.calls = 0
+
+            def exists(self):
+                self.calls += 1
+                return self.calls < 4
+
+        fake_workspace = _FakeWorkspace()
+        sleeps = []
+
+        async def _fake_sleep(seconds):
+            sleeps.append(seconds)
+
+        async def _run():
+            with (
+                patch.object(task_manager_module, "get_fileserver_client", return_value=_FakeClient()),
+                patch.object(task_manager_module, "Path", return_value=fake_workspace),
+                patch.object(task_manager_module.asyncio, "to_thread", AsyncMock(return_value=None)),
+                patch.object(task_manager_module.asyncio, "sleep", _fake_sleep),
+            ):
+                return await self.manager._cleanup_task_workspace(task, token="tok")
+
+        cleanup_status = asyncio.run(_run())
+
+        self.assertEqual("deleted", cleanup_status)
+        self.assertEqual([5, 5, 5], sleeps)
+
     def test_manual_delete_force_ignores_downstream_delete_failure_and_removes_parent(self):
         task = BinarySecurityTask(
             id="t-force-delete",
@@ -25965,10 +26121,55 @@ def _test_record_polled_child_sync_failure_marks_owned_execution_owner_lost(self
         )
 
     events = [event for event in db.added if isinstance(event, BinarySecurityEvent)]
-    self.assertEqual(2, len(events))
+    self.assertEqual(3, len(events))
     self.assertEqual("owned_execution_owner_lost", events[0].event_type)
     self.assertIn("当前执行 owner 已丢失，等待 worker 重新接管", events[0].message)
-    self.assertEqual("downstream_poll_attempt_failed", events[1].event_type)
+    self.assertEqual("child_owner_lost_detected", events[1].event_type)
+    self.assertEqual("child_owner_lost_requeue_scheduled", events[2].event_type)
+    self.assertEqual(1, int(item.retry_count or 0))
+
+
+def _test_record_polled_child_sync_failure_marks_owner_lost_exhausted_after_retry_budget(self):
+    task = BinarySecurityTask(
+        id="task-owned-stale-exhausted",
+        project_id="p1",
+        name="n",
+        status="dispatching",
+        current_stage="binary_to_source",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.policy = {"max_retries_per_item": 1}
+    item = BinarySecurityStageItem(
+        id="item-owned-stale-exhausted",
+        task_id="task-owned-stale-exhausted",
+        project_id="p1",
+        stage_name="binary_to_source",
+        item_key="module-1",
+        status="dispatching",
+        retry_count=1,
+        downstream_service="binary_to_source",
+        downstream_task_id="b2s-1",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[item])
+
+    with patch.object(task_manager_module, "get_session_factory", return_value=lambda: db):
+        self.manager._record_polled_child_sync_failure(
+            task_id="task-owned-stale-exhausted",
+            item_id="item-owned-stale-exhausted",
+            error_message="任务 task-owned-stale-exhausted 当前执行 token 已失效",
+            error_type="StaleTaskExecution",
+            http_status=500,
+        )
+
+    events = [event for event in db.added if isinstance(event, BinarySecurityEvent)]
+    self.assertEqual("child_owner_lost_retry_exhausted", events[2].event_type)
+    self.assertEqual("failed", item.status)
+    self.assertEqual("owner_lost_retry_exhausted", item.error_message)
+    self.assertEqual(2, int(item.retry_count or 0))
 
 
 def _test_record_polled_child_sync_failure_keeps_tail_owner_lost_for_tail_stale(self):
@@ -26750,6 +26951,127 @@ def _test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_fai
     event_types = [event.event_type for event in db.events]
     self.assertIn("task_finalized_after_stage_failure", event_types)
     self.assertIn("task_finalized_after_child_failure", event_types)
+
+
+def _test_refresh_task_status_after_sync_keeps_owner_lost_child_recoverable(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-firmware-owner-lost",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="firmware_unpack",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-z",
+        dispatch_started_at=_now() - timedelta(minutes=3),
+        lease_expires_at=_now() - timedelta(seconds=10),
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    firmware_run = BinarySecurityStageRun(
+        id="sr-fw-owner-lost",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="firmware_unpack",
+        sequence_no=1,
+        status="failed",
+        last_error="Task owner pod lost",
+    )
+    item = BinarySecurityStageItem(
+        id="si-fw-owner-lost",
+        task_id=task.id,
+        project_id="p1",
+        stage_run_id=firmware_run.id,
+        stage_name="firmware_unpack",
+        item_key="fw.bin",
+        item_name="fw.bin",
+        status="failed",
+        downstream_service="firmware_unpacker",
+        downstream_task_id="fu-owner-lost",
+        error_message="Task owner pod lost",
+        result={
+            "sync_observation": {
+                "sync_status": "transport_error",
+                "error_type": "StaleTaskExecution",
+                "error_message": "任务 task-firmware-owner-lost 当前执行 token 已失效",
+                "last_result": "error",
+            }
+        },
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[firmware_run], stage_items=[item], events=[])
+
+    manager._refresh_task_status_after_sync(db, task)
+
+    self.assertEqual("pending", task.status)
+    self.assertEqual("firmware_unpack", task.current_stage)
+    self.assertIsNone(task.finished_at)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+    self.assertNotEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
+
+
+def _test_refresh_task_status_after_sync_fails_owner_lost_child_after_retry_budget_exhausted(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-firmware-owner-lost-exhausted",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="firmware_unpack",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-z",
+        dispatch_started_at=_now() - timedelta(minutes=3),
+        lease_expires_at=_now() - timedelta(seconds=10),
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming", "max_retries_per_item": 1}),
+    )
+    task.policy = {"pipeline_mode": "mixed_streaming", "max_retries_per_item": 1}
+    firmware_run = BinarySecurityStageRun(
+        id="sr-fw-owner-lost-exhausted",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="firmware_unpack",
+        sequence_no=1,
+        status="failed",
+        last_error="owner_lost_retry_exhausted",
+    )
+    item = BinarySecurityStageItem(
+        id="si-fw-owner-lost-exhausted",
+        task_id=task.id,
+        project_id="p1",
+        stage_run_id=firmware_run.id,
+        stage_name="firmware_unpack",
+        item_key="fw.bin",
+        item_name="fw.bin",
+        status="failed",
+        retry_count=2,
+        downstream_service="firmware_unpacker",
+        downstream_task_id="fu-owner-lost",
+        error_message="owner_lost_retry_exhausted",
+        result={
+            "sync_observation": {
+                "sync_status": "transport_error",
+                "error_type": "StaleTaskExecution",
+                "error_message": "任务 task-firmware-owner-lost-exhausted 当前执行 token 已失效",
+                "last_result": "error",
+            }
+        },
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[firmware_run], stage_items=[item], events=[])
+
+    manager._refresh_task_status_after_sync(db, task)
+
+    self.assertEqual("failed", task.status)
+    self.assertEqual("firmware_unpack", task.current_stage)
+    self.assertIsNotNone(task.finished_at)
+    self.assertEqual("owner_lost_retry_exhausted", task.latest_abnormal_reason.get("code"))
 
 
 def _test_refresh_task_status_after_sync_converts_dispatching_task_with_earlier_cancelled_stage_to_failed(self):
@@ -27541,6 +27863,52 @@ def _test_stage_dataflow_vuln_scan_uses_selected_entry_inputs_in_manual_mode(sel
     self.assertEqual(["e2"], [item["entry_key"] for item in captured["inputs"]])
 
 
+def _test_cleanup_task_workspace_retries_transient_residual_directory(self):
+    task = BinarySecurityTask(
+        id="t-cleanup-retry",
+        project_id="p1",
+        name="cleanup-retry",
+        status="running",
+        task_type=TASK_TYPE_BINARY,
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/out",
+        workspace_root="/tmp/ws-cleanup-retry",
+    )
+
+    class _FakeClient:
+        async def delete_project_path(self, project_id, path, token, recursive=True):
+            return None
+
+    class _FakeWorkspace:
+        def __init__(self):
+            self.calls = 0
+
+        def exists(self):
+            self.calls += 1
+            return self.calls < 4
+
+    fake_workspace = _FakeWorkspace()
+    sleeps = []
+
+    async def _fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    async def _run():
+        with (
+            patch.object(task_manager_module, "get_fileserver_client", return_value=_FakeClient()),
+            patch.object(task_manager_module, "Path", return_value=fake_workspace),
+            patch.object(task_manager_module.asyncio, "to_thread", AsyncMock(return_value=None)),
+            patch.object(task_manager_module.asyncio, "sleep", _fake_sleep),
+        ):
+            return await self.manager._cleanup_task_workspace(task, token="tok")
+
+    cleanup_status = asyncio.run(_run())
+
+    self.assertEqual("deleted", cleanup_status)
+    self.assertEqual([5, 5, 5], sleeps)
+
+
 def _test_get_project_config_normalizes_legacy_partial_success_stage_names(self):
     row = BinarySecurityProjectConfig(project_id="p1")
     row.config = {
@@ -27591,6 +27959,7 @@ TaskManagerTests.test_reducer_sync_downstream_status_reclaims_pending_tail_recon
 TaskManagerTests.test_start_reducer_role_runs_reconcile_loops = _test_start_reducer_role_runs_reconcile_loops
 TaskManagerTests.test_tail_control_plane_stale_error_does_not_pollute_sync_error = _test_tail_control_plane_stale_error_does_not_pollute_sync_error
 TaskManagerTests.test_record_polled_child_sync_failure_marks_owned_execution_owner_lost = _test_record_polled_child_sync_failure_marks_owned_execution_owner_lost
+TaskManagerTests.test_record_polled_child_sync_failure_marks_owner_lost_exhausted_after_retry_budget = _test_record_polled_child_sync_failure_marks_owner_lost_exhausted_after_retry_budget
 TaskManagerTests.test_record_polled_child_sync_failure_keeps_tail_owner_lost_for_tail_stale = _test_record_polled_child_sync_failure_keeps_tail_owner_lost_for_tail_stale
 TaskManagerTests.test_worker_skips_tail_tasks_in_downstream_reconcile_candidates = _test_worker_skips_tail_tasks_in_downstream_reconcile_candidates
 TaskManagerTests.test_get_timeline_compresses_repeated_tail_owner_lost_events = _test_get_timeline_compresses_repeated_tail_owner_lost_events
@@ -27615,6 +27984,8 @@ TaskManagerTests.test_run_task_records_takeover_resume_event_for_streaming_tail 
 TaskManagerTests.test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task = _test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task
 TaskManagerTests.test_run_task_finally_preserves_tail_runtime_lease = _test_run_task_finally_preserves_tail_runtime_lease
 TaskManagerTests.test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_failed = _test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_failed
+TaskManagerTests.test_refresh_task_status_after_sync_keeps_owner_lost_child_recoverable = _test_refresh_task_status_after_sync_keeps_owner_lost_child_recoverable
+TaskManagerTests.test_refresh_task_status_after_sync_fails_owner_lost_child_after_retry_budget_exhausted = _test_refresh_task_status_after_sync_fails_owner_lost_child_after_retry_budget_exhausted
 TaskManagerTests.test_reclaim_stale_dispatching_skips_failed_streaming_task = _test_reclaim_stale_dispatching_skips_failed_streaming_task
 TaskManagerTests.test_sync_downstream_status_does_not_record_recovery_event_for_failed_terminal_child = _test_sync_downstream_status_does_not_record_recovery_event_for_failed_terminal_child
 TaskManagerTests.test_sync_downstream_status_skips_recovery_event_for_terminal_failed_child = _test_sync_downstream_status_skips_recovery_event_for_terminal_failed_child
@@ -27643,6 +28014,7 @@ TaskManagerTests.test_archive_job_payload_uses_compact_downstream_payload = _tes
 TaskManagerTests.test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payload_changes = _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payload_changes
 TaskManagerTests.test_stage_entry_analysis_manual_confirm_sets_pending_entry_confirmation = _test_stage_entry_analysis_manual_confirm_sets_pending_entry_confirmation
 TaskManagerTests.test_stage_dataflow_vuln_scan_uses_selected_entry_inputs_in_manual_mode = _test_stage_dataflow_vuln_scan_uses_selected_entry_inputs_in_manual_mode
+TaskManagerTests.test_cleanup_task_workspace_retries_transient_residual_directory = _test_cleanup_task_workspace_retries_transient_residual_directory
 
 
 if __name__ == "__main__":
