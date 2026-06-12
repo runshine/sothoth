@@ -107,6 +107,7 @@ class TaskService:
         )
         report_outputs = self._normalize_report_outputs(payload)
         stage_names = self._determine_stage_names(payload, report_outputs)
+        timeout_seconds = self._resolve_task_timeout_seconds(payload.timeout_seconds)
         with get_database().connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             if payload.idempotency_key:
@@ -155,6 +156,7 @@ class TaskService:
                 "start_stage": "poc" if payload.pipeline_mode == "poc_only" else stage_names[0],
                 "stage_names": stage_names,
                 "report_outputs": report_outputs,
+                "timeout_seconds": timeout_seconds,
                 "graph_source": payload.graph_source.model_dump() if payload.graph_source is not None else None,
             }
             conn.execute(
@@ -344,6 +346,7 @@ class TaskService:
                 "execution_mode": "agentflow_cli",
                 "report_outputs": report_outputs,
                 "stage_names": declared_stage_names,
+                "timeout_seconds": self._resolve_task_timeout_seconds(None),
             }
             context = StageContext(
                 task_id=validation_task_id,
@@ -476,6 +479,7 @@ class TaskService:
             "work_dir": str(work_dir),
             "attempt_root": str(context.attempt_root),
             "runtime_root": str(context.runtime_root),
+            "timeout_seconds": self._resolve_task_timeout_seconds(context.effective_config.get("timeout_seconds")),
             "stage_names": list(context.effective_config.get("stage_names") or []),
             "poc_runtime": poc_runtime,
             "report_outputs": report_output_map,
@@ -918,6 +922,7 @@ class TaskService:
             if latest_attempt is None:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"task has no attempts: {task_id}")
             effective_config = json.loads(latest_attempt["effective_config_json"] or "{}")
+            effective_config["timeout_seconds"] = self._resolve_task_timeout_seconds(effective_config.get("timeout_seconds"))
             start_stage = "audit"
             if payload.retry_scope == "from_stage":
                 if row["pipeline_mode"] == "custom_graph":
@@ -1441,6 +1446,16 @@ class TaskService:
         if pipeline_mode in {"audit_then_poc", "audit_only", "poc_only"}:
             return ["audit", "poc"]
         return []
+
+    @staticmethod
+    def _resolve_task_timeout_seconds(value: Any) -> int:
+        try:
+            timeout_seconds = int(value)
+        except (TypeError, ValueError):
+            timeout_seconds = int(get_config().execution.task_timeout_seconds)
+        if timeout_seconds < 1:
+            timeout_seconds = int(get_config().execution.task_timeout_seconds)
+        return timeout_seconds
 
     @staticmethod
     def _default_report_outputs(pipeline_mode: str) -> list[dict[str, Any]]:

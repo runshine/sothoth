@@ -48,4 +48,5 @@ def get_capabilities() -> CapabilityResponse:
             "session_file",
         ],
         max_parallel_tasks=get_runtime_config_service().get_max_parallel_tasks(),
+        default_task_timeout_seconds=cfg.execution.task_timeout_seconds,
     )

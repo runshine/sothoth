@@ -28,6 +28,7 @@ from app.workers.runner import (
     resolve_stage_primary_report_output_path,
     resolve_stage_executor_model,
     resolve_stage_work_dir,
+    resolve_task_timeout_seconds,
     run_logged_command,
     write_json_file,
     write_last_message_from_agentflow_result,
@@ -171,6 +172,10 @@ def _run_mock_stage(
             ]
         ),
     )
+    write_text_file(
+        events_path,
+        '{"type":"message","role":"assistant","content":"[mock] audit stage completed"}\n',
+    )
     write_text_file(last_message_path, report_body)
     write_text_file(final_report_path, report_body)
     return StageExecutionResult(
@@ -180,7 +185,7 @@ def _run_mock_stage(
         return_code=0,
         log_path=log_path,
         artifacts=[StageArtifact("audit_report", final_report_path, display_name=final_report_path.name)],
-        session_files=[prompt_path, last_message_path],
+        session_files=[prompt_path, events_path, last_message_path],
         output_path=final_report_path,
         metadata={"executor_mode": "mock", "audit_skill": audit_skill},
     )
@@ -238,7 +243,7 @@ def _run_codex_stage(
         log_path=log_path,
         log_header=log_header,
         hooks=hooks,
-        timeout_seconds=int(get_config().execution.task_timeout_seconds),
+        timeout_seconds=resolve_task_timeout_seconds(context.effective_config),
         mirror_output_paths=[events_path] if cfg.codex_json_output else None,
         process_env=process_env,
     )
@@ -453,7 +458,7 @@ def _run_agentflow_single_node_stage(
         log_path=log_path,
         log_header=log_header,
         hooks=hooks,
-        timeout_seconds=int(cfg.task_timeout_seconds),
+        timeout_seconds=resolve_task_timeout_seconds(context.effective_config),
         process_env=process_env,
     )
     session_files = [prompt_path]
@@ -709,7 +714,7 @@ def _run_agentflow_combined_pipeline(
         log_path=combined_cli_log_path,
         log_header=log_header,
         hooks=hooks,
-        timeout_seconds=int(cfg.task_timeout_seconds),
+        timeout_seconds=resolve_task_timeout_seconds(context.effective_config),
         process_env=process_env,
     )
     run_dir = discover_single_run_dir(runs_dir)
@@ -916,7 +921,7 @@ def _run_opencode_stage(
         log_path=log_path,
         log_header=log_header,
         hooks=hooks,
-        timeout_seconds=int(get_config().execution.task_timeout_seconds),
+        timeout_seconds=resolve_task_timeout_seconds(context.effective_config),
         mirror_output_paths=[events_path],
         process_env=process_env,
     )
@@ -977,7 +982,7 @@ def _run_opencode_stage(
             log_path=log_path,
             log_header=retry_header,
             hooks=hooks,
-            timeout_seconds=int(get_config().execution.task_timeout_seconds),
+            timeout_seconds=resolve_task_timeout_seconds(context.effective_config),
             mirror_output_paths=[events_path],
             append=True,
             process_env=process_env,

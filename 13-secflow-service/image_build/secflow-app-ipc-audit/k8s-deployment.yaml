@@ -70,7 +70,9 @@ spec:
             - name: AGENTFLOW_OPENCODE_CHUNK_TIMEOUT_MS
               value: "300000"
             - name: IPC_AUDIT_TASK_TIMEOUT_SECONDS
-              value: "3600"
+              value: "604800"
+            - name: IPC_AUDIT_AGENTFLOW_NODE_TIMEOUT_SECONDS
+              value: "7200"
             - name: IPC_AUDIT_PROVIDER_TIMEOUT_SECONDS
               value: "3600"
           volumeMounts:

@@ -74,6 +74,8 @@ def build_in_container_qemu_prompt(instance_name: str) -> str:
             f"  {hdc_bin} tconn {hdc_bind}:<HDC_PORT_FROM_HELPER_LIST>",
             f"  {hdc_bin} list targets",
             "",
+            f"- When running any {helper_bin} command, set the command/tool timeout to more than 240 seconds, for example 300s or 600s. Shorter timeouts can expire before the QEMU guest OS finishes booting.",
+            "",
             "Network rules:",
             f"- In bridge mode, the guest normally receives a 192.168.111.x address and {helper_bin} starts socat to forward {hdc_bind}:<HDC_PORT> to <GUEST_IP>:55555.",
             "- Prefer the HDC endpoint printed by the helper or recorded in the runtime/state/*.env file; do not guess the IP/port.",

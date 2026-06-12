@@ -1,0 +1,20 @@
+{
+  "default_provider_key": "local-openai",
+  "items": [
+    {
+      "provider_key": "local-openai",
+      "display_name": "Local OpenAI",
+      "provider_type": "openai",
+      "enabled": true,
+      "is_default": true,
+      "api_base": "${OPENAI_BASE_URL:-https://api.openai.com/v1}",
+      "api_key": "${OPENAI_API_KEY:-}",
+      "model": "${IPC_AUDIT_PROVIDER_FALLBACK_MODEL:-openai/gpt-5}",
+      "env_bindings": {
+        "OPENAI_API_KEY": "${OPENAI_API_KEY:-}",
+        "OPENAI_BASE_URL": "${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+      },
+      "file_bindings": []
+    }
+  ]
+}

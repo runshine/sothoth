@@ -10,6 +10,8 @@ import yaml
 from pydantic import BaseModel, Field
 
 DEFAULT_AGENTFLOW_ROOT = "/home/icsl/agentflow-alpha"
+DEFAULT_TASK_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_AGENTFLOW_NODE_TIMEOUT_SECONDS = 7200
 K8S_AGENTFLOW_ROOT_CANDIDATES = (
     "/var/lib/secflow-app-ipc-audit/agentflow-alpha",
     "/var/lib/secflow-ipc-audit/agentflow-alpha",
@@ -40,7 +42,8 @@ class ExecutionConfig(BaseModel):
     scheduler_tick_interval_seconds: float = 1.0
     heartbeat_interval_seconds: int = 5
     lease_duration_seconds: int = 30
-    task_timeout_seconds: int = 7200
+    task_timeout_seconds: int = DEFAULT_TASK_TIMEOUT_SECONDS
+    agentflow_node_timeout_seconds: int = DEFAULT_AGENTFLOW_NODE_TIMEOUT_SECONDS
     cancel_check_interval_seconds: float = 1.0
     process_terminate_grace_seconds: float = 5.0
     poc_enabled: bool = True
@@ -269,7 +272,16 @@ def _merge_env_overrides(payload: dict[str, object]) -> dict[str, object]:
         )
     )
     execution_payload["task_timeout_seconds"] = int(
-        os.environ.get("IPC_AUDIT_TASK_TIMEOUT_SECONDS", execution_payload.get("task_timeout_seconds", 7200))
+        os.environ.get(
+            "IPC_AUDIT_TASK_TIMEOUT_SECONDS",
+            execution_payload.get("task_timeout_seconds", DEFAULT_TASK_TIMEOUT_SECONDS),
+        )
+    )
+    execution_payload["agentflow_node_timeout_seconds"] = int(
+        os.environ.get(
+            "IPC_AUDIT_AGENTFLOW_NODE_TIMEOUT_SECONDS",
+            execution_payload.get("agentflow_node_timeout_seconds", DEFAULT_AGENTFLOW_NODE_TIMEOUT_SECONDS),
+        )
     )
     execution_payload["cancel_check_interval_seconds"] = float(
         os.environ.get(

@@ -41,7 +41,8 @@ data:
       scheduler_tick_interval_seconds: 1
       heartbeat_interval_seconds: 5
       lease_duration_seconds: 30
-      task_timeout_seconds: 7200
+      task_timeout_seconds: 604800
+      agentflow_node_timeout_seconds: 7200
       cancel_check_interval_seconds: 1
       process_terminate_grace_seconds: 5
       poc_enabled: true

@@ -27,6 +27,7 @@ from app.workers.runner import (
     resolve_attempt_relative_path,
     resolve_report_outputs_for_attempt,
     resolve_stage_work_dir,
+    resolve_task_timeout_seconds,
     run_logged_command,
     write_json_file,
     write_last_message_from_agentflow_result,
@@ -148,7 +149,7 @@ def run_graph(context: StageContext, hooks: StageHooks) -> GraphExecutionResult:
         log_path=cli_log_path,
         log_header=log_header,
         hooks=hooks,
-        timeout_seconds=int(get_config().execution.task_timeout_seconds),
+        timeout_seconds=resolve_task_timeout_seconds(context.effective_config),
         process_env=process_env,
         progress_tick=progress_tick,
     )
@@ -240,6 +241,7 @@ def _build_template_context(context: StageContext, report_outputs: list[dict[str
         "work_dir": str(work_dir),
         "attempt_root": str(context.attempt_root),
         "runtime_root": str(context.runtime_root),
+        "timeout_seconds": resolve_task_timeout_seconds(context.effective_config),
         "stage_names": _declared_stage_names(context),
         "poc_runtime": poc_runtime,
         "report_outputs": report_output_map,
@@ -320,7 +322,7 @@ def _materialize_pipeline(
         log_path=builder_log_path,
         log_header=log_header,
         hooks=hooks,
-        timeout_seconds=int(get_config().execution.task_timeout_seconds),
+        timeout_seconds=resolve_task_timeout_seconds(context.effective_config),
         process_env=process_env,
     )
     metadata["graph_builder_return_code"] = result.return_code
@@ -420,7 +422,7 @@ def _normalize_pipeline_payload(context: StageContext, payload: dict[str, Any]) 
     if not isinstance(nodes_value, list) or not nodes_value:
         raise ValueError("pipeline.nodes must be a non-empty array")
     normalized_nodes: list[dict[str, Any]] = []
-    default_timeout_seconds = int(get_config().execution.task_timeout_seconds)
+    default_timeout_seconds = int(get_config().execution.agentflow_node_timeout_seconds)
     work_dir = resolve_stage_work_dir(context)
     seen_ids: set[str] = set()
     for node in nodes_value:

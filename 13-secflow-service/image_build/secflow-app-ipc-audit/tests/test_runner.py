@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 from app.core.config import load_config
-from app.workers.runner import StageHooks, run_logged_command
+from app.workers.runner import StageHooks, resolve_task_timeout_seconds, run_logged_command
 
 
 class RunLoggedCommandTest(unittest.TestCase):
@@ -73,6 +73,10 @@ class RunLoggedCommandTest(unittest.TestCase):
         while time.monotonic() < deadline and self._process_exists(child_pid):
             time.sleep(0.05)
         self.assertFalse(self._process_exists(child_pid))
+
+    def test_resolve_task_timeout_seconds_prefers_attempt_config(self) -> None:
+        self.assertEqual(resolve_task_timeout_seconds({"timeout_seconds": 12345}), 12345)
+        self.assertEqual(resolve_task_timeout_seconds({}), 604800)
 
     def test_hook_exception_terminates_descendant_in_separate_process_group(self) -> None:
         child_pid_path = self.state_root / "hook-child.pid"

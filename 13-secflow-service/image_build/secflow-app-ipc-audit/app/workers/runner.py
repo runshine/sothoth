@@ -180,6 +180,17 @@ def resolve_stage_executor_model(context: StageContext) -> str | None:
     return resolve_executor_model(context.effective_config)
 
 
+def resolve_task_timeout_seconds(effective_config: dict[str, Any] | None) -> int:
+    cfg_timeout = int(get_config().execution.task_timeout_seconds)
+    if not isinstance(effective_config, dict):
+        return cfg_timeout
+    try:
+        timeout_seconds = int(effective_config.get("timeout_seconds"))
+    except (TypeError, ValueError):
+        return cfg_timeout
+    return timeout_seconds if timeout_seconds > 0 else cfg_timeout
+
+
 def load_declared_report_outputs(effective_config: dict[str, Any]) -> list[dict[str, Any]]:
     outputs = effective_config.get("report_outputs")
     if not isinstance(outputs, list):
@@ -347,7 +358,7 @@ def build_agentflow_node(
             "kind": "local",
             "cwd": str(work_dir or repo_root),
         },
-        "timeout_seconds": int(cfg.task_timeout_seconds),
+        "timeout_seconds": int(cfg.agentflow_node_timeout_seconds),
         "executable": executable,
         "extra_args": extra_args,
         "env": node_env,

@@ -42,6 +42,7 @@ class CapabilityResponse(BaseModel):
     default_pipeline_mode: str | None
     artifact_kinds: list[str]
     max_parallel_tasks: int
+    default_task_timeout_seconds: int
 
 
 class RuntimeConfigResponse(BaseModel):
@@ -212,6 +213,7 @@ class TaskCreateRequest(BaseModel):
     provider_keys: list[str] = Field(default_factory=list)
     graph_source: TaskGraphSource | None = None
     report_outputs: list[TaskReportOutputSpec] = Field(default_factory=list)
+    timeout_seconds: int | None = Field(None, ge=1)
     notes: str | None = None
     idempotency_key: str | None = None
 

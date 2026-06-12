@@ -115,6 +115,22 @@ class ExecutionFlowTest(unittest.TestCase):
             ],
         )
 
+    def test_create_task_persists_custom_timeout_seconds(self) -> None:
+        task = get_task_service().create_task(
+            TaskCreateRequest(
+                title="custom-timeout",
+                workspace_id="oh61-main",
+                pipeline_mode="audit_only",
+                input_ref=InputRef(kind="custom_project", project_path="foundation/demo/service"),
+                timeout_seconds=12345,
+            ),
+            self.subject,
+        )
+
+        detail = get_task_service().get_task(task.task_id)
+        attempt = get_task_service().get_attempt(task.task_id, str(detail.latest_attempt_id))
+        self.assertEqual(attempt.effective_config["timeout_seconds"], 12345)
+
     def test_poc_only_accepts_dot_audit_report_path(self) -> None:
         task = get_task_service().create_task(
             TaskCreateRequest(
