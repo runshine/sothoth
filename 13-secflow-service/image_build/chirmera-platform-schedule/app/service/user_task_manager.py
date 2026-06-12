@@ -848,6 +848,7 @@ class UserTaskManager:
                 return self._serialize_task(task, bindings, dispatch)
 
             dispatch_policy = self._dispatch_policy_for_task_type(task.task_type)
+            dispatch_auth_token = self.auto_dispatch_token()
             dispatch_task_key_result = await self.aigw.create_task_key(
                 management_token=self._aigw_management_token(),
                 task_id=task.id,
@@ -935,18 +936,18 @@ class UserTaskManager:
                 project_id=project_id,
                 task_id=task.id,
                 payload=create_payload,
-                bearer_token=dispatch_secret,
+                bearer_token=dispatch_auth_token,
             )
             await self.binary_security.complete_uploads(
                 project_id=project_id,
                 task_id=task.id,
                 files=copied_files,
-                bearer_token=dispatch_secret,
+                bearer_token=dispatch_auth_token,
             )
             await self.binary_security.start_task(
                 project_id=project_id,
                 task_id=task.id,
-                bearer_token=dispatch_secret,
+                bearer_token=dispatch_auth_token,
             )
 
             dispatch.dispatch_status = "succeeded"
