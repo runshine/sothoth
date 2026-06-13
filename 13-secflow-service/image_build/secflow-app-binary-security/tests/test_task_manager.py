@@ -20526,6 +20526,146 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual("pending", task.status)
         self.assertTrue(any(event.event_type == "tail_reconciliation_released_idle" for event in fake_db.events))
 
+    def test_tail_stage_work_summary_ignores_terminal_residual_entry_bindings(self):
+        task = BinarySecurityTask(
+            id="task-tail-entry-history-only",
+            project_id="p1",
+            name="demo",
+            status="running",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json='{"pipeline_mode": "mixed_streaming"}',
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            tail_reconcile_state="active",
+        )
+        runs = [
+            BinarySecurityStageRun(id="sr-system", task_id="task-tail-entry-history-only", project_id="p1", stage_name="system_analysis", sequence_no=1, status="success"),
+            BinarySecurityStageRun(id="sr-entry", task_id="task-tail-entry-history-only", project_id="p1", stage_name="entry_analysis", sequence_no=2, status="cancelled"),
+        ]
+        items = [
+            BinarySecurityStageItem(
+                id="si-entry-a",
+                task_id="task-tail-entry-history-only",
+                project_id="p1",
+                stage_run_id="sr-entry",
+                stage_name="entry_analysis",
+                item_key="entry-a",
+                status="cancelled",
+                downstream_service="entry_analyse",
+                downstream_task_id="eat-a",
+                result={"downstream_status": "pending", "sync_status": "synced"},
+            ),
+            BinarySecurityStageItem(
+                id="si-entry-b",
+                task_id="task-tail-entry-history-only",
+                project_id="p1",
+                stage_run_id="sr-entry",
+                stage_name="entry_analysis",
+                item_key="entry-b",
+                status="cancelled",
+                downstream_service="entry_analyse",
+                downstream_task_id="eat-b",
+                result={"downstream_status": "pending", "sync_status": "synced"},
+            ),
+        ]
+        fake_db = _AppendingModelAwareDb(tasks=[task], stage_runs=runs, stage_items=items, events=[])
+
+        summary = self.manager._tail_stage_work_summary(fake_db, task)
+
+        self.assertIsNone(summary["active_stage_name"])
+        self.assertFalse(summary["has_downstream_refs"])
+        self.assertEqual(2, summary["terminal_residual_binding_count"])
+        self.assertEqual("idle", summary["tail_control_mode"])
+        self.assertFalse(self.manager._tail_reconcile_context_active(fake_db, task))
+
+    def test_tail_stage_work_summary_keeps_replacement_binding_active(self):
+        task = BinarySecurityTask(
+            id="task-tail-entry-replacement",
+            project_id="p1",
+            name="demo",
+            status="running",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json='{"pipeline_mode": "mixed_streaming"}',
+        )
+        runs = [
+            BinarySecurityStageRun(id="sr-entry", task_id="task-tail-entry-replacement", project_id="p1", stage_name="entry_analysis", sequence_no=2, status="cancelled"),
+        ]
+        items = [
+            BinarySecurityStageItem(
+                id="si-entry-a",
+                task_id="task-tail-entry-replacement",
+                project_id="p1",
+                stage_run_id="sr-entry",
+                stage_name="entry_analysis",
+                item_key="entry-a",
+                status="cancelled",
+                downstream_service="entry_analyse",
+                downstream_task_id="eat-a",
+                result={
+                    "sync_observation": {
+                        "replacement_in_progress": True,
+                        "binding_cleared": True,
+                        "verification_status": "pending",
+                    }
+                },
+            ),
+        ]
+        fake_db = _AppendingModelAwareDb(tasks=[task], stage_runs=runs, stage_items=items, events=[])
+
+        summary = self.manager._tail_stage_work_summary(fake_db, task)
+
+        self.assertEqual("entry_analysis", summary["active_stage_name"])
+        self.assertTrue(summary["has_downstream_refs"])
+        self.assertEqual("reconciliation", summary["tail_control_mode"])
+
+    def test_tail_stage_work_summary_keeps_transport_error_binding_active(self):
+        task = BinarySecurityTask(
+            id="task-tail-entry-transport",
+            project_id="p1",
+            name="demo",
+            status="running",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json='{"pipeline_mode": "mixed_streaming"}',
+        )
+        runs = [
+            BinarySecurityStageRun(id="sr-entry", task_id="task-tail-entry-transport", project_id="p1", stage_name="entry_analysis", sequence_no=2, status="cancelled"),
+        ]
+        items = [
+            BinarySecurityStageItem(
+                id="si-entry-a",
+                task_id="task-tail-entry-transport",
+                project_id="p1",
+                stage_run_id="sr-entry",
+                stage_name="entry_analysis",
+                item_key="entry-a",
+                status="cancelled",
+                downstream_service="entry_analyse",
+                downstream_task_id="eat-a",
+                result={"sync_status": "transport_error"},
+            ),
+        ]
+        fake_db = _AppendingModelAwareDb(tasks=[task], stage_runs=runs, stage_items=items, events=[])
+
+        summary = self.manager._tail_stage_work_summary(fake_db, task)
+
+        self.assertEqual("entry_analysis", summary["active_stage_name"])
+        self.assertTrue(summary["has_downstream_refs"])
+        self.assertEqual("reconciliation", summary["tail_control_mode"])
+
     def test_run_task_ignores_stale_worker_failure_after_retry(self):
         task = BinarySecurityTask(
             id="task1",
@@ -30546,6 +30686,154 @@ TaskManagerTests.test_stage_entry_analysis_manual_confirm_sets_pending_entry_con
 TaskManagerTests.test_stage_dataflow_vuln_scan_uses_selected_entry_inputs_in_manual_mode = _test_stage_dataflow_vuln_scan_uses_selected_entry_inputs_in_manual_mode
 TaskManagerTests.test_cleanup_task_workspace_retries_transient_residual_directory = _test_cleanup_task_workspace_retries_transient_residual_directory
 TaskManagerTests.test_stage_item_response_does_not_show_pending_sync_when_downstream_status_exists = _test_stage_item_response_does_not_show_pending_sync_when_downstream_status_exists
+
+
+def _test_tail_stage_work_summary_ignores_terminal_residual_entry_bindings(self):
+    task = BinarySecurityTask(
+        id="task-tail-entry-history-only",
+        project_id="p1",
+        name="demo",
+        status="running",
+        current_stage="entry_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json='{"pipeline_mode": "mixed_streaming"}',
+        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        tail_reconcile_state="active",
+    )
+    runs = [
+        BinarySecurityStageRun(id="sr-system", task_id="task-tail-entry-history-only", project_id="p1", stage_name="system_analysis", sequence_no=1, status="success"),
+        BinarySecurityStageRun(id="sr-entry", task_id="task-tail-entry-history-only", project_id="p1", stage_name="entry_analysis", sequence_no=2, status="cancelled"),
+    ]
+    items = [
+        BinarySecurityStageItem(
+            id="si-entry-a",
+            task_id="task-tail-entry-history-only",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="entry-a",
+            status="cancelled",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-a",
+            result={"downstream_status": "pending", "sync_status": "synced"},
+        ),
+        BinarySecurityStageItem(
+            id="si-entry-b",
+            task_id="task-tail-entry-history-only",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="entry-b",
+            status="cancelled",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-b",
+            result={"downstream_status": "pending", "sync_status": "synced"},
+        ),
+    ]
+    fake_db = _AppendingModelAwareDb(tasks=[task], stage_runs=runs, stage_items=items, events=[])
+
+    summary = self.manager._tail_stage_work_summary(fake_db, task)
+
+    self.assertIsNone(summary["active_stage_name"])
+    self.assertFalse(summary["has_downstream_refs"])
+    self.assertEqual(2, summary["terminal_residual_binding_count"])
+    self.assertEqual("idle", summary["tail_control_mode"])
+    self.assertFalse(self.manager._tail_reconcile_context_active(fake_db, task))
+
+
+def _test_tail_stage_work_summary_keeps_replacement_binding_active(self):
+    task = BinarySecurityTask(
+        id="task-tail-entry-replacement",
+        project_id="p1",
+        name="demo",
+        status="running",
+        current_stage="entry_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json='{"pipeline_mode": "mixed_streaming"}',
+    )
+    runs = [
+        BinarySecurityStageRun(id="sr-entry", task_id="task-tail-entry-replacement", project_id="p1", stage_name="entry_analysis", sequence_no=2, status="cancelled"),
+    ]
+    items = [
+        BinarySecurityStageItem(
+            id="si-entry-a",
+            task_id="task-tail-entry-replacement",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="entry-a",
+            status="cancelled",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-a",
+            result={
+                "sync_observation": {
+                    "replacement_in_progress": True,
+                    "binding_cleared": True,
+                    "verification_status": "pending",
+                }
+            },
+        ),
+    ]
+    fake_db = _AppendingModelAwareDb(tasks=[task], stage_runs=runs, stage_items=items, events=[])
+
+    summary = self.manager._tail_stage_work_summary(fake_db, task)
+
+    self.assertEqual("entry_analysis", summary["active_stage_name"])
+    self.assertTrue(summary["has_downstream_refs"])
+    self.assertEqual("reconciliation", summary["tail_control_mode"])
+
+
+def _test_tail_stage_work_summary_keeps_transport_error_binding_active(self):
+    task = BinarySecurityTask(
+        id="task-tail-entry-transport",
+        project_id="p1",
+        name="demo",
+        status="running",
+        current_stage="entry_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json='{"pipeline_mode": "mixed_streaming"}',
+    )
+    runs = [
+        BinarySecurityStageRun(id="sr-entry", task_id="task-tail-entry-transport", project_id="p1", stage_name="entry_analysis", sequence_no=2, status="cancelled"),
+    ]
+    items = [
+        BinarySecurityStageItem(
+            id="si-entry-a",
+            task_id="task-tail-entry-transport",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="entry-a",
+            status="cancelled",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-a",
+            result={"sync_status": "transport_error"},
+        ),
+    ]
+    fake_db = _AppendingModelAwareDb(tasks=[task], stage_runs=runs, stage_items=items, events=[])
+
+    summary = self.manager._tail_stage_work_summary(fake_db, task)
+
+    self.assertEqual("entry_analysis", summary["active_stage_name"])
+    self.assertTrue(summary["has_downstream_refs"])
+    self.assertEqual("reconciliation", summary["tail_control_mode"])
+
+
+TaskManagerTests.test_tail_stage_work_summary_ignores_terminal_residual_entry_bindings = _test_tail_stage_work_summary_ignores_terminal_residual_entry_bindings
+TaskManagerTests.test_tail_stage_work_summary_keeps_replacement_binding_active = _test_tail_stage_work_summary_keeps_replacement_binding_active
+TaskManagerTests.test_tail_stage_work_summary_keeps_transport_error_binding_active = _test_tail_stage_work_summary_keeps_transport_error_binding_active
 
 
 if __name__ == "__main__":

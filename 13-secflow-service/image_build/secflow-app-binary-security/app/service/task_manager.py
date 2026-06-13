@@ -2062,6 +2062,50 @@ class TaskManager:
         active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
         return bool(active_stage_name) and (active_item_count > 0 or has_downstream_refs)
 
+    def _is_terminal_tail_item_with_only_residual_binding(self, item: BinarySecurityStageItem) -> bool:
+        normalized_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()
+        if normalized_status not in {"success", "failed", "cancelled", "downstream_missing", "partial_success"}:
+            return False
+        if not str(item.downstream_task_id or "").strip():
+            return False
+        if str(getattr(item, "claim_owner_instance_id", "") or "").strip():
+            return False
+        if str(getattr(item, "claim_execution_token", "") or "").strip():
+            return False
+        replacement_state = self._replacement_in_progress_state(item)
+        if replacement_state["replacement_in_progress"]:
+            return False
+        if replacement_state["binding_cleared"] and replacement_state["verification_status"] != "succeeded":
+            return False
+        sync_status = self._stage_item_sync_status_value(item)
+        if sync_status in {"transport_error", "binding_mismatch", "binding_missing_during_recreate"}:
+            return False
+        if self._stage_item_sync_in_retry_backoff(item):
+            return False
+        observed_status = self._normalize_downstream_status(self._latest_observed_downstream_status(item))
+        if observed_status in {"pending", "queued", "dispatching", "running"}:
+            return False
+        return True
+
+    def _stage_item_has_unresolved_downstream_ref(self, item: BinarySecurityStageItem) -> bool:
+        if not str(item.downstream_task_id or "").strip():
+            return False
+        normalized_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()
+        if normalized_status in {"pending", "queued", "dispatching", "running"}:
+            return True
+        if self._item_has_pending_replacement_or_stale_child(item):
+            return True
+        if self._stage_item_sync_in_retry_backoff(item):
+            return True
+        sync_status = self._stage_item_sync_status_value(item)
+        if sync_status in {"transport_error", "binding_mismatch", "binding_missing_during_recreate"}:
+            return True
+        if self._item_missing_recorded_downstream_status(item):
+            return True
+        if self._is_terminal_tail_item_with_only_residual_binding(item):
+            return False
+        return False
+
     def _tail_stage_work_summary(
         self,
         db: Session,
@@ -2083,6 +2127,7 @@ class TaskManager:
         bound_active_item_count = 0
         has_downstream_refs = False
         has_incomplete_stage = False
+        terminal_residual_binding_count = 0
         for stage_name in self._streaming_tail_stage_names(task):
             items = self._stage_items(db, task.id, stage_name)
             stage_bound_active_item_count = 0
@@ -2097,37 +2142,42 @@ class TaskManager:
                 .first()
             )
             normalized_stage_status = self._normalize_downstream_status(getattr(stage_run, "status", None)) or str(getattr(stage_run, "status", "") or "").strip()
-            if active_stage_name is None and items:
-                active_stage_name = stage_name
-            if active_stage_name is None and normalized_stage_status in {"pending", "queued", "dispatching", "running", "applying"}:
-                active_stage_name = stage_name
+            stage_has_unresolved_tail_work = False
             for item in items:
                 normalized_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip()
-                has_child = bool(str(item.downstream_task_id or "").strip())
+                unresolved_downstream_ref = self._stage_item_has_unresolved_downstream_ref(item)
+                if self._is_terminal_tail_item_with_only_residual_binding(item):
+                    terminal_residual_binding_count += 1
                 if normalized_status in {"pending", "queued"}:
                     unbound_runnable_item_count += 1
                     stage_has_runnable_unbound_items = True
-                    if has_child:
+                    stage_has_unresolved_tail_work = True
+                    if unresolved_downstream_ref:
                         has_downstream_refs = True
                         stage_has_downstream_refs = True
-                    if active_stage_name is None:
-                        active_stage_name = stage_name
-                elif has_child and self._is_streaming_active_item_status(normalized_status):
+                elif unresolved_downstream_ref and self._is_streaming_active_item_status(normalized_status):
                     bound_active_item_count += 1
                     stage_bound_active_item_count += 1
                     has_downstream_refs = True
                     stage_has_downstream_refs = True
-                    if active_stage_name is None:
-                        active_stage_name = stage_name
-                elif has_child:
+                    stage_has_unresolved_tail_work = True
+                elif unresolved_downstream_ref:
                     has_downstream_refs = True
                     stage_has_downstream_refs = True
+                    stage_has_unresolved_tail_work = True
             if normalized_stage_status in {"pending", "queued"}:
                 has_incomplete_stage = True
             elif normalized_stage_status in {"dispatching", "running", "applying"} and not (
                 stage_bound_active_item_count > 0 or stage_has_downstream_refs or stage_has_runnable_unbound_items
             ):
                 has_incomplete_stage = True
+            if active_stage_name is None and (
+                stage_has_runnable_unbound_items
+                or stage_bound_active_item_count > 0
+                or stage_has_downstream_refs
+                or (normalized_stage_status in {"pending", "queued", "dispatching", "running", "applying"} and stage_has_unresolved_tail_work)
+            ):
+                active_stage_name = stage_name
         has_runnable_unbound_items = unbound_runnable_item_count > 0
         if has_runnable_unbound_items or has_incomplete_stage:
             tail_control_mode = "execution_takeover"
@@ -2149,6 +2199,7 @@ class TaskManager:
             "bound_active_item_count": bound_active_item_count,
             "has_downstream_refs": has_downstream_refs,
             "has_incomplete_stage": has_incomplete_stage,
+            "terminal_residual_binding_count": terminal_residual_binding_count,
             "takeover_required": takeover_required,
             "takeover_reason": takeover_reason,
         }
@@ -22850,7 +22901,7 @@ class TaskManager:
         can_retry = bool(task_retry_supported)
         can_retry_failed_items = bool(task_retry_failed_supported)
         can_retry_stage = (has_stage_retry or has_stage_retry_failed) and not running
-        can_retry_stage_failed_items = has_stage_retry_failed or has_item_level_stage_retry_failed
+        can_retry_stage_failed_items = (has_stage_retry_failed or has_item_level_stage_retry_failed) and not streaming_auto_progressing
         can_delete = True
         blocked_policy_statuses = {"dispatching", "running"}
         can_edit_policy = task.status not in blocked_policy_statuses
@@ -28608,6 +28659,8 @@ class TaskManager:
         task: BinarySecurityTask,
         stage_name: str,
     ) -> tuple[bool, str | None, list[BinarySecurityStageItem]]:
+        if self._streaming_tail_auto_progressing(db, task):
+            return False, "当前任务处于 streaming tail 自动推进中，暂不支持阶段失败项重试", []
         items = self._stage_retry_candidate_items(db, task, stage_name)
         if not items:
             return False, "当前阶段没有可重试的失败项", []
