@@ -1,1 +1,0 @@
-"""File gateway worker package."""
