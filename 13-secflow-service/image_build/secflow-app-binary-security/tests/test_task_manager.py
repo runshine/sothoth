@@ -1785,6 +1785,61 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("pending", item.status)
         self.assertTrue(any(event.event_type == "streaming_stage_item_claim_skipped_non_owner" for event in db.events))
 
+    def test_claim_streaming_stage_items_deduplicates_non_owner_skip_events_for_same_stage(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        now = _now()
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            dispatcher_instance_id="worker-b",
+            dispatch_started_at=now,
+            lease_expires_at=now + timedelta(seconds=300),
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming", "stage_parallelism": {"entry_analysis": 2}}),
+        )
+        item1 = BinarySecurityStageItem(
+            id="si-entry-1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="mod1.so",
+            parent_key="fw-1",
+            item_identity_key="module-1::fw-1",
+            status="pending",
+            downstream_service="entry_analyse",
+        )
+        item2 = BinarySecurityStageItem(
+            id="si-entry-2",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-2",
+            item_name="mod2.so",
+            parent_key="fw-1",
+            item_identity_key="module-2::fw-1",
+            status="pending",
+            downstream_service="entry_analyse",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item1, item2], events=[])
+
+        claimed = self.manager._claim_streaming_stage_items(db)
+
+        self.assertEqual([], claimed)
+        events = [event for event in db.added if isinstance(event, BinarySecurityEvent) and event.event_type == "streaming_stage_item_claim_skipped_non_owner"]
+        self.assertEqual(1, len(events))
+        self.assertEqual("流式阶段子任务 claim 被非 owner pod 拦截，等待当前执行实例消费: entry_analysis", events[0].message)
+
     def test_claim_streaming_stage_items_returns_empty_on_retryable_lock_conflict(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         now = _now()
@@ -27007,6 +27062,228 @@ def _test_tail_control_plane_stale_error_does_not_pollute_sync_error(self):
     self.assertIsNone(observation.get("error_type"))
 
 
+def _test_sync_observation_recovery_clears_lingering_sync_error_state(self):
+    manager = TaskManager()
+    item = BinarySecurityStageItem(
+        id="si-recovery-clean",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="source_project-security_policy",
+        status="pending",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-current",
+        result={
+            "last_sync_error_message": "owner_lost_retry_exhausted",
+            "last_sync_error_type": "StaleTaskExecution",
+            "last_sync_result": "error",
+            "sync_error_budget_exhausted": True,
+            "next_sync_retry_at": (_now() + timedelta(minutes=5)).isoformat(),
+            "sync_observation": {
+                "error_message": "owner_lost_retry_exhausted",
+                "error_type": "StaleTaskExecution",
+                "http_status": 500,
+                "last_error_at": (_now() - timedelta(minutes=3)).isoformat(),
+                "last_result": "error",
+                "consecutive_error_count": 3,
+                "budget_exhausted": True,
+                "next_retry_at": (_now() + timedelta(minutes=5)).isoformat(),
+            },
+        },
+    )
+
+    manager._apply_child_task_sync_observation(
+        item,
+        sync_status="synced",
+        synced_at=_now(),
+        error_message=None,
+        error_type=None,
+        downstream_status_raw="pending",
+        downstream_status_mapped="pending",
+        downstream_status="pending",
+        state_applied=True,
+        clear_error_state=True,
+    )
+
+    result = dict(item.result or {})
+    observation = dict(result.get("sync_observation") or {})
+    self.assertEqual("success", result.get("last_sync_result"))
+    self.assertIsNone(result.get("last_sync_error_message"))
+    self.assertIsNone(result.get("last_sync_error_type"))
+    self.assertFalse(bool(result.get("sync_error_budget_exhausted")))
+    self.assertIsNone(result.get("next_sync_retry_at"))
+    self.assertEqual("success", observation.get("last_result"))
+    self.assertIsNone(observation.get("error_message"))
+    self.assertIsNone(observation.get("error_type"))
+    self.assertIsNone(observation.get("http_status"))
+    self.assertIsNone(observation.get("last_error_at"))
+    self.assertEqual(0, observation.get("consecutive_error_count"))
+    self.assertFalse(bool(observation.get("budget_exhausted")))
+    self.assertIsNone(observation.get("next_retry_at"))
+
+
+def _test_task_sync_status_view_excludes_no_child_business_failures_from_sync_errors(self):
+    manager = TaskManager()
+    business_failed = BinarySecurityStageItem(
+        id="si-no-child-failed",
+        task_id="t1",
+        project_id="p1",
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-a",
+        status="failed",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id=None,
+        result={
+            "last_sync_error_message": "未识别到明确污点参数，无法执行数据流分析",
+            "last_sync_result": "error",
+            "sync_observation": {
+                "error_message": "未识别到明确污点参数，无法执行数据流分析",
+                "error_type": "business_rule",
+                "last_error_at": (_now() - timedelta(minutes=2)).isoformat(),
+                "last_result": "error",
+            },
+        },
+    )
+    missing_child = BinarySecurityStageItem(
+        id="si-missing-child",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="source_project-gs_ledger",
+        status="downstream_missing",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-missing",
+        result={
+            "downstream_status": "downstream_missing",
+            "sync_observation": {
+                "error_message": "下游子任务不存在",
+                "error_type": "downstream_missing",
+                "last_error_at": (_now() - timedelta(minutes=1)).isoformat(),
+                "last_result": "error",
+            },
+        },
+    )
+    recovered_child = BinarySecurityStageItem(
+        id="si-recovered-child",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="source_project-security_policy",
+        status="pending",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-ok",
+        result={
+            "downstream_status": "pending",
+            "last_sync_result": "success",
+            "sync_observation": {
+                "sync_status": "synced",
+                "downstream_status": "pending",
+                "mapped_status": "pending",
+                "last_result": "success",
+            },
+        },
+    )
+
+    stats = manager._task_sync_status_view([business_failed, missing_child, recovered_child])
+
+    self.assertEqual(1, stats[5])
+    self.assertEqual("downstream_missing", stats[3])
+    self.assertEqual("下游子任务不存在", stats[4])
+
+
+def _test_build_task_runtime_health_marks_remote_owner_as_degraded_not_unhealthy(self):
+    manager = TaskManager()
+    now_value = _now()
+    task = BinarySecurityTask(
+        id="task-remote-owner",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = BinarySecurityStageItem(
+        id="si-remote-owner",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        item_key="source_project-security_policy",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-current",
+        updated_at=now_value,
+    )
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        execution_epoch=1,
+        owner_instance_id="remote-worker",
+        heartbeat_at=now_value,
+        lease_expires_at=now_value + timedelta(seconds=120),
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[item], runtime_leases=[lease])
+    manager.instance_id = "local-worker"
+
+    health = manager._build_task_runtime_health(db, task)
+    units = {unit["unit_key"]: unit for unit in health["units"]}
+
+    self.assertEqual("degraded", units["task_worker"]["status"])
+    self.assertEqual("degraded", units["task_heartbeat"]["status"])
+    self.assertIn(units["stage_workers"]["status"], {"healthy", "degraded"})
+    self.assertNotEqual("unhealthy", units["task_worker"]["status"])
+
+
+def _test_task_sync_status_view_excludes_terminal_synced_items_from_stale_count(self):
+    manager = TaskManager()
+    stale_success = BinarySecurityStageItem(
+        id="si-stale-success",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="source_project-ok",
+        status="success",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-old",
+        result={
+            "downstream_status": "success",
+            "downstream_status_synced_at": (_now() - timedelta(hours=3)).isoformat(),
+            "sync_observation": {
+                "sync_status": "synced",
+                "downstream_status": "success",
+                "mapped_status": "success",
+                "last_result": "success",
+            },
+        },
+    )
+    stale_running = BinarySecurityStageItem(
+        id="si-stale-running",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="source_project-running",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-running",
+        result={
+            "downstream_status": "running",
+            "downstream_status_synced_at": (_now() - timedelta(hours=3)).isoformat(),
+            "sync_observation": {
+                "sync_status": "synced",
+                "downstream_status": "running",
+                "mapped_status": "running",
+                "last_result": "success",
+            },
+        },
+    )
+
+    stats = manager._task_sync_status_view([stale_success, stale_running])
+
+    self.assertEqual(1, stats[7])
+
+
 def _test_record_polled_child_sync_failure_marks_owned_execution_owner_lost(self):
     task = BinarySecurityTask(
         id="task-owned-stale",
@@ -29267,6 +29544,10 @@ TaskManagerTests.test_start_reducer_role_runs_reconcile_loops = _test_start_redu
 TaskManagerTests.test_sync_downstream_status_recovers_failed_entry_item_from_current_child_running = _test_sync_downstream_status_recovers_failed_entry_item_from_current_child_running
 TaskManagerTests.test_effective_stage_item_downstream_status_allows_recoverable_running_display = _test_effective_stage_item_downstream_status_allows_recoverable_running_display
 TaskManagerTests.test_tail_control_plane_stale_error_does_not_pollute_sync_error = _test_tail_control_plane_stale_error_does_not_pollute_sync_error
+TaskManagerTests.test_sync_observation_recovery_clears_lingering_sync_error_state = _test_sync_observation_recovery_clears_lingering_sync_error_state
+TaskManagerTests.test_task_sync_status_view_excludes_no_child_business_failures_from_sync_errors = _test_task_sync_status_view_excludes_no_child_business_failures_from_sync_errors
+TaskManagerTests.test_build_task_runtime_health_marks_remote_owner_as_degraded_not_unhealthy = _test_build_task_runtime_health_marks_remote_owner_as_degraded_not_unhealthy
+TaskManagerTests.test_task_sync_status_view_excludes_terminal_synced_items_from_stale_count = _test_task_sync_status_view_excludes_terminal_synced_items_from_stale_count
 TaskManagerTests.test_record_polled_child_sync_failure_marks_owned_execution_owner_lost = _test_record_polled_child_sync_failure_marks_owned_execution_owner_lost
 TaskManagerTests.test_record_polled_child_sync_failure_marks_owned_execution_runtime_owner_change_as_owner_lost = _test_record_polled_child_sync_failure_marks_owned_execution_runtime_owner_change_as_owner_lost
 TaskManagerTests.test_record_polled_child_sync_failure_marks_owner_lost_exhausted_after_retry_budget = _test_record_polled_child_sync_failure_marks_owner_lost_exhausted_after_retry_budget

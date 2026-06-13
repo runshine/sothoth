@@ -1056,6 +1056,9 @@ class TaskManager:
         self._last_stale_operation_requeue_at: datetime | None = None
         self._last_stage_item_sync_reconcile_at: datetime | None = None
         self._tail_reconcile_handoff_reason: dict[str, str] = {}
+        self._non_owner_claim_log_state: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        self._non_owner_claim_log_lock = threading.Lock()
+        self._non_owner_claim_event_state: dict[tuple[str, str, str, str], datetime] = {}
 
     def _service_role(self) -> str:
         raw_role = os.environ.get("SECFLOW_BINARY_SECURITY_ROLE") or "all"
@@ -1177,6 +1180,95 @@ class TaskManager:
                 continue
             return True
         return False
+
+    def _record_non_owner_streaming_claim_skip(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        emit_event: bool = True,
+    ) -> None:
+        task_owner = str(task.dispatcher_instance_id or "").strip() or None
+        local_owner = str(self.instance_id or "").strip() or None
+        event_message = f"流式阶段子任务 claim 被非 owner pod 拦截，等待当前执行实例消费: {item.stage_name}"
+        throttle_key = (
+            str(task.id or ""),
+            str(item.stage_name or ""),
+            str(task_owner or ""),
+            str(local_owner or ""),
+        )
+        now = _now()
+        last_event_at = self._non_owner_claim_event_state.get(throttle_key)
+        should_record_event = last_event_at is None or (now - last_event_at).total_seconds() >= 60
+        if emit_event and should_record_event and not self._has_recent_matching_task_event(
+            db,
+            task,
+            event_type="streaming_stage_item_claim_skipped_non_owner",
+            stage_name=item.stage_name,
+            message=event_message,
+            payload_keys={
+                "task_owner": task_owner,
+                "local_owner": local_owner,
+            },
+            within_seconds=60,
+        ):
+            self._record_event(
+                db,
+                task,
+                "streaming_stage_item_claim_skipped_non_owner",
+                event_message,
+                level="warning",
+                stage_name=item.stage_name,
+                item=item,
+                payload={
+                    "item_id": item.id,
+                    "item_key": item.item_key,
+                    "task_owner": task_owner,
+                    "local_owner": local_owner,
+                    "task_execution_token": self._dispatch_token(task),
+                },
+            )
+            self._non_owner_claim_event_state[throttle_key] = now
+        with self._non_owner_claim_log_lock:
+            state = self._non_owner_claim_log_state.get(throttle_key)
+            if state is None:
+                self._non_owner_claim_log_state[throttle_key] = {
+                    "last_emitted_at": now,
+                    "suppressed_count": 0,
+                    "sample_item_ids": [str(item.id or "")] if item.id else [],
+                }
+                should_emit = True
+                skipped_count = 1
+                sample_item_ids = [str(item.id or "")] if item.id else []
+            else:
+                sample_item_ids = list(state.get("sample_item_ids") or [])
+                item_id = str(item.id or "")
+                if item_id and item_id not in sample_item_ids and len(sample_item_ids) < 5:
+                    sample_item_ids.append(item_id)
+                    state["sample_item_ids"] = sample_item_ids
+                elapsed = (now - state["last_emitted_at"]).total_seconds()
+                if elapsed < 60:
+                    state["suppressed_count"] = int(state.get("suppressed_count") or 0) + 1
+                    should_emit = False
+                    skipped_count = int(state["suppressed_count"]) + 1
+                else:
+                    skipped_count = int(state.get("suppressed_count") or 0) + 1
+                    state["last_emitted_at"] = now
+                    state["suppressed_count"] = 0
+                    state["sample_item_ids"] = [item_id] if item_id else []
+                    sample_item_ids = list(state["sample_item_ids"])
+                    should_emit = True
+        if should_emit:
+            logger.info(
+                "binary-security streaming stage item claim skipped for non-owner pod: task_id=%s stage=%s task_owner=%s local_owner=%s skipped_count=%s sample_item_ids=%s",
+                task.id,
+                item.stage_name,
+                task.dispatcher_instance_id,
+                self.instance_id,
+                skipped_count,
+                ",".join(filter(None, sample_item_ids)),
+            )
 
     def _downstream_tasks(self):
         return get_downstream_task_controller(self)
@@ -3433,11 +3525,16 @@ class TaskManager:
         tail_control_mode = str(tail_summary.get("tail_control_mode") or "idle")
         tail_takeover_required = bool(tail_summary.get("takeover_required"))
         tail_takeover_reason = self._string_or_none(tail_summary.get("takeover_reason"))
+        lease_active = bool(lease_expires_at is not None and (_seconds_until(lease_expires_at) or 0) > 0)
+        remote_owner_active = bool(
+            lease_owner
+            and lease_owner != self.instance_id
+            and lease_active
+        )
         units: list[dict[str, Any]] = []
 
         if task_status in active_task_statuses:
             if runtime_phase == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                lease_active = lease_expires_at is not None and (_seconds_until(lease_expires_at) or 0) > 0
                 if lease_active and tail_active_item_count > 0:
                     task_worker_status = "healthy"
                 elif lease_active or tail_active_item_count > 0 or tail_has_downstream_refs:
@@ -3454,14 +3551,18 @@ class TaskManager:
                     else "tail 收敛期缺少有效 lease 或活跃 tail 证据"
                 )
             else:
-                task_worker_status = "healthy" if (local_worker_alive and has_local_owner) else "degraded" if (local_worker_alive or has_local_owner or lease_expires_at) else "unhealthy"
+                task_worker_status = "healthy" if (local_worker_alive and has_local_owner) else "degraded" if (local_worker_alive or has_local_owner or lease_expires_at or remote_owner_active) else "unhealthy"
                 if not local_worker_alive and not has_local_owner and lease_expires_at is None:
                     task_worker_status = "unhealthy"
+                elif remote_owner_active and not local_worker_alive and not has_local_owner:
+                    task_worker_status = "degraded"
                 task_worker_label = "主任务执行协程"
                 task_worker_detail = "负责当前父任务阶段推进与调度衔接"
                 task_worker_reason = (
                     "本地任务协程与执行 owner 正常存在"
                     if task_worker_status == "healthy"
+                    else "当前任务由远端 owner 持有，本 Pod 仅观察到有效 lease"
+                    if remote_owner_active and not local_worker_alive and not has_local_owner
                     else "主任务协程存在但 owner/lease 信号不完整"
                     if task_worker_status == "degraded"
                     else "任务处于活动态，但当前看不到稳定的本地执行协程或 owner"
@@ -3522,6 +3623,14 @@ class TaskManager:
                 )
                 if stage_status == "unknown":
                     stage_status = "degraded"
+            elif remote_owner_active or lease_active:
+                stage_status = self._runtime_health_age_status(
+                    stage_age_seconds,
+                    healthy_threshold_seconds=heartbeat_interval_seconds * 2,
+                    degraded_threshold_seconds=worker_stale_seconds,
+                )
+                if stage_status in {"unknown", "unhealthy"}:
+                    stage_status = "degraded"
             else:
                 stage_status = "unhealthy" if task_status in {"dispatching", "running"} else "degraded"
             units.append(
@@ -3537,6 +3646,8 @@ class TaskManager:
                     reason=(
                         "阶段子任务协程活跃，最近状态刷新正常"
                         if stage_status == "healthy"
+                        else "当前活跃阶段子任务由远端 owner 推进，本 Pod 未持有本地协程"
+                        if (remote_owner_active or lease_active) and local_stage_worker_count == 0
                         else "阶段子任务仍在推进，但最近活动已接近陈旧窗口"
                         if stage_status == "degraded"
                         else "存在活跃阶段子任务，但当前没有看到对应的本地协程驱动"
@@ -3676,6 +3787,8 @@ class TaskManager:
             )
             if last_task_heartbeat_at is None and lease_expires_at is not None:
                 heartbeat_status = "degraded" if _seconds_until(lease_expires_at) and _seconds_until(lease_expires_at) > 0 else "unhealthy"
+            if remote_owner_active and not has_local_owner and last_task_heartbeat_at is None:
+                heartbeat_status = "degraded"
             if runtime_phase == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
                 if lease_expires_at is not None and (_seconds_until(lease_expires_at) or 0) > 0 and tail_active_item_count > 0:
                     heartbeat_status = "healthy"
@@ -3694,6 +3807,8 @@ class TaskManager:
                     reason=(
                         "心跳与 lease 都在有效窗口内"
                         if heartbeat_status == "healthy"
+                        else "当前 lease 由远端 owner 保持活跃，本 Pod 未直接持有心跳内存态"
+                        if remote_owner_active and heartbeat_status == "degraded" and last_task_heartbeat_at is None
                         else "当前仍有 lease/owner 证据，但心跳已接近阈值"
                         if heartbeat_status == "degraded"
                         else "任务保活信号已经明显老化或缺失"
@@ -8441,7 +8556,6 @@ class TaskManager:
                             )
                         continue
                     if mapped_status not in ARCHIVE_SUCCESS_MAPPED_STATUSES:
-                        error_message = observed_error_message
                         sync_supervisor_state = self._read_stage_item_sync_supervisor_state(item)
                         recovered_after_errors = (
                             sync_supervisor_state.consecutive_error_count > 0
@@ -8453,6 +8567,7 @@ class TaskManager:
                             mapped_status=mapped_status,
                             payload=payload,
                         )
+                        error_message = None if recovery_applied else observed_error_message
                         should_apply = observed_apply_state and (mapped_status != before_status or force)
                         if should_apply:
                             if not self._apply_child_state_with_savepoint(
@@ -8500,8 +8615,10 @@ class TaskManager:
                                         mapped_status=mapped_status,
                                         downstream_status=downstream_status,
                                         state_applied=True,
+                                        clear_error_state=recovery_applied,
                                     ),
                                 ),
+                                clear_error_state=recovery_applied,
                             ):
                                 failed_count += 1
                                 continue
@@ -8873,8 +8990,10 @@ class TaskManager:
                                 mapped_status=mapped_status,
                                 downstream_status=downstream_status,
                                 state_applied=True,
+                                clear_error_state=recovery_applied,
                             ),
                         ),
+                        clear_error_state=recovery_applied,
                     ):
                         failed_count += 1
                         continue
@@ -11900,6 +12019,7 @@ class TaskManager:
     def _claim_streaming_stage_items(self, db: Session) -> list[str]:
         claimed_ids: list[str] = []
         claimed_counts_by_stage: dict[tuple[str, str], int] = {}
+        seen_non_owner_skip_keys: set[tuple[str, str, str, str]] = set()
         pending_items = (
             db.query(BinarySecurityStageItem)
             .filter(BinarySecurityStageItem.status.in_(["pending", "queued"]))
@@ -11930,43 +12050,19 @@ class TaskManager:
             if self._task_runtime_phase(task) != TASK_RUNTIME_PHASE_OWNED_EXECUTION:
                 continue
             if str(task.dispatcher_instance_id or "").strip() != str(self.instance_id or "").strip():
-                event_message = f"流式阶段子任务 claim 被非 owner pod 拦截，等待当前执行实例消费: {item.stage_name}:{item.item_key}"
-                if not self._has_recent_matching_task_event(
+                skip_key = (
+                    str(task.id or ""),
+                    str(item.stage_name or ""),
+                    str(task.dispatcher_instance_id or "").strip(),
+                    str(self.instance_id or "").strip(),
+                )
+                self._record_non_owner_streaming_claim_skip(
                     db,
                     task,
-                    event_type="streaming_stage_item_claim_skipped_non_owner",
-                    stage_name=item.stage_name,
-                    message=event_message,
-                    payload_keys={
-                        "item_id": item.id,
-                        "task_owner": str(task.dispatcher_instance_id or "").strip() or None,
-                        "local_owner": str(self.instance_id or "").strip() or None,
-                    },
-                    within_seconds=60,
-                ):
-                    self._record_event(
-                        db,
-                        task,
-                        "streaming_stage_item_claim_skipped_non_owner",
-                        event_message,
-                        level="warning",
-                        stage_name=item.stage_name,
-                        item=item,
-                        payload={
-                            "item_id": item.id,
-                            "task_owner": str(task.dispatcher_instance_id or "").strip() or None,
-                            "local_owner": str(self.instance_id or "").strip() or None,
-                            "task_execution_token": self._dispatch_token(task),
-                        },
-                    )
-                logger.info(
-                    "binary-security streaming stage item claim skipped for non-owner pod: task_id=%s item_id=%s stage=%s task_owner=%s local_owner=%s",
-                    task.id,
-                    item.id,
-                    item.stage_name,
-                    task.dispatcher_instance_id,
-                    self.instance_id,
+                    item,
+                    emit_event=skip_key not in seen_non_owner_skip_keys,
                 )
+                seen_non_owner_skip_keys.add(skip_key)
                 continue
             if not task.dispatch_started_at or not self._lease_is_active(task):
                 continue
@@ -13290,6 +13386,7 @@ class TaskManager:
         budget_exhausted: bool | None = None,
         next_retry_at: datetime | None = None,
         last_sync_result: str | None = None,
+        clear_error_state: bool = False,
     ) -> None:
         self._apply_child_task_sync_observation(
             item,
@@ -13306,6 +13403,7 @@ class TaskManager:
             budget_exhausted=budget_exhausted,
             next_retry_at=next_retry_at,
             last_sync_result=last_sync_result,
+            clear_error_state=clear_error_state,
         )
 
     def _refresh_polled_child_sync_snapshot(
@@ -19317,6 +19415,7 @@ class TaskManager:
         budget_exhausted: bool | None = None,
         next_retry_at: datetime | None = None,
         last_sync_result: str | None = None,
+        clear_error_state: bool = False,
     ) -> list[str]:
         current_result = dict(item.result or {})
         preserved_keys = [key for key in self._preserved_child_result_keys() if key in current_result]
@@ -19360,7 +19459,7 @@ class TaskManager:
             sync_observation["next_retry_at"] = None
         if error_message or error_type:
             sync_observation["last_error_at"] = observed_at_iso
-        elif state_applied or downstream_status or downstream_status_mapped or downstream_status_raw:
+        elif clear_error_state or state_applied or downstream_status or downstream_status_mapped or downstream_status_raw:
             sync_observation["last_success_at"] = observed_at_iso
             sync_observation["last_synced_at"] = observed_at_iso
             sync_observation["last_error_at"] = None
@@ -19370,6 +19469,7 @@ class TaskManager:
             sync_observation["consecutive_error_count"] = 0
             sync_observation["budget_exhausted"] = False
             sync_observation["next_retry_at"] = None
+            sync_observation["last_result"] = "success"
         merged_result = {
             **current_result,
             "sync_status": sync_status,
@@ -19551,6 +19651,7 @@ class TaskManager:
         budget_exhausted: bool | None = None,
         next_retry_at: datetime | None = None,
         last_sync_result: str | None = None,
+        clear_error_state: bool = False,
     ) -> bool:
         before_status = str(item.status or "").strip().lower() or None
         after_status = str(item.status or "").strip().lower() or None
@@ -19586,6 +19687,7 @@ class TaskManager:
                         budget_exhausted=budget_exhausted,
                         next_retry_at=next_retry_at,
                         last_sync_result=last_sync_result,
+                        clear_error_state=clear_error_state,
                     )
                     db.flush()
                 return True
@@ -19635,6 +19737,7 @@ class TaskManager:
         error_type: str | None,
         apply_fn,
         extra_payload: dict[str, Any] | None = None,
+        clear_error_state: bool = False,
     ) -> bool:
         before_status = str(item.status or "").strip().lower() or None
         max_attempts = self._retryable_write_attempts()
@@ -21350,6 +21453,9 @@ class TaskManager:
         stale_synced_item_count = 0
         now = _now()
         for item in items or []:
+            has_active_sync_error = self._stage_item_has_active_sync_error(item)
+            if has_active_sync_error:
+                active_sync_error_item_count += 1
             last_synced_at = self._stage_item_last_synced_at_value(item)
             if last_synced_at is not None and (latest_success is None or last_synced_at > latest_success):
                 latest_success = last_synced_at
@@ -21378,8 +21484,7 @@ class TaskManager:
                     parsed_error_at = None
             error_type = self._string_or_none(sync_observation.get("error_type")) or self._string_or_none(result.get("last_sync_error_type"))
             error_message = self._string_or_none(sync_observation.get("error_message")) or self._string_or_none(result.get("last_sync_error_message"))
-            if parsed_error_at is not None:
-                active_sync_error_item_count += 1
+            if parsed_error_at is not None and has_active_sync_error:
                 if latest_error_at is None or parsed_error_at > latest_error_at:
                     latest_error_at = parsed_error_at
                     latest_error_type = error_type
@@ -21389,7 +21494,7 @@ class TaskManager:
                 latest_error_message = error_message
             if last_synced_at is None and parsed_attempt is not None:
                 never_synced_item_count += 1
-            if last_synced_at is not None and (now - last_synced_at).total_seconds() >= max(60, int(self.cfg.scheduler.downstream_reconcile_interval_seconds or 30) * 3):
+            if self._stage_item_counts_as_stale_sync(item, now_value=now, last_synced_at=last_synced_at):
                 stale_synced_item_count += 1
         return (
             latest_success,
@@ -21401,6 +21506,58 @@ class TaskManager:
             never_synced_item_count,
             stale_synced_item_count,
         )
+
+    def _stage_item_has_child_binding(self, item: BinarySecurityStageItem) -> bool:
+        if str(getattr(item, "downstream_task_id", "") or "").strip():
+            return True
+        result = self._load_stage_item_result_payload(item)
+        downstream = dict(result.get("downstream") or {})
+        return bool(str(downstream.get("task_id") or downstream.get("id") or "").strip())
+
+    def _stage_item_observed_downstream_status(self, item: BinarySecurityStageItem) -> str | None:
+        result = self._load_stage_item_result_payload(item)
+        sync_observation = self._stage_item_sync_observation(item)
+        return (
+            self._string_or_none(sync_observation.get("downstream_status"))
+            or self._string_or_none(sync_observation.get("mapped_status"))
+            or self._string_or_none(result.get("downstream_status"))
+        )
+
+    def _stage_item_has_active_sync_error(self, item: BinarySecurityStageItem) -> bool:
+        result = self._load_stage_item_result_payload(item)
+        sync_observation = self._stage_item_sync_observation(item)
+        sync_status = self._stage_item_sync_status_value(item)
+        if sync_status in {"binding_mismatch", "binding_missing_during_recreate", "transport_error", "rate_limited"}:
+            return True
+        error_message = self._string_or_none(sync_observation.get("error_message")) or self._string_or_none(result.get("last_sync_error_message"))
+        error_type = self._string_or_none(sync_observation.get("error_type")) or self._string_or_none(result.get("last_sync_error_type"))
+        if not error_message and not error_type:
+            return False
+        if not self._stage_item_has_child_binding(item):
+            return False
+        item_status = self._normalize_downstream_status(item.status)
+        observed_status = self._normalize_downstream_status(self._stage_item_observed_downstream_status(item))
+        if sync_status == "synced" and observed_status in {"pending", "queued", "running", "dispatching"}:
+            return False
+        if item_status in {"pending", "queued", "running", "dispatching"}:
+            return False
+        return True
+
+    def _stage_item_counts_as_stale_sync(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        now_value: datetime,
+        last_synced_at: datetime | None,
+    ) -> bool:
+        if last_synced_at is None:
+            return False
+        if not self._stage_item_has_child_binding(item):
+            return False
+        if not self._item_needs_downstream_sync(item, for_task_status="running", now_value=now_value):
+            return False
+        threshold_seconds = max(60, int(self.cfg.scheduler.downstream_reconcile_interval_seconds or 30) * 3)
+        return (now_value - last_synced_at).total_seconds() >= threshold_seconds
 
     def _task_list_response(
         self,
