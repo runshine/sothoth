@@ -1,15 +1,26 @@
 ---
 name: poc-phase1-binary-dependency
-description: Phase 1 of POC dynamic verification — analyze source code to trace the call chain from entry function to vulnerability function, then map every function onto actual ELF binaries in the firmware directory, resolving addresses and shared library dependencies. Use when the user needs to determine which binary files are needed for a vulnerability path, identify firmware architecture, or map a source-level call chain to binary artifacts.
+description: (内部) PoC 动态验证的第一阶段 — 解析漏洞报告,追踪源码调用链,把每个函数映射到固件目录里的 ELF 二进制,解析地址与共享库依赖。请勿直接调用,改用 poc-verify-pipeline。
+disable-model-invocation: true
 ---
 
-# Phase 1: Binary Dependency Analysis
+# 阶段一：二进制依赖分析
 
-From an entry function name and a vulnerability report, trace the source-level call chain, then map each function to its binary and address.
+根据入口函数名和漏洞报告,追踪源码级调用链,然后把每个函数映射到对应的 binary 与地址。
 
-## Input
+**本 Skill 由 `poc-verify-pipeline` 主控在内部调用,完成后必须把控制权交还主控,不要自行进入阶段二。**
 
-The working directory contains `phase1_input.json`:
+## 与流水线的集成
+
+开始前,读取 `.pipeline_state.json` 校验 `current_stage` 应为 `"phase1_binary_dependency"`,若已是 `"FAILED"` 或 `"COMPLETED"`,立即终止。
+
+从 `.pipeline_state.json` 读取输入参数:`vuln_report`、`entry_function`、`source_dir`、`binary_dir`、`output_dir`。若这些字段为空,退回读取输出目录中的 `phase1_input.json`。
+
+完成后,把 `.pipeline_state.json` 的 `current_stage` 改为 `"phase2_qiling_emulation"`,并输出信号:"阶段一完成 — binary_dependency_map.json 已生成"。
+
+## 输入
+
+工作目录中存在 `phase1_input.json`:
 
 ```json
 {
@@ -21,41 +32,38 @@ The working directory contains `phase1_input.json`:
 }
 ```
 
-## Task
+## 任务
 
-Produce `<output_dir>/binary_dependency_map.json` containing the complete call chain with binary mappings and all required dependencies.
+产出 `<output_dir>/binary_dependency_map.json`,其中包含完整的调用链、binary 映射以及所有依赖。
 
-## Procedure
+## 执行流程
 
-### Step 1: Parse the vulnerability report
+### 步骤 1: 解析漏洞报告
 
-Read `<vuln_report>`. Extract:
-- **vuln_function**: the vulnerability function name
-- **vuln_file**: the source file containing the vulnerability (e.g. `httpd/handler.c`)
-- **vuln_line**: line number if present
-- **vuln_address**: binary address if present
-- **vuln_type**: vulnerability type (buffer overflow, etc.)
+读取 `<vuln_report>`,抽取以下字段:
 
-The report may be Markdown or JSON. For Markdown, look for `**漏洞函数**`, `**漏洞文件**`, `**漏洞地址**`, `**漏洞类型**`. For JSON, read `vuln_function.name / .file / .address`, `type`.
+- **vuln_function**:漏洞函数名
+- **vuln_file**:漏洞所在源文件(如 `httpd/handler.c`)
+- **vuln_line**:行号(如有)
+- **vuln_address**:二进制地址(如有)
+- **vuln_type**:漏洞类型(缓冲区溢出等)
 
-### Step 2: Trace the call chain from source
+报告可能为 Markdown 或 JSON 格式。Markdown 中请查找 `**漏洞函数**`、`**漏洞文件**`、`**漏洞地址**`、`**漏洞类型**`;JSON 中请读取 `vuln_function.name / .file / .address`、`type`。
 
-Starting from the entry function (e.g. `main`), trace **every function call** that leads to the vulnerability function by analyzing the source code in `<source_dir>`.
+### 步骤 2: 从源码追踪调用链
 
-How to trace:
+从入口函数(例如 `main`)出发,分析 `<source_dir>` 中的源码,**追踪每一条**通向漏洞函数的函数调用。
 
-1. Find the source file containing the entry function (search recursively under `<source_dir>` for a definition like `void main(` or `int main(`).
+追踪方法:
 
-2. Read the source file. Identify every function called by the entry function. Record them in order.
-
-3. For each called function, repeat: find its definition, identify what it calls. Continue until the vulnerability function is reached.
-
-4. Stop criteria:
-   - The vulnerability function is reached → collect the full path
-   - A dead end (no calls toward vuln) → backtrack and try other branches
-   - External library calls (`printf`, `malloc`, `strcpy`) → skip (they don't lead to the vuln)
-
-5. Output format — a deduplicated ordered list of functions:
+1. 在 `<source_dir>` 中递归查找入口函数定义(形如 `void main(` 或 `int main(`)。
+2. 读取该源文件,识别入口函数调用的所有函数,按调用顺序记录。
+3. 对每一个被调用的函数,递归执行:定位其定义,识别它又调用了哪些函数。一直追踪到漏洞函数。
+4. 终止条件:
+   - 已到达漏洞函数 → 收集完整路径
+   - 死胡同(没有通向漏洞的调用) → 回溯,尝试其他分支
+   - 外部库调用(`printf`、`malloc`、`strcpy` 等) → 跳过(它们不会通向漏洞)
+5. 输出格式:去重且有序的函数列表:
 
 ```json
 [
@@ -67,31 +75,32 @@ How to trace:
 ]
 ```
 
-The first entry is always the entry function. The last entry is always the vulnerability function. The entry function has no `caller` field.
+首条记录必为入口函数,末条必为漏洞函数。入口函数没有 `caller` 字段。
 
-### Step 3: Enumerate ELF binaries
+### 步骤 3: 枚举 ELF 二进制
 
-Scan `<binary_dir>` recursively for ELF files. A file is ELF if its first 4 bytes are `\x7fELF`.
+递归扫描 `<binary_dir>`,前 4 字节为 `\x7fELF` 的即为 ELF 文件:
 
 ```bash
 find <binary_dir> -type f -not -type l -exec sh -c 'readelf -h "$1" > /dev/null 2>&1 && echo "$1"' _ {} \;
 ```
 
-### Step 4: Analyze each binary
+### 步骤 4: 分析每个 binary
 
-For each ELF file, run:
+对每个 ELF 文件,执行:
 
 ```bash
-file -b <binary_path>                      # → architecture, kind
-readelf -h <binary_path>                   # → endianness, entry point
-readelf -s --dyn-syms <binary_path>        # → exported symbols
-readelf -d <binary_path>                   # → NEEDED .so dependencies
-nm -D <binary_path>                        # → fallback symbol lookup
+file -b <binary_path>                      # → 架构、类型
+readelf -h <binary_path>                   # → 字节序、入口点
+readelf -s --dyn-syms <binary_path>        # → 导出符号
+readelf -d <binary_path>                   # → NEEDED .so 依赖
+nm -D <binary_path>                        # → 符号备查
 ```
 
-**Architecture mapping** (from `file` output):
-| Pattern | Value |
-|---------|-------|
+**架构映射**(从 `file` 输出):
+
+| 模式 | 取值 |
+|------|------|
 | `ARM aarch64` | `aarch64` |
 | `ARM` | `arm` |
 | `x86-64` | `x86_64` |
@@ -99,47 +108,49 @@ nm -D <binary_path>                        # → fallback symbol lookup
 | `MIPS64` | `mips64` |
 | `MIPS` | `mips` |
 
-**Kind**: `shared object` → `shared_library`, `executable` → `executable`, `.ko` → `kernel_module`
+**类型**:`shared object` → `shared_library`,`executable` → `executable`,`.ko` → `kernel_module`
 
-**Endianness** from `readelf -h` Data field: `little` or `big`.
+**字节序**:从 `readelf -h` Data 字段读取:`little` 或 `big`。
 
-**Symbols**: from `readelf -s --dyn-syms`, extract function names (the rightmost column of lines with FUNC type). Skip `@@` entries.
+**符号**:从 `readelf -s --dyn-syms` 抽取类型为 FUNC 的函数名(最右列)。跳过 `@@` 项。
 
-**Dependencies**: from `readelf -d`, every `(NEEDED) Shared library: [name]`.
+**依赖**:从 `readelf -d` 中所有 `(NEEDED) Shared library: [name]`。
 
-**Address lookup** with `nm -D`:
+**地址查询**用 `nm -D`:
+
 ```bash
 nm -D <binary> | grep " T <func_name>$"
 ```
-The address is the first hex column, formatted as `"0x<hex>"`.
 
-### Step 5: Match functions to binaries
+第一列十六进制数,格式化为 `"0x<hex>"`。
 
-For each function in the call chain:
+### 步骤 5: 把函数匹配到 binary
 
-1. **Exact match**: function name equals symbol name → resolved
-2. **Substring match**: function name appears inside symbol name (C++ mangling) → resolved
-3. **Not found**: mark as `missing_functions`
+对调用链中的每个函数:
 
-Prefer symbols from `executable` files over `shared_library` files when a function appears in multiple binaries.
+1. **精确匹配**:函数名等于符号名 → 已解析
+2. **子串匹配**:函数名出现在符号名内(C++ 名字修饰) → 已解析
+3. **未找到**:标记为 `missing_functions`
 
-### Step 6: Collect shared library dependencies
+若同一函数出现在多个 binary 中,优先 `executable` 而非 `shared_library`。
 
-For every binary that contains a call chain function, recursively follow its `NEEDED` entries:
+### 步骤 6: 收集共享库依赖
 
-1. Look up each `.so` name anywhere under `<binary_dir>`
-2. Add the `.so` to the required list
-3. Repeat for that `.so`'s own dependencies
+对包含调用链函数的每个 binary,递归跟踪其 `NEEDED` 项:
 
-This ensures Qiling has every library needed at load time.
+1. 在 `<binary_dir>` 任意位置查找每个 `.so` 文件
+2. 把 `.so` 加入必需列表
+3. 对该 `.so` 自身的依赖,重复同样过程
 
-### Step 7: Determine architecture
+这能保证 Qiling 加载时所有库都已就位。
 
-Count architectures across all analyzed binaries. The most common (excluding "unknown") is the firmware architecture. If tied, prefer the architecture of the binary containing the entry function.
+### 步骤 7: 确定架构
 
-### Step 8: Write the output
+统计所有已分析 binary 的架构,出现次数最多的(排除 "unknown")即为固件架构。若并列,优先取包含入口函数的那个 binary 的架构。
 
-Write `<output_dir>/binary_dependency_map.json`:
+### 步骤 8: 写出结果
+
+写入 `<output_dir>/binary_dependency_map.json`:
 
 ```json
 {
@@ -167,4 +178,12 @@ Write `<output_dir>/binary_dependency_map.json`:
 }
 ```
 
-**Important:** All paths in `required_binaries` MUST be absolute (use `realpath`). Qiling requires absolute paths.
+**重要**:`required_binaries` 中所有路径必须为绝对路径(用 `realpath`)。Qiling 要求绝对路径。
+
+## 完成动作
+
+完成输出文件后:
+
+1. 更新 `.pipeline_state.json`,把 `current_stage` 设为 `"phase2_qiling_emulation"`
+2. 输出:"阶段一完成 — binary_dependency_map.json 已生成"
+3. **不要自行进入阶段二或读取其他 Skill**,把控制权交还 Master。
