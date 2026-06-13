@@ -12,13 +12,14 @@ from app.config import reload_config
 from app.model import TaskStatus, UnpackTask, UnpackTaskEvent, WorkerInstance, WorkspaceCleanupJob, get_db_session, init_database
 import app.model as model_module
 import app.unpacker_engine as unpacker_engine_module
+import app.services.task_events as task_events_module
 import app.services.task_manager as task_manager_module
 from app.api.firmware import _agent_runtime_payload_from_snapshot, _submit_task
 from app.exception import ValidationError
 from app.model import ServiceConfig
 from app.schemas import UnpackRequest
 from app.services.task_manager import prepare_task_workspace, resolve_task_runtime_paths, submit_unpack_task
-from app.services.task_events import list_task_events
+from app.services.task_events import list_task_events, record_task_event
 from app.time_utils import now_local
 
 
@@ -1015,6 +1016,48 @@ class TaskManagerLlmSnapshotTests(unittest.TestCase):
             task = db.query(UnpackTask).filter(UnpackTask.id == created["task_id"]).first()
             snapshot = json.loads(task.llm_binding_snapshot)
             self.assertEqual("provider-executor-v1", snapshot["roles"]["executor"]["provider_key"])
+        finally:
+            db.close()
+
+    def test_record_task_event_auto_trims_oldest_events_when_limit_exceeded(self):
+        task_id = "t-event-trim"
+        db = get_db_session()
+        try:
+            db.add(
+                UnpackTask(
+                    id=task_id,
+                    project_id="p1",
+                    firmware_path=str(self.firmware),
+                    output_path=str(self.root / "output"),
+                    status=TaskStatus.RUNNING.value,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        with patch.object(task_events_module, "DB_TIMELINE_EVENT_LIMIT", 3):
+            for idx in range(4):
+                record_task_event(
+                    task_id,
+                    project_id="p1",
+                    event_type=f"progress_{idx}",
+                    summary=f"event {idx}",
+                )
+
+        db = get_db_session()
+        try:
+            rows = (
+                db.query(UnpackTaskEvent)
+                .filter(UnpackTaskEvent.task_id == task_id)
+                .order_by(UnpackTaskEvent.created_at.asc(), UnpackTaskEvent.id.asc())
+                .all()
+            )
+            self.assertEqual(3, len(rows))
+            self.assertEqual(
+                ["progress_1", "progress_2", "progress_3"],
+                [row.event_type for row in rows],
+            )
         finally:
             db.close()
 

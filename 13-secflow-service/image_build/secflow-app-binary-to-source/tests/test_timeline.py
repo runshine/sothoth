@@ -107,6 +107,33 @@ class TimelineServiceTests(unittest.TestCase):
         self.assertEqual(1, deleted_one)
         self.assertEqual(1, deleted_all)
 
+    def test_task_timeline_auto_trims_oldest_events_when_limit_exceeded(self) -> None:
+        with mock.patch.object(task_service, "DB_TIMELINE_EVENT_LIMIT", 3):
+            for idx in range(4):
+                task_service._safe_create_task_event(
+                    self.db,
+                    task_id=self.task.id,
+                    project_id=self.task.project_id,
+                    source="b2s",
+                    event_type=f"task_created_{idx}",
+                    message=f"event-{idx}",
+                    status="running",
+                    dedupe_key=f"trim-{idx}",
+                )
+            self.db.commit()
+
+        rows = (
+            self.db.query(B2STaskEvent)
+            .filter(B2STaskEvent.task_id == self.task.id)
+            .order_by(B2STaskEvent.created_at.asc(), B2STaskEvent.id.asc())
+            .all()
+        )
+        self.assertEqual(3, len(rows))
+        self.assertEqual(
+            ["task_created_1", "task_created_2", "task_created_3"],
+            [row.event_type for row in rows],
+        )
+
     def test_build_task_detail_exposes_phase_timings(self) -> None:
         started_at = now_local() - timedelta(minutes=15)
         finished_at = now_local() - timedelta(minutes=1)

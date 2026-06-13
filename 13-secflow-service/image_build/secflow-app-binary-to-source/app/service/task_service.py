@@ -152,6 +152,7 @@ FUNCTION_STATS_FIELDS = ("total_functions", "completed_functions", "failed_funct
 TASK_EVENT_SOURCE_B2S = "b2s"
 TASK_EVENT_SOURCE_PI = "pi_re_agent"
 TASK_EVENT_DEDUPE_KEY_MAX_LEN = 255
+DB_TIMELINE_EVENT_LIMIT = 10_000
 AGENT_SESSION_STALE_SECONDS = 10 * 60
 AGENT_SESSION_ACTIVE_STATUSES = {"pending", "dispatched", "streaming", "waiting_review", "waiting_execution", "stale"}
 AGENT_SESSION_STATUS_TITLES = {
@@ -373,6 +374,39 @@ def _is_default_timeline_event(event: B2STaskEventModel) -> bool:
     return _event_timeline_visible(event) and _event_timeline_class(event) in DEFAULT_TIMELINE_CLASSES
 
 
+def _trim_task_timeline_events(db: Session, task_id: str, *, limit: int | None = None) -> int:
+    normalized_limit = max(0, int(DB_TIMELINE_EVENT_LIMIT if limit is None else limit))
+    if normalized_limit <= 0:
+        return 0
+    total = int(
+        db.query(B2STaskEventModel)
+        .filter(B2STaskEventModel.task_id == task_id)
+        .count()
+        or 0
+    )
+    trim_count = max(0, total - normalized_limit)
+    if trim_count <= 0:
+        return 0
+    old_event_ids = [
+        row.id
+        for row in (
+            db.query(B2STaskEventModel.id)
+            .filter(B2STaskEventModel.task_id == task_id)
+            .order_by(B2STaskEventModel.created_at.asc(), B2STaskEventModel.id.asc())
+            .limit(trim_count)
+            .all()
+        )
+    ]
+    if not old_event_ids:
+        return 0
+    deleted = (
+        db.query(B2STaskEventModel)
+        .filter(B2STaskEventModel.id.in_(old_event_ids))
+        .delete(synchronize_session=False)
+    )
+    return int(deleted or 0)
+
+
 def _task_execution_epoch(task: B2STask | None) -> int | None:
     if task is None:
         return None
@@ -572,6 +606,7 @@ def _create_task_event(
     event.payload = payload or {}
     db.add(event)
     db.flush()
+    _trim_task_timeline_events(db, task_id)
 
 
 def _safe_create_task_event(db: Session, **kwargs: Any) -> None:
