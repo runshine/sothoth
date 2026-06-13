@@ -9,6 +9,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from app.copy_utils import safe_copy2
 from app.tool_store import parse_tool_metadata
 
 
@@ -157,7 +158,7 @@ def _replace_with_symlink(link_path: Path, target_path: Path) -> None:
         relative_target = os.path.relpath(target_path, start=link_path.parent)
         link_path.symlink_to(relative_target)
     except Exception:
-        shutil.copy2(target_path, link_path)
+        safe_copy2(target_path, link_path)
 
 
 def activate_tool_version(

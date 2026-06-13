@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.copy_utils import safe_copy2
 from app.build_info import build_service_meta
 from app.concurrency import get_queue_class, get_queue_controller, get_request_id
 from app.config import get_config, get_data_nfs_base_path, get_data_nfs_server, get_data_pvc_name
@@ -1337,7 +1338,7 @@ def store_project_input_original_file(source_path: str, original_name: str, dest
         filename = f"{stem}-{uuid4().hex[:8]}{ext}"
         target_path = os.path.join(destination_dir, filename)
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
-    shutil.copy2(source_path, target_path)
+    safe_copy2(source_path, target_path)
     return {"processed_files": 1, "warnings": []}
 
 

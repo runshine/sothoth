@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from app.copy_utils import safe_copy2
 from app.preprocess import detect_format
 from app.subprocess_utils import StreamingLineSink, run_streaming_process
 from app.tool_dispatcher import (
@@ -106,7 +107,7 @@ def _copy_tool_to_working(job_root: Path, source_tool_path: str) -> Path:
     if not source.exists():
         raise FileNotFoundError(f"tool not found: {source_tool_path}")
     target = evolution_working_tool_path(job_root, source_tool_path)
-    shutil.copy2(source, target)
+    safe_copy2(source, target)
     return target
 
 
@@ -576,7 +577,7 @@ def _normalize_tool_into_working_dir(
     )
     if candidate.resolve() == canonical_path.resolve():
         return canonical_path
-    shutil.copy2(candidate, canonical_path)
+    safe_copy2(candidate, canonical_path)
     pycache_dir = working_dir / "__pycache__"
     if pycache_dir.exists():
         shutil.rmtree(pycache_dir, ignore_errors=True)
@@ -672,7 +673,7 @@ def _save_generated_tool_to_repo(
     version = _next_generated_tool_version(TOOLS_STORE_DIR, family_id)
     target = _build_versioned_tool_path(TOOLS_STORE_DIR, family_id, version)
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(working_tool, target)
+    safe_copy2(working_tool, target)
     previous = str(resolve_active_tool_target(source_tool)) if source_tool is not None else None
     return str(target), previous, source_tool is None
 
@@ -690,9 +691,9 @@ def _save_generated_tool_to_run(
     generated_dir = job_root / "generated_tools"
     generated_dir.mkdir(parents=True, exist_ok=True)
     target = _build_versioned_tool_path(generated_dir, family_id, version, suffix="generated")
-    shutil.copy2(working_tool, target)
+    safe_copy2(working_tool, target)
     if source_tool is not None and source_tool.resolve() == working_tool.resolve():
-        shutil.copy2(working_tool, source_tool)
+        safe_copy2(working_tool, source_tool)
         return str(target), str(source_tool), False
     if source_tool is not None:
         return str(target), str(source_tool), True
@@ -719,7 +720,7 @@ def _publish_tool_to_store(
     version = _next_generated_tool_version(TOOLS_STORE_DIR, family_id)
     target = _build_versioned_tool_path(TOOLS_STORE_DIR, family_id, version)
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(working_tool, target)
+    safe_copy2(working_tool, target)
     return str(target)
 
 
@@ -747,7 +748,7 @@ def _snapshot_round_report(round_dir: Path, source_path: Path, target_name: str)
         return None
     target = round_dir / target_name
     try:
-        shutil.copy2(source_path, target)
+        safe_copy2(source_path, target)
     except Exception:
         return str(source_path)
     return str(target)

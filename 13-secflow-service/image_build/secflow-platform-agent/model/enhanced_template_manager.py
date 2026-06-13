@@ -4,6 +4,7 @@ import tempfile
 import hashlib
 from contextlib import ExitStack
 
+from .copy_utils import safe_copy2
 
 from .db import DatabaseManager
 from .constants import COMPRESSION_EXT_MAPPING, SUPPORTED_FORMATS
@@ -1157,7 +1158,7 @@ class EnhancedTemplateManager:
                     new_zip.write(updated_file, str(relative_path))
 
                 # 替换原ZIP文件
-                shutil.copy2(temp_zip, zip_path)
+                safe_copy2(temp_zip, zip_path)
                 return True
 
         except Exception as e:
@@ -1214,7 +1215,7 @@ class EnhancedTemplateManager:
                     new_tar.add(updated_file, arcname=str(relative_path))
 
                 # 替换原TAR文件
-                shutil.copy2(temp_tar, tar_path)
+                safe_copy2(temp_tar, tar_path)
                 return True
 
         except Exception as e:
@@ -1403,7 +1404,7 @@ class EnhancedTemplateManager:
                                 new_zip.writestr(item, content)
 
                 # 替换原ZIP文件
-                shutil.copy2(temp_zip, zip_path)
+                safe_copy2(temp_zip, zip_path)
                 return True
 
         except Exception as e:
@@ -1457,7 +1458,7 @@ class EnhancedTemplateManager:
                                 continue
 
                 # 替换原TAR文件
-                shutil.copy2(temp_tar, tar_path)
+                safe_copy2(temp_tar, tar_path)
                 return True
 
         except Exception as e:
@@ -1657,7 +1658,7 @@ class EnhancedTemplateManager:
                                 new_zip.writestr(item, content)
 
                 # 替换原ZIP文件
-                shutil.copy2(temp_zip, zip_path)
+                safe_copy2(temp_zip, zip_path)
                 return True
 
         except Exception as e:
@@ -1711,7 +1712,7 @@ class EnhancedTemplateManager:
                                 continue
 
                 # 替换原TAR文件
-                shutil.copy2(temp_tar, tar_path)
+                safe_copy2(temp_tar, tar_path)
                 return True
 
         except Exception as e:

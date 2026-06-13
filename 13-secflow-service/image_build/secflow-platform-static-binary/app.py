@@ -37,6 +37,15 @@ from registry import get_registry_service
 
 
 # ==================== 命令行参数解析 ====================
+def _safe_copy2(src: str | os.PathLike[str], dst: str | os.PathLike[str], *, follow_symlinks: bool = True) -> str:
+    if os.fspath(src) == os.fspath(dst):
+        return "reused"
+    if os.path.realpath(os.fspath(src)) == os.path.realpath(os.fspath(dst)):
+        return "reused"
+    shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
+    return "copied"
+
+
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='多架构软件包管理系统')
@@ -1370,7 +1379,7 @@ def upload_package():
 
         # 保存原始包文件
         original_package_path = os.path.join(app.config['ORIGINAL_PACKAGE_FOLDER'], f"{package_id}_{filename}")
-        shutil.copy2(temp_path, original_package_path)
+        _safe_copy2(temp_path, original_package_path)
 
         # 解压软件包
         storage_path, files_info = extract_package(temp_path, package_id, package_info)

@@ -25,6 +25,15 @@ ANDROID_NDK_BIN_PATH = "/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/b
 ENV_MARKER = "__SECFLOW_KERNEL_SCAN_ENV__"
 
 
+def _safe_copy2(src: str | os.PathLike[str], dst: str | os.PathLike[str], *, follow_symlinks: bool = True) -> str:
+    if os.fspath(src) == os.fspath(dst):
+        return "reused"
+    if os.path.realpath(os.fspath(src)) == os.path.realpath(os.fspath(dst)):
+        return "reused"
+    shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
+    return "copied"
+
+
 def run_poc_stage(
     context: StageContext,
     hooks: StageHooks,
@@ -215,7 +224,7 @@ def _prepare_report_dir(report_path: Path, poc_root: Path, log_path: Path) -> tu
     target = input_dir / report_path.name
     try:
         if report_path.resolve() != target.resolve():
-            shutil.copy2(report_path, target)
+            _safe_copy2(report_path, target)
     except OSError as exc:
         log_path.write_text(f"failed to prepare report file {report_path}: {exc}\n", encoding="utf-8")
         return None, "failed to prepare report file"

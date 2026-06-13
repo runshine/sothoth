@@ -29,6 +29,7 @@ from sqlalchemy import Integer, and_, case, cast, func, or_, text
 from sqlalchemy.exc import IntegrityError, OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.orm import Session, load_only
 
+from app.copy_utils import safe_copy2
 from app.config import get_config
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
 from app.model import (
@@ -542,7 +543,7 @@ def _copytree(src: Path, dst: Path) -> None:
         return
     if src.is_file():
         ensure_dir(dst.parent)
-        shutil.copy2(src, dst, follow_symlinks=False)
+        safe_copy2(src, dst, follow_symlinks=False)
         return
     shutil.copytree(
         src,
@@ -593,7 +594,7 @@ def _copytree_best_effort(
                 return
             if source.is_file():
                 ensure_dir(target.parent)
-                shutil.copy2(source, target, follow_symlinks=False)
+                safe_copy2(source, target, follow_symlinks=False)
                 stats["copied_files"] += 1
                 return
             if source.is_dir():

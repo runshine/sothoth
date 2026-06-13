@@ -18,6 +18,7 @@ from typing import Dict, List, Any, Optional, Tuple, Union
 from dataclasses import dataclass, asdict, field
 from concurrent.futures import ThreadPoolExecutor, Future
 import redis
+from .copy_utils import safe_copy2
 import requests
 from urllib.parse import urlparse
 import base64
@@ -534,7 +535,7 @@ class TaskManager:
                 if item.is_dir():
                     shutil.copytree(item, dest)
                 else:
-                    shutil.copy2(item, dest)
+                    safe_copy2(item, dest)
 
             compose_path = temp_root / main_yaml
             if not compose_path.exists():

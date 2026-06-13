@@ -8,6 +8,15 @@ from vuln_dispatch.log import logged
 from vuln_dispatch.models import RouterOutput, VerifierGroup
 
 
+def _safe_copy2(src: str | Path, dst: str | Path, *, follow_symlinks: bool = True) -> str:
+    if str(src) == str(dst):
+        return "reused"
+    if Path(src).resolve() == Path(dst).resolve():
+        return "reused"
+    shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
+    return "copied"
+
+
 def _write_manifest(
     manifest_path: Path, group: VerifierGroup, source_root: Path, binary_root: Path
 ) -> None:
@@ -71,7 +80,7 @@ def assemble(
     groups_path.mkdir(parents=True, exist_ok=True)
     unrouteable_path.mkdir(parents=True, exist_ok=True)
 
-    shutil.copy2(threat_path, output_path / "threat_model.md")
+    _safe_copy2(threat_path, output_path / "threat_model.md")
 
     for group in output_data.groups:
         group_path = groups_path / group.group_id
@@ -84,14 +93,14 @@ def assemble(
         for report in group.reports:
             source = Path(report.source_path)
             destination = reports_path / f"{report.report_id}_{source.name}"
-            shutil.copy2(source, destination)
+            _safe_copy2(source, destination)
 
     for item in output_data.unrouteable:
         source_path = item.source_path
         if source_path:
             source = Path(source_path)
             if source.exists():
-                shutil.copy2(source, unrouteable_path / source.name)
+                _safe_copy2(source, unrouteable_path / source.name)
 
     Path(logfile).parent.mkdir(parents=True, exist_ok=True)
     with Path(logfile).open("w", encoding="utf-8") as handle:

@@ -15,6 +15,15 @@ from agent_ai_service.services.agent_process_manager import AgentProcessManager
 from agent_ai_service.services.backend_registry import BackendRegistry
 
 
+def _safe_copy2(src: str | Path, dst: str | Path, *, follow_symlinks: bool = True) -> str:
+    if os.fspath(src) == os.fspath(dst):
+        return "reused"
+    if Path(src).resolve() == Path(dst).resolve():
+        return "reused"
+    shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
+    return "copied"
+
+
 class BackendRuntimeService:
     def __init__(self, registry: BackendRegistry, process_manager: AgentProcessManager):
         self.registry = registry
@@ -128,7 +137,7 @@ class BackendRuntimeService:
         existed = target.exists()
         if existed:
             backup_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(target), str(backup_path))
+            _safe_copy2(str(target), str(backup_path))
         else:
             if backup_path.exists():
                 backup_path.unlink()
@@ -149,7 +158,7 @@ class BackendRuntimeService:
         try:
             if existed and backup_path.exists():
                 target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(backup_path), str(target))
+                _safe_copy2(str(backup_path), str(target))
             elif not existed:
                 if target.exists() and target.is_file():
                     target.unlink()

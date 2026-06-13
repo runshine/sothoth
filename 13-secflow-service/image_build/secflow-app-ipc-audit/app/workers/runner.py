@@ -17,6 +17,15 @@ from app.core.config import ExecutionConfig, get_config, resolve_agentflow_root
 SUPPORTED_EXECUTOR_MODES = ("mock", "codex_cli", "opencode_cli", "agentflow_cli")
 
 
+def _safe_copy2(src: str | os.PathLike[str], dst: str | os.PathLike[str], *, follow_symlinks: bool = True) -> str:
+    if os.fspath(src) == os.fspath(dst):
+        return "reused"
+    if os.path.realpath(os.fspath(src)) == os.path.realpath(os.fspath(dst)):
+        return "reused"
+    shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
+    return "copied"
+
+
 @dataclass(frozen=True)
 class StageArtifact:
     artifact_kind: str
@@ -126,7 +135,7 @@ def write_json_file(path: Path, payload: dict[str, Any]) -> Path:
 
 def copy_file(source: Path, target: Path) -> Path:
     ensure_parent(target)
-    shutil.copy2(source, target)
+    _safe_copy2(source, target)
     return target
 
 

@@ -19,6 +19,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.copy_utils import safe_copy2
 from app.config import get_config
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
 from app.model import B2STask, B2STaskBatch, B2STaskEvent as B2STaskEventModel, B2STaskItem, B2STaskPhase, get_db_session
@@ -2388,7 +2389,7 @@ def prepare_input_file(project_id: str, task_id: str, sequence_no: int, source_p
     if not target_path.is_relative_to(input_dir):
         raise ValidationError("输入文件路径不合法")
     if source_path.resolve() != target_path:
-        shutil.copy2(source_path, target_path)
+        safe_copy2(source_path, target_path)
     return target_path
 
 

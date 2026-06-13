@@ -12,6 +12,15 @@ import json5
 DEFAULT_PASSWORD = "Huawei12#$"
 
 
+def safe_copy2(src, dst, *, follow_symlinks=True):
+    if os.fspath(src) == os.fspath(dst):
+        return "reused"
+    if Path(src).resolve() == Path(dst).resolve():
+        return "reused"
+    shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
+    return "copied"
+
+
 def ensure_dict(parent, key):
     value = parent.get(key)
     if isinstance(value, dict):
@@ -43,7 +52,7 @@ def copy_seed_tree(source_dir, target_dir):
         if item.is_dir():
             shutil.copytree(item, destination)
         else:
-            shutil.copy2(item, destination)
+            safe_copy2(item, destination)
 
 
 def load_config(config_path):
@@ -87,7 +96,7 @@ def main():
     if not config_path.exists():
         seed_config = state_seed_dir / "openclaw.json"
         if seed_config.exists():
-            shutil.copy2(seed_config, config_path)
+            safe_copy2(seed_config, config_path)
 
     if str(workspace_dir) != "/host":
         if not workspace_dir.exists():

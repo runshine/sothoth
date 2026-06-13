@@ -12,6 +12,15 @@ from typing import Optional, Tuple
 from fastapi import UploadFile
 
 
+def _safe_copy2(src: str | os.PathLike[str], dst: str | os.PathLike[str], *, follow_symlinks: bool = True) -> str:
+    if os.fspath(src) == os.fspath(dst):
+        return "reused"
+    if os.path.realpath(os.fspath(src)) == os.path.realpath(os.fspath(dst)):
+        return "reused"
+    shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
+    return "copied"
+
+
 class UploadService:
     """Upload service for file operations."""
 
@@ -177,7 +186,7 @@ class UploadService:
         md5_hash = hashlib.md5(source.read_bytes()).hexdigest()
 
         # Copy file
-        shutil.copy2(source, file_path)
+        _safe_copy2(source, file_path)
 
         return str(file_path), source.name, file_size, md5_hash
 
