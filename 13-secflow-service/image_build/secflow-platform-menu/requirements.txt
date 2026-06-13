@@ -1,8 +1,0 @@
-# SecFlow Menu Service 依赖
-
-Flask==3.0.0
-PyYAML==6.0.1
-Werkzeug==3.0.1
-redis==5.2.1
-# Gunicorn 用于生产环境部署
-gunicorn==21.2.0
