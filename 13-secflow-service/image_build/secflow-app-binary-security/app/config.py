@@ -105,6 +105,9 @@ class SchedulerConfig(BaseModel):
     stage_item_sync_reconcile_interval_seconds: int = 30
     readless_reconcile_interval_seconds: int = 300
     heartbeat_update_interval_seconds: int = 15
+    task_lease_ttl_seconds: int = 120
+    task_reclaim_grace_seconds: int = 180
+    task_lease_write_retry_attempts: int = 3
     operation_lease_ttl_seconds: int = 60
     operation_heartbeat_interval_seconds: int = 15
     stale_operation_requeue_interval_seconds: int = 15

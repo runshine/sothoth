@@ -6448,7 +6448,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("running", task.status)
         self.assertEqual("dataflow_vuln_scan", task.current_stage)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
-        self.assertIsNone(task.tail_reconcile_state)
+        self.assertEqual("idle", task.tail_reconcile_state)
         self.assertTrue(
             any(
                 isinstance(obj, BinarySecurityEvent) and obj.event_type == "task_finalize_deferred_for_active_stage"

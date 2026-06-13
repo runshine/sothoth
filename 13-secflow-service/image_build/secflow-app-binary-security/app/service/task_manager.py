@@ -17189,7 +17189,7 @@ class TaskManager:
             ):
                 task.status = "running"
                 self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
-                task.tail_reconcile_state = None
+                task.tail_reconcile_state = "idle"
                 self._release_tail_reconcile_owner(task.id)
                 self._last_task_heartbeat_at.pop(task.id, None)
                 self._record_event(
