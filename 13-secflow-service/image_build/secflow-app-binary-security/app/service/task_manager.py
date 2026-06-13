@@ -8434,6 +8434,19 @@ class TaskManager:
                                     },
                                 )
                             continue
+                        if self._requeue_stage_item_after_downstream_missing(
+                            db,
+                            task,
+                            item,
+                            observed_at=sync_observed_at,
+                            previous_downstream_task_id=str(item.downstream_task_id or "").strip() or None,
+                            error_message="下游子任务不存在",
+                            http_status=404,
+                        ):
+                            touched_stages.add(item.stage_name)
+                            revived_count += 1
+                            synced_count += 1
+                            continue
                         should_apply = observed_apply_state and (mapped_status != before_status or force)
                         if should_apply:
                             if not self._apply_child_state_with_savepoint(
@@ -9108,6 +9121,19 @@ class TaskManager:
                         or str(before_status or "").strip().lower() in {"queued", "running", "dispatching"}
                     )
                 if notfound_apply_state:
+                    if self._requeue_stage_item_after_downstream_missing(
+                        db,
+                        task,
+                        item,
+                        observed_at=_now(),
+                        previous_downstream_task_id=str(item.downstream_task_id or "").strip() or None,
+                        error_message="下游子任务不存在",
+                        http_status=404,
+                    ):
+                        touched_stages.add(item.stage_name)
+                        revived_count += 1
+                        synced_count += 1
+                        continue
                     if not self._apply_child_state_with_savepoint(
                         db,
                         task=task,
@@ -13405,6 +13431,187 @@ class TaskManager:
             last_sync_result=last_sync_result,
             clear_error_state=clear_error_state,
         )
+
+    def _should_requeue_missing_downstream_item(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        observed_status: str | None,
+    ) -> tuple[bool, str]:
+        normalized_status = self._map_downstream_status(str(observed_status or "")) or str(observed_status or "").strip().lower()
+        if normalized_status != "downstream_missing":
+            return False, "not_downstream_missing"
+        if not self._streaming_mode_enabled(task):
+            return False, "not_streaming_mode"
+        if not self._is_streaming_tail_stage(task, item.stage_name):
+            return False, "not_streaming_tail_stage"
+        if str(task.status or "").strip().lower() not in {"running", "dispatching"}:
+            return False, "task_not_active"
+        if self._task_runtime_phase(task) != TASK_RUNTIME_PHASE_OWNED_EXECUTION:
+            return False, "not_owned_execution"
+        if not self._lease_is_active(task, db=db):
+            return False, "lease_inactive"
+        if not self._is_streaming_tail_stage(task, task.current_stage):
+            return False, "task_current_stage_not_streaming_tail"
+        if normalize_stage_name(task.current_stage) != normalize_stage_name(item.stage_name):
+            return False, "stage_not_active"
+        if self._task_is_waiting_for_manual_confirmation(task):
+            return False, "waiting_manual_confirmation"
+        if str(item.status or "").strip().lower() == "success":
+            return False, "already_success"
+        if str(task.dispatcher_instance_id or "").strip() != str(self.instance_id or "").strip():
+            return False, "not_owner"
+        claim_owner = str(getattr(item, "claim_owner_instance_id", "") or "").strip() or None
+        claim_token = str(getattr(item, "claim_execution_token", "") or "").strip() or None
+        current_token = self._dispatch_token(task)
+        if claim_owner and claim_owner == str(self.instance_id or "").strip() and claim_token and claim_token == current_token:
+            return False, "claimed_by_current_execution"
+        if claim_token and claim_token == current_token:
+            return False, "claimed_by_current_execution"
+        return True, "requeued_pending"
+
+    def _requeue_stage_item_after_downstream_missing(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        observed_at: datetime | None,
+        previous_downstream_task_id: str | None,
+        error_message: str | None,
+        http_status: int | None,
+    ) -> bool:
+        observed_at = observed_at or _now()
+        should_requeue, reason = self._should_requeue_missing_downstream_item(
+            db,
+            task,
+            item,
+            observed_status="downstream_missing",
+        )
+        if not should_requeue:
+            if reason in {"not_owner", "task_not_active", "not_owned_execution", "stage_not_active", "claimed_by_current_execution"}:
+                self._record_event(
+                    db,
+                    task,
+                    "streaming_stage_item_missing_requeue_skipped_not_owner" if reason == "not_owner" else "streaming_stage_item_missing_requeue_skipped_terminal" if reason in {"task_not_active", "stage_not_active"} else "streaming_stage_item_missing_requeue_skipped_claimed",
+                    "检测到下游子任务不存在，但当前不满足自动回退条件，本次仅记录观测",
+                    level="warning",
+                    stage_name=item.stage_name,
+                    item=item,
+                    payload={
+                        "downstream_service": item.downstream_service,
+                        "downstream_task_id": previous_downstream_task_id,
+                        "http_status": http_status or 404,
+                        "error_type": "not_found",
+                        "recovery_action": reason,
+                        "task_runtime_phase": self._task_runtime_phase(task),
+                        "dispatcher_instance_id": task.dispatcher_instance_id,
+                        "task_execution_token": self._dispatch_token(task),
+                    },
+                )
+            return False
+        previous_status = str(item.status or "").strip().lower() or None
+        result = self._load_stage_item_result_payload(item)
+        sync_observation = dict(result.get("sync_observation") or {})
+        sync_observation.update(
+            {
+                "sync_status": "recovered_for_redispatch",
+                "error_message": error_message or "下游子任务不存在",
+                "error_type": "not_found",
+                "http_status": http_status or 404,
+                "status_raw": "downstream_missing",
+                "mapped_status": "downstream_missing",
+                "downstream_status": "downstream_missing",
+                "state_applied": True,
+                "last_result": "recovered_for_redispatch",
+                "recovery_reason": "downstream_missing_requeue",
+                "last_missing_child_task_id": previous_downstream_task_id,
+                "last_missing_detected_at": observed_at.isoformat(),
+                "last_error_at": observed_at.isoformat(),
+                "last_attempt_at": observed_at.isoformat(),
+                "budget_exhausted": False,
+            }
+        )
+        sync_observation.pop("next_retry_at", None)
+        result.update(
+            {
+                "downstream_status_synced_at": observed_at.isoformat(),
+                "downstream_status": "downstream_missing",
+                "downstream": {"status": "downstream_missing", "error": error_message or "下游子任务不存在"},
+                "sync_observation": sync_observation,
+                "last_sync_attempt_at": observed_at.isoformat(),
+                "last_sync_error_at": observed_at.isoformat(),
+                "last_sync_error_message": error_message or "下游子任务不存在",
+                "last_sync_error_type": "not_found",
+                "last_sync_result": "recovered_for_redispatch",
+                "consecutive_sync_error_count": 0,
+                "sync_error_budget_exhausted": False,
+                "next_sync_retry_at": None,
+                "recovery_reason": "downstream_missing_requeue",
+                "last_missing_child_task_id": previous_downstream_task_id,
+                "last_missing_detected_at": observed_at.isoformat(),
+            }
+        )
+        item.downstream_task_id = None
+        item.claim_owner_instance_id = None
+        item.claim_execution_token = None
+        item.claim_started_at = None
+        item.status = "pending"
+        item.error_message = error_message or "下游子任务不存在"
+        item.finished_at = None
+        item.updated_at = observed_at
+        item.result = self._persist_stage_item_result(
+            task,
+            item,
+            stage_name=item.stage_name,
+            result=result,
+        )
+        self._record_event(
+            db,
+            task,
+            "streaming_stage_item_downstream_missing_detected",
+            "检测到下游子任务不存在，准备回退当前流式子任务以重新派发",
+            level="warning",
+            stage_name=item.stage_name,
+            item=item,
+            payload={
+                "downstream_service": item.downstream_service,
+                "downstream_task_id": previous_downstream_task_id,
+                "http_status": http_status or 404,
+                "error_type": "not_found",
+                "recovery_action": "requeued_pending",
+                "before_status": previous_status,
+                "after_status": "pending",
+                "task_runtime_phase": self._task_runtime_phase(task),
+                "dispatcher_instance_id": task.dispatcher_instance_id,
+                "task_execution_token": self._dispatch_token(task),
+            },
+        )
+        self._record_event(
+            db,
+            task,
+            "streaming_stage_item_requeued_after_downstream_missing",
+            "下游子任务不存在，当前流式子任务已回退到 pending 等待重新派发",
+            level="warning",
+            stage_name=item.stage_name,
+            item=item,
+            payload={
+                "downstream_service": item.downstream_service,
+                "downstream_task_id": previous_downstream_task_id,
+                "http_status": http_status or 404,
+                "error_type": "not_found",
+                "recovery_action": "requeued_pending",
+                "before_status": previous_status,
+                "after_status": "pending",
+                "task_runtime_phase": self._task_runtime_phase(task),
+                "dispatcher_instance_id": task.dispatcher_instance_id,
+                "task_execution_token": self._dispatch_token(task),
+            },
+        )
+        self._reconcile_stage_and_task_state_after_item_update(db, task, item.stage_name)
+        return True
 
     def _refresh_polled_child_sync_snapshot(
         self,
@@ -19164,7 +19371,13 @@ class TaskManager:
         binding = self._downstream_binding_snapshot(item)
         task_id = str(item.downstream_task_id or "").strip()
         item_result = self._load_stage_item_result_payload(item)
-        downstream_status = self._string_or_none(binding.get("downstream_status")) or self._string_or_none(item_result.get("downstream_status"))
+        downstream_status = (
+            self._string_or_none(binding.get("downstream_status"))
+            or self._string_or_none(item_result.get("downstream_status"))
+            or self._string_or_none(dict(item_result.get("sync_observation") or {}).get("downstream_status"))
+            or self._string_or_none(dict(item_result.get("sync_observation") or {}).get("mapped_status"))
+            or self._string_or_none(dict(item_result.get("downstream") or {}).get("status"))
+        )
         explicit = self._string_or_none(binding.get("state"))
         if task_id:
             return "bound" if downstream_status else "created_pending_sync"
@@ -22443,6 +22656,9 @@ class TaskManager:
         total_retry_count = int(item.retry_count or 0) + int(item.rerun_count or 0)
         binding = self._downstream_binding_snapshot(item)
         binding_state = self._downstream_binding_state(item)
+        binding_message = self._string_or_none(binding.get("message"))
+        if binding_state != "created_pending_sync":
+            binding_message = None
         latest_binding_mismatch = dict(result.get("latest_binding_mismatch") or {}) or None
         archive_bound_downstream_task_id = None
         if archive_jobs:
@@ -22479,7 +22695,7 @@ class TaskManager:
             downstream_create_last_error=self._string_or_none(binding.get("last_error")),
             downstream_create_last_error_type=self._string_or_none(binding.get("last_error_type")),
             downstream_create_recoverable=self._bool_or_none(binding.get("recoverable")),
-            downstream_binding_message=self._string_or_none(binding.get("message")) or self._downstream_binding_status_message(item),
+            downstream_binding_message=binding_message or self._downstream_binding_status_message(item),
             downstream_cancel_phase=self._string_or_none(downstream_payload.get("cancel_phase")),
             downstream_summary=self._stage_item_downstream_summary(item, result=result),
             input_ref=item.input_ref,

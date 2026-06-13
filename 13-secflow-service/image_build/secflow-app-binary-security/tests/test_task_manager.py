@@ -26084,6 +26084,45 @@ def _test_stage_item_response_falls_back_to_downstream_payload_status(self):
     self.assertEqual("synced", response.sync_status)
 
 
+def _test_stage_item_response_does_not_show_pending_sync_when_downstream_status_exists(self):
+    item = BinarySecurityStageItem(
+        id="si-pgcrypto",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="source_project-pgcrypto",
+        item_name="pgcrypto",
+        status="success",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    item.result = {
+        "sync_status": "synced",
+        "sync_observation": {
+            "downstream_status": "passed",
+            "mapped_status": "success",
+            "last_result": "success",
+        },
+        "downstream": {
+            "task_id": "eat-1",
+            "status": "passed",
+        },
+        "downstream_binding": {
+            "state": "created_pending_sync",
+            "message": "下游已创建，状态待同步",
+        },
+    }
+
+    response = self.manager._stage_item_response(item)
+
+    self.assertEqual("bound", response.downstream_binding_state)
+    self.assertNotEqual("下游已创建，状态待同步", response.downstream_binding_message)
+    self.assertEqual("passed", response.downstream_status)
+
+
+TaskManagerTests.test_stage_item_response_does_not_show_pending_sync_when_downstream_status_exists = _test_stage_item_response_does_not_show_pending_sync_when_downstream_status_exists
+
+
 def _test_task_reconcile_candidate_items_scans_all_stages_with_downstream_refs(self):
     task = BinarySecurityTask(
         id="task1",
@@ -28079,6 +28118,287 @@ def _test_sync_downstream_status_keeps_dispatching_pending_for_entry_item(self):
     self.assertEqual("dispatching", item.status)
 
 
+def _test_sync_downstream_status_requeues_missing_entry_item_for_owned_execution(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-a"
+    now = _now()
+    task = BinarySecurityTask(
+        id="task-missing-entry",
+        project_id="p1",
+        name="demo",
+        status="running",
+        current_stage="entry_analysis",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id="worker-a",
+        dispatch_started_at=now,
+        lease_expires_at=now + timedelta(seconds=300),
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    run = BinarySecurityStageRun(
+        id="sr-missing-entry",
+        task_id="task-missing-entry",
+        project_id="p1",
+        stage_name="entry_analysis",
+        sequence_no=1,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si-missing-entry",
+        task_id="task-missing-entry",
+        project_id="p1",
+        stage_run_id="sr-missing-entry",
+        stage_name="entry_analysis",
+        item_key="source_project-gs_ledger",
+        item_name="gs_ledger",
+        status="downstream_missing",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-missing-entry",
+        error_message="下游子任务不存在",
+        result={
+            "downstream_status": "downstream_missing",
+            "sync_observation": {
+                "sync_status": "synced",
+                "error_type": "not_found",
+                "error_message": "下游子任务不存在",
+                "consecutive_error_count": 20,
+                "budget_exhausted": True,
+            },
+        },
+    )
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        execution_epoch=0,
+        owner_instance_id="worker-a",
+        heartbeat_at=now,
+        lease_expires_at=now + timedelta(seconds=300),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], runtime_leases=[lease], events=[])
+
+    async def _raise_not_found(_task, _item, _token):
+        raise NotFoundError("downstream task not found")
+
+    async def _noop_write(*_args, **_kwargs):
+        return None
+
+    original_fetch = manager._fetch_downstream_task_payload
+    original_write = manager._write_task_metadata_async
+    original_enqueue = manager._enqueue_task
+    try:
+        manager._fetch_downstream_task_payload = _raise_not_found
+        manager._write_task_metadata_async = _noop_write
+        manager._enqueue_task = lambda *_args, **_kwargs: None
+        asyncio.run(
+            manager.sync_downstream_status(
+                db,
+                project_id="p1",
+                task_id=task.id,
+                stage_name="entry_analysis",
+                apply_state=True,
+                force=True,
+            )
+        )
+    finally:
+        manager._fetch_downstream_task_payload = original_fetch
+        manager._write_task_metadata_async = original_write
+        manager._enqueue_task = original_enqueue
+
+    self.assertEqual("pending", item.status)
+    self.assertIsNone(item.downstream_task_id)
+    self.assertIsNone(item.claim_owner_instance_id)
+    self.assertIsNone(item.claim_execution_token)
+    self.assertEqual("下游子任务不存在", item.error_message)
+    result = manager._load_stage_item_result_payload(item)
+    observation = dict(result.get("sync_observation") or {})
+    self.assertEqual("downstream_missing_requeue", observation.get("recovery_reason"))
+    self.assertEqual("eat-missing-entry", observation.get("last_missing_child_task_id"))
+    self.assertEqual(False, observation.get("budget_exhausted"))
+    event_types = [event.event_type for event in db.added if isinstance(event, BinarySecurityEvent)]
+    self.assertIn("streaming_stage_item_downstream_missing_detected", event_types)
+    self.assertIn("streaming_stage_item_requeued_after_downstream_missing", event_types)
+
+
+def _test_sync_downstream_status_does_not_requeue_missing_entry_item_for_non_owner(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-a"
+    now = _now()
+    task = BinarySecurityTask(
+        id="task-missing-entry-non-owner",
+        project_id="p1",
+        name="demo",
+        status="running",
+        current_stage="entry_analysis",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id="worker-b",
+        dispatch_started_at=now,
+        lease_expires_at=now + timedelta(seconds=300),
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    run = BinarySecurityStageRun(
+        id="sr-missing-entry-non-owner",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="entry_analysis",
+        sequence_no=1,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si-missing-entry-non-owner",
+        task_id=task.id,
+        project_id="p1",
+        stage_run_id=run.id,
+        stage_name="entry_analysis",
+        item_key="source_project-gs_ledger",
+        item_name="gs_ledger",
+        status="downstream_missing",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-missing-entry",
+        error_message="下游子任务不存在",
+        result={"downstream_status": "downstream_missing"},
+    )
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        execution_epoch=0,
+        owner_instance_id="worker-b",
+        heartbeat_at=now,
+        lease_expires_at=now + timedelta(seconds=300),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], runtime_leases=[lease], events=[])
+
+    async def _raise_not_found(_task, _item, _token):
+        raise NotFoundError("downstream task not found")
+
+    async def _noop_write(*_args, **_kwargs):
+        return None
+
+    original_fetch = manager._fetch_downstream_task_payload
+    original_write = manager._write_task_metadata_async
+    original_enqueue = manager._enqueue_task
+    try:
+        manager._fetch_downstream_task_payload = _raise_not_found
+        manager._write_task_metadata_async = _noop_write
+        manager._enqueue_task = lambda *_args, **_kwargs: None
+        asyncio.run(
+            manager.sync_downstream_status(
+                db,
+                project_id="p1",
+                task_id=task.id,
+                stage_name="entry_analysis",
+                apply_state=True,
+                force=True,
+            )
+        )
+    finally:
+        manager._fetch_downstream_task_payload = original_fetch
+        manager._write_task_metadata_async = original_write
+        manager._enqueue_task = original_enqueue
+
+    self.assertEqual("downstream_missing", item.status)
+    self.assertEqual("eat-missing-entry", item.downstream_task_id)
+    event_types = [event.event_type for event in db.added if isinstance(event, BinarySecurityEvent)]
+    self.assertIn("streaming_stage_item_missing_requeue_skipped_not_owner", event_types)
+    self.assertNotIn("streaming_stage_item_requeued_after_downstream_missing", event_types)
+
+
+def _test_sync_downstream_status_does_not_requeue_missing_entry_item_claimed_by_current_execution(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-a"
+    now = _now()
+    task = BinarySecurityTask(
+        id="task-missing-entry-claimed",
+        project_id="p1",
+        name="demo",
+        status="running",
+        current_stage="entry_analysis",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id="worker-a",
+        dispatch_started_at=now,
+        lease_expires_at=now + timedelta(seconds=300),
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    run = BinarySecurityStageRun(
+        id="sr-missing-entry-claimed",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="entry_analysis",
+        sequence_no=1,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si-missing-entry-claimed",
+        task_id=task.id,
+        project_id="p1",
+        stage_run_id=run.id,
+        stage_name="entry_analysis",
+        item_key="source_project-gs_ledger",
+        item_name="gs_ledger",
+        status="downstream_missing",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-missing-entry",
+        claim_owner_instance_id="worker-a",
+        claim_execution_token=now.isoformat(),
+        claim_started_at=now,
+        error_message="下游子任务不存在",
+        result={"downstream_status": "downstream_missing"},
+    )
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        execution_epoch=0,
+        owner_instance_id="worker-a",
+        heartbeat_at=now,
+        lease_expires_at=now + timedelta(seconds=300),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], runtime_leases=[lease], events=[])
+
+    async def _raise_not_found(_task, _item, _token):
+        raise NotFoundError("downstream task not found")
+
+    async def _noop_write(*_args, **_kwargs):
+        return None
+
+    original_fetch = manager._fetch_downstream_task_payload
+    original_write = manager._write_task_metadata_async
+    original_enqueue = manager._enqueue_task
+    try:
+        manager._fetch_downstream_task_payload = _raise_not_found
+        manager._write_task_metadata_async = _noop_write
+        manager._enqueue_task = lambda *_args, **_kwargs: None
+        asyncio.run(
+            manager.sync_downstream_status(
+                db,
+                project_id="p1",
+                task_id=task.id,
+                stage_name="entry_analysis",
+                apply_state=True,
+                force=True,
+            )
+        )
+    finally:
+        manager._fetch_downstream_task_payload = original_fetch
+        manager._write_task_metadata_async = original_write
+        manager._enqueue_task = original_enqueue
+
+    self.assertEqual("downstream_missing", item.status)
+    self.assertEqual("eat-missing-entry", item.downstream_task_id)
+    self.assertEqual(now.isoformat(), item.claim_execution_token)
+    event_types = [event.event_type for event in db.added if isinstance(event, BinarySecurityEvent)]
+    self.assertNotIn("streaming_stage_item_requeued_after_downstream_missing", event_types)
+
+
 def _test_task_list_response_exposes_runtime_lease_and_sync_view(self):
     manager = TaskManager()
     now_value = _now()
@@ -29613,6 +29933,7 @@ TaskManagerTests.test_ensure_downstream_archive_job_keeps_success_job_when_downs
 TaskManagerTests.test_stage_entry_analysis_manual_confirm_sets_pending_entry_confirmation = _test_stage_entry_analysis_manual_confirm_sets_pending_entry_confirmation
 TaskManagerTests.test_stage_dataflow_vuln_scan_uses_selected_entry_inputs_in_manual_mode = _test_stage_dataflow_vuln_scan_uses_selected_entry_inputs_in_manual_mode
 TaskManagerTests.test_cleanup_task_workspace_retries_transient_residual_directory = _test_cleanup_task_workspace_retries_transient_residual_directory
+TaskManagerTests.test_stage_item_response_does_not_show_pending_sync_when_downstream_status_exists = _test_stage_item_response_does_not_show_pending_sync_when_downstream_status_exists
 
 
 if __name__ == "__main__":
