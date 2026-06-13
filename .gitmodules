@@ -43,3 +43,7 @@
 	path = 13-secflow-service/image_build/secflow-platform-auth
 	url = https://github.com/GaiaSecHW/secflow-platform-auth.git
 	branch = main
+[submodule "13-secflow-service/image_build/secflow-platform-k8s"]
+	path = 13-secflow-service/image_build/secflow-platform-k8s
+	url = https://github.com/GaiaSecHW/secflow-platform-k8s.git
+	branch = main
