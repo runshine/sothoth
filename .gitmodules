@@ -39,3 +39,7 @@
 	path = 13-secflow-service/image_build/secflow-platform-resource-file-gateway-worker
 	url = https://github.com/GaiaSecHW/secflow-platform-resource-file-gateway-worker.git
 	branch = main
+[submodule "13-secflow-service/image_build/secflow-platform-auth"]
+	path = 13-secflow-service/image_build/secflow-platform-auth
+	url = https://github.com/GaiaSecHW/secflow-platform-auth.git
+	branch = main
