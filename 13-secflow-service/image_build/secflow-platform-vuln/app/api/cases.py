@@ -489,7 +489,6 @@ def _validate_stage_transition(
     finished_reason: str | None = None,
     summary: str | None = None,
 ) -> None:
-    lifecycle = get_lifecycle_state(case)
     if to_stage not in {MAIN_STAGE_RECEIVE, MAIN_STAGE_TRIAGE, MAIN_STAGE_VALIDATION, MAIN_STAGE_FINISHED}:
         raise HTTPException(status_code=400, detail=f"unsupported stage: {to_stage}")
     if case.current_stage == MAIN_STAGE_FINISHED:
@@ -497,18 +496,12 @@ def _validate_stage_transition(
     if to_stage == case.current_stage:
         raise HTTPException(status_code=400, detail="target stage must be different from current stage")
 
-    if case.current_stage == MAIN_STAGE_RECEIVE and to_stage != MAIN_STAGE_TRIAGE:
-        raise HTTPException(status_code=400, detail="receive stage can only transition to triage")
+    if case.current_stage == MAIN_STAGE_RECEIVE and to_stage != MAIN_STAGE_VALIDATION:
+        raise HTTPException(status_code=400, detail="receive stage can only transition to validation")
     if case.current_stage == MAIN_STAGE_TRIAGE and to_stage not in {MAIN_STAGE_VALIDATION, MAIN_STAGE_FINISHED}:
         raise HTTPException(status_code=400, detail="triage stage can only transition to validation or finished")
     if case.current_stage == MAIN_STAGE_VALIDATION and to_stage != MAIN_STAGE_FINISHED:
         raise HTTPException(status_code=400, detail="validation stage can only transition to finished")
-
-    if case.current_stage == MAIN_STAGE_TRIAGE and to_stage == MAIN_STAGE_VALIDATION:
-        if lifecycle.get("triage_decision") != "issue":
-            raise HTTPException(status_code=400, detail="triage_decision must be issue before validation")
-        if lifecycle.get("triage_gate") != "approved_to_validation":
-            raise HTTPException(status_code=400, detail="triage_gate must be approved_to_validation before validation")
 
     if to_stage == MAIN_STAGE_FINISHED:
         if case.current_stage not in {MAIN_STAGE_TRIAGE, MAIN_STAGE_VALIDATION}:
