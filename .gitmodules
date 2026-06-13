@@ -31,3 +31,7 @@
 	path = 13-secflow-service/image_build/secflow-platform-fileserver
 	url = https://github.com/GaiaSecHW/secflow-platform-fileserver.git
 	branch = main
+[submodule "13-secflow-service/image_build/secflow-platform-resource"]
+	path = 13-secflow-service/image_build/secflow-platform-resource
+	url = https://github.com/GaiaSecHW/secflow-platform-resource.git
+	branch = main
