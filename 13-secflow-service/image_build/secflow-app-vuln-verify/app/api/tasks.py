@@ -15,6 +15,7 @@ from app.schemas import (
     ArtifactContentResponse,
     ArtifactEntry,
     ArtifactListResponse,
+    ProjectStatsResponse,
     TaskCreate,
     ReportDataResponse,
     TaskDetailResponse,
@@ -27,6 +28,7 @@ from app.service.auth import get_auth_service
 from app.service.project import get_project_service
 from app.service.security import validate_project_id
 from app.service.task_service import (
+    build_project_stats,
     build_detail,
     build_report_data,
     build_response,
@@ -75,6 +77,7 @@ def list_tasks(
     project_id: str,
     status: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
+    result_verdict: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     _: TokenUser = Depends(get_current_context),
@@ -86,9 +89,31 @@ def list_tasks(
     if search:
         pattern = f"%{search.strip()}%"
         query = query.filter(VulnVerifyTask.name.ilike(pattern))
+    normalized_result_verdict = (result_verdict or "").strip().lower()
+    if normalized_result_verdict == "confirmed":
+        query = query.filter(VulnVerifyTask.result_summary_json.like('%"confirmed"%'))
+    elif normalized_result_verdict == "ruled_out":
+        query = query.filter(VulnVerifyTask.result_summary_json.like('%"ruled_out"%'))
+    elif normalized_result_verdict == "unresolved":
+        query = query.filter(VulnVerifyTask.result_summary_json.like('%"unresolved"%'))
     total = query.count()
     tasks = query.order_by(VulnVerifyTask.created_at.desc()).offset(offset).limit(limit).all()
     return TaskListResponse(total=total, items=[build_response(task) for task in tasks])
+
+
+@router.get("/projects/{project_id}/stats", response_model=ProjectStatsResponse)
+def get_project_stats(
+    project_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    tasks = (
+        db.query(VulnVerifyTask)
+        .filter(VulnVerifyTask.project_id == project_id)
+        .order_by(VulnVerifyTask.created_at.desc())
+        .all()
+    )
+    return ProjectStatsResponse(**build_project_stats(tasks))
 
 
 @router.post("/projects/{project_id}/tasks", response_model=TaskResponse)

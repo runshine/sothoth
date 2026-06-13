@@ -56,6 +56,7 @@ def create_event(
 
 
 def build_response(task: VulnVerifyTask) -> TaskResponse:
+    result_summary = get_task_result_summary(task)
     return TaskResponse(
         id=task.id,
         project_id=task.project_id,
@@ -75,13 +76,20 @@ def build_response(task: VulnVerifyTask) -> TaskResponse:
         worker_id=task.worker_id,
         error_reason=task.error_reason,
         progress=task.progress,
-        result_summary=task.result_summary,
+        result_summary=result_summary,
         created_by=task.created_by,
         created_at=task.created_at,
         updated_at=task.updated_at,
         started_at=task.started_at,
         finished_at=task.finished_at,
     )
+
+
+def get_task_result_summary(task: VulnVerifyTask) -> dict:
+    result_summary = dict(task.result_summary or {})
+    if (result_summary.get("result_count") or 0) and "confirmed_count" not in result_summary:
+        result_summary = summarize_results(task)
+    return result_summary
 
 
 def build_detail(db: Session, task: VulnVerifyTask) -> TaskDetailResponse:
@@ -170,6 +178,13 @@ def summarize_results(task: VulnVerifyTask) -> dict:
     stderr_files = sorted(verifier_output.glob("*.stderr")) if verifier_output.is_dir() else []
     groups_dir = output / "groups"
     group_count = len([p for p in groups_dir.iterdir() if p.is_dir() and p.name.startswith("group_")]) if groups_dir.is_dir() else 0
+    verdict_counter: Counter[str] = Counter()
+    for path in result_files:
+        payload = _safe_read_json(path)
+        if not payload:
+            continue
+        verdict = str(payload.get("verdict") or "unverified").strip() or "unverified"
+        verdict_counter[verdict] += 1
     return {
         "result_count": len(result_files),
         "group_count": group_count,
@@ -177,7 +192,36 @@ def summarize_results(task: VulnVerifyTask) -> dict:
         "stdout_count": len(stdout_files),
         "stderr_count": len(stderr_files),
         "verify_log_exists": (output / "verify.log").is_file(),
+        "verified_count": int(sum(verdict_counter.values())),
+        "confirmed_count": int(verdict_counter.get("confirmed", 0)),
+        "ruled_out_count": int(verdict_counter.get("ruled_out", 0)),
+        "unresolved_count": int(verdict_counter.get("unresolved", 0)),
+        "unverified_count": int(verdict_counter.get("unverified", 0)),
+        "verdicts": dict(verdict_counter),
     }
+
+
+def build_project_stats(tasks: list[VulnVerifyTask]) -> dict:
+    totals = {
+        "total_tasks": len(tasks),
+        "verified_tasks": 0,
+        "total_results": 0,
+        "confirmed_count": 0,
+        "ruled_out_count": 0,
+        "unresolved_count": 0,
+        "unverified_count": 0,
+    }
+    for task in tasks:
+        summary = get_task_result_summary(task)
+        result_count = int(summary.get("result_count") or 0)
+        if result_count > 0:
+            totals["verified_tasks"] += 1
+        totals["total_results"] += result_count
+        totals["confirmed_count"] += int(summary.get("confirmed_count") or 0)
+        totals["ruled_out_count"] += int(summary.get("ruled_out_count") or 0)
+        totals["unresolved_count"] += int(summary.get("unresolved_count") or 0)
+        totals["unverified_count"] += int(summary.get("unverified_count") or 0)
+    return totals
 
 
 def load_results(task: VulnVerifyTask, *, limit: int = 500) -> list[dict]:

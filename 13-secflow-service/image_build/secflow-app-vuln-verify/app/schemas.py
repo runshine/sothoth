@@ -57,6 +57,16 @@ class TaskListResponse(BaseModel):
     items: list[TaskResponse]
 
 
+class ProjectStatsResponse(BaseModel):
+    total_tasks: int = 0
+    verified_tasks: int = 0
+    total_results: int = 0
+    confirmed_count: int = 0
+    ruled_out_count: int = 0
+    unresolved_count: int = 0
+    unverified_count: int = 0
+
+
 class TaskDetailResponse(TaskResponse):
     events: list["TaskEventResponse"] = Field(default_factory=list)
 
