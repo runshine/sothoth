@@ -5869,6 +5869,11 @@ class TaskManager:
         ]
         if not retry_items:
             raise ValidationError("失败项重试未找到目标阶段子任务")
+        retry_item_ids = [
+            str(item.id or "").strip()
+            for item in retry_items
+            if str(item.id or "").strip()
+        ]
         sync_apply_state = True
         if target_stage == "entry_analysis":
             # Entry-analysis failed-item retry must not eagerly re-apply the old
@@ -5880,6 +5885,7 @@ class TaskManager:
             project_id=task.project_id,
             task_id=task.id,
             stage_name=target_stage,
+            item_ids=retry_item_ids,
             force=True,
             token=self._service_token(),
             record_request_event=False,
