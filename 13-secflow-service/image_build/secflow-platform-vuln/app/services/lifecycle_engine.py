@@ -563,13 +563,9 @@ def capability_bind_stage(service: ServiceRegistry, capability: ServiceCapabilit
 def _stage_from_action(action_type: str, current_stage: str) -> str:
     if action_type == "proof_verification" and current_stage == MAIN_STAGE_FINISHED:
         return MAIN_STAGE_FINISHED
+    if action_type in {"analysis", "ai_analysis", "static_analysis", "reverse_analysis", "manual_review", "manual_decision"}:
+        return current_stage if current_stage != MAIN_STAGE_TRIAGE else MAIN_STAGE_TRIAGE
     mapping = {
-        "analysis": MAIN_STAGE_TRIAGE,
-        "ai_analysis": MAIN_STAGE_TRIAGE,
-        "static_analysis": MAIN_STAGE_TRIAGE,
-        "reverse_analysis": MAIN_STAGE_TRIAGE,
-        "manual_review": MAIN_STAGE_TRIAGE,
-        "manual_decision": MAIN_STAGE_TRIAGE,
         "validation": MAIN_STAGE_VALIDATION,
         "blackbox_validation": MAIN_STAGE_VALIDATION,
         "runtime_validation": MAIN_STAGE_VALIDATION,
