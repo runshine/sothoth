@@ -40,6 +40,7 @@ from app.service.task_service import (
     request_terminate,
     rerun_task,
     summarize_results,
+    task_matches_result_verdict,
 )
 
 router = APIRouter(prefix="/api/app/vuln-verify", tags=["vuln-verify"])
@@ -90,15 +91,20 @@ def list_tasks(
         pattern = f"%{search.strip()}%"
         query = query.filter(VulnVerifyTask.name.ilike(pattern))
     normalized_result_verdict = (result_verdict or "").strip().lower()
-    if normalized_result_verdict == "confirmed":
-        query = query.filter(VulnVerifyTask.result_summary_json.like('%"confirmed"%'))
-    elif normalized_result_verdict == "ruled_out":
-        query = query.filter(VulnVerifyTask.result_summary_json.like('%"ruled_out"%'))
-    elif normalized_result_verdict == "unresolved":
-        query = query.filter(VulnVerifyTask.result_summary_json.like('%"unresolved"%'))
-    total = query.count()
-    tasks = query.order_by(VulnVerifyTask.created_at.desc()).offset(offset).limit(limit).all()
-    return TaskListResponse(total=total, items=[build_response(task) for task in tasks])
+    ordered_query = query.order_by(VulnVerifyTask.created_at.desc())
+    if not normalized_result_verdict:
+        total = ordered_query.count()
+        tasks = ordered_query.offset(offset).limit(limit).all()
+        return TaskListResponse(total=total, items=[build_response(task) for task in tasks])
+
+    filtered_tasks = [
+        task
+        for task in ordered_query.all()
+        if task_matches_result_verdict(task, normalized_result_verdict)
+    ]
+    total = len(filtered_tasks)
+    page_items = filtered_tasks[offset:offset + limit]
+    return TaskListResponse(total=total, items=[build_response(task) for task in page_items])
 
 
 @router.get("/projects/{project_id}/stats", response_model=ProjectStatsResponse)

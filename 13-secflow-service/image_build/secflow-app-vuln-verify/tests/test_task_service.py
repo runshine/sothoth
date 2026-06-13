@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from app.model import VulnVerifyTask
-from app.service.task_service import build_project_stats
+from app.service.task_service import build_project_stats, task_matches_result_verdict
 
 
 class VulnVerifyProjectStatsTests(unittest.TestCase):
@@ -88,6 +88,24 @@ class VulnVerifyProjectStatsTests(unittest.TestCase):
             self.assertEqual(1, stats["confirmed_count"])
             self.assertEqual(1, stats["ruled_out_count"])
             self.assertEqual(1, stats["unresolved_count"])
+
+    def test_task_matches_result_verdict_backfills_legacy_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "legacy-filter"
+            verifier_output = task_root / "verifier_output"
+            verifier_output.mkdir(parents=True)
+            (task_root / "threat.md").write_text("threat", encoding="utf-8")
+            (verifier_output / "result_a.json").write_text('{"verdict":"ruled_out"}', encoding="utf-8")
+
+            legacy_task = self._make_task(
+                task_id="legacy-filter",
+                output_dir=str(task_root),
+                result_summary={"result_count": 1},
+            )
+
+            self.assertTrue(task_matches_result_verdict(legacy_task, "ruled_out"))
+            self.assertFalse(task_matches_result_verdict(legacy_task, "confirmed"))
+            self.assertFalse(task_matches_result_verdict(legacy_task, "unresolved"))
 
 
 if __name__ == "__main__":

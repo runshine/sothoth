@@ -224,6 +224,20 @@ def build_project_stats(tasks: list[VulnVerifyTask]) -> dict:
     return totals
 
 
+def task_matches_result_verdict(task: VulnVerifyTask, verdict: str) -> bool:
+    normalized_verdict = str(verdict or "").strip().lower()
+    if not normalized_verdict:
+        return True
+    summary = get_task_result_summary(task)
+    if normalized_verdict == "confirmed":
+        return int(summary.get("confirmed_count") or 0) > 0
+    if normalized_verdict == "ruled_out":
+        return int(summary.get("ruled_out_count") or 0) > 0
+    if normalized_verdict == "unresolved":
+        return int(summary.get("unresolved_count") or 0) > 0
+    return False
+
+
 def load_results(task: VulnVerifyTask, *, limit: int = 500) -> list[dict]:
     verifier_output = Path(task.output_dir) / "verifier_output"
     result_files = sorted(verifier_output.glob("result_*.json")) if verifier_output.is_dir() else []
