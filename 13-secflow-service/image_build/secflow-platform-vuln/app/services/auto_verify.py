@@ -361,9 +361,7 @@ def _derive_validation_result(report_data: dict[str, Any] | None) -> str:
 def _ensure_validation_stage(db: Session, case: Case) -> None:
     if case.current_stage == MAIN_STAGE_VALIDATION:
         return
-    if case.current_stage == MAIN_STAGE_RECEIVE:
-        advance_case_stage(db, case, MAIN_STAGE_TRIAGE, "auto verify task synced", source_type="system")
-    if case.current_stage == MAIN_STAGE_TRIAGE:
+    if case.current_stage in {MAIN_STAGE_RECEIVE, MAIN_STAGE_TRIAGE}:
         advance_case_stage(db, case, MAIN_STAGE_VALIDATION, "auto verify task synced", source_type="system")
     elif case.current_stage != MAIN_STAGE_VALIDATION:
         advance_case_stage(db, case, MAIN_STAGE_VALIDATION, "auto verify task synced", source_type="system")
@@ -567,9 +565,7 @@ async def create_auto_verify_task(
     should_advance_to_validation = getattr(request, "advance_to_validation", True)
     was_validation_stage = case.current_stage == MAIN_STAGE_VALIDATION
     if should_advance_to_validation and case.current_stage != MAIN_STAGE_VALIDATION:
-        if case.current_stage == MAIN_STAGE_RECEIVE:
-            advance_case_stage(db, case, MAIN_STAGE_TRIAGE, "auto verify task created", source_type="system")
-        if case.current_stage == MAIN_STAGE_TRIAGE:
+        if case.current_stage in {MAIN_STAGE_RECEIVE, MAIN_STAGE_TRIAGE}:
             advance_case_stage(db, case, MAIN_STAGE_VALIDATION, "auto verify task created", source_type="system")
         elif case.current_stage != MAIN_STAGE_VALIDATION:
             advance_case_stage(db, case, MAIN_STAGE_VALIDATION, "auto verify task created", source_type="system")
