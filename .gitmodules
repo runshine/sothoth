@@ -23,3 +23,7 @@
 	path = 13-secflow-service/image_build/secflow-platform-vuln
 	url = https://github.com/GaiaSecHW/secflow-platform-vuln.git
 	branch = main
+[submodule "13-secflow-service/image_build/secflow-platform-project"]
+	path = 13-secflow-service/image_build/secflow-platform-project
+	url = https://github.com/GaiaSecHW/secflow-platform-project.git
+	branch = main
