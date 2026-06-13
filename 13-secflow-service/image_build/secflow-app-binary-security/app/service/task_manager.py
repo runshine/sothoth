@@ -8545,7 +8545,13 @@ class TaskManager:
                                 state_applied=False,
                             )
                             skipped_count += 1
-                        if should_apply and (force or mapped_status != before_status or record_noop_events or not apply_state):
+                        if self._should_record_downstream_sync_skip_event(
+                            should_apply=bool(should_apply),
+                            force=force,
+                            mapped_status=mapped_status,
+                            before_status=before_status,
+                            apply_state=apply_state,
+                        ):
                             self._record_event(
                                 db,
                                 task,
@@ -8674,7 +8680,13 @@ class TaskManager:
                                     "consecutive_error_count_before_recovery": sync_supervisor_state.consecutive_error_count,
                                 },
                             )
-                        if should_apply or force or mapped_status != before_status or record_noop_events or not apply_state:
+                        if self._should_record_downstream_sync_skip_event(
+                            should_apply=bool(should_apply),
+                            force=force,
+                            mapped_status=mapped_status,
+                            before_status=before_status,
+                            apply_state=apply_state,
+                        ):
                             self._record_event(
                                 db,
                                 task,
@@ -8803,7 +8815,13 @@ class TaskManager:
                                 state_applied=False,
                             )
                             skipped_count += 1
-                        if should_apply or force or mapped_status != before_status or record_noop_events or not apply_state:
+                        if self._should_record_downstream_sync_skip_event(
+                            should_apply=bool(should_apply),
+                            force=force,
+                            mapped_status=mapped_status,
+                            before_status=before_status,
+                            apply_state=apply_state,
+                        ):
                             self._record_event(
                                 db,
                                 task,
@@ -9044,7 +9062,13 @@ class TaskManager:
                         state_applied=False,
                     )
                     skipped_count += 1
-                if should_apply or force or mapped_status != before_status or record_noop_events or not apply_state:
+                if self._should_record_downstream_sync_skip_event(
+                    should_apply=bool(should_apply),
+                    force=force,
+                    mapped_status=mapped_status,
+                    before_status=before_status,
+                    apply_state=apply_state,
+                ):
                     self._record_event(
                         db,
                         task,
@@ -18739,6 +18763,23 @@ class TaskManager:
         streak = max(0, int(consecutive_error_count or 0))
         return streak == 1 or (streak > 0 and streak % 10 == 0)
 
+    def _should_record_downstream_sync_skip_event(
+        self,
+        *,
+        should_apply: bool,
+        force: bool,
+        mapped_status: str | None,
+        before_status: str | None,
+        apply_state: bool,
+    ) -> bool:
+        if should_apply or force:
+            return True
+        if mapped_status != before_status:
+            return True
+        if not apply_state:
+            return True
+        return False
+
     def _read_stage_item_sync_supervisor_state(self, item: BinarySecurityStageItem) -> DownstreamSyncSupervisorState:
         result = self._load_stage_item_result_payload(item)
         sync_observation = self._stage_item_sync_observation(item)
@@ -25790,6 +25831,91 @@ class TaskManager:
             if identity_key:
                 existing_items_by_identity[identity_key] = existing_item
         processed_identities = set(existing_items_by_identity.keys())
+
+        def _should_requeue_existing_streaming_item(existing_item: BinarySecurityStageItem) -> bool:
+            if not self._streaming_mode_enabled(task):
+                return False
+            if not self._is_streaming_tail_stage(task, stage_run.stage_name):
+                return False
+            if self._task_runtime_phase(task) != TASK_RUNTIME_PHASE_OWNED_EXECUTION:
+                return False
+            if normalize_stage_name(task.current_stage) != normalize_stage_name(stage_run.stage_name):
+                return False
+            if self._task_is_waiting_for_manual_confirmation(task):
+                return False
+            normalized_status = str(existing_item.status or "").strip().lower()
+            if normalized_status not in {"failed", "cancelled", "downstream_missing"}:
+                return False
+            claim_token = str(getattr(existing_item, "claim_execution_token", "") or "").strip() or None
+            claim_owner = str(getattr(existing_item, "claim_owner_instance_id", "") or "").strip() or None
+            current_token = self._dispatch_token(task)
+            if claim_token and claim_token == current_token:
+                return False
+            if claim_owner and claim_owner == str(self.instance_id or "").strip() and claim_token == current_token:
+                return False
+            return True
+
+        for identity_key, existing_item in existing_items_by_identity.items():
+            if not _should_requeue_existing_streaming_item(existing_item):
+                continue
+            previous_status = str(existing_item.status or "").strip().lower() or None
+            previous_downstream_task_id = str(existing_item.downstream_task_id or "").strip() or None
+            observed_at = _now()
+            existing_result = self._load_stage_item_result_payload(existing_item)
+            sync_observation = dict(existing_result.get("sync_observation") or {})
+            sync_observation.update(
+                {
+                    "sync_status": "recovered_for_redispatch",
+                    "last_result": "recovered_for_redispatch",
+                    "recovery_reason": "downstream_missing_requeue",
+                    "last_missing_child_task_id": previous_downstream_task_id,
+                    "last_missing_detected_at": observed_at.isoformat(),
+                    "budget_exhausted": False,
+                }
+            )
+            sync_observation.pop("next_retry_at", None)
+            existing_result.update(
+                {
+                    "sync_observation": sync_observation,
+                    "last_sync_result": "recovered_for_redispatch",
+                    "sync_error_budget_exhausted": False,
+                    "next_sync_retry_at": None,
+                    "recovery_reason": "downstream_missing_requeue",
+                    "last_missing_child_task_id": previous_downstream_task_id,
+                    "last_missing_detected_at": observed_at.isoformat(),
+                }
+            )
+            existing_item.stage_run_id = stage_run.id
+            existing_item.status = "queued"
+            existing_item.downstream_task_id = None
+            existing_item.error_message = previous_status == "downstream_missing" and existing_item.error_message or None
+            existing_item.finished_at = None
+            existing_item.updated_at = observed_at
+            self._clear_stage_item_claim(existing_item)
+            self._persist_stage_item_result(
+                task,
+                existing_item,
+                stage_name=stage_run.stage_name,
+                result=existing_result,
+            )
+            self._record_event(
+                db,
+                task,
+                "streaming_stage_item_requeued_after_downstream_missing",
+                "当前执行实例已接管流式阶段，异常下游子任务已回退到 queued 等待重新派发",
+                level="warning",
+                stage_name=stage_run.stage_name,
+                item=existing_item,
+                payload={
+                    "before_status": previous_status,
+                    "after_status": "queued",
+                    "downstream_task_id": previous_downstream_task_id,
+                    "task_runtime_phase": self._task_runtime_phase(task),
+                    "dispatcher_instance_id": task.dispatcher_instance_id,
+                    "task_execution_token": self._dispatch_token(task),
+                    "recovery_action": "requeued_pending",
+                },
+            )
 
         batch_size = min(100, max(25, int(task.policy.get("stage_item_seed_batch_size") or 100)))
         last_error: Exception | None = None
