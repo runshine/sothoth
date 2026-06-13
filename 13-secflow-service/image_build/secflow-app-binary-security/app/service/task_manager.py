@@ -8154,6 +8154,7 @@ class TaskManager:
             item_id=item_id,
             force=force,
         )
+        selected_by_item_ids = bool(item_ids)
         if item_ids:
             ordered_ids = [str(current_id).strip() for current_id in list(item_ids or []) if str(current_id).strip()]
             matched = {str(item.id): item for item in items if str(item.id or "").strip()}
@@ -8980,6 +8981,49 @@ class TaskManager:
                                     reason_code=skip_reason_code,
                                     reason_category=skip_reason_category,
                                 )
+                        continue
+                    if (
+                        selected_by_item_ids
+                        and stage_name
+                        and str(item.stage_name or "").strip() == str(stage_name or "").strip()
+                        and mapped_status in ARCHIVE_SUCCESS_MAPPED_STATUSES
+                        and current_item_status in ARCHIVE_SUCCESS_MAPPED_STATUSES
+                        and not apply_state
+                    ):
+                        self._refresh_stage_item_downstream_observation(
+                            item,
+                            sync_status="synced",
+                            synced_at=sync_observed_at,
+                            status_raw=downstream_status,
+                            mapped_status=mapped_status,
+                            downstream_status=downstream_status,
+                            state_applied=False,
+                            downstream_payload=payload,
+                        )
+                        self._record_downstream_sync_skip_event_if_needed(
+                            db,
+                            task,
+                            item,
+                            message="同阶段成功项已同步，本次失败项重试预同步不再补偿归档",
+                            payload={
+                                "downstream_service": item.downstream_service,
+                                "downstream_task_id": item.downstream_task_id,
+                                "http_status": None,
+                                "error_type": None,
+                                "status_raw": downstream_status,
+                                "mapped_status": mapped_status,
+                                "state_applied": False,
+                                "before_status": before_status,
+                                "downstream_status": downstream_status,
+                                "after_status": mapped_status,
+                                "archive_skipped": True,
+                                "skip_archive_compensation": True,
+                                "selected_by_item_ids": True,
+                            },
+                            reason_code="same_stage_success_archive_compensation_skipped",
+                            reason_category="retry_prepare",
+                        )
+                        skipped_count += 1
                         continue
                     job = self._ensure_downstream_archive_job(
                         db,
@@ -14399,6 +14443,22 @@ class TaskManager:
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
             return
         next_stage = self._next_incomplete_stage(db, task)
+        if next_stage and self._should_skip_stage_without_runnable_work(db, task, next_stage):
+            blocked_reason = self._continue_stage_input_error(db, task, next_stage)
+            self._record_event(
+                db,
+                task,
+                "next_stage_auto_advance_blocked",
+                f"阶段完成后未自动推进到下一阶段: {next_stage}",
+                level="warning",
+                stage_name=next_stage,
+                payload={
+                    "state_event_id": event.id,
+                    "completed_stage": stage_name,
+                    "blocked_reason": blocked_reason,
+                },
+            )
+            next_stage = None
         if (
             task.status in {"running", "dispatching"}
             and next_stage
@@ -23910,11 +23970,7 @@ class TaskManager:
             if run is None:
                 if self._should_finalize_without_entries(db, task, stage_name):
                     continue
-                if (
-                    self._is_streaming_tail_stage(task, stage_name)
-                    and normalize_stage_name(stage_name) == "dataflow_vuln_scan"
-                    and self._continue_stage_input_error(db, task, stage_name)
-                ):
+                if self._should_skip_stage_without_runnable_work(db, task, stage_name):
                     continue
                 return stage_name
             items = self._stage_items(db, task.id, stage_name)
@@ -23926,11 +23982,7 @@ class TaskManager:
                     return stage_name
                 if self._stage_archive_success_blocked(task, stage_name, items, db=db):
                     return stage_name
-            elif (
-                self._is_streaming_tail_stage(task, stage_name)
-                and normalize_stage_name(stage_name) == "dataflow_vuln_scan"
-                and self._continue_stage_input_error(db, task, stage_name)
-            ):
+            elif self._should_skip_stage_without_runnable_work(db, task, stage_name):
                 continue
             if self._should_finalize_without_entries(db, task, stage_name):
                 continue
@@ -23952,6 +24004,19 @@ class TaskManager:
             if normalized_status not in {"success", "failed", "cancelled", "downstream_missing", "partial_success", "skipped"}:
                 return stage_name
         return None
+
+    def _should_skip_stage_without_runnable_work(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> bool:
+        normalized_stage = normalize_stage_name(stage_name)
+        if normalized_stage not in {"entry_analysis", "dataflow_vuln_scan"}:
+            return False
+        if self._stage_items(db, task.id, stage_name):
+            return False
+        return bool(self._continue_stage_input_error(db, task, stage_name))
 
     def _first_failed_terminal_stage(self, db: Session, task: BinarySecurityTask) -> str | None:
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
