@@ -2010,16 +2010,19 @@ class TaskManager:
             for item in items:
                 normalized_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip()
                 has_child = bool(str(item.downstream_task_id or "").strip())
-                if has_child and self._is_streaming_active_item_status(normalized_status):
+                if normalized_status in {"pending", "queued"}:
+                    unbound_runnable_item_count += 1
+                    stage_has_runnable_unbound_items = True
+                    if has_child:
+                        has_downstream_refs = True
+                        stage_has_downstream_refs = True
+                    if active_stage_name is None:
+                        active_stage_name = stage_name
+                elif has_child and self._is_streaming_active_item_status(normalized_status):
                     bound_active_item_count += 1
                     stage_bound_active_item_count += 1
                     has_downstream_refs = True
                     stage_has_downstream_refs = True
-                    if active_stage_name is None:
-                        active_stage_name = stage_name
-                elif normalized_status in {"pending", "queued"}:
-                    unbound_runnable_item_count += 1
-                    stage_has_runnable_unbound_items = True
                     if active_stage_name is None:
                         active_stage_name = stage_name
                 elif has_child:
@@ -3973,6 +3976,62 @@ class TaskManager:
             return True
         return expected_downstream_task_id == observed_downstream_task_id
 
+    def _is_recoverable_child_failure_status(self, item: BinarySecurityStageItem | None) -> bool:
+        if item is None:
+            return False
+        result_payload = dict(getattr(item, "result", None) or {})
+        sync_observation = dict(result_payload.get("sync_observation") or {})
+        raw_values = [
+            self._string_or_none(getattr(item, "error_message", None)),
+            self._string_or_none(result_payload.get("error_message")),
+            self._string_or_none(sync_observation.get("error_message")),
+            self._string_or_none(sync_observation.get("error_type")),
+            self._string_or_none(result_payload.get("last_sync_error_message")),
+            self._string_or_none(result_payload.get("last_sync_error_type")),
+        ]
+        joined = " ".join(str(value or "").strip().lower() for value in raw_values if str(value or "").strip())
+        if not joined:
+            return False
+        recoverable_tokens = (
+            "owner_lost_retry_exhausted",
+            "owner changed",
+            "owner 已变更",
+            "lease expired",
+            "lease 已失效",
+            "staletaskexecution",
+            "当前执行 token 已失效",
+            "当前 owned_execution runtime lease owner 已变更",
+            "当前 tail 收敛 owner 已变更",
+            "当前 tail 收敛 lease 已失效",
+            "takeover",
+            "requeue",
+            "requeued",
+            "recovery",
+            "transport_error",
+            "http_5xx",
+            "upstreamerror",
+        )
+        return any(token in joined for token in recoverable_tokens)
+
+    def _should_apply_current_child_intermediate_recovery(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        mapped_status: str,
+        payload: dict[str, Any] | None,
+    ) -> bool:
+        if mapped_status not in {"pending", "queued", "running", "dispatching"}:
+            return False
+        if not self._payload_matches_current_child(item, payload):
+            return False
+        replacement_state = self._replacement_in_progress_state(item)
+        if replacement_state["replacement_in_progress"] or replacement_state["binding_cleared"]:
+            return False
+        current_status = self._normalize_downstream_status(item.status) or self._string_or_none(item.status)
+        if current_status not in {"failed", "cancelled", "downstream_missing"}:
+            return False
+        return self._is_recoverable_child_failure_status(item)
+
     def _archive_job_bound_downstream_task_id(self, job: BinarySecurityArchiveJob | None) -> str:
         if job is None:
             return ""
@@ -5422,7 +5481,7 @@ class TaskManager:
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
         preserve_target_stage_refs = any(
-            str(item.downstream_task_id or "").strip()
+            self._should_preserve_target_stage_downstream_ref(db, task, item)
             for item in self._stage_items(db, task.id, target_stage)
         )
         self._invalidate_task_execution(task)
@@ -5648,7 +5707,6 @@ class TaskManager:
             force=True,
             token=self._service_token(),
             record_request_event=False,
-            record_noop_events=False,
             apply_state=sync_apply_state,
         )
         if target_stage == "entry_analysis":
@@ -5786,11 +5844,14 @@ class TaskManager:
             and normalized_display in {"pending", "dispatching", "running"}
             and not replacement_state["replacement_in_progress"]
         ):
-            display_status = normalized_item
-            sync_observation["downstream_status"] = normalized_item
-            sync_observation.setdefault("status_raw", normalized_display or display_status)
-            sync_observation["mapped_status"] = normalized_item
-            repaired = True
+            if self._is_recoverable_child_failure_status(item):
+                sync_observation["downstream_status"] = normalized_display
+            else:
+                display_status = normalized_item
+                sync_observation["downstream_status"] = normalized_item
+                sync_observation.setdefault("status_raw", normalized_display or display_status)
+                sync_observation["mapped_status"] = normalized_item
+                repaired = True
         elif replacement_state["replacement_in_progress"] and normalized_display in {"pending", "dispatching", "running"}:
             sync_observation["downstream_status"] = normalized_display
         if not display_status and str(item.downstream_task_id or "").strip():
@@ -7810,10 +7871,6 @@ class TaskManager:
         task_type = self._task_type(task)
         if task_type not in {TASK_TYPE_SOURCE, TASK_TYPE_BINARY_MODULE}:
             return False
-        # Source tasks do not produce entry_count during system_analysis.
-        # They must still execute entry_analysis to discover real entries.
-        if task_type == TASK_TYPE_SOURCE:
-            return False
         if self._stage_items(db, task.id, stage_name):
             return False
         if db.query(BinarySecurityStageRun).filter(
@@ -7829,7 +7886,7 @@ class TaskManager:
         if summary.get("entry_results"):
             return False
         selected_modules = list(summary.get("selected_modules") or [])
-        if task_type == TASK_TYPE_BINARY_MODULE and not selected_modules:
+        if selected_modules:
             return False
         upstream_run = db.query(BinarySecurityStageRun).filter(
             BinarySecurityStageRun.task_id == task.id,
@@ -7856,7 +7913,7 @@ class TaskManager:
         if (
             self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
             and self._is_reducer_role()
-            and str(task.status or "").strip().lower() == "pending"
+            and str(task.status or "").strip().lower() in {"pending", "running", "dispatching"}
         ):
             active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
             if self._tail_requires_execution_takeover(db, task):
@@ -7883,7 +7940,13 @@ class TaskManager:
                 self._clear_task_abnormal_reason_snapshot(db, task)
                 db.commit()
                 self._enqueue_task(task.id)
-                task = self._task_or_404(db, project_id, task_id)
+                return BinarySecurityActionResponse(
+                    task_id=task.id,
+                    status="accepted",
+                    accepted=True,
+                    action="resume_owned_execution",
+                    message="已退出 tail 收口并重新交给 worker 继续执行",
+                )
             elif active_item_count > 0 or has_downstream_refs:
                 task.status = "running"
                 task.current_stage = active_stage_name or task.current_stage
@@ -8385,6 +8448,11 @@ class TaskManager:
                             and str(sync_supervisor_state.last_result or "").strip() == "error"
                             and mapped_status not in {"failed", "cancelled", "downstream_missing"}
                         )
+                        recovery_applied = self._should_apply_current_child_intermediate_recovery(
+                            item,
+                            mapped_status=mapped_status,
+                            payload=payload,
+                        )
                         should_apply = observed_apply_state and (mapped_status != before_status or force)
                         if should_apply:
                             if not self._apply_child_state_with_savepoint(
@@ -8439,6 +8507,27 @@ class TaskManager:
                                 continue
                             touched_stages.add(item.stage_name)
                             synced_count += 1
+                            if recovery_applied:
+                                self._record_event(
+                                    db,
+                                    task,
+                                    "downstream_intermediate_state_recovered",
+                                    "当前有效 child 已恢复到中间态，父任务状态已回写",
+                                    stage_name=item.stage_name,
+                                    item=item,
+                                    level="warning",
+                                    payload={
+                                        "downstream_service": item.downstream_service,
+                                        "downstream_task_id": item.downstream_task_id,
+                                        "before_status": before_status,
+                                        "after_status": mapped_status,
+                                        "status_raw": downstream_status,
+                                        "mapped_status": mapped_status,
+                                        "state_applied": True,
+                                        "recovery_applied": True,
+                                        "recovery_reason": "current_child_intermediate_recovery",
+                                    },
+                                )
                         else:
                             skipped_count += 1
                         if recovered_after_errors:
@@ -8730,6 +8819,11 @@ class TaskManager:
                         mapped_status=mapped_status,
                         payload=payload,
                     )
+                recovery_applied = should_apply and self._should_apply_current_child_intermediate_recovery(
+                    item,
+                    mapped_status=mapped_status,
+                    payload=payload,
+                )
                 if should_apply:
                     apply_error_message = None if mapped_status in {"queued", "running", "success"} else (
                         payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message
@@ -8786,6 +8880,27 @@ class TaskManager:
                         continue
                     touched_stages.add(item.stage_name)
                     synced_count += 1
+                    if recovery_applied:
+                        self._record_event(
+                            db,
+                            task,
+                            "downstream_intermediate_state_recovered",
+                            "当前有效 child 已恢复到中间态，父任务状态已回写",
+                            stage_name=item.stage_name,
+                            item=item,
+                            level="warning",
+                            payload={
+                                "downstream_service": item.downstream_service,
+                                "downstream_task_id": item.downstream_task_id,
+                                "before_status": before_status,
+                                "after_status": mapped_status,
+                                "status_raw": downstream_status,
+                                "mapped_status": mapped_status,
+                                "state_applied": True,
+                                "recovery_applied": True,
+                                "recovery_reason": "current_child_intermediate_recovery",
+                            },
+                        )
                 else:
                     self._mark_stage_item_sync_observation(
                         item,
@@ -11045,7 +11160,6 @@ class TaskManager:
                 force=True,
                 token=self._service_token(),
                 record_request_event=False,
-                record_noop_events=False,
                 apply_state=(target_stage != "entry_analysis"),
             )
             synced_count += len(batch_item_ids)
@@ -11427,6 +11541,22 @@ class TaskManager:
             if strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
                 old_task_id = str(action.get("old_downstream_task_id") or "").strip()
                 new_task_id = str(item.downstream_task_id or "").strip()
+                replacement_state = self._replacement_in_progress_state(item)
+                if (
+                    old_task_id
+                    and old_task_id == new_task_id
+                    and (
+                        replacement_state["replacement_in_progress"]
+                        or replacement_state["verification_status"] == "pending"
+                    )
+                ):
+                    self._clear_replacement_in_progress(item)
+                    old_task_id = ""
+                    self._update_retry_item_action(
+                        task,
+                        item_id=item_id,
+                        updates={"old_downstream_task_id": None},
+                    )
                 if not new_task_id:
                     self._record_operation_event(
                         db,
@@ -11462,6 +11592,7 @@ class TaskManager:
                         },
                     )
                     raise ValidationError(f"失败项重试仍绑定旧下游任务: {item.item_key}")
+            self._clear_replacement_in_progress(item)
             self._update_retry_item_action(
                 task,
                 item_id=item_id,
@@ -13125,6 +13256,8 @@ class TaskManager:
         payload: dict[str, Any] | None,
     ) -> bool:
         before_status = str(item.status or "").strip().lower()
+        if self._should_apply_current_child_intermediate_recovery(item, mapped_status=mapped_status, payload=payload):
+            return True
         normalized_stage_name = normalize_stage_name(item.stage_name)
         if mapped_status == "running":
             if normalized_stage_name == "dataflow_vuln_scan":
@@ -14072,7 +14205,6 @@ class TaskManager:
                 force=False,
                 token=token,
                 record_request_event=False,
-                record_noop_events=False,
                 apply_state=True,
             )
         finally:
@@ -14264,7 +14396,6 @@ class TaskManager:
                 force=True,
                 token=token,
                 record_request_event=False,
-                record_noop_events=False,
                 apply_state=True,
             )
         finally:
@@ -15443,6 +15574,32 @@ class TaskManager:
         downstream_payload = dict(result.get("downstream") or {})
         return not self._string_or_none(downstream_payload.get("status"))
 
+    def _item_has_pending_replacement_or_stale_child(self, item: BinarySecurityStageItem) -> bool:
+        replacement_state = self._replacement_in_progress_state(item)
+        if replacement_state["replacement_in_progress"] or replacement_state["verification_status"] == "pending":
+            return True
+        sync_status = self._stage_item_sync_status_value(item)
+        if sync_status in {"transport_error", "binding_mismatch", "binding_missing_during_recreate"}:
+            return True
+        observed_status = self._normalize_downstream_status(self._latest_observed_downstream_status(item))
+        item_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()
+        if observed_status == "downstream_missing":
+            return True
+        if item_status == "success" and observed_status in {"pending", "queued", "dispatching", "running"}:
+            return True
+        return False
+
+    def _should_preserve_target_stage_downstream_ref(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+    ) -> bool:
+        del db, task
+        if not str(item.downstream_task_id or "").strip():
+            return False
+        return not self._item_has_pending_replacement_or_stale_child(item)
+
     def _task_reconcile_candidate_items(
         self,
         db: Session,
@@ -15484,6 +15641,9 @@ class TaskManager:
                 and not str(item.downstream_task_id or "").strip()
                 and self._item_needs_downstream_binding_reconcile(item)
             ):
+                candidates.append(item)
+                continue
+            if self._item_has_pending_replacement_or_stale_child(item):
                 candidates.append(item)
                 continue
             if self._item_needs_downstream_sync(

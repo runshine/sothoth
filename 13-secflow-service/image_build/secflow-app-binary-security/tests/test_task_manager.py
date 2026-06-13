@@ -14931,6 +14931,117 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("binding_mismatch", item.result.get("sync_status"))
         self.assertIn("latest_binding_mismatch", item.result)
 
+    def test_sync_downstream_status_recovers_failed_entry_item_from_current_child_running(self):
+        task = BinarySecurityTask(
+            id="s-entry-recover",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        run = BinarySecurityStageRun(
+            id="sr-entry-recover",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si-entry-recover",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=run.id,
+            stage_name="entry_analysis",
+            item_key="source_project-security_policy",
+            status="failed",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-current",
+            error_message="owner_lost_retry_exhausted",
+            result={
+                "sync_observation": {
+                    "sync_status": "transport_error",
+                    "error_type": "StaleTaskExecution",
+                    "error_message": "任务 s-entry-recover 当前执行 token 已失效",
+                    "last_result": "error",
+                }
+            },
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
+
+        original_fetch = self.manager._fetch_downstream_task_payload
+        original_write = self.manager._write_task_metadata_async
+        original_enqueue = self.manager._enqueue_task
+
+        async def _fetch(_task, _item, _token):
+            return {
+                "task_id": "eat-current",
+                "status": "running",
+                "parent_stage_item_id": "si-entry-recover",
+                "parent_stage_item_key": "source_project-security_policy",
+            }
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._fetch_downstream_task_payload = _fetch
+        self.manager._write_task_metadata_async = _noop_write
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        try:
+            resp = asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id="p1",
+                    task_id=task.id,
+                    stage_name="entry_analysis",
+                    item_id=item.id,
+                    apply_state=True,
+                )
+            )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+            self.manager._write_task_metadata_async = original_write
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual(1, resp.synced_downstream_count)
+        self.assertEqual("running", item.status)
+        self.assertEqual("synced", item.result.get("sync_status"))
+        self.assertEqual("running", item.result.get("downstream_status"))
+        self.assertIn("downstream_intermediate_state_recovered", [event.event_type for event in db.events])
+
+    def test_effective_stage_item_downstream_status_allows_recoverable_running_display(self):
+        item = BinarySecurityStageItem(
+            id="si-display-recover",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="source_project-security_policy",
+            status="failed",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-current",
+            error_message="owner_lost_retry_exhausted",
+            result={
+                "sync_observation": {
+                    "downstream_status": "running",
+                    "mapped_status": "running",
+                    "error_message": "任务 t1 当前执行 token 已失效",
+                    "error_type": "StaleTaskExecution",
+                },
+                "downstream": {"task_id": "eat-current", "status": "running"},
+            },
+        )
+
+        display_status, sync_observation, repaired = self.manager._effective_stage_item_downstream_status(item)
+
+        self.assertEqual("running", display_status)
+        self.assertEqual("running", sync_observation.get("downstream_status"))
+        self.assertFalse(repaired)
+
     def test_apply_downstream_status_event_reuses_unified_reconcile(self):
         task = BinarySecurityTask(
             id="t1",
@@ -26607,6 +26718,97 @@ def _test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_ta
     self.assertTrue(manager._has_tail_reconcile_owner(task.id))
 
 
+def _test_reducer_sync_downstream_status_resumes_owned_execution_from_running_tail_reconciliation_task(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="tail-reconcile-running-1",
+        project_id="p1",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/out",
+        workspace_root="/ws",
+        policy_json='{"pipeline_mode": "mixed_streaming"}',
+        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+    )
+    stage_run = BinarySecurityStageRun(
+        id="sr-tail-reconcile-running-1",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        sequence_no=1,
+        status="running",
+    )
+    pending_item = BinarySecurityStageItem(
+        id="si-tail-reconcile-running-pending-1",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=stage_run.id,
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-1",
+        status="pending",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-1",
+    )
+    active_item = BinarySecurityStageItem(
+        id="si-tail-reconcile-running-active-1",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=stage_run.id,
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-2",
+        status="running",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-2",
+        result={
+            "sync_status": "skipped",
+            "sync_observation": {
+                "last_attempt_at": (_now() - timedelta(minutes=10)).isoformat(),
+                "last_synced_at": (_now() - timedelta(minutes=10)).isoformat(),
+            },
+        },
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[pending_item, active_item], events=[])
+
+    async def _fetch(_task, item, _token):
+        return {
+            "task_id": item.downstream_task_id,
+            "status": "running" if item.id == active_item.id else "pending",
+            "parent_stage_item_id": item.id,
+        }
+
+    original_fetch = manager._fetch_downstream_task_payload
+    original_enqueue = manager._enqueue_task
+    queued: list[str] = []
+    try:
+        manager._fetch_downstream_task_payload = _fetch
+        manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
+        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "reducer"}, clear=False):
+            asyncio.run(
+                manager.sync_downstream_status(
+                    db,
+                    project_id=task.project_id,
+                    task_id=task.id,
+                    force=False,
+                    record_request_event=False,
+                    apply_state=True,
+                )
+            )
+    finally:
+        manager._fetch_downstream_task_payload = original_fetch
+        manager._enqueue_task = original_enqueue
+
+    self.assertEqual("pending", task.status)
+    self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
+    self.assertEqual(["tail-reconcile-running-1"], queued)
+    self.assertEqual([], db.runtime_leases)
+    resumed_events = [event for event in db.events if event.event_type == "tail_execution_takeover_resumed"]
+    self.assertTrue(resumed_events)
+    self.assertEqual("dataflow_vuln_scan", resumed_events[-1].stage_name)
+
+
 def _test_start_reducer_role_runs_reconcile_loops(self):
     manager = TaskManager()
 
@@ -26652,6 +26854,119 @@ def _test_start_reducer_role_runs_reconcile_loops(self):
         manager._state_repair_reconcile_loop = original_state_repair
         manager._state_reducer_loop = original_state_reducer
         manager._reducer_metrics_snapshot_loop = original_metrics
+
+
+def _test_sync_downstream_status_recovers_failed_entry_item_from_current_child_running(self):
+    task = BinarySecurityTask(
+        id="s-entry-recover",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/tmp",
+    )
+    run = BinarySecurityStageRun(
+        id="sr-entry-recover",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        sequence_no=2,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si-entry-recover",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=run.id,
+        stage_name="entry_analysis",
+        item_key="source_project-security_policy",
+        status="failed",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-current",
+        error_message="owner_lost_retry_exhausted",
+        result={
+            "sync_observation": {
+                "sync_status": "transport_error",
+                "error_type": "StaleTaskExecution",
+                "error_message": "任务 s-entry-recover 当前执行 token 已失效",
+                "last_result": "error",
+            }
+        },
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
+
+    original_fetch = self.manager._fetch_downstream_task_payload
+    original_write = self.manager._write_task_metadata_async
+    original_enqueue = self.manager._enqueue_task
+
+    async def _fetch(_task, _item, _token):
+        return {
+            "task_id": "eat-current",
+            "status": "running",
+            "parent_stage_item_id": "si-entry-recover",
+            "parent_stage_item_key": "source_project-security_policy",
+        }
+
+    async def _noop_write(*_args, **_kwargs):
+        return None
+
+    self.manager._fetch_downstream_task_payload = _fetch
+    self.manager._write_task_metadata_async = _noop_write
+    self.manager._enqueue_task = lambda *_args, **_kwargs: None
+    try:
+        resp = asyncio.run(
+            self.manager.sync_downstream_status(
+                db,
+                project_id="p1",
+                task_id=task.id,
+                stage_name="entry_analysis",
+                item_id=item.id,
+                apply_state=True,
+            )
+        )
+    finally:
+        self.manager._fetch_downstream_task_payload = original_fetch
+        self.manager._write_task_metadata_async = original_write
+        self.manager._enqueue_task = original_enqueue
+
+    self.assertEqual(1, resp.synced_downstream_count)
+    self.assertEqual("running", item.status)
+    self.assertEqual("synced", item.result.get("sync_status"))
+    self.assertEqual("running", item.result.get("downstream_status"))
+    self.assertIn("downstream_intermediate_state_recovered", [event.event_type for event in db.events])
+
+
+def _test_effective_stage_item_downstream_status_allows_recoverable_running_display(self):
+    item = BinarySecurityStageItem(
+        id="si-display-recover",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="source_project-security_policy",
+        status="failed",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-current",
+        error_message="owner_lost_retry_exhausted",
+        result={
+            "sync_observation": {
+                "downstream_status": "running",
+                "mapped_status": "running",
+                "error_message": "任务 t1 当前执行 token 已失效",
+                "error_type": "StaleTaskExecution",
+            },
+            "downstream": {"task_id": "eat-current", "status": "running"},
+        },
+    )
+
+    display_status, sync_observation, repaired = self.manager._effective_stage_item_downstream_status(item)
+
+    self.assertEqual("running", display_status)
+    self.assertEqual("running", sync_observation.get("downstream_status"))
+    self.assertFalse(repaired)
 
 
 def _test_tail_control_plane_stale_error_does_not_pollute_sync_error(self):
@@ -28783,6 +29098,152 @@ def _test_parent_linked_downstream_candidates_uses_current_dataflow_scanner_tabl
     self.assertEqual("secflow_dataflow_vuln_scanner_run_index", dataflow[1])
 
 
+def _test_continue_prepare_does_not_preserve_stale_target_stage_ref(self):
+    task = BinarySecurityTask(
+        id="t-continue-stale",
+        project_id="p1",
+        name="source",
+        status="failed",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    system_run = BinarySecurityStageRun(task_id=task.id, project_id=task.project_id, stage_name="system_analysis", sequence_no=1, status="failed")
+    entry_run = BinarySecurityStageRun(task_id=task.id, project_id=task.project_id, stage_name="entry_analysis", sequence_no=2, status="pending")
+    item = BinarySecurityStageItem(
+        id="si-stale",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        item_key="source_project",
+        status="success",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-stale",
+        result={
+            "sync_observation": {
+                "replacement_in_progress": True,
+                "verification_status": "pending",
+                "old_downstream_task_id": "sat-stale",
+                "downstream_status": "running",
+            },
+            "downstream_status": "running",
+        },
+    )
+    db = _ModelAwareDb(tasks=[task], stage_runs=[system_run, entry_run], stage_items=[item])
+
+    assert self.manager._should_preserve_target_stage_downstream_ref(db, task, item) is False
+
+
+def _test_retry_verify_clears_replacement_state_after_success(self):
+    task = BinarySecurityTask(
+        id="t-retry-verify",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-retry-verify",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type="retry_failed_items",
+        target_stage="system_analysis",
+        status="running",
+        request_payload={"target_stage": "system_analysis"},
+    )
+    item = BinarySecurityStageItem(
+        id="si-retry-verify",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        item_key="source_project",
+        status="pending",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-new",
+        result={
+            "sync_observation": {
+                "replacement_in_progress": True,
+                "binding_cleared": False,
+                "verification_status": "pending",
+                "old_downstream_task_id": "sat-old",
+            }
+        },
+    )
+    self.manager._set_retry_item_actions(
+        task,
+        [
+            {
+                "item_id": item.id,
+                "item_key": item.item_key,
+                "stage_name": item.stage_name,
+                "strategy": "recreate_from_abnormal",
+                "old_downstream_task_id": "sat-old",
+                "cleanup_status": "succeeded",
+                "create_status": "succeeded",
+                "verification_status": "pending",
+            }
+        ],
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], operations=[operation], events=[])
+
+    async def fake_reconcile(*_args, **_kwargs):
+        return {"reused_items": 0, "adopted_items": 0}
+
+    self.manager._operation_reconcile_retry_non_abnormal_children = fake_reconcile
+    result = asyncio.run(self.manager._operation_verify_retry_bindings(db, task, operation))
+
+    assert result["validation"]["validated"] is True
+    assert self.manager._replacement_in_progress_state(item)["replacement_in_progress"] is False
+    assert self.manager._replacement_in_progress_state(item)["verification_status"] is None
+
+
+def _test_task_reconcile_candidate_items_includes_stale_system_analysis_replacement_item(self):
+    task = BinarySecurityTask(
+        id="t-candidate-stale",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = BinarySecurityStageItem(
+        id="si-candidate-stale",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        item_key="source_project",
+        status="success",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-stale",
+        result={
+            "downstream_status": "running",
+            "sync_observation": {
+                "replacement_in_progress": True,
+                "verification_status": "pending",
+                "downstream_status": "running",
+                "mapped_status": "running",
+            },
+        },
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+    candidates = self.manager._task_reconcile_candidate_items(db, task, stage_name="system_analysis")
+
+    assert [row.id for row in candidates] == [item.id]
+
+
 TaskManagerTests.test_stage_item_response_falls_back_to_downstream_payload_status = _test_stage_item_response_falls_back_to_downstream_payload_status
 TaskManagerTests.test_task_reconcile_candidate_items_scans_all_stages_with_downstream_refs = _test_task_reconcile_candidate_items_scans_all_stages_with_downstream_refs
 TaskManagerTests.test_task_sync_cooldown_elapsed_uses_all_candidate_items = _test_task_sync_cooldown_elapsed_uses_all_candidate_items
@@ -28801,7 +29262,10 @@ TaskManagerTests.test_task_heartbeat_controller_refreshes_running_task_without_d
 TaskManagerTests.test_worker_does_not_take_tail_runtime_lease_on_refresh = _test_worker_does_not_take_tail_runtime_lease_on_refresh
 TaskManagerTests.test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_lease = _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_lease
 TaskManagerTests.test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_task = _test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_task
+TaskManagerTests.test_reducer_sync_downstream_status_resumes_owned_execution_from_running_tail_reconciliation_task = _test_reducer_sync_downstream_status_resumes_owned_execution_from_running_tail_reconciliation_task
 TaskManagerTests.test_start_reducer_role_runs_reconcile_loops = _test_start_reducer_role_runs_reconcile_loops
+TaskManagerTests.test_sync_downstream_status_recovers_failed_entry_item_from_current_child_running = _test_sync_downstream_status_recovers_failed_entry_item_from_current_child_running
+TaskManagerTests.test_effective_stage_item_downstream_status_allows_recoverable_running_display = _test_effective_stage_item_downstream_status_allows_recoverable_running_display
 TaskManagerTests.test_tail_control_plane_stale_error_does_not_pollute_sync_error = _test_tail_control_plane_stale_error_does_not_pollute_sync_error
 TaskManagerTests.test_record_polled_child_sync_failure_marks_owned_execution_owner_lost = _test_record_polled_child_sync_failure_marks_owned_execution_owner_lost
 TaskManagerTests.test_record_polled_child_sync_failure_marks_owned_execution_runtime_owner_change_as_owner_lost = _test_record_polled_child_sync_failure_marks_owned_execution_runtime_owner_change_as_owner_lost
@@ -28846,6 +29310,9 @@ TaskManagerTests.test_get_module_report_rejects_unknown_module = _test_get_modul
 TaskManagerTests.test_confirm_entry_selection_updates_task = _test_confirm_entry_selection_updates_task
 TaskManagerTests.test_get_project_config_normalizes_legacy_partial_success_stage_names = _test_get_project_config_normalizes_legacy_partial_success_stage_names
 TaskManagerTests.test_parent_linked_downstream_candidates_uses_current_dataflow_scanner_table = _test_parent_linked_downstream_candidates_uses_current_dataflow_scanner_table
+TaskManagerTests.test_continue_prepare_does_not_preserve_stale_target_stage_ref = _test_continue_prepare_does_not_preserve_stale_target_stage_ref
+TaskManagerTests.test_retry_verify_clears_replacement_state_after_success = _test_retry_verify_clears_replacement_state_after_success
+TaskManagerTests.test_task_reconcile_candidate_items_includes_stale_system_analysis_replacement_item = _test_task_reconcile_candidate_items_includes_stale_system_analysis_replacement_item
 TaskManagerTests.test_normalize_source_input_files_rejects_duplicate_relative_paths = _test_normalize_source_input_files_rejects_duplicate_relative_paths
 TaskManagerTests.test_normalize_source_input_files_rejects_non_archive = _test_normalize_source_input_files_rejects_non_archive
 TaskManagerTests.test_materialize_source_archives_extracts_into_input_and_cleans_temp_file = _test_materialize_source_archives_extracts_into_input_and_cleans_temp_file

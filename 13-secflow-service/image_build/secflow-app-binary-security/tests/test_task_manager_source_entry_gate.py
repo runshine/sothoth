@@ -45,6 +45,43 @@ def test_source_task_does_not_skip_entry_analysis_when_system_analysis_has_no_en
     assert next_stage == "entry_analysis"
 
 
+def test_source_task_skips_entry_analysis_when_system_analysis_has_no_selected_modules():
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-source-no-modules",
+        project_id="p1",
+        name="source-task",
+        status="failed",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.summary = {
+        "selected_modules": [],
+        "candidate_modules": [],
+        "failure_code": "no_candidate_modules",
+    }
+    task.metrics = {"entry_count": 0, "selected_module_count": 0, "candidate_module_count": 0}
+    system_run = BinarySecurityStageRun(
+        id="sr-system-empty",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        sequence_no=1,
+        status="success",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[system_run], stage_items=[], events=[])
+
+    should_skip = manager._should_finalize_without_entries(db, task, "entry_analysis")
+    next_stage = manager._next_incomplete_stage(db, task)
+
+    assert should_skip is True
+    assert next_stage is None
+
+
 def test_source_system_analysis_rebuild_restores_entry_analysis_input_contract_fields():
     manager = TaskManager()
     task = BinarySecurityTask(
