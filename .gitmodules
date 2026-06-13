@@ -71,3 +71,7 @@
 	path = 13-secflow-service/image_build/secflow-platform-workflow
 	url = https://github.com/GaiaSecHW/secflow-platform-workflow.git
 	branch = main
+[submodule "13-secflow-service/image_build/secflow-platform-workflow-status"]
+	path = 13-secflow-service/image_build/secflow-platform-workflow-status
+	url = https://github.com/GaiaSecHW/secflow-platform-workflow-status.git
+	branch = main
