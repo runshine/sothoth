@@ -63,3 +63,7 @@
 	path = 13-secflow-service/image_build/secflow-platform-deploy-script
 	url = https://github.com/GaiaSecHW/secflow-platform-deploy-script.git
 	branch = main
+[submodule "13-secflow-service/image_build/secflow-platform-static-binary"]
+	path = 13-secflow-service/image_build/secflow-platform-static-binary
+	url = https://github.com/GaiaSecHW/secflow-platform-static-binary.git
+	branch = main
