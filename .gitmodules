@@ -55,3 +55,7 @@
 	path = 13-secflow-service/image_build/secflow-platform-configcenter
 	url = https://github.com/GaiaSecHW/secflow-platform-configcenter.git
 	branch = main
+[submodule "13-secflow-service/image_build/secflow-platform-agent"]
+	path = 13-secflow-service/image_build/secflow-platform-agent
+	url = https://github.com/GaiaSecHW/secflow-platform-agent.git
+	branch = main
