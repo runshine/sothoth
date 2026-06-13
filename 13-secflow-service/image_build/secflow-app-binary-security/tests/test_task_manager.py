@@ -14695,8 +14695,160 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("pending", item.result.get("sync_observation", {}).get("status_raw"))
         self.assertEqual("pending", item.result.get("sync_observation", {}).get("mapped_status"))
         self.assertFalse(bool(item.result.get("sync_observation", {}).get("state_applied")))
+        self.assertEqual("pending", item.result.get("downstream", {}).get("status"))
         skipped_events = [event for event in db.events if event.event_type == "downstream_status_sync_skipped"]
         self.assertFalse(skipped_events)
+
+    def test_sync_downstream_status_same_pending_observation_refreshes_stale_downstream_error(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            sequence_no=3,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry1",
+            parent_key="module1",
+            status="pending",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dvs_1",
+            result={
+                "downstream": {
+                    "status": "error",
+                    "error": "cannot access local variable 'queue' where it is not associated with a value",
+                }
+            },
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
+
+        original_fetch = self.manager._fetch_downstream_task_payload
+        original_write = self.manager._write_task_metadata_async
+        original_enqueue = self.manager._enqueue_task
+
+        async def _fetch(_task, _item, _token):
+            return {
+                "status": "pending",
+                "parent_stage_item_id": "si1",
+                "task_id": "dvs_1",
+                "updated_at": "2026-06-13T15:15:03+08:00",
+            }
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._fetch_downstream_task_payload = _fetch
+        self.manager._write_task_metadata_async = _noop_write
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        try:
+            resp = asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id="p1",
+                    task_id="s1",
+                    stage_name="dataflow_vuln_scan",
+                    apply_state=True,
+                )
+            )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+            self.manager._write_task_metadata_async = original_write
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual(1, resp.skipped_downstream_count)
+        self.assertEqual("pending", item.result.get("downstream", {}).get("status"))
+        self.assertIsNone(item.result.get("downstream", {}).get("error"))
+        skipped_events = [event for event in db.events if event.event_type == "downstream_status_sync_skipped"]
+        self.assertFalse(skipped_events)
+
+    def test_sync_downstream_status_intermediate_blocked_records_reason_code(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="system_analysis",
+            item_key="fw1",
+            parent_key="fw1",
+            status="failed",
+            downstream_service="system_analyse",
+            downstream_task_id="sat_1",
+            error_message="old failure",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
+
+        original_fetch = self.manager._fetch_downstream_task_payload
+        original_write = self.manager._write_task_metadata_async
+        original_enqueue = self.manager._enqueue_task
+
+        async def _fetch(_task, _item, _token):
+            return {"status": "pending", "parent_stage_item_id": "si1", "task_id": "sat_1"}
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._fetch_downstream_task_payload = _fetch
+        self.manager._write_task_metadata_async = _noop_write
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        try:
+            resp = asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id="p1",
+                    task_id="s1",
+                    stage_name="system_analysis",
+                    apply_state=True,
+                )
+            )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+            self.manager._write_task_metadata_async = original_write
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual(1, resp.skipped_downstream_count)
+        self.assertEqual("failed", item.status)
+        self.assertEqual("pending", item.result.get("downstream", {}).get("status"))
+        skipped_events = [event for event in db.events if event.event_type == "downstream_status_sync_skipped"]
+        self.assertTrue(skipped_events)
+        self.assertTrue(all(event.payload.get("reason_code") == "intermediate_state_write_blocked" for event in skipped_events))
 
     def test_sync_downstream_status_allows_same_child_success_to_repair_terminal_failure(self):
         item = BinarySecurityStageItem(
