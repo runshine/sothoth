@@ -184,6 +184,7 @@ class _TaskDetailContext:
     abnormal_reason: BinarySecurityAbnormalReason | None = None
     stage_items_total: int = 0
     item_stats: dict[str, dict[str, int]] = field(default_factory=dict)
+    downstream_status_counts: dict[str, dict[str, int]] = field(default_factory=dict)
     last_successful_sync_at: datetime | None = None
     last_sync_attempt_at: datetime | None = None
     last_sync_error_at: datetime | None = None
@@ -3065,6 +3066,11 @@ class TaskManager:
         project_id: str,
         task_id: str,
         stage_name: str,
+        status: str | None = None,
+        downstream_status: str | None = None,
+        sync_status: str | None = None,
+        sort_by: str | None = None,
+        sort_direction: str = "desc",
         page: int = 1,
         per_page: int = 50,
     ) -> BinarySecurityStageItemPageResponse:
@@ -3076,18 +3082,37 @@ class TaskManager:
                 BinarySecurityStageItem.task_id == task.id,
                 BinarySecurityStageItem.stage_name == normalized_stage_name,
             )
-            .order_by(BinarySecurityStageItem.created_at.asc(), BinarySecurityStageItem.id.asc())
         )
-        total = query.count()
-        rows = query.offset((page - 1) * per_page).limit(per_page).all()
+        normalized_status = self._string_or_none(status)
+        if normalized_status:
+            query = query.filter(BinarySecurityStageItem.status == normalized_status)
+        rows = query.order_by(BinarySecurityStageItem.created_at.asc(), BinarySecurityStageItem.id.asc()).all()
         archive_jobs_by_item = self._stage_archive_jobs_by_item(db, task.id, normalized_stage_name)
+        item_responses = [
+            self._stage_item_response(task, item, archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []))
+            for item in rows
+        ]
+        item_responses = self._filter_stage_item_responses(
+            item_responses,
+            downstream_status=downstream_status,
+            sync_status=sync_status,
+        )
+        item_responses = self._sort_stage_item_responses(
+            item_responses,
+            sort_by=sort_by,
+            sort_direction=sort_direction,
+        )
+        total = len(item_responses)
+        start = max(0, (page - 1) * per_page)
+        end = start + per_page
+        page_items = item_responses[start:end]
         return BinarySecurityStageItemPageResponse(
             task_id=task.id,
             stage_name=normalized_stage_name,
             total=total,
             page=page,
             per_page=per_page,
-            items=[self._stage_item_response(task, item, archive_jobs=archive_jobs_by_item.get(str(item.id or ""), [])) for item in rows],
+            items=page_items,
         )
 
     def get_orchestration_observability(self, db: Session, *, project_id: str, task_id: str) -> dict[str, Any]:
@@ -3256,12 +3281,6 @@ class TaskManager:
             .order_by(BinarySecurityStageRun.sequence_no.asc())
             .all()
         )
-        stage_items_total = (
-            db.query(func.count(BinarySecurityStageItem.id))
-            .filter(BinarySecurityStageItem.task_id == task.id)
-            .scalar()
-            or 0
-        )
         stage_items = (
             db.query(BinarySecurityStageItem)
             .options(
@@ -3293,29 +3312,6 @@ class TaskManager:
             .limit(DETAIL_STAGE_ITEMS_LIMIT)
             .all()
         )
-        item_stats_rows = (
-            db.query(
-                BinarySecurityStageItem.stage_name,
-                BinarySecurityStageItem.status,
-                func.count(BinarySecurityStageItem.id),
-            )
-            .filter(BinarySecurityStageItem.task_id == task.id)
-            .group_by(BinarySecurityStageItem.stage_name, BinarySecurityStageItem.status)
-            .all()
-        )
-        item_stats: dict[str, dict[str, int]] = {}
-        for stage_name, status, count in item_stats_rows:
-            stage_key = str(stage_name or "").strip()
-            if not stage_key:
-                continue
-            entry = item_stats.setdefault(
-                stage_key,
-                {"total": 0, "success": 0, "failed": 0, "skipped": 0, "running": 0, "cancelled": 0},
-            )
-            normalized_status = self._normalize_downstream_status(status) or str(status or "").strip()
-            entry["total"] += int(count or 0)
-            if normalized_status in entry:
-                entry[normalized_status] += int(count or 0)
         sync_items = (
             db.query(BinarySecurityStageItem)
             .options(
@@ -3328,6 +3324,9 @@ class TaskManager:
             .filter(BinarySecurityStageItem.task_id == task.id)
             .all()
         )
+        stage_items_total = len(sync_items)
+        item_stats = self._item_stats(sync_items)
+        downstream_status_counts = self._downstream_status_counts_from_items(sync_items)
         sync_times = self._task_sync_status_view(sync_items)
         archive_jobs = (
             db.query(BinarySecurityArchiveJob)
@@ -3342,6 +3341,8 @@ class TaskManager:
             stage_sequence,
             stage_runs,
             stage_items,
+            item_stats=item_stats,
+            downstream_status_counts=downstream_status_counts,
             include_retry_support=False,
         )
         abnormal_reason = None
@@ -3363,6 +3364,7 @@ class TaskManager:
             abnormal_reason=abnormal_reason,
             stage_items_total=int(stage_items_total),
             item_stats=item_stats,
+            downstream_status_counts=downstream_status_counts,
             last_successful_sync_at=sync_times[0],
             last_sync_attempt_at=sync_times[1],
             last_sync_error_at=sync_times[2],
@@ -5355,6 +5357,8 @@ class TaskManager:
             "downstream_http_429_retry_scheduled",
             "downstream_http_429_retry_attempted",
             "downstream_http_429_retry_recovered",
+            "owned_execution_takeover_requeued",
+            "streaming_stage_item_requeued_after_downstream_missing",
         }
 
     def _same_timeline_compression_bucket(self, left: BinarySecurityEvent, right: BinarySecurityEvent) -> bool:
@@ -5372,6 +5376,11 @@ class TaskManager:
             and str(left_payload.get("http_status") or "") == str(right_payload.get("http_status") or "")
             and str(left_payload.get("error_type") or "") == str(right_payload.get("error_type") or "")
             and str(left_payload.get("error_message") or "") == str(right_payload.get("error_message") or "")
+            and str(left_payload.get("takeover_action") or "") == str(right_payload.get("takeover_action") or "")
+            and str(left_payload.get("takeover_reason") or "") == str(right_payload.get("takeover_reason") or "")
+            and str(left_payload.get("recovery_action") or "") == str(right_payload.get("recovery_action") or "")
+            and str(left_payload.get("task_execution_token") or "") == str(right_payload.get("task_execution_token") or "")
+            and str(left_payload.get("dispatcher_instance_id") or "") == str(right_payload.get("dispatcher_instance_id") or "")
         )
 
     def get_operations(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskOperationPageResponse:
@@ -19294,6 +19303,18 @@ class TaskManager:
         payload: dict[str, Any] | None = None,
         operation_id: str | None = None,
     ) -> None:
+        normalized_payload = payload or {}
+        if self._should_skip_duplicate_event(
+            db,
+            task=task,
+            event_type=event_type,
+            message=message,
+            stage_name=stage_name,
+            item=item,
+            payload=normalized_payload,
+            operation_id=operation_id,
+        ):
+            return
         event = BinarySecurityEvent(
             id=f"evt_{uuid.uuid4().hex[:24]}",
             task_id=task.id,
@@ -19312,11 +19333,54 @@ class TaskManager:
             event_id=event.id,
             event_type=event_type,
             stage_name=stage_name,
-            payload=payload or {},
+            payload=normalized_payload,
             state_event=False,
         )
         db.add(event)
         self._trim_task_timeline_events(db, task_id=task.id)
+
+    def _event_dedupe_window_seconds(self, event_type: str) -> int:
+        if str(event_type or "").strip() in {
+            "owned_execution_takeover_requeued",
+            "streaming_stage_item_requeued_after_downstream_missing",
+        }:
+            return 10
+        return 0
+
+    def _should_skip_duplicate_event(
+        self,
+        db: Session,
+        *,
+        task: BinarySecurityTask,
+        event_type: str,
+        message: str,
+        stage_name: str | None,
+        item: BinarySecurityStageItem | None,
+        payload: dict[str, Any],
+        operation_id: str | None,
+    ) -> bool:
+        within_seconds = self._event_dedupe_window_seconds(event_type)
+        if within_seconds <= 0 or not hasattr(db, "query"):
+            return False
+        return self._has_recent_matching_task_event(
+            db,
+            task,
+            event_type=event_type,
+            stage_name=stage_name,
+            message=message,
+            payload_keys={
+                "downstream_task_id": payload.get("downstream_task_id"),
+                "takeover_action": payload.get("takeover_action"),
+                "takeover_reason": payload.get("takeover_reason"),
+                "recovery_action": payload.get("recovery_action"),
+                "task_execution_token": payload.get("task_execution_token"),
+                "dispatcher_instance_id": payload.get("dispatcher_instance_id"),
+                "operation_id": operation_id,
+                "item_id": _stage_item_attr(item, "id"),
+                "item_key": _stage_item_attr(item, "item_key"),
+            },
+            within_seconds=within_seconds,
+        )
 
     def _trim_task_timeline_events(self, db: Session, *, task_id: str, keep_limit: int = DB_TIMELINE_EVENT_LIMIT) -> None:
         if keep_limit <= 0:
@@ -20834,6 +20898,8 @@ class TaskManager:
         stage_runs: list[BinarySecurityStageRun],
         items: list[BinarySecurityStageItem],
         *,
+        item_stats: dict[str, dict[str, int]] | None = None,
+        downstream_status_counts: dict[str, dict[str, int]] | None = None,
         include_retry_support: bool = True,
     ) -> list[BinarySecurityStageSummary]:
         runs_by_stage = {run.stage_name: run for run in stage_runs if run.stage_name in stage_sequence}
@@ -20863,27 +20929,45 @@ class TaskManager:
         for index, stage_name in enumerate(stage_sequence, start=1):
             run = runs_by_stage.get(stage_name)
             stage_items = items_by_stage.get(stage_name, [])
-            downstream_status_counts: dict[str, int] = {}
-            for item in stage_items:
-                item_result = self._load_stage_item_result_payload(item)
-                sync_observation = dict(item_result.get("sync_observation") or {})
-                downstream_status = (
-                    self._string_or_none(sync_observation.get("downstream_status"))
-                    or self._string_or_none(item_result.get("downstream_status"))
-                )
-                display_downstream_status = self._downstream_status_display_value(downstream_status)
-                downstream_status_counts[display_downstream_status] = downstream_status_counts.get(display_downstream_status, 0) + 1
+            current_downstream_status_counts = dict((downstream_status_counts or {}).get(stage_name, {}))
+            if not current_downstream_status_counts:
+                for item in stage_items:
+                    item_result = self._load_stage_item_result_payload(item)
+                    sync_observation = dict(item_result.get("sync_observation") or {})
+                    downstream_status = (
+                        self._string_or_none(sync_observation.get("downstream_status"))
+                        or self._string_or_none(item_result.get("downstream_status"))
+                    )
+                    display_downstream_status = self._downstream_status_display_value(downstream_status)
+                    current_downstream_status_counts[display_downstream_status] = current_downstream_status_counts.get(display_downstream_status, 0) + 1
+            stage_counts_payload = (item_stats or {}).get(stage_name, {})
+            def _count(name: str, fallback: int) -> int:
+                if name in stage_counts_payload:
+                    return int(stage_counts_payload.get(name) or 0)
+                return int(fallback)
             counts = {
-                "total_items": len(stage_items),
-                "success_items": len([item for item in stage_items if (self._normalize_downstream_status(item.status) or item.status) == "success"]),
-                "failed_items": len([item for item in stage_items if (self._normalize_downstream_status(item.status) or item.status) == "failed"]),
-                "downstream_missing_items": len([item for item in stage_items if (self._normalize_downstream_status(item.status) or item.status) == "downstream_missing"]),
-                "skipped_items": 0,
-                "running_items": len(
-                    [
-                        item for item in stage_items
-                        if (self._normalize_downstream_status(item.status) or item.status) in {"pending", "queued", "running", "dispatching"}
-                    ]
+                "total_items": _count("total", len(stage_items)),
+                "success_items": _count(
+                    "success",
+                    len([item for item in stage_items if (self._normalize_downstream_status(item.status) or item.status) == "success"]),
+                ),
+                "failed_items": _count(
+                    "failed",
+                    len([item for item in stage_items if (self._normalize_downstream_status(item.status) or item.status) == "failed"]),
+                ),
+                "downstream_missing_items": _count(
+                    "downstream_missing",
+                    len([item for item in stage_items if (self._normalize_downstream_status(item.status) or item.status) == "downstream_missing"]),
+                ),
+                "skipped_items": _count("skipped", 0),
+                "running_items": _count(
+                    "running",
+                    len(
+                        [
+                            item for item in stage_items
+                            if (self._normalize_downstream_status(item.status) or item.status) in {"pending", "queued", "running", "dispatching"}
+                        ]
+                    ),
                 ),
             }
             stage_summary = BinarySecurityStageSummary(
@@ -20904,8 +20988,11 @@ class TaskManager:
                 downstream_missing_items=counts["downstream_missing_items"],
                 skipped_items=counts["skipped_items"],
                 running_items=counts["running_items"],
-                cancelled_items=len([item for item in stage_items if (self._normalize_downstream_status(item.status) or item.status) == "cancelled"]),
-                downstream_status_counts=downstream_status_counts,
+                cancelled_items=_count(
+                    "cancelled",
+                    len([item for item in stage_items if (self._normalize_downstream_status(item.status) or item.status) == "cancelled"]),
+                ),
+                downstream_status_counts=current_downstream_status_counts,
                 started_at=run.started_at if run else None,
                 finished_at=run.finished_at if run else None,
                 last_error=(
@@ -20930,6 +21017,8 @@ class TaskManager:
         stage_runs: list[BinarySecurityStageRun],
         items: list[BinarySecurityStageItem],
         *,
+        item_stats: dict[str, dict[str, int]] | None = None,
+        downstream_status_counts: dict[str, dict[str, int]] | None = None,
         include_retry_support: bool = True,
     ) -> list[BinarySecurityStageSummary]:
         return self._build_stage_summaries(
@@ -20938,6 +21027,8 @@ class TaskManager:
             stage_sequence,
             stage_runs,
             items,
+            item_stats=item_stats,
+            downstream_status_counts=downstream_status_counts,
             include_retry_support=include_retry_support,
         )
 
@@ -22787,6 +22878,102 @@ class TaskManager:
             return "never_succeeded"
         return "not_applicable"
 
+    def _format_downstream_status_label(self, status: str | None) -> str:
+        normalized = str(status or "").strip().lower()
+        mapping = {
+            "pending": "待处理",
+            "queued": "排队中",
+            "running": "运行中",
+            "passed": "已通过",
+            "success": "已成功",
+            "failed": "已失败",
+            "cancelled": "已取消",
+            "downstream_missing": "下游不存在",
+            "not_applicable": "不适用",
+            "unknown": "未知",
+            "": "未知",
+        }
+        return mapping.get(normalized, str(status or "未知"))
+
+    def _stage_item_display_downstream_status(self, item: BinarySecurityStageItemResponse) -> str:
+        binding_state = str(item.downstream_binding_state or "").strip().lower()
+        if item.downstream_task_id and not item.downstream_status:
+            return "下游已创建，状态待同步"
+        if binding_state == "creating":
+            return "下游任务创建中"
+        if binding_state == "create_retrying":
+            return "下游任务创建重试中"
+        if binding_state == "create_failed":
+            return "下游任务创建失败"
+        return self._format_downstream_status_label(item.downstream_status)
+
+    def _stage_item_response_sort_value(
+        self,
+        item: BinarySecurityStageItemResponse,
+        sort_by: str,
+    ) -> int | None:
+        normalized_sort = str(sort_by or "").strip().lower()
+        if normalized_sort == "duration":
+            started_at = item.started_at
+            if not isinstance(started_at, datetime):
+                return None
+            finished_at = item.finished_at if isinstance(item.finished_at, datetime) else _now()
+            return max(0, int((finished_at - started_at).total_seconds() * 1000))
+        value = getattr(item, normalized_sort, None)
+        if not isinstance(value, datetime):
+            return None
+        return int(value.timestamp() * 1000)
+
+    def _filter_stage_item_responses(
+        self,
+        items: list[BinarySecurityStageItemResponse],
+        *,
+        downstream_status: str | None = None,
+        sync_status: str | None = None,
+    ) -> list[BinarySecurityStageItemResponse]:
+        normalized_downstream_status = str(downstream_status or "").strip()
+        normalized_sync_status = str(sync_status or "").strip().lower()
+        filtered: list[BinarySecurityStageItemResponse] = []
+        for item in items:
+            if normalized_downstream_status and self._stage_item_display_downstream_status(item) != normalized_downstream_status:
+                continue
+            current_sync_status = str(item.sync_status or "unknown").strip().lower()
+            if normalized_sync_status and current_sync_status != normalized_sync_status:
+                continue
+            filtered.append(item)
+        return filtered
+
+    def _sort_stage_item_responses(
+        self,
+        items: list[BinarySecurityStageItemResponse],
+        *,
+        sort_by: str | None = None,
+        sort_direction: str = "desc",
+    ) -> list[BinarySecurityStageItemResponse]:
+        normalized_sort = str(sort_by or "").strip().lower()
+        if normalized_sort not in {
+            "started_at",
+            "finished_at",
+            "duration",
+            "last_sync_attempt_at",
+            "last_sync_success_at",
+            "last_sync_error_at",
+        }:
+            return items
+        ascending = str(sort_direction or "desc").strip().lower() == "asc"
+        return sorted(
+            items,
+            key=lambda item: (
+                self._stage_item_response_sort_value(item, normalized_sort) is None,
+                (
+                    self._stage_item_response_sort_value(item, normalized_sort) or -1
+                    if ascending
+                    else -(self._stage_item_response_sort_value(item, normalized_sort) or 0)
+                ),
+                str(item.id or ""),
+            ),
+        )
+
     def _stage_item_downstream_summary(
         self,
         item: BinarySecurityStageItem,
@@ -23347,12 +23534,103 @@ class TaskManager:
     def _item_stats(self, items: list[BinarySecurityStageItem]) -> dict[str, dict[str, int]]:
         stats: dict[str, dict[str, int]] = {}
         for item in items:
-            entry = stats.setdefault(item.stage_name, {"total": 0, "success": 0, "failed": 0, "skipped": 0, "running": 0, "cancelled": 0})
+            entry = stats.setdefault(
+                item.stage_name,
+                {"total": 0, "success": 0, "failed": 0, "downstream_missing": 0, "skipped": 0, "running": 0, "cancelled": 0, "partial_success": 0},
+            )
             entry["total"] += 1
             normalized_status = self._normalize_downstream_status(item.status) or item.status
             if normalized_status in entry:
                 entry[normalized_status] += 1
+            elif normalized_status in {"pending", "queued", "running", "dispatching"}:
+                entry["running"] += 1
         return stats
+
+    def _downstream_status_counts_from_items(
+        self,
+        items: list[BinarySecurityStageItem],
+    ) -> dict[str, dict[str, int]]:
+        counts: dict[str, dict[str, int]] = {}
+        for item in items:
+            stage_key = str(item.stage_name or "").strip()
+            if not stage_key:
+                continue
+            item_result = self._load_stage_item_result_payload(item)
+            sync_observation = dict(item_result.get("sync_observation") or {})
+            downstream_status = (
+                self._string_or_none(sync_observation.get("downstream_status"))
+                or self._string_or_none(item_result.get("downstream_status"))
+            )
+            display_status = self._downstream_status_display_value(downstream_status)
+            stage_counts = counts.setdefault(stage_key, {})
+            stage_counts[display_status] = stage_counts.get(display_status, 0) + 1
+        return counts
+
+    def _stage_item_stats_from_db(
+        self,
+        db: Session,
+        task_id: str,
+    ) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
+        item_stats_rows = (
+            db.query(
+                BinarySecurityStageItem.stage_name,
+                BinarySecurityStageItem.status,
+                func.count(BinarySecurityStageItem.id),
+            )
+            .filter(BinarySecurityStageItem.task_id == task_id)
+            .group_by(BinarySecurityStageItem.stage_name, BinarySecurityStageItem.status)
+            .all()
+        )
+        item_stats: dict[str, dict[str, int]] = {}
+        for stage_name, status, count in item_stats_rows:
+            stage_key = str(stage_name or "").strip()
+            if not stage_key:
+                continue
+            entry = item_stats.setdefault(
+                stage_key,
+                {
+                    "total": 0,
+                    "success": 0,
+                    "failed": 0,
+                    "downstream_missing": 0,
+                    "skipped": 0,
+                    "running": 0,
+                    "cancelled": 0,
+                    "partial_success": 0,
+                },
+            )
+            normalized_status = self._normalize_downstream_status(status) or str(status or "").strip()
+            entry["total"] += int(count or 0)
+            if normalized_status in entry:
+                entry[normalized_status] += int(count or 0)
+            elif normalized_status in {"pending", "queued", "running", "dispatching"}:
+                entry["running"] += int(count or 0)
+
+        downstream_rows = (
+            db.query(BinarySecurityStageItem.stage_name, BinarySecurityStageItem.result_json)
+            .filter(BinarySecurityStageItem.task_id == task_id)
+            .all()
+        )
+        downstream_status_counts: dict[str, dict[str, int]] = {}
+        for stage_name, result_json in downstream_rows:
+            stage_key = str(stage_name or "").strip()
+            if not stage_key:
+                continue
+            result_payload = {}
+            if result_json:
+                try:
+                    result_payload = json.loads(result_json)
+                except Exception:
+                    result_payload = {}
+            sync_observation = dict(result_payload.get("sync_observation") or {})
+            downstream_status = (
+                self._string_or_none(sync_observation.get("downstream_status"))
+                or self._string_or_none(result_payload.get("downstream_status"))
+            )
+            display_status = self._downstream_status_display_value(downstream_status)
+            counts = downstream_status_counts.setdefault(stage_key, {})
+            counts[display_status] = counts.get(display_status, 0) + 1
+        return item_stats, downstream_status_counts
 
     def _next_incomplete_stage(self, db: Session, task: BinarySecurityTask) -> str | None:
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()

@@ -68,8 +68,36 @@ class _RouteManagerStub:
             policy={"pipeline_mode": "mixed_streaming"},
         )
 
-    def get_task_stage_items_page(self, db, project_id, task_id, stage_name, page, per_page):
-        self.calls.append(("get_task_stage_items_page", db, project_id, task_id, stage_name, page, per_page))
+    def get_task_stage_items_page(
+        self,
+        db,
+        project_id,
+        task_id,
+        stage_name,
+        status=None,
+        downstream_status=None,
+        sync_status=None,
+        sort_by=None,
+        sort_direction="desc",
+        page=1,
+        per_page=50,
+    ):
+        self.calls.append(
+            (
+                "get_task_stage_items_page",
+                db,
+                project_id,
+                task_id,
+                stage_name,
+                status,
+                downstream_status,
+                sync_status,
+                sort_by,
+                sort_direction,
+                page,
+                per_page,
+            )
+        )
         return BinarySecurityStageItemPageResponse(
             task_id=task_id,
             stage_name=stage_name,
@@ -361,7 +389,7 @@ class TaskApiRouteTests(unittest.TestCase):
             manager.calls[0],
         )
 
-    def test_get_task_stage_items_route_preserves_pagination_and_lineage(self):
+    def test_get_task_stage_items_route_preserves_pagination_and_filters(self):
         app, fake_db = self._build_client()
         manager = _RouteManagerStub()
 
@@ -369,17 +397,39 @@ class TaskApiRouteTests(unittest.TestCase):
             with TestClient(app) as client:
                 response = client.get(
                     "/api/app/binary-security/projects/p1/tasks/t1/stage-items",
-                    params={"stage_name": "dataflow_vuln_scan", "page": 2, "per_page": 10},
+                    params={
+                        "stage_name": "dataflow_vuln_scan",
+                        "status": "running",
+                        "downstream_status": "运行中",
+                        "sync_status": "synced",
+                        "sort_by": "last_sync_attempt_at",
+                        "sort_direction": "asc",
+                        "page": 2,
+                        "per_page": 2000,
+                    },
                     headers={"Authorization": "Bearer token"},
                 )
 
         self.assertEqual(200, response.status_code)
         payload = response.json()
         self.assertEqual(2, payload["page"])
-        self.assertEqual(10, payload["per_page"])
+        self.assertEqual(2000, payload["per_page"])
         self.assertEqual("i-entry-1", payload["items"][0]["input_ref"]["upstream_item_id"])
         self.assertEqual(
-            ("get_task_stage_items_page", fake_db, "p1", "t1", "dataflow_vuln_scan", 2, 10),
+            (
+                "get_task_stage_items_page",
+                fake_db,
+                "p1",
+                "t1",
+                "dataflow_vuln_scan",
+                "running",
+                "运行中",
+                "synced",
+                "last_sync_attempt_at",
+                "asc",
+                2,
+                2000,
+            ),
             manager.calls[0],
         )
 

@@ -4030,6 +4030,71 @@ class TaskManagerTests(unittest.TestCase):
         self.assertIsInstance(detail.stage_items_total, int)
         self.assertIsInstance(detail.stage_items, list)
 
+    def test_get_task_detail_stage_overview_counts_use_full_stage_item_set(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {}
+        task.metrics = {}
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=1,
+            status="running",
+        )
+        stage_items = []
+        for index in range(105):
+            item = BinarySecurityStageItem(
+                id=f"si-{index}",
+                task_id="t1",
+                project_id="p1",
+                stage_run_id="sr-entry",
+                stage_name="entry_analysis",
+                item_key=f"module-{index}",
+                item_name=f"module-{index}",
+                parent_key="source_project",
+                item_identity_key=f"module-{index}::source_project",
+                status="success" if index < 60 else ("failed" if index < 80 else "pending"),
+                downstream_service="entry_analyse",
+                downstream_task_id=f"eat-{index}",
+            )
+            item.result = {
+                "sync_status": "synced" if index < 80 else "pending",
+                "sync_observation": {
+                    "downstream_status": "passed" if index < 60 else ("failed" if index < 80 else "pending"),
+                    "mapped_status": "success" if index < 60 else ("failed" if index < 80 else "pending"),
+                },
+            }
+            stage_items.append(item)
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=stage_items, archive_jobs=[], events=[])
+
+        detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
+
+        self.assertEqual(105, detail.stage_items_total)
+        self.assertTrue(detail.stage_items_truncated)
+        self.assertEqual(100, len(detail.stage_items))
+        entry_summary = next(summary for summary in detail.stage_summaries if summary.stage_name == "entry_analysis")
+        self.assertEqual(105, entry_summary.total_items)
+        self.assertEqual(60, entry_summary.success_items)
+        self.assertEqual(20, entry_summary.failed_items)
+        self.assertEqual(25, entry_summary.running_items)
+        entry_node = next(node for node in detail.overview_nodes if node.node_id == "business:entry_analysis")
+        self.assertEqual(105, entry_node.detail.total_items)
+        self.assertEqual(60, entry_node.detail.success_items)
+        self.assertEqual(20, entry_node.detail.orchestration_failed_items)
+        self.assertEqual(25, entry_node.detail.running_items)
+
     def test_list_tasks_keeps_read_path_side_effect_free_when_stage_is_running(self):
         task = BinarySecurityTask(
             id="t1",
@@ -26194,6 +26259,132 @@ def _test_stage_item_response_does_not_show_pending_sync_when_downstream_status_
 TaskManagerTests.test_stage_item_response_does_not_show_pending_sync_when_downstream_status_exists = _test_stage_item_response_does_not_show_pending_sync_when_downstream_status_exists
 
 
+def _test_get_task_stage_items_page_filters_by_sync_and_downstream_status(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/tmp",
+    )
+    item_match = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="module-a",
+        item_name="module-a",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    item_match.result = {
+        "sync_status": "synced",
+        "sync_observation": {"downstream_status": "running", "mapped_status": "running"},
+        "downstream": {"task_id": "eat-1", "status": "running"},
+    }
+    item_other = BinarySecurityStageItem(
+        id="si2",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="module-b",
+        item_name="module-b",
+        status="success",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-2",
+    )
+    item_other.result = {
+        "sync_status": "pending",
+        "sync_observation": {"downstream_status": "pending", "mapped_status": "pending"},
+        "downstream": {"task_id": "eat-2", "status": "pending"},
+    }
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item_match, item_other], archive_jobs=[])
+
+    response = self.manager.get_task_stage_items_page(
+        db,
+        project_id="p1",
+        task_id="t1",
+        stage_name="entry_analysis",
+        status="running",
+        downstream_status="运行中",
+        sync_status="synced",
+        page=1,
+        per_page=50,
+    )
+
+    self.assertEqual(1, response.total)
+    self.assertEqual(["si1"], [item.id for item in response.items])
+
+
+def _test_get_task_stage_items_page_sorts_by_last_sync_attempt_at(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/tmp",
+    )
+    older = BinarySecurityStageItem(
+        id="si-older",
+        task_id="t1",
+        project_id="p1",
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-a",
+        status="running",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-1",
+    )
+    older.result = {
+        "sync_status": "synced",
+        "last_sync_attempt_at": "2026-06-13T10:00:00+00:00",
+        "sync_observation": {"last_attempt_at": "2026-06-13T10:00:00+00:00", "downstream_status": "running"},
+    }
+    newer = BinarySecurityStageItem(
+        id="si-newer",
+        task_id="t1",
+        project_id="p1",
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-b",
+        status="running",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-2",
+    )
+    newer.result = {
+        "sync_status": "synced",
+        "last_sync_attempt_at": "2026-06-13T11:00:00+00:00",
+        "sync_observation": {"last_attempt_at": "2026-06-13T11:00:00+00:00", "downstream_status": "running"},
+    }
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[older, newer], archive_jobs=[])
+
+    response = self.manager.get_task_stage_items_page(
+        db,
+        project_id="p1",
+        task_id="t1",
+        stage_name="dataflow_vuln_scan",
+        sort_by="last_sync_attempt_at",
+        sort_direction="desc",
+        page=1,
+        per_page=50,
+    )
+
+    self.assertEqual(["si-newer", "si-older"], [item.id for item in response.items])
+
+
+TaskManagerTests.test_get_task_stage_items_page_filters_by_sync_and_downstream_status = _test_get_task_stage_items_page_filters_by_sync_and_downstream_status
+TaskManagerTests.test_get_task_stage_items_page_sorts_by_last_sync_attempt_at = _test_get_task_stage_items_page_sorts_by_last_sync_attempt_at
+
+
 def _test_task_reconcile_candidate_items_scans_all_stages_with_downstream_refs(self):
     task = BinarySecurityTask(
         id="task1",
@@ -27635,6 +27826,58 @@ def _test_get_timeline_compresses_repeated_tail_owner_lost_events(self):
     self.assertIn("已压缩 2 次", timeline.events[0].message)
 
 
+def _test_get_timeline_compresses_repeated_owned_execution_takeover_requeued_events(self):
+    task = BinarySecurityTask(
+        id="task-takeover",
+        project_id="p1",
+        name="n",
+        status="running",
+        current_stage="entry_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    payload = {
+        "takeover_action": "requeue_owned_execution",
+        "takeover_reason": "refresh_task_status_no_active_owner",
+        "dispatcher_instance_id": "worker-a",
+        "task_execution_token": "2026-06-13T11:15:13",
+    }
+    event1 = BinarySecurityEvent(
+        id="evt-takeover-1",
+        task_id="task-takeover",
+        project_id="p1",
+        level="warning",
+        event_type="owned_execution_takeover_requeued",
+        stage_name="entry_analysis",
+        message="检测到执行接管悬空，已重新排队等待 worker 接管",
+        payload=payload,
+    )
+    event1.created_at = _now()
+    event2 = BinarySecurityEvent(
+        id="evt-takeover-2",
+        task_id="task-takeover",
+        project_id="p1",
+        level="warning",
+        event_type="owned_execution_takeover_requeued",
+        stage_name="entry_analysis",
+        message="检测到执行接管悬空，已重新排队等待 worker 接管",
+        payload=dict(payload),
+    )
+    event2.created_at = _now()
+    db = _ModelAwareDb(tasks=[task], events=[event1, event2])
+
+    with patch.object(task_manager_module, "get_session_factory", return_value=lambda: db):
+        timeline = TaskManager().get_timeline(db, project_id="p1", task_id="task-takeover")
+
+    self.assertEqual(1, len(timeline.events))
+    self.assertTrue(timeline.events[0].compressed)
+    self.assertEqual(2, timeline.events[0].repeat_count)
+    self.assertIn("已压缩 2 次", timeline.events[0].message)
+
+
 def _test_record_event_trims_task_timeline_to_10000_events(self):
     manager = TaskManager()
     task = BinarySecurityTask(
@@ -27675,6 +27918,59 @@ def _test_record_event_trims_task_timeline_to_10000_events(self):
     self.assertEqual(10_000, len(db.events))
     self.assertFalse(any(event.id == "evt-00000" for event in db.events))
     self.assertTrue(any(event.event_type == "overflow" for event in db.events))
+
+
+def _test_record_event_skips_duplicate_owned_execution_takeover_requeued_events(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-dedupe",
+        project_id="p1",
+        name="timeline-dedupe",
+        status="running",
+        current_stage="entry_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/out",
+        workspace_root="/ws",
+    )
+    existing = BinarySecurityEvent(
+        id="evt-existing",
+        task_id=task.id,
+        project_id=task.project_id,
+        level="warning",
+        event_type="owned_execution_takeover_requeued",
+        stage_name="entry_analysis",
+        item_id=None,
+        item_key=None,
+        message="检测到执行接管悬空，已重新排队等待 worker 接管",
+        payload={
+            "takeover_action": "requeue_owned_execution",
+            "takeover_reason": "refresh_task_status_no_active_owner",
+            "dispatcher_instance_id": "worker-a",
+            "task_execution_token": "2026-06-13T11:15:13",
+        },
+    )
+    existing.created_at = _now()
+    db = _ModelAwareDb(tasks=[task], events=[existing])
+
+    manager._record_event(
+        db,
+        task,
+        "owned_execution_takeover_requeued",
+        "检测到执行接管悬空，已重新排队等待 worker 接管",
+        level="warning",
+        stage_name="entry_analysis",
+        payload={
+            "takeover_action": "requeue_owned_execution",
+            "takeover_reason": "refresh_task_status_no_active_owner",
+            "dispatcher_instance_id": "worker-a",
+            "task_execution_token": "2026-06-13T11:15:13",
+        },
+    )
+
+    requeue_events = [event for event in db.events if event.event_type == "owned_execution_takeover_requeued"]
+    self.assertEqual(1, len(requeue_events))
 
 
 def _test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged(self):
@@ -30036,7 +30332,9 @@ TaskManagerTests.test_record_polled_child_sync_failure_marks_owner_lost_exhauste
 TaskManagerTests.test_record_polled_child_sync_failure_keeps_tail_owner_lost_for_tail_stale = _test_record_polled_child_sync_failure_keeps_tail_owner_lost_for_tail_stale
 TaskManagerTests.test_worker_skips_tail_tasks_in_downstream_reconcile_candidates = _test_worker_skips_tail_tasks_in_downstream_reconcile_candidates
 TaskManagerTests.test_get_timeline_compresses_repeated_tail_owner_lost_events = _test_get_timeline_compresses_repeated_tail_owner_lost_events
+TaskManagerTests.test_get_timeline_compresses_repeated_owned_execution_takeover_requeued_events = _test_get_timeline_compresses_repeated_owned_execution_takeover_requeued_events
 TaskManagerTests.test_record_event_trims_task_timeline_to_10000_events = _test_record_event_trims_task_timeline_to_10000_events
+TaskManagerTests.test_record_event_skips_duplicate_owned_execution_takeover_requeued_events = _test_record_event_skips_duplicate_owned_execution_takeover_requeued_events
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_locally_owned_running_task = _test_task_needs_downstream_reconcile_skips_locally_owned_running_task
 TaskManagerTests.test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items = _test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_failed_task_with_terminal_child = _test_task_needs_downstream_reconcile_skips_failed_task_with_terminal_child
