@@ -19342,6 +19342,75 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual("/old/archive", refreshed.archive_root)
         self.assertEqual("copy failed", refreshed.error_message)
 
+    def test_ensure_downstream_archive_job_reuses_ignored_job_for_same_dedupe_key(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="entry_analysis",
+            item_key="source_project-images",
+            item_name="images",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+            status="success",
+        )
+        job = BinarySecurityArchiveJob(
+            id="aj1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_id="si1",
+            item_key="source_project-images",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+            job_dedupe_key="si1::eat_1",
+            archive_status="ignored",
+        )
+        job.payload = {
+            "mapped_status": "success",
+            "before_status": "running",
+            "force": True,
+            "downstream_payload": {
+                "task_id": "eat_1",
+                "status": "passed",
+            },
+            "extra_paths": [],
+        }
+        db = _LockingDb(_FakeConnection(lock_result=True))
+        db.tasks.append(task)
+        db.stage_items.append(item)
+        db.archive_jobs.append(job)
+
+        refreshed = self.manager._ensure_downstream_archive_job(
+            db,
+            task,
+            item,
+            payload={
+                "task_id": "eat_1",
+                "status": "passed",
+                "updated_at": "2026-06-14T00:27:41+00:00",
+            },
+            mapped_status="success",
+            before_status="success",
+            force=True,
+        )
+
+        self.assertIs(job, refreshed)
+        self.assertEqual("ignored", refreshed.archive_status)
+        self.assertEqual(1, len(db.archive_jobs))
+
     def test_ensure_downstream_archive_job_retries_retryable_deadlock(self):
         task = BinarySecurityTask(
             id="task1",

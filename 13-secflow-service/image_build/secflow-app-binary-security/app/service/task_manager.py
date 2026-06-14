@@ -10695,7 +10695,15 @@ class TaskManager:
                     BinarySecurityArchiveJob.task_id == task.id,
                     BinarySecurityArchiveJob.stage_name == item.stage_name,
                     BinarySecurityArchiveJob.job_dedupe_key == job_dedupe_key,
-                    BinarySecurityArchiveJob.archive_status.in_(["pending", "running", "archived", "applying", "success"]),
+                    BinarySecurityArchiveJob.archive_status.in_([
+                        "pending",
+                        "running",
+                        "archived",
+                        "applying",
+                        "success",
+                        "ignored",
+                        "skipped",
+                    ]),
                 )
                 .order_by(BinarySecurityArchiveJob.created_at.desc())
                 .first()
