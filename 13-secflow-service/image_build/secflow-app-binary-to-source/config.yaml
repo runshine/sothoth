@@ -44,7 +44,7 @@ pi_re_agent:
   default_worker_max_concurrent_jobs: 3
   dispatcher_lease_seconds: 15
   batch_size: 8192
-  max_retries: 3
+  max_retries: -1
   agent_run_timeout_seconds: 86400
   agent_timeout_retry_enabled: true
   agent_timeout_max_retries: 20

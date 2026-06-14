@@ -73,7 +73,7 @@ class PiReAgentConfig(BaseModel):
     cancelling_stale_after_seconds: int = 300
     queued_stale_after_seconds: int = 1800
     batch_size: int = 8192
-    max_retries: int = 3
+    max_retries: int = -1
     agent_run_timeout_seconds: int = 86400
     agent_timeout_retry_enabled: bool = True
     agent_timeout_max_retries: int = 20

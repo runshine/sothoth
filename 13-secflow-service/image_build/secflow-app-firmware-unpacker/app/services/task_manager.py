@@ -698,12 +698,42 @@ def _is_http_429_error(error: str) -> bool:
     return _extract_http_status_from_error(error) == 429
 
 
+def _is_retryable_api_error(error: str) -> bool:
+    text = str(error or "").strip().lower()
+    if not text:
+        return False
+    status = _extract_http_status_from_error(text)
+    if status is not None:
+        return status == 429 or status >= 400
+    retryable_patterns = (
+        "api",
+        "http",
+        "timeout",
+        "connection",
+        "rate limit",
+        "too many requests",
+        "service unavailable",
+        "server error",
+        "bad gateway",
+        "gateway timeout",
+        "temporarily unavailable",
+        "upstream",
+    )
+    return any(pattern in text for pattern in retryable_patterns)
+
+
 _RATE_LIMIT_RETRY_DELAY_SECONDS = 30
 
 
 def _should_emit_rate_limit_timeline_event(streak: int) -> bool:
     streak = max(0, int(streak or 0))
     return streak == 1 or (streak > 0 and streak % 10 == 0)
+
+
+def _should_emit_api_retry_timeline_event(streak: int, delay_seconds: int) -> bool:
+    retries = max(0, int(streak or 0))
+    delay = max(0, int(delay_seconds or 0))
+    return delay >= _RATE_LIMIT_RETRY_DELAY_SECONDS and retries > 0 and retries % 10 == 0
 
 
 def _sleep_with_cancel_check(task_id: str, run_token: str, seconds: int) -> bool:
@@ -4925,13 +4955,19 @@ def run_claimed_task_process(task_id: str, *, owner_id: str, run_token: str) -> 
                 break
             except Exception as exc:
                 error_text = str(exc)
-                if not _is_http_429_error(error_text):
+                is_rate_limited = _is_http_429_error(error_text)
+                is_retryable_api = _is_retryable_api_error(error_text)
+                if not is_rate_limited and not is_retryable_api:
                     logger.exception("task %s failed with exception: %s", task_id, exc)
                     _update_task_error(task_id, error_text, run_token=run_token)
                     break
                 rate_limit_streak += 1
-                logger.warning("task %s rate limited by downstream model pool streak=%s: %s", task_id, rate_limit_streak, error_text)
-                if _should_emit_rate_limit_timeline_event(rate_limit_streak):
+                retry_delay_seconds = _RATE_LIMIT_RETRY_DELAY_SECONDS
+                if is_rate_limited:
+                    logger.warning("task %s rate limited by downstream model pool streak=%s: %s", task_id, rate_limit_streak, error_text)
+                else:
+                    logger.warning("task %s hit retryable API error streak=%s: %s", task_id, rate_limit_streak, error_text)
+                if is_rate_limited and _should_emit_rate_limit_timeline_event(rate_limit_streak):
                     _record_task_event(
                         task_id,
                         project_id=task.project_id,
@@ -4942,8 +4978,24 @@ def run_claimed_task_process(task_id: str, *, owner_id: str, run_token: str) -> 
                         detail={
                             "http_status": 429,
                             "reason": error_text,
-                            "retry_delay_seconds": _RATE_LIMIT_RETRY_DELAY_SECONDS,
+                            "retry_delay_seconds": retry_delay_seconds,
                             "consecutive_rate_limit_count": rate_limit_streak,
+                        },
+                        owner_id=owner_id,
+                        created_by="task_manager",
+                    )
+                if (not is_rate_limited) and _should_emit_api_retry_timeline_event(rate_limit_streak, retry_delay_seconds):
+                    _record_task_event(
+                        task_id,
+                        project_id=task.project_id,
+                        event_type="task_api_retrying",
+                        summary=f"智能体 API 错误，已自动重试 {rate_limit_streak} 次（当前退避 {retry_delay_seconds} 秒）",
+                        stage_key=task.current_stage,
+                        status=getattr(task, "status", None),
+                        detail={
+                            "reason": error_text,
+                            "retry_delay_seconds": retry_delay_seconds,
+                            "consecutive_api_retry_count": rate_limit_streak,
                         },
                         owner_id=owner_id,
                         created_by="task_manager",
@@ -4954,7 +5006,7 @@ def run_claimed_task_process(task_id: str, *, owner_id: str, run_token: str) -> 
                     run_token=run_token,
                     stage=f"rate_limited_retrying:{rate_limit_streak}",
                 )
-                if _sleep_with_cancel_check(task_id, run_token, _RATE_LIMIT_RETRY_DELAY_SECONDS):
+                if _sleep_with_cancel_check(task_id, run_token, retry_delay_seconds):
                     _mark_task_cancelled(task_id, reason="cancel requested during rate limit backoff")
                     break
     finally:
