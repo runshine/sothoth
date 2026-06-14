@@ -5880,17 +5880,29 @@ class TaskManager:
             # terminal downstream state, otherwise the stale cancelled/failed child
             # short-circuits the requeue path before a replacement child can be created.
             sync_apply_state = False
-        await self.sync_downstream_status(
-            db,
-            project_id=task.project_id,
-            task_id=task.id,
-            stage_name=target_stage,
-            item_ids=retry_item_ids,
-            force=True,
-            token=self._service_token(),
-            record_request_event=False,
-            apply_state=sync_apply_state,
-        )
+        scoped_retry_item_ids: set[str] | None = None
+        if target_stage == "entry_analysis":
+            scoped_retry_item_ids = set(retry_item_ids)
+            setattr(task, "_retry_prepare_scoped_item_ids", scoped_retry_item_ids)
+            setattr(task, "_retry_prepare_scoped_stage_name", target_stage)
+        try:
+            await self.sync_downstream_status(
+                db,
+                project_id=task.project_id,
+                task_id=task.id,
+                stage_name=target_stage,
+                item_ids=retry_item_ids,
+                force=True,
+                token=self._service_token(),
+                record_request_event=False,
+                apply_state=sync_apply_state,
+            )
+        finally:
+            if scoped_retry_item_ids is not None:
+                if hasattr(task, "_retry_prepare_scoped_item_ids"):
+                    delattr(task, "_retry_prepare_scoped_item_ids")
+                if hasattr(task, "_retry_prepare_scoped_stage_name"):
+                    delattr(task, "_retry_prepare_scoped_stage_name")
         if target_stage == "entry_analysis":
             # Failed-item retry for entry-analysis must sever the stale child link
             # after observing the old terminal state, but binding removal now
@@ -8165,6 +8177,15 @@ class TaskManager:
             ordered_ids = [str(current_id).strip() for current_id in list(item_ids or []) if str(current_id).strip()]
             matched = {str(item.id): item for item in items if str(item.id or "").strip()}
             items = [matched[current_id] for current_id in ordered_ids if current_id in matched]
+        scoped_retry_item_ids = getattr(task, "_retry_prepare_scoped_item_ids", None)
+        scoped_retry_stage_name = str(getattr(task, "_retry_prepare_scoped_stage_name", "") or "").strip()
+        if scoped_retry_item_ids and scoped_retry_stage_name:
+            items = [
+                item
+                for item in items
+                if str(item.stage_name or "").strip() == scoped_retry_stage_name
+                and str(item.id or "").strip() in scoped_retry_item_ids
+            ]
         if item_id and not items:
             raise NotFoundError("阶段子任务不存在")
         if item_ids and not items:
