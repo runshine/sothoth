@@ -5605,6 +5605,46 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("barrier", detail.policy["pipeline_mode"])
         self.assertEqual("barrier", db.tasks[-1].policy["pipeline_mode"])
 
+    async def test_create_task_marks_source_tree_input_kind_when_relative_paths_provided(self):
+        payload = BinarySecurityTaskCreate(
+            task_id="t1",
+            task_type=TASK_TYPE_SOURCE,
+            name="source-task",
+            input_files=[
+                BinarySecurityInputFile(filename="main.c", relative_path="src/main.c", size=12),
+                BinarySecurityInputFile(filename="util.h", relative_path="include/util.h", size=8),
+            ],
+        )
+        db = _AppendingModelAwareDb()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "task-root"
+            with (
+                patch.object(task_manager_module, "app_task_root", return_value=workspace),
+                patch.object(self.manager, "_init_workspace_async", unittest.mock.AsyncMock()),
+                patch.object(self.manager, "_ensure_task_directories", unittest.mock.AsyncMock()),
+                patch.object(self.manager, "_write_task_metadata_async", unittest.mock.AsyncMock()),
+                patch.object(
+                    self.manager,
+                    "get_task_detail",
+                    side_effect=lambda _db, project_id, task_id: SimpleNamespace(
+                        id=task_id,
+                        project_id=project_id,
+                        summary=dict(_db.tasks[-1].summary or {}),
+                    ),
+                ),
+            ):
+                detail = await self.manager.create_task(
+                    db,
+                    project_id="p1",
+                    payload=payload,
+                    created_by="tester",
+                    authorization_token="token",
+                )
+
+        self.assertEqual("source_tree_files", detail.summary["input_kind"])
+        self.assertEqual("source_tree_files", db.tasks[-1].summary["input_kind"])
+
     async def test_complete_uploads_populates_binary_module_summary_and_metrics(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -5669,6 +5709,96 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, task.metrics["selected_module_count"])
             self.assertEqual(1, task.metrics["candidate_module_count"])
             self.assertEqual(1, task.metrics["uploaded_file_count"])
+            self.assertEqual("ready_to_start", detail.status)
+
+    def test_normalize_source_input_files_accepts_source_tree_files(self):
+        rows = self.manager._normalize_input_files(
+            [
+                {"filename": "main.c", "relative_path": "src/main.c"},
+                {"filename": "util.h", "relative_path": "include/util.h"},
+            ],
+            task_type=TASK_TYPE_SOURCE,
+        )
+
+        self.assertEqual(["src/main.c", "include/util.h"], [row["relative_path"] for row in rows])
+        self.assertEqual("source_tree_files", self.manager._source_input_kind(rows))
+
+    def test_normalize_source_input_files_rejects_mixed_archive_and_tree_modes(self):
+        with self.assertRaisesRegex(ValidationError, "不能混合目录文件和压缩包"):
+            self.manager._normalize_input_files(
+                [
+                    {"filename": "src.zip"},
+                    {"filename": "main.c", "relative_path": "src/main.c"},
+                ],
+                task_type=TASK_TYPE_SOURCE,
+            )
+
+    async def test_complete_uploads_accepts_source_tree_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            input_dir = workspace / "input"
+            src_file = input_dir / "src" / "main.c"
+            header_file = input_dir / "include" / "util.h"
+            src_file.parent.mkdir(parents=True, exist_ok=True)
+            header_file.parent.mkdir(parents=True, exist_ok=True)
+            src_file.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+            header_file.write_text("#pragma once\n", encoding="utf-8")
+
+            task = BinarySecurityTask(
+                id="src1",
+                project_id="p1",
+                name="source-task",
+                task_type=TASK_TYPE_SOURCE,
+                status="pending_upload",
+                firmware_source="project_filesystem",
+                firmware_path=str(input_dir),
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            task.summary = {
+                "input_dir": str(input_dir),
+                "temp_upload_dir": str(workspace / "run" / "upload-tmp"),
+                "input_kind": "source_tree_files",
+                "input_files": [
+                    {"filename": "main.c", "relative_path": "src/main.c"},
+                    {"filename": "util.h", "relative_path": "include/util.h"},
+                ],
+            }
+            task.metrics = {}
+            db = _ModelAwareDb(tasks=[task], stage_runs=[], stage_items=[], archive_jobs=[])
+
+            def _fake_start_task(_db, *, project_id, task_id):
+                self.assertEqual("p1", project_id)
+                self.assertEqual("src1", task_id)
+                return self.manager.get_task_detail(_db, project_id=project_id, task_id=task_id)
+
+            original_start_task = self.manager.start_task
+            original_build_queue_info = self.manager._build_queue_info
+            self.manager.start_task = _fake_start_task
+            self.manager._build_queue_info = lambda *_args, **_kwargs: {"pending_positions": {}, "running_count": 0, "queued_count": 0, "max_concurrent_tasks": 0}
+            try:
+                with patch.object(self.manager, "_check_storage_free_space", return_value=None):
+                    detail = await self.manager.complete_uploads(
+                        db,
+                        project_id="p1",
+                        task_id="src1",
+                        payload=BinarySecurityUploadCompletePayload(
+                            files=[
+                                BinarySecurityInputFile(filename="main.c", relative_path="src/main.c"),
+                                BinarySecurityInputFile(filename="util.h", relative_path="include/util.h"),
+                            ]
+                        ),
+                        updated_by="tester",
+                        authorization_token="token",
+                    )
+            finally:
+                self.manager.start_task = original_start_task
+                self.manager._build_queue_info = original_build_queue_info
+
+            self.assertEqual("ready_to_start", task.status)
+            self.assertEqual("source_tree_files", task.summary["input_kind"])
+            self.assertEqual(2, len(task.summary["input_files"]))
+            self.assertEqual(2, task.metrics["uploaded_file_count"])
             self.assertEqual("ready_to_start", detail.status)
 
     def test_build_project_stats_aggregates_task_metrics(self):
@@ -18610,7 +18740,7 @@ def _test_get_module_report_rejects_unknown_module(self):
         self.manager.get_module_report(db, project_id="p1", task_id="t1", module_key="unknown")
 
 def _test_normalize_source_input_files_rejects_duplicate_relative_paths(self):
-    with self.assertRaisesRegex(Exception, "重复文件名"):
+    with self.assertRaisesRegex(Exception, "重复路径"):
         self.manager._normalize_input_files(
             [
                 {"filename": "src.zip", "relative_path": "src/a.c"},
