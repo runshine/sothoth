@@ -159,6 +159,31 @@ Manages Kubernetes resources directly via K8s API:
 - Handles pod/exec for terminal sessions
 - Manages deployments and services
 
+## secflow-app-system-analyse: Task Format Versioning
+
+任务根目录（`/data/output/{task_id}/`）通过 `.task_version` 文件记录创建该任务时的代码格式版本号。
+
+### 版本规则
+- **大版本号**（V1.0 → V2.0）：表示任务目录布局发生了**不兼容变更**
+  - 变更大版本号时，所有旧版本任务目录将在下次执行时自动清空重建
+  - resume（断点续跑）会被拒绝，提示用户使用 restart
+- **小版本号**（V2.0 → V2.1）：兼容升级，无需清空
+
+### 需要递增大版本号的场景
+- `.snapshot` 文件/目录形态变更
+- `modules/` 目录结构调整
+- `details/` JSON schema 变更
+- `workspace/` 关键文件命名或布局变更
+
+### 操作方式
+1. 修改 `app/task_version.py` 中的 `TASK_FORMAT_VERSION`
+2. 在文件注释中记录变更说明
+3. 入口点自动调用 `ensure_task_format_version()` 完成校验和清空
+
+### V2.0 变更说明
+- `.snapshot` 从纯文件变为支持目录形态（`modules/<mod>/.snapshot/files.list`）以兼容只读 NFS
+- 首次引入 `.task_version` 文件
+
 ## Important Notes
 
 - When running services locally for development, use the `sothoth` conda environment
