@@ -2611,7 +2611,7 @@ class TaskManager:
             "input_manifest_path": str(metadata_path),
             "input_files": input_files,
             "input_kind": (
-                "source_archives"
+                self._source_input_kind(input_files)
                 if task_type == TASK_TYPE_SOURCE
                 else "module_elf_files"
                 if task_type == TASK_TYPE_BINARY_MODULE
@@ -2681,13 +2681,25 @@ class TaskManager:
         input_dir = Path(task.workspace_root) / "input"
         self._record_event(db, task, "task_upload_started", "开始校验上传文件")
         if self._task_type(task) == TASK_TYPE_SOURCE:
-            actual_files, total_bytes, extracted_count = await self._materialize_source_archives(task, declared)
-            self._record_event(
-                db,
-                task,
-                "source_archives_extracted",
-                "源码压缩包已解压到任务输入目录",
-                payload={"archive_count": len(actual_files), "extracted_file_count": extracted_count},
+            source_input_kind = self._source_input_kind(declared)
+            if source_input_kind == "source_archives":
+                actual_files, total_bytes, extracted_count = await self._materialize_source_archives(task, declared)
+                self._record_event(
+                    db,
+                    task,
+                    "source_archives_extracted",
+                    "源码压缩包已解压到任务输入目录",
+                    payload={"archive_count": len(actual_files), "extracted_file_count": extracted_count},
+                )
+            else:
+                actual_files, total_bytes = await self._materialize_source_tree_files(task, declared)
+                extracted_count = len(actual_files)
+                self._record_event(
+                    db,
+                    task,
+                    "source_tree_verified",
+                    "源码目录文件已校验并纳入任务输入目录",
+                    payload={"file_count": len(actual_files)},
                 )
         elif self._task_type(task) == TASK_TYPE_BINARY_MODULE:
             actual_files = []
@@ -2738,6 +2750,7 @@ class TaskManager:
         task.summary = {
             **task.summary,
             "input_files": actual_files,
+            "input_kind": self._source_input_kind(actual_files) if self._task_type(task) == TASK_TYPE_SOURCE else task.summary.get("input_kind"),
             **(self._build_binary_module_summary(task, actual_files) if self._task_type(task) == TASK_TYPE_BINARY_MODULE else {}),
         }
         task.metrics = {
@@ -18025,7 +18038,78 @@ class TaskManager:
     async def _write_task_metadata_async(self, task: BinarySecurityTask, metadata_path: Path, *, status: str) -> None:
         await asyncio.to_thread(self._write_task_metadata, task, metadata_path, status=status)
 
+    def _normalize_source_input_files(self, files: list[BinarySecurityInputFile | dict[str, Any]]) -> list[dict[str, Any]]:
+        rows = []
+        seen_relative_paths: set[str] = set()
+        seen_archive_names: set[str] = set()
+        seen_keys: set[str] = set()
+        source_mode: str | None = None
+        for index, raw in enumerate(files):
+            item = raw.model_dump(mode="json") if isinstance(raw, BinarySecurityInputFile) else dict(raw)
+            filename = str(item.get("filename") or "").strip()
+            if not filename:
+                raise ValidationError("上传文件名不能为空")
+            if "/" in filename or "\\" in filename:
+                raise ValidationError(f"文件名不合法: {filename}")
+            relative_path_raw = str(item.get("relative_path") or "").strip().replace("\\", "/").strip("/")
+            if relative_path_raw:
+                path_parts = [part for part in relative_path_raw.split("/") if part]
+                if any(part in {".", ".."} for part in path_parts):
+                    raise ValidationError(f"相对路径不合法: {relative_path_raw}")
+                effective_path = "/".join(path_parts)
+                if Path(effective_path).name != filename:
+                    effective_path = "/".join([part for part in path_parts[:-1]] + [filename]) if path_parts else filename
+                current_mode = "source_tree_files"
+            else:
+                effective_path = filename
+                current_mode = "source_archives"
+            if source_mode is None:
+                source_mode = current_mode
+            elif source_mode != current_mode:
+                raise ValidationError("源码扫描输入不能混合目录文件和压缩包，请选择同一种输入方式")
+            if current_mode == "source_archives":
+                if filename in seen_archive_names:
+                    raise ValidationError(f"存在重复文件名: {filename}")
+                seen_archive_names.add(filename)
+                if not self._is_supported_source_archive(filename):
+                    raise ValidationError(f"源码扫描仅支持常见压缩文件或源码目录文件: {filename}")
+            else:
+                if effective_path in seen_relative_paths:
+                    raise ValidationError(f"存在重复路径: {effective_path}")
+                seen_relative_paths.add(effective_path)
+            firmware_key = _slug(effective_path or filename)
+            if firmware_key in seen_keys:
+                firmware_key = _slug(f"{index + 1}-{effective_path or filename}")
+            seen_keys.add(firmware_key)
+            rows.append(
+                {
+                    "filename": filename,
+                    "size": int(item.get("size") or 0),
+                    "content_type": item.get("content_type"),
+                    "relative_path": effective_path,
+                    "metadata": item.get("metadata") or {},
+                    "firmware_key": firmware_key,
+                    "firmware_name": Path(filename).stem or filename,
+                }
+            )
+        if not rows:
+            raise ValidationError("至少需要上传一个输入文件")
+        return rows
+
+    def _source_input_kind(self, input_files: list[dict[str, Any]]) -> str:
+        if not input_files:
+            return "source_archives"
+        if all(
+            self._is_supported_source_archive(str(item.get("filename") or ""))
+            and str(item.get("relative_path") or "").strip() == str(item.get("filename") or "").strip()
+            for item in input_files
+        ):
+            return "source_archives"
+        return "source_tree_files"
+
     def _normalize_input_files(self, files: list[BinarySecurityInputFile | dict[str, Any]], *, task_type: str) -> list[dict[str, Any]]:
+        if task_type == TASK_TYPE_SOURCE:
+            return self._normalize_source_input_files(files)
         rows = []
         seen_names: set[str] = set()
         seen_paths: set[str] = set()
@@ -18047,21 +18131,13 @@ class TaskManager:
                     effective_path = "/".join([part for part in path_parts[:-1]] + [filename]) if path_parts else filename
             else:
                 effective_path = filename
-            if task_type == TASK_TYPE_SOURCE:
-                effective_path = filename
-                if filename in seen_names:
-                    raise ValidationError(f"存在重复文件名: {filename}")
-                seen_names.add(filename)
-                if not self._is_supported_source_archive(filename):
-                    raise ValidationError(f"源码扫描仅支持常见压缩文件: {filename}")
-            else:
-                dedupe_key = effective_path if task_type == TASK_TYPE_BINARY_MODULE else filename
-                if dedupe_key in seen_paths:
-                    raise ValidationError(f"存在重复{'路径' if task_type == TASK_TYPE_BINARY_MODULE else '文件名'}: {dedupe_key}")
-                seen_paths.add(dedupe_key)
-                if filename in seen_names and task_type != TASK_TYPE_BINARY_MODULE:
-                    raise ValidationError(f"存在重复文件名: {filename}")
-                seen_names.add(filename)
+            dedupe_key = effective_path if task_type == TASK_TYPE_BINARY_MODULE else filename
+            if dedupe_key in seen_paths:
+                raise ValidationError(f"存在重复{'路径' if task_type == TASK_TYPE_BINARY_MODULE else '文件名'}: {dedupe_key}")
+            seen_paths.add(dedupe_key)
+            if filename in seen_names and task_type != TASK_TYPE_BINARY_MODULE:
+                raise ValidationError(f"存在重复文件名: {filename}")
+            seen_names.add(filename)
             firmware_key = _slug(filename)
             if firmware_key in seen_keys:
                 firmware_key = _slug(f"{index + 1}-{filename}")
@@ -18264,6 +18340,32 @@ class TaskManager:
         await asyncio.to_thread(shutil.rmtree, temp_dir, True)
         await asyncio.to_thread(ensure_dir, temp_dir)
         return actual_files, total_bytes, extracted_count
+
+    async def _materialize_source_tree_files(self, task: BinarySecurityTask, declared: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+        input_dir = ensure_dir(Path(task.workspace_root) / "input")
+        actual_files: list[dict[str, Any]] = []
+        total_bytes = 0
+        for file_info in declared:
+            filename = str(file_info["filename"])
+            relative_path = str(file_info.get("relative_path") or filename).strip().replace("\\", "/")
+            local_path = input_dir / relative_path
+            if not await asyncio.to_thread(local_path.is_file):
+                raise ValidationError(f"上传文件缺失: {relative_path}")
+            stat = await asyncio.to_thread(local_path.stat)
+            self._check_storage_free_space(required_bytes=stat.st_size)
+            total_bytes += stat.st_size
+            actual_files.append(
+                {
+                    **file_info,
+                    "size": stat.st_size,
+                    "uploaded": True,
+                    "path": f"{task.summary.get('input_dir')}/{relative_path}",
+                    "extracted": False,
+                }
+            )
+        if not actual_files:
+            raise ValidationError("源码目录中没有可用文件")
+        return actual_files, total_bytes
 
     def _merge_policy(self, db: Session, project_id: str, overrides: dict[str, Any], stage_options: dict[str, Any]) -> dict[str, Any]:
         stage_parallelism = {stage: self.cfg.runtime_policy.max_stage_parallelism for stage in STAGE_SEQUENCE}
