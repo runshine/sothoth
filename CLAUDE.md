@@ -186,6 +186,10 @@ Manages Kubernetes resources directly via K8s API:
 - 根因：LLM Worker 的 `write`/`bash` 工具可能意外创建 `.snapshot/` 目录；修复策略是每次模块处理前删除目录重建文件，而非兼容目录形态
 - 首次引入 `.task_version` 文件
 
+## Important Rules
+
+- **No asyncio outside FastAPI/uvicorn**: All background services (schedulers, workers, health checks, dispatch loops) must use threading + time.sleep(). Do NOT use async/await outside of FastAPI route handlers and uvicorn. Use `threading.Thread`, `time.sleep()`, and synchronous DB/HTTP calls.
+
 ## Important Notes
 
 - When running services locally for development, use the `sothoth` conda environment
