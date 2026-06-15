@@ -181,7 +181,9 @@ Manages Kubernetes resources directly via K8s API:
 3. 入口点自动调用 `ensure_task_format_version()` 完成校验和清空
 
 ### V2.0 变更说明
-- `.snapshot` 从纯文件变为支持目录形态（`modules/<mod>/.snapshot/files.list`）以兼容只读 NFS
+- `.snapshot` 始终为纯文件格式，S2 每次通过 `_create_snapshot_file` 强制规范化
+- 回滚了 `1c81dd5` 的目录兼容代码（`_snapshot_file_path` 嵌套路径、`_ensure_snapshot_file` 目录转换）
+- 根因：LLM Worker 的 `write`/`bash` 工具可能意外创建 `.snapshot/` 目录；修复策略是每次模块处理前删除目录重建文件，而非兼容目录形态
 - 首次引入 `.task_version` 文件
 
 ## Important Notes
