@@ -13754,6 +13754,37 @@ class TaskManager:
             return False, "claimed_by_current_execution"
         return True, "requeued_pending"
 
+    def _should_recreate_entry_child_from_terminal_status(
+        self,
+        *,
+        retrying: bool,
+        terminal_status: str | None,
+    ) -> bool:
+        normalized_status = str(terminal_status or "").strip().lower()
+        if normalized_status not in {"failed", "error", "cancelled", "downstream_missing"}:
+            return False
+        # Entry analysis terminal children should not be silently recreated by
+        # streaming reconcile. Only an explicit retry path may recreate them.
+        return bool(retrying)
+
+    def _entry_terminal_payload_requires_recreate(
+        self,
+        *,
+        retrying: bool,
+        payload: dict[str, Any] | None,
+    ) -> tuple[bool, str | None]:
+        terminal_status = self._status_from_downstream_payload(
+            dict(payload or {}),
+            success_statuses={"passed", "success"},
+        )
+        return (
+            self._should_recreate_entry_child_from_terminal_status(
+                retrying=retrying,
+                terminal_status=terminal_status,
+            ),
+            terminal_status,
+        )
+
     def _requeue_stage_item_after_downstream_missing(
         self,
         db: Session,
@@ -32387,8 +32418,35 @@ class TaskManager:
                         )
                     else:
                         payload = dict(reusable_payload)
-                        status = self._status_from_downstream_payload(payload, success_statuses={"passed", "success"})
-                    created = None
+                        should_recreate, terminal_status = self._entry_terminal_payload_requires_recreate(
+                            retrying=retrying,
+                            payload=payload,
+                        )
+                        if should_recreate:
+                            input_contract = self._build_entry_analysis_input_contract(entry_input)
+                            item.downstream_task_id = None
+                            created = await self._downstream_create_task(
+                                session,
+                                task,
+                                item,
+                                service="entry_analyse",
+                                token=token,
+                                payload={
+                                    "task_name": f"{task.name}-{entry_input['module_name']}-entry",
+                                    "input_path": input_contract["module_dir"],
+                                    "module_name": entry_input["module_name"],
+                                    "source_path": input_contract["source_root"],
+                                    "origin": {
+                                        **_downstream_origin_payload(task, item),
+                                        "input_contract": input_contract,
+                                        "entry_descriptor_root": entry_input.get("entry_descriptor_root"),
+                                        "entry_files_list": entry_input.get("entry_files_list"),
+                                    },
+                                },
+                            )
+                        else:
+                            status = terminal_status
+                            created = None
                 elif retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
                     control = await self._downstream_control_existing_task(
                         session,
@@ -32418,7 +32476,10 @@ class TaskManager:
                         terminal_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
                         item.downstream_task_id = terminal_task_id
                         terminal_status = self._status_from_downstream_payload(payload, success_statuses={"passed", "success"})
-                        if terminal_status in {"failed", "cancelled", "downstream_missing"}:
+                        if self._should_recreate_entry_child_from_terminal_status(
+                            retrying=retrying,
+                            terminal_status=terminal_status,
+                        ):
                             input_contract = self._build_entry_analysis_input_contract(entry_input)
                             item.downstream_task_id = None
                             created = await self._downstream_create_task(

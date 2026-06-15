@@ -23042,83 +23042,6 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual("ea-live", item.downstream_task_id)
         self.assertEqual("success", item.status)
 
-    def test_run_entry_item_retry_recreates_child_when_existing_downstream_is_terminal_cancelled(self):
-        task = BinarySecurityTask(
-            id="t1",
-            name="source-task",
-            project_id="p1",
-            workspace_root="/tmp/ws",
-            output_root="/tmp/out",
-            firmware_source="project_filesystem",
-            firmware_path="/tmp/fw",
-        )
-        stage_run = BinarySecurityStageRun(
-            id="sr1",
-            task_id="t1",
-            project_id="p1",
-            stage_name="entry_analysis",
-            sequence_no=2,
-            status="running",
-        )
-        item = BinarySecurityStageItem(
-            id="si1",
-            task_id="t1",
-            project_id="p1",
-            stage_name="entry_analysis",
-            item_key="module-1",
-            item_name="mod",
-            parent_key="fw-1",
-            downstream_service="entry_analyse",
-            downstream_task_id="ea-old",
-            status="cancelled",
-            output_ref={},
-        )
-        item.result = {
-            "downstream_status": "cancelled",
-            "sync_observation": {"downstream_status": "cancelled"},
-        }
-        module = {
-            "module_key": "module-1",
-            "module_name": "mod",
-            "firmware_key": "fw-1",
-            "source_dir": "/tmp/src",
-            "module_dir": "/tmp/src",
-            "source_root": "/tmp/src",
-        }
-        fake_session = _ModelAwareDb()
-        create_calls: list[dict[str, object]] = []
-
-        async def fake_create_task(session, parent_task, stage_item, *, service, token, payload):
-            del session, parent_task, stage_item, token
-            create_calls.append({"service": service, "payload": dict(payload)})
-            return {"task_id": "ea-new", "status": "pending"}
-
-        async def fake_poll(*args, **kwargs):
-            del args, kwargs
-            return "success", {"task_id": "ea-new", "status": "passed"}
-
-        with (
-            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
-            patch.object(self.manager, "_upsert_stage_item", return_value=item),
-            patch.object(self.manager, "_active_downstream_payload", return_value=None),
-            patch.object(self.manager, "_downstream_cancel_refs", new=AsyncMock(return_value=1)),
-            patch.object(self.manager, "_delete_downstream_refs", new=AsyncMock(return_value=1)),
-            patch.object(self.manager, "_downstream_control_existing_task") as control_mock,
-            patch.object(self.manager, "_downstream_create_task", side_effect=fake_create_task),
-            patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
-            patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
-            patch.object(self.manager, "_parse_entries", return_value=[]),
-            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
-            patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
-        ):
-            result = asyncio.run(self.manager._run_entry_item(task, stage_run, module, token="tok", retrying=True))
-
-        self.assertEqual("success", result["status"])
-        self.assertEqual(1, len(create_calls))
-        self.assertEqual("entry_analyse", create_calls[0]["service"])
-        control_mock.assert_not_called()
-        self.assertEqual("ea-new", item.downstream_task_id)
-        self.assertEqual("success", item.status)
 
     def test_classify_retry_downstream_strategy_reuses_success(self):
         item = BinarySecurityStageItem(
@@ -31030,9 +30953,149 @@ def _test_tail_stage_work_summary_keeps_transport_error_binding_active(self):
     self.assertEqual("reconciliation", summary["tail_control_mode"])
 
 
+def _test_run_entry_item_retry_recreates_child_when_existing_downstream_is_terminal_cancelled(self):
+    task = BinarySecurityTask(
+        id="t1",
+        name="source-task",
+        project_id="p1",
+        workspace_root="/tmp/ws",
+        output_root="/tmp/out",
+        firmware_source="project_filesystem",
+        firmware_path="/tmp/fw",
+    )
+    stage_run = BinarySecurityStageRun(
+        id="sr1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        sequence_no=2,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="module-1",
+        item_name="mod",
+        parent_key="fw-1",
+        downstream_service="entry_analyse",
+        downstream_task_id="ea-old",
+        status="cancelled",
+        output_ref={},
+    )
+    item.result = {
+        "downstream_status": "cancelled",
+        "sync_observation": {"downstream_status": "cancelled"},
+    }
+    module = {
+        "module_key": "module-1",
+        "module_name": "mod",
+        "firmware_key": "fw-1",
+        "source_dir": "/tmp/src",
+        "module_dir": "/tmp/src",
+        "source_root": "/tmp/src",
+    }
+    fake_session = _ModelAwareDb()
+    create_calls: list[dict[str, object]] = []
+
+    async def fake_create_task(session, parent_task, stage_item, *, service, token, payload):
+        del session, parent_task, stage_item, token
+        create_calls.append({"service": service, "payload": dict(payload)})
+        return {"task_id": "ea-new", "status": "pending"}
+
+    async def fake_poll(*args, **kwargs):
+        del args, kwargs
+        return "success", {"task_id": "ea-new", "status": "passed"}
+
+    with (
+        patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+        patch.object(self.manager, "_upsert_stage_item", return_value=item),
+        patch.object(self.manager, "_active_downstream_payload", return_value=None),
+        patch.object(self.manager, "_downstream_cancel_refs", new=AsyncMock(return_value=1)),
+        patch.object(self.manager, "_delete_downstream_refs", new=AsyncMock(return_value=1)),
+        patch.object(self.manager, "_downstream_control_existing_task") as control_mock,
+        patch.object(self.manager, "_downstream_create_task", side_effect=fake_create_task),
+        patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
+        patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
+        patch.object(self.manager, "_parse_entries", return_value=[]),
+        patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+        patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
+    ):
+        result = asyncio.run(self.manager._run_entry_item(task, stage_run, module, token="tok", retrying=True))
+
+    self.assertEqual("success", result["status"])
+    self.assertEqual(1, len(create_calls))
+    self.assertEqual("entry_analyse", create_calls[0]["service"])
+    control_mock.assert_not_called()
+    self.assertEqual("ea-new", item.downstream_task_id)
+    self.assertEqual("success", item.status)
+
+
+def _test_run_entry_item_non_retry_keeps_terminal_cancelled_child_without_recreate(self):
+    task = BinarySecurityTask(
+        id="t1",
+        name="source-task",
+        project_id="p1",
+        workspace_root="/tmp/ws",
+        output_root="/tmp/out",
+        firmware_source="project_filesystem",
+        firmware_path="/tmp/fw",
+    )
+    stage_run = BinarySecurityStageRun(
+        id="sr1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        sequence_no=2,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="module-1",
+        item_name="mod",
+        parent_key="fw-1",
+        downstream_service="entry_analyse",
+        downstream_task_id="ea-old",
+        status="running",
+        output_ref={},
+    )
+    module = {
+        "module_key": "module-1",
+        "module_name": "mod",
+        "firmware_key": "fw-1",
+        "source_dir": "/tmp/src",
+        "module_dir": "/tmp/src",
+        "source_root": "/tmp/src",
+    }
+    fake_session = _ModelAwareDb()
+
+    with (
+        patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+        patch.object(self.manager, "_upsert_stage_item", return_value=item),
+        patch.object(self.manager, "_active_downstream_payload", return_value=None),
+        patch.object(self.manager, "_find_reusable_entry_payload", return_value={"task_id": "ea-old", "status": "cancelled", "error": "downstream stalled"}),
+        patch.object(self.manager, "_downstream_create_task", new=AsyncMock(side_effect=AssertionError("should not recreate entry child"))),
+        patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
+        patch.object(self.manager, "_parse_entries", return_value=[]),
+        patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+        patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
+    ):
+        result = asyncio.run(self.manager._run_entry_item(task, stage_run, module, token="tok", retrying=False))
+
+    self.assertEqual("cancelled", result["status"])
+    self.assertEqual("ea-old", item.downstream_task_id)
+    self.assertEqual("cancelled", item.status)
+
+
 TaskManagerTests.test_tail_stage_work_summary_ignores_terminal_residual_entry_bindings = _test_tail_stage_work_summary_ignores_terminal_residual_entry_bindings
 TaskManagerTests.test_tail_stage_work_summary_keeps_replacement_binding_active = _test_tail_stage_work_summary_keeps_replacement_binding_active
 TaskManagerTests.test_tail_stage_work_summary_keeps_transport_error_binding_active = _test_tail_stage_work_summary_keeps_transport_error_binding_active
+TaskManagerTests.test_run_entry_item_retry_recreates_child_when_existing_downstream_is_terminal_cancelled = _test_run_entry_item_retry_recreates_child_when_existing_downstream_is_terminal_cancelled
+TaskManagerTests.test_run_entry_item_non_retry_keeps_terminal_cancelled_child_without_recreate = _test_run_entry_item_non_retry_keeps_terminal_cancelled_child_without_recreate
 
 
 if __name__ == "__main__":
