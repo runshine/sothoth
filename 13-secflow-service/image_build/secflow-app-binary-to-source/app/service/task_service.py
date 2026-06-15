@@ -2000,6 +2000,7 @@ def _pi_job_payload(
         "batch_size": pi_cfg.batch_size,
         "max_retries": pi_cfg.max_retries,
         "timeout_seconds": timeout_seconds,
+        "ida_timeout_seconds": timeout_seconds,
         "timeout_retry_enabled": timeout_retry_enabled,
         "timeout_max_retries": timeout_max_retries,
         "model": job_model,

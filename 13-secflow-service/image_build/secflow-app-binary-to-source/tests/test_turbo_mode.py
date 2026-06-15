@@ -140,6 +140,8 @@ class TurboModeTests(unittest.TestCase):
         )
 
         self.assertEqual("turbo", payload["engine"])
+        self.assertEqual(3600, payload["timeout_seconds"])
+        self.assertEqual(3600, payload["ida_timeout_seconds"])
         self.assertIsNone(payload["model"])
 
     def test_cache_service_supports_turbo_keys(self):
