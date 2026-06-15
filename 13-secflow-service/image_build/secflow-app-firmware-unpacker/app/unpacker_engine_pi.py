@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -20,6 +21,7 @@ from app.unpacker_engine_config import (
     ROLE_CONFIG_FILE_KEYS,
     ROLE_MODEL_CONFIG_KEYS,
     build_settings_json,
+    ensure_models_json_context_window,
     get_agent_thinking_level,
     get_agent_run_timeout_seconds,
     get_agent_timeout_max_retries,
@@ -30,6 +32,29 @@ from app.unpacker_engine_session import update_session_index
 
 
 log = logging.getLogger("unpacker.engine")
+_DEFAULT_CONTEXT_WINDOW = 128_000
+_SINGLE_INPUT_CONTEXT_RATIO = 0.75
+_PROMPT_TOKEN_OVERHEAD = 128
+_COMPACTION_TRIGGER_PROMPT = (
+    "请立即触发一次当前会话的自动压缩（compaction），"
+    "仅保留后续继续执行任务所需的关键结论、约束和待办。"
+    "不要继续业务分析，只回复 COMPACTION_OK。"
+)
+
+
+class PiPromptResult:
+    def __init__(self) -> None:
+        self.output = ""
+        self.error: str | None = None
+        self.provider_role: str | None = None
+        self.runtime_dir: str | None = None
+        self.context_window: int = 0
+        self.proxy_reserved_tokens: int = 0
+        self.compaction_requested = False
+        self.compaction_completed = False
+        self.context_budget_exceeded_preflight = False
+        self.context_overflow_retrying = False
+        self.context_overflow_failed_after_compaction = False
 
 
 class PiRpcClient:
@@ -102,6 +127,7 @@ class PiRpcClient:
         self._provider_runtime: dict[str, Any] | None = None
         self._agent_dir: Path | None = None
         self._agent_tmp_root: Path | None = None
+        self._runtime_dir: Path | None = None
         self._session_dir = session_dir
         self._session_path = session_path
         self._session_role = str(session_role or "").strip() or None
@@ -113,6 +139,93 @@ class PiRpcClient:
         self._session_status = "created"
         self._register_session("created")
         self._start()
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        return max(1, len(str(text or "")) // 4)
+
+    @staticmethod
+    def _parse_context_overflow_details(error_text: str | None) -> dict[str, int]:
+        text = str(error_text or "")
+        details = {
+            "actual_input_tokens": 0,
+            "provider_reported_context_length": 0,
+            "proxy_reserved_tokens": 0,
+            "context_length": 0,
+        }
+        if not text:
+            return details
+        patterns = {
+            "actual_input_tokens": r"input has\s+(\d[\d,]*)\s+tokens",
+            "provider_reported_context_length": r"maximum context length is\s+(\d[\d,]*)\s+tokens",
+            "proxy_reserved_tokens": r"reserves\s+(\d[\d,]*)\s+safety-buffer tokens",
+        }
+        for key, pattern in patterns.items():
+            match = re.search(pattern, text, re.IGNORECASE)
+            if not match:
+                continue
+            try:
+                details[key] = int(match.group(1).replace(",", ""))
+            except ValueError:
+                continue
+        details["context_length"] = details["provider_reported_context_length"]
+        return details
+
+    @classmethod
+    def _is_context_overflow_error(cls, error_text: str | None) -> bool:
+        if not error_text:
+            return False
+        lowered = str(error_text).lower()
+        if cls._parse_context_overflow_details(error_text).get("context_length", 0) > 0:
+            return True
+        return any(
+            marker in lowered
+            for marker in (
+                "maximum context length",
+                "prefill_context_length_exceeded",
+                "input has",
+                "safety-buffer",
+                "context length",
+            )
+        )
+
+    def _context_window(self) -> int:
+        runtime = self._provider_runtime or {}
+        models_json = runtime.get("models_json") if isinstance(runtime.get("models_json"), dict) else {}
+        providers = models_json.get("providers") if isinstance(models_json.get("providers"), dict) else {}
+        for provider_payload in providers.values():
+            if not isinstance(provider_payload, dict):
+                continue
+            models = provider_payload.get("models") if isinstance(provider_payload.get("models"), list) else []
+            for item in models:
+                if not isinstance(item, dict):
+                    continue
+                value = item.get("contextWindow") or item.get("contextLength")
+                try:
+                    parsed = int(value)
+                except (TypeError, ValueError):
+                    parsed = 0
+                if parsed > 0:
+                    return parsed
+        return _DEFAULT_CONTEXT_WINDOW
+
+    def _single_input_token_estimate(self, prompt: str) -> int:
+        system_prompt = ""
+        if self._system_prompt_file and Path(self._system_prompt_file).exists():
+            try:
+                system_prompt = Path(self._system_prompt_file).read_text(encoding="utf-8")
+            except Exception:
+                system_prompt = ""
+        return self._estimate_tokens(system_prompt + "\n\n" + str(prompt or "")) + _PROMPT_TOKEN_OVERHEAD
+
+    @staticmethod
+    def _effective_context_limit(context_window: int, proxy_reserved_tokens: int = 0) -> int:
+        reserve = max(int(proxy_reserved_tokens or 0), 4096)
+        return max(1, int(context_window) - reserve - 4096)
+
+    @classmethod
+    def _preflight_limit(cls, context_window: int, proxy_reserved_tokens: int = 0) -> int:
+        return max(1, int(cls._effective_context_limit(context_window, proxy_reserved_tokens) * _SINGLE_INPUT_CONTEXT_RATIO))
 
     def _register_session(self, status: str) -> None:
         if self._session_dir is None or self._session_path is None:
@@ -167,8 +280,16 @@ class PiRpcClient:
                         "resolved_model": resolved_model,
                         "cli_model": cli_model,
                         "env": {},
-                        "models_json": provider.get("models_json") if isinstance(provider.get("models_json"), dict) else {},
-                        "settings_json": provider.get("settings_json") if isinstance(provider.get("settings_json"), dict) else build_settings_json(selected_provider_key, resolved_model),
+                        "models_json": ensure_models_json_context_window(
+                            provider.get("models_json") if isinstance(provider.get("models_json"), dict) else {},
+                        ),
+                        "settings_json": build_settings_json(selected_provider_key, resolved_model)
+                        | (
+                            provider.get("settings_json")
+                            if isinstance(provider.get("settings_json"), dict)
+                            else {}
+                        ),
+                        "runtime_dir": str(provider.get("runtime_dir") or "").strip() or None,
                     }
                     return self._provider_runtime
             log.warning(
@@ -204,8 +325,11 @@ class PiRpcClient:
             "resolved_model": resolved_model,
             "cli_model": cli_model,
             "env": {},
-            "models_json": provider.get("models_json") if isinstance(provider.get("models_json"), dict) else {},
-            "settings_json": build_settings_json(selected_provider_key, "auto"),
+            "models_json": ensure_models_json_context_window(
+                provider.get("models_json") if isinstance(provider.get("models_json"), dict) else {},
+            ),
+            "settings_json": build_settings_json(selected_provider_key, resolved_model),
+            "runtime_dir": None,
         }
         return self._provider_runtime
 
@@ -213,10 +337,19 @@ class PiRpcClient:
         runtime = self._resolve_provider_runtime()
         if runtime is None:
             return None, {}
-        agent_root = Path.home() / ".pi" / "agent"
-        task_dir_name = self._task_id or f"adhoc-{os.getpid()}"
-        config_file_key = str(runtime.get("config_file_key") or runtime.get("provider_key") or "default").replace("/", "_")
-        agent_dir = agent_root / "secflow-app-firmware-unpacker" / "tasks" / task_dir_name / "configs" / config_file_key
+        if not self._task_id or not isinstance(self._llm_binding_snapshot, dict):
+            raise ValueError("PiRpcClient 需要 task_id 与任务级 llm_binding_snapshot 才能构造角色级 runtime")
+        project_id = str(self._llm_binding_snapshot.get("project_id") or "").strip()
+        if not project_id:
+            project_id = str(self._llm_binding_snapshot.get("_project_id") or "").strip()
+        if not project_id:
+            raise ValueError("llm_binding_snapshot 缺少 project_id，无法构造角色级 runtime")
+        role = str(self._provider_role or "").strip()
+        from app.services.task_manager import role_runtime_dir_for_task
+        agent_dir = Path(
+            str(runtime.get("runtime_dir") or "").strip()
+            or role_runtime_dir_for_task(project_id=project_id, task_id=self._task_id, role=role)
+        )
         agent_dir.mkdir(parents=True, exist_ok=True)
         (agent_dir / "models.json").write_text(
             json.dumps(runtime["models_json"], ensure_ascii=False, indent=2),
@@ -246,6 +379,7 @@ class PiRpcClient:
         )
         self._agent_tmp_root = agent_dir.parent
         self._agent_dir = agent_dir
+        self._runtime_dir = agent_dir
         return agent_dir, dict(runtime["env"])
 
     def _start(self):
@@ -459,11 +593,38 @@ class PiRpcClient:
             if timer is not None:
                 timer.join(timeout=0.1)
 
+    def _run_compaction(self) -> bool:
+        try:
+            self._prompt_once(_COMPACTION_TRIGGER_PROMPT, stream_callback=None, timeout_seconds=get_agent_run_timeout_seconds())
+            return True
+        except Exception:
+            return False
+
     def prompt(
         self,
         message: str,
         stream_callback: Optional[Callable[[dict[str, Any]], None]] = None,
-    ) -> str:
+    ) -> PiPromptResult:
+        result = PiPromptResult()
+        result.provider_role = self._provider_role
+        result.runtime_dir = str(self._runtime_dir) if self._runtime_dir is not None else None
+        result.context_window = self._context_window()
+        estimated_tokens = self._single_input_token_estimate(message)
+        if estimated_tokens > self._preflight_limit(result.context_window, 0):
+            result.context_budget_exceeded_preflight = True
+            if self._session_path is not None:
+                result.compaction_requested = True
+                result.compaction_completed = self._run_compaction()
+                if result.compaction_completed and self._single_input_token_estimate(message) <= self._preflight_limit(result.context_window, 0):
+                    pass
+                else:
+                    result.context_overflow_failed_after_compaction = True
+                    result.error = "preflight_context_length_exceeded"
+                    return result
+            else:
+                result.context_overflow_failed_after_compaction = True
+                result.error = "preflight_context_length_exceeded"
+                return result
         timeout_seconds = get_agent_run_timeout_seconds()
         timeout_retry_enabled = get_agent_timeout_retry_enabled()
         timeout_max_retries = get_agent_timeout_max_retries()
@@ -473,12 +634,38 @@ class PiRpcClient:
             try:
                 for busy_attempt in range(busy_retries + 1):
                     try:
-                        return self._prompt_once(
+                        result.output = self._prompt_once(
                             message,
                             stream_callback=stream_callback,
                             timeout_seconds=timeout_seconds,
                         )
+                        return result
                     except RuntimeError as exc:
+                        if self._is_context_overflow_error(str(exc)):
+                            overflow = self._parse_context_overflow_details(str(exc))
+                            result.context_window = overflow.get("context_length") or result.context_window
+                            result.proxy_reserved_tokens = overflow.get("proxy_reserved_tokens", 0)
+                            if self._session_path is None:
+                                result.error = str(exc)
+                                result.context_overflow_failed_after_compaction = True
+                                return result
+                            result.compaction_requested = True
+                            result.compaction_completed = self._run_compaction()
+                            if not result.compaction_completed:
+                                result.error = str(exc)
+                                result.context_overflow_failed_after_compaction = True
+                                return result
+                            if self._single_input_token_estimate(message) > self._preflight_limit(result.context_window, result.proxy_reserved_tokens):
+                                result.error = str(exc)
+                                result.context_overflow_failed_after_compaction = True
+                                return result
+                            result.context_overflow_retrying = True
+                            result.output = self._prompt_once(
+                                message,
+                                stream_callback=stream_callback,
+                                timeout_seconds=timeout_seconds,
+                            )
+                            return result
                         if "timed out after" in str(exc).lower():
                             timeout_failures += 1
                             can_retry = timeout_retry_enabled and (
@@ -516,7 +703,8 @@ class PiRpcClient:
                     raise
                 self._respawn()
 
-        raise RuntimeError("Prompt failed after exhausting retries")
+        result.error = "Prompt failed after exhausting retries"
+        return result
 
     def get_messages(self):
         self.send({"id": "req-message", "type": "get_messages"})

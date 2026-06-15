@@ -2133,6 +2133,7 @@ class TaskManager:
             stage_bound_active_item_count = 0
             stage_has_downstream_refs = False
             stage_has_runnable_unbound_items = False
+            stage_has_real_runnable_work = self._stage_has_real_runnable_work(db, task, stage_name)
             stage_run = (
                 db.query(BinarySecurityStageRun)
                 .filter(
@@ -2165,7 +2166,7 @@ class TaskManager:
                     has_downstream_refs = True
                     stage_has_downstream_refs = True
                     stage_has_unresolved_tail_work = True
-            if normalized_stage_status in {"pending", "queued"}:
+            if normalized_stage_status in {"pending", "queued"} and stage_has_real_runnable_work:
                 has_incomplete_stage = True
             elif normalized_stage_status in {"dispatching", "running", "applying"} and not (
                 stage_bound_active_item_count > 0 or stage_has_downstream_refs or stage_has_runnable_unbound_items
@@ -14206,6 +14207,32 @@ class TaskManager:
         ).first()
         if stage_run is None:
             stage_run = self._ensure_stage_run(db, task, stage_name)
+        ignore_terminal, ignore_reason = self._should_ignore_stage_terminal_event(
+            db,
+            task,
+            stage_name=stage_name,
+            event=event,
+            payload=payload,
+            stage_run=stage_run,
+        )
+        if ignore_terminal:
+            self._record_event(
+                db,
+                task,
+                "stage_worker_terminal_stale_generation_ignored" if ignore_reason == "stale_generation" else "stage_worker_terminal_duplicate_ignored",
+                "历史阶段终态事件已忽略，避免重复推进父任务",
+                level="warning",
+                stage_name=stage_name,
+                payload={
+                    "state_event_id": event.id,
+                    "ignored_reason": ignore_reason,
+                    "event_stage_generation": payload.get("stage_generation"),
+                    "current_stage_generation": self._stage_terminal_generation_key(task, stage_name, db=db, stage_run=stage_run),
+                    "current_stage": task.current_stage,
+                },
+            )
+            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+            return
         if stage_name == "system_analysis":
             stage_run = self._refresh_stage_from_authoritative_items(db, task, stage_name) or stage_run
             summary = dict(stage_run.output_summary or summary)
@@ -14522,7 +14549,7 @@ class TaskManager:
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
             return
         next_stage = self._next_incomplete_stage(db, task)
-        if next_stage and self._should_skip_stage_without_runnable_work(db, task, next_stage):
+        if next_stage and not self._should_auto_advance_to_stage(db, task, next_stage):
             blocked_reason = self._continue_stage_input_error(db, task, next_stage)
             self._record_event(
                 db,
@@ -17807,7 +17834,7 @@ class TaskManager:
                     event_payload={"stage_status": active_streaming_status, "source": "finalize_streaming_upstream"},
                 )
             return
-        has_active_incomplete_stage, active_stage_name, active_stage_status = self._has_any_active_incomplete_stage(task, stage_runs)
+        has_active_incomplete_stage, active_stage_name, active_stage_status = self._has_any_active_incomplete_stage(db, task, stage_runs)
         if has_active_incomplete_stage:
             task.status = "running" if active_stage_status in {"running", "dispatching", "applying"} else "pending"
             task.current_stage = active_stage_name or task.current_stage
@@ -19511,6 +19538,7 @@ class TaskManager:
 
     def _has_any_active_incomplete_stage(
         self,
+        db: Session,
         task: BinarySecurityTask,
         stage_runs: list[BinarySecurityStageRun],
     ) -> tuple[bool, str | None, str | None]:
@@ -19530,6 +19558,8 @@ class TaskManager:
                 continue
             normalized_status = self._normalize_downstream_status(run.status) or str(run.status or "").strip()
             if task_retry_target_stage and stage_name == task_retry_target_stage and normalized_status == "success":
+                continue
+            if normalized_status in {"pending", "queued"} and not self._stage_has_real_runnable_work(db, task, stage_name):
                 continue
             if normalized_status in active_statuses:
                 active_candidates.append((stage_name, normalized_status))
@@ -19717,16 +19747,22 @@ class TaskManager:
                 or self._task_runtime_phase(task) != before_phase
             )
             if self._tail_requires_execution_takeover(session, task):
+                tail_summary = self._tail_stage_work_summary(session, task)
+                takeover_reason = str(tail_summary.get("takeover_reason") or "").strip() or "runnable_unbound_tail_items"
+                if takeover_reason == "incomplete_tail_stage":
+                    message = "检测到流式尾段阶段尚未完成，任务将回到 worker 接管继续执行"
+                else:
+                    message = "检测到流式尾段仍有未绑定子项，任务将回到 worker 接管继续执行"
                 self._record_event(
                     session,
                     task,
                     "tail_execution_takeover_required",
-                    "检测到流式尾段仍有未绑定子项，任务将回到 worker 接管继续执行",
+                    message,
                     level="warning",
                     stage_name=task.current_stage,
                     payload={
                         "tail_control_mode": "execution_takeover",
-                        "reason": "runnable_unbound_tail_items",
+                        "reason": takeover_reason,
                     },
                 )
                 self._enqueue_task(task.id)
@@ -20695,6 +20731,7 @@ class TaskManager:
         target_stage_name: str | None,
         execution_token: str | None,
     ) -> BinarySecurityStateEvent | None:
+        stage_generation = self._stage_terminal_generation_key(task, stage_name, db=db)
         return self._enqueue_state_event(
             db,
             task=task,
@@ -20704,7 +20741,7 @@ class TaskManager:
             event_type="stage_worker_terminal_observed",
             idempotency_key=(
                 f"stage_worker_terminal_observed:{task.id}:{stage_name}:"
-                f"{execution_token or ''}:{status}"
+                f"{stage_generation}:{status}"
             ),
             payload={
                 "stage_name": stage_name,
@@ -20714,8 +20751,152 @@ class TaskManager:
                 "task_retry_mode": bool(task_retry_mode),
                 "target_stage_name": target_stage_name,
                 "execution_token": execution_token,
+                "stage_generation": stage_generation,
             },
         )
+
+    def _stage_terminal_generation_key(
+        self,
+        task: BinarySecurityTask,
+        stage_name: str | None,
+        *,
+        db: Session | None = None,
+        stage_run: BinarySecurityStageRun | None = None,
+    ) -> str:
+        normalized_stage_name = str(stage_name or "").strip()
+        if not normalized_stage_name:
+            return "unknown"
+        resolved_stage_run = stage_run
+        if resolved_stage_run is None and db is not None:
+            resolved_stage_run = db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == normalized_stage_name,
+            ).first()
+        if resolved_stage_run is not None and getattr(resolved_stage_run, "sequence_no", None) is not None:
+            return f"seq:{int(resolved_stage_run.sequence_no)}"
+        if resolved_stage_run is not None and getattr(resolved_stage_run, "started_at", None) is not None:
+            return f"started:{resolved_stage_run.started_at.isoformat()}"
+        return f"stage:{normalized_stage_name}"
+
+    def _stage_terminal_event_idempotency_key(
+        self,
+        task: BinarySecurityTask,
+        stage_name: str | None,
+        stage_status: str | None,
+        *,
+        db: Session | None = None,
+        stage_run: BinarySecurityStageRun | None = None,
+    ) -> str:
+        normalized_stage_name = str(stage_name or "").strip()
+        normalized_status = str(stage_status or "").strip()
+        return (
+            f"stage_worker_terminal_observed:{task.id}:{normalized_stage_name}:"
+            f"{self._stage_terminal_generation_key(task, normalized_stage_name, db=db, stage_run=stage_run)}:{normalized_status}"
+        )
+
+    def _stage_has_authoritative_progress_beyond(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str | None,
+    ) -> bool:
+        normalized_stage_name = str(stage_name or "").strip()
+        if not normalized_stage_name:
+            return False
+        stage_sequence = self._stage_sequence_for_task(task)
+        if normalized_stage_name not in stage_sequence:
+            return False
+        current_index = stage_sequence.index(normalized_stage_name)
+        for downstream_stage_name in stage_sequence[current_index + 1 :]:
+            stage_run = db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == downstream_stage_name,
+            ).first()
+            items = self._stage_items(db, task.id, downstream_stage_name)
+            if stage_run is not None:
+                normalized_status = self._normalize_downstream_status(stage_run.status) or str(stage_run.status or "").strip()
+                if normalized_status not in {"pending"}:
+                    return True
+            if items:
+                if any(self._is_active_item_status(item.status) or self._is_terminal_item_status(item.status) for item in items):
+                    return True
+                if any(str(item.downstream_task_id or "").strip() for item in items):
+                    return True
+        return False
+
+    def _stage_terminal_already_consumed(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str | None,
+    ) -> bool:
+        normalized_stage_name = str(stage_name or "").strip()
+        if not normalized_stage_name:
+            return False
+        current_stage = str(task.current_stage or "").strip()
+        stage_sequence = self._stage_sequence_for_task(task)
+        if normalized_stage_name in stage_sequence and current_stage in stage_sequence:
+            if stage_sequence.index(current_stage) > stage_sequence.index(normalized_stage_name):
+                return True
+        return False
+
+    def _is_stage_terminal_event_recovery_candidate(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun,
+    ) -> bool:
+        stage_name = str(stage_run.stage_name or "").strip()
+        stage_status = str(stage_run.status or "").strip()
+        if not stage_name or stage_status not in {"success", "partial_success", "failed", "cancelled", "downstream_missing"}:
+            return False
+        if self._stage_terminal_already_consumed(db, task, stage_name):
+            return False
+        if self._stage_has_authoritative_progress_beyond(db, task, stage_name):
+            return False
+        return True
+
+    def _should_auto_advance_to_stage(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        next_stage: str | None,
+    ) -> bool:
+        normalized_stage = str(next_stage or "").strip()
+        if not normalized_stage:
+            return False
+        existing_items = self._stage_items(db, task.id, normalized_stage)
+        if existing_items:
+            return True
+        existing_run = db.query(BinarySecurityStageRun).filter(
+            BinarySecurityStageRun.task_id == task.id,
+            BinarySecurityStageRun.stage_name == normalized_stage,
+        ).first()
+        if existing_run is not None:
+            normalized_status = self._normalize_downstream_status(existing_run.status) or str(existing_run.status or "").strip()
+            if normalized_status in {"pending", "queued", "running", "dispatching", "applying"}:
+                return True
+        if self._should_skip_stage_without_runnable_work(db, task, normalized_stage):
+            return False
+        return self._stage_has_real_runnable_work(db, task, normalized_stage) or self._stage_has_materialized_inputs(db, task, normalized_stage)
+
+    def _should_ignore_stage_terminal_event(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_name: str,
+        event: BinarySecurityStateEvent,
+        payload: dict[str, Any],
+        stage_run: BinarySecurityStageRun | None,
+    ) -> tuple[bool, str | None]:
+        if self._stage_terminal_already_consumed(db, task, stage_name):
+            payload_generation = str(payload.get("stage_generation") or "").strip()
+            current_generation = self._stage_terminal_generation_key(task, stage_name, db=db, stage_run=stage_run)
+            if payload_generation and payload_generation != current_generation:
+                return True, "stale_generation"
+            return True, "duplicate_consumed"
+        return False, None
 
     def _enqueue_downstream_status_event(
         self,
@@ -20801,14 +20982,19 @@ class TaskManager:
         recovered = False
         running_tasks = db.query(BinarySecurityTask).filter(BinarySecurityTask.status == "running").all()
         for task in running_tasks:
-            execution_token = task.dispatch_started_at.isoformat() if task.dispatch_started_at else ""
             stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
             for stage_run in stage_runs:
+                if not self._is_stage_terminal_event_recovery_candidate(db, task, stage_run):
+                    continue
                 stage_name = str(stage_run.stage_name or "").strip()
                 stage_status = str(stage_run.status or "").strip()
-                if stage_status not in {"success", "partial_success", "failed", "cancelled", "downstream_missing"}:
-                    continue
-                expected_key = f"stage_worker_terminal_observed:{task.id}:{stage_name}:{execution_token}:{stage_status}"
+                expected_key = self._stage_terminal_event_idempotency_key(
+                    task,
+                    stage_name,
+                    stage_status,
+                    db=db,
+                    stage_run=stage_run,
+                )
                 existing = db.query(BinarySecurityStateEvent).filter(
                     BinarySecurityStateEvent.idempotency_key == expected_key
                 ).first()
@@ -20824,7 +21010,7 @@ class TaskManager:
                     stage_retry_mode=False,
                     task_retry_mode=False,
                     target_stage_name=None,
-                    execution_token=execution_token,
+                    execution_token=task.dispatch_started_at.isoformat() if task.dispatch_started_at else "",
                 )
                 if emitted is None:
                     continue
@@ -20833,9 +21019,9 @@ class TaskManager:
                     task,
                     stage_name=stage_name,
                     status=stage_status,
-                    reason="dispatch_loop_recovery_missing_execution_token" if not execution_token else "dispatch_loop_recovery",
+                    reason="dispatch_loop_recovery",
                     summary=summary,
-                    execution_token=execution_token,
+                    execution_token=task.dispatch_started_at.isoformat() if task.dispatch_started_at else "",
                 )
                 recovered = True
         if recovered:
@@ -22224,6 +22410,8 @@ class TaskManager:
             return False
         normalized_stage_status = str(next_stage_status or "").strip()
         if normalized_stage_status and normalized_stage_status not in {"pending", "queued", "running", "dispatching", "applying"}:
+            return False
+        if self._stage_terminal_already_consumed(db, task, stage_name) and not self._stage_has_real_runnable_work(db, task, stage_name):
             return False
         return self._stage_has_real_runnable_work(db, task, stage_name)
 

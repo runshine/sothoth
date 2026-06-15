@@ -450,6 +450,7 @@ class TaskResultApiTests(unittest.TestCase):
                                 "provider_key": "provider-executor",
                                 "model": "gpt-test",
                                 "model_selector": "default",
+                                "runtime_dir": "/tmp/task/.pi/agents/executor",
                                 "models_json": {
                                     "providers": {
                                         "executor-config": {
@@ -458,8 +459,16 @@ class TaskResultApiTests(unittest.TestCase):
                                     }
                                 },
                                 "settings_json": {"temperature": 0.1},
+                                "runtime_files": {
+                                    "auth_json": {
+                                        "agent_task_key_id": "atk-1",
+                                        "agent_task_key_prefix": "sk-task",
+                                        "agent_task_key_secret": "***",
+                                    }
+                                },
                             }
                         },
+                        "agent_runtime_mode": "task_scoped",
                         "frozen_at": "2026-06-11T00:00:00Z",
                     },
                     ensure_ascii=False,
@@ -470,6 +479,7 @@ class TaskResultApiTests(unittest.TestCase):
         self.assertTrue(snapshot["available"])
         self.assertEqual("secret-plaintext", snapshot["agent_auth_json"]["agent_task_key_secret"])
         self.assertEqual("schedule_dispatch", snapshot["agent_auth_json"]["agent_task_key_source"])
+        self.assertEqual("/tmp/task/.pi/agents/executor", snapshot["provider_runtime_summary"]["executor"]["runtime_dir"])
         self.assertEqual("executor-config", snapshot["provider_runtime_summary"]["executor"]["config_file_key"])
         self.assertEqual(
             "https://api.example.test/v1",

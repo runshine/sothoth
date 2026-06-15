@@ -129,7 +129,7 @@ def _agent_runtime_payload_from_snapshot(snapshot: dict | None) -> dict[str, Any
         "has_agent_task_key": False,
         "agent_task_key_id": None,
         "agent_task_key_prefix": None,
-        "agent_runtime_mode": None,
+        "agent_runtime_mode": "task_scoped",
     }
     if not isinstance(snapshot, dict):
         return payload
@@ -141,7 +141,8 @@ def _agent_runtime_payload_from_snapshot(snapshot: dict | None) -> dict[str, Any
     payload["has_agent_task_key"] = bool(agent_task_key_id or agent_task_key_prefix)
     payload["agent_task_key_id"] = agent_task_key_id
     payload["agent_task_key_prefix"] = agent_task_key_prefix
-    payload["agent_runtime_mode"] = str(agent_task_key.get("source") or "").strip() or None
+    runtime_mode = str(snapshot.get("agent_runtime_mode") or "").strip() if isinstance(snapshot, dict) else ""
+    payload["agent_runtime_mode"] = runtime_mode or "task_scoped"
     return payload
 
 
@@ -195,12 +196,15 @@ def _build_task_config_snapshot(task: dict[str, Any]) -> dict[str, Any]:
                 provider_runtime_summary[role_name] = None
                 continue
             provider_runtime_summary[role_name] = {
+                "role_name": role_name,
+                "runtime_dir": role_payload.get("runtime_dir"),
                 "config_file_key": role_payload.get("config_file_key"),
                 "provider_key": role_payload.get("provider_key"),
                 "model": role_payload.get("model"),
                 "model_selector": role_payload.get("model_selector"),
                 "models_json": role_payload.get("models_json"),
                 "settings_json": role_payload.get("settings_json"),
+                "auth_json": role_payload.get("runtime_files", {}).get("auth_json") if isinstance(role_payload.get("runtime_files"), dict) else None,
             }
 
     return {

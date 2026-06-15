@@ -71,7 +71,7 @@ class TaskManagerWorkspaceTests(unittest.TestCase):
                 "has_agent_task_key": False,
                 "agent_task_key_id": None,
                 "agent_task_key_prefix": None,
-                "agent_runtime_mode": None,
+                "agent_runtime_mode": "task_scoped",
             },
             _agent_runtime_payload_from_snapshot(None),
         )
@@ -80,10 +80,11 @@ class TaskManagerWorkspaceTests(unittest.TestCase):
                 "has_agent_task_key": True,
                 "agent_task_key_id": "tk-1",
                 "agent_task_key_prefix": "tsk_x",
-                "agent_runtime_mode": "schedule_dispatch",
+                "agent_runtime_mode": "task_scoped",
             },
             _agent_runtime_payload_from_snapshot(
                 {
+                    "agent_runtime_mode": "task_scoped",
                     "agent_task_key": {
                         "id": "tk-1",
                         "prefix": "tsk_x",

@@ -71,6 +71,7 @@ from app.unpacker_engine_logs import (
     write_token_summary as _write_token_summary,
 )
 from app.unpacker_engine_pi import PiRpcClient
+from app.unpacker_engine_pi import PiPromptResult
 from app.unpacker_engine_session import build_session_artifacts, update_session_index
 
 
@@ -550,6 +551,43 @@ def _preview_markdown(path: Path, limit: int = 1000) -> str | None:
     return text[:limit]
 
 
+def _emit_agent_runtime_events(
+    event_callback: Optional[Callable[[str, str], None]],
+    *,
+    result: Any,
+    stage: str,
+    role: str,
+    model: str,
+) -> None:
+    if event_callback is None:
+        return
+    payload = {
+        "role": role,
+        "runtime_dir": str(getattr(result, "runtime_dir", "") or ""),
+        "model": model,
+        "context_window": int(getattr(result, "context_window", 0) or 0),
+    }
+    proxy_reserved_tokens = int(getattr(result, "proxy_reserved_tokens", 0) or 0)
+    if getattr(result, "compaction_requested", False):
+        event_callback("task_context_compaction_requested", "智能体上下文超限，已请求会话压缩", stage_key=stage, detail=dict(payload, proxy_reserved_tokens=proxy_reserved_tokens))
+    if getattr(result, "compaction_completed", False):
+        event_callback("task_context_compaction_completed", "智能体会话压缩已完成", stage_key=stage, detail=payload)
+    if getattr(result, "context_budget_exceeded_preflight", False):
+        event_callback("task_context_budget_exceeded_preflight", "智能体请求在发送前已判定超出上下文预算", stage_key=stage, detail=dict(payload, proxy_reserved_tokens=proxy_reserved_tokens, error=str(getattr(result, "error", "") or "")))
+    if getattr(result, "context_overflow_retrying", False):
+        event_callback("task_context_overflow_retrying", "智能体上下文超限，压缩后正在重试", stage_key=stage, detail=dict(payload, proxy_reserved_tokens=proxy_reserved_tokens))
+    if getattr(result, "context_overflow_failed_after_compaction", False):
+        event_callback("task_context_overflow_failed_after_compaction", "智能体上下文压缩后仍超出预算，请求已终止", stage_key=stage, detail=dict(payload, proxy_reserved_tokens=proxy_reserved_tokens, error=str(getattr(result, "error", "") or "")))
+
+
+def _normalize_prompt_result(value: Any) -> PiPromptResult:
+    if isinstance(value, PiPromptResult):
+        return value
+    result = PiPromptResult()
+    result.output = str(value or "")
+    return result
+
+
 def _normalize_output_reports(output_path: str) -> None:
     output_root = Path(output_path)
     for legacy_name, canonical_name in (("summary.txt", "summary.md"), ("reason.txt", "reason.md")):
@@ -679,13 +717,20 @@ def _run_reviewer(
                 f"- You must read `{recursive_manifest_path}` before judging completeness for tool-stage review.\n"
             )
         with _ProgressKeepalive(stage="review", activity_callback=activity_callback):
-            verify_result = validator.prompt(
+            verify_result = _normalize_prompt_result(validator.prompt(
                 review_prompt,
                 stream_callback=_stream_review_event,
-            )
+            ))
+        _emit_agent_runtime_events(
+            None,
+            result=verify_result,
+            stage="review",
+            role="reviewer",
+            model=val_def["model"],
+        )
         token_stats = _save_agent_log(validator, log, round_dir, "reviewer")
         completed_at = datetime.utcnow().isoformat()
-        return _is_review_success(verify_result), verify_result, {
+        return _is_review_success(verify_result.output), verify_result.output, {
             "started_at": started_at,
             "completed_at": completed_at,
             "duration_seconds": round(time.perf_counter() - started_monotonic, 3),
@@ -758,10 +803,10 @@ def _run_skill_unpack(
                 activity_callback("tool_match")
 
         with _ProgressKeepalive(stage="tool_match", activity_callback=activity_callback):
-            exec_result = executor.prompt(
+            exec_result = _normalize_prompt_result(executor.prompt(
                 render_prompt(EXEC_FIRST_TMPL, firmware_path, output_path),
                 stream_callback=_stream_skill_event,
-            )
+            ))
         _save_agent_log(executor, log, global_round_dir, "skill_executor")
         passed, review_result, _review_meta = _run_reviewer(
             task_id,
@@ -780,7 +825,7 @@ def _run_skill_unpack(
         result = {
             "success": passed,
             "method": f"skill:{skill_meta.get('filename')}",
-            "response": exec_result,
+            "response": exec_result.output,
             "review": review_result,
         }
         _append_stage_log(
@@ -788,7 +833,7 @@ def _run_skill_unpack(
             "skill_exec.log",
             "skill execution completed",
             success=passed,
-            response_preview=_preview_text(exec_result),
+            response_preview=_preview_text(exec_result.output),
             review_preview=_preview_text(review_result),
         )
         _write_json_log(
@@ -799,7 +844,7 @@ def _run_skill_unpack(
                 "family_id": skill_meta.get("family_id"),
                 "skill_version": skill_meta.get("skill_version"),
                 "success": passed,
-                "response_preview": _preview_text(exec_result),
+                "response_preview": _preview_text(exec_result.output),
                 "review_preview": _preview_text(review_result),
             },
         )
@@ -1033,10 +1078,17 @@ def _run_generic_unpack(
             executor_started_at = datetime.utcnow().isoformat()
             executor_started_monotonic = time.perf_counter()
             with _ProgressKeepalive(stage="llm_unpack", activity_callback=activity_callback):
-                exec_result = executor.prompt(
+                exec_result = _normalize_prompt_result(executor.prompt(
                     exec_msg,
                     stream_callback=_stream_unpack_event,
-                )
+                ))
+            _emit_agent_runtime_events(
+                event_callback,
+                result=exec_result,
+                stage="llm_unpack",
+                role="executor",
+                model=exec_def["model"],
+            )
             executor_token_stats = _save_agent_log(executor, log, round_dir, "executor")
             executor_completed_at = datetime.utcnow().isoformat()
             executor_duration_seconds = round(time.perf_counter() - executor_started_monotonic, 3)
@@ -1045,7 +1097,7 @@ def _run_generic_unpack(
                 "stage3_llm_unpack.log",
                 "executor round completed",
                 attempt=attempt,
-                response_preview=_preview_text(exec_result),
+                response_preview=_preview_text(exec_result.output),
             )
             if event_callback:
                 event_callback(
@@ -1055,7 +1107,7 @@ def _run_generic_unpack(
                     status="running",
                     detail={
                         "round": attempt,
-                        "response_preview": _preview_text(exec_result),
+                        "response_preview": _preview_text(exec_result.output),
                     },
                 )
             if round_dir is not None:
@@ -1098,7 +1150,7 @@ def _run_generic_unpack(
                 "executor attempt completed",
                 event="executor_attempt_complete",
                 attempt=attempt,
-                response_preview=_preview_text(exec_result),
+                response_preview=_preview_text(exec_result.output),
             )
             log_event(
                 log,
@@ -1185,7 +1237,7 @@ def _run_generic_unpack(
                         "session_name": session_artifacts["session_name"],
                         "session_file": session_artifacts["session_path"].name,
                         "prompt_type": "initial" if attempt == 1 else "retry",
-                        "response_preview": _preview_text(exec_result),
+                        "response_preview": _preview_text(exec_result.output),
                         "duration_seconds": executor_duration_seconds,
                         "tokens": executor_tokens,
                         "started_at": executor_started_at,
@@ -1335,10 +1387,17 @@ def _generate_candidate_skill(
                     activity_callback("skill_author")
 
             with _ProgressKeepalive(stage="skill_author", activity_callback=activity_callback):
-                raw_doc = author.prompt(
+                raw_doc = _normalize_prompt_result(author.prompt(
                     prompt,
                     stream_callback=_stream_skill_author_event,
-                )
+                ))
+            _emit_agent_runtime_events(
+                event_callback,
+                result=raw_doc,
+                stage="skill_author",
+                role="skill_author",
+                model=author_def["model"],
+            )
             _save_agent_log(author, log, log_dir, "skill_author")
         finally:
             if bind_cancel_client:
@@ -1481,13 +1540,20 @@ def _run_cleaner(
                 activity_callback("cleanup")
 
         with _ProgressKeepalive(stage="cleanup", activity_callback=activity_callback):
-            result = cleaner.prompt(clean_msg, stream_callback=_stream_cleanup_event)
+            result = _normalize_prompt_result(cleaner.prompt(clean_msg, stream_callback=_stream_cleanup_event))
+        _emit_agent_runtime_events(
+            event_callback,
+            result=result,
+            stage="cleanup",
+            role="cleaner",
+            model=clean_def["model"],
+        )
         log_event(
             log,
             logging.INFO,
             "cleanup completed",
             event="cleanup_complete",
-            response_preview=_preview_text(result),
+            response_preview=_preview_text(result.output),
         )
         _append_stage_log(
             log_dir,

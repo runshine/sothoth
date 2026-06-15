@@ -159,13 +159,34 @@ class PiRpcClientRuntimeBindingTests(unittest.TestCase):
              patch("app.unpacker_engine_pi.subprocess.Popen", side_effect=_fake_popen), \
              patch("app.unpacker_engine_pi.os.getpgid", return_value=123), \
              patch("app.unpacker_engine_pi.os.killpg"):
-            client = PiRpcClient(provider_role="executor")
+            client = PiRpcClient(
+                provider_role="executor",
+                task_id="task-1",
+                llm_binding_snapshot={
+                    "project_id": "p1",
+                    "roles": {
+                        "executor": {
+                            "config_file_key": "share_codex",
+                            "provider_key": "share_codex",
+                            "model": "glm-5",
+                            "model_selector": "share_codex/glm-5",
+                            "runtime_dir": str(self._tmp.name) + "/data/p1/app/secflow-app-firmware-unpacker/task-1/run/.pi/agents/executor",
+                            "models_json": fake_provider["models_json"],
+                            "settings_json": {"defaultProvider": "share_codex", "defaultModel": "glm-5"},
+                        }
+                    },
+                },
+            )
             agent_dir = Path(captured["env"][PI_AGENT_DIR_ENV])
             self.assertTrue((agent_dir / "models.json").is_file())
             self.assertTrue((agent_dir / "settings.json").is_file())
             settings = json.loads((agent_dir / "settings.json").read_text(encoding="utf-8"))
             self.assertEqual("share_codex", settings["defaultProvider"])
-            self.assertEqual("auto", settings["defaultModel"])
+            self.assertEqual("glm-5", settings["defaultModel"])
+            self.assertTrue(settings["compaction"]["enabled"])
+            self.assertEqual(8192, settings["compaction"]["reserveTokens"])
+            self.assertEqual(50000, settings["compaction"]["keepRecentTokens"])
+            self.assertEqual("executor", agent_dir.name)
             self.assertIn("--model", captured["args"])
             self.assertIn("share_codex/glm-5", captured["args"])
             client.close()

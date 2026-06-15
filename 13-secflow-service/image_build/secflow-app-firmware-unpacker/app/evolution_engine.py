@@ -24,6 +24,7 @@ from app.tool_dispatcher import (
     resolve_active_tool_target,
 )
 from app.tool_store import compute_family_id, parse_tool_metadata
+from app.unpacker_engine import _normalize_prompt_result
 from app.unpacker_engine_config import (
     DISPATCHER_RULES_PATH,
     DISPATCHER_DIR,
@@ -1441,13 +1442,13 @@ def run_evolution_job(
                             event,
                         )
 
-                    tool_result = evolution_client.prompt(
+                    tool_result = _normalize_prompt_result(evolution_client.prompt(
                         f"{rendered_evolution_prompt}\n\n{evolution_prompt}",
                         stream_callback=_stream_evolution_event,
-                    )
+                    ))
                     token_stats = _save_agent_log(evolution_client, log, round_dir, "evolution_executor")
                     executor_prompt_ran = True
-                    evolved_path = _extract_path_only(tool_result or "")
+                    evolved_path = _extract_path_only(tool_result.output or "")
                     if evolved_path is None:
                         if not working_tool.exists():
                             raise RuntimeError("工具进化执行器未返回 Python 工具路径，且 working tool 不存在")
@@ -1638,12 +1639,12 @@ def run_evolution_job(
                         event,
                     )
 
-                review_result = review_client.prompt(
+                review_result = _normalize_prompt_result(review_client.prompt(
                     review_prompt,
                     stream_callback=_stream_review_event,
-                )
+                ))
                 review_token_stats = _save_agent_log(review_client, log, round_dir, "reviewer")
-                review_round_passed = _review_passed(review_result)
+                review_round_passed = _review_passed(review_result.output)
                 _append_stage_log(
                     round_dir,
                     "reviewer.log",

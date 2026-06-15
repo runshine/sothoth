@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from app.services.configcenter import _DEFAULT_CONTEXT_WINDOW
 
 AGENT_DIR = Path(
     os.environ.get(
@@ -68,6 +70,15 @@ ROLE_REUSE_CONFIG_KEYS = {
     "skill_author": "reuse_agent_between_rounds_skill_author",
     "skill_executor": "reuse_agent_between_rounds_skill_executor",
     "evolution_improver": "reuse_agent_between_rounds_evolution_improver",
+}
+
+_PI_COMPACTION_SETTINGS = {
+    "defaultThinkingLevel": "off",
+    "compaction": {
+        "enabled": True,
+        "reserveTokens": 8192,
+        "keepRecentTokens": 50000,
+    },
 }
 
 
@@ -231,11 +242,36 @@ def resolve_provider_selector(provider_key: str, configured_model: str, explicit
 
 
 def build_settings_json(provider_key: str, resolved_model: str) -> dict[str, Any]:
+    thinking_level = get_agent_thinking_level() or _PI_COMPACTION_SETTINGS["defaultThinkingLevel"]
     return {
         "defaultProvider": provider_key,
         "defaultModel": resolved_model,
+        "defaultThinkingLevel": thinking_level,
+        "compaction": dict(_PI_COMPACTION_SETTINGS["compaction"]),
         "retry": {"enabled": True},
     }
+
+
+def ensure_models_json_context_window(models_json: dict[str, Any], *, default_context_window: int = _DEFAULT_CONTEXT_WINDOW) -> dict[str, Any]:
+    payload = json.loads(json.dumps(models_json or {}, ensure_ascii=False))
+    providers = payload.get("providers") if isinstance(payload.get("providers"), dict) else {}
+    for provider_payload in providers.values():
+        if not isinstance(provider_payload, dict):
+            continue
+        models = provider_payload.get("models") if isinstance(provider_payload.get("models"), list) else []
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            context_window = item.get("contextWindow") or item.get("contextLength") or default_context_window
+            try:
+                normalized = int(context_window)
+            except (TypeError, ValueError):
+                normalized = default_context_window
+            if normalized <= 0:
+                normalized = default_context_window
+            item["contextWindow"] = normalized
+            item["contextLength"] = normalized
+    return payload
 
 
 def load_agent_def(md_path: str) -> dict[str, Any]:

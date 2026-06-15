@@ -37,7 +37,16 @@ from app.services.observability import (
     record_task_stage_transition,
 )
 from app.time_utils import isoformat_local, now_local
-from app.unpacker_engine_config import DISPATCHER_RULES_PATH, TOOLS_ACTIVE_DIR, TOOLS_STORE_DIR, get_max_retries, get_max_retries_reached_action
+from app.unpacker_engine_config import (
+    DISPATCHER_RULES_PATH,
+    ROLE_CONFIG_FILE_KEYS,
+    TOOLS_ACTIVE_DIR,
+    TOOLS_STORE_DIR,
+    build_settings_json,
+    ensure_models_json_context_window,
+    get_max_retries,
+    get_max_retries_reached_action,
+)
 from app.unpacker_engine_logs import TASK_RESULT_CACHE_FILENAME, atomic_write_json, scan_output_tree
 from app.preprocess import detect_format
 from app.tool_dispatcher import activate_tool_version, dispatch_tool_by_magic, find_dispatcher_rule, upsert_dispatcher_rule
@@ -97,6 +106,90 @@ EVOLUTION_FAILED = "failed"
 EVOLUTION_CANCELLED = "cancelled"
 EVOLUTION_MAX_ROUNDS = 3
 RETRY_PREPARING_TIMEOUT_SECONDS = 300
+_AGENT_RUNTIME_MODE = "task_scoped"
+_AUTO_RECOVERED_PENDING_KEY = "_auto_recovered_pending"
+_AUTO_RECOVERED_REASON_KEY = "_auto_recovered_reason"
+_AUTO_RECOVERED_PREVIOUS_OWNER_KEY = "_auto_recovered_previous_owner_id"
+_AUTO_RECOVERED_PREVIOUS_EPOCH_KEY = "_auto_recovered_previous_epoch"
+_AUTO_RECOVERED_PREVIOUS_ERROR_KEY = "_auto_recovered_previous_error"
+_AUTO_RECOVERED_MARKED_AT_KEY = "_auto_recovered_marked_at"
+
+
+def _task_agent_root_for_paths(*, project_id: str, task_id: str) -> Path:
+    return build_task_workspace(project_id, task_id)["run_dir"] / ".pi" / "agents"
+
+
+def role_runtime_dir_for_task(*, project_id: str, task_id: str, role: str) -> str:
+    normalized_role = str(role or "").strip()
+    if normalized_role not in ROLE_CONFIG_FILE_KEYS:
+        raise ValueError(f"未知 LLM Provider 角色: {normalized_role}")
+    return str(_task_agent_root_for_paths(project_id=project_id, task_id=task_id) / normalized_role)
+
+
+def _agent_auth_payload(snapshot: dict[str, Any] | None) -> dict[str, Any]:
+    agent_task_key = snapshot.get("agent_task_key") if isinstance(snapshot, dict) and isinstance(snapshot.get("agent_task_key"), dict) else {}
+    return {
+        "agent_task_key_id": str(agent_task_key.get("id") or "").strip() or None,
+        "agent_task_key_name": str(agent_task_key.get("name") or "").strip() or None,
+        "agent_task_key_prefix": str(agent_task_key.get("prefix") or "").strip() or None,
+        "agent_task_key_secret": str(agent_task_key.get("secret") or "").strip() or None,
+        "agent_task_key_source": str(agent_task_key.get("source") or "").strip() or None,
+    }
+
+
+def _sanitize_agent_auth_payload(auth_payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(auth_payload, dict):
+        return None
+    return {
+        "agent_task_key_id": auth_payload.get("agent_task_key_id"),
+        "agent_task_key_name": auth_payload.get("agent_task_key_name"),
+        "agent_task_key_prefix": auth_payload.get("agent_task_key_prefix"),
+        "agent_task_key_secret": "***" if auth_payload.get("agent_task_key_secret") else None,
+        "agent_task_key_source": auth_payload.get("agent_task_key_source"),
+    }
+
+
+def _snapshot_runtime_mode(snapshot: dict[str, Any] | None) -> str:
+    if isinstance(snapshot, dict):
+        value = str(snapshot.get("agent_runtime_mode") or "").strip()
+        if value:
+            return value
+    return _AGENT_RUNTIME_MODE
+
+
+def _mark_task_auto_recovered_pending(task: Any, *, reason: str, previous_owner_id: str | None, previous_epoch: Any = None, previous_error: str | None = None) -> None:
+    snapshot = _parse_llm_binding_snapshot(getattr(task, "llm_binding_snapshot", None)) or {}
+    snapshot[_AUTO_RECOVERED_PENDING_KEY] = True
+    snapshot[_AUTO_RECOVERED_REASON_KEY] = str(reason or "").strip() or "owner_or_orphan_recovered"
+    snapshot[_AUTO_RECOVERED_PREVIOUS_OWNER_KEY] = str(previous_owner_id or "").strip() or None
+    snapshot[_AUTO_RECOVERED_PREVIOUS_EPOCH_KEY] = previous_epoch
+    snapshot[_AUTO_RECOVERED_PREVIOUS_ERROR_KEY] = str(previous_error or "").strip() or None
+    snapshot[_AUTO_RECOVERED_MARKED_AT_KEY] = isoformat_local(now_local()) or ""
+    task.llm_binding_snapshot = json.dumps(snapshot, ensure_ascii=False)
+
+
+def _consume_task_auto_recovered_marker(task: Any) -> dict[str, Any] | None:
+    snapshot = _parse_llm_binding_snapshot(getattr(task, "llm_binding_snapshot", None)) or {}
+    if not snapshot.get(_AUTO_RECOVERED_PENDING_KEY):
+        return None
+    payload = {
+        "reason": snapshot.get(_AUTO_RECOVERED_REASON_KEY),
+        "previous_owner_id": snapshot.get(_AUTO_RECOVERED_PREVIOUS_OWNER_KEY),
+        "lease_epoch_before": snapshot.get(_AUTO_RECOVERED_PREVIOUS_EPOCH_KEY),
+        "previous_error": snapshot.get(_AUTO_RECOVERED_PREVIOUS_ERROR_KEY),
+        "marked_at": snapshot.get(_AUTO_RECOVERED_MARKED_AT_KEY),
+    }
+    for key in (
+        _AUTO_RECOVERED_PENDING_KEY,
+        _AUTO_RECOVERED_REASON_KEY,
+        _AUTO_RECOVERED_PREVIOUS_OWNER_KEY,
+        _AUTO_RECOVERED_PREVIOUS_EPOCH_KEY,
+        _AUTO_RECOVERED_PREVIOUS_ERROR_KEY,
+        _AUTO_RECOVERED_MARKED_AT_KEY,
+    ):
+        snapshot.pop(key, None)
+    task.llm_binding_snapshot = json.dumps(snapshot, ensure_ascii=False)
+    return payload
 
 
 def _executor_capacity() -> int:
@@ -1325,12 +1418,12 @@ def _parse_llm_binding_snapshot(snapshot_raw: str | None) -> dict | None:
 
 def _agent_runtime_payload_from_snapshot(snapshot: dict | None) -> dict[str, Any]:
     agent_task_key = snapshot.get("agent_task_key") if isinstance(snapshot, dict) and isinstance(snapshot.get("agent_task_key"), dict) else {}
-    secret = str(agent_task_key.get("secret") or "").strip()
+    auth_payload = _agent_auth_payload(snapshot if isinstance(snapshot, dict) else None)
     return {
-        "has_agent_task_key": bool(secret),
+        "has_agent_task_key": bool(auth_payload.get("agent_task_key_id") or auth_payload.get("agent_task_key_prefix")),
         "agent_task_key_id": str(agent_task_key.get("id") or "").strip() or None,
         "agent_task_key_prefix": str(agent_task_key.get("prefix") or "").strip() or None,
-        "agent_runtime_mode": "task_scoped" if secret else "global",
+        "agent_runtime_mode": _snapshot_runtime_mode(snapshot if isinstance(snapshot, dict) else None),
     }
 
 
@@ -1360,21 +1453,33 @@ def _build_llm_binding_snapshot(db) -> dict:
             str(config_file.get("default_model") or "").strip(),
             configured_model or None,
         )
+        models_json = ensure_models_json_context_window(
+            config_file.get("models_json") if isinstance(config_file.get("models_json"), dict) else {},
+        )
+        settings_json = build_settings_json(selected_provider_key, resolved_model)
         roles[role] = {
             "config_file_key": config_file_key,
             "provider_key": selected_provider_key,
             "display_name": str(config_file.get("display_name") or "").strip() or config_file_key,
             "model": resolved_model,
             "model_selector": model_selector,
-            "models_json": config_file.get("models_json"),
-            "settings_json": _build_settings_json(selected_provider_key, "auto"),
+            "runtime_dir": None,
+            "models_json": models_json,
+            "settings_json": settings_json,
+            "runtime_files": {
+                "models_json": models_json,
+                "settings_json": settings_json,
+                "auth_json": None,
+            },
             "frozen_at": frozen_at,
             "updated_at": str(config_file.get("updated_at") or "").strip() or None,
         }
 
     return {
         "version": 2,
+        "agent_runtime_mode": _AGENT_RUNTIME_MODE,
         "frozen_at": frozen_at,
+        "project_id": None,
         "roles": roles,
     }
 
@@ -1390,13 +1495,52 @@ def _freeze_task_llm_binding_snapshot(task_id: str) -> dict:
         if task.llm_binding_snapshot:
             return json.loads(task.llm_binding_snapshot)
 
-        snapshot = _build_llm_binding_snapshot(db)
+        snapshot = _materialize_snapshot_runtime_details(
+            _build_llm_binding_snapshot(db),
+            project_id=str(task.project_id or "").strip(),
+            task_id=str(task.id or "").strip(),
+        )
         task.llm_binding_snapshot = json.dumps(snapshot, ensure_ascii=False)
         task.last_progress_at = now_local()
         db.commit()
         return snapshot
     finally:
         db.close()
+
+
+def _materialize_snapshot_runtime_details(
+    snapshot: dict[str, Any] | None,
+    *,
+    project_id: str,
+    task_id: str,
+) -> dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        return {"version": 2, "agent_runtime_mode": _AGENT_RUNTIME_MODE, "roles": {}}
+    auth_payload = _agent_auth_payload(snapshot)
+    sanitized_auth = _sanitize_agent_auth_payload(auth_payload)
+    roles = snapshot.get("roles") if isinstance(snapshot.get("roles"), dict) else {}
+    for role_name, role_payload in roles.items():
+        if not isinstance(role_payload, dict):
+            continue
+        runtime_dir = role_runtime_dir_for_task(project_id=project_id, task_id=task_id, role=role_name)
+        role_payload["runtime_dir"] = runtime_dir
+        models_json = ensure_models_json_context_window(
+            role_payload.get("models_json") if isinstance(role_payload.get("models_json"), dict) else {},
+        )
+        settings_json = role_payload.get("settings_json") if isinstance(role_payload.get("settings_json"), dict) else build_settings_json(
+            str(role_payload.get("provider_key") or role_payload.get("config_file_key") or "").strip(),
+            str(role_payload.get("model") or "auto").strip() or "auto",
+        )
+        role_payload["models_json"] = models_json
+        role_payload["settings_json"] = settings_json
+        role_payload["runtime_files"] = {
+            "models_json": models_json,
+            "settings_json": settings_json,
+            "auth_json": sanitized_auth,
+        }
+    snapshot["agent_runtime_mode"] = _snapshot_runtime_mode(snapshot)
+    snapshot["project_id"] = str(project_id or "").strip() or None
+    return snapshot
 
 
 def _update_task_progress(task_id: str, *, stage: Optional[str] = None) -> None:
@@ -1527,6 +1671,14 @@ def _finalize_orphaned_task(task_id: str, reason: str, *, owner_lost: bool = Fal
         task.last_progress_at = now_local()
         db.commit()
         if owner_lost:
+            if task.status == TaskStatus.AWAITING_TAKEOVER.value:
+                _mark_task_auto_recovered_pending(
+                    task,
+                    reason=reason,
+                    previous_owner_id=previous_owner_id,
+                    previous_error=reason,
+                )
+                db.commit()
             _record_task_event_from_row(
                 task,
                 event_type="owner_lost",
@@ -1885,7 +2037,11 @@ def process_workspace_cleanup_jobs(limit: int = 2) -> int:
                         db.query(FirmwareEvolutionRound).filter(FirmwareEvolutionRound.job_id == evolution_job.id).delete()
                     db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.task_id == task.id).delete()
                     if not task.llm_binding_snapshot:
-                        snapshot = _build_llm_binding_snapshot(db)
+                        snapshot = _materialize_snapshot_runtime_details(
+                            _build_llm_binding_snapshot(db),
+                            project_id=str(task.project_id or "").strip(),
+                            task_id=str(task.id or "").strip(),
+                        )
                         task.llm_binding_snapshot = json.dumps(snapshot, ensure_ascii=False)
                     db.commit()
                     requeue_task_id = task.id
@@ -2166,6 +2322,11 @@ def submit_unpack_task(
                 **effective_snapshot,
                 **llm_binding_snapshot,
             }
+        effective_snapshot = _materialize_snapshot_runtime_details(
+            effective_snapshot,
+            project_id=normalized_project_id,
+            task_id=task_id,
+        )
         db.add(
             UnpackTask(
                 id=task_id,
@@ -2969,6 +3130,27 @@ def _assign_task_to_worker(task_id: str, worker_id: str, pod_name: str) -> bool:
         if updated:
             task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
             if task is not None and task.status == TaskStatus.ASSIGNED.value:
+                recovery_payload = _consume_task_auto_recovered_marker(task)
+                if recovery_payload is not None:
+                    db.commit()
+                    _record_task_event_from_row(
+                        task,
+                        event_type="task_auto_recovered",
+                        summary="任务已由系统自动恢复并重新认领执行",
+                        stage_key=task.current_stage,
+                        status=task.status,
+                        detail={
+                            "reason": recovery_payload.get("reason"),
+                            "previous_status": "running",
+                            "previous_error": recovery_payload.get("previous_error"),
+                            "previous_owner_id": recovery_payload.get("previous_owner_id"),
+                            "lease_epoch_before": recovery_payload.get("lease_epoch_before"),
+                            "lease_epoch_after": int(task.assignment_generation or 0),
+                            "control_version": int(task.assignment_generation or 0),
+                        },
+                        owner_id=worker_id,
+                        created_by="task_manager",
+                    )
                 _record_task_event_from_row(
                     task,
                     event_type="task_owner_lost_recovered",
