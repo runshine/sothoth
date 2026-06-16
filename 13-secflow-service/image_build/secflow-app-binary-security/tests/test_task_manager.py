@@ -29935,6 +29935,92 @@ def _test_sync_downstream_status_skips_recovery_event_for_terminal_failed_child(
     self.assertEqual([], recovery_events)
 
 
+def _test_sync_downstream_status_system_analysis_success_creates_archive_job(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-sa-archive",
+        project_id="p1",
+        name="firmware",
+        status="running",
+        current_stage="system_analysis",
+        task_type=TASK_TYPE_BINARY,
+        firmware_source="upload",
+        firmware_path="/fw.bin",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    run = BinarySecurityStageRun(
+        id="sr-sa-archive",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        sequence_no=2,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si-sa-archive",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=run.id,
+        stage_name="system_analysis",
+        item_key="fw1",
+        item_name="fw1",
+        status="running",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-1",
+        result={
+            "sync_observation": {
+                "replacement_in_progress": True,
+                "old_downstream_task_id": "sat-old",
+            },
+        },
+    )
+    db = _ModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], archive_jobs=[], events=[])
+
+    async def _fetch(_task, _item, _token):
+        return {
+            "task_id": "sat-1",
+            "status": "passed",
+            "updated_at": "2026-06-16T03:25:42+08:00",
+            "finished_at": "2026-06-16T03:25:42+08:00",
+            "result": {"output_root": "/tmp/system-analysis/sat-1/output"},
+        }
+
+    async def _noop_apply_archive_job_status(_job_id, _archive_root):
+        return None
+
+    original_fetch = manager._fetch_downstream_task_payload
+    original_apply_archive = manager._apply_archive_job_status
+    original_write = manager._write_task_metadata_async
+    original_enqueue = manager._enqueue_task
+    try:
+        manager._fetch_downstream_task_payload = _fetch
+        manager._apply_archive_job_status = _noop_apply_archive_job_status
+        manager._write_task_metadata_async = AsyncMock(return_value=None)
+        manager._enqueue_task = lambda *_args, **_kwargs: None
+        resp = asyncio.run(
+            manager.sync_downstream_status(
+                db,
+                project_id="p1",
+                task_id=task.id,
+                stage_name="system_analysis",
+                apply_state=True,
+            )
+        )
+    finally:
+        manager._fetch_downstream_task_payload = original_fetch
+        manager._apply_archive_job_status = original_apply_archive
+        manager._write_task_metadata_async = original_write
+        manager._enqueue_task = original_enqueue
+
+    self.assertEqual(0, resp.synced_downstream_count)
+    self.assertEqual(1, resp.skipped_downstream_count)
+    self.assertEqual(1, len(db.archive_jobs))
+    self.assertEqual("system_analysis", db.archive_jobs[0].stage_name)
+    self.assertEqual("si-sa-archive::sat-1", db.archive_jobs[0].job_dedupe_key)
+    self.assertEqual("success", db.archive_jobs[0].payload.get("mapped_status"))
+
+
 def _test_requeue_released_running_locked_requeues_streaming_tail_with_active_items(self):
     manager = TaskManager()
     task = BinarySecurityTask(
@@ -31282,6 +31368,7 @@ TaskManagerTests.test_tail_stage_work_summary_keeps_replacement_binding_active =
 TaskManagerTests.test_tail_stage_work_summary_keeps_transport_error_binding_active = _test_tail_stage_work_summary_keeps_transport_error_binding_active
 TaskManagerTests.test_tail_stage_work_summary_ignores_empty_pending_tail_stage_without_work = _test_tail_stage_work_summary_ignores_empty_pending_tail_stage_without_work
 TaskManagerTests.test_process_readless_reconcile_records_incomplete_tail_reason = _test_process_readless_reconcile_records_incomplete_tail_reason
+TaskManagerTests.test_sync_downstream_status_system_analysis_success_creates_archive_job = _test_sync_downstream_status_system_analysis_success_creates_archive_job
 TaskManagerTests.test_run_entry_item_retry_recreates_child_when_existing_downstream_is_terminal_cancelled = _test_run_entry_item_retry_recreates_child_when_existing_downstream_is_terminal_cancelled
 TaskManagerTests.test_run_entry_item_non_retry_keeps_terminal_cancelled_child_without_recreate = _test_run_entry_item_non_retry_keeps_terminal_cancelled_child_without_recreate
 

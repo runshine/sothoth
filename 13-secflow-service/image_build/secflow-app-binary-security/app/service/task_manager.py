@@ -8818,7 +8818,7 @@ class TaskManager:
                                     db,
                                     task,
                                     "downstream_status_synced",
-                                    "下游终态已同步，当前子任务不再进入归档",
+                                    "下游终态已同步，当前终态不属于产物归档范围",
                                     stage_name=item.stage_name,
                                     item=item,
                                     level="warning" if mapped_status in {"failed", "cancelled"} else "info",
@@ -8841,7 +8841,7 @@ class TaskManager:
                                     db,
                                     task,
                                     item,
-                                    message="下游终态已观测，本次仅观测未写回状态",
+                                    message="下游终态已观测，当前终态不属于产物归档范围，本次仅观测未写回状态",
                                     payload={
                                         "downstream_service": item.downstream_service,
                                         "downstream_task_id": item.downstream_task_id,
@@ -8854,170 +8854,6 @@ class TaskManager:
                                         "downstream_status": downstream_status,
                                         "after_status": mapped_status,
                                         "archive_skipped": True,
-                                    },
-                                    reason_code=skip_reason_code,
-                                    reason_category=skip_reason_category,
-                                )
-                        continue
-                    if mapped_status == "success" and item.stage_name == "system_analysis" and item.downstream_service == "system_analyse":
-                        should_apply = observed_apply_state and (mapped_status != before_status or force)
-                        if should_apply:
-                            setattr(task, "_preferred_requeue_event_stage_name", item.stage_name)
-                            with suppress(Exception):
-                                await self._refresh_terminal_item_result_from_downstream(
-                                    task,
-                                    item,
-                                    payload,
-                                    mapped_status=mapped_status,
-                                    archived_dir=None,
-                                )
-                            if not self._apply_child_state_with_savepoint(
-                                db,
-                                task=task,
-                                item=item,
-                                change_source="downstream_sync",
-                                target_status=mapped_status,
-                                sync_status="synced",
-                                downstream_status_raw=downstream_status,
-                                downstream_status_mapped=mapped_status,
-                                downstream_status=downstream_status,
-                                error_message=None,
-                                http_status=None,
-                                error_type=None,
-                                apply_fn=lambda: (
-                                    self._enqueue_downstream_terminal_event(
-                                        db,
-                                        task=task,
-                                        item=item,
-                                        mapped_status=mapped_status,
-                                        before_status=before_status,
-                                        downstream_status=downstream_status,
-                                        payload=payload,
-                                        error_message=None,
-                                        http_status=None,
-                                        error_type=None,
-                                        status_raw=downstream_status,
-                                        force=force,
-                                    ),
-                                    self._apply_downstream_status_inline(
-                                        item,
-                                        mapped_status=mapped_status,
-                                        downstream_payload=payload,
-                                        error_message=None,
-                                        synced_at=sync_observed_at,
-                                    ),
-                                    self._reconcile_stage_and_task_state_after_item_update(db, task, item.stage_name),
-                                    self._mark_stage_item_sync_observation(
-                                        item,
-                                        sync_status="synced",
-                                        synced_at=sync_observed_at,
-                                        status_raw=downstream_status,
-                                        mapped_status=mapped_status,
-                                        downstream_status=downstream_status,
-                                        state_applied=True,
-                                    ),
-                                ),
-                            ):
-                                failed_count += 1
-                                continue
-                            downstream_stage_runs = [
-                                run
-                                for run in db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
-                                if str(run.stage_name or "").strip() != "system_analysis"
-                            ]
-                            active_downstream_stage = next(
-                                (
-                                    run
-                                    for run in downstream_stage_runs
-                                    if str(run.status or "").strip() in {"running", "dispatching", "pending", "queued"}
-                                ),
-                                None,
-                            )
-                            if (
-                                active_downstream_stage is not None
-                                and self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_OWNED_EXECUTION
-                                and not self._has_active_owned_execution_holder(db, task)
-                            ):
-                                self._requeue_owned_execution_takeover(
-                                    db,
-                                    task,
-                                    stage_name=str(active_downstream_stage.stage_name or "").strip() or None,
-                                    reason="system_analysis_sync_next_stage_active_without_owner",
-                                    event_type="owned_execution_takeover_requeued",
-                                    message="系统分析同步完成，检测到后续阶段已处于活跃态，任务已重新排队等待 worker 接管",
-                                    event_payload={
-                                        "source": "system_analysis_sync_success",
-                                        "next_stage_status": str(active_downstream_stage.status or "").strip() or None,
-                                    },
-                                )
-                            else:
-                                touched_stages.add(item.stage_name)
-                            synced_count += 1
-                        else:
-                            self._mark_stage_item_sync_observation(
-                                item,
-                                sync_status="skipped",
-                                synced_at=sync_observed_at,
-                                status_raw=downstream_status,
-                                mapped_status=mapped_status,
-                                downstream_status=downstream_status,
-                                state_applied=False,
-                            )
-                            skipped_count += 1
-                        skip_reason_code, skip_reason_category = self._classify_downstream_sync_skip_reason(
-                            mapped_status=mapped_status,
-                            before_status=before_status,
-                            apply_state=apply_state,
-                        )
-                        if self._should_record_downstream_sync_skip_event(
-                            should_apply=bool(should_apply),
-                            skip_reason_code=skip_reason_code,
-                            mapped_status=mapped_status,
-                            before_status=before_status,
-                            apply_state=apply_state,
-                        ):
-                            if should_apply:
-                                self._record_event(
-                                    db,
-                                    task,
-                                    "downstream_status_synced",
-                                    "系统分析下游终态已同步",
-                                    stage_name=item.stage_name,
-                                    item=item,
-                                    payload={
-                                        "downstream_service": item.downstream_service,
-                                        "downstream_task_id": item.downstream_task_id,
-                                        "http_status": None,
-                                        "error_type": None,
-                                        "status_raw": downstream_status,
-                                        "mapped_status": mapped_status,
-                                        "state_applied": True,
-                                        "before_status": before_status,
-                                        "downstream_status": downstream_status,
-                                        "after_status": mapped_status,
-                                        "archive_skipped": True,
-                                        "result_refreshed_inline": True,
-                                    },
-                                )
-                            else:
-                                self._record_downstream_sync_skip_event_if_needed(
-                                    db,
-                                    task,
-                                    item,
-                                    message="系统分析下游终态已观测，本次未写回",
-                                    payload={
-                                        "downstream_service": item.downstream_service,
-                                        "downstream_task_id": item.downstream_task_id,
-                                        "http_status": None,
-                                        "error_type": None,
-                                        "status_raw": downstream_status,
-                                        "mapped_status": mapped_status,
-                                        "state_applied": False,
-                                        "before_status": before_status,
-                                        "downstream_status": downstream_status,
-                                        "after_status": mapped_status,
-                                        "archive_skipped": True,
-                                        "result_refreshed_inline": True,
                                     },
                                     reason_code=skip_reason_code,
                                     reason_category=skip_reason_category,
