@@ -15401,6 +15401,12 @@ class TaskManager:
                     "archive_bound_downstream_task_id": job_bound_downstream_task_id or None,
                 },
             )
+            self._repair_descendants_after_archive_apply_if_needed(
+                db,
+                task,
+                item,
+                state_event_id=state_event_id,
+            )
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
             observe_archive_action("apply", "success")
             observe_archive_duration(
@@ -29161,6 +29167,381 @@ class TaskManager:
     def _clear_task_failure_state(self, task: BinarySecurityTask) -> None:
         task.summary = self._clear_failure_fields_from_summary(task.summary or {})
         task.last_error = None
+
+    def _archive_apply_repaired_stage_refresh(self, db: Session, task: BinarySecurityTask, stage_name: str) -> None:
+        normalized_stage = normalize_stage_name(stage_name)
+        if normalized_stage == "system_analysis":
+            self._refresh_system_analysis_stage_from_synced_items(db, task)
+        elif normalized_stage == "firmware_unpack":
+            self._refresh_firmware_unpack_stage_from_synced_items(db, task)
+        elif normalized_stage == "binary_to_source":
+            self._rebuild_summary_results_from_stage_items(db, task, "binary_to_source", "b2s_results")
+        elif normalized_stage == "entry_analysis":
+            self._rebuild_entry_results_from_stage_items(db, task)
+
+    def _archive_apply_downstream_input_signature(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> dict[str, Any]:
+        normalized_stage = normalize_stage_name(stage_name)
+        summary = dict(task.summary or {})
+        if normalized_stage == "system_analysis":
+            selected_modules = [
+                str(module.get("module_key") or "").strip()
+                for module in list(summary.get("selected_modules") or [])
+                if isinstance(module, dict) and str(module.get("module_key") or "").strip()
+            ]
+            candidate_modules = [
+                str(module.get("module_key") or "").strip()
+                for module in list(summary.get("candidate_modules") or [])
+                if isinstance(module, dict) and str(module.get("module_key") or "").strip()
+            ]
+            return {
+                "stage_name": "system_analysis",
+                "selected_module_count": len(selected_modules),
+                "selected_module_keys": selected_modules,
+                "candidate_module_count": len(candidate_modules),
+            }
+        if normalized_stage == "binary_to_source":
+            entry_inputs = self._entry_analysis_inputs(db, task)
+            entry_keys = [
+                str(row.get("module_key") or row.get("entry_key") or "").strip()
+                for row in entry_inputs
+                if isinstance(row, dict)
+            ]
+            return {
+                "stage_name": "binary_to_source",
+                "entry_input_count": len(entry_inputs),
+                "entry_input_keys": [key for key in entry_keys if key],
+            }
+        if normalized_stage == "entry_analysis":
+            entry_results = self._effective_entry_inputs(task)
+            entries: list[dict[str, Any]] = []
+            for row in entry_results:
+                if isinstance(row, dict):
+                    entries.extend([dict(entry) for entry in list(row.get("entries") or []) if isinstance(entry, dict)])
+            deduped = _deduplicate_entry_keys(entries)
+            entry_keys = [str(entry.get("entry_key") or "").strip() for entry in deduped if str(entry.get("entry_key") or "").strip()]
+            return {
+                "stage_name": "entry_analysis",
+                "entry_count": len(deduped),
+                "entry_keys": entry_keys,
+            }
+        if normalized_stage == "firmware_unpack":
+            system_inputs = self._system_analysis_inputs(task)
+            firmware_keys = [
+                str(row.get("firmware_key") or "").strip()
+                for row in system_inputs
+                if isinstance(row, dict) and str(row.get("firmware_key") or "").strip()
+            ]
+            return {
+                "stage_name": "firmware_unpack",
+                "system_input_count": len(system_inputs),
+                "firmware_keys": firmware_keys,
+            }
+        return {"stage_name": normalized_stage}
+
+    def _archive_apply_signature_has_runnable_inputs(self, signature: dict[str, Any] | None) -> bool:
+        payload = dict(signature or {})
+        stage_name = normalize_stage_name(payload.get("stage_name"))
+        if stage_name == "system_analysis":
+            return int(payload.get("selected_module_count") or 0) > 0
+        if stage_name == "binary_to_source":
+            return int(payload.get("entry_input_count") or 0) > 0
+        if stage_name == "entry_analysis":
+            return int(payload.get("entry_count") or 0) > 0
+        if stage_name == "firmware_unpack":
+            return int(payload.get("system_input_count") or 0) > 0
+        return False
+
+    def _archive_apply_stage_has_authoritative_success_payload(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> bool:
+        normalized_stage = normalize_stage_name(stage_name)
+        if normalized_stage == "system_analysis":
+            items = self._stage_items(db, task.id, stage_name)
+            return any(str(item.status or "").strip() == "success" for item in items)
+        return False
+
+    def _descendant_stages_for_stage(self, task: BinarySecurityTask, stage_name: str) -> list[str]:
+        stage_sequence = self._stage_sequence_for_task(task)
+        normalized_stage_name = str(stage_name or "").strip()
+        if normalized_stage_name not in stage_sequence:
+            return []
+        index = stage_sequence.index(normalized_stage_name)
+        return [stage for stage in stage_sequence[index + 1 :] if self._stage_enabled(task, stage)]
+
+    def _is_archive_repair_sensitive_failure(
+        self,
+        stage_name: str,
+        *,
+        failure_code: str | None,
+        failure_message: str | None,
+    ) -> bool:
+        normalized_stage = normalize_stage_name(stage_name)
+        code = str(failure_code or "").strip().lower()
+        message = str(failure_message or "").strip()
+        lowered = message.lower()
+        if normalized_stage == "binary_to_source":
+            return code == "missing_selected_modules" or "缺少已选模块列表" in message
+        if normalized_stage == "entry_analysis":
+            return code == "missing_entry_analysis_input" or "可用于入口分析" in message or "缺少源码模块" in message or "缺少入口分析" in lowered
+        if normalized_stage == "dataflow_vuln_scan":
+            return code == "missing_dataflow_entries" or "可用于数据流漏洞挖掘的入口" in message
+        if normalized_stage == "system_analysis":
+            return code == "missing_system_analysis_input" or "可用于系统分析的输入" in message
+        return False
+
+    def _archive_apply_descendant_contamination(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        repaired_stage: str,
+    ) -> list[dict[str, Any]]:
+        contaminated: list[dict[str, Any]] = []
+        descendant_stages = self._descendant_stages_for_stage(task, repaired_stage)
+        if not descendant_stages:
+            return contaminated
+        stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+        runs_by_stage = {str(run.stage_name or "").strip(): run for run in stage_runs}
+        for stage_name in descendant_stages:
+            stage_run = runs_by_stage.get(stage_name)
+            stage_items = self._stage_items(db, task.id, stage_name)
+            stage_status = self._normalize_downstream_status(getattr(stage_run, "status", None)) or str(getattr(stage_run, "status", "") or "").strip().lower()
+            failure_snapshot = self._stage_failure_snapshot(task, stage_run) if stage_run is not None else {}
+            failure_code = self._string_or_none(failure_snapshot.get("failure_code"))
+            failure_message = (
+                self._string_or_none(failure_snapshot.get("failure_message"))
+                or self._string_or_none(failure_snapshot.get("error"))
+                or self._string_or_none(getattr(stage_run, "last_error", None))
+            )
+            reason: str | None = None
+            if stage_status in {"failed", "cancelled", "downstream_missing"} and self._is_archive_repair_sensitive_failure(
+                stage_name,
+                failure_code=failure_code,
+                failure_message=failure_message,
+            ):
+                reason = "failed_due_to_missing_repaired_inputs"
+            elif stage_status in {"pending", "queued", "running", "dispatching", "success", "partial_success"} and stage_items:
+                reason = "stale_descendant_items_present"
+            elif stage_status in {"pending", "queued", "running", "dispatching"} and stage_run is not None:
+                reason = "stale_descendant_stage_run_present"
+            if reason:
+                contaminated.append(
+                    {
+                        "stage_name": stage_name,
+                        "reason": reason,
+                        "stage_run": stage_run,
+                        "stage_items": list(stage_items),
+                        "failure_code": failure_code,
+                        "failure_message": failure_message,
+                    }
+                )
+        return contaminated
+
+    def _archive_apply_forced_descendant_contamination(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        repaired_stage: str,
+    ) -> list[dict[str, Any]]:
+        normalized_repaired_stage = normalize_stage_name(repaired_stage)
+        current_stage = str(task.current_stage or "").strip()
+        if normalized_repaired_stage != "system_analysis" or not current_stage:
+            return []
+        descendant_stages = self._descendant_stages_for_stage(task, repaired_stage)
+        if current_stage not in descendant_stages:
+            return []
+        current_stage_run = db.query(BinarySecurityStageRun).filter(
+            BinarySecurityStageRun.task_id == task.id,
+            BinarySecurityStageRun.stage_name == current_stage,
+        ).first()
+        current_failure_message = (
+            self._string_or_none(getattr(current_stage_run, "last_error", None))
+            or self._string_or_none(task.last_error)
+        )
+        if not self._is_archive_repair_sensitive_failure(
+            current_stage,
+            failure_code=None,
+            failure_message=current_failure_message,
+        ):
+            return []
+        contaminated: list[dict[str, Any]] = []
+        for stage_name in descendant_stages:
+            stage_run = db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == stage_name,
+            ).first()
+            stage_items = self._stage_items(db, task.id, stage_name)
+            if stage_run is None and not stage_items:
+                continue
+            contaminated.append(
+                {
+                    "stage_name": stage_name,
+                    "reason": "forced_missing_input_descendant_repair",
+                    "stage_run": stage_run,
+                    "stage_items": list(stage_items),
+                    "failure_code": None,
+                    "failure_message": current_failure_message,
+                }
+            )
+        return contaminated
+
+    def _reset_descendant_stages_after_archive_repair(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        repaired_stage: str,
+        contaminated: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        affected_stages = [str(row.get("stage_name") or "").strip() for row in contaminated if str(row.get("stage_name") or "").strip()]
+        if not affected_stages:
+            return {
+                "affected_stages": [],
+                "deleted_stage_item_count": 0,
+                "deleted_archive_job_count": 0,
+                "deleted_state_event_count": 0,
+                "deleted_timeline_event_count": 0,
+            }
+        self._clear_task_failure_state(task)
+        self._clear_stage_outputs_from(task, affected_stages[0], mark_stale=False)
+        self._clear_stage_output_artifacts(task, affected_stages)
+        deleted_archive_job_count = self._delete_archive_children_for_stages(db, task, affected_stages)
+        deleted_stage_item_count = self._delete_stage_items_for_stages(db, task.id, affected_stages)
+        deleted_state_event_count = self._delete_state_event_rows_for_stages(db, task.id, affected_stages)
+        deleted_timeline_event_count = self._delete_timeline_rows_for_stages(db, task.id, affected_stages)
+        for stage_name in affected_stages:
+            stage_run = db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == stage_name,
+            ).first()
+            if stage_run is not None:
+                self._reset_stage_run_for_retry(task, stage_run, increment_retry=False)
+        summary = dict(task.summary or {})
+        summary["stale_reason"] = "archive_input_repaired"
+        summary["stale_from_stage"] = repaired_stage
+        summary["stale_stages"] = affected_stages
+        task.summary = summary
+        return {
+            "affected_stages": affected_stages,
+            "deleted_stage_item_count": deleted_stage_item_count,
+            "deleted_archive_job_count": deleted_archive_job_count,
+            "deleted_state_event_count": deleted_state_event_count,
+            "deleted_timeline_event_count": deleted_timeline_event_count,
+        }
+
+    def _requeue_after_archive_input_repair(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        repaired_stage: str,
+        affected_stages: list[str],
+        state_event_id: str | None,
+        before_signature: dict[str, Any],
+        after_signature: dict[str, Any],
+    ) -> bool:
+        next_stage = self._next_incomplete_stage(db, task)
+        if not next_stage:
+            return False
+        if not self._should_auto_advance_to_stage(db, task, next_stage):
+            blocked_reason = self._continue_stage_input_error(db, task, next_stage)
+            self._record_event(
+                db,
+                task,
+                "archive_apply_input_repair_blocked",
+                "归档晚到修复后仍无法自动推进到下一阶段",
+                level="warning",
+                stage_name=next_stage,
+                payload={
+                    "state_event_id": state_event_id,
+                    "repaired_stage": repaired_stage,
+                    "blocked_reason": blocked_reason,
+                    "affected_stages": affected_stages,
+                    "input_semantics_before": before_signature,
+                    "input_semantics_after": after_signature,
+                },
+            )
+            return False
+        task.status = "pending"
+        task.current_stage = next_stage
+        task.finished_at = None
+        self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+        self._invalidate_task_execution(task)
+        self._record_event(
+            db,
+            task,
+            "archive_apply_triggered_input_repair",
+            "上游阶段归档晚到修复了后续输入，已失效化污染阶段并重新排队",
+            stage_name=repaired_stage,
+            level="warning",
+            payload={
+                "state_event_id": state_event_id,
+                "repaired_stage": repaired_stage,
+                "next_stage": next_stage,
+                "affected_stages": affected_stages,
+                "input_semantics_before": before_signature,
+                "input_semantics_after": after_signature,
+            },
+        )
+        self._record_event(
+            db,
+            task,
+            "task_requeued_after_archive_input_repair",
+            f"归档修复后任务重新进入下一阶段: {next_stage}",
+            stage_name=next_stage,
+            payload={
+                "state_event_id": state_event_id,
+                "repaired_stage": repaired_stage,
+                "affected_stages": affected_stages,
+            },
+        )
+        self._enqueue_task(task.id)
+        return True
+
+    def _repair_descendants_after_archive_apply_if_needed(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        state_event_id: str | None,
+    ) -> bool:
+        repaired_stage = str(item.stage_name or "").strip()
+        if not repaired_stage:
+            return False
+        descendant_stages = self._descendant_stages_for_stage(task, repaired_stage)
+        if not descendant_stages:
+            return False
+        before_signature = self._archive_apply_downstream_input_signature(db, task, repaired_stage)
+        self._archive_apply_repaired_stage_refresh(db, task, repaired_stage)
+        after_signature = self._archive_apply_downstream_input_signature(db, task, repaired_stage)
+        contaminated = self._archive_apply_descendant_contamination(db, task, repaired_stage)
+        if not contaminated:
+            contaminated = self._archive_apply_forced_descendant_contamination(db, task, repaired_stage)
+        if not contaminated:
+            return False
+        if (
+            before_signature == after_signature
+            and not self._archive_apply_signature_has_runnable_inputs(after_signature)
+            and not self._archive_apply_stage_has_authoritative_success_payload(db, task, repaired_stage)
+        ):
+            return False
+        repair_result = self._reset_descendant_stages_after_archive_repair(db, task, repaired_stage, contaminated)
+        return self._requeue_after_archive_input_repair(
+            db,
+            task,
+            repaired_stage=repaired_stage,
+            affected_stages=list(repair_result.get("affected_stages") or []),
+            state_event_id=state_event_id,
+            before_signature=before_signature,
+            after_signature=after_signature,
+        )
 
     def _base_task_summary(
         self,

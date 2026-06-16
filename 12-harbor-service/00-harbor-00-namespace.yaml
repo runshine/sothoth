@@ -1,7 +1,0 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: harbor-ns
-  labels:
-    name: harbor-ns
-    environment: production

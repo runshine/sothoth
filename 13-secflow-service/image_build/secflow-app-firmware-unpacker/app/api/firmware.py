@@ -1818,11 +1818,13 @@ def _read_round_metrics(run_root: Path) -> dict:
         )
         previous_executor_tokens = raw_executor_tokens
         reviewer_tokens = tokens_payload.get("reviewer") if isinstance(tokens_payload.get("reviewer"), dict) else {}
+        round_total_payload = tokens_payload.get("round_total") if isinstance(tokens_payload.get("round_total"), dict) else {}
         round_tokens = _normalize_round_tokens(
             {
                 field: _safe_int(executor_tokens.get(field)) + _safe_int(reviewer_tokens.get(field))
                 for field in TOKEN_FIELDS
             }
+            | {"cost": _safe_float(round_total_payload.get("cost"))}
         )
         output_snapshot = payload.get("output_snapshot") if isinstance(payload.get("output_snapshot"), dict) else {}
         output_delta = payload.get("output_delta") if isinstance(payload.get("output_delta"), dict) else {}
@@ -1932,6 +1934,9 @@ def _read_round_metrics(run_root: Path) -> dict:
         tokens = item.get("tokens") if isinstance(item.get("tokens"), dict) else {}
         total_tokens += _safe_int(tokens.get("total"))
         total_cost += _safe_float(tokens.get("cost"))
+        if _safe_float(tokens.get("cost")) <= 0:
+            round_total = tokens.get("round_total") if isinstance(tokens.get("round_total"), dict) else {}
+            total_cost += _safe_float(round_total.get("cost"))
         delta = item.get("output_delta") if isinstance(item.get("output_delta"), dict) else {}
         output_growth += _safe_int(delta.get("size_bytes_delta"))
 

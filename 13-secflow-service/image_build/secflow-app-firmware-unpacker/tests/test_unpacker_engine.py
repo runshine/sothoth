@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 import sys
@@ -238,7 +239,7 @@ class StreamingSubprocessTests(unittest.TestCase):
             source_target.parent.mkdir(parents=True, exist_ok=True)
             source_target.write_text("# old\n", encoding="utf-8")
             source_link = source_dir / "huawei-cc-00000002.py"
-            source_link.symlink_to(source_target.relative_to(source_link.parent))
+            source_link.symlink_to(os.path.relpath(source_target, start=source_link.parent))
 
             working_dir = root / "run" / "working_tool"
             working_dir.mkdir(parents=True, exist_ok=True)
@@ -265,7 +266,7 @@ class StreamingSubprocessTests(unittest.TestCase):
                     tool_changed=False,
                 )
 
-            self.assertIn("/202605", published)
+            self.assertTrue(str(published).startswith(str(store_dir)))
             self.assertTrue(Path(published).is_file())
             self.assertNotEqual(str(source_link), published)
 

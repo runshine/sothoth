@@ -15980,6 +15980,211 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             [event.event_type for event in db.events],
         )
 
+    def test_repair_descendants_after_archive_apply_requeues_after_system_analysis_unlocks_selected_modules(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="binary_to_source",
+            firmware_source="project_filesystem",
+            firmware_path="/fw.bin",
+            output_root="/o",
+            workspace_root="/tmp",
+            runtime_phase=TASK_RUNTIME_PHASE_TERMINAL,
+        )
+        task.last_error = "缺少已选模块列表"
+        task.summary = {
+            "selected_modules": [],
+            "candidate_modules": [],
+            "system_analysis_results": [],
+            "system_analysis_modules": [],
+        }
+        firmware_run = BinarySecurityStageRun(
+            id="sr-fw",
+            task_id="t1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            sequence_no=1,
+            status="success",
+        )
+        system_run = BinarySecurityStageRun(
+            id="sr-system",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=2,
+            status="success",
+        )
+        binary_to_source_run = BinarySecurityStageRun(
+            id="sr-b2s",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            sequence_no=3,
+            status="failed",
+        )
+        binary_to_source_run.last_error = "缺少已选模块列表"
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=4,
+            status="pending",
+        )
+        system_item = BinarySecurityStageItem(
+            id="si-system",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-system",
+            stage_name="system_analysis",
+            item_key="fw-1",
+            item_name="fw-1",
+            parent_key="fw-1",
+            status="success",
+            downstream_service="system_analyse",
+            downstream_task_id="sat1",
+        )
+        firmware_item = BinarySecurityStageItem(
+            id="si-fw",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-fw",
+            stage_name="firmware_unpack",
+            item_key="fw-1",
+            item_name="fw-1",
+            parent_key="fw-1",
+            status="success",
+            downstream_service="firmware_unpacker",
+            downstream_task_id="fu1",
+        )
+        system_item.result = {
+            "firmware_key": "fw-1",
+            "firmware_name": "fw-1",
+            "filename": "fw-1.bin",
+            "modules": [
+                {
+                    "module_key": "m1",
+                    "module_name": "module-1",
+                    "risk_level": "高",
+                    "risk_score": 85,
+                    "source_dir": "/src/m1",
+                }
+            ],
+        }
+        stale_b2s_item = BinarySecurityStageItem(
+            id="si-b2s",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-b2s",
+            stage_name="binary_to_source",
+            item_key="m-stale",
+            item_name="m-stale",
+            parent_key="fw-1",
+            status="failed",
+            downstream_service="binary_to_source",
+            downstream_task_id="b2s1",
+        )
+        stale_b2s_item.error_message = "缺少已选模块列表"
+        stale_entry_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="entry-stale",
+            item_name="entry-stale",
+            parent_key="m-stale",
+            status="pending",
+            downstream_service="entry_analyse",
+            downstream_task_id="ea1",
+        )
+        archive_job = BinarySecurityArchiveJob(
+            id="job1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_id="si-system",
+            item_key="fw-1",
+            downstream_service="system_analyse",
+            downstream_task_id="sat1",
+            archive_status="archived",
+        )
+        archive_job.payload = {
+            "mapped_status": "success",
+            "bound_downstream_task_id": "sat1",
+            "downstream_payload": {"task_id": "sat1", "status": "success"},
+        }
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[firmware_run, system_run, binary_to_source_run, entry_run],
+            stage_items=[firmware_item, system_item, stale_b2s_item, stale_entry_item],
+            archive_jobs=[archive_job],
+            events=[],
+            state_events=[],
+        )
+
+        original_enqueue = self.manager._enqueue_task
+        original_refresh = self.manager._archive_apply_repaired_stage_refresh
+        original_signature = self.manager._archive_apply_downstream_input_signature
+        original_contamination = self.manager._archive_apply_descendant_contamination
+        original_next_stage = self.manager._next_incomplete_stage
+        original_should_auto = self.manager._should_auto_advance_to_stage
+        queued = []
+        self.manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
+        self.manager._archive_apply_repaired_stage_refresh = lambda *_args, **_kwargs: None
+        self.manager._archive_apply_downstream_input_signature = lambda *_args, **_kwargs: {
+            "stage_name": "system_analysis",
+            "selected_module_count": 1,
+            "selected_module_keys": ["m1"],
+        }
+        self.manager._archive_apply_descendant_contamination = lambda *_args, **_kwargs: [
+            {
+                "stage_name": "binary_to_source",
+                "reason": "failed_due_to_missing_repaired_inputs",
+                "stage_run": binary_to_source_run,
+                "stage_items": [stale_b2s_item],
+                "failure_code": None,
+                "failure_message": "缺少已选模块列表",
+            },
+            {
+                "stage_name": "entry_analysis",
+                "reason": "stale_descendant_stage_run_present",
+                "stage_run": entry_run,
+                "stage_items": [stale_entry_item],
+                "failure_code": None,
+                "failure_message": None,
+            },
+        ]
+        self.manager._next_incomplete_stage = lambda *_args, **_kwargs: "binary_to_source"
+        self.manager._should_auto_advance_to_stage = lambda *_args, **_kwargs: True
+        try:
+            repaired = self.manager._repair_descendants_after_archive_apply_if_needed(
+                db,
+                task,
+                system_item,
+                state_event_id="sev1",
+            )
+        finally:
+            self.manager._enqueue_task = original_enqueue
+            self.manager._archive_apply_repaired_stage_refresh = original_refresh
+            self.manager._archive_apply_downstream_input_signature = original_signature
+            self.manager._archive_apply_descendant_contamination = original_contamination
+            self.manager._next_incomplete_stage = original_next_stage
+            self.manager._should_auto_advance_to_stage = original_should_auto
+
+        self.assertTrue(repaired)
+        self.assertEqual("pending", task.status)
+        self.assertEqual("binary_to_source", task.current_stage)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
+        self.assertEqual(["t1"], queued)
+        self.assertEqual([], [item for item in db.stage_items if item.stage_name in {"binary_to_source", "entry_analysis"}])
+        self.assertIn("binary_to_source", list(task.summary.get("stale_stages") or []))
+        self.assertIn("archive_apply_triggered_input_repair", [event.event_type for event in db.events])
+        self.assertIn("task_requeued_after_archive_input_repair", [event.event_type for event in db.events])
+
     def test_archive_downstream_output_records_copy_stats_only_in_output_ref(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             task = BinarySecurityTask(
