@@ -24381,7 +24381,12 @@ class TaskManager:
         summary = dict(task.summary or {})
         stale_stages = set(summary.get("stale_stages") or [])
         stale_from_stage = str(summary.get("stale_from_stage") or "").strip()
-        if stage_name in stale_stages and stale_from_stage in upstream_stages:
+        stale_reason = str(summary.get("stale_reason") or "").strip()
+        if (
+            stale_reason == "upstream_stage_retried"
+            and stage_name in stale_stages
+            and stale_from_stage in upstream_stages
+        ):
             return True, stale_from_stage
 
         for upstream_stage in upstream_stages:

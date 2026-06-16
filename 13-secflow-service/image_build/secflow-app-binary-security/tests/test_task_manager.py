@@ -4897,6 +4897,7 @@ class TaskManagerTests(unittest.TestCase):
             status="partial_success",
         )
         task.summary = {
+            "stale_reason": "upstream_stage_retried",
             "stale_from_stage": "system_analysis",
             "stale_stages": ["entry_analysis"],
         }
@@ -16023,9 +16024,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             project_id="p1",
             stage_name="binary_to_source",
             sequence_no=3,
-            status="failed",
+            status="pending",
         )
-        binary_to_source_run.last_error = "缺少已选模块列表"
         entry_run = BinarySecurityStageRun(
             id="sr-entry",
             task_id="t1",
@@ -16242,9 +16242,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             project_id="p1",
             stage_name="binary_to_source",
             sequence_no=3,
-            status="failed",
+            status="pending",
         )
-        binary_to_source_run.last_error = "缺少已选模块列表"
         entry_run = BinarySecurityStageRun(
             id="sr-entry",
             task_id="t1",
@@ -16255,12 +16254,66 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         )
         db = _ModelAwareDb(tasks=[task], stage_runs=[firmware_run, system_run, binary_to_source_run, entry_run], stage_items=[])
 
-        self.manager._refresh_task_status_after_sync(db, task)
+        original_enqueue = self.manager._enqueue_task
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        try:
+            self.manager._refresh_task_status_after_sync(db, task)
+        finally:
+            self.manager._enqueue_task = original_enqueue
 
         self.assertEqual("pending", task.status)
         self.assertEqual("binary_to_source", task.current_stage)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertIsNone(task.last_error)
+
+    def test_upstream_stage_retried_ignores_archive_input_repair_stale_marker(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="binary_to_source",
+            firmware_source="project_filesystem",
+            firmware_path="/fw.bin",
+            output_root="/o",
+            workspace_root="/tmp",
+        )
+        task.summary = {
+            "stale_reason": "archive_input_repaired",
+            "stale_from_stage": "system_analysis",
+            "stale_stages": ["binary_to_source", "entry_analysis"],
+        }
+        firmware_run = BinarySecurityStageRun(
+            id="sr-fw",
+            task_id="t1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            sequence_no=1,
+            status="success",
+        )
+        system_run = BinarySecurityStageRun(
+            id="sr-system",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=2,
+            status="success",
+        )
+        binary_run = BinarySecurityStageRun(
+            id="sr-b2s",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            sequence_no=3,
+            status="pending",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[firmware_run, system_run, binary_run], stage_items=[])
+
+        retried, upstream_stage = self.manager._upstream_stage_retried(db, task, "binary_to_source")
+
+        self.assertFalse(retried)
+        self.assertIsNone(upstream_stage)
 
     def test_archive_downstream_output_records_copy_stats_only_in_output_ref(self):
         with tempfile.TemporaryDirectory() as tmpdir:
