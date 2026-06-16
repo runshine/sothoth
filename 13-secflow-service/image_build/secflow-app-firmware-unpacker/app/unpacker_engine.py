@@ -1516,6 +1516,12 @@ def _run_cleaner(
     result = ""
     try:
         clean_msg = render_prompt(CLEAN_PROMPT_TMPL, output_path, "")
+        clean_msg = (
+            f"{clean_msg}\n\n"
+            "Runtime mode: backend non-interactive cleanup.\n"
+            "Do not ask for confirmation or present options.\n"
+            "Execute the cleanup directly and then report the result."
+        )
         log_event(log, logging.INFO, "cleanup started", event="cleanup_start")
         if event_callback:
             event_callback(

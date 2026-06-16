@@ -16,7 +16,7 @@ Analyze a firmware extraction output directory, identify and remove:
 
 ## Workflow
 
-**Follow these steps strictly in order. Complete each step before proceeding to the next. Analyze first, confirm with the user, then clean.**
+**Follow these steps strictly in order. Complete each step before proceeding to the next. Analyze first, then clean automatically, then verify.**
 
 ### Step 1: Understand the Directory Structure
 
@@ -96,7 +96,7 @@ diff <(cd <dir_A> && find . -type f -exec md5sum {} \; | sort -k2) \
 **Decision criteria:**
 
 - Two directories with **identical** file lists and **identical** file contents → keep one, delete the other
-- Two directories with **highly similar** file lists (>90% overlap) but minor differences → they are variants for different boards/architectures; **recommend keeping** but confirm with the user
+- Two directories with **highly similar** file lists (>90% overlap) but minor differences → they are variants for different boards/architectures; **recommend keeping** unless there is strong evidence they are redundant
 - Two directories with **significant differences** → not duplicates, **keep both**
 
 **Important caveats:**
@@ -134,9 +134,9 @@ find <extraction_dir> -type d -empty
 
 Zero-byte files and empty directories are typically extraction leftovers and can be safely deleted.
 
-### Step 6: Summarize Report and Confirm
+### Step 6: Summarize Report and Execute
 
-**Before performing any deletions, present the full cleanup plan to the user:**
+**Before performing any deletions, summarize the full cleanup plan in the response/log output, then execute it directly.**
 
 Use this format:
 
@@ -170,15 +170,11 @@ Estimated space savings: XX MB
 ═══════════════════════════════════════════════════
 ```
 
-**Wait for user confirmation before executing any deletions.** The user may choose to:
-- Clean everything
-- Clean only a specific category
-- Exclude certain files/directories
-- Cancel
+Do not ask follow-up questions or present cleanup options. This agent runs in a non-interactive backend task. After summarizing the plan, immediately execute the cleanup according to the safety rules in this document.
 
 ### Step 7: Execute Cleanup
 
-After user confirmation, delete items one by one:
+Delete items one by one:
 
 ```bash
 # Delete intermediate files
@@ -216,7 +212,7 @@ Present a before-and-after comparison to the user.
 ## Important Notes
 
 1. **Analyze before deleting** — never skip the analysis steps and jump straight to deletion
-2. **User confirmation required** — always present the cleanup plan and wait for explicit approval
+2. **Non-interactive backend mode** — do not ask for confirmation, options, exclusions, or approval; execute the safe cleanup directly after analysis
 3. **Architecture awareness** — x86_64 and aarch64 files are NOT duplicates even if they share the same name
 4. **Firmware resource files** — `.zip`/`.tar.gz` files inside squashfs roots that are runtime resources (e.g., YANG models, config files) should not be treated as intermediates
 5. **Signature files** — `.cms`, `.pss.cms`, `.crl` files are firmware signature verification files; keep them unless the user explicitly requests removal
