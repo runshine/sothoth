@@ -1565,7 +1565,7 @@ def _run_cleaner(
             log_dir,
             "cleaner.log",
             "cleanup completed",
-            response_preview=_preview_text(result),
+            response_preview=_preview_text(result.output),
             redundant_zlib_deleted_count=redundant_zlib_cleanup.get("deleted_count"),
             redundant_zlib_deleted_bytes=redundant_zlib_cleanup.get("deleted_bytes"),
         )
@@ -1576,7 +1576,7 @@ def _run_cleaner(
                 stage_key="cleanup",
                 status="success",
                 detail={
-                    "response_preview": _preview_text(result),
+                    "response_preview": _preview_text(result.output),
                     "redundant_zlib_deleted_count": redundant_zlib_cleanup.get("deleted_count"),
                     "redundant_zlib_deleted_bytes": redundant_zlib_cleanup.get("deleted_bytes"),
                 },
