@@ -16185,6 +16185,83 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("archive_apply_triggered_input_repair", [event.event_type for event in db.events])
         self.assertIn("task_requeued_after_archive_input_repair", [event.event_type for event in db.events])
 
+    def test_archive_input_repair_reopens_failed_binary_to_source_stage_after_inputs_restored(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw.bin",
+            output_root="/o",
+            workspace_root="/tmp",
+            runtime_phase=TASK_RUNTIME_PHASE_TERMINAL,
+        )
+        task.last_error = None
+        task.summary = {
+            "selected_modules": [
+                {
+                    "module_key": "m1",
+                    "module_name": "module-1",
+                    "source_dir": "/src/m1",
+                    "selected_by": "auto",
+                }
+            ],
+            "candidate_modules": [
+                {
+                    "module_key": "m1",
+                    "module_name": "module-1",
+                    "source_dir": "/src/m1",
+                }
+            ],
+            "stale_reason": "archive_input_repaired",
+            "stale_from_stage": "system_analysis",
+            "stale_stages": ["binary_to_source", "entry_analysis"],
+        }
+        firmware_run = BinarySecurityStageRun(
+            id="sr-fw",
+            task_id="t1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            sequence_no=1,
+            status="success",
+        )
+        system_run = BinarySecurityStageRun(
+            id="sr-system",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=2,
+            status="success",
+        )
+        binary_to_source_run = BinarySecurityStageRun(
+            id="sr-b2s",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            sequence_no=3,
+            status="failed",
+        )
+        binary_to_source_run.last_error = "缺少已选模块列表"
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=4,
+            status="pending",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[firmware_run, system_run, binary_to_source_run, entry_run], stage_items=[])
+
+        self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual("pending", task.status)
+        self.assertEqual("binary_to_source", task.current_stage)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
+        self.assertIsNone(task.last_error)
+
     def test_archive_downstream_output_records_copy_stats_only_in_output_ref(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             task = BinarySecurityTask(

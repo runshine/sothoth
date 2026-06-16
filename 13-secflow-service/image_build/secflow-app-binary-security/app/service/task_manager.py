@@ -25876,7 +25876,11 @@ class TaskManager:
                         break
         if had_stage_retry_mode and preferred_retry_next_stage:
             next_stage = preferred_retry_next_stage
-        if failed_stage_run is not None and self._should_terminalize_parent_for_failed_stage(task, failed_stage_run):
+        if (
+            failed_stage_run is not None
+            and not self._should_reopen_failed_stage_after_archive_input_repair(db, task, failed_stage_run)
+            and self._should_terminalize_parent_for_failed_stage(task, failed_stage_run)
+        ):
             failure_snapshot = self._stage_failure_snapshot(task, failed_stage_run)
             self._finalize_task_after_authoritative_failure(
                 db,
@@ -25893,7 +25897,12 @@ class TaskManager:
                 event_type="task_finalized_after_stage_failure",
             )
             return
-        if failed_stage_run is not None and not had_stage_retry_mode and not had_task_retry_mode:
+        if (
+            failed_stage_run is not None
+            and not had_stage_retry_mode
+            and not had_task_retry_mode
+            and not self._should_reopen_failed_stage_after_archive_input_repair(db, task, failed_stage_run)
+        ):
             failed_items = self._stage_items(db, task.id, str(failed_stage_run.stage_name or ""))
             exhausted_owner_lost_items = [item for item in failed_items if self._owner_lost_retry_exhausted(task, item)]
             if exhausted_owner_lost_items:
@@ -25940,7 +25949,12 @@ class TaskManager:
                         event_type="task_finalized_after_stage_failure",
                     )
                     return
-        if failed_stage_run is not None and not had_stage_retry_mode and not had_task_retry_mode:
+        if (
+            failed_stage_run is not None
+            and not had_stage_retry_mode
+            and not had_task_retry_mode
+            and not self._should_reopen_failed_stage_after_archive_input_repair(db, task, failed_stage_run)
+        ):
             task.status = "pending"
             task.current_stage = failed_stage_run.stage_name or task.current_stage
             task.finished_at = None
@@ -29352,27 +29366,53 @@ class TaskManager:
     ) -> list[dict[str, Any]]:
         normalized_repaired_stage = normalize_stage_name(repaired_stage)
         current_stage = str(task.current_stage or "").strip()
-        if normalized_repaired_stage != "system_analysis" or not current_stage:
+        if normalized_repaired_stage != "system_analysis":
             return []
         descendant_stages = self._descendant_stages_for_stage(task, repaired_stage)
-        if current_stage not in descendant_stages:
+        if not descendant_stages:
             return []
-        current_stage_run = db.query(BinarySecurityStageRun).filter(
-            BinarySecurityStageRun.task_id == task.id,
-            BinarySecurityStageRun.stage_name == current_stage,
-        ).first()
-        current_failure_message = (
-            self._string_or_none(getattr(current_stage_run, "last_error", None))
-            or self._string_or_none(task.last_error)
-        )
-        if not self._is_archive_repair_sensitive_failure(
-            current_stage,
-            failure_code=None,
-            failure_message=current_failure_message,
-        ):
+        forced_start_stage: str | None = None
+        if current_stage and current_stage in descendant_stages:
+            current_stage_run = db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == current_stage,
+            ).first()
+            current_failure_message = (
+                self._string_or_none(getattr(current_stage_run, "last_error", None))
+                or self._string_or_none(task.last_error)
+            )
+            if self._is_archive_repair_sensitive_failure(
+                current_stage,
+                failure_code=None,
+                failure_message=current_failure_message,
+            ):
+                forced_start_stage = current_stage
+        if forced_start_stage is None:
+            for stage_name in descendant_stages:
+                stage_run = db.query(BinarySecurityStageRun).filter(
+                    BinarySecurityStageRun.task_id == task.id,
+                    BinarySecurityStageRun.stage_name == stage_name,
+                ).first()
+                if stage_run is None:
+                    continue
+                failure_snapshot = self._stage_failure_snapshot(task, stage_run)
+                failure_message = (
+                    self._string_or_none(failure_snapshot.get("failure_message"))
+                    or self._string_or_none(failure_snapshot.get("error"))
+                    or self._string_or_none(getattr(stage_run, "last_error", None))
+                )
+                if self._is_archive_repair_sensitive_failure(
+                    stage_name,
+                    failure_code=self._string_or_none(failure_snapshot.get("failure_code")),
+                    failure_message=failure_message,
+                ):
+                    forced_start_stage = stage_name
+                    break
+        if forced_start_stage is None:
             return []
         contaminated: list[dict[str, Any]] = []
-        for stage_name in descendant_stages:
+        start_index = descendant_stages.index(forced_start_stage)
+        for stage_name in descendant_stages[start_index:]:
             stage_run = db.query(BinarySecurityStageRun).filter(
                 BinarySecurityStageRun.task_id == task.id,
                 BinarySecurityStageRun.stage_name == stage_name,
@@ -29391,6 +29431,34 @@ class TaskManager:
                 }
             )
         return contaminated
+
+    def _should_reopen_failed_stage_after_archive_input_repair(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun | None,
+    ) -> bool:
+        if stage_run is None or str(stage_run.status or "").strip() != "failed":
+            return False
+        summary = dict(task.summary or {})
+        if str(summary.get("stale_reason") or "").strip() != "archive_input_repaired":
+            return False
+        stage_name = str(stage_run.stage_name or "").strip()
+        if not stage_name:
+            return False
+        failure_snapshot = self._stage_failure_snapshot(task, stage_run)
+        failure_message = (
+            self._string_or_none(failure_snapshot.get("failure_message"))
+            or self._string_or_none(failure_snapshot.get("error"))
+            or self._string_or_none(getattr(stage_run, "last_error", None))
+        )
+        if not self._is_archive_repair_sensitive_failure(
+            stage_name,
+            failure_code=self._string_or_none(failure_snapshot.get("failure_code")),
+            failure_message=failure_message,
+        ):
+            return False
+        return self._stage_has_materialized_inputs(db, task, stage_name)
 
     def _reset_descendant_stages_after_archive_repair(
         self,
