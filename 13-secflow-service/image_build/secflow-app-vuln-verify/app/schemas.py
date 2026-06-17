@@ -67,6 +67,22 @@ class ProjectStatsResponse(BaseModel):
     unverified_count: int = 0
 
 
+class ServiceConfigPayload(BaseModel):
+    default_model: str | None = None
+
+
+class ServiceConfigUpsertRequest(BaseModel):
+    config: ServiceConfigPayload = Field(default_factory=ServiceConfigPayload)
+
+
+class ServiceConfigResponse(BaseModel):
+    config: ServiceConfigPayload = Field(default_factory=ServiceConfigPayload)
+    effective_default_model: str | None = None
+    source: str = "none"
+    updated_by: str | None = None
+    updated_at: datetime | None = None
+
+
 class TaskDetailResponse(TaskResponse):
     events: list["TaskEventResponse"] = Field(default_factory=list)
 
