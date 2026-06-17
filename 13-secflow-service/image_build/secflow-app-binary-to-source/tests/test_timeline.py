@@ -280,6 +280,7 @@ class TimelineServiceTests(unittest.TestCase):
         with (
             mock.patch.object(task_service, "ensure_path_in_project", return_value=Path("/tmp/demo.elf")),
             mock.patch.object(task_service, "prepare_input_file", return_value=Path("/tmp/input/demo.elf")),
+            mock.patch.object(task_service, "is_ida_supported_input", return_value=True),
             mock.patch.object(task_service, "safe_output_dir", return_value=Path("/tmp/output")),
             mock.patch.object(task_service, "get_cache_service", return_value=cache_service),
             mock.patch.object(task_service, "refresh_item_function_stats", return_value=False),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -80,6 +81,7 @@ class TurboModeTests(unittest.TestCase):
         with (
             mock.patch.object(task_service, "ensure_path_in_project", return_value=Path("/tmp/demo.elf")),
             mock.patch.object(task_service, "prepare_input_file", return_value=Path("/tmp/input/demo.elf")),
+            mock.patch.object(task_service, "is_ida_supported_input", return_value=True),
             mock.patch.object(task_service, "safe_output_dir", return_value=Path("/tmp/output")),
             mock.patch.object(task_service, "_project_default_llm_provider_key", return_value="team_codex"),
             mock.patch.object(task_service, "get_cache_service", return_value=cache_service),
@@ -112,6 +114,72 @@ class TurboModeTests(unittest.TestCase):
         self.assertFalse(db.task_items[0].extra_metadata["llm_used"])
         self.assertIsNone(db.task_items[0].extra_metadata["llm_provider_key"])
         materialize.assert_not_called()
+
+    def test_create_task_skips_non_elf_input_and_copies_original_to_output(self):
+        db = _FakeDb()
+        cache_service = SimpleNamespace(
+            try_apply_cache_hit=mock.Mock(return_value=SimpleNamespace(hit=False)),
+            prepare_cache_metadata=mock.Mock(),
+            store_success_cache=mock.Mock(return_value=False),
+            delete_caches_for_source_task=mock.Mock(),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "notes.txt"
+            source.write_text("plain source note\n", encoding="utf-8")
+            input_path = root / "input" / "notes.txt"
+            output_dir = root / "output"
+            req = TaskCreate(
+                task_id="skip-task",
+                name="skip-demo",
+                mode="turbo",
+                elf_tasks=[ElfTaskInput(elf_path=str(source))],
+            )
+
+            def _prepare_input(*_):
+                input_path.parent.mkdir(parents=True, exist_ok=True)
+                task_service.safe_copy2(source, input_path)
+                return input_path
+
+            with (
+                mock.patch.object(task_service, "ensure_path_in_project", return_value=source),
+                mock.patch.object(task_service, "prepare_input_file", side_effect=_prepare_input),
+                mock.patch.object(task_service, "safe_output_dir", return_value=output_dir),
+                mock.patch.object(task_service, "_project_default_llm_provider_key", return_value=None),
+                mock.patch.object(task_service, "get_cache_service", return_value=cache_service),
+                mock.patch.object(
+                    task_service,
+                    "get_config",
+                    return_value=SimpleNamespace(
+                        pi_re_agent=SimpleNamespace(
+                            batch_size=8192,
+                            max_retries=3,
+                            concurrency=4,
+                            agent_run_timeout_seconds=3600,
+                            agent_timeout_retry_enabled=True,
+                            agent_timeout_max_retries=3,
+                            engine="hybrid",
+                            model=None,
+                        ),
+                        configcenter_service=SimpleNamespace(enabled=False),
+                    ),
+                ),
+            ):
+                response = asyncio.run(task_service.create_task(db, "p1", req, "tester"))
+
+            item = db.task_items[0]
+            copied = output_dir / "notes.txt"
+            self.assertEqual("skip-task", response.id)
+            self.assertEqual("completed", response.status)
+            self.assertEqual("success", item.status)
+            self.assertEqual("skipped", item.dispatch_status)
+            self.assertEqual("completed", item.phase)
+            self.assertTrue(item.extra_metadata["skipped_by_b2s"])
+            self.assertEqual("unsupported_by_ida_non_elf", item.extra_metadata["skip_reason"])
+            self.assertEqual([str(copied.resolve())], item.generated_files)
+            self.assertEqual("plain source note\n", copied.read_text(encoding="utf-8"))
+            cache_service.try_apply_cache_hit.assert_not_called()
+            cache_service.prepare_cache_metadata.assert_not_called()
 
     def test_task_mode_summary_returns_turbo_label(self):
         item = B2STaskItem(id="i1", task_id="t1", project_id="p1", sequence_no=1, elf_path="/tmp/a", output_dir="/tmp/o", status="pending")
