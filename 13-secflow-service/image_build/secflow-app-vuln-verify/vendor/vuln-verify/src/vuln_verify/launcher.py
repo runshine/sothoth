@@ -24,6 +24,7 @@ def _verify_one(
     prompt_msg: str,
     model: str | None,
     tmp_files: list[Path],
+    session_dir: Path,
 ) -> tuple[str, int]:
     """对一个分组执行 pi 验证，返回 (group_id, exit_code)。"""
     log = get_logger("vuln_verify.launcher")
@@ -43,7 +44,7 @@ def _verify_one(
     stdout_file = out_dir / f"{group_dir.name}.stdout"
     stderr_file = out_dir / f"{group_dir.name}.stderr"
 
-    pi_cmd = ["pi", "--append-system-prompt", str(tmp_prompt), "-p", prompt_msg]
+    pi_cmd = ["pi", "--session-dir", str(session_dir), "--append-system-prompt", str(tmp_prompt), "-p", prompt_msg]
     if model:
         pi_cmd.extend(["--model", model])
 
@@ -82,7 +83,7 @@ def _verify_one(
 
 
 def launch(assembled_dir: Path, threat_path: str, model: str | None = None,
-           concurrency: int = 4, resume: bool = False) -> None:
+           concurrency: int = 4, resume: bool = False, session_dir: Path | None = None) -> None:
     log = get_logger("vuln_verify.launcher")
     """
     遍历 {assembled_dir}/groups/group_*/ 目录。
@@ -94,6 +95,8 @@ def launch(assembled_dir: Path, threat_path: str, model: str | None = None,
     groups_dir = assembled_path / "groups"
     out_dir = (assembled_path / "verifier_output").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    session_path = (session_dir or assembled_path / "run").resolve()
+    session_path.mkdir(parents=True, exist_ok=True)
 
     if not groups_dir.is_dir():
         raise FileNotFoundError(f"groups directory not found: {groups_dir}")
@@ -129,7 +132,7 @@ def launch(assembled_dir: Path, threat_path: str, model: str | None = None,
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = {
                 executor.submit(
-                    _verify_one, g, out_dir, base_prompt, prompt_msg, model, tmp_files
+                    _verify_one, g, out_dir, base_prompt, prompt_msg, model, tmp_files, session_path
                 ): g
                 for g in group_dirs
             }

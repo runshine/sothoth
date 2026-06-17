@@ -67,10 +67,11 @@ class VulnVerifyWorkerRateLimitTests(unittest.TestCase):
                 def poll(self):
                     return self._return_code
 
-            popen_calls = {"count": 0}
+            popen_calls = {"count": 0, "cmds": []}
 
             def fake_popen(cmd, **kwargs):
                 popen_calls["count"] += 1
+                popen_calls["cmds"].append(list(cmd))
                 if popen_calls["count"] == 1:
                     kwargs["stderr"].write(b"429 too many requests\n")
                     kwargs["stderr"].flush()
@@ -108,6 +109,10 @@ class VulnVerifyWorkerRateLimitTests(unittest.TestCase):
                 self.assertIsNone(task.error_reason)
                 self.assertEqual(0, task.return_code)
                 self.assertEqual(2, popen_calls["count"])
+                first_cmd = popen_calls["cmds"][0]
+                self.assertIn("--session-dir", first_cmd)
+                self.assertEqual(str(tmp_path / "run"), first_cmd[first_cmd.index("--session-dir") + 1])
+                self.assertTrue((tmp_path / "run").is_dir())
                 mock_sleep.assert_awaited_once_with(30)
                 rate_limit_events = [event for event in events if event.event_type == "task_rate_limited_retrying"]
                 self.assertEqual(1, len(rate_limit_events))

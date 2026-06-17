@@ -79,6 +79,8 @@ class TestLaunch:
 
         cmd = mock_popen_success.call_args_list[0][0][0]
         assert cmd[0] == "pi"
+        assert "--session-dir" in cmd
+        assert cmd[cmd.index("--session-dir") + 1] == str((mock_assembled_dir / "run").resolve())
         assert "--append-system-prompt" in cmd
         assert "-p" in cmd
         assert any("verifier_output" in a for a in cmd)
@@ -90,6 +92,16 @@ class TestLaunch:
         cmd = mock_popen_success.call_args_list[0][0][0]
         idx = cmd.index("--model")
         assert cmd[idx + 1] == "test-model:xhigh"
+
+    def test_custom_session_dir_passed_to_pi(self, mock_assembled_dir, threat_file, mock_popen_success):
+        session_dir = mock_assembled_dir / "custom-run"
+        with patch("vuln_verify.launcher.load_prompt", return_value="prompt"):
+            launch(mock_assembled_dir, threat_file, session_dir=session_dir)
+
+        cmd = mock_popen_success.call_args_list[0][0][0]
+        idx = cmd.index("--session-dir")
+        assert cmd[idx + 1] == str(session_dir.resolve())
+        assert session_dir.is_dir()
 
     def test_no_model_flag_when_omitted(self, mock_assembled_dir, threat_file, mock_popen_success):
         with patch("vuln_verify.launcher.load_prompt", return_value="prompt"):
