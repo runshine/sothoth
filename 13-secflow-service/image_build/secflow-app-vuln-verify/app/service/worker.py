@@ -15,6 +15,7 @@ from pathlib import Path
 
 from app.config import get_config
 from app.model import VulnVerifyTask, get_db_session
+from app.service.llm_provider_sync import sync_providers_to_pi
 from app.service.task_service import create_event, summarize_results
 from app.time_utils import now_local
 
@@ -31,6 +32,26 @@ def _is_rate_limited_text(text: str | None) -> bool:
 def _should_emit_rate_limit_event(streak: int) -> bool:
     streak = max(0, int(streak or 0))
     return streak == 1 or (streak > 0 and streak % 10 == 0)
+
+
+def _machine_token() -> str:
+    cfg = get_config().auth_service
+    return os.environ.get("SECFLOW_SERVICE_MACHINE_TOKEN") or cfg.service_machine_token or ""
+
+
+def _sync_llm_providers_before_task() -> None:
+    cfg = get_config()
+    configcenter = getattr(cfg, "configcenter", None)
+    if configcenter is None or not getattr(configcenter, "sync_before_task", True):
+        return
+    result = sync_providers_to_pi(
+        base_url=configcenter.base_url,
+        token=_machine_token(),
+        timeout=configcenter.timeout,
+        preferred_provider_key=getattr(configcenter, "default_provider_key", None),
+    )
+    if not result.ok:
+        logger.warning("任务执行前同步 LLM Provider 失败，保留现有 pi 配置: %s", result.error)
 
 
 class VulnVerifyWorker:
@@ -132,6 +153,7 @@ class VulnVerifyWorker:
                     return
                 output_dir = Path(task.output_dir)
                 output_dir.mkdir(parents=True, exist_ok=True)
+                _sync_llm_providers_before_task()
                 stdout_path = output_dir / "service.stdout"
                 stderr_path = output_dir / "service.stderr"
                 cmd = [

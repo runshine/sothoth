@@ -40,4 +40,17 @@ GET  /api/app/vuln-verify/projects/{project_id}/tasks/{task_id}/artifacts/conten
 
 ## LLM Provider
 
-参考 dataflow-vuln-scan：容器启动时把 `/data/config/models.json` 软链到 `$PI_CODING_AGENT_DIR/models.json`，不从 ConfigCenter 动态物化。
+服务启动和 Worker 执行任务前会通过机机 Token 调用 ConfigCenter：
+
+```text
+GET /api/configcenter/service/llm/providers
+```
+
+并将平台 LLM Provider 动态物化为 pi runtime 配置：
+
+```text
+$PI_CODING_AGENT_DIR/models.json
+$PI_CODING_AGENT_DIR/settings.json
+```
+
+默认模型不在 vuln-verify 配置中写死；未在创建任务请求中显式传 `model` 时，服务不会传 `--model`，由 pi 根据 `settings.json` 中的 `defaultProvider` / `defaultModel` 使用 ConfigCenter 默认 Provider 的默认模型。容器 entrypoint 仍保留 `/data/pi-re-agent-config` 和 `/data/config` 的软链逻辑，作为 ConfigCenter 同步失败时的兼容兜底。

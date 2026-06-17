@@ -153,7 +153,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, operator: T
         binary_root=str(binary_root),
         threat_path=str(threat_path),
         output_dir=str(output_dir),
-        model=(str(req.model).strip() if req.model else (get_config().worker.default_model or None)),
+        model=(str(req.model).strip() if req.model else None),
         concurrency=_normalize_concurrency(req.concurrency),
         resume=1 if req.resume else 0,
         created_by=_operator_name(operator),

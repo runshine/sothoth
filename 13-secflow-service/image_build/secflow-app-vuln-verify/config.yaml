@@ -22,6 +22,13 @@ project_service:
   get_project_path: "/api/project"
   timeout: 10
 
+configcenter:
+  base_url: "http://secflow-platform-configcenter/api/configcenter"
+  timeout: 30
+  sync_on_startup: true
+  sync_before_task: true
+  default_provider_key: null
+
 storage:
   project_root_template: "/data/files/{project_id}"
   app_root_name: "app/secflow-app-vuln-verify"
@@ -35,7 +42,6 @@ worker:
   max_local_running_tasks: 1
   default_concurrency: 4
   max_concurrency: 16
-  default_model: "local_minimax/MiniMax/MiniMax-M2.5"
   task_timeout_seconds: 0
 
 registry:
