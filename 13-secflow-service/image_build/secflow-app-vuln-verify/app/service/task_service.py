@@ -16,6 +16,7 @@ from app.config import get_config
 from app.exception import ConflictError, NotFoundError, ValidationError
 from app.model import VulnVerifyTask, VulnVerifyTaskEvent
 from app.schemas import TaskCreate, TaskResponse, TaskDetailResponse, TaskEventResponse, TokenUser
+from app.service.config_service import get_service_default_model
 from app.service.security import app_task_root, ensure_path_in_project, safe_output_dir, validate_task_id
 from app.time_utils import now_local
 
@@ -142,6 +143,11 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, operator: T
     threat_path = ensure_path_in_project(project_id, req.threat_path, must_be_file=True)
     output_dir = safe_output_dir(project_id, task_id)
 
+    requested_model = str(req.model or "").strip() or None
+    service_default_model = get_service_default_model(db)
+    resolved_model = requested_model or service_default_model
+    model_source = "request" if requested_model else ("service_config" if service_default_model else "pi_default")
+
     task = VulnVerifyTask(
         id=task_id,
         project_id=project_id,
@@ -153,7 +159,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, operator: T
         binary_root=str(binary_root),
         threat_path=str(threat_path),
         output_dir=str(output_dir),
-        model=(str(req.model).strip() if req.model else (get_config().worker.default_model or None)),
+        model=resolved_model,
         concurrency=_normalize_concurrency(req.concurrency),
         resume=1 if req.resume else 0,
         created_by=_operator_name(operator),
@@ -163,7 +169,13 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, operator: T
     task.progress = {"message": "等待后台执行", "percent": 0}
     db.add(task)
     db.flush()
-    create_event(db, task, "task_created", f"任务 {task.name} 已创建", payload={"output_dir": task.output_dir})
+    create_event(
+        db,
+        task,
+        "task_created",
+        f"任务 {task.name} 已创建",
+        payload={"output_dir": task.output_dir, "model": task.model, "model_source": model_source},
+    )
     db.commit()
     db.refresh(task)
     return build_response(task)

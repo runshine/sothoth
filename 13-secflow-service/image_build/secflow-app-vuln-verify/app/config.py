@@ -48,6 +48,14 @@ class ProjectServiceConfig(BaseModel):
         return f"http://{self.host}:{self.port}"
 
 
+class ConfigCenterConfig(BaseModel):
+    base_url: str = "http://secflow-platform-configcenter/api/configcenter"
+    timeout: int = 30
+    sync_on_startup: bool = True
+    sync_before_task: bool = True
+    default_provider_key: str | None = None
+
+
 class StorageConfig(BaseModel):
     project_root_template: str = "/data/files/{project_id}"
     app_root_name: str = "app/secflow-app-vuln-verify"
@@ -62,7 +70,6 @@ class WorkerConfig(BaseModel):
     max_local_running_tasks: int = 1
     default_concurrency: int = 4
     max_concurrency: int = 16
-    default_model: str | None = "local_minimax/MiniMax/MiniMax-M2.5"
     task_timeout_seconds: int = 0
 
 
@@ -108,6 +115,7 @@ class Config(BaseModel):
     database: DatabaseConfig
     auth_service: AuthServiceConfig
     project_service: ProjectServiceConfig
+    configcenter: ConfigCenterConfig = Field(default_factory=ConfigCenterConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)

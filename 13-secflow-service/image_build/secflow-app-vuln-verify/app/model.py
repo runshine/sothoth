@@ -83,6 +83,24 @@ class VulnVerifyTaskEvent(Base):
         self.payload_json = json.dumps(value or {}, ensure_ascii=False)
 
 
+class VulnVerifyServiceConfig(Base):
+    __tablename__ = "secflow_vuln_verify_service_config"
+
+    config_key = Column(String(64), primary_key=True)
+    config_json = Column(Text, nullable=False)
+    updated_by = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=now_local, nullable=False)
+    updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
+
+    @property
+    def config(self) -> dict[str, Any]:
+        return _loads(self.config_json, {})
+
+    @config.setter
+    def config(self, value: dict[str, Any] | None) -> None:
+        self.config_json = json.dumps(value or {}, ensure_ascii=False)
+
+
 def _loads(raw: Optional[str], default: Any) -> Any:
     if not raw:
         return default
