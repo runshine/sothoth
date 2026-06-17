@@ -111,8 +111,8 @@ class VulnVerifyWorkerRateLimitTests(unittest.TestCase):
                 self.assertEqual(2, popen_calls["count"])
                 first_cmd = popen_calls["cmds"][0]
                 self.assertIn("--session-dir", first_cmd)
-                self.assertEqual(str(tmp_path / "run"), first_cmd[first_cmd.index("--session-dir") + 1])
-                self.assertTrue((tmp_path / "run").is_dir())
+                self.assertEqual(str(tmp_path.parent / "run"), first_cmd[first_cmd.index("--session-dir") + 1])
+                self.assertTrue((tmp_path.parent / "run").is_dir())
                 mock_sleep.assert_awaited_once_with(30)
                 rate_limit_events = [event for event in events if event.event_type == "task_rate_limited_retrying"]
                 self.assertEqual(1, len(rate_limit_events))

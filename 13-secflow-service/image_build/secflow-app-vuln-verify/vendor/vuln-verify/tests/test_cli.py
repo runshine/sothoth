@@ -207,7 +207,7 @@ class TestSuccessfulInvocation:
             assert mock_launch.call_args.kwargs["session_dir"] == session_dir.resolve()
             assert session_dir.is_dir()
 
-    def test_session_dir_defaults_to_output_run(self, mock_artifacts):
+    def test_session_dir_defaults_to_task_run(self, mock_artifacts):
         with patch("vuln_verify.cli.run", return_value=MagicMock()), \
              patch("vuln_verify.cli.assemble"), \
              patch("vuln_verify.cli.launch") as mock_launch:
@@ -218,7 +218,7 @@ class TestSuccessfulInvocation:
                 "--threat", str(mock_artifacts["threat"]),
                 "--output", str(mock_artifacts["output"]),
             ])
-            expected = mock_artifacts["output"].resolve() / "run"
+            expected = mock_artifacts["output"].resolve().parent / "run"
             mock_launch.assert_called_once()
             assert mock_launch.call_args.kwargs["session_dir"] == expected
             assert expected.is_dir()

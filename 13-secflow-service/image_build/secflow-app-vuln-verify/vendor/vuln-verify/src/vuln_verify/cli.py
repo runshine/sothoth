@@ -56,7 +56,7 @@ def _run_pipeline(args: argparse.Namespace, output_dir: Path, logfile: Path) -> 
         source_root=Path(args.source_root).expanduser(),
         binary_root=Path(args.binary_root).expanduser(),
     )
-    session_dir = Path(args.session_dir).expanduser().resolve() if args.session_dir else output_dir / "run"
+    session_dir = Path(args.session_dir).expanduser().resolve() if args.session_dir else output_dir.parent / "run"
     session_dir.mkdir(parents=True, exist_ok=True)
     launch(output_dir, str(Path(args.threat).expanduser()), model=args.model,
            concurrency=args.concurrency, resume=args.resume, session_dir=session_dir)
@@ -74,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True, help="output directory")
     parser.add_argument("--logfile", help="routing summary path; defaults to {output}/verify.log")
     parser.add_argument("--model", help="LLM model for assessment engine. Uses pi default if omitted.")
-    parser.add_argument("--session-dir", help="pi session directory. Defaults to {output}/run.")
+    parser.add_argument("--session-dir", help="pi session directory. Defaults to {output}/../run.")
     parser.add_argument("-j", "--concurrency", type=int, default=4,
                         help="最大并发验证数 (默认 4)")
     parser.add_argument("--resume", action="store_true",

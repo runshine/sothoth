@@ -80,7 +80,7 @@ class TestLaunch:
         cmd = mock_popen_success.call_args_list[0][0][0]
         assert cmd[0] == "pi"
         assert "--session-dir" in cmd
-        assert cmd[cmd.index("--session-dir") + 1] == str((mock_assembled_dir / "run").resolve())
+        assert cmd[cmd.index("--session-dir") + 1] == str((mock_assembled_dir.parent / "run").resolve())
         assert "--append-system-prompt" in cmd
         assert "-p" in cmd
         assert any("verifier_output" in a for a in cmd)

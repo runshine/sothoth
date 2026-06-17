@@ -154,7 +154,7 @@ class VulnVerifyWorker:
                 output_dir = Path(task.output_dir)
                 output_dir.mkdir(parents=True, exist_ok=True)
                 _sync_llm_providers_before_task()
-                session_dir = output_dir / "run"
+                session_dir = output_dir.parent / "run"
                 session_dir.mkdir(parents=True, exist_ok=True)
                 stdout_path = output_dir / "service.stdout"
                 stderr_path = output_dir / "service.stderr"

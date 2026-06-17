@@ -95,7 +95,7 @@ def launch(assembled_dir: Path, threat_path: str, model: str | None = None,
     groups_dir = assembled_path / "groups"
     out_dir = (assembled_path / "verifier_output").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    session_path = (session_dir or assembled_path / "run").resolve()
+    session_path = (session_dir or assembled_path.parent / "run").resolve()
     session_path.mkdir(parents=True, exist_ok=True)
 
     if not groups_dir.is_dir():
