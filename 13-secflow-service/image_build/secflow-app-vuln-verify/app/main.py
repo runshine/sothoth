@@ -17,6 +17,7 @@ from app.api.tasks import router
 from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
 from app.model import get_engine, init_database
+from app.service.llm_provider_sync import sync_providers_to_pi
 from app.service.registry import get_registry_service
 from app.service.worker import get_worker
 
@@ -40,9 +41,28 @@ def _worker_enabled() -> bool:
     return _role() in {"all", "worker"}
 
 
+def _machine_token() -> str:
+    cfg = get_config().auth_service
+    return os.environ.get("SECFLOW_SERVICE_MACHINE_TOKEN") or cfg.service_machine_token or ""
+
+
+def sync_llm_providers_on_startup() -> None:
+    cfg = get_config()
+    if not cfg.configcenter.sync_on_startup:
+        return
+    result = sync_providers_to_pi(
+        base_url=cfg.configcenter.base_url,
+        token=_machine_token(),
+        timeout=cfg.configcenter.timeout,
+        preferred_provider_key=cfg.configcenter.default_provider_key,
+    )
+    if not result.ok:
+        logger.warning("启动时同步 LLM Provider 失败，保留现有 pi 配置: %s", result.error)
+
+
 def verify_auth_service_or_exit() -> None:
     cfg = get_config().auth_service
-    machine_token = os.environ.get("SECFLOW_SERVICE_MACHINE_TOKEN") or cfg.service_machine_token
+    machine_token = _machine_token()
     if not machine_token:
         logger.error("未配置auth_service.service_machine_token或SECFLOW_SERVICE_MACHINE_TOKEN，拒绝启动")
         sys.exit(1)
@@ -87,6 +107,7 @@ async def lifespan(_: FastAPI):
         with get_engine().connect() as conn:
             conn.exec_driver_sql("SELECT 1")
         verify_auth_service_or_exit()
+        sync_llm_providers_on_startup()
         if _api_enabled():
             await get_registry_service().start()
         if _worker_enabled():

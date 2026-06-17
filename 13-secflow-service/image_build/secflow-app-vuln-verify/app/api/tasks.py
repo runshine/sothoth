@@ -16,6 +16,8 @@ from app.schemas import (
     ArtifactEntry,
     ArtifactListResponse,
     ProjectStatsResponse,
+    ServiceConfigResponse,
+    ServiceConfigUpsertRequest,
     TaskCreate,
     ReportDataResponse,
     TaskDetailResponse,
@@ -26,6 +28,7 @@ from app.schemas import (
 )
 from app.service.auth import get_auth_service
 from app.service.project import get_project_service
+from app.service.config_service import get_service_config, resolve_effective_default_model, save_service_config
 from app.service.security import validate_project_id
 from app.service.task_service import (
     build_project_stats,
@@ -105,6 +108,43 @@ def list_tasks(
     total = len(filtered_tasks)
     page_items = filtered_tasks[offset:offset + limit]
     return TaskListResponse(total=total, items=[build_response(task) for task in page_items])
+
+
+@router.get("/projects/{project_id}/service-config", response_model=ServiceConfigResponse)
+def get_vuln_verify_service_config(
+    project_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    del project_id
+    config, row = get_service_config(db)
+    effective_default_model, source = resolve_effective_default_model(db)
+    return ServiceConfigResponse(
+        config=config,
+        effective_default_model=effective_default_model,
+        source=source,
+        updated_by=row.updated_by if row else None,
+        updated_at=row.updated_at if row else None,
+    )
+
+
+@router.put("/projects/{project_id}/service-config", response_model=ServiceConfigResponse)
+async def update_vuln_verify_service_config(
+    project_id: str,
+    payload: ServiceConfigUpsertRequest,
+    user: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    del project_id
+    config, row = save_service_config(db, payload.config.model_dump(), user)
+    effective_default_model, source = resolve_effective_default_model(db)
+    return ServiceConfigResponse(
+        config=config,
+        effective_default_model=effective_default_model,
+        source=source,
+        updated_by=row.updated_by,
+        updated_at=row.updated_at,
+    )
 
 
 @router.get("/projects/{project_id}/stats", response_model=ProjectStatsResponse)
