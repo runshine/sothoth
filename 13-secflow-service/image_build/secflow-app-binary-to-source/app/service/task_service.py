@@ -2394,6 +2394,62 @@ def prepare_input_file(project_id: str, task_id: str, sequence_no: int, source_p
     return target_path
 
 
+def is_ida_supported_input(path: Path) -> bool:
+    try:
+        with path.open("rb") as file:
+            return file.read(4) == b"\x7fELF"
+    except OSError as exc:
+        raise ValidationError(f"读取输入文件失败: {path}: {exc}") from exc
+
+
+def materialize_unsupported_input(item: B2STaskItem, input_path: Path) -> str:
+    output_root = Path(item.output_dir).resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    output_path = output_root.joinpath(input_path.name).resolve()
+    if not output_path.is_relative_to(output_root):
+        raise ValidationError("跳过文件输出路径不合法")
+    if input_path.resolve() != output_path:
+        safe_copy2(input_path, output_path)
+    metadata = item.extra_metadata or {}
+    metadata.update({
+        "skipped_by_b2s": True,
+        "skip_reason": "unsupported_by_ida_non_elf",
+        "skip_action": "copied_original_to_output",
+        "source_elf_path": metadata.get("source_elf_path") or str(input_path),
+    })
+    item.extra_metadata = metadata
+    item.pi_job_id = None
+    item.status = "success"
+    item.dispatch_status = "skipped"
+    item.phase = "completed"
+    item.progress = {
+        "phase": "completed",
+        "raw_phase": "skipped",
+        "phase_label": phase_label("completed"),
+        "message": "非ELF文件不进入IDA分析，已原样复制到输出目录",
+        "total_functions": 0,
+        "completed_functions": 0,
+        "total_bytes": _file_size(str(input_path)),
+        "completed_bytes": _file_size(str(input_path)),
+        "total_batches": 0,
+        "completed_batches": 0,
+        "current_batch": None,
+        "current_attempt": None,
+        "current_function": None,
+        "active_batches": [],
+        "percent": 100.0,
+        "bytes_percent": 100.0,
+        "batches_percent": 100.0,
+        "updated_at": isoformat_local(now_local()),
+    }
+    item.failure_type = None
+    item.error_reason = None
+    item.generated_files = [str(output_path)]
+    item.started_at = now_local()
+    item.finished_at = item.started_at
+    return str(output_path)
+
+
 async def create_task(db: Session, project_id: str, req: TaskCreate, operator: TokenUser | str | None) -> TaskResponse:
     if not req.elf_tasks:
         raise ValidationError("elf_tasks不能为空")
@@ -2518,15 +2574,20 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, operator: T
         }
         cache_service = get_cache_service()
         cache_result = None
-        if reuse_cache:
-            cache_result = cache_service.try_apply_cache_hit(db, item, input_elf_path)
+        skipped_output_path = None
+        if is_ida_supported_input(input_elf_path):
+            if reuse_cache:
+                cache_result = cache_service.try_apply_cache_hit(db, item, input_elf_path)
+            else:
+                cache_service.prepare_cache_metadata(item, input_elf_path)
+                get_observability().record_cache_request(mode=str(job_mode or "fast"), reuse_cache=False)
+                get_observability().record_cache_bypassed(mode=str(job_mode or "fast"))
+            if not cache_result or not cache_result.hit:
+                _queue_item_for_dispatch(item, clean=False)
+            refresh_item_function_stats(item, inspect_files=bool(cache_result and cache_result.hit))
         else:
-            cache_service.prepare_cache_metadata(item, input_elf_path)
-            get_observability().record_cache_request(mode=str(job_mode or "fast"), reuse_cache=False)
-            get_observability().record_cache_bypassed(mode=str(job_mode or "fast"))
-        if not cache_result or not cache_result.hit:
-            _queue_item_for_dispatch(item, clean=False)
-        refresh_item_function_stats(item, inspect_files=bool(cache_result and cache_result.hit))
+            skipped_output_path = materialize_unsupported_input(item, input_elf_path)
+            refresh_item_function_stats(item, inspect_files=True)
         db.add(item)
         db.flush()
         _safe_create_task_event(
@@ -2545,10 +2606,25 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, operator: T
                 "mode": job_mode,
                 "engine": job_engine,
                 "cache_hit": bool(cache_result and cache_result.hit),
+                "skipped_by_b2s": bool(skipped_output_path),
             },
             dedupe_key=_event_dedupe_key(task.id, item.id, "item_registered"),
         )
-        if cache_result and cache_result.hit:
+        if skipped_output_path:
+            _safe_create_task_event(
+                db,
+                task_id=task.id,
+                project_id=task.project_id,
+                item=item,
+                event_type="item_skipped_unsupported_input",
+                source=TASK_EVENT_SOURCE_B2S,
+                phase=item.phase,
+                status=item.status,
+                message=f"任务项 #{idx} 不是ELF文件，已跳过IDA分析并原样复制到输出目录",
+                payload={"output_path": skipped_output_path, "skip_reason": "unsupported_by_ida_non_elf"},
+                dedupe_key=_event_dedupe_key(task.id, item.id, "item_skipped_unsupported_input"),
+            )
+        elif cache_result and cache_result.hit:
             _safe_create_task_event(
                 db,
                 task_id=task.id,
