@@ -32,6 +32,12 @@ class _FakeQuery:
     def all(self):
         return list(self._rows)
 
+    def delete(self, synchronize_session=False):
+        del synchronize_session
+        count = len(self._rows)
+        self._rows.clear()
+        return count
+
 
 class _FakeDb:
     def __init__(self):
@@ -180,6 +186,55 @@ class TurboModeTests(unittest.TestCase):
             self.assertEqual("plain source note\n", copied.read_text(encoding="utf-8"))
             cache_service.try_apply_cache_hit.assert_not_called()
             cache_service.prepare_cache_metadata.assert_not_called()
+
+    def test_rerun_task_skips_non_elf_input_and_copies_original_to_output(self):
+        db = _FakeDb()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            input_path = root / "input" / "notes.txt"
+            input_path.parent.mkdir(parents=True, exist_ok=True)
+            input_path.write_text("plain source note on rerun\n", encoding="utf-8")
+            item_root = root / "task" / "1"
+            output_dir = item_root / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "stale.txt").write_text("stale", encoding="utf-8")
+
+            task = B2STask(id="rerun-skip-task", project_id="p1", name="rerun skip", status="completed")
+            item = B2STaskItem(
+                id="i1",
+                task_id=task.id,
+                project_id="p1",
+                sequence_no=1,
+                elf_path=str(input_path),
+                output_dir=str(output_dir),
+                status="success",
+                dispatch_status="skipped",
+                phase="completed",
+            )
+            item.extra_metadata = {"mode": "turbo", "engine": "turbo", "reuse_cache": True}
+            db.tasks.append(task)
+            db.task_items.append(item)
+
+            with (
+                mock.patch.object(task_service, "get_config", return_value=SimpleNamespace(configcenter_service=SimpleNamespace(enabled=False))),
+                mock.patch.object(task_service, "project_root", return_value=root),
+                mock.patch.object(task_service, "app_task_item_root", return_value=item_root),
+                mock.patch.object(task_service, "_queue_item_for_dispatch") as queue_item,
+            ):
+                asyncio.run(task_service.rerun_task(db, task, "tester"))
+
+            copied = Path(item.output_dir) / "notes.txt"
+            self.assertEqual("completed", task.status)
+            self.assertEqual("success", item.status)
+            self.assertEqual("skipped", item.dispatch_status)
+            self.assertEqual("completed", item.phase)
+            self.assertIsNone(item.pi_job_id)
+            self.assertTrue(item.extra_metadata["skipped_by_b2s"])
+            self.assertEqual("unsupported_by_ida_non_elf", item.extra_metadata["skip_reason"])
+            self.assertEqual([str(copied.resolve())], item.generated_files)
+            self.assertEqual("plain source note on rerun\n", copied.read_text(encoding="utf-8"))
+            self.assertFalse((Path(item.output_dir) / "stale.txt").exists())
+            queue_item.assert_not_called()
 
     def test_task_mode_summary_returns_turbo_label(self):
         item = B2STaskItem(id="i1", task_id="t1", project_id="p1", sequence_no=1, elf_path="/tmp/a", output_dir="/tmp/o", status="pending")

@@ -3092,26 +3092,44 @@ async def rerun_task(
             metadata["llm_provider_display_name"] = str(provider.get("display_name") or "").strip() or None
             metadata["llm_provider_type"] = str(provider.get("provider_type") or "").strip() or None
         item.extra_metadata = metadata
-        _queue_item_for_dispatch(item, clean=True, fresh_pi_job=True)
-        _safe_create_task_event(
-            db,
-            task_id=task.id,
-            project_id=task.project_id,
-            item=item,
-            source=TASK_EVENT_SOURCE_B2S,
-            event_type="item_requeued",
-            phase=item.phase,
-            status=item.status,
-            message=f"任务项 #{item.sequence_no} 已重新排队等待重跑",
-            payload=_timeline_payload(
-                task=task,
-                timeline_class=TIMELINE_CLASS_DISPATCH,
-                dispatch_cycle=int(item.dispatch_attempts or 0),
-                operation_name="rerun",
-                payload={"reason": "rerun"},
-            ),
-            dedupe_key=_event_dedupe_key(task.id, item.id, "item_requeued", "rerun", item.extra_metadata.get("pi_idempotency_key")),
-        )
+        input_path = Path(item.elf_path)
+        if is_ida_supported_input(input_path):
+            _queue_item_for_dispatch(item, clean=True, fresh_pi_job=True)
+            _safe_create_task_event(
+                db,
+                task_id=task.id,
+                project_id=task.project_id,
+                item=item,
+                source=TASK_EVENT_SOURCE_B2S,
+                event_type="item_requeued",
+                phase=item.phase,
+                status=item.status,
+                message=f"任务项 #{item.sequence_no} 已重新排队等待重跑",
+                payload=_timeline_payload(
+                    task=task,
+                    timeline_class=TIMELINE_CLASS_DISPATCH,
+                    dispatch_cycle=int(item.dispatch_attempts or 0),
+                    operation_name="rerun",
+                    payload={"reason": "rerun"},
+                ),
+                dedupe_key=_event_dedupe_key(task.id, item.id, "item_requeued", "rerun", item.extra_metadata.get("pi_idempotency_key")),
+            )
+        else:
+            skipped_output_path = materialize_unsupported_input(item, input_path)
+            refresh_item_function_stats(item, inspect_files=True)
+            _safe_create_task_event(
+                db,
+                task_id=task.id,
+                project_id=task.project_id,
+                item=item,
+                source=TASK_EVENT_SOURCE_B2S,
+                event_type="item_skipped_unsupported_input",
+                phase=item.phase,
+                status=item.status,
+                message=f"任务项 #{item.sequence_no} 不是ELF文件，已跳过IDA分析并原样复制到输出目录",
+                payload={"output_path": skipped_output_path, "skip_reason": "unsupported_by_ida_non_elf", "operation": "rerun"},
+                dedupe_key=_event_dedupe_key(task.id, item.id, "item_skipped_unsupported_input", "rerun", item.extra_metadata.get("pi_idempotency_key")),
+            )
         _record_item_snapshot_events(db, task=task, item=item, previous=previous, source=TASK_EVENT_SOURCE_B2S, payload={"reason": "rerun"})
         db.flush()
     recompute_task_status(db, task)
