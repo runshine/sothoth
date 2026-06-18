@@ -13936,7 +13936,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("operation_step_succeeded", event_types)
         self.assertIn("task_requeued", event_types)
 
-    def test_sync_streaming_task_tail_state_rebuilds_entry_results(self):
+    def test_sync_streaming_task_tail_state_rebuilds_entry_results_without_advancing_to_dataflow_without_tail_facts(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         with tempfile.TemporaryDirectory() as tmp:
             task = BinarySecurityTask(
@@ -13999,7 +13999,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 self.manager._write_task_metadata_async = original_write
 
             self.assertEqual(["entry-a"], [row.get("entries", [{}])[0].get("entry_key") for row in task.summary.get("entry_results") or []])
-            self.assertEqual("dataflow_vuln_scan", task.current_stage)
+            self.assertEqual("entry_analysis", task.current_stage)
             self.assertEqual("pending", task.status)
             self.assertEqual(self.manager.instance_id, task.dispatcher_instance_id)
             self.assertIsNotNone(task.dispatch_started_at)
@@ -14068,6 +14068,74 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual("dataflow_vuln_scan", task.current_stage)
             self.assertEqual("failed", task.status)
+            self.assertEqual(self.manager.instance_id, task.dispatcher_instance_id)
+            self.assertIsNotNone(task.dispatch_started_at)
+            self.assertIsNotNone(task.lease_expires_at)
+
+    def test_sync_streaming_task_tail_state_advances_to_dataflow_only_with_authoritative_tail_items(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="running",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="entry_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(Path(tmp) / "output"),
+                workspace_root=tmp,
+                dispatcher_instance_id=self.manager.instance_id,
+                dispatch_started_at=_now(),
+                lease_expires_at=_now() + timedelta(minutes=1),
+                policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+            )
+            task.summary = {
+                "entry_results": [
+                    {
+                        "module_key": "mod-a",
+                        "module_name": "mod-a",
+                        "entries": [{"entry_key": "entry-a", "function_name": "func_a"}],
+                    }
+                ]
+            }
+            runs = [
+                BinarySecurityStageRun(id="sr-entry", task_id="task1", project_id="p1", stage_name="entry_analysis", sequence_no=1, status="success"),
+                BinarySecurityStageRun(id="sr-df", task_id="task1", project_id="p1", stage_name="dataflow_vuln_scan", sequence_no=2, status="pending"),
+            ]
+            dataflow_item = BinarySecurityStageItem(
+                id="si-df",
+                task_id="task1",
+                project_id="p1",
+                stage_run_id="sr-df",
+                stage_name="dataflow_vuln_scan",
+                item_key="entry-a",
+                item_name="func_a",
+                parent_key="mod-a",
+                item_identity_key="entry-a::mod-a",
+                status="pending",
+                downstream_service="dataflow_vuln_scan",
+            )
+            db = _AppendingModelAwareDb(tasks=[task], stage_runs=runs, stage_items=[dataflow_item])
+
+            original_factory = task_manager_module.get_session_factory
+            original_write = self.manager._write_task_metadata_async
+            task_manager_module.get_session_factory = lambda: (lambda: db)
+
+            async def fake_write(*args, **kwargs):
+                del args, kwargs
+                return None
+
+            self.manager._write_task_metadata_async = fake_write
+            try:
+                asyncio.run(self.manager._sync_streaming_task_tail_state("task1"))
+            finally:
+                task_manager_module.get_session_factory = original_factory
+                self.manager._write_task_metadata_async = original_write
+
+            self.assertEqual("dataflow_vuln_scan", task.current_stage)
+            self.assertEqual("running", task.status)
             self.assertEqual(self.manager.instance_id, task.dispatcher_instance_id)
             self.assertIsNotNone(task.dispatch_started_at)
             self.assertIsNotNone(task.lease_expires_at)

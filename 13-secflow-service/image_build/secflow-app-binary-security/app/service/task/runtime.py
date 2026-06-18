@@ -94,7 +94,26 @@ class TaskRuntimeServiceMixin:
                     summary["entry_results"] = rebuilt_rows
                     task.summary = summary
             current_stage_before_sync = str(task.current_stage or "").strip()
-            if self._entry_results(task):
+            authoritative_tail_item_present = any(
+                str(getattr(item, "status", "") or "").strip() in {"running", "dispatching", "success", "failed", "partial_success", "cancelled"}
+                or bool(getattr(item, "started_at", None))
+                or bool(getattr(item, "finished_at", None))
+                or bool(str(getattr(item, "downstream_task_id", "") or "").strip())
+                for item in tail_items
+            )
+            authoritative_tail_run_present = any(
+                bool(getattr(run, "started_at", None))
+                or bool(getattr(run, "finished_at", None))
+                or str(getattr(run, "status", "") or "").strip() in {"running", "failed", "success", "partial_success", "cancelled"}
+                for run in tail_runs
+            )
+            authoritative_tail_progress = (
+                active_tail_item
+                or authoritative_tail_item_present
+                or authoritative_tail_run_present
+                or current_stage_before_sync == "dataflow_vuln_scan"
+            )
+            if self._entry_results(task) and authoritative_tail_progress:
                 task.current_stage = "dataflow_vuln_scan"
                 if active_tail_item:
                     task.status = "running"
@@ -110,7 +129,7 @@ class TaskRuntimeServiceMixin:
                     task.status = "running"
                 task.last_error = None
                 task.finished_at = None
-            elif active_tail_item or nonterminal_tail_run is not None:
+            elif active_tail_item or authoritative_tail_progress:
                 task.current_stage = "dataflow_vuln_scan"
                 task.status = "running" if active_tail_item else "pending"
                 task.last_error = None
