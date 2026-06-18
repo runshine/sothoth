@@ -103,7 +103,7 @@ class TestLaunch:
         assert "/root/.pi/agent/skills/wiki-mount" in cmd
         assert "/root/.pi/agent/skills/task-collect" in cmd
         prompt = cmd[cmd.index("-p") + 1]
-        assert "Terminal Skills Canary - Full Mode" in prompt
+        assert "自动尽最大可能获取当前的session_id" in prompt
         assert "post-task-reflect" in prompt
         assert "task-collect" in prompt
 

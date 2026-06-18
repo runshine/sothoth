@@ -42,17 +42,16 @@ def _terminal_skills_canary_prompt() -> str:
 
     if mode == "full":
         return (
-            "【Terminal Skills Canary - Full Mode】\n"
-            "本次任务用于测试 terminal-skills 的完整实际效果。"
-            "在执行漏洞验证前，先读取 /root/.config/secocto/.env 并将其中变量导入执行环境。"
-            "然后依次加载并使用 wiki-mount 和 skill-recall-pull，"
-            "从项目 Wiki、远程 skill recall 与历史经验中搜索当前漏洞验证需要的上下文。"
-            "核心漏洞验证完成后，继续执行完整 post-task 生命周期："
-            "post-task-reflect、distill-experience、task-score、task-trace、vuln-report、"
-            "skill-recall-onboard、sec-skill-local-evolve、skill-recall-propose、task-collect。"
-            "如果任何外部服务不可达或某个 skill 执行失败，必须记录失败原因并继续生成漏洞验证结果，"
-            "不能因为 skill 失败而放弃输出 result_*.json。"
-            "最终仍必须将 result_*.json 输出到指定 verifier_output 目录。\n"
+            "在执行任务前你先把~/.config/secocto/.env 这里面的环境变量加到全局环境变量里面，"
+            "自动尽最大可能获取当前的session_id, 如果无法行获取请自行创建，"
+            "后续skill里面的session_id统一使用这个session_id，"
+            "然后依次加载wiki-mount和skill-recall-pull这两个skill，"
+            "后续任务必须从这两个skill加载的wiiki和远程skill中去搜索"
+            "（skill-recall-pull里面包含相关的调用方法）需要使用的经验和skill，"
+            "在任务执行之后，依次执行post-task-reflect、distill-experience、task-score、"
+            "task-trace、vuln-report、skill-recall-onboard、sec-skill-local-evolve"
+            "(除非skill完全符合要求，否则找到最需要进化的1-2个skill触发进化)、"
+            "skill-recall-propose，最后执行task-collect\n"
         )
 
     return (
