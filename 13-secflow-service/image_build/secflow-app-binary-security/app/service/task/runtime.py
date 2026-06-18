@@ -172,7 +172,32 @@ class TaskRuntimeServiceMixin:
                     if task_id:
                         claimed_id = self._dispatch_task_by_id(db, task_id)
                         if claimed_id:
-                            await self._start_task_runtime(claimed_id)
+                            started = await self._start_task_runtime(claimed_id)
+                            if not started:
+                                task = (
+                                    db.query(task_manager_module.BinarySecurityTask)
+                                    .filter(task_manager_module.BinarySecurityTask.id == claimed_id)
+                                    .first()
+                                )
+                                current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() if task is not None else ""
+                                current_status = str(getattr(task, "status", "") or "").strip() if task is not None else ""
+                                dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() if task is not None else ""
+                                runtime_phase = str(self._task_runtime_phase(task)) if task is not None else ""
+                                handle = self._runtime_handle(claimed_id)
+                                task_manager_module.logger.warning(
+                                    "binary-security dispatch claimed task but runtime start returned false: task_id=%s queue_task_id=%s "
+                                    "status=%s runtime_phase=%s dispatcher_instance_id=%s current_operation_id=%s "
+                                    "local_handle_present=%s local_handle_done=%s local_handle_cancel_requested=%s",
+                                    claimed_id,
+                                    task_id,
+                                    current_status,
+                                    runtime_phase,
+                                    dispatcher_instance_id,
+                                    current_operation_id,
+                                    handle is not None,
+                                    handle.done() if handle is not None else None,
+                                    getattr(handle, "cancel_requested", None) if handle is not None else None,
+                                )
                     await self._reconcile_work_queues(db)
                     await self._observe_runtime_metrics(db)
                     self._mark_loop_heartbeat("task_dispatch")
@@ -322,6 +347,19 @@ class TaskRuntimeServiceMixin:
             and str(getattr(current_operation, "status", "") or "").strip().lower()
             in task_manager_module.TASK_OPERATION_ACTIVE_STATUSES
         )
+        current_status = str(getattr(task, "status", "") or "").strip().lower()
+        if has_owner_inbox_work and current_status:
+            if current_status != "pending":
+                task_manager_module.logger.info(
+                    "binary-security dispatch claiming non-pending task because owner inbox work is active: "
+                    "task_id=%s status=%s runtime_phase=%s current_operation_id=%s operation_status=%s dispatcher_instance_id=%s",
+                    task_id,
+                    current_status,
+                    self._task_runtime_phase(task),
+                    current_operation_id,
+                    str(getattr(current_operation, "status", "") or "").strip().lower() if current_operation is not None else None,
+                    str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                )
         if (
             self._task_runtime_phase(task) == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
             and self._tail_requires_execution_takeover(db, task)
@@ -927,13 +965,38 @@ class TaskRuntimeServiceMixin:
             task = db.query(task_manager_module.BinarySecurityTask).filter(
                 task_manager_module.BinarySecurityTask.id == task_id
             ).first()
+            if task is None:
+                task_manager_module.logger.warning(
+                    "binary-security run_task aborted before execution because task row is missing: task_id=%s",
+                    task_id,
+                )
             if (
                 task is None
                 or task.status != "dispatching"
                 or task.dispatcher_instance_id != self.instance_id
                 or not self._lease_is_active(task, db=db)
             ):
+                if task is not None:
+                    task_manager_module.logger.warning(
+                        "binary-security run_task exited before switching to running due to failed precondition: "
+                        "task_id=%s status=%s dispatcher_instance_id=%s expected_instance_id=%s lease_active=%s current_operation_id=%s runtime_phase=%s",
+                        task_id,
+                        str(task.status or "").strip(),
+                        str(task.dispatcher_instance_id or "").strip(),
+                        str(self.instance_id or "").strip(),
+                        self._lease_is_active(task, db=db),
+                        str(getattr(task, "current_operation_id", "") or "").strip(),
+                        self._task_runtime_phase(task),
+                    )
                 return
+            task_manager_module.logger.info(
+                "binary-security run_task entering active execution: task_id=%s current_operation_id=%s runtime_phase=%s dispatch_started_at=%s lease_expires_at=%s",
+                task_id,
+                str(getattr(task, "current_operation_id", "") or "").strip(),
+                self._task_runtime_phase(task),
+                task_manager_module._isoformat_or_none(getattr(task, "dispatch_started_at", None)),
+                task_manager_module._isoformat_or_none(getattr(task, "lease_expires_at", None)),
+            )
             if task.started_at is None:
                 task.started_at = task_manager_module._now()
             started_at = task.dispatch_started_at or task_manager_module._now()
@@ -1134,7 +1197,7 @@ class TaskRuntimeServiceMixin:
                 )
                 if start_event is not None:
                     self._apply_stage_worker_start_requested_locked(db, start_event)
-                handler = getattr(self, f"_stage_{task_manager_module.normalize_stage_name(stage_name)}")
+                handler = self._run_stage_executor
                 stage_run = self._ensure_stage_run(db, task, stage_name)
                 existing_stage_items = self._stage_items(db, task.id, stage_name) if task_retry_mode else []
                 db.commit()
@@ -1143,7 +1206,7 @@ class TaskRuntimeServiceMixin:
                     retry_existing = True
                 elif task_retry_mode and existing_stage_items:
                     retry_existing = True
-                status, summary = await handler(db, task, stage_run, token, retry_existing)
+                status, summary = await handler(db, task, stage_run, token, retry_existing=retry_existing)
                 execution_token = task.dispatch_started_at.isoformat() if task.dispatch_started_at else None
                 self._emit_stage_terminal_event_safely(
                     db,

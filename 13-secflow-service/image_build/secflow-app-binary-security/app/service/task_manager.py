@@ -33,6 +33,9 @@ from app.copy_utils import safe_copy2
 from app.config import get_config
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
 from app.model import (
+    PIPELINE_PROFILE_DEFAULT,
+    PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+    TASK_PIPELINE_PROFILE_SEQUENCES,
     STAGE_SEQUENCE,
     TASK_TERMINAL_STATUSES,
     TASK_RUNTIME_PHASE_OWNED_EXECUTION,
@@ -229,6 +232,7 @@ from app.service.task.shared import (
 from app.service.task_queue import get_task_queue
 from app.service.http_client import get_shared_async_client
 from app.service.stages.registry import get_binary_security_stage_registry
+from app.service.knowledge_graph_entries import get_knowledge_graph_entries_client
 from app.time_utils import now_local
 
 logger = logging.getLogger(__name__)
@@ -433,6 +437,7 @@ STAGE_SUMMARY_RESULT_KEYS = {
     "system_analysis": ["system_analysis_results", "high_risk_modules", "system_analysis_modules", "candidate_modules", "selected_modules"],
     "binary_to_source": ["b2s_results"],
     "entry_analysis": ["entry_results"],
+    "knowledge_graph_entry_fetch": ["knowledge_graph_entry_results", "entry_results"],
     "dataflow_vuln_scan": ["dataflow_results", "vuln_results"],
 }
 STAGE_METRIC_RESETTERS = {
@@ -452,6 +457,7 @@ STAGE_TITLES = {
     "system_analysis": "系统分析",
     "binary_to_source": "二进制逆向",
     "entry_analysis": "入口分析",
+    "knowledge_graph_entry_fetch": "知识图谱入口获取",
     "dataflow_vuln_scan": "数据流漏洞挖掘",
 }
 
@@ -1503,12 +1509,24 @@ class TaskManager(
         return self._workers.get(str(task_id or "").strip())
 
     async def _start_task_runtime(self, task_id: str) -> bool:
+        from app.service import task_manager as task_manager_module
+
         normalized_task_id = str(task_id or "").strip()
         if not normalized_task_id:
             return False
         async with self._worker_lock:
             existing = self._workers.get(normalized_task_id)
             if existing is not None and not existing.done():
+                task_manager_module.logger.warning(
+                    "binary-security start_task_runtime skipped because local handle is still active: "
+                    "task_id=%s handle_done=%s cancel_requested=%s heartbeat_done=%s execution_token=%s lease_owner_instance_id=%s",
+                    normalized_task_id,
+                    existing.done(),
+                    existing.cancel_requested,
+                    existing.heartbeat_task.done() if existing.heartbeat_task is not None else None,
+                    existing.execution_token,
+                    existing.lease_owner_instance_id,
+                )
                 return False
             runner_task = asyncio.create_task(
                 self._run_task(normalized_task_id),
@@ -1527,6 +1545,13 @@ class TaskManager(
                 lease_owner_instance_id=str(self.instance_id or "").strip() or None,
             )
             self._workers[normalized_task_id] = handle
+            task_manager_module.logger.info(
+                "binary-security start_task_runtime created new local handle: task_id=%s runner_task=%s heartbeat_task=%s lease_owner_instance_id=%s",
+                normalized_task_id,
+                runner_task.get_name(),
+                heartbeat_task.get_name(),
+                handle.lease_owner_instance_id,
+            )
             return True
 
     async def _run_task_heartbeat(self, task_id: str) -> None:
@@ -2003,8 +2028,21 @@ class TaskManager(
         raw = task if isinstance(task, str) else getattr(task, "task_type", None)
         return raw if raw in TASK_STAGE_SEQUENCES else TASK_TYPE_BINARY
 
+    def _pipeline_profile(self, task: BinarySecurityTask | dict[str, Any] | None) -> str:
+        if isinstance(task, dict):
+            policy = dict(task.get("policy") or {})
+        else:
+            policy = dict(getattr(task, "policy", {}) or {})
+        raw = str(policy.get("pipeline_profile") or PIPELINE_PROFILE_DEFAULT).strip().lower()
+        return raw or PIPELINE_PROFILE_DEFAULT
+
     def _stage_sequence_for_task(self, task: BinarySecurityTask | str | None) -> list[str]:
-        return list(TASK_STAGE_SEQUENCES[self._task_type(task)])
+        task_type = self._task_type(task)
+        if isinstance(task, BinarySecurityTask):
+            profile = self._pipeline_profile(task)
+        else:
+            profile = PIPELINE_PROFILE_DEFAULT
+        return list(TASK_PIPELINE_PROFILE_SEQUENCES.get((task_type, profile), TASK_STAGE_SEQUENCES[task_type]))
 
     def _stage_handler(self, stage_name: str | None):
         return self._stage_registry.get(stage_name)
@@ -2014,6 +2052,24 @@ class TaskManager(
         if normalized not in TASK_STAGE_SEQUENCES:
             raise ValidationError(f"不支持的任务类型: {task_type}")
         return normalized
+
+    def _validate_pipeline_profile(self, task_type: str, pipeline_profile: str | None) -> str:
+        normalized = str(pipeline_profile or PIPELINE_PROFILE_DEFAULT).strip().lower() or PIPELINE_PROFILE_DEFAULT
+        if normalized == PIPELINE_PROFILE_DEFAULT:
+            return normalized
+        if normalized == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+            if task_type != TASK_TYPE_SOURCE:
+                raise ValidationError("kg_source_vuln_scan 仅支持源码任务")
+            return normalized
+        raise ValidationError(f"不支持的流程模式: {pipeline_profile}")
+
+    def _knowledge_graph_entries_url(self, task: BinarySecurityTask | dict[str, Any] | None) -> str | None:
+        if isinstance(task, dict):
+            policy = dict(task.get("policy") or {})
+        else:
+            policy = dict(getattr(task, "policy", {}) or {})
+        value = str(policy.get("knowledge_graph_entries_url") or "").strip()
+        return value or None
 
     async def complete_uploads(
         self,
@@ -3296,6 +3352,98 @@ class TaskManager(
         return {
             "candidate_entry_count": len(self._entry_candidates(task)),
             "selected_entry_count": len(self._effective_entry_inputs(task)) if self._entry_selection_mode(task) == ENTRY_SELECTION_MODE_MANUAL_CONFIRM else len(self._entry_candidates(task)),
+        }
+
+    def _knowledge_graph_entry_reason(self, entry: dict[str, Any]) -> str:
+        parts: list[str] = []
+        channel = str(entry.get("channel") or "").strip()
+        subkind = str(entry.get("subkind") or "").strip()
+        confidence = str(entry.get("confidence") or "").strip()
+        if channel:
+            parts.append(f"channel={channel}")
+        if subkind:
+            parts.append(f"subkind={subkind}")
+        if confidence:
+            parts.append(f"confidence={confidence}")
+        if bool(entry.get("is_promoted_root")):
+            parts.append("promoted_root=true")
+        if bool(entry.get("enhanced_yes")):
+            parts.append("enhanced_yes=true")
+        if bool(entry.get("basic_yes")):
+            parts.append("basic_yes=true")
+        if bool(entry.get("disagreement")):
+            parts.append("disagreement=true")
+        return "; ".join(parts) or "knowledge_graph_entry"
+
+    def _normalize_knowledge_graph_entry(
+        self,
+        task: BinarySecurityTask,
+        raw: dict[str, Any],
+    ) -> dict[str, Any]:
+        input_dir = str((task.summary or {}).get("input_dir") or "").strip()
+        source_file = str(raw.get("file_path") or "").strip().replace("\\", "/")
+        line_hint = str(raw.get("start_line") or "").strip()
+        function_name = str(raw.get("name") or "").strip()
+        entry_key = str(raw.get("source_id") or "").strip()
+        return {
+            "entry_key": entry_key,
+            "firmware_key": SOURCE_TASK_INPUT_KEY,
+            "firmware_name": task.name,
+            "module_key": "knowledge_graph_source_project",
+            "module_name": "source-project",
+            "module_dir": input_dir,
+            "descriptor_root": input_dir,
+            "source_dir": input_dir,
+            "source_root": input_dir,
+            "source_root_path": input_dir,
+            "module_input_path": input_dir,
+            "source_file": source_file,
+            "definition_file": source_file,
+            "function_name": function_name,
+            "raw_function_name": function_name,
+            "line_no": line_hint,
+            "definition_line": line_hint,
+            "definition_kind": "unknown",
+            "function_description": str(raw.get("function_purpose") or "").strip(),
+            "function_description_source": "knowledge_graph",
+            "entry_reason": self._knowledge_graph_entry_reason(raw),
+            "entry_reason_source": "knowledge_graph",
+            "taint_params": [],
+            "taint_details": [],
+            "signature": str(raw.get("signature") or "").strip(),
+            "channel": str(raw.get("channel") or "").strip(),
+            "subkind": str(raw.get("subkind") or "").strip(),
+            "confidence": str(raw.get("confidence") or "").strip(),
+            "is_promoted_root": bool(raw.get("is_promoted_root")),
+            "covers": list(raw.get("covers") or []),
+            "dominated_by": str(raw.get("dominated_by") or "").strip(),
+            "source_provider": "knowledge_graph",
+            "source_id": entry_key,
+            "task_type": TASK_TYPE_SOURCE,
+        }
+
+    async def _fetch_knowledge_graph_entry_results(
+        self,
+        task: BinarySecurityTask,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        started = time.perf_counter()
+        payload = await get_knowledge_graph_entries_client().list_entries(
+            override_url=self._knowledge_graph_entries_url(task),
+        )
+        entries = payload.get("entries")
+        if not isinstance(entries, list):
+            raise ValidationError("知识图谱入口响应格式非法: 缺少 entries 列表")
+        raw_entries = [dict(item) for item in entries if isinstance(item, dict)]
+        selected_raw = [item for item in raw_entries if bool(item.get("is_entry"))]
+        normalized_entries = [self._normalize_knowledge_graph_entry(task, item) for item in selected_raw]
+        deduped = _deduplicate_entry_keys(normalized_entries)
+        return deduped, {
+            "entries_url": self._knowledge_graph_entries_url(task)
+            or f"{self.cfg.services.knowledge_graph_entries.base_url.rstrip('/')}{self.cfg.services.knowledge_graph_entries.entries_path}",
+            "raw_entry_count": len(raw_entries),
+            "selected_entry_count": len(deduped),
+            "filtered_out_count": max(0, len(raw_entries) - len(selected_raw)),
+            "duration_ms": int((time.perf_counter() - started) * 1000),
         }
 
     def _filter_candidate_modules(self, modules: list[dict[str, Any]], risk_levels: list[str]) -> list[dict[str, Any]]:
@@ -9015,6 +9163,114 @@ class TaskManager(
             }
         return status, summary
 
+    async def _stage_knowledge_graph_entry_fetch(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun,
+        token: str | None,
+        retry_existing: bool = False,
+    ) -> tuple[str, dict[str, Any]]:
+        del db, token, retry_existing
+        self._record_event(
+            db,
+            task,
+            "knowledge_graph_entry_fetch_started",
+            "开始拉取知识图谱源码入口",
+            stage_name=stage_run.stage_name,
+            payload={
+                "provider": "knowledge_graph",
+                "entries_url": self._knowledge_graph_entries_url(task)
+                or f"{self.cfg.services.knowledge_graph_entries.base_url.rstrip('/')}{self.cfg.services.knowledge_graph_entries.entries_path}",
+            },
+        )
+        try:
+            entries, meta = await self._fetch_knowledge_graph_entry_results(task)
+        except Exception as exc:
+            self._record_event(
+                db,
+                task,
+                "knowledge_graph_entry_fetch_failed",
+                "知识图谱入口获取失败",
+                level="error",
+                stage_name=stage_run.stage_name,
+                payload={
+                    "provider": "knowledge_graph",
+                    "entries_url": self._knowledge_graph_entries_url(task)
+                    or f"{self.cfg.services.knowledge_graph_entries.base_url.rstrip('/')}{self.cfg.services.knowledge_graph_entries.entries_path}",
+                    "error_message": str(exc),
+                },
+            )
+            return "failed", {"error": str(exc)}
+        if not entries:
+            self._record_event(
+                db,
+                task,
+                "knowledge_graph_entry_fetch_empty",
+                "知识图谱入口结果为空",
+                level="warning",
+                stage_name=stage_run.stage_name,
+                payload={
+                    "provider": "knowledge_graph",
+                    **meta,
+                },
+            )
+            task.summary = {
+                **(task.summary or {}),
+                "knowledge_graph_entry_results": [],
+                "entry_results": [],
+            }
+            task.metrics = {
+                **(task.metrics or {}),
+                "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
+                "knowledge_graph_selected_entry_count": 0,
+                "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                "candidate_entry_count": 0,
+                "selected_entry_count": 0,
+                "entry_count": 0,
+            }
+            return "failed", {"error": "知识图谱入口结果为空", **meta}
+        compact_entries = [
+            {
+                **entry,
+                "entries": [dict(entry)],
+            }
+            for entry in entries
+        ]
+        task.summary = {
+            **(task.summary or {}),
+            "knowledge_graph_entry_results": entries,
+            "entry_results": compact_entries,
+        }
+        task.metrics = {
+            **(task.metrics or {}),
+            "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
+            "knowledge_graph_selected_entry_count": int(meta.get("selected_entry_count") or 0),
+            "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+            "candidate_entry_count": int(meta.get("selected_entry_count") or 0),
+            "selected_entry_count": int(meta.get("selected_entry_count") or 0),
+            "entry_count": int(meta.get("selected_entry_count") or 0),
+        }
+        self._record_event(
+            db,
+            task,
+            "knowledge_graph_entry_fetch_succeeded",
+            "知识图谱入口获取成功",
+            stage_name=stage_run.stage_name,
+            payload={
+                "provider": "knowledge_graph",
+                **meta,
+            },
+        )
+        return "success", {
+            "items": compact_entries,
+            "success_count": len(entries),
+            "failed_count": 0,
+            "candidate_entry_count": len(entries),
+            "selected_entry_count": len(entries),
+            "entry_results": compact_entries,
+        }
+
     async def _stage_dataflow_vuln_scan(
         self,
         db: Session,
@@ -9060,6 +9316,30 @@ class TaskManager(
             initial_retry=retry_existing,
         )
         return self._aggregate_stage_items(db, task, results, "dataflow_results")
+
+    async def _run_stage_executor(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun,
+        token: str | None,
+        *,
+        retry_existing: bool = False,
+    ) -> tuple[str, dict[str, Any]]:
+        stage_name = normalize_stage_name(stage_run.stage_name)
+        if stage_name == "knowledge_graph_entry_fetch":
+            return await self._stage_knowledge_graph_entry_fetch(db, task, stage_run, token, retry_existing)
+        if stage_name == "firmware_unpack":
+            return await self._stage_firmware_unpack(db, task, stage_run, token, retry_existing)
+        if stage_name == "system_analysis":
+            return await self._stage_system_analysis(db, task, stage_run, token, retry_existing)
+        if stage_name == "binary_to_source":
+            return await self._stage_binary_to_source(db, task, stage_run, token, retry_existing)
+        if stage_name == "entry_analysis":
+            return await self._stage_entry_analysis(db, task, stage_run, token, retry_existing)
+        if stage_name == "dataflow_vuln_scan":
+            return await self._stage_dataflow_vuln_scan(db, task, stage_run, token, retry_existing)
+        raise ValidationError(f"不支持的阶段: {stage_name}")
 
     async def _stage_dataflow_analysis(
         self,

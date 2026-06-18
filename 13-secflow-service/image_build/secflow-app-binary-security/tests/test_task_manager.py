@@ -8608,9 +8608,19 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         health = self.manager._build_task_runtime_health(db, task)
         units = {unit["unit_key"]: unit for unit in health["units"]}
+        groups = {group["group_key"]: group for group in health["groups"]}
+        spotlight = {item["slot_key"]: item for item in health["spotlight"]}
+        snapshot_cards = {card["card_key"]: card for card in health["snapshot_cards"]}
+        related_loops = {loop["loop_key"]: loop for loop in health["related_loops"]}
 
         self.assertEqual("healthy", units["task_worker"]["status"])
         self.assertEqual("healthy", units["task_heartbeat"]["status"])
+        self.assertIn("execution", groups)
+        self.assertIn("lease", groups)
+        self.assertEqual("healthy", spotlight["task_worker"]["status"])
+        self.assertEqual("healthy", spotlight["task_heartbeat"]["status"])
+        self.assertIn("local_task_runtime", snapshot_cards)
+        self.assertIn("task_dispatch", related_loops)
         self.assertNotEqual("unhealthy", health["summary"]["overall_status"])
 
     def test_get_task_detail_streaming_tail_queued_item_is_exposed_as_running(self):
@@ -29519,10 +29529,18 @@ def _test_build_task_runtime_health_marks_remote_owner_as_degraded_not_unhealthy
 
     health = manager._build_task_runtime_health(db, task)
     units = {unit["unit_key"]: unit for unit in health["units"]}
+    groups = {group["group_key"]: group for group in health["groups"]}
+    spotlight = {item["slot_key"]: item for item in health["spotlight"]}
+    snapshot_cards = {card["card_key"]: card for card in health["snapshot_cards"]}
+    related_loops = {loop["loop_key"]: loop for loop in health["related_loops"]}
 
     self.assertEqual("degraded", units["task_worker"]["status"])
     self.assertEqual("degraded", units["task_heartbeat"]["status"])
     self.assertIn(units["stage_workers"]["status"], {"healthy", "degraded"})
+    self.assertEqual("degraded", groups["execution"]["status"])
+    self.assertEqual("degraded", spotlight["task_worker"]["status"])
+    self.assertIn(snapshot_cards["local_task_runtime"]["status"], {"idle", "degraded", "healthy"})
+    self.assertIn("downstream_reconcile", related_loops)
     self.assertNotEqual("unhealthy", units["task_worker"]["status"])
 
 

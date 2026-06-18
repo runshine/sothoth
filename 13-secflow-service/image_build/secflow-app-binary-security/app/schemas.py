@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-from app.model import STAGE_SEQUENCE, TASK_TYPE_BINARY
+from app.model import PIPELINE_PROFILE_DEFAULT, STAGE_SEQUENCE, TASK_TYPE_BINARY
 
 
 class TokenUser(BaseModel):
@@ -32,6 +32,7 @@ class StageOptions(BaseModel):
 
 class TaskPolicyOverrides(BaseModel):
     pipeline_mode: Optional[str] = None
+    pipeline_profile: Optional[str] = None
     max_stage_parallelism: Optional[int] = Field(default=None, ge=1, le=32)
     max_retries_per_item: Optional[int] = Field(default=None, ge=0, le=20)
     continue_on_item_failure: Optional[bool] = None
@@ -40,6 +41,7 @@ class TaskPolicyOverrides(BaseModel):
     module_selection_mode: Optional[str] = None
     module_risk_levels: Optional[list[str]] = None
     entry_selection_mode: Optional[str] = None
+    knowledge_graph_entries_url: Optional[str] = None
 
 
 class BinarySecurityTaskCreate(BaseModel):
@@ -155,6 +157,7 @@ class BinarySecurityTaskResponse(BaseModel):
     id: str
     project_id: str
     task_type: str = TASK_TYPE_BINARY
+    pipeline_profile: str = PIPELINE_PROFILE_DEFAULT
     name: str
     status: str
     runtime_phase: str = "owned_execution"
@@ -528,6 +531,50 @@ class BinarySecurityRuntimeHealthUnit(BaseModel):
     evidence: list[BinarySecurityRuntimeHealthEvidence] = Field(default_factory=list)
 
 
+class BinarySecurityRuntimeHealthSpotlightItem(BaseModel):
+    slot_key: str
+    title: str
+    subtitle: Optional[str] = None
+    status: str
+    unit_key: Optional[str] = None
+    owner_instance_id: Optional[str] = None
+    last_heartbeat_at: Optional[datetime] = None
+    age_seconds: Optional[float] = None
+    reason: Optional[str] = None
+    evidence: list[BinarySecurityRuntimeHealthEvidence] = Field(default_factory=list)
+
+
+class BinarySecurityRuntimeHealthGroup(BaseModel):
+    group_key: str
+    group_label: str
+    description: Optional[str] = None
+    status: str = "unknown"
+    active_unit_count: int = 0
+    units: list[BinarySecurityRuntimeHealthUnit] = Field(default_factory=list)
+
+
+class BinarySecurityRuntimeHealthSnapshotCard(BaseModel):
+    card_key: str
+    title: str
+    subtitle: Optional[str] = None
+    status: str = "unknown"
+    message: Optional[str] = None
+    rows: list[BinarySecurityRuntimeHealthEvidence] = Field(default_factory=list)
+
+
+class BinarySecurityRuntimeHealthLoopSnapshot(BaseModel):
+    loop_key: str
+    loop_label: str
+    status: str = "unknown"
+    alive: bool = False
+    task_running: bool = False
+    heartbeat_alive: bool = False
+    heartbeat_at: Optional[datetime] = None
+    heartbeat_age_seconds: Optional[float] = None
+    stale_after_seconds: Optional[int] = None
+    message: Optional[str] = None
+
+
 class BinarySecurityRuntimeHealthSummary(BaseModel):
     overall_status: str = "unknown"
     active_unit_count: int = 0
@@ -540,6 +587,10 @@ class BinarySecurityRuntimeHealthSummary(BaseModel):
 
 class BinarySecurityRuntimeHealthResponse(BaseModel):
     summary: BinarySecurityRuntimeHealthSummary = Field(default_factory=BinarySecurityRuntimeHealthSummary)
+    spotlight: list[BinarySecurityRuntimeHealthSpotlightItem] = Field(default_factory=list)
+    snapshot_cards: list[BinarySecurityRuntimeHealthSnapshotCard] = Field(default_factory=list)
+    related_loops: list[BinarySecurityRuntimeHealthLoopSnapshot] = Field(default_factory=list)
+    groups: list[BinarySecurityRuntimeHealthGroup] = Field(default_factory=list)
     units: list[BinarySecurityRuntimeHealthUnit] = Field(default_factory=list)
 
 

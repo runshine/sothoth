@@ -1787,6 +1787,7 @@ class TaskReadModelServiceMixin:
             id=task.id,
             project_id=task.project_id,
             task_type=self._task_type(task),
+            pipeline_profile=self._pipeline_profile(task),
             name=task.name,
             status=task.status,
             runtime_phase=runtime_phase,
@@ -1938,6 +1939,295 @@ class TaskReadModelServiceMixin:
             "evidence": rendered_evidence,
         }
 
+    def _runtime_health_group_definition(self: TaskManager, unit_key: str) -> tuple[str, str, str]:
+        normalized = str(unit_key or "").strip().lower()
+        if normalized == "task_worker":
+            return ("execution", "任务执行", "主任务执行协程与 owner/lease 一致性")
+        if normalized == "task_heartbeat":
+            return ("lease", "保活与心跳", "任务级保活单元、lease 与心跳新鲜度")
+        if normalized == "downstream_sync":
+            return ("tail", "Tail 收口", "下游同步、tail reconcile 与最终收口推进")
+        if normalized == "stage_workers":
+            return ("stage_workers", "阶段子协程", "当前活跃 stage item 对应的父任务侧协程观察")
+        if normalized == "archive_workers":
+            return ("archive", "归档执行", "归档 worker 与归档任务活动状态")
+        if normalized == "task_operation":
+            return ("operation", "任务操作", "continue/retry/cancel 等任务操作协程与锁")
+        return ("other", "其他单元", "未归类的任务 scoped 运行单元")
+
+    def _runtime_health_group_status(self: TaskManager, units: list[dict[str, Any]]) -> str:
+        statuses = {str(unit.get("status") or "").strip().lower() for unit in units}
+        if "unhealthy" in statuses:
+            return "unhealthy"
+        if "degraded" in statuses:
+            return "degraded"
+        if "healthy" in statuses:
+            return "healthy"
+        if "unknown" in statuses:
+            return "unknown"
+        if "idle" in statuses:
+            return "idle"
+        if "done" in statuses or "terminal" in statuses:
+            return "terminal"
+        return "unknown"
+
+    def _build_runtime_health_groups(self: TaskManager, units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        grouped: dict[str, dict[str, Any]] = {}
+        for unit in units:
+            group_key, group_label, description = self._runtime_health_group_definition(str(unit.get("unit_key") or ""))
+            bucket = grouped.setdefault(
+                group_key,
+                {
+                    "group_key": group_key,
+                    "group_label": group_label,
+                    "description": description,
+                    "units": [],
+                },
+            )
+            bucket["units"].append(unit)
+        groups: list[dict[str, Any]] = []
+        for group in grouped.values():
+            group_units = list(group["units"])
+            groups.append(
+                {
+                    "group_key": group["group_key"],
+                    "group_label": group["group_label"],
+                    "description": group["description"],
+                    "status": self._runtime_health_group_status(group_units),
+                    "active_unit_count": sum(
+                        1
+                        for unit in group_units
+                        if str(unit.get("status") or "").strip().lower() in {"healthy", "degraded", "unhealthy"}
+                    ),
+                    "units": group_units,
+                }
+            )
+        groups.sort(
+            key=lambda group: (
+                task_shared._runtime_health_status_rank(str(group.get("status") or "")),
+                str(group.get("group_label") or ""),
+            ),
+            reverse=True,
+        )
+        return groups
+
+    def _build_runtime_health_spotlight(self: TaskManager, units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        preferred_slots = [
+            ("task_worker", "主任务执行协程", "当前父任务推进主协程"),
+            ("task_heartbeat", "任务保活/心跳", "任务 lease 与心跳保活"),
+            ("downstream_sync", "Tail 收口协程", "下游同步与 tail reconcile"),
+            ("stage_workers", "阶段子协程", "活跃 stage item 对应的父任务侧协程"),
+            ("task_operation", "任务操作协程", "retry/continue/cancel 操作"),
+            ("archive_workers", "归档协程", "产物归档执行单元"),
+        ]
+        by_key = {str(unit.get("unit_key") or ""): unit for unit in units}
+        spotlight: list[dict[str, Any]] = []
+        for slot_key, title, subtitle in preferred_slots:
+            unit = by_key.get(slot_key)
+            if unit is None:
+                continue
+            spotlight.append(
+                {
+                    "slot_key": slot_key,
+                    "title": title,
+                    "subtitle": subtitle,
+                    "status": unit.get("status") or "unknown",
+                    "unit_key": unit.get("unit_key"),
+                    "owner_instance_id": unit.get("owner_instance_id"),
+                    "last_heartbeat_at": unit.get("last_heartbeat_at") or unit.get("started_at"),
+                    "age_seconds": unit.get("age_seconds"),
+                    "reason": unit.get("reason"),
+                    "evidence": list(unit.get("evidence") or [])[:4],
+                }
+            )
+        return spotlight
+
+    def _runtime_health_snapshot_status(self: TaskManager, *, active: bool, warning: bool = False, error: bool = False) -> str:
+        if error:
+            return "unhealthy"
+        if warning:
+            return "degraded"
+        if active:
+            return "healthy"
+        return "idle"
+
+    def _build_runtime_health_snapshot_cards(
+        self: TaskManager,
+        *,
+        task_id: str,
+        local_worker_alive: bool,
+        last_task_heartbeat_at: datetime | None,
+        has_local_owner: bool,
+        owner_count: int,
+        local_stage_worker_count: int,
+        active_stage_item_count: int,
+        local_archive_job_count: int,
+        active_archive_job_count: int,
+        local_operation_alive: bool,
+        operation_lock_owner: str | None,
+        operation_lock_heartbeat_at: datetime | None,
+    ) -> list[dict[str, Any]]:
+        worker_handle = self._workers.get(task_id)
+        cards = [
+            {
+                "card_key": "local_task_runtime",
+                "title": "本地任务运行句柄",
+                "subtitle": "当前 Pod 内父任务主协程 / heartbeat handle 快照",
+                "status": self._runtime_health_snapshot_status(
+                    active=local_worker_alive or has_local_owner,
+                    warning=bool(not local_worker_alive and has_local_owner),
+                ),
+                "message": (
+                    "当前 Pod 持有本地父任务执行句柄"
+                    if local_worker_alive
+                    else "当前 Pod 仅持有执行 owner 标记，没有观测到活跃主协程"
+                    if has_local_owner
+                    else "当前 Pod 未持有该任务的本地父任务执行句柄"
+                ),
+                "rows": [
+                    {"label": "task_id", "value": task_id},
+                    {"label": "local_worker_alive", "value": str(local_worker_alive).lower()},
+                    {"label": "worker_handle_present", "value": str(worker_handle is not None).lower()},
+                    {"label": "worker_done", "value": None if worker_handle is None else str(worker_handle.done()).lower()},
+                    {"label": "heartbeat_task_present", "value": None if worker_handle is None else str(worker_handle.heartbeat_task is not None).lower()},
+                    {"label": "heartbeat_task_done", "value": None if worker_handle is None or worker_handle.heartbeat_task is None else str(worker_handle.heartbeat_task.done()).lower()},
+                    {"label": "local_owner", "value": str(has_local_owner).lower()},
+                    {"label": "local_owner_count", "value": str(owner_count)},
+                    {"label": "last_local_heartbeat_at", "value": task_shared._isoformat_or_none(last_task_heartbeat_at)},
+                ],
+            },
+            {
+                "card_key": "local_stage_workers",
+                "title": "本地阶段子协程",
+                "subtitle": "当前 Pod 内 stage-item worker 句柄快照",
+                "status": self._runtime_health_snapshot_status(
+                    active=local_stage_worker_count > 0,
+                    warning=bool(local_stage_worker_count == 0 and active_stage_item_count > 0),
+                ),
+                "message": (
+                    f"当前 Pod 观测到 {local_stage_worker_count} 个活跃 stage-item worker"
+                    if local_stage_worker_count > 0
+                    else "当前 Pod 没有观测到活跃 stage-item worker"
+                ),
+                "rows": [
+                    {"label": "local_stage_worker_count", "value": str(local_stage_worker_count)},
+                    {"label": "active_stage_item_count", "value": str(active_stage_item_count)},
+                    {"label": "stage_item_worker_handles", "value": str(len(self._stage_item_workers))},
+                ],
+            },
+            {
+                "card_key": "local_archive_workers",
+                "title": "本地归档协程",
+                "subtitle": "当前 Pod 内 archive worker 与活跃归档任务快照",
+                "status": self._runtime_health_snapshot_status(
+                    active=local_archive_job_count > 0,
+                    warning=bool(local_archive_job_count == 0 and active_archive_job_count > 0),
+                ),
+                "message": (
+                    f"当前 Pod 持有 {local_archive_job_count} 个活跃归档任务"
+                    if local_archive_job_count > 0
+                    else "当前 Pod 没有持有活跃归档任务"
+                ),
+                "rows": [
+                    {"label": "local_archive_job_count", "value": str(local_archive_job_count)},
+                    {"label": "active_archive_job_count", "value": str(active_archive_job_count)},
+                    {"label": "archive_worker_handles", "value": str(len(self._archive_workers))},
+                ],
+            },
+            {
+                "card_key": "local_operation_worker",
+                "title": "本地任务操作协程",
+                "subtitle": "continue / retry / cancel 对应的 operation worker 与 lock 快照",
+                "status": self._runtime_health_snapshot_status(
+                    active=local_operation_alive,
+                    warning=bool(not local_operation_alive and operation_lock_owner),
+                ),
+                "message": (
+                    "当前 Pod 持有活跃任务操作协程"
+                    if local_operation_alive
+                    else "当前存在 operation lock，但当前 Pod 没有活跃本地 operation worker"
+                    if operation_lock_owner
+                    else "当前没有活跃任务操作协程"
+                ),
+                "rows": [
+                    {"label": "local_operation_alive", "value": str(local_operation_alive).lower()},
+                    {"label": "operation_lock_owner", "value": operation_lock_owner},
+                    {"label": "operation_lock_heartbeat_at", "value": task_shared._isoformat_or_none(operation_lock_heartbeat_at)},
+                    {"label": "operation_worker_handles", "value": str(len(self._operation_workers))},
+                ],
+            },
+        ]
+        return cards
+
+    def _runtime_health_loop_snapshot_label(self: TaskManager, loop_key: str) -> str:
+        return {
+            "task_dispatch": "任务分发 loop",
+            "stage_item_dispatch": "阶段子项分发 loop",
+            "task_heartbeat": "任务保活 loop",
+            "downstream_reconcile": "下游收口 loop",
+            "stage_item_sync_reconcile": "阶段同步 reconcile loop",
+            "archive_dispatch": "归档分发 loop",
+            "archive_runtime_reconcile": "归档 reconcile loop",
+            "state_repair_reconcile": "状态修复 loop",
+            "state_reducer": "状态归约 reducer loop",
+            "readless_reconcile": "readless reconcile loop",
+        }.get(str(loop_key or "").strip(), loop_key)
+
+    def _runtime_health_loop_snapshot_status(self: TaskManager, detail: dict[str, Any] | None) -> str:
+        if not detail:
+            return "unknown"
+        if bool(detail.get("task_running")) and bool(detail.get("heartbeat_alive")):
+            return "healthy"
+        if bool(detail.get("alive")):
+            return "degraded"
+        return "unhealthy"
+
+    def _build_runtime_health_related_loops(self: TaskManager) -> list[dict[str, Any]]:
+        loop_sources = {
+            "task_dispatch": getattr(self, "_loop_task", None),
+            "stage_item_dispatch": getattr(self, "_stage_item_loop_task", None),
+            "task_heartbeat": getattr(self, "_task_heartbeat_loop_task", None),
+            "downstream_reconcile": getattr(self, "_downstream_reconcile_task", None),
+            "archive_dispatch": getattr(self, "_archive_loop_task", None),
+            "archive_runtime_reconcile": getattr(self, "_archive_runtime_reconcile_task", None),
+            "stage_item_sync_reconcile": getattr(self, "_stage_item_sync_reconcile_task", None),
+            "state_repair_reconcile": getattr(self, "_state_repair_reconcile_task", None),
+            "state_reducer": getattr(self, "_state_reducer_loop_task", None),
+            "readless_reconcile": getattr(self, "_readless_reconcile_task", None),
+        }
+        loops: list[dict[str, Any]] = []
+        for loop_key, task in loop_sources.items():
+            detail = self._loop_runtime_detail(loop_key, task)
+            status = self._runtime_health_loop_snapshot_status(detail)
+            loops.append(
+                {
+                    "loop_key": loop_key,
+                    "loop_label": self._runtime_health_loop_snapshot_label(loop_key),
+                    "status": status,
+                    "alive": bool(detail.get("alive")),
+                    "task_running": bool(detail.get("task_running")),
+                    "heartbeat_alive": bool(detail.get("heartbeat_alive")),
+                    "heartbeat_at": task_shared._parse_iso_datetime(detail.get("heartbeat_at")),
+                    "heartbeat_age_seconds": detail.get("heartbeat_age_seconds"),
+                    "stale_after_seconds": detail.get("stale_after_seconds"),
+                    "message": (
+                        "loop task 与 heartbeat 都处于活跃窗口"
+                        if status == "healthy"
+                        else "loop 尚存活，但 task 或 heartbeat 信号不完整"
+                        if status == "degraded"
+                        else "当前没有观测到稳定的 loop task / heartbeat"
+                    ),
+                }
+            )
+        loops.sort(
+            key=lambda item: (
+                task_shared._runtime_health_status_rank(str(item.get("status") or "")),
+                str(item.get("loop_label") or ""),
+            ),
+            reverse=True,
+        )
+        return loops
+
     def _build_task_runtime_health(
         self: TaskManager,
         db: Session,
@@ -1986,6 +2276,7 @@ class TaskReadModelServiceMixin:
         operation_lock_owner = str(task.operation_lock_owner or "").strip() or None
         operation_lock_heartbeat_at = task.operation_lock_heartbeat_at
         operation_lock_expires_at = task.operation_lock_expires_at
+        local_operation_alive = False
         active_stage_items = [
             item
             for item in stage_items
@@ -2422,6 +2713,23 @@ class TaskReadModelServiceMixin:
             key=lambda unit: (task_shared._runtime_health_status_rank(unit["status"]), unit["unit_label"]),
             reverse=True,
         )
+        groups = self._build_runtime_health_groups(units)
+        spotlight = self._build_runtime_health_spotlight(units)
+        snapshot_cards = self._build_runtime_health_snapshot_cards(
+            task_id=task.id,
+            local_worker_alive=local_worker_alive,
+            last_task_heartbeat_at=last_task_heartbeat_at,
+            has_local_owner=has_local_owner,
+            owner_count=owner_count,
+            local_stage_worker_count=local_stage_worker_count,
+            active_stage_item_count=len(active_stage_items),
+            local_archive_job_count=len(local_archive_jobs),
+            active_archive_job_count=len(active_archive_jobs),
+            local_operation_alive=local_operation_alive,
+            operation_lock_owner=operation_lock_owner,
+            operation_lock_heartbeat_at=operation_lock_heartbeat_at,
+        )
+        related_loops = self._build_runtime_health_related_loops()
         return {
             "summary": {
                 "overall_status": overall_status,
@@ -2432,6 +2740,10 @@ class TaskReadModelServiceMixin:
                 "last_updated_at": task_shared._now(),
                 "message": self._runtime_health_summary_message(overall_status),
             },
+            "spotlight": spotlight,
+            "snapshot_cards": snapshot_cards,
+            "related_loops": related_loops,
+            "groups": groups,
             "units": units,
         }
 
