@@ -1,0 +1,1188 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import time
+import uuid
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.orm import Session
+
+from app.exception import ValidationError
+
+if TYPE_CHECKING:
+    from app.service.task_manager import TaskManager
+
+
+class TaskArchiveServiceMixin:
+    def _expand_stage_name_aliases(self: TaskManager, stage_names: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for stage_name in stage_names:
+            raw_name = str(stage_name or "").strip()
+            candidate = task_shared_name = None
+            try:
+                from app.service import task_manager as task_manager_module
+
+                candidate = task_manager_module.normalize_stage_name(stage_name)
+            except Exception:
+                candidate = str(stage_name or "").strip() or None
+            for alias in (raw_name, str(candidate or "").strip()):
+                if alias and alias not in seen:
+                    seen.add(alias)
+                    normalized.append(alias)
+            task_shared_name = str(candidate or "").strip()
+            if task_shared_name == "dataflow_vuln_scan":
+                for alias in ("dataflow_analysis", "vuln_scan"):
+                    if alias not in seen:
+                        seen.add(alias)
+                        normalized.append(alias)
+        return normalized
+
+    def _clear_archive_jobs_for_stages(
+        self: TaskManager,
+        db: Session,
+        task_id: str,
+        stage_names: list[str],
+        *,
+        batch_size: int = 100,
+        max_retries: int = 3,
+    ) -> int:
+        from app.service import task_manager as task_manager_module
+
+        normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
+        if not normalized:
+            return 0
+        deleted = 0
+        while True:
+            job_ids = [
+                row[0]
+                for row in db.query(task_manager_module.BinarySecurityArchiveJob.id)
+                .filter(
+                    task_manager_module.BinarySecurityArchiveJob.task_id == task_id,
+                    task_manager_module.BinarySecurityArchiveJob.stage_name.in_(normalized),
+                )
+                .order_by(task_manager_module.BinarySecurityArchiveJob.created_at.asc(), task_manager_module.BinarySecurityArchiveJob.id.asc())
+                .limit(max(1, int(batch_size)))
+                .all()
+            ]
+            if not job_ids:
+                if hasattr(db, "archive_jobs") and isinstance(getattr(db, "archive_jobs"), list):
+                    allowed_stage_names = set(normalized)
+                    db.archive_jobs = [
+                        row for row in db.archive_jobs
+                        if not (
+                            str(getattr(row, "task_id", "") or "").strip() == task_id
+                            and str(getattr(row, "stage_name", "") or "").strip() in allowed_stage_names
+                        )
+                    ]
+                return deleted
+            for attempt in range(max(1, int(max_retries))):
+                try:
+                    with self._savepoint(db):
+                        deleted += int(
+                            db.query(task_manager_module.BinarySecurityArchiveJob)
+                            .filter(
+                                task_manager_module.BinarySecurityArchiveJob.task_id == task_id,
+                                task_manager_module.BinarySecurityArchiveJob.id.in_(job_ids),
+                            )
+                            .delete(synchronize_session=False)
+                            or 0
+                        )
+                    break
+                except Exception as exc:
+                    if attempt >= max(1, int(max_retries)) - 1 or not self._is_retryable_lock_error(exc):
+                        raise
+                    db.rollback()
+
+    def _clear_archive_jobs_for_stage_items(
+        self: TaskManager,
+        db: Session,
+        task_id: str,
+        stage_name: str,
+        item_ids: list[str],
+    ) -> int:
+        from app.service import task_manager as task_manager_module
+
+        normalized_stage = str(stage_name or "").strip()
+        normalized_item_ids = [str(item_id or "").strip() for item_id in item_ids if str(item_id or "").strip()]
+        if not normalized_stage or not normalized_item_ids:
+            return 0
+        deleted = int(
+            db.query(task_manager_module.BinarySecurityArchiveJob)
+            .filter(
+                task_manager_module.BinarySecurityArchiveJob.task_id == task_id,
+                task_manager_module.BinarySecurityArchiveJob.stage_name == normalized_stage,
+                task_manager_module.BinarySecurityArchiveJob.item_id.in_(normalized_item_ids),
+            )
+            .delete(synchronize_session=False)
+            or 0
+        )
+        if hasattr(db, "archive_jobs") and isinstance(getattr(db, "archive_jobs"), list):
+            allowed_item_ids = set(normalized_item_ids)
+            db.archive_jobs = [
+                row
+                for row in db.archive_jobs
+                if not (
+                    str(getattr(row, "task_id", "") or "").strip() == task_id
+                    and str(getattr(row, "stage_name", "") or "").strip() == normalized_stage
+                    and str(getattr(row, "item_id", "") or "").strip() in allowed_item_ids
+                )
+            ]
+        return deleted
+
+    def _delete_archive_children_for_stages(
+        self: TaskManager,
+        db: Session,
+        task,
+        stage_names: list[str],
+    ) -> int:
+        normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
+        if not normalized:
+            return 0
+        self._clear_stage_output_artifacts(task, normalized)
+        if hasattr(db, "archive_jobs") and isinstance(getattr(db, "archive_jobs"), list):
+            allowed_stage_names = set(normalized)
+            matching = [
+                row
+                for row in db.archive_jobs
+                if str(getattr(row, "task_id", "") or "").strip() == task.id
+                and str(getattr(row, "stage_name", "") or "").strip() in allowed_stage_names
+            ]
+            if matching:
+                db.archive_jobs = [row for row in db.archive_jobs if row not in matching]
+                return len(matching)
+        return self._clear_archive_jobs_for_stages(db, task.id, normalized)
+
+    def _archive_retry_blocked_reason(self: TaskManager, db: Session, task: Any) -> str | None:
+        active_operation = self._active_operation(db, task.id)
+        if active_operation is not None:
+            return f"当前任务正在执行 {active_operation.operation_type}，请稍后重试"
+        if task.status in {"dispatching", "running"}:
+            return f"当前任务正在执行中，当前状态 {task.status} 下不可手工重试归档"
+        if task.status in {"pending_upload", "uploading", "ready_to_start", "pending"}:
+            return f"当前任务状态不允许重试归档: {task.status}"
+        return None
+
+    def _archive_job_retry_support(
+        self: TaskManager,
+        db: Session,
+        task: Any,
+        job: Any,
+        *,
+        ignore_operation_lock: bool = False,
+    ) -> tuple[bool, str | None]:
+        if not ignore_operation_lock:
+            blocked_reason = self._archive_retry_blocked_reason(db, task)
+            if blocked_reason:
+                return False, blocked_reason
+        if str(getattr(job, "task_id", "") or "").strip() != str(task.id):
+            return False, "归档任务不属于当前任务"
+        if str(getattr(job, "archive_status", "") or "").strip() != "failed":
+            return False, f"当前归档任务状态不允许重试: {getattr(job, 'archive_status', None) or '-'}"
+        mapped_status = str((getattr(job, "payload", None) or {}).get("mapped_status") or "").strip()
+        if mapped_status not in {"success", "partial_success"}:
+            return False, f"当前归档任务目标状态不允许重试: {mapped_status or '-'}"
+        return True, None
+
+    def _archive_retry_support(
+        self: TaskManager,
+        db: Session,
+        task: Any,
+        stage_name: str,
+        *,
+        ignore_operation_lock: bool = False,
+    ):
+        from app.service import task_manager as task_manager_module
+
+        normalized_stage = task_manager_module.normalize_stage_name(stage_name)
+        allowed_stage_names = set(self._expand_stage_name_aliases([normalized_stage or stage_name]))
+        if not ignore_operation_lock:
+            blocked_reason = self._archive_retry_blocked_reason(db, task)
+            if blocked_reason:
+                return False, blocked_reason, []
+        jobs = (
+            db.query(task_manager_module.BinarySecurityArchiveJob)
+            .filter(task_manager_module.BinarySecurityArchiveJob.task_id == task.id)
+            .order_by(task_manager_module.BinarySecurityArchiveJob.created_at.asc())
+            .all()
+        )
+        jobs = [
+            job
+            for job in jobs
+            if str(getattr(job, "task_id", "") or "").strip() == str(task.id)
+            and str(getattr(job, "stage_name", "") or "").strip() in allowed_stage_names
+        ]
+        if not jobs:
+            return False, "当前阶段暂无归档任务", []
+        retryable_jobs = []
+        for job in jobs:
+            supported, _ = self._archive_job_retry_support(db, task, job, ignore_operation_lock=ignore_operation_lock)
+            if supported:
+                retryable_jobs.append(job)
+        if not retryable_jobs:
+            return False, "当前阶段暂无可重试的失败归档任务", []
+        return True, None, retryable_jobs
+
+    def _archive_full_retry_support(
+        self: TaskManager,
+        db: Session,
+        task: Any,
+        stage_name: str,
+        *,
+        ignore_operation_lock: bool = False,
+    ):
+        from app.service import task_manager as task_manager_module
+
+        normalized_stage = task_manager_module.normalize_stage_name(stage_name)
+        allowed_stage_names = set(self._expand_stage_name_aliases([normalized_stage or stage_name]))
+        if not ignore_operation_lock:
+            blocked_reason = self._archive_retry_blocked_reason(db, task)
+            if blocked_reason:
+                return False, blocked_reason, [], []
+        stage_sequence = self._stage_sequence_for_task(task)
+        if normalized_stage not in stage_sequence and str(stage_name or "").strip() not in stage_sequence:
+            return False, f"无效阶段: {stage_name}", [], []
+        jobs = self._archive_jobs_for_stages(db, task.id, list(allowed_stage_names))
+        stage_items: list[Any] = []
+        for candidate_stage in allowed_stage_names:
+            try:
+                stage_items.extend(self._stage_items(db, task.id, candidate_stage))
+            except Exception:
+                continue
+        seen_item_ids: set[str] = set()
+        deduped_stage_items: list[Any] = []
+        for item in stage_items:
+            item_id = str(getattr(item, "id", "") or "").strip()
+            if item_id and item_id in seen_item_ids:
+                continue
+            if item_id:
+                seen_item_ids.add(item_id)
+            deduped_stage_items.append(item)
+        stage_items = deduped_stage_items
+        if not jobs and not stage_items:
+            return False, "当前阶段暂无归档任务", [], []
+        retryable_items = [
+            item
+            for item in stage_items
+            if str(getattr(item, "status", "") or "").strip() in {"success", "partial_success", "failed", "downstream_missing"}
+        ]
+        if not jobs and not retryable_items:
+            return False, "当前阶段暂无可完全重试的归档任务", [], []
+        return True, None, jobs, retryable_items or stage_items
+
+    def _mark_task_waiting_for_archive_retry(self: TaskManager, db: Session, task: Any, stage_name: str) -> None:
+        task.status = "running"
+        task.current_stage = stage_name
+        task.execution_mode = None
+        task.target_stage_name = None
+        task.last_error = None
+        self._clear_task_abnormal_reason_snapshot(db, task)
+        task.dispatcher_instance_id = None
+        task.dispatch_started_at = None
+        task.lease_expires_at = None
+        task.finished_at = None
+        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="running")
+        self._record_event(
+            db,
+            task,
+            "task_archive_retry_requeued",
+            "失败任务的产物归档已重新排队，等待归档 worker 完成后继续推进",
+            stage_name=stage_name,
+            payload={"stage_name": stage_name, "retry_semantics": "archive_retry"},
+        )
+
+    async def _prepare_archive_retry_failed_items(
+        self: TaskManager,
+        db: Session,
+        task: Any,
+        target_stage: str,
+    ) -> list[str]:
+        supported, reason, jobs = self._archive_retry_support(db, task, target_stage, ignore_operation_lock=True)
+        if not supported:
+            raise ValidationError(reason or f"阶段 {target_stage} 暂无可重试的归档任务")
+        self._delete_archive_roots_for_jobs(task, jobs)
+        self._requeue_archive_jobs(
+            db,
+            task,
+            jobs,
+            stage_name=target_stage,
+            event_type="archive_stage_retry_requested",
+            event_message="阶段归档任务已重新排队",
+        )
+        self._mark_task_waiting_for_archive_retry(db, task, target_stage)
+        return [target_stage]
+
+    async def _prepare_archive_retry_full(
+        self: TaskManager,
+        db: Session,
+        task: Any,
+        target_stage: str,
+    ) -> list[str]:
+        supported, reason, jobs, stage_items = self._archive_full_retry_support(
+            db,
+            task,
+            target_stage,
+            ignore_operation_lock=True,
+        )
+        if not supported:
+            raise ValidationError(reason or f"阶段 {target_stage} 暂无可完全重试的归档任务")
+        if jobs:
+            self._delete_archive_roots_for_jobs(task, jobs)
+            self._clear_archive_jobs_for_stages(db, task.id, [target_stage])
+        rebuilt = self._rebuild_archive_jobs_for_stage(db, task, target_stage, stage_items)
+        self._mark_task_waiting_for_archive_retry(db, task, target_stage)
+        self._record_event(
+            db,
+            task,
+            "archive_stage_full_retry_requested",
+            "阶段归档任务已清空并重建",
+            stage_name=target_stage,
+            payload={
+                "stage_name": target_stage,
+                "rebuild_count": rebuilt,
+                "retry_semantics": "archive_full",
+            },
+        )
+        return [target_stage]
+
+    def _requeue_archive_jobs(
+        self: TaskManager,
+        db: Session,
+        task: Any,
+        jobs: list[Any],
+        *,
+        stage_name: str,
+        event_type: str,
+        event_message: str,
+    ) -> None:
+        from app.service import task_manager as task_manager_module
+
+        if not jobs:
+            return
+        now = task_manager_module._now()
+        touched_stage_names: set[str] = set()
+        for job in jobs:
+            item = db.query(task_manager_module.BinarySecurityStageItem).filter(
+                task_manager_module.BinarySecurityStageItem.id == job.item_id
+            ).first()
+            mapped_status = str((job.payload or {}).get("mapped_status") or "success").strip()
+            if item is not None:
+                item.status = mapped_status
+                item.error_message = None
+                item.started_at = item.started_at or now
+                item.finished_at = item.finished_at or now
+                if item.stage_name == "firmware_unpack":
+                    self._refresh_firmware_unpack_item_result(
+                        task,
+                        item,
+                        archived_dir=Path(job.archive_root) if job.archive_root else None,
+                    )
+                touched_stage_names.add(item.stage_name)
+            job.payload = self._clear_archive_job_retry_metadata(job)
+            job.archive_status = "pending"
+            job.owner_id = None
+            job.error_message = None
+            job.archive_root = None
+            job.started_at = None
+            job.completed_at = None
+            job.updated_at = now
+            self._record_event(
+                db,
+                task,
+                event_type,
+                event_message,
+                stage_name=stage_name,
+                item=item,
+                payload={
+                    "archive_job_id": job.id,
+                    "downstream_service": job.downstream_service,
+                    "downstream_task_id": job.downstream_task_id,
+                    "mapped_status": mapped_status,
+                },
+            )
+        for current_stage in sorted(touched_stage_names):
+            if current_stage == "system_analysis":
+                self._refresh_system_analysis_stage_from_synced_items(db, task)
+            else:
+                self._refresh_stage_run_from_items(db, task, current_stage)
+        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+
+    def _ensure_downstream_archive_job(
+        self: TaskManager,
+        db: Session,
+        task,
+        item,
+        *,
+        payload: dict[str, Any],
+        mapped_status: str,
+        before_status: str | None,
+        force: bool = False,
+        extra_paths: list[str | Path] | None = None,
+    ):
+        from app.service import task_manager as task_manager_module
+
+        downstream_task_id = str(item.downstream_task_id or "").strip()
+        job_dedupe_key = task_manager_module.build_archive_job_dedupe_key(item.id, downstream_task_id)
+        lock_digest = hashlib.sha1(f"{item.id}:{downstream_task_id}".encode("utf-8")).hexdigest()
+        lock_name = f"bs_archive:{lock_digest}"
+        locked = False
+        try:
+            try:
+                locked = bool(
+                    db.execute(
+                        task_manager_module.text("SELECT GET_LOCK(:name, :timeout)"),
+                        {"name": lock_name, "timeout": 5},
+                    ).scalar()
+                )
+            except Exception:
+                locked = False
+            if not locked:
+                time.sleep(0.05)
+            existing = (
+                db.query(task_manager_module.BinarySecurityArchiveJob)
+                .filter(
+                    task_manager_module.BinarySecurityArchiveJob.task_id == task.id,
+                    task_manager_module.BinarySecurityArchiveJob.stage_name == item.stage_name,
+                    task_manager_module.BinarySecurityArchiveJob.job_dedupe_key == job_dedupe_key,
+                    task_manager_module.BinarySecurityArchiveJob.archive_status.in_(
+                        ["pending", "running", "archived", "applying", "success", "ignored", "skipped"]
+                    ),
+                )
+                .order_by(task_manager_module.BinarySecurityArchiveJob.created_at.desc())
+                .first()
+            )
+            if existing is not None:
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
+                return existing
+            failed = (
+                db.query(task_manager_module.BinarySecurityArchiveJob)
+                .filter(
+                    task_manager_module.BinarySecurityArchiveJob.task_id == task.id,
+                    task_manager_module.BinarySecurityArchiveJob.stage_name == item.stage_name,
+                    task_manager_module.BinarySecurityArchiveJob.job_dedupe_key == job_dedupe_key,
+                    task_manager_module.BinarySecurityArchiveJob.archive_status == "failed",
+                )
+                .order_by(task_manager_module.BinarySecurityArchiveJob.created_at.desc())
+                .first()
+            )
+            if failed is not None:
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
+                return failed
+            job = task_manager_module.BinarySecurityArchiveJob(
+                id=f"aj_{uuid.uuid4().hex[:24]}",
+                task_id=task.id,
+                project_id=task.project_id,
+                stage_name=item.stage_name,
+                item_id=item.id,
+                item_key=item.item_key,
+                downstream_service=item.downstream_service,
+                downstream_task_id=downstream_task_id,
+                job_dedupe_key=job_dedupe_key,
+            )
+            job.archive_status = "pending"
+            job.owner_id = None
+            job.error_message = None
+            job.archive_root = None
+            job.started_at = None
+            job.completed_at = None
+            job.updated_at = task_manager_module._now()
+            job.payload = self._build_archive_job_payload(
+                mapped_status=mapped_status,
+                before_status=before_status,
+                force=force,
+                payload=payload,
+                bound_downstream_task_id=downstream_task_id,
+                extra_paths=extra_paths,
+            )
+            db.add(job)
+            max_attempts = self._retryable_write_attempts()
+            for attempt in range(max_attempts):
+                try:
+                    with self._savepoint(db):
+                        db.flush()
+                    break
+                except IntegrityError:
+                    existing = (
+                        db.query(task_manager_module.BinarySecurityArchiveJob)
+                        .filter(
+                            task_manager_module.BinarySecurityArchiveJob.task_id == task.id,
+                            task_manager_module.BinarySecurityArchiveJob.stage_name == item.stage_name,
+                            task_manager_module.BinarySecurityArchiveJob.job_dedupe_key == job_dedupe_key,
+                        )
+                        .order_by(task_manager_module.BinarySecurityArchiveJob.created_at.desc())
+                        .first()
+                    )
+                    if existing is None:
+                        raise
+                    return existing
+                except OperationalError as exc:
+                    if not self._is_retryable_lock_error(exc) or attempt >= max_attempts - 1:
+                        raise
+                    self._sleep_after_retryable_lock_error(attempt + 1)
+            for attempt in range(max_attempts):
+                try:
+                    db.commit()
+                    break
+                except OperationalError as exc:
+                    db.rollback()
+                    if not self._is_retryable_lock_error(exc) or attempt >= max_attempts - 1:
+                        raise
+                    self._sleep_after_retryable_lock_error(attempt + 1)
+                except Exception:
+                    db.rollback()
+                    raise
+            return job
+        finally:
+            if locked:
+                try:
+                    db.execute(task_manager_module.text("SELECT RELEASE_LOCK(:name)"), {"name": lock_name})
+                except Exception:
+                    pass
+
+    def _queue_downstream_archive_job(
+        self: TaskManager,
+        db: Session,
+        task,
+        item,
+        *,
+        payload: dict[str, Any],
+        mapped_status: str,
+        before_status: str | None,
+        extra_paths: list[str | Path] | None = None,
+    ):
+        from app.service import task_manager as task_manager_module
+
+        if mapped_status not in task_manager_module.ARCHIVE_SUCCESS_MAPPED_STATUSES:
+            raise ValidationError(f"当前状态不生成归档任务: {mapped_status}")
+        allowed, ignored_reason = self._may_queue_archive_for_current_binding(
+            item,
+            payload=payload,
+            mapped_status=mapped_status,
+        )
+        if not allowed:
+            self._record_event(
+                db,
+                task,
+                "stale_archive_trigger_ignored",
+                "旧 child 的终态归档触发已忽略",
+                stage_name=item.stage_name,
+                item=item,
+                level="warning",
+                payload={
+                    "downstream_service": item.downstream_service,
+                    "downstream_task_id": item.downstream_task_id,
+                    "payload_downstream_task_id": self._payload_downstream_task_id(payload),
+                    "mapped_status": mapped_status,
+                    "ignored_reason": ignored_reason,
+                    "superseded": True,
+                },
+            )
+            return None
+        job = self._ensure_downstream_archive_job(
+            db,
+            task,
+            item,
+            payload=payload,
+            mapped_status=mapped_status,
+            before_status=before_status,
+            force=False,
+            extra_paths=extra_paths,
+        )
+        self._record_event(
+            db,
+            task,
+            "downstream_archive_job_queued" if job.archive_status in {"pending", "running"} else "downstream_archive_job_reused",
+            "下游子任务已终态，产物归档已入队",
+            stage_name=item.stage_name,
+            item=item,
+            payload={
+                "archive_job_id": job.id,
+                "archive_status": job.archive_status,
+                "downstream_service": item.downstream_service,
+                "downstream_task_id": item.downstream_task_id,
+                "mapped_status": mapped_status,
+            },
+        )
+        return job
+
+    async def _queue_archive_and_wait(
+        self: TaskManager,
+        db: Session,
+        task,
+        item,
+        *,
+        payload: dict[str, Any],
+        mapped_status: str,
+        before_status: str | None,
+        extra_paths: list[str | Path] | None = None,
+    ) -> tuple[Path | None, Any]:
+        from app.service import task_manager as task_manager_module
+
+        if mapped_status not in task_manager_module.ARCHIVE_SUCCESS_MAPPED_STATUSES:
+            return None, None
+        job = self._queue_downstream_archive_job(
+            db,
+            task,
+            item,
+            payload=payload,
+            mapped_status=mapped_status,
+            before_status=before_status,
+            extra_paths=extra_paths,
+        )
+        if job is None:
+            return None, None
+        db.commit()
+        completed = await self._wait_archive_job_completion(job.id, task.id)
+        try:
+            db.refresh(item)
+        except Exception:
+            db.rollback()
+        if completed is None or completed.archive_status != "success":
+            error = completed.error_message if completed is not None else "归档任务不存在"
+            self._record_event(
+                db,
+                task,
+                "downstream_archive_blocking_failed",
+                "总任务产物归档未完成，阶段结果不能用于后续推进",
+                stage_name=item.stage_name,
+                item=item,
+                level="warning",
+                payload={"archive_job_id": job.id, "error": error or "下游产物归档失败"},
+            )
+            db.commit()
+            return None, completed
+        return Path(completed.archive_root) if completed.archive_root else None, completed
+
+    def _persist_downstream_sync_failure(self: TaskManager, db: Session, **kwargs):
+        from app.service import task_manager as task_manager_module
+
+        task = kwargs["task"]
+        item = kwargs["item"]
+        error = kwargs["error"]
+        change_source = kwargs["change_source"]
+        operation = kwargs["operation"]
+        before_status = kwargs.get("before_status")
+        error_type = self._classify_downstream_sync_error(error)
+        observed_at = task_manager_module._now()
+        http_status = self._extract_http_status_from_exception(error)
+        is_http_429 = http_status == 429
+        state = (
+            self._build_next_http_429_failure_state(item, observed_at=observed_at)
+            if is_http_429
+            else self._build_next_downstream_sync_failure_state(item, observed_at=observed_at)
+        )
+        sync_status = "rate_limited" if is_http_429 else "transport_error"
+        persisted = self._persist_child_sync_observation(
+            db,
+            task=task,
+            item=item,
+            change_source=change_source,
+            sync_status=sync_status,
+            synced_at=observed_at,
+            error_message=str(error),
+            http_status=http_status,
+            error_type=error_type,
+            state_applied=False,
+            extra_payload={
+                "operation": operation,
+                **self._downstream_sync_failure_payload(
+                    item,
+                    error_type=error_type,
+                    error_message=str(error),
+                    state=state,
+                ),
+            },
+            consecutive_error_count=state.consecutive_error_count,
+            budget_exhausted=state.budget_exhausted,
+            next_retry_at=state.next_retry_at,
+            last_sync_result="error",
+        )
+        if not persisted:
+            return False
+        failure_payload = self._downstream_sync_failure_payload(
+            item,
+            error_type=error_type,
+            error_message=str(error),
+            state=state,
+        )
+        for event_type in (
+            "downstream_http_429_retry_scheduled" if is_http_429 else "downstream_poll_retry_scheduled",
+            (
+                "downstream_http_429_retry_scheduled"
+                if is_http_429
+                else "downstream_sync_error_budget_exhausted" if state.budget_exhausted else "downstream_poll_retry_scheduled"
+            ),
+        ):
+            self._log_child_status_event(
+                db,
+                task=task,
+                item=item,
+                event_type=event_type,
+                change_source=change_source,
+                before_status=before_status or (str(item.status or "").strip().lower() or None),
+                after_status=str(item.status or "").strip().lower() or before_status,
+                sync_status=sync_status,
+                downstream_status_raw=None,
+                downstream_status_mapped=None,
+                downstream_status=None,
+                state_applied=False,
+                error_message=str(error),
+                error_type=error_type,
+                http_status=http_status,
+                extra_payload={
+                    "operation": operation,
+                    "retry_attempt_count": state.consecutive_error_count,
+                    "retry_delay_seconds": (
+                        self._next_http_429_retry_backoff_seconds(state.consecutive_error_count)
+                        if is_http_429
+                        else self._next_stage_sync_retry_backoff_seconds(state.consecutive_error_count)
+                    ),
+                    **failure_payload,
+                },
+            )
+        return True
+
+    def _run_archive_copy_job(self: TaskManager, job_id: str):
+        from app.service import task_manager as task_manager_module
+
+        session_factory = task_manager_module.get_session_factory()
+        db = session_factory()
+        try:
+            job = db.query(task_manager_module.BinarySecurityArchiveJob).filter(
+                task_manager_module.BinarySecurityArchiveJob.id == job_id
+            ).first()
+            if job is None or job.archive_status != "running":
+                return None, "archive job is not running", False
+            task = db.query(task_manager_module.BinarySecurityTask).filter(
+                task_manager_module.BinarySecurityTask.id == job.task_id
+            ).first()
+            item = db.query(task_manager_module.BinarySecurityStageItem).filter(
+                task_manager_module.BinarySecurityStageItem.id == job.item_id
+            ).first()
+            if task is None or item is None:
+                job.archive_status = "failed"
+                job.error_message = "任务或阶段子任务不存在"
+                job.completed_at = task_manager_module._now()
+                db.commit()
+                return None, job.error_message, False
+            if task.status == "cancelled":
+                job.archive_status = "failed"
+                job.error_message = "任务已取消，跳过归档复制"
+                job.completed_at = task_manager_module._now()
+                job.updated_at = task_manager_module._now()
+                db.commit()
+                return None, job.error_message, False
+            payload = dict(job.payload or {})
+            bound_downstream_task_id = self._archive_job_bound_downstream_task_id(job)
+            archive_result = self._archive_downstream_output(
+                db,
+                task,
+                item,
+                semantic_key=item.item_key,
+                bound_downstream_task_id=bound_downstream_task_id,
+                payload=payload.get("downstream_payload") or {},
+                extra_paths=payload.get("extra_paths") or None,
+            )
+            if archive_result.status == "source_not_ready":
+                scheduled, retry_delay_seconds, next_retry_at = self._schedule_archive_job_missing_source_retry(
+                    db,
+                    task,
+                    item,
+                    job,
+                    source_candidates=archive_result.source_candidates,
+                )
+                if scheduled:
+                    db.commit()
+                    return None, None, True
+                exhausted_attempt = self._archive_job_retry_attempt(job)
+                job.archive_status = "failed"
+                job.error_message = "下游产物归档未完成"
+                job.completed_at = task_manager_module._now()
+                job.updated_at = task_manager_module._now()
+                job.payload = {
+                    **self._clear_archive_job_retry_metadata(job),
+                    "archive_copy_stats": dict((item.output_ref or {}).get("archive_copy_stats") or {}),
+                    "copy_retry_reason": task_manager_module.ARCHIVE_COPY_MISSING_SOURCE_RETRY_REASON,
+                    "copy_retry_attempt": exhausted_attempt,
+                    "copy_retry_schedule_seconds": self._archive_copy_missing_source_retry_schedule_seconds(),
+                    "last_missing_source_observed_at": task_manager_module._now().isoformat(),
+                    "last_source_candidate_count": len(archive_result.source_candidates),
+                    "last_source_candidates_preview": list(
+                        archive_result.source_candidates[:task_manager_module.DB_ARTIFACT_PREVIEW_LIMIT]
+                    ),
+                }
+                self._record_event(
+                    db,
+                    task,
+                    "downstream_archive_job_retry_exhausted",
+                    "下游产物长时间未就绪，归档延迟重试已耗尽",
+                    stage_name=job.stage_name,
+                    item=item,
+                    level="warning",
+                    payload={
+                        "archive_job_id": job.id,
+                        "retry_attempt": exhausted_attempt,
+                        "retry_delay_seconds": retry_delay_seconds,
+                        "next_retry_at": next_retry_at.isoformat() if next_retry_at else None,
+                        "source_candidate_count": len(archive_result.source_candidates),
+                        "source_candidates_preview": list(
+                            archive_result.source_candidates[:task_manager_module.DB_ARTIFACT_PREVIEW_LIMIT]
+                        ),
+                        "downstream_task_id": job.downstream_task_id,
+                        "resolution_reason": "archive_source_retry_exhausted",
+                    },
+                )
+                db.commit()
+                return None, job.error_message, False
+            archived_dir = archive_result.target_dir
+            if not archived_dir:
+                job.archive_status = "failed"
+                job.error_message = "下游产物归档未完成"
+                job.completed_at = task_manager_module._now()
+                job.updated_at = task_manager_module._now()
+                db.commit()
+                return None, job.error_message, False
+            copy_stats = dict((item.output_ref or {}).get("archive_copy_stats") or {})
+            job.payload = {
+                **self._clear_archive_job_retry_metadata(job),
+                "bound_downstream_task_id": bound_downstream_task_id,
+                "downstream_payload": payload.get("downstream_payload") or {},
+                "extra_paths": payload.get("extra_paths") or None,
+                "mapped_status": payload.get("mapped_status"),
+                "archive_copy_stats": copy_stats,
+            }
+            task_manager_module.observe_archive_duration(
+                action="copy",
+                result="archived",
+                duration_seconds=task_manager_module._elapsed_seconds_since(job.started_at),
+            )
+            job.archive_status = "archived"
+            job.archive_root = str(archived_dir)
+            job.error_message = None
+            job.updated_at = task_manager_module._now()
+            db.commit()
+            return str(archived_dir), None, False
+        except Exception as exc:
+            db.rollback()
+            try:
+                job = db.query(task_manager_module.BinarySecurityArchiveJob).filter(
+                    task_manager_module.BinarySecurityArchiveJob.id == job_id
+                ).first()
+                if job is not None:
+                    job.archive_status = "failed"
+                    job.error_message = str(exc)
+                    job.completed_at = task_manager_module._now()
+                    job.updated_at = task_manager_module._now()
+                    task_manager_module.observe_archive_duration(
+                        action="copy",
+                        result="failed",
+                        duration_seconds=task_manager_module._elapsed_seconds_since(job.started_at),
+                    )
+                    db.commit()
+            except Exception:
+                db.rollback()
+            return None, str(exc), False
+        finally:
+            db.close()
+
+    async def _apply_archive_job_status(self: TaskManager, job_id: str, archived_root: str | None) -> None:
+        await asyncio.to_thread(
+            self._enqueue_archive_state_event_by_job_id,
+            job_id,
+            event_type="archive_job_copied",
+            payload={"archive_root": archived_root, "source": "compat_apply_request"},
+        )
+
+    async def _apply_archive_job_status_locked(
+        self: TaskManager,
+        db: Session,
+        job_id: str,
+        archived_root: str | None,
+        *,
+        state_event_id: str | None = None,
+    ) -> None:
+        from app.service import task_manager as task_manager_module
+
+        job = db.query(task_manager_module.BinarySecurityArchiveJob).filter(
+            task_manager_module.BinarySecurityArchiveJob.id == job_id
+        ).first()
+        if job is None or job.archive_status not in {"archived", "running", "applying", "success"}:
+            return
+        task = db.query(task_manager_module.BinarySecurityTask).filter(
+            task_manager_module.BinarySecurityTask.id == job.task_id
+        ).first()
+        item = db.query(task_manager_module.BinarySecurityStageItem).filter(
+            task_manager_module.BinarySecurityStageItem.id == job.item_id
+        ).first()
+        if task is None or item is None:
+            return
+        job_bound_downstream_task_id = self._archive_job_bound_downstream_task_id(job)
+        current_downstream_task_id = self._current_downstream_task_id(item)
+        if job_bound_downstream_task_id and current_downstream_task_id and job_bound_downstream_task_id != current_downstream_task_id:
+            mismatch_payload = self._binding_mismatch_payload(
+                source="archive_apply",
+                expected_downstream_task_id=current_downstream_task_id,
+                actual_downstream_task_id=job_bound_downstream_task_id,
+                archive_job_id=job.id,
+            )
+            self._record_binding_mismatch_event(
+                db,
+                task,
+                item,
+                event_type="archive_job_superseded_late_result",
+                message="旧 child 归档结果晚到，已忽略并废弃旧归档作业",
+                payload=mismatch_payload,
+            )
+            job.archive_status = "superseded"
+            job.error_message = None
+            job.completed_at = task_manager_module._now()
+            job.updated_at = task_manager_module._now()
+            payload = dict(job.payload or {})
+            payload["superseded"] = True
+            payload["superseded_reason"] = "late_archive_apply_binding_mismatch"
+            payload["superseded_downstream_task_id"] = job_bound_downstream_task_id or None
+            job.payload = payload
+            task_manager_module.observe_archive_action("apply", "superseded")
+            task_manager_module.observe_archive_duration(
+                action="apply",
+                result="superseded",
+                duration_seconds=task_manager_module._elapsed_seconds_since(job.started_at),
+            )
+            return
+        if str(task.status or "").strip() in {task_manager_module.TASK_STATUS_CANCELLING, "cancelled"}:
+            job.archive_status = "ignored"
+            job.error_message = None
+            job.completed_at = job.completed_at or task_manager_module._now()
+            job.updated_at = task_manager_module._now()
+            self._record_event(
+                db,
+                task,
+                "downstream_archive_job_ignored",
+                "归档完成事件到达时任务已进入取消链路，已忽略以避免恢复已取消阶段状态",
+                level="warning",
+                stage_name=item.stage_name,
+                item=item,
+                payload={
+                    "archive_job_id": job.id,
+                    "state_event_id": state_event_id,
+                    "archive_root": archived_root or job.archive_root,
+                    "task_status": task.status,
+                    "archive_bound_downstream_task_id": job_bound_downstream_task_id or None,
+                },
+            )
+            await self._write_task_metadata_async(
+                task,
+                Path(task.workspace_root) / "input" / "task-metadata.json",
+                status=task.status,
+            )
+            return
+        failure_ctx = self._current_stage_authoritative_failure_context(db, task)
+        if (
+            failure_ctx is not None
+            and str(failure_ctx.get("failure_category") or "").strip() == "archive_blocked"
+            and str(failure_ctx.get("stage_name") or "").strip() == str(item.stage_name or "").strip()
+        ):
+            job.archive_status = "ignored"
+            job.error_message = None
+            job.completed_at = job.completed_at or task_manager_module._now()
+            job.updated_at = task_manager_module._now()
+            self._record_event(
+                db,
+                task,
+                "downstream_archive_apply_blocked_by_authoritative_failure",
+                "归档结果到达时当前阶段已被归档失败阻断，已拒绝晚到回写推进",
+                level="warning",
+                stage_name=item.stage_name,
+                item=item,
+                payload={
+                    "archive_job_id": job.id,
+                    "state_event_id": state_event_id,
+                    "archive_root": archived_root or job.archive_root,
+                    "failure_code": self._string_or_none(failure_ctx.get("failure_code")),
+                    "failure_message": self._string_or_none(failure_ctx.get("failure_message")),
+                    "archive_bound_downstream_task_id": job_bound_downstream_task_id or None,
+                },
+            )
+            await self._write_task_metadata_async(
+                task,
+                Path(task.workspace_root) / "input" / "task-metadata.json",
+                status=task.status,
+            )
+            return
+        try:
+            payload = dict(job.payload or {})
+            mapped_status = str(payload.get("mapped_status") or "").strip()
+            downstream_payload = dict(payload.get("downstream_payload") or {})
+            effective_archive_root = archived_root or job.archive_root
+            archive_copy_stats = dict(payload.get("archive_copy_stats") or {})
+            if not mapped_status:
+                job.archive_status = "failed"
+                job.error_message = "归档 job 缺少目标状态"
+                job.completed_at = task_manager_module._now()
+                return
+            normalized_mapped_status = self._map_downstream_status(mapped_status) or mapped_status
+            downstream_error_text = json.dumps(downstream_payload, ensure_ascii=False) if downstream_payload else ""
+            if normalized_mapped_status == "failed" and any(
+                marker in downstream_error_text.lower()
+                for marker in ("task not found", "not found", "不存在", "downstream_missing")
+            ):
+                normalized_mapped_status = "downstream_missing"
+            if str(item.status or "").strip().lower() == "downstream_missing" and normalized_mapped_status == "failed":
+                normalized_mapped_status = "downstream_missing"
+            self._apply_child_task_status_change(
+                db,
+                task=task,
+                item=item,
+                change_source="archive_apply",
+                after_status=normalized_mapped_status,
+                downstream_payload=downstream_payload,
+                sync_status="synced",
+                downstream_status_raw=self._string_or_none(downstream_payload.get("status")),
+                downstream_status_mapped=normalized_mapped_status,
+                downstream_status=self._string_or_none(downstream_payload.get("status")) or normalized_mapped_status,
+                state_applied=True,
+                error_message=(
+                    downstream_payload.get("error")
+                    or downstream_payload.get("error_message")
+                    or downstream_payload.get("message")
+                    or item.error_message
+                ),
+                archive_job_id=job.id,
+                state_event_id=state_event_id,
+                event_type="child_archive_status_changed",
+                extra_payload={
+                    "archive_root": effective_archive_root,
+                    "downstream_payload": self._lightweight_downstream_payload(downstream_payload),
+                },
+            )
+            self._merge_stage_item_output_ref(
+                item,
+                archive_root=effective_archive_root,
+                **({"archive_copy_stats": archive_copy_stats} if archive_copy_stats else {}),
+            )
+            if item.stage_name == "firmware_unpack" and normalized_mapped_status == "success":
+                self._refresh_firmware_unpack_item_result(
+                    task,
+                    item,
+                    archived_dir=Path(effective_archive_root) if effective_archive_root else None,
+                    bound_downstream_task_id=job_bound_downstream_task_id or None,
+                    downstream_payload=downstream_payload,
+                )
+            if normalized_mapped_status in {"success", "partial_success"}:
+                await self._refresh_terminal_item_result_from_downstream(
+                    task,
+                    item,
+                    downstream_payload,
+                    mapped_status=normalized_mapped_status,
+                    archived_dir=Path(effective_archive_root) if effective_archive_root else None,
+                )
+            self._reconcile_after_item_layer_update_in_session(
+                db,
+                task,
+                stage_name=item.stage_name,
+                preferred_stage_name=item.stage_name,
+                reason="archive_apply_without_active_holder",
+                message="检测到归档回写后阶段已推进但当前无 active holder，已重新排队等待 worker 接管",
+                payload={
+                    "source": "archive_apply",
+                    "item_id": item.id,
+                    "archive_job_id": job.id,
+                    "downstream_task_id": item.downstream_task_id,
+                },
+            )
+            if effective_archive_root:
+                job.archive_root = effective_archive_root
+            job.archive_status = "success"
+            job.error_message = None
+            job.completed_at = task_manager_module._now()
+            job.updated_at = task_manager_module._now()
+            self._record_event(
+                db,
+                task,
+                "downstream_archive_job_completed",
+                "下游产物归档完成，状态已同步",
+                stage_name=item.stage_name,
+                item=item,
+                payload={
+                    "archive_job_id": job.id,
+                    "archive_root": effective_archive_root,
+                    "mapped_status": mapped_status,
+                    "downstream_service": item.downstream_service,
+                    "downstream_task_id": item.downstream_task_id,
+                    "archive_bound_downstream_task_id": job_bound_downstream_task_id or None,
+                },
+            )
+            self._repair_descendants_after_archive_apply_if_needed(
+                db,
+                task,
+                item,
+                state_event_id=state_event_id,
+            )
+            await self._write_task_metadata_async(
+                task,
+                Path(task.workspace_root) / "input" / "task-metadata.json",
+                status=task.status,
+            )
+            task_manager_module.observe_archive_action("apply", "success")
+            task_manager_module.observe_archive_duration(
+                action="apply",
+                result="success",
+                duration_seconds=task_manager_module._elapsed_seconds_since(job.started_at),
+            )
+        except Exception as exc:
+            if job is not None:
+                job.archive_status = "failed"
+                job.error_message = str(exc)
+                job.completed_at = task_manager_module._now()
+                job.updated_at = task_manager_module._now()
+            task_manager_module.observe_archive_action("apply", "failed")
+            task_manager_module.observe_archive_duration(
+                action="apply",
+                result="failed",
+                duration_seconds=task_manager_module._elapsed_seconds_since(job.started_at) if job is not None else None,
+            )
+            raise
+
+    def _repair_descendants_after_archive_apply_if_needed(self: TaskManager, db: Session, task, item, *, state_event_id: str | None):
+        repaired_stage = str(item.stage_name or "").strip()
+        if not repaired_stage:
+            return False
+        descendant_stages = self._descendant_stages_for_stage(task, repaired_stage)
+        if not descendant_stages:
+            return False
+        before_signature = self._archive_apply_downstream_input_signature(db, task, repaired_stage)
+        self._archive_apply_repaired_stage_refresh(db, task, repaired_stage)
+        after_signature = self._archive_apply_downstream_input_signature(db, task, repaired_stage)
+        contaminated = self._archive_apply_descendant_contamination(db, task, repaired_stage)
+        if not contaminated:
+            contaminated = self._archive_apply_forced_descendant_contamination(db, task, repaired_stage)
+        if not contaminated:
+            return False
+        if (
+            before_signature == after_signature
+            and not self._archive_apply_signature_has_runnable_inputs(after_signature)
+            and not self._archive_apply_stage_has_authoritative_success_payload(db, task, repaired_stage)
+        ):
+            return False
+        repair_result = self._reset_descendant_stages_after_archive_repair(db, task, repaired_stage, contaminated)
+        return self._requeue_after_archive_input_repair(
+            db,
+            task,
+            repaired_stage=repaired_stage,
+            affected_stages=list(repair_result.get("affected_stages") or []),
+            state_event_id=state_event_id,
+            before_signature=before_signature,
+            after_signature=after_signature,
+        )

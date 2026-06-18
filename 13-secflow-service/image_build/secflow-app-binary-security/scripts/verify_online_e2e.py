@@ -151,7 +151,7 @@ def main() -> int:
     ok, detail = expect(status == 200 and project is not None, f"status={status}, found={project is not None}")
     report.add("project_lookup", ok, detail, payload={"project_name": project.get("name") if project else None})
 
-    status, config_payload = client.request("GET", f"/api/app/binary-security/projects/{args.project_id}/config")
+    status, config_payload = client.request("GET", "/api/app/binary-security/config")
     config = (config_payload or {}).get("config") or {}
     has_pipeline_mode = "pipeline_mode" in config
     ok = status == 200 and has_pipeline_mode

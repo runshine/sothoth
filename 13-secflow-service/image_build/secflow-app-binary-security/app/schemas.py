@@ -774,3 +774,30 @@ class BinarySecurityServiceConfigPayload(BaseModel):
 
 class BinarySecurityServiceConfigResponse(BaseModel):
     config: BinarySecurityServiceConfigPayload
+
+
+class BinarySecurityGlobalConfigPayload(BaseModel):
+    max_concurrent_tasks: int = Field(default=20, ge=1, le=200)
+    dispatch_timeout_seconds: int = Field(default=60, ge=10, le=600)
+    lease_timeout_seconds: int = Field(default=90, ge=15, le=1800)
+    pipeline_mode: str = Field(default="barrier")
+    max_stage_parallelism: int = Field(default=4, ge=1, le=32)
+    max_retries_per_item: int = Field(default=2, ge=0, le=20)
+    continue_on_item_failure: bool = True
+    partial_success_stage_advancement: dict[str, bool] = Field(
+        default_factory=lambda: {
+            "binary_to_source": False,
+            "entry_analysis": False,
+            "dataflow_vuln_scan": False,
+        }
+    )
+    stage_parallelism: dict[str, int] = Field(
+        default_factory=lambda: {stage: 4 for stage in STAGE_SEQUENCE}
+    )
+    stage_options: dict[str, StageOptions] = Field(
+        default_factory=lambda: {stage: StageOptions(enabled=True) for stage in STAGE_SEQUENCE}
+    )
+
+
+class BinarySecurityGlobalConfigResponse(BaseModel):
+    config: BinarySecurityGlobalConfigPayload

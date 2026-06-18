@@ -205,28 +205,26 @@ async def list_llm_providers(
     )
 
 
-@router.get("/projects/{project_id}/config", response_model=B2SServiceConfig)
+@router.get("/config", response_model=B2SServiceConfig)
 async def get_b2s_config(
-    project_id: str,
-    _: TokenUser = Depends(get_current_context),
+    _: TokenUser = Depends(get_current_user_context),
     db: Session = Depends(get_db),
 ):
-    payload = get_config_service().get_config(db, project_id)
+    payload = get_config_service().get_config(db)
     payload["effective_llm_provider"] = await _effective_llm_provider_summary(payload.get("llm_provider_key"))
     return B2SServiceConfig(**payload)
 
 
-@router.put("/projects/{project_id}/config", response_model=B2SServiceConfig)
+@router.put("/config", response_model=B2SServiceConfig)
 async def save_b2s_config(
-    project_id: str,
     payload: ConfigSaveRequest,
-    _: TokenUser = Depends(get_current_context),
+    _: TokenUser = Depends(get_current_user_context),
     db: Session = Depends(get_db),
 ):
     provider_key = str(payload.config.get("llm_provider_key") or "").strip()
     if provider_key:
         await get_configcenter_client().get_llm_provider(provider_key)
-    saved = get_config_service().save_config(db, project_id, payload.config)
+    saved = get_config_service().save_config(db, payload.config)
     saved["effective_llm_provider"] = await _effective_llm_provider_summary(saved.get("llm_provider_key"))
     return B2SServiceConfig(**saved)
 

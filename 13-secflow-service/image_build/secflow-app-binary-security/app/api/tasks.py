@@ -24,10 +24,11 @@ from app.schemas import (
     BinarySecurityModuleSelectionConfirmPayload,
     BinarySecurityModuleSelectionResponse,
     BinarySecurityOverviewResponse,
+    BinarySecurityGlobalConfigPayload,
+    BinarySecurityGlobalConfigResponse,
     BinarySecurityProjectConfigPayload,
     BinarySecurityProjectConfigResponse,
     BinarySecurityReducerEventPageResponse,
-    BinarySecurityServiceConfigPayload,
     BinarySecurityServiceConfigResponse,
     BinarySecurityStageItemPageResponse,
     BinarySecurityTaskConcurrencyUpdatePayload,
@@ -176,6 +177,33 @@ async def create_task(
         created_by=created_by,
         authorization_token=token,
     )
+
+
+@router.get("/projects/{project_id}/config", response_model=BinarySecurityProjectConfigResponse)
+def get_project_config(
+    project_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().get_project_config(db, project_id=project_id)
+
+
+@router.put("/projects/{project_id}/config", response_model=BinarySecurityProjectConfigResponse)
+def save_project_config(
+    project_id: str,
+    payload: BinarySecurityProjectConfigPayload,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().save_project_config(db, project_id=project_id, payload=payload)
+
+
+@router.get("/service/config", response_model=BinarySecurityServiceConfigResponse)
+def get_service_config(
+    _: TokenUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().get_service_config(db)
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/uploads/complete", response_model=BinarySecurityTaskDetailResponse)
@@ -667,37 +695,18 @@ def confirm_entry_selection(
     )
 
 
-@router.get("/projects/{project_id}/config", response_model=BinarySecurityProjectConfigResponse)
-def get_project_config(
-    project_id: str,
-    _: TokenUser = Depends(get_current_context),
-    db: Session = Depends(get_db),
-):
-    return get_task_manager().get_project_config(db, project_id)
-
-
-@router.put("/projects/{project_id}/config", response_model=BinarySecurityProjectConfigResponse)
-def put_project_config(
-    project_id: str,
-    payload: BinarySecurityProjectConfigPayload,
-    _: TokenUser = Depends(get_current_context),
-    db: Session = Depends(get_db),
-):
-    return get_task_manager().save_project_config(db, project_id, payload)
-
-
-@router.get("/service/config", response_model=BinarySecurityServiceConfigResponse)
-def get_service_config(
+@router.get("/config", response_model=BinarySecurityGlobalConfigResponse)
+def get_config(
     _: TokenUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    return get_task_manager().get_service_config(db)
+    return get_task_manager().get_config(db)
 
 
-@router.put("/service/config", response_model=BinarySecurityServiceConfigResponse)
-def put_service_config(
-    payload: BinarySecurityServiceConfigPayload,
+@router.put("/config", response_model=BinarySecurityGlobalConfigResponse)
+def put_config(
+    payload: BinarySecurityGlobalConfigPayload,
     _: TokenUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    return get_task_manager().save_service_config(db, payload)
+    return get_task_manager().save_config(db, payload)

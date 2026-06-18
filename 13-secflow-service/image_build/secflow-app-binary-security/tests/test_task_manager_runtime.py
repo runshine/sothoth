@@ -267,7 +267,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         logger_exception.assert_not_called()
 
 
-class StreamingTailTakeoverTests(unittest.TestCase):
+class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.manager = TaskManager()
 
@@ -478,19 +478,26 @@ class StreamingTailTakeoverTests(unittest.TestCase):
 
         db = _Db()
         calls = []
+        heartbeats = []
 
         async def _sync_downstream_status(_db, **kwargs):
             calls.append(kwargs["item_ids"])
             return None
 
+        async def _heartbeat(_db, _task, _operation, **kwargs):
+            heartbeats.append(kwargs)
+            _operation.resume_cursor = dict(kwargs.get("resume_cursor") or {})
+            return None
+
         manager.sync_downstream_status = _sync_downstream_status
+        manager._operation_progress_heartbeat = _heartbeat
 
         payload = await manager._operation_sync_retry_target_stage_state(db, task, operation)
 
         self.assertEqual([["item-1", "item-2"], ["item-3"]], calls)
         self.assertEqual(3, payload["synced_items"])
         self.assertEqual(3, payload["total_items"])
-        self.assertEqual(2, db.commits)
+        self.assertEqual(2, len(heartbeats))
         self.assertEqual(
             3,
             operation.resume_cursor["sync_target_stage_state"]["processed_count"],
@@ -516,7 +523,7 @@ class StreamingTailTakeoverTests(unittest.TestCase):
         with (
             patch("app.service.task_manager.asyncio.sleep", new=_sleep),
             patch("app.service.task_manager.logger.exception") as logger_exception,
-            patch("app.service.task_manager.observe_state_reducer_health") as observe_health,
+            patch("app.service.task.reducer.observe_state_reducer_health") as observe_health,
         ):
             await manager._state_reducer_loop()
 
@@ -546,7 +553,7 @@ class StreamingTailTakeoverTests(unittest.TestCase):
 
         with (
             patch("app.service.task_manager.asyncio.sleep", new=_sleep),
-            patch("app.service.task_manager.observe_state_reducer_health") as observe_health,
+            patch("app.service.task.reducer.observe_state_reducer_health") as observe_health,
         ):
             await manager._state_reducer_loop()
 
@@ -630,68 +637,13 @@ class StreamingTailTakeoverTests(unittest.TestCase):
         manager._running = True
         manager.cfg.scheduler.readless_reconcile_interval_seconds = 300
 
-        class _CandidateSession:
-            def query(self, model):
-                del model
-                return self
-
-            def filter(self, *args, **kwargs):
-                del args, kwargs
-                return self
-
-            def order_by(self, *args, **kwargs):
-                del args, kwargs
-                return self
-
-            def limit(self, *args, **kwargs):
-                del args, kwargs
-                return self
-
-            def all(self):
-                return [("t1",)]
-
-            def close(self):
-                return None
-
-        class _TaskSession:
-            def __init__(self):
-                self.task = type("Task", (), {"id": "t1", "status": "pending", "current_stage": "system_analysis"})()
-                self.commits = 0
-                self.rollbacks = 0
-
-            def query(self, model):
-                del model
-                return self
-
-            def filter(self, *args, **kwargs):
-                del args, kwargs
-                return self
-
-            def first(self):
-                return self.task
-
-            def commit(self):
-                self.commits += 1
-
-            def rollback(self):
-                self.rollbacks += 1
-
-            def close(self):
-                return None
-
-        task_session = _TaskSession()
-        sessions = [_CandidateSession(), task_session]
-
-        def _session_factory():
-            return sessions.pop(0)
-
         refresh_calls = []
         observe_calls = []
         sleep_calls = []
 
-        def _refresh(_session, task):
-            refresh_calls.append(task.id)
-            task.status = "running"
+        async def _process_one(task_id):
+            refresh_calls.append(task_id)
+            return True, True
 
         def _observe(**kwargs):
             observe_calls.append(kwargs)
@@ -700,18 +652,15 @@ class StreamingTailTakeoverTests(unittest.TestCase):
             sleep_calls.append(seconds)
             manager._running = False
 
-        manager._refresh_task_status_after_sync = _refresh
-
         with (
-            patch("app.service.task_manager.get_session_factory", return_value=_session_factory),
-            patch("app.service.task_manager.observe_task_readless_reconcile", side_effect=_observe),
+            patch.object(manager, "_load_readless_reconcile_candidate_ids", return_value=["t1"]),
+            patch.object(manager, "_process_readless_reconcile_task", side_effect=_process_one),
+            patch("app.service.task.item_sync.observe_task_readless_reconcile", side_effect=_observe),
             patch("app.service.task_manager.asyncio.sleep", new=_sleep),
         ):
             await manager._readless_reconcile_loop()
 
         self.assertEqual(["t1"], refresh_calls)
-        self.assertEqual(1, task_session.commits)
-        self.assertEqual(0, task_session.rollbacks)
         self.assertEqual(1, len(observe_calls))
         self.assertEqual(1, observe_calls[0]["attempted"])
         self.assertEqual(1, observe_calls[0]["changed"])
@@ -723,23 +672,25 @@ class StreamingTailTakeoverTests(unittest.TestCase):
     async def test_readless_reconcile_skips_active_leased_task_without_refreshing(self):
         manager = TaskManager()
         lease_expires_at = _now() + timedelta(minutes=5)
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-a",
+            lease_expires_at=lease_expires_at,
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        )
 
         class _TaskSession:
             def __init__(self):
-                self.task = BinarySecurityTask(
-                    id="t1",
-                    project_id="p1",
-                    name="demo",
-                    status="running",
-                    task_type=TASK_TYPE_BINARY,
-                    current_stage="dataflow_vuln_scan",
-                    firmware_source="project_filesystem",
-                    firmware_path="/fw",
-                    output_root="/o",
-                    workspace_root="/tmp/ws",
-                    dispatcher_instance_id="worker-a",
-                    lease_expires_at=lease_expires_at,
-                )
+                self.task = task
                 self.commits = 0
                 self.rollbacks = 0
 
@@ -771,13 +722,18 @@ class StreamingTailTakeoverTests(unittest.TestCase):
 
         manager._refresh_task_status_after_sync = _refresh
 
-        with patch.object(task_manager_module, "get_session_factory", return_value=lambda: task_session):
+        with (
+            patch.object(manager, "_readless_reconcile_item_layer", return_value=set()),
+            patch.object(manager, "_readless_reconcile_stage_layer", return_value=set()),
+            patch.object(manager, "_readless_reconcile_task_layer", return_value=manager._task_state_snapshot(task)),
+            patch.object(manager, "_readless_reconcile_tail_takeover", return_value=None),
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: task_session),
+        ):
             attempted, changed = await manager._process_readless_reconcile_task("t1")
 
         self.assertTrue(attempted)
         self.assertFalse(changed)
         self.assertEqual([], refresh_calls)
-        self.assertEqual(0, task_session.commits)
         self.assertEqual(1, task_session.rollbacks)
 
     async def test_observe_runtime_metrics_collects_db_snapshot_in_thread(self):

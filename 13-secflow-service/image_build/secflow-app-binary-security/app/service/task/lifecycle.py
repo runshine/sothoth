@@ -1,0 +1,993 @@
+from __future__ import annotations
+
+import asyncio
+import time
+from contextlib import suppress
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
+
+from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
+from sqlalchemy.orm import Session
+
+from app.observability import (
+    observe_archive_action,
+    observe_archive_reclaim,
+    observe_scheduler_loop,
+    observe_task_heartbeat_loop_duration,
+)
+
+from . import shared as task_shared
+
+if TYPE_CHECKING:
+    from app.service.task_manager import TaskManager
+
+
+class TaskLifecycleServiceMixin:
+    def _requeue_stale_operations(self: TaskManager, db: Session) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        changed = False
+        now_value = task_shared._now()
+        for operation in db.query(task_manager_module.BinarySecurityTaskOperation).all():
+            status = str(getattr(operation, "status", "") or "").strip()
+            if status not in {"running", "accepted"}:
+                continue
+            lease_expires_at = getattr(operation, "claim_lease_expires_at", None)
+            if lease_expires_at is None or lease_expires_at > now_value:
+                continue
+            operation.status = "queued"
+            operation.owner_instance_id = None
+            operation.claim_lease_expires_at = None
+            self._enqueue_operation(operation.id)
+            changed = True
+        return changed
+
+    async def _seed_work_queues(self: TaskManager) -> None:
+        from app.service import task_manager as task_manager_module
+
+        db = task_manager_module.get_session_factory()()
+        try:
+            queue = task_manager_module.get_task_queue()
+            task_ids: list[str] = []
+            for task in db.query(task_manager_module.BinarySecurityTask).all():
+                status = str(getattr(task, "status", "") or "").strip().lower()
+                task_id = str(getattr(task, "id", "") or "").strip()
+                if not task_id:
+                    continue
+                if status in {"pending", "dispatching", "running"}:
+                    task_ids.append(task_id)
+            operation_ids: list[str] = []
+            for operation in db.query(task_manager_module.BinarySecurityTaskOperation).all():
+                operation_id = str(getattr(operation, "id", "") or "").strip()
+                status = str(getattr(operation, "status", "") or "").strip().lower()
+                if not operation_id:
+                    continue
+                if status in {"pending", "running"}:
+                    operation_ids.append(operation_id)
+            for task_id in task_ids:
+                await queue.push_task(task_id)
+            for operation_id in operation_ids:
+                await queue.push_operation(operation_id)
+        finally:
+            with suppress(Exception):
+                db.close()
+
+    def _operation_lease_expires_at(
+        self: TaskManager,
+        *,
+        now_value: datetime | None = None,
+        ttl_seconds: int = 60,
+    ) -> datetime:
+        from app.service import task_manager as task_manager_module
+
+        base = now_value or task_shared._now()
+        effective_ttl = self._operation_lease_ttl_seconds() if ttl_seconds == task_manager_module.TASK_OPERATION_LOCK_TTL_SECONDS else max(30, int(ttl_seconds))
+        return base + timedelta(seconds=effective_ttl)
+
+    def _operation_lease_ttl_seconds(self: TaskManager) -> int:
+        return max(30, int(getattr(self.cfg.scheduler, "operation_lease_ttl_seconds", 60) or 60))
+
+    def _operation_heartbeat_interval_seconds(self: TaskManager) -> int:
+        configured = int(getattr(self.cfg.scheduler, "operation_heartbeat_interval_seconds", 15) or 15)
+        return max(5, min(configured, max(5, int(self._operation_lease_ttl_seconds() / 2))))
+
+    def _stale_operation_requeue_interval_seconds(self: TaskManager) -> int:
+        configured = int(getattr(self.cfg.scheduler, "stale_operation_requeue_interval_seconds", 15) or 15)
+        return max(5, configured)
+
+    def _operation_step_batch_size(self: TaskManager) -> int:
+        return max(1, int(getattr(self.cfg.scheduler, "operation_step_batch_size", 10) or 10))
+
+    def _loop_stale_threshold_seconds(self: TaskManager, loop_name: str) -> int:
+        configured = int(getattr(self.cfg.scheduler, "worker_ready_loop_stale_seconds", 90) or 90)
+        interval_seconds = {
+            "task_dispatch": max(1, int(getattr(self.cfg.queue, "block_timeout_seconds", 5) or 5)),
+            "operation_dispatch": max(1, int(getattr(self.cfg.queue, "block_timeout_seconds", 5) or 5)),
+            "archive_dispatch": max(1, int(getattr(self.cfg.scheduler, "poll_interval_seconds", 5) or 5)),
+            "stage_item_dispatch": max(1, int(getattr(self.cfg.scheduler, "stage_poll_interval_seconds", 5) or 5)),
+            "downstream_reconcile": max(1, int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30) or 30)),
+            "stage_item_sync_reconcile": self._stage_item_sync_reconcile_interval_seconds(),
+            "archive_runtime_reconcile": self._archive_runtime_reconcile_interval_seconds(),
+            "state_repair_reconcile": self._state_repair_reconcile_interval_seconds(),
+            "readless_reconcile": max(1, int(getattr(self.cfg.scheduler, "readless_reconcile_interval_seconds", 300) or 300)),
+            "state_reducer": max(1, int(getattr(self.cfg.scheduler, "poll_interval_seconds", 5) or 5)),
+            "reducer_metrics_snapshot": max(5, int(getattr(self.cfg.scheduler, "poll_interval_seconds", 5) or 5)),
+            "task_heartbeat": max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 15) or 15)),
+        }.get(loop_name, configured)
+        return max(configured, interval_seconds * 2 + 15)
+
+    def _mark_loop_heartbeat(self: TaskManager, loop_name: str, *, now_value: datetime | None = None) -> None:
+        self._loop_heartbeats[str(loop_name)] = now_value or task_shared._now()
+
+    def _recover_loop_db_error(self: TaskManager, loop_name: str, db: Session | None, exc: Exception) -> None:
+        from app.service import task_manager as task_manager_module
+
+        if db is not None:
+            with suppress(Exception):
+                db.rollback()
+            with suppress(Exception):
+                db.close()
+        if isinstance(exc, (OperationalError, SATimeoutError)):
+            with suppress(Exception):
+                task_manager_module.get_engine().dispose()
+            task_manager_module.logger.warning("binary-security %s loop reset database engine after db error: %s", loop_name, exc)
+
+    def _loop_runtime_detail(self: TaskManager, loop_name: str, task: asyncio.Task | None) -> dict[str, Any]:
+        task_running = bool(task and not task.done())
+        heartbeat_at = self._loop_heartbeats.get(loop_name)
+        heartbeat_age_seconds = task_shared._elapsed_seconds_since(heartbeat_at)
+        stale_after_seconds = self._loop_stale_threshold_seconds(loop_name)
+        heartbeat_alive = bool(
+            heartbeat_at
+            and heartbeat_age_seconds is not None
+            and heartbeat_age_seconds <= stale_after_seconds
+        )
+        alive = bool(task_running or heartbeat_alive)
+        stale = bool(alive and heartbeat_at and heartbeat_age_seconds is not None and heartbeat_age_seconds > stale_after_seconds)
+        return {
+            "alive": alive,
+            "task_running": task_running,
+            "heartbeat_alive": heartbeat_alive,
+            "heartbeat_at": task_shared._isoformat_or_none(heartbeat_at),
+            "heartbeat_age_seconds": None if heartbeat_age_seconds is None else round(float(heartbeat_age_seconds), 3),
+            "stale_after_seconds": stale_after_seconds,
+            "stale": stale,
+        }
+
+    def runtime_status(self: TaskManager) -> dict[str, object]:
+        loop_details = {
+            "task_dispatch": self._loop_runtime_detail("task_dispatch", self._loop_task),
+            "operation_dispatch": self._loop_runtime_detail("operation_dispatch", getattr(self, "_operation_loop_task", None)),
+            "archive_dispatch": self._loop_runtime_detail("archive_dispatch", self._archive_loop_task),
+            "stage_item_dispatch": self._loop_runtime_detail("stage_item_dispatch", self._stage_item_loop_task),
+            "downstream_reconcile": self._loop_runtime_detail("downstream_reconcile", self._downstream_reconcile_task),
+            "stage_item_sync_reconcile": self._loop_runtime_detail("stage_item_sync_reconcile", self._stage_item_sync_reconcile_task),
+            "archive_runtime_reconcile": self._loop_runtime_detail("archive_runtime_reconcile", self._archive_runtime_reconcile_task),
+            "state_repair_reconcile": self._loop_runtime_detail("state_repair_reconcile", self._state_repair_reconcile_task),
+            "readless_reconcile": self._loop_runtime_detail("readless_reconcile", self._readless_reconcile_task),
+            "state_reducer": self._loop_runtime_detail("state_reducer", self._state_reducer_loop_task),
+            "reducer_metrics_snapshot": self._loop_runtime_detail("reducer_metrics_snapshot", self._reducer_metrics_snapshot_loop_task),
+            "task_heartbeat": self._loop_runtime_detail("task_heartbeat", self._task_heartbeat_loop_task),
+        }
+        return {
+            "running": self._running,
+            "loops": {loop_name: bool(detail.get("alive")) for loop_name, detail in loop_details.items() if loop_name != "task_heartbeat"},
+            "loop_details": loop_details,
+            "workers": {
+                "task_workers": len([task for task in self._workers.values() if not task.done()]),
+                "operation_workers": len([task for task in self._operation_workers.values() if not task.done()]),
+                "stage_item_workers": len([task for task in self._stage_item_workers.values() if not task.done()]),
+                "archive_workers": len([task for task in self._archive_workers if not task.done()]),
+            },
+            "tail_reconcile_active": bool(self._is_reducer_role() and self._runtime_lease_capable()),
+        }
+
+    def _maybe_requeue_stale_operations(self: TaskManager, db: Session) -> bool:
+        now_value = task_shared._now()
+        if self._last_stale_operation_requeue_at is not None:
+            elapsed = (now_value - self._last_stale_operation_requeue_at).total_seconds()
+            if elapsed < self._stale_operation_requeue_interval_seconds():
+                return False
+        changed = self._requeue_stale_operations(db)
+        self._last_stale_operation_requeue_at = now_value
+        return bool(changed)
+
+    def _collect_runtime_metrics_snapshot_sync(self: TaskManager) -> dict[str, int]:
+        from app.service import task_manager as task_manager_module
+
+        db = task_manager_module.get_session_factory()()
+        try:
+            pending_tasks = int(
+                db.query(task_manager_module.func.count(task_manager_module.BinarySecurityTask.id))
+                .filter(task_manager_module.BinarySecurityTask.status == "pending")
+                .scalar()
+                or 0
+            )
+            running_tasks = int(
+                db.query(task_manager_module.func.count(task_manager_module.BinarySecurityTask.id))
+                .filter(task_manager_module.BinarySecurityTask.status.in_(["dispatching", "running"]))
+                .scalar()
+                or 0
+            )
+            archive_pending_jobs = int(
+                db.query(task_manager_module.func.count(task_manager_module.BinarySecurityArchiveJob.id))
+                .filter(task_manager_module.BinarySecurityArchiveJob.archive_status == "pending")
+                .scalar()
+                or 0
+            )
+            archive_running_jobs = int(
+                db.query(task_manager_module.func.count(task_manager_module.BinarySecurityArchiveJob.id))
+                .filter(task_manager_module.BinarySecurityArchiveJob.archive_status == "running")
+                .scalar()
+                or 0
+            )
+            archive_applying_jobs = int(
+                db.query(task_manager_module.func.count(task_manager_module.BinarySecurityArchiveJob.id))
+                .filter(task_manager_module.BinarySecurityArchiveJob.archive_status == "applying")
+                .scalar()
+                or 0
+            )
+            leased_tasks = int(
+                db.query(task_manager_module.func.count(task_manager_module.BinarySecurityTaskRuntimeLease.task_id))
+                .scalar()
+                or 0
+            )
+        finally:
+            with suppress(Exception):
+                db.close()
+        return {
+            "pending_tasks": pending_tasks,
+            "running_tasks": running_tasks,
+            "archive_pending_jobs": archive_pending_jobs,
+            "archive_running_jobs": archive_running_jobs,
+            "archive_applying_jobs": archive_applying_jobs,
+            "leased_tasks": leased_tasks,
+            "task_capacity": int(getattr(self.cfg.service, "max_concurrent_tasks", 0) or 0),
+        }
+
+    async def _observe_runtime_metrics(self: TaskManager, db: Session | None, *, reconcile_candidates: int = 0) -> None:
+        from app.service import task_manager as task_manager_module
+
+        del db
+        queue_snapshot = await task_manager_module.get_task_queue().snapshot()
+        runtime_snapshot = await asyncio.to_thread(self._collect_runtime_metrics_snapshot_sync)
+        task_manager_module.observe_queue_depths(
+            task_queue_length=int(dict(queue_snapshot.get("task_queue") or {}).get("length") or 0),
+            task_queue_oldest_age_seconds=dict(queue_snapshot.get("task_queue") or {}).get("oldest_age_seconds"),
+            operation_queue_length=int(dict(queue_snapshot.get("operation_queue") or {}).get("length") or 0),
+            operation_queue_oldest_age_seconds=dict(queue_snapshot.get("operation_queue") or {}).get("oldest_age_seconds"),
+            pending_tasks=int(runtime_snapshot.get("pending_tasks") or 0),
+            running_tasks=int(runtime_snapshot.get("running_tasks") or 0),
+            archive_pending_jobs=int(runtime_snapshot.get("archive_pending_jobs") or 0),
+            archive_running_jobs=int(runtime_snapshot.get("archive_running_jobs") or 0),
+            archive_applying_jobs=int(runtime_snapshot.get("archive_applying_jobs") or 0),
+            leased_tasks=int(runtime_snapshot.get("leased_tasks") or 0),
+            reconcile_candidates=max(0, int(reconcile_candidates or 0)),
+        )
+        task_manager_module.observe_slot_usage(
+            task_capacity=int(runtime_snapshot.get("task_capacity") or 0),
+            task_active=len([task for task in self._workers.values() if not task.done()]),
+            action_active=len([task for task in self._operation_workers.values() if not task.done()]),
+        )
+
+    async def _operation_dispatch_loop(self: TaskManager) -> None:
+        from app.service import task_manager as task_manager_module
+
+        session_factory = task_manager_module.get_session_factory()
+        while self._running:
+            operation_id = None
+            db = session_factory()
+            try:
+                with observe_scheduler_loop("operation_dispatch"):
+                    self._mark_loop_heartbeat("operation_dispatch")
+                    self._maybe_requeue_stale_operations(db)
+                    operation_id = await task_manager_module.get_task_queue().pop_operation(
+                        self.cfg.queue.block_timeout_seconds
+                    )
+                    if operation_id:
+                        async with self._operation_worker_lock:
+                            existing = self._operation_workers.get(operation_id)
+                            if existing is None or existing.done():
+                                self._operation_workers[operation_id] = asyncio.create_task(
+                                    self._run_task_operation(operation_id),
+                                    name=f"binary-security-operation-{operation_id}",
+                                )
+                    else:
+                        self._maybe_requeue_stale_operations(db)
+                    self._mark_loop_heartbeat("operation_dispatch")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._recover_loop_db_error("operation_dispatch", db, exc)
+                task_manager_module.logger.exception("binary-security operation dispatch loop crashed and recovered")
+                await asyncio.sleep(1)
+            finally:
+                with suppress(Exception):
+                    db.close()
+
+    async def _reconcile_downstream_task_ref(self: TaskManager, ref: dict[str, str], token: str | None) -> None:
+        from app.service import task_manager as task_manager_module
+
+        db = task_manager_module.get_session_factory()()
+        try:
+            await self.sync_downstream_status(
+                db,
+                project_id=ref["project_id"],
+                task_id=ref["task_id"],
+                force=False,
+                token=token,
+                record_request_event=False,
+                apply_state=True,
+            )
+        finally:
+            db.close()
+
+    async def _reconcile_stale_stage_item_sync_ref(self: TaskManager, ref: dict[str, Any], token: str | None) -> None:
+        from app.service import task_manager as task_manager_module
+
+        db = task_manager_module.get_session_factory()()
+        try:
+            task = self._task_or_404(db, ref["project_id"], ref["task_id"])
+            self._record_event(
+                db,
+                task,
+                "downstream_sync_reconcile_triggered",
+                "检测到阶段下游同步陈旧，触发安全重同步",
+                stage_name=ref.get("stage_name"),
+                payload={
+                    "task_id": ref["task_id"],
+                    "stage_name": ref.get("stage_name"),
+                    "item_ids": list(ref.get("item_ids") or []),
+                    "resolution_reason": "stale_sync_attempt",
+                },
+            )
+            db.commit()
+            await self.sync_downstream_status(
+                db,
+                project_id=ref["project_id"],
+                task_id=ref["task_id"],
+                stage_name=ref.get("stage_name"),
+                item_ids=list(ref.get("item_ids") or []),
+                force=True,
+                token=token,
+                record_request_event=False,
+                apply_state=True,
+            )
+        finally:
+            db.close()
+
+    async def _task_heartbeat_loop(self: TaskManager) -> None:
+        interval_seconds = max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15))
+        while self._running:
+            started = time.perf_counter()
+            try:
+                self._mark_loop_heartbeat("task_heartbeat")
+                await asyncio.to_thread(self._refresh_task_heartbeats_once)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                from app.service import task_manager as task_manager_module
+
+                task_manager_module.logger.exception("binary-security task heartbeat loop crashed and recovered")
+                await asyncio.sleep(1)
+            finally:
+                self._mark_loop_heartbeat("task_heartbeat")
+                observe_task_heartbeat_loop_duration(time.perf_counter() - started)
+            await asyncio.sleep(interval_seconds)
+
+    async def _downstream_reconcile_loop(self: TaskManager) -> None:
+        from app.service import task_manager as task_manager_module
+
+        interval_seconds = max(
+            5,
+            int(
+                getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30)
+                or self.cfg.scheduler.stage_poll_interval_seconds
+                or self.cfg.scheduler.poll_interval_seconds
+                or 30
+            ),
+        )
+        while self._running:
+            db = task_manager_module.get_session_factory()()
+            try:
+                with observe_scheduler_loop("downstream_reconcile"):
+                    self._mark_loop_heartbeat("downstream_reconcile")
+                    task_refs = await asyncio.to_thread(self._list_tasks_needing_downstream_sync, db)
+                    token = self._service_token()
+                    results = await self._run_with_limits(
+                        task_refs,
+                        lambda ref: self._reconcile_downstream_task_ref(ref, token),
+                        concurrency=max(1, min(int(self.cfg.scheduler.downstream_sync_concurrency or 1), 8)),
+                        timeout_seconds=self.cfg.scheduler.downstream_request_timeout_seconds,
+                    )
+                    for ref, _, exc in results:
+                        if exc is None:
+                            continue
+                        try:
+                            task = self._task_or_404(db, ref["project_id"], ref["task_id"])
+                            self._record_event(
+                                db,
+                                task,
+                                "downstream_status_reconcile_failed",
+                                f"后台同步下游状态失败: {exc}",
+                                level="warning",
+                                payload={
+                                    "task_id": ref["task_id"],
+                                    "project_id": ref["project_id"],
+                                    "error": str(exc),
+                                    "error_type": exc.__class__.__name__,
+                                    "downstream_sync_batch_size": int(
+                                        getattr(self.cfg.scheduler, "downstream_sync_batch_size", 50) or 50
+                                    ),
+                                },
+                            )
+                            db.commit()
+                        except Exception:
+                            db.rollback()
+                    deferred_cleanup_refs = await asyncio.to_thread(self._list_tasks_with_deferred_cleanup, db)
+                    deferred_results = await self._run_with_limits(
+                        deferred_cleanup_refs,
+                        lambda ref: self._reconcile_deferred_cleanup_task_ref(ref, token),
+                        concurrency=max(1, min(int(self.cfg.scheduler.downstream_sync_concurrency or 1), 8)),
+                        timeout_seconds=self.cfg.scheduler.downstream_request_timeout_seconds,
+                    )
+                    for ref, _, exc in deferred_results:
+                        if exc is None:
+                            continue
+                        try:
+                            task = self._task_or_404(db, ref["project_id"], ref["task_id"])
+                            self._record_event(
+                                db,
+                                task,
+                                "task_delete_cleanup_reconcile_failed",
+                                f"后台补偿下游删除失败: {exc}",
+                                level="warning",
+                                payload={
+                                    "task_id": ref["task_id"],
+                                    "project_id": ref["project_id"],
+                                    "error": str(exc),
+                                    "error_type": exc.__class__.__name__,
+                                },
+                            )
+                            db.commit()
+                        except Exception:
+                            db.rollback()
+                    await self._observe_runtime_metrics(db, reconcile_candidates=len(task_refs))
+                    self._mark_loop_heartbeat("downstream_reconcile")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._recover_loop_db_error("downstream_reconcile", db, exc)
+                task_manager_module.logger.exception("binary-security downstream reconcile loop crashed and recovered")
+                await asyncio.sleep(1)
+            finally:
+                db.close()
+            await asyncio.sleep(interval_seconds)
+
+    async def _stage_item_sync_reconcile_loop(self: TaskManager) -> None:
+        from app.service import task_manager as task_manager_module
+
+        interval_seconds = self._stage_item_sync_reconcile_interval_seconds()
+        while self._running:
+            db = task_manager_module.get_session_factory()()
+            try:
+                with observe_scheduler_loop("stage_item_sync_reconcile"):
+                    self._mark_loop_heartbeat("stage_item_sync_reconcile")
+                    refs = await asyncio.to_thread(self._list_tasks_with_stale_stage_item_syncs, db)
+                    token = self._service_token()
+                    results = await self._run_with_limits(
+                        refs,
+                        lambda ref: self._reconcile_stale_stage_item_sync_ref(ref, token),
+                        concurrency=max(1, min(int(self.cfg.scheduler.downstream_sync_concurrency or 1), 8)),
+                        timeout_seconds=self.cfg.scheduler.downstream_request_timeout_seconds,
+                    )
+                    for ref, _, exc in results:
+                        if exc is None:
+                            continue
+                        with suppress(Exception):
+                            task = self._task_or_404(db, ref["project_id"], ref["task_id"])
+                            self._record_event(
+                                db,
+                                task,
+                                "downstream_sync_reconcile_failed",
+                                f"后台 stale sync 收敛失败: {exc}",
+                                level="warning",
+                                stage_name=ref.get("stage_name"),
+                                payload={
+                                    "task_id": ref["task_id"],
+                                    "project_id": ref["project_id"],
+                                    "stage_name": ref.get("stage_name"),
+                                    "item_ids": list(ref.get("item_ids") or []),
+                                    "error": str(exc),
+                                    "error_type": exc.__class__.__name__,
+                                },
+                            )
+                            db.commit()
+                    self._mark_loop_heartbeat("stage_item_sync_reconcile")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._recover_loop_db_error("stage_item_sync_reconcile", db, exc)
+                task_manager_module.logger.exception("binary-security stage item sync reconcile loop crashed and recovered")
+                await asyncio.sleep(1)
+            finally:
+                db.close()
+            await asyncio.sleep(interval_seconds)
+
+    async def _archive_runtime_reconcile_loop(self: TaskManager) -> None:
+        from app.service import task_manager as task_manager_module
+
+        interval_seconds = self._archive_runtime_reconcile_interval_seconds()
+        while self._running:
+            try:
+                self._mark_loop_heartbeat("archive_runtime_reconcile")
+                await asyncio.to_thread(self._reclaim_stale_archive_jobs)
+                self._mark_loop_heartbeat("archive_runtime_reconcile")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                task_manager_module.logger.exception("binary-security archive runtime reconcile loop crashed and recovered")
+                await asyncio.sleep(1)
+            await asyncio.sleep(interval_seconds)
+
+    async def _state_repair_reconcile_loop(self: TaskManager) -> None:
+        from app.service import task_manager as task_manager_module
+
+        interval_seconds = self._state_repair_reconcile_interval_seconds()
+        while self._running:
+            db = task_manager_module.get_session_factory()()
+            try:
+                self._mark_loop_heartbeat("state_repair_reconcile")
+                await asyncio.to_thread(self._repair_retryable_state_events, db)
+                self._mark_loop_heartbeat("state_repair_reconcile")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                task_manager_module.logger.exception("binary-security state repair reconcile loop crashed and recovered")
+                await asyncio.sleep(1)
+            finally:
+                db.close()
+            await asyncio.sleep(interval_seconds)
+
+    async def _archive_dispatch_loop(self: TaskManager) -> None:
+        from app.service import task_manager as task_manager_module
+
+        while self._running:
+            try:
+                with observe_scheduler_loop("archive_dispatch"):
+                    self._mark_loop_heartbeat("archive_dispatch")
+                    await asyncio.to_thread(self._reclaim_stale_archive_jobs)
+                    await self._schedule_archive_workers()
+                    self._mark_loop_heartbeat("archive_dispatch")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                task_manager_module.logger.exception("binary-security archive dispatch loop crashed and recovered")
+                await asyncio.sleep(1)
+            await asyncio.sleep(max(1, self.cfg.scheduler.poll_interval_seconds))
+
+    def _next_archived_job(self: TaskManager) -> str | None:
+        from app.service import task_manager as task_manager_module
+
+        db = task_manager_module.get_session_factory()()
+        try:
+            jobs = (
+                db.query(task_manager_module.BinarySecurityArchiveJob)
+                .filter(task_manager_module.BinarySecurityArchiveJob.archive_status == "archived")
+                .order_by(
+                    task_manager_module.BinarySecurityArchiveJob.updated_at.asc(),
+                    task_manager_module.BinarySecurityArchiveJob.created_at.asc(),
+                    task_manager_module.BinarySecurityArchiveJob.id.asc(),
+                )
+                .all()
+            )
+            for job in jobs:
+                if str(getattr(job, "owner_id", "") or "").strip():
+                    continue
+                job.archive_status = "applying"
+                job.owner_id = str(self.instance_id or "").strip() or None
+                job.updated_at = task_shared._now()
+                db.commit()
+                return str(job.id or "").strip() or None
+            db.rollback()
+            return None
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _claim_archive_job(self: TaskManager) -> str | None:
+        from app.service import task_manager as task_manager_module
+
+        db = task_manager_module.get_session_factory()()
+        try:
+            jobs = (
+                db.query(task_manager_module.BinarySecurityArchiveJob)
+                .filter(task_manager_module.BinarySecurityArchiveJob.archive_status == "pending")
+                .order_by(
+                    task_manager_module.BinarySecurityArchiveJob.updated_at.asc(),
+                    task_manager_module.BinarySecurityArchiveJob.created_at.asc(),
+                    task_manager_module.BinarySecurityArchiveJob.id.asc(),
+                )
+                .all()
+            )
+            for job in jobs:
+                if str(getattr(job, "owner_id", "") or "").strip():
+                    continue
+                if not self._archive_job_ready_for_retry(job):
+                    continue
+                job.archive_status = "running"
+                job.owner_id = str(self.instance_id or "").strip() or None
+                now_value = task_shared._now()
+                job.started_at = now_value
+                job.updated_at = now_value
+                job.error_message = None
+                db.commit()
+                return str(job.id or "").strip() or None
+            db.rollback()
+            return None
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    async def _schedule_archive_workers(self: TaskManager) -> None:
+        max_workers = max(1, int(getattr(self.cfg.scheduler, "archive_job_concurrency", 0) or 1))
+        async with self._archive_worker_lock:
+            self._archive_workers = {task for task in self._archive_workers if not task.done()}
+            slots = max_workers - len(self._archive_workers)
+            if slots <= 0:
+                return
+            assignments: list[tuple[str, str]] = []
+            for _ in range(slots):
+                archived_job_id = await asyncio.to_thread(self._next_archived_job)
+                if archived_job_id:
+                    observe_archive_action("claim", "apply")
+                    assignments.append(("apply", archived_job_id))
+                    continue
+                job_id = await asyncio.to_thread(self._claim_archive_job)
+                if job_id:
+                    observe_archive_action("claim", "copy")
+                    assignments.append(("copy", job_id))
+                    continue
+                break
+            for work_type, job_id in assignments:
+                worker = asyncio.create_task(
+                    self._archive_worker(work_type, job_id),
+                    name=f"binary-security-archive-{work_type}-{job_id}",
+                )
+                self._archive_workers.add(worker)
+            self._observe_worker_counts()
+
+    async def _archive_worker(self: TaskManager, work_type: str, job_id: str) -> None:
+        try:
+            if work_type == "apply":
+                await asyncio.to_thread(
+                    self._enqueue_archive_state_event_by_job_id,
+                    job_id,
+                    event_type="archive_job_copied",
+                    payload={"source": "archive_apply_claim"},
+                )
+            else:
+                await self._process_archive_job(job_id)
+        except asyncio.CancelledError:
+            if work_type == "copy":
+                await asyncio.to_thread(self._requeue_running_archive_job_if_owned, job_id, "archive worker cancelled")
+            raise
+        finally:
+            async with self._archive_worker_lock:
+                self._archive_workers.discard(asyncio.current_task())
+            self._observe_worker_counts()
+
+    def _archive_reclaim_timeout_seconds(self: TaskManager) -> int:
+        return max(30, int(getattr(self.cfg.scheduler, "archive_reclaim_timeout_seconds", 300) or 300))
+
+    def _archive_reclaim_max_attempts(self: TaskManager) -> int:
+        return max(1, int(getattr(self.cfg.scheduler, "archive_reclaim_max_attempts", 3) or 3))
+
+    def _archive_copy_missing_source_retry_schedule_seconds(self: TaskManager) -> list[int]:
+        raw_schedule = getattr(self.cfg.scheduler, "archive_copy_missing_source_retry_schedule_seconds", None)
+        values = raw_schedule if isinstance(raw_schedule, list) else [60, 120, 180]
+        schedule = [max(1, int(value)) for value in values if str(value).strip()]
+        return schedule or [60, 120, 180]
+
+    def _archive_job_retry_attempt(self: TaskManager, job) -> int:
+        return max(0, int((job.payload or {}).get("copy_retry_attempt") or 0))
+
+    def _archive_job_retry_next_at(self: TaskManager, job) -> datetime | None:
+        raw = (job.payload or {}).get("copy_retry_next_at")
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(str(raw))
+        except Exception:
+            return None
+
+    def _archive_job_ready_for_retry(self: TaskManager, job, *, now: datetime | None = None) -> bool:
+        del now
+        next_retry_at = self._archive_job_retry_next_at(job)
+        if next_retry_at is None:
+            return True
+        return task_shared._seconds_until(next_retry_at) is None or task_shared._seconds_until(next_retry_at) <= 0
+
+    def _clear_archive_job_retry_metadata(self: TaskManager, job) -> dict[str, object]:
+        payload = dict(job.payload or {})
+        for key in (
+            "copy_retry_reason",
+            "copy_retry_attempt",
+            "copy_retry_next_at",
+            "copy_retry_schedule_seconds",
+            "last_missing_source_observed_at",
+            "last_source_candidates",
+            "last_source_candidate_count",
+            "last_source_candidates_preview",
+        ):
+            payload.pop(key, None)
+        return payload
+
+    def _schedule_archive_job_missing_source_retry(
+        self: TaskManager,
+        db,
+        task,
+        item,
+        job,
+        *,
+        source_candidates: list[str],
+    ) -> tuple[bool, int | None, datetime | None]:
+        from app.service import task_manager as task_manager_module
+
+        schedule = self._archive_copy_missing_source_retry_schedule_seconds()
+        retry_attempt = self._archive_job_retry_attempt(job)
+        if retry_attempt >= len(schedule):
+            return False, None, None
+        retry_delay_seconds = int(schedule[retry_attempt])
+        next_retry_at = task_shared._now() + timedelta(seconds=retry_delay_seconds)
+        payload = self._clear_archive_job_retry_metadata(job)
+        payload.update(
+            {
+                "copy_retry_reason": task_manager_module.ARCHIVE_COPY_MISSING_SOURCE_RETRY_REASON,
+                "copy_retry_attempt": retry_attempt + 1,
+                "copy_retry_next_at": next_retry_at.isoformat(),
+                "copy_retry_schedule_seconds": schedule,
+                "last_missing_source_observed_at": task_shared._now().isoformat(),
+                "last_source_candidate_count": len(source_candidates),
+                "last_source_candidates_preview": list(source_candidates[: task_manager_module.DB_ARTIFACT_PREVIEW_LIMIT]),
+            }
+        )
+        job.payload = payload
+        job.archive_status = "pending"
+        job.owner_id = None
+        job.error_message = None
+        job.archive_root = None
+        job.started_at = None
+        job.completed_at = None
+        job.updated_at = task_shared._now()
+        self._record_event(
+            db,
+            task,
+            "downstream_archive_job_delayed_retry_scheduled",
+            f"下游产物暂未就绪，已安排 {retry_delay_seconds}s 后重试归档",
+            stage_name=job.stage_name,
+            item=item,
+            level="warning",
+            payload={
+                "archive_job_id": job.id,
+                "retry_attempt": retry_attempt + 1,
+                "retry_delay_seconds": retry_delay_seconds,
+                "next_retry_at": next_retry_at.isoformat(),
+                "source_candidate_count": len(source_candidates),
+                "source_candidates_preview": list(source_candidates[: task_manager_module.DB_ARTIFACT_PREVIEW_LIMIT]),
+                "downstream_task_id": job.downstream_task_id,
+                "resolution_reason": task_manager_module.ARCHIVE_COPY_MISSING_SOURCE_RETRY_REASON,
+            },
+        )
+        return True, retry_delay_seconds, next_retry_at
+
+    def _active_archive_job_ids(self: TaskManager) -> set[str]:
+        active_job_ids: set[str] = set()
+        for worker in self._archive_workers:
+            if worker.done():
+                continue
+            name = str(worker.get_name() or "")
+            prefix = "binary-security-archive-"
+            if not name.startswith(prefix):
+                continue
+            job_id = name.split("-")[-1]
+            if job_id:
+                active_job_ids.add(job_id)
+        return active_job_ids
+
+    def _requeue_running_archive_job_if_owned(self: TaskManager, job_id: str, reason: str) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        db = task_manager_module.get_session_factory()()
+        try:
+            job = db.query(task_manager_module.BinarySecurityArchiveJob).filter(task_manager_module.BinarySecurityArchiveJob.id == job_id).first()
+            if job is None or str(job.archive_status or "").strip() != "running":
+                return False
+            if str(job.owner_id or "").strip() != str(self.instance_id or "").strip():
+                return False
+            task = db.query(task_manager_module.BinarySecurityTask).filter(task_manager_module.BinarySecurityTask.id == job.task_id).first()
+            if task is None:
+                return False
+            item = db.query(task_manager_module.BinarySecurityStageItem).filter(task_manager_module.BinarySecurityStageItem.id == job.item_id).first()
+            self._requeue_archive_jobs(
+                db,
+                task,
+                [job],
+                stage_name=job.stage_name,
+                event_type="downstream_archive_job_owner_lost",
+                event_message="归档 worker 中断，归档任务已自动回退重排队",
+            )
+            self._record_event(
+                db,
+                task,
+                "downstream_archive_job_owner_lost",
+                "归档 worker 中断，运行中的归档任务已自动回退重排队",
+                stage_name=job.stage_name,
+                item=item,
+                level="warning",
+                payload={"archive_job_id": job.id, "owner_id_before": self.instance_id, "resolution_reason": reason},
+            )
+            observe_archive_reclaim("owner_cleanup")
+            db.commit()
+            return True
+        except Exception:
+            db.rollback()
+            return False
+        finally:
+            db.close()
+
+    def _requeue_owned_running_archive_jobs(self: TaskManager) -> int:
+        from app.service import task_manager as task_manager_module
+
+        db = task_manager_module.get_session_factory()()
+        try:
+            jobs = (
+                db.query(task_manager_module.BinarySecurityArchiveJob)
+                .filter(
+                    task_manager_module.BinarySecurityArchiveJob.archive_status == "running",
+                    task_manager_module.BinarySecurityArchiveJob.owner_id == self.instance_id,
+                )
+                .order_by(task_manager_module.BinarySecurityArchiveJob.updated_at.asc(), task_manager_module.BinarySecurityArchiveJob.id.asc())
+                .all()
+            )
+            if not jobs:
+                return 0
+            tasks_by_id = {
+                str(task.id): task
+                for task in db.query(task_manager_module.BinarySecurityTask).filter(
+                    task_manager_module.BinarySecurityTask.id.in_([str(job.task_id) for job in jobs if job.task_id])
+                ).all()
+            }
+            reclaimed = 0
+            for job in jobs:
+                task = tasks_by_id.get(str(job.task_id))
+                if task is None:
+                    continue
+                item = db.query(task_manager_module.BinarySecurityStageItem).filter(task_manager_module.BinarySecurityStageItem.id == job.item_id).first()
+                self._requeue_archive_jobs(
+                    db,
+                    task,
+                    [job],
+                    stage_name=job.stage_name,
+                    event_type="downstream_archive_job_owner_lost",
+                    event_message="归档实例停止，运行中的归档任务已自动回退重排队",
+                )
+                self._record_event(
+                    db,
+                    task,
+                    "downstream_archive_job_owner_lost",
+                    "归档实例停止，运行中的归档任务已自动回退重排队",
+                    stage_name=job.stage_name,
+                    item=item,
+                    level="warning",
+                    payload={"archive_job_id": job.id, "owner_id_before": self.instance_id, "resolution_reason": "stop_cleanup"},
+                )
+                reclaimed += 1
+            if reclaimed:
+                observe_archive_reclaim("stop_cleanup")
+                db.commit()
+            else:
+                db.rollback()
+            return reclaimed
+        except Exception:
+            db.rollback()
+            return 0
+        finally:
+            db.close()
+
+    def _reclaim_stale_archive_jobs(self: TaskManager) -> int:
+        from app.service import task_manager as task_manager_module
+
+        db = task_manager_module.get_session_factory()()
+        try:
+            active_job_ids = self._active_archive_job_ids()
+            timeout_seconds = self._archive_reclaim_timeout_seconds()
+            max_attempts = self._archive_reclaim_max_attempts()
+            now = task_shared._now()
+            jobs = (
+                db.query(task_manager_module.BinarySecurityArchiveJob)
+                .filter(task_manager_module.BinarySecurityArchiveJob.archive_status == "running")
+                .order_by(task_manager_module.BinarySecurityArchiveJob.updated_at.asc(), task_manager_module.BinarySecurityArchiveJob.id.asc())
+                .all()
+            )
+            reclaimed = 0
+            for job in jobs:
+                if str(job.id or "") in active_job_ids:
+                    continue
+                if job.archive_root or job.completed_at:
+                    continue
+                last_progress_at = job.updated_at or job.started_at or job.created_at
+                if last_progress_at is None:
+                    continue
+                if (now - last_progress_at).total_seconds() < timeout_seconds:
+                    continue
+                task = db.query(task_manager_module.BinarySecurityTask).filter(task_manager_module.BinarySecurityTask.id == job.task_id).first()
+                if task is None:
+                    continue
+                item = db.query(task_manager_module.BinarySecurityStageItem).filter(task_manager_module.BinarySecurityStageItem.id == job.item_id).first()
+                attempts = int(job.attempts or 0)
+                owner_before = str(job.owner_id or "").strip() or None
+                if attempts > max_attempts:
+                    job.archive_status = "failed"
+                    job.error_message = "archive worker lost after claim; reclaim exhausted"
+                    job.completed_at = now
+                    job.updated_at = now
+                    self._record_event(
+                        db,
+                        task,
+                        "downstream_archive_job_reclaim_failed",
+                        "归档任务在运行态丢失且已超过自动回收预算，需人工处理",
+                        stage_name=job.stage_name,
+                        item=item,
+                        level="warning",
+                        payload={
+                            "archive_job_id": job.id,
+                            "attempts": attempts,
+                            "owner_id_before": owner_before,
+                            "resolution_reason": "archive_reclaim_exhausted",
+                            "timeout_seconds": timeout_seconds,
+                        },
+                    )
+                    observe_archive_reclaim("failed")
+                    reclaimed += 1
+                    continue
+                self._requeue_archive_jobs(
+                    db,
+                    task,
+                    [job],
+                    stage_name=job.stage_name,
+                    event_type="downstream_archive_job_requeued_after_reclaim",
+                    event_message="归档任务在运行态丢失，已自动回退重排队",
+                )
+                self._record_event(
+                    db,
+                    task,
+                    "downstream_archive_job_owner_lost",
+                    "归档任务长时间无进展且无本地 worker 持有，判定为运行态丢失",
+                    stage_name=job.stage_name,
+                    item=item,
+                    level="warning",
+                    payload={
+                        "archive_job_id": job.id,
+                        "attempts": attempts,
+                        "owner_id_before": owner_before,
+                        "resolution_reason": "stale_running_archive_job",
+                        "timeout_seconds": timeout_seconds,
+                    },
+                )
+                observe_archive_reclaim("requeued")
+                reclaimed += 1
+            if reclaimed:
+                db.commit()
+            else:
+                db.rollback()
+            return reclaimed
+        except Exception:
+            db.rollback()
+            return 0
+        finally:
+            db.close()

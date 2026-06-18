@@ -148,8 +148,8 @@ GET  /api/app/binary-security/projects/{project_id}/tasks/{task_id}/timeline
 GET  /api/app/binary-security/projects/{project_id}/tasks/{task_id}/artifacts
 POST /api/app/binary-security/projects/{project_id}/tasks/{task_id}/cancel
 POST /api/app/binary-security/projects/{project_id}/tasks/{task_id}/retry
-GET  /api/app/binary-security/projects/{project_id}/config
-PUT  /api/app/binary-security/projects/{project_id}/config
+GET  /api/app/binary-security/config
+PUT  /api/app/binary-security/config
 ```
 
 ## 工作目录
