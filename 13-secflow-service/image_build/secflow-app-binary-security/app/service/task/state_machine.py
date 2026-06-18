@@ -1330,6 +1330,16 @@ class TaskStateMachineMixin:
             task.finished_at = None
             return True
         if active_operation is not None:
+            if self._release_unsupported_task_row_owner(
+                db,
+                task,
+                active_operation=active_operation,
+                reason="active_operation_without_local_runtime",
+            ):
+                self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+                task.current_operation_id = active_operation.id
+                task.finished_at = None
+                return True
             if self._task_runtime_phase(task) != task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
                 self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION)
             task.finished_at = None

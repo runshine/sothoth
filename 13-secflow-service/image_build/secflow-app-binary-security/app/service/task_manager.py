@@ -1926,6 +1926,8 @@ class TaskManager(
     def _should_keep_task_heartbeat(self, db: Session, task: BinarySecurityTask | None) -> bool:
         if task is None:
             return False
+        if not self._task_row_owner_is_supported_locally(task):
+            return False
         if str(task.status or "").strip().lower() != "running":
             return False
         if str(task.status or "").strip() == TASK_STATUS_CANCELLING:
@@ -1944,6 +1946,102 @@ class TaskManager(
                 return True
         if not self._has_local_task_execution_owner(task.id) and not self._task_has_active_streaming_stage_workers(task.id):
             return False
+        return True
+
+    def _local_operation_worker_alive(self, operation_id: str | None) -> bool:
+        normalized_operation_id = str(operation_id or "").strip()
+        if not normalized_operation_id:
+            return False
+        worker = self._operation_workers.get(normalized_operation_id)
+        return bool(worker is not None and not worker.done())
+
+    def _task_owner_runtime_supported_locally(
+        self,
+        task: BinarySecurityTask | None,
+        *,
+        active_operation=None,
+    ) -> bool:
+        if task is None:
+            return False
+        task_id = str(getattr(task, "id", "") or "").strip()
+        if not task_id:
+            return False
+        handle = self._runtime_handle(task_id)
+        if handle is not None and not handle.done():
+            return True
+        if self._has_local_task_execution_owner(task_id):
+            return True
+        if self._task_has_active_streaming_stage_workers(task_id):
+            return True
+        operation = active_operation
+        if operation is None:
+            current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
+            if current_operation_id:
+                session = get_session_factory()()
+                try:
+                    operation = session.query(BinarySecurityTaskOperation).filter(
+                        BinarySecurityTaskOperation.id == current_operation_id
+                    ).first()
+                finally:
+                    session.close()
+        if operation is None:
+            return False
+        operation_status = str(getattr(operation, "status", "") or "").strip().lower()
+        if operation_status not in TASK_OPERATION_ACTIVE_STATUSES:
+            return False
+        return self._local_operation_worker_alive(str(getattr(operation, "id", "") or "").strip())
+
+    def _task_row_owner_is_supported_locally(
+        self,
+        task: BinarySecurityTask | None,
+        *,
+        active_operation=None,
+    ) -> bool:
+        if task is None:
+            return False
+        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+        if dispatcher_instance_id != str(self.instance_id or "").strip():
+            return True
+        if str(getattr(task, "status", "") or "").strip().lower() not in {"dispatching", "running"}:
+            return True
+        return self._task_owner_runtime_supported_locally(task, active_operation=active_operation)
+
+    def _release_unsupported_task_row_owner(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        active_operation=None,
+        reason: str,
+    ) -> bool:
+        if self._task_row_owner_is_supported_locally(task, active_operation=active_operation):
+            return False
+        previous_status = str(getattr(task, "status", "") or "").strip().lower()
+        current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
+        if previous_status == "running":
+            task.status = "pending"
+        elif previous_status == "dispatching":
+            task.status = "pending"
+        task.dispatcher_instance_id = None
+        task.dispatch_started_at = None
+        task.lease_expires_at = None
+        task.finished_at = None
+        task.last_error = None
+        self._clear_runtime_lease(db, task.id, owner_instance_id=self.instance_id)
+        self._record_event(
+            db,
+            task,
+            "task_row_owner_released_without_local_runtime",
+            "检测到任务 owner 元数据漂移，但当前 Pod 没有本地执行句柄，已释放 owner 并等待重新调度",
+            level="warning",
+            stage_name=task.current_stage,
+            payload={
+                "reason": reason,
+                "previous_status": previous_status,
+                "current_operation_id": current_operation_id,
+                "dispatcher_instance_id": str(self.instance_id or "").strip() or None,
+            },
+        )
         return True
 
     def _write_task_heartbeat(self, session: Session, task_id: str, *, now_value: datetime, source: str) -> bool:

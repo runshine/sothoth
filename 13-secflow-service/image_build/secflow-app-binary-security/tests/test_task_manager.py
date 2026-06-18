@@ -29545,6 +29545,110 @@ def _test_build_task_runtime_health_marks_remote_owner_as_degraded_not_unhealthy
     self.assertNotEqual("unhealthy", units["task_worker"]["status"])
 
 
+def _test_build_task_runtime_health_marks_fake_local_owner_unhealthy(self):
+    manager = TaskManager()
+    now_value = _now()
+    task = BinarySecurityTask(
+        id="task-fake-owner",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="local-worker",
+        lease_expires_at=now_value + timedelta(seconds=120),
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[], runtime_leases=[])
+    manager.instance_id = "local-worker"
+
+    health = manager._build_task_runtime_health(db, task)
+    units = {unit["unit_key"]: unit for unit in health["units"]}
+    snapshot_cards = {card["card_key"]: card for card in health["snapshot_cards"]}
+
+    self.assertEqual("unhealthy", units["task_worker"]["status"])
+    self.assertEqual("unhealthy", units["task_heartbeat"]["status"])
+    self.assertIn("owner 元数据", units["task_worker"]["reason"])
+    self.assertEqual("unhealthy", snapshot_cards["local_task_runtime"]["status"])
+
+
+def _test_dispatch_task_by_id_releases_fake_local_owner_without_runtime(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    task = BinarySecurityTask(
+        id="task-fake-owner-dispatch",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="local-worker",
+        current_operation_id="op-queued",
+        lease_expires_at=_now() + timedelta(seconds=120),
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-queued",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type="retry",
+        status="queued",
+        current_step=None,
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation])
+
+    claimed = manager._dispatch_task_by_id(db, task.id)
+
+    self.assertIsNone(claimed)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+    self.assertEqual("pending", task.status)
+
+
+def _test_refresh_task_status_after_sync_clears_fake_local_owner(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    task = BinarySecurityTask(
+        id="task-fake-owner-sync",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="local-worker",
+        current_operation_id="op-sync",
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-sync",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type="retry",
+        status="queued",
+        current_step=None,
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], stage_runs=[], stage_items=[])
+
+    refreshed = manager._refresh_task_status_after_sync_early_return(db, task)
+
+    self.assertTrue(refreshed)
+    self.assertEqual("pending", task.status)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+    self.assertEqual(operation.id, task.current_operation_id)
+
+
 def _test_task_sync_status_view_excludes_terminal_synced_items_from_stale_count(self):
     manager = TaskManager()
     stale_success = BinarySecurityStageItem(
@@ -32418,6 +32522,7 @@ TaskManagerTests.test_tail_control_plane_stale_error_does_not_pollute_sync_error
 TaskManagerTests.test_sync_observation_recovery_clears_lingering_sync_error_state = _test_sync_observation_recovery_clears_lingering_sync_error_state
 TaskManagerTests.test_task_sync_status_view_excludes_no_child_business_failures_from_sync_errors = _test_task_sync_status_view_excludes_no_child_business_failures_from_sync_errors
 TaskManagerTests.test_build_task_runtime_health_marks_remote_owner_as_degraded_not_unhealthy = _test_build_task_runtime_health_marks_remote_owner_as_degraded_not_unhealthy
+TaskManagerTests.test_build_task_runtime_health_marks_fake_local_owner_unhealthy = _test_build_task_runtime_health_marks_fake_local_owner_unhealthy
 TaskManagerTests.test_task_sync_status_view_excludes_terminal_synced_items_from_stale_count = _test_task_sync_status_view_excludes_terminal_synced_items_from_stale_count
 TaskManagerTests.test_record_polled_child_sync_failure_marks_owned_execution_owner_lost = _test_record_polled_child_sync_failure_marks_owned_execution_owner_lost
 TaskManagerTests.test_record_polled_child_sync_failure_marks_owned_execution_runtime_owner_change_as_owner_lost = _test_record_polled_child_sync_failure_marks_owned_execution_runtime_owner_change_as_owner_lost
@@ -32455,6 +32560,8 @@ TaskManagerTests.test_refresh_task_status_after_sync_converts_failed_streaming_p
 TaskManagerTests.test_refresh_task_status_after_sync_keeps_owner_lost_child_recoverable = _test_refresh_task_status_after_sync_keeps_owner_lost_child_recoverable
 TaskManagerTests.test_refresh_task_status_after_sync_fails_owner_lost_child_after_retry_budget_exhausted = _test_refresh_task_status_after_sync_fails_owner_lost_child_after_retry_budget_exhausted
 TaskManagerTests.test_reclaim_stale_dispatching_skips_failed_streaming_task = _test_reclaim_stale_dispatching_skips_failed_streaming_task
+TaskManagerTests.test_dispatch_task_by_id_releases_fake_local_owner_without_runtime = _test_dispatch_task_by_id_releases_fake_local_owner_without_runtime
+TaskManagerTests.test_refresh_task_status_after_sync_clears_fake_local_owner = _test_refresh_task_status_after_sync_clears_fake_local_owner
 TaskManagerTests.test_sync_downstream_status_does_not_record_recovery_event_for_failed_terminal_child = _test_sync_downstream_status_does_not_record_recovery_event_for_failed_terminal_child
 TaskManagerTests.test_sync_downstream_status_skips_recovery_event_for_terminal_failed_child = _test_sync_downstream_status_skips_recovery_event_for_terminal_failed_child
 TaskManagerTests.test_confirm_module_selection_updates_task = _test_confirm_module_selection_updates_task

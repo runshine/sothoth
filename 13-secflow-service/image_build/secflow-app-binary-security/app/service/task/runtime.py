@@ -369,6 +369,15 @@ class TaskRuntimeServiceMixin:
                 .filter(task_manager_module.BinarySecurityTaskOperation.id == current_operation_id)
                 .first()
             )
+        if self._release_unsupported_task_row_owner(
+            db,
+            task,
+            active_operation=current_operation,
+            reason="dispatch_attempt_without_local_runtime",
+        ):
+            db.commit()
+            self._enqueue_task(task.id)
+            return None
         has_owner_inbox_work = bool(
             current_operation is not None
             and str(getattr(current_operation, "status", "") or "").strip().lower()

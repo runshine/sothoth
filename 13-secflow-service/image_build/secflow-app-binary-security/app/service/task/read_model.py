@@ -2058,6 +2058,7 @@ class TaskReadModelServiceMixin:
         local_worker_alive: bool,
         last_task_heartbeat_at: datetime | None,
         has_local_owner: bool,
+        fake_local_owner: bool,
         owner_count: int,
         local_stage_worker_count: int,
         active_stage_item_count: int,
@@ -2080,11 +2081,14 @@ class TaskReadModelServiceMixin:
                 "subtitle": "当前 Pod 内父任务主协程 / heartbeat handle 快照",
                 "status": self._runtime_health_snapshot_status(
                     active=local_worker_alive or has_local_owner,
-                    warning=bool(not local_worker_alive and has_local_owner),
+                    warning=bool((not local_worker_alive and has_local_owner) or fake_local_owner),
+                    error=fake_local_owner,
                 ),
                 "message": (
                     "当前 Pod 持有本地父任务执行句柄"
                     if local_worker_alive
+                    else "当前 Pod 被标记为任务 owner，但没有本地执行句柄，owner 元数据发生漂移"
+                    if fake_local_owner
                     else "当前 Pod 仅持有执行 owner 标记，没有观测到活跃主协程"
                     if has_local_owner
                     else "当前 Pod 未持有该任务的本地父任务执行句柄"
@@ -2104,6 +2108,7 @@ class TaskReadModelServiceMixin:
                     {"label": "heartbeat_task_name", "value": None if worker_handle is None or worker_handle.heartbeat_task is None else worker_handle.heartbeat_task.get_name()},
                     {"label": "heartbeat_task_done", "value": None if worker_handle is None or worker_handle.heartbeat_task is None else str(worker_handle.heartbeat_task.done()).lower()},
                     {"label": "local_owner", "value": str(has_local_owner).lower()},
+                    {"label": "fake_local_owner", "value": str(fake_local_owner).lower()},
                     {"label": "local_owner_count", "value": str(owner_count)},
                     {"label": "last_local_heartbeat_at", "value": task_shared._isoformat_or_none(last_task_heartbeat_at)},
                 ],
@@ -2292,6 +2297,13 @@ class TaskReadModelServiceMixin:
         operation_lock_heartbeat_at = task.operation_lock_heartbeat_at
         operation_lock_expires_at = task.operation_lock_expires_at
         local_operation_alive = False
+        row_owner_is_local = bool(str(task.dispatcher_instance_id or "").strip() == str(self.instance_id or "").strip())
+        runtime_supported_locally = self._task_owner_runtime_supported_locally(task, active_operation=active_operation)
+        fake_local_owner = bool(
+            row_owner_is_local
+            and task_status in active_task_statuses
+            and not runtime_supported_locally
+        )
         active_stage_items = [
             item
             for item in stage_items
@@ -2365,6 +2377,8 @@ class TaskReadModelServiceMixin:
                     if (local_worker_alive or has_local_owner or lease_expires_at or remote_owner_active)
                     else "unhealthy"
                 )
+                if fake_local_owner:
+                    task_worker_status = "unhealthy"
                 if not local_worker_alive and not has_local_owner and lease_expires_at is None:
                     task_worker_status = "unhealthy"
                 elif remote_owner_active and not local_worker_alive and not has_local_owner:
@@ -2372,6 +2386,9 @@ class TaskReadModelServiceMixin:
                 task_worker_label = "主任务执行协程"
                 task_worker_detail = "负责当前父任务阶段推进与调度衔接"
                 task_worker_reason = (
+                    "任务 row owner 指向当前 Pod，但没有本地执行句柄，owner 元数据与真实执行已脱节"
+                    if fake_local_owner
+                    else
                     "本地任务协程与执行 owner 正常存在"
                     if task_worker_status == "healthy"
                     else "当前任务由远端 owner 持有，本 Pod 仅观察到有效 lease"
@@ -2546,6 +2563,12 @@ class TaskReadModelServiceMixin:
                 operation_status = "healthy"
             if active_operation is None and operation_lock_owner and operation_status != "healthy":
                 operation_status = "degraded"
+            if (
+                active_operation is not None
+                and str(getattr(active_operation, "status", "") or "").strip().lower() in {"accepted", "queued", "claimed"}
+                and not local_operation_alive
+            ):
+                operation_status = "unhealthy"
             units.append(
                 self._build_runtime_health_unit(
                     unit_key="task_operation",
@@ -2557,6 +2580,13 @@ class TaskReadModelServiceMixin:
                     last_heartbeat_at=operation_heartbeat,
                     detail=(f"当前操作类型：{active_operation.operation_type}" if active_operation is not None else "当前存在任务级 operation lock"),
                     reason=(
+                        "当前 operation 仍处于 queued/claimed，但本地没有活跃 operation worker"
+                        if (
+                            active_operation is not None
+                            and str(getattr(active_operation, "status", "") or "").strip().lower() in {"accepted", "queued", "claimed"}
+                            and not local_operation_alive
+                        )
+                        else
                         "任务级操作协程和锁状态正常"
                         if operation_status == "healthy"
                         else "当前仍有操作中的锁或 worker，但心跳已有老化"
@@ -2595,6 +2625,8 @@ class TaskReadModelServiceMixin:
                     if task_shared._seconds_until(lease_expires_at) and task_shared._seconds_until(lease_expires_at) > 0
                     else "unhealthy"
                 )
+            if fake_local_owner:
+                heartbeat_status = "unhealthy"
             if remote_owner_active and not has_local_owner and last_task_heartbeat_at is None:
                 heartbeat_status = "degraded"
             if runtime_phase == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
@@ -2613,6 +2645,9 @@ class TaskReadModelServiceMixin:
                     last_heartbeat_at=last_task_heartbeat_at,
                     detail="维护任务级 lease 与保活心跳",
                     reason=(
+                        "任务 row owner 指向当前 Pod，但本地没有执行句柄，lease 处于漂移状态"
+                        if fake_local_owner
+                        else
                         "心跳与 lease 都在有效窗口内"
                         if heartbeat_status == "healthy"
                         else "当前 lease 由远端 owner 保持活跃，本 Pod 未直接持有心跳内存态"
@@ -2735,6 +2770,7 @@ class TaskReadModelServiceMixin:
             local_worker_alive=local_worker_alive,
             last_task_heartbeat_at=last_task_heartbeat_at,
             has_local_owner=has_local_owner,
+            fake_local_owner=fake_local_owner,
             owner_count=owner_count,
             local_stage_worker_count=local_stage_worker_count,
             active_stage_item_count=len(active_stage_items),
