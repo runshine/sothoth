@@ -1,0 +1,94 @@
+# Task taxonomy — dimensions applicable to task classification.
+# Extracted from shared/taxonomy/secagentnet_taxonomy.v1.yaml
+# Agent reads this file and picks the best matching values.
+
+dimensions:
+
+  task_type:
+    description: "The type of agent task performed in this session"
+    required: true
+    single_value: true
+    extensible: true
+    values:
+      - vuln-audit
+      - code-review
+      - exploit-dev
+      - poc-gen
+      - feature-impl
+      - bug-fix
+      - refactor
+      - infra-setup
+      - evolution
+      - research
+      - documentation
+
+  product:
+    description: "Target product, platform, or technology"
+    required: false
+    single_value: false
+    extensible: true
+    values:
+      - generic
+      - linux
+      - windows
+      - kubernetes
+      - docker
+      - aws
+      - azure
+      - gcp
+      - android
+      - ios
+      - openharmony
+      - harmonyos
+      - liteos
+      - cloud-core
+      - cloud-ai
+      - cloud-data
+      - network-datacom
+      - network-carrier
+      - network-device
+      - storage
+      - terminal
+      - vehicle
+      - energy
+      - web-application
+      - database
+
+  attack_pattern:
+    description: "CAPEC-style attack pattern (only if security-related)"
+    required: false
+    single_value: false
+    extensible: true
+    values:
+      - capec-injection
+      - capec-cmd-injection
+      - capec-code-injection
+      - capec-sqli
+      - capec-xss
+      - capec-overflow
+      - capec-format-string
+      - capec-deserialization
+      - capec-path-traversal
+      - capec-privilege-esc
+      - capec-credential-access
+      - capec-credential-enum
+      - capec-brute-force
+      - capec-lateral-movement
+      - capec-exfiltration
+      - capec-evasion
+      - capec-discovery
+      - capec-persistence
+      - capec-phishing
+      - capec-social-engineering
+      - capec-supply-chain
+      - capec-dos
+      - capec-exploitation
+      - capec-cryptanalysis
+      - capec-fuzzing
+      - capec-vuln-scan
+      - capec-reverse-engineering
+      - capec-configuration-abuse
+      - capec-api-abuse
+      - capec-race-condition
+      - capec-mitm
+      - capec-side-channel

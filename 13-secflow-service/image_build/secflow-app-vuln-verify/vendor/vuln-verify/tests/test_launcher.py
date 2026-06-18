@@ -93,6 +93,20 @@ class TestLaunch:
         idx = cmd.index("--model")
         assert cmd[idx + 1] == "test-model:xhigh"
 
+    def test_terminal_skills_canary_full_adds_skills_and_prompt(self, mock_assembled_dir, threat_file, mock_popen_success, monkeypatch):
+        monkeypatch.setenv("SECOCTO_TERMINAL_SKILLS_CANARY", "full")
+        with patch("vuln_verify.launcher.load_prompt", return_value="prompt"):
+            launch(mock_assembled_dir, threat_file)
+
+        cmd = mock_popen_success.call_args_list[0][0][0]
+        assert cmd.count("--skill") == 11
+        assert "/root/.pi/agent/skills/wiki-mount" in cmd
+        assert "/root/.pi/agent/skills/task-collect" in cmd
+        prompt = cmd[cmd.index("-p") + 1]
+        assert "Terminal Skills Canary - Full Mode" in prompt
+        assert "post-task-reflect" in prompt
+        assert "task-collect" in prompt
+
     def test_custom_session_dir_passed_to_pi(self, mock_assembled_dir, threat_file, mock_popen_success):
         session_dir = mock_assembled_dir / "custom-run"
         with patch("vuln_verify.launcher.load_prompt", return_value="prompt"):

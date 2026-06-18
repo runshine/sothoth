@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 import time
@@ -10,6 +11,61 @@ from vuln_dispatch.log import get_logger
 from vuln_verify.prompt import load_prompt
 
 RATE_LIMIT_RETRY_DELAY_SECONDS = 30
+TERMINAL_SKILLS_CANARY_VALUES = {"1", "true", "yes", "readonly", "read-only", "full"}
+TERMINAL_SKILLS_ALL = [
+    "wiki-mount",
+    "skill-recall-pull",
+    "post-task-reflect",
+    "distill-experience",
+    "task-score",
+    "task-trace",
+    "vuln-report",
+    "skill-recall-onboard",
+    "sec-skill-local-evolve",
+    "skill-recall-propose",
+    "task-collect",
+]
+
+
+def _terminal_skills_canary_mode() -> str:
+    return os.getenv("SECOCTO_TERMINAL_SKILLS_CANARY", "").strip().lower()
+
+
+def _terminal_skills_canary_enabled() -> bool:
+    return _terminal_skills_canary_mode() in TERMINAL_SKILLS_CANARY_VALUES
+
+
+def _terminal_skills_canary_prompt() -> str:
+    mode = _terminal_skills_canary_mode()
+    if mode not in TERMINAL_SKILLS_CANARY_VALUES:
+        return ""
+
+    if mode == "full":
+        return (
+            "【Terminal Skills Canary - Full Mode】\n"
+            "本次任务用于测试 terminal-skills 的完整实际效果。"
+            "在执行漏洞验证前，先读取 /root/.config/secocto/.env 并将其中变量导入执行环境。"
+            "然后依次加载并使用 wiki-mount 和 skill-recall-pull，"
+            "从项目 Wiki、远程 skill recall 与历史经验中搜索当前漏洞验证需要的上下文。"
+            "核心漏洞验证完成后，继续执行完整 post-task 生命周期："
+            "post-task-reflect、distill-experience、task-score、task-trace、vuln-report、"
+            "skill-recall-onboard、sec-skill-local-evolve、skill-recall-propose、task-collect。"
+            "如果任何外部服务不可达或某个 skill 执行失败，必须记录失败原因并继续生成漏洞验证结果，"
+            "不能因为 skill 失败而放弃输出 result_*.json。"
+            "最终仍必须将 result_*.json 输出到指定 verifier_output 目录。\n"
+        )
+
+    return (
+        "【Terminal Skills Canary - Readonly Mode】\n"
+        "本次任务用于测试 terminal-skills 的只读集成效果。"
+        "在执行漏洞验证前，先检查 /root/.config/secocto/.env 是否存在；如存在，读取其中环境变量。"
+        "优先加载并使用 wiki-mount 和 skill-recall-pull，查找项目 Wiki、历史经验和可复用 Skill。"
+        "除非用户明确要求，禁止执行会写入远端系统或修改本地 Skill 的操作，"
+        "包括 skill-recall-onboard、sec-skill-local-evolve、skill-recall-propose、"
+        "task-collect、vuln-report、distill-experience。"
+        "如果外部服务不可达，记录原因并继续完成漏洞验证。"
+        "最终仍必须将 result_*.json 输出到指定 verifier_output 目录。\n"
+    )
 
 
 def _is_rate_limited_output(text: str) -> bool:
@@ -44,7 +100,11 @@ def _verify_one(
     stdout_file = out_dir / f"{group_dir.name}.stdout"
     stderr_file = out_dir / f"{group_dir.name}.stderr"
 
-    pi_cmd = ["pi", "--session-dir", str(session_dir), "--append-system-prompt", str(tmp_prompt), "-p", prompt_msg]
+    pi_cmd = ["pi", "--session-dir", str(session_dir)]
+    if _terminal_skills_canary_enabled():
+        for skill_name in TERMINAL_SKILLS_ALL:
+            pi_cmd.extend(["--skill", f"/root/.pi/agent/skills/{skill_name}"])
+    pi_cmd.extend(["--append-system-prompt", str(tmp_prompt), "-p", prompt_msg])
     if model:
         pi_cmd.extend(["--model", model])
 
@@ -123,7 +183,8 @@ def launch(assembled_dir: Path, threat_path: str | None = None, model: str | Non
     tmp_files: list[Path] = []
 
     prompt_msg = (
-        "分析 reports/ 下的漏洞报告。manifest.json 中有 file_path 和 binary_root 路径。"
+        _terminal_skills_canary_prompt()
+        + "分析 reports/ 下的漏洞报告。manifest.json 中有 file_path 和 binary_root 路径。"
         f"将 result_*.json 输出到 {out_dir}。"
         "不需要生成任何 .md 文件，仅输出 JSON 格式的验证结果。"
     )

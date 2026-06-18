@@ -10,7 +10,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        curl ca-certificates procps psmisc findutils coreutils jq git \
+        curl ca-certificates procps psmisc findutils coreutils jq git rclone \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -23,10 +23,14 @@ COPY app/ /app/app/
 COPY config.yaml /app/config.yaml
 RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
-RUN mkdir -p /root/.pi/agent/bin /data/config /data/files \
-    && for _cmd in rg grep find head tail cat sed awk cut tr sort uniq wc xargs ls stat file basename dirname readlink realpath jq python3; do \
+RUN mkdir -p /root/.pi/agent/bin /root/.pi/agent/skills /root/.config/secocto /data/config /data/files \
+    && for _cmd in rg grep find head tail cat sed awk cut tr sort uniq wc xargs ls stat file basename dirname readlink realpath jq python3 rclone; do \
         _target="$(command -v "$_cmd" 2>/dev/null)" && [ -x "$_target" ] && ln -sf "$_target" "/root/.pi/agent/bin/$_cmd" 2>/dev/null || true; \
     done
+
+COPY skills/ /root/.pi/agent/skills/
+RUN find /root/.pi/agent/skills -type f -name "*.sh" -exec chmod +x {} \; \
+    && find /root/.pi/agent/skills -type f -name "*.py" -exec chmod +x {} \; || true
 
 COPY scripts/entrypoint.sh /entrypoint.sh
 RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
