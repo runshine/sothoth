@@ -262,9 +262,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         def _dispatch_task_by_id(_db, task_id):
             return task_id
 
-        async def _run_task(_task_id):
-            return None
-
         async def _reconcile(_db):
             reconcile_calls.append("called")
 
@@ -272,12 +269,27 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             return None
 
         manager._dispatch_task_by_id = _dispatch_task_by_id
-        manager._run_task = _run_task
+        manager._start_task_runtime = lambda _task_id: asyncio.sleep(0, result=True)
         manager._reconcile_work_queues = _reconcile
         manager._observe_runtime_metrics = _observe
 
+        class _Db:
+            class _Query:
+                def filter(self, *args, **kwargs):
+                    return self
+
+                def first(self):
+                    return None
+
+            def query(self, *args, **kwargs):
+                return self._Query()
+
+            def close(self):
+                return None
+
         with patch("app.service.task_manager.get_task_queue", return_value=_Queue()):
-            await manager._dispatch_loop()
+            with patch("app.service.task_manager.get_session_factory", return_value=lambda: _Db()):
+                await manager._dispatch_loop()
 
         self.assertEqual(["called", "called"], reconcile_calls)
 

@@ -4,6 +4,7 @@ from app.service.stages.binary_to_source import BinaryToSourceStageHandler
 from app.service.stages.dataflow_vuln_scan import DataflowVulnScanStageHandler
 from app.service.stages.entry_analysis import EntryAnalysisStageHandler
 from app.service.stages.firmware_unpack import FirmwareUnpackStageHandler
+from app.service.stages.knowledge_graph_entry_fetch import KnowledgeGraphEntryFetchStageHandler
 from app.service.stages.registry import get_binary_security_stage_registry
 from app.service.stages.system_analysis import SystemAnalysisStageHandler
 
@@ -17,6 +18,7 @@ class BinarySecurityStageRegistryTests(unittest.TestCase):
             "system_analysis",
             "binary_to_source",
             "entry_analysis",
+            "knowledge_graph_entry_fetch",
             "dataflow_vuln_scan",
         ]:
             with self.subTest(stage_name=stage_name):
@@ -38,6 +40,7 @@ class BinarySecurityStageRegistryTests(unittest.TestCase):
         self.assertIsInstance(registry.get("system_analysis"), SystemAnalysisStageHandler)
         self.assertIsInstance(registry.get("binary_to_source"), BinaryToSourceStageHandler)
         self.assertIsInstance(registry.get("entry_analysis"), EntryAnalysisStageHandler)
+        self.assertIsInstance(registry.get("knowledge_graph_entry_fetch"), KnowledgeGraphEntryFetchStageHandler)
         self.assertIsInstance(registry.get("dataflow_vuln_scan"), DataflowVulnScanStageHandler)
 
     def test_registry_returns_none_for_unknown_or_empty_stage(self):

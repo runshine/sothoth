@@ -30,6 +30,7 @@ from app.model import (
     TASK_RUNTIME_PHASE_OWNED_EXECUTION,
     TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
     TASK_RUNTIME_PHASE_TERMINAL,
+    PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
     TASK_TYPE_BINARY,
     TASK_TYPE_BINARY_MODULE,
     TASK_TYPE_SOURCE,
@@ -33289,6 +33290,178 @@ def _test_get_task_detail_task_key_snapshot_reports_unused_without_keys(self):
     self.assertEqual([], detail.task_key_snapshot.work_keys)
 
 
+def _test_stage_sequence_uses_pipeline_profile_for_source_kg_scan(self):
+    task = BinarySecurityTask(
+        id="kg-source-1",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="pending",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.policy = {"pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN}
+
+    self.assertEqual(
+        ["knowledge_graph_entry_fetch", "dataflow_vuln_scan"],
+        self.manager._stage_sequence_for_task(task),
+    )
+
+
+def _test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary(self):
+    task = BinarySecurityTask(
+        id="kg-source-2",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        current_stage="knowledge_graph_entry_fetch",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.summary = {
+        "input_dir": "/workspace/input",
+        "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+    }
+    task.policy = {"pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN}
+    stage_run = BinarySecurityStageRun(
+        id="sr-kg-1",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="knowledge_graph_entry_fetch",
+        sequence_no=1,
+        status="running",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], events=[])
+
+    async def _fake_fetch(_task):
+        return (
+            [
+                {
+                    "entry_key": "src-1",
+                    "function_name": "sink",
+                    "source_file": "src/main.c",
+                    "definition_file": "src/main.c",
+                    "definition_line": 42,
+                    "line_no": 42,
+                    "function_description": "demo",
+                    "function_description_source": "knowledge_graph",
+                    "entry_reason": "channel=http",
+                    "entry_reason_source": "knowledge_graph",
+                    "module_key": "knowledge_graph_source_project",
+                    "module_name": "source-project",
+                    "source_root_path": "/workspace/input",
+                    "module_input_path": "/workspace/input",
+                    "task_type": TASK_TYPE_SOURCE,
+                }
+            ],
+            {
+                "entries_url": "http://172.31.30.88:10001/api/v1/sources/entries",
+                "raw_entry_count": 3,
+                "selected_entry_count": 1,
+                "filtered_out_count": 2,
+                "duration_ms": 55,
+            },
+        )
+
+    self.manager._fetch_knowledge_graph_entry_results = _fake_fetch
+
+    status, summary = asyncio.run(
+        self.manager._stage_knowledge_graph_entry_fetch(db, task, stage_run, token=None, retry_existing=False)
+    )
+
+    self.assertEqual("success", status)
+    self.assertEqual(1, summary["success_count"])
+    self.assertEqual(1, task.metrics["entry_count"])
+    self.assertEqual(1, task.metrics["knowledge_graph_selected_entry_count"])
+    self.assertEqual(1, len(task.summary["knowledge_graph_entry_results"]))
+    self.assertEqual(1, len(task.summary["entry_results"]))
+    self.assertEqual("src-1", task.summary["entry_results"][0]["entries"][0]["entry_key"])
+    self.assertEqual("http://172.31.30.88:10001/api/v1/sources/entries", summary["entries_url"])
+
+
+def _test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results(self):
+    task = BinarySecurityTask(
+        id="kg-source-3",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        current_stage="knowledge_graph_entry_fetch",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.summary = {
+        "input_dir": "/workspace/input",
+        "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+        "knowledge_graph_entry_results": [{"entry_key": "stale"}],
+        "entry_results": [{"entries": [{"entry_key": "stale"}]}],
+    }
+    task.policy = {"pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN}
+    stage_run = BinarySecurityStageRun(
+        id="sr-kg-2",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="knowledge_graph_entry_fetch",
+        sequence_no=1,
+        status="running",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], events=[])
+
+    async def _fake_fetch(_task):
+        return (
+            [],
+            {
+                "entries_url": "http://172.31.30.88:10001/api/v1/sources/entries",
+                "raw_entry_count": 2,
+                "selected_entry_count": 0,
+                "filtered_out_count": 2,
+                "duration_ms": 31,
+            },
+        )
+
+    self.manager._fetch_knowledge_graph_entry_results = _fake_fetch
+
+    status, summary = asyncio.run(
+        self.manager._stage_knowledge_graph_entry_fetch(db, task, stage_run, token=None, retry_existing=False)
+    )
+
+    self.assertEqual("failed", status)
+    self.assertEqual("知识图谱入口结果为空", summary["error"])
+    self.assertEqual([], task.summary["knowledge_graph_entry_results"])
+    self.assertEqual([], task.summary["entry_results"])
+    self.assertEqual(0, task.metrics["entry_count"])
+    self.assertEqual(0, task.metrics["candidate_entry_count"])
+    self.assertEqual(0, task.metrics["selected_entry_count"])
+
+
+def _test_task_response_exposes_pipeline_profile(self):
+    task = BinarySecurityTask(
+        id="kg-source-4",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="pending",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.policy = {"pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN}
+    task.summary = {"pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN}
+    db = _ModelAwareDb(tasks=[task], stage_runs=[], stage_items=[], archive_jobs=[])
+
+    response = self.manager._task_response(db, task)
+
+    self.assertEqual(PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN, response.pipeline_profile)
+
+
 TaskManagerTests.test_tail_stage_work_summary_ignores_terminal_residual_entry_bindings = _test_tail_stage_work_summary_ignores_terminal_residual_entry_bindings
 TaskManagerTests.test_tail_stage_work_summary_keeps_replacement_binding_active = _test_tail_stage_work_summary_keeps_replacement_binding_active
 TaskManagerTests.test_tail_stage_work_summary_keeps_transport_error_binding_active = _test_tail_stage_work_summary_keeps_transport_error_binding_active
@@ -33309,6 +33482,10 @@ TaskManagerTests.test_archive_apply_repaired_stage_refresh_delegates_to_binary_t
 TaskManagerTests.test_compact_stage_success_items_delegates_to_dataflow_handler = _test_compact_stage_success_items_delegates_to_dataflow_handler
 TaskManagerTests.test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets = _test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets
 TaskManagerTests.test_get_task_detail_task_key_snapshot_reports_unused_without_keys = _test_get_task_detail_task_key_snapshot_reports_unused_without_keys
+TaskManagerTests.test_stage_sequence_uses_pipeline_profile_for_source_kg_scan = _test_stage_sequence_uses_pipeline_profile_for_source_kg_scan
+TaskManagerTests.test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary = _test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary
+TaskManagerTests.test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results = _test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results
+TaskManagerTests.test_task_response_exposes_pipeline_profile = _test_task_response_exposes_pipeline_profile
 
 
 if __name__ == "__main__":

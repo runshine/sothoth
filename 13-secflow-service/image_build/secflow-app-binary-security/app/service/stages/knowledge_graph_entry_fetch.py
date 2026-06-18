@@ -34,8 +34,8 @@ class KnowledgeGraphEntryFetchStageHandler(BinarySecurityStageHandler):
         return "源码任务缺少输入目录，不能继续知识图谱入口获取阶段"
 
     def refresh_summary_from_items(self, manager: TaskManager, db: Session, task: BinarySecurityTask) -> None:
-        manager._refresh_stage_run_from_items(db, task, self.stage_name)
-        manager._rebuild_summary_results_from_stage_items(db, task, self.stage_name, "entry_results")
+        del db
+        manager._refresh_knowledge_graph_entry_fetch_summary(task)
 
     def compact_success_items(
         self,
@@ -46,4 +46,3 @@ class KnowledgeGraphEntryFetchStageHandler(BinarySecurityStageHandler):
     ) -> list[dict[str, Any]]:
         del summary_key
         return [manager._compact_entry_summary_item(row) for row in rows if isinstance(row, dict)]
-
