@@ -574,8 +574,20 @@ def _emit_agent_runtime_events(
         event_callback("task_context_compaction_completed", "智能体会话压缩已完成", stage_key=stage, detail=payload)
     if getattr(result, "context_budget_exceeded_preflight", False):
         event_callback("task_context_budget_exceeded_preflight", "智能体请求在发送前已判定超出上下文预算", stage_key=stage, detail=dict(payload, proxy_reserved_tokens=proxy_reserved_tokens, error=str(getattr(result, "error", "") or "")))
-    if getattr(result, "context_overflow_retrying", False):
-        event_callback("task_context_overflow_retrying", "智能体上下文超限，压缩后正在重试", stage_key=stage, detail=dict(payload, proxy_reserved_tokens=proxy_reserved_tokens))
+    if getattr(result, "fatal_retry_event_due", False):
+        event_callback(
+            "task_fatal_retrying",
+            "智能体基础设施异常，已进入 30 秒固定间隔重试",
+            stage_key=stage,
+            detail=dict(
+                payload,
+                reason=str(getattr(result, "fatal_retry_reason", "") or ""),
+                retry_delay_seconds=30,
+                consecutive_fatal_retry_count=int(getattr(result, "consecutive_fatal_retry_count", 0) or 0),
+            ),
+        )
+    if getattr(result, "context_overflow_retrying", False) and getattr(result, "context_overflow_retry_event_due", False):
+        event_callback("task_context_overflow_retrying", "智能体上下文持续超限，已进入无限压缩重试", stage_key=stage, detail=dict(payload, proxy_reserved_tokens=proxy_reserved_tokens, context_overflow_retry_count=int(getattr(result, "context_overflow_retry_count", 0) or 0)))
     if getattr(result, "context_overflow_failed_after_compaction", False):
         event_callback("task_context_overflow_failed_after_compaction", "智能体上下文压缩后仍超出预算，请求已终止", stage_key=stage, detail=dict(payload, proxy_reserved_tokens=proxy_reserved_tokens, error=str(getattr(result, "error", "") or "")))
 

@@ -193,6 +193,73 @@ class PiRpcClientRuntimeBindingTests(unittest.TestCase):
             client.close()
             self.assertFalse(agent_dir.exists())
 
+    def test_pi_rpc_client_identifies_invalid_request_overflow_and_compacts(self):
+        fake_provider = {
+            "provider_key": "share_codex",
+            "provider_type": "openai-compatible",
+            "api_base": "http://llm.local/v1",
+            "api_key": "secret",
+            "model": "glm-5",
+            "models_json": build_models_json_from_provider(
+                {
+                    "provider_key": "share_codex",
+                    "provider_type": "openai-compatible",
+                    "api_base": "http://llm.local/v1",
+                    "api_key": "secret",
+                    "model": "glm-5",
+                }
+            ),
+            "max_tokens": 4096,
+        }
+
+        class _FakeClient:
+            def get_llm_config_file(self, provider_key: str):
+                if provider_key != "share_codex":
+                    raise AssertionError(provider_key)
+                return fake_provider
+
+        with patch("app.unpacker_engine_pi.get_configcenter_client", return_value=_FakeClient()), \
+             patch("app.unpacker_engine_pi.subprocess.Popen", return_value=_FakeProc()), \
+             patch("app.unpacker_engine_pi.os.getpgid", return_value=123), \
+             patch("app.unpacker_engine_pi.os.killpg"), \
+             patch.object(PiRpcClient, "_prompt_once") as prompt_once, \
+             patch.object(PiRpcClient, "_run_compaction", return_value=True):
+            prompt_once.side_effect = [
+                RuntimeError(
+                    "400 litellm.BadRequestError: Hosted_vllmException - "
+                    '{"object":"error","message":"Prefiller\'s maximum context length is 131072 tokens, '
+                    'however the input has 127564 tokens and the proxy reserves 4096 safety-buffer tokens '
+                    'after chat template rendering. Please reduce the length of the input.",'
+                    '"type":"invalid_request_error","code":"prefill_context_length_exceeded"}'
+                ),
+                "ok",
+            ]
+            client = PiRpcClient(
+                provider_role="executor",
+                task_id="task-1",
+                session_path=Path(self._tmp.name) / "executor.jsonl",
+                llm_binding_snapshot={
+                    "project_id": "p1",
+                    "roles": {
+                        "executor": {
+                            "config_file_key": "share_codex",
+                            "provider_key": "share_codex",
+                            "model": "glm-5",
+                            "model_selector": "share_codex/glm-5",
+                            "runtime_dir": str(Path(self._tmp.name) / "runtime" / "executor"),
+                            "models_json": fake_provider["models_json"],
+                            "settings_json": {"defaultProvider": "share_codex", "defaultModel": "glm-5"},
+                        }
+                    },
+                },
+            )
+            result = client.prompt("summary")
+            self.assertTrue(result.compaction_requested)
+            self.assertTrue(result.compaction_completed)
+            self.assertTrue(result.context_overflow_retrying)
+            self.assertEqual("ok", result.output)
+            client.close()
+
 
 class StreamingSubprocessTests(unittest.TestCase):
     def test_run_streaming_process_drains_large_stdout_and_stderr(self):

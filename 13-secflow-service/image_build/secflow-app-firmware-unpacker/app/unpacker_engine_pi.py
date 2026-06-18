@@ -55,6 +55,29 @@ class PiPromptResult:
         self.context_budget_exceeded_preflight = False
         self.context_overflow_retrying = False
         self.context_overflow_failed_after_compaction = False
+        self.fatal_retry_event_due = False
+        self.consecutive_fatal_retry_count = 0
+        self.fatal_retry_reason: str | None = None
+        self.context_overflow_retry_count = 0
+        self.context_overflow_retry_event_due = False
+
+
+def _should_emit_infinite_retry_event(streak: int) -> bool:
+    streak = max(0, int(streak or 0))
+    return streak > 0 and streak % 10 == 0
+
+
+def _mark_infinite_retry(result: PiPromptResult, *, kind: str, count: int, reason: str, delay_seconds: float = 30.0) -> None:
+    result.fatal_retry_event_due = False
+    result.context_overflow_retry_event_due = False
+    if kind == "fatal":
+        result.fatal_retry_event_due = _should_emit_infinite_retry_event(count)
+        result.consecutive_fatal_retry_count = int(count)
+        result.fatal_retry_reason = reason
+    else:
+        result.context_overflow_retrying = True
+        result.context_overflow_retry_count = int(count)
+        result.context_overflow_retry_event_due = _should_emit_infinite_retry_event(count)
 
 
 class PiRpcClient:
@@ -609,29 +632,31 @@ class PiRpcClient:
         result.provider_role = self._provider_role
         result.runtime_dir = str(self._runtime_dir) if self._runtime_dir is not None else None
         result.context_window = self._context_window()
-        estimated_tokens = self._single_input_token_estimate(message)
-        if estimated_tokens > self._preflight_limit(result.context_window, 0):
-            result.context_budget_exceeded_preflight = True
-            if self._session_path is not None:
-                result.compaction_requested = True
-                result.compaction_completed = self._run_compaction()
-                if result.compaction_completed and self._single_input_token_estimate(message) <= self._preflight_limit(result.context_window, 0):
-                    pass
-                else:
-                    result.context_overflow_failed_after_compaction = True
-                    result.error = "preflight_context_length_exceeded"
-                    return result
-            else:
-                result.context_overflow_failed_after_compaction = True
-                result.error = "preflight_context_length_exceeded"
-                return result
         timeout_seconds = get_agent_run_timeout_seconds()
         timeout_retry_enabled = get_agent_timeout_retry_enabled()
         timeout_max_retries = get_agent_timeout_max_retries()
         busy_retries = 2
         timeout_failures = 0
-        for attempt in range(1 + self.RETRIES):
+        fatal_retry_count = 0
+        overflow_retry_count = 0
+        while True:
             try:
+                estimated_tokens = self._single_input_token_estimate(message)
+                preflight_limit = self._preflight_limit(result.context_window, 0)
+                if estimated_tokens > preflight_limit:
+                    result.context_budget_exceeded_preflight = True
+                    if self._session_path is None:
+                        result.context_overflow_failed_after_compaction = True
+                        result.error = "preflight_context_length_exceeded"
+                        return result
+                    result.compaction_requested = True
+                    result.compaction_completed = self._run_compaction()
+                    overflow_retry_count += 1
+                    result.context_overflow_retrying = True
+                    result.context_overflow_retry_count = overflow_retry_count
+                    result.context_overflow_retry_event_due = _should_emit_infinite_retry_event(overflow_retry_count)
+                    continue
+                retry_outer = False
                 for busy_attempt in range(busy_retries + 1):
                     try:
                         result.output = self._prompt_once(
@@ -651,21 +676,12 @@ class PiRpcClient:
                                 return result
                             result.compaction_requested = True
                             result.compaction_completed = self._run_compaction()
-                            if not result.compaction_completed:
-                                result.error = str(exc)
-                                result.context_overflow_failed_after_compaction = True
-                                return result
-                            if self._single_input_token_estimate(message) > self._preflight_limit(result.context_window, result.proxy_reserved_tokens):
-                                result.error = str(exc)
-                                result.context_overflow_failed_after_compaction = True
-                                return result
+                            overflow_retry_count += 1
                             result.context_overflow_retrying = True
-                            result.output = self._prompt_once(
-                                message,
-                                stream_callback=stream_callback,
-                                timeout_seconds=timeout_seconds,
-                            )
-                            return result
+                            result.context_overflow_retry_count = overflow_retry_count
+                            result.context_overflow_retry_event_due = _should_emit_infinite_retry_event(overflow_retry_count)
+                            retry_outer = True
+                            break
                         if "timed out after" in str(exc).lower():
                             timeout_failures += 1
                             can_retry = timeout_retry_enabled and (
@@ -685,7 +701,8 @@ class PiRpcClient:
                             )
                             self._respawn()
                             time.sleep(1)
-                            continue
+                            retry_outer = True
+                            break
                         if str(exc) != "__PI_BUSY__" or busy_attempt >= busy_retries:
                             raise
                         log_event(
@@ -695,16 +712,17 @@ class PiRpcClient:
                             event="pi_prompt_busy_retry",
                             retry=busy_attempt + 1,
                         )
-            except RuntimeError:
+                if retry_outer:
+                    continue
+            except RuntimeError as exc:
+                fatal_retry_count += 1
+                result.fatal_retry_event_due = _should_emit_infinite_retry_event(fatal_retry_count)
+                result.consecutive_fatal_retry_count = fatal_retry_count
+                result.fatal_retry_reason = str(exc)
                 if self.proc.poll() is None:
-                    raise
-                if attempt >= self.RETRIES:
-                    self._mark_session_failed()
-                    raise
-                self._respawn()
-
-        result.error = "Prompt failed after exhausting retries"
-        return result
+                    self._respawn()
+                time.sleep(30)
+                continue
 
     def get_messages(self):
         self.send({"id": "req-message", "type": "get_messages"})
